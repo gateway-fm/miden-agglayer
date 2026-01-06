@@ -1,11 +1,16 @@
+use crate::service_state::ServiceState;
 use miden_agglayer::*;
 use std::str::FromStr;
 use url::Url;
+
+mod claim_endpoint;
+mod service;
+pub mod service_state;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::setup_tracing()?;
     let url = Url::from_str("http://localhost:12345")?;
-    tracing::info!(target: "miden-agglayer", address = %url, "Service started");
+    service::serve(url, ServiceState {}).await?;
     Ok(())
 }

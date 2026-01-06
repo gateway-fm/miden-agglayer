@@ -20,7 +20,7 @@ thiserror          = { default-features = false, version = "2.0" }
 tokio              = { features = ["macros", "rt-multi-thread"], version = "1.48" }
 tokio-stream       = { version = "0.1" }
 tower              = { version = "0.5" }
-tower-http         = { features = ["cors"], version = "0.6" }
+tower-http         = { features = ["cors", "set-header"], version = "0.6" }
 tracing            = { version = "0.1" }
 tracing-subscriber = { features = ["env-filter", "fmt", "json"], version = "0.3" }
 url                = { features = ["serde"], version = "2.5" }
