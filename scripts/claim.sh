@@ -10,7 +10,7 @@ fi
 
 args=(
 	# L2 RPC node
-	--rpc-url http://localhost:8123
+	--rpc-url http://localhost:12345
 	--insecure
 	# default pre-funded dev account
 	--private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -19,6 +19,8 @@ args=(
     --bridge-service-url http://localhost:5579
     # L1 chain ID
 	--deposit-network 0
+	# L2 rollup chain ID
+	--chain-id 1001
 	--deposit-count $depositCount
 	--legacy=false
 	--dry-run
