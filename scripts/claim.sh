@@ -23,7 +23,7 @@ args=(
 	--chain-id 1001
 	--deposit-count $depositCount
 	--legacy=false
-	--dry-run
+	# --dry-run
 	# --verbosity trace
 )
 

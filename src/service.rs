@@ -1,9 +1,11 @@
-use crate::claim_endpoint::claim_endpoint;
+use crate::claim_endpoint::claim_endpoint_dry_run;
+use crate::claim_endpoint::claim_endpoint_raw_txn;
 use crate::service_state::ServiceState;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
+use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
 use miden_agglayer::COMPONENT;
@@ -14,7 +16,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use url::Url;
 
 async fn json_rpc_endpoint(
-    State(_service): State<ServiceState>,
+    State(service): State<ServiceState>,
     request: JsonRpcExtractor,
 ) -> JrpcResult {
     let answer_id = request.get_answer_id();
@@ -37,6 +39,27 @@ async fn json_rpc_endpoint(
             let _params: (String, String) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         },
+        "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+        "eth_sendRawTransaction" => {
+            let params: (String,) = request.parse_params()?;
+            let result = claim_endpoint_raw_txn(service, params.0).await;
+            match result {
+                Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
+                Err(error) => {
+                    let error = JsonRpcError::new(
+                        JsonRpcErrorReason::ApplicationError(1),
+                        error.to_string(),
+                        serde_json::Value::Null,
+                    );
+                    Err(JsonRpcResponse::error(answer_id, error))
+                },
+            }
+        },
+        "eth_getTransactionReceipt" => {
+            let _params: (String,) = request.parse_params()?;
+            let result = serde_json::json!({"blockHash":"0xa957d47df264a31badc3ae823e10ac1d444b098d9b73d204c40426e57f47e8c3","blockNumber":"0xeff35f","contractAddress":null,"cumulativeGasUsed":"0xa12515","effectiveGasPrice":"0x5a9c688d4","from":"0x6221a9c005f6e47eb398fd867784cacfdcfff4e7","gasUsed":"0xb4c8","logs":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":["0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0x0000000000000000000000006221a9c005f6e47eb398fd867784cacfdcfff4e7","0x0000000000000000000000001e0049783f008a0085193e00003d00cd54003c71"],"data":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","blockNumber":"0xeff35f","transactionHash":"0x85d995eba9763907fdf35cd2034144dd9d53ce32cbec21349d4b12823c6860c5","transactionIndex":"0x66","blockHash":"0xa957d47df264a31badc3ae823e10ac1d444b098d9b73d204c40426e57f47e8c3","logIndex":"0xfa","removed":false}],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000080000000000000000200000000000000000000020000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020001000000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000010200000000000000000000000000000000000000000000000000000020000","status":"0x1","to":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","transactionHash":"0x85d995eba9763907fdf35cd2034144dd9d53ce32cbec21349d4b12823c6860c5","transactionIndex":"0x66","type":"0x2"});
+            Ok(JsonRpcResponse::success(answer_id, result))
+        },
         method => Ok(request.method_not_found(method)),
     }
 }
@@ -44,7 +67,7 @@ async fn json_rpc_endpoint(
 pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(json_rpc_endpoint))
-        .route("/claim", post(claim_endpoint))
+        .route("/claim", post(claim_endpoint_dry_run))
         .layer(
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::if_not_present(
