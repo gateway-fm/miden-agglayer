@@ -208,6 +208,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-jrpc"
+version = "0.8.0"
+dependencies = [
+ "axum",
+ "cfg-if",
+ "mime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1556,6 +1568,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "axum-jrpc",
  "clap",
  "http",
  "miden-client",
