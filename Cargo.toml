@@ -9,6 +9,7 @@ version      = "0.1.0"
 
 [dependencies]
 alloy              = { features = ["consensus", "eips"], version = "1.3.0" }
+alloy-core         = { features = ["sol-types"], version = "1.5.2" }
 anyhow             = { default-features = false, version = "1.0" }
 async-trait        = { version = "0.1" }
 axum               = { features = ["tokio"], version = "0.8" }

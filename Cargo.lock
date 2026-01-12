@@ -2865,6 +2865,7 @@ name = "miden-agglayer"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-core",
  "anyhow",
  "async-trait",
  "axum",
