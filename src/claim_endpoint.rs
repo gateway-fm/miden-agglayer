@@ -1,11 +1,14 @@
 use crate::service_state::ServiceState;
-use alloy::consensus::TxEnvelope;
+use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, TxEnvelope};
 use alloy::eips::Decodable2718;
+use alloy::primitives::{Log, TxHash};
+use alloy::rpc::types::TransactionReceipt;
 use alloy_core::sol_types::SolCall;
 use axum::Json;
 use axum::extract::State;
 use hex::FromHexError;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 fn hex_decode_prefixed(input: &str) -> Result<Vec<u8>, FromHexError> {
     hex::decode(input.strip_prefix("0x").unwrap_or(input))
@@ -64,8 +67,7 @@ pub async fn claim_endpoint_dry_run(
 pub async fn claim_endpoint_raw_txn(
     _service: ServiceState,
     input: String,
-) -> anyhow::Result<String> {
-    tracing::debug!("input: {:?}", input);
+) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
@@ -73,6 +75,8 @@ pub async fn claim_endpoint_raw_txn(
     match txn_envelope {
         TxEnvelope::Eip1559(txn_signed) => {
             let txn = txn_signed.tx();
+            let txn_hash = *txn_signed.hash();
+            tracing::debug!("hash: {:?}", txn_hash);
             tracing::debug!("chain_id: {:?}", txn.chain_id);
             tracing::debug!("to: {:?}", txn.to);
 
@@ -83,12 +87,41 @@ pub async fn claim_endpoint_raw_txn(
             } else {
                 panic!("unhandled txn method {:?}", params_encoded);
             }
+
+            Ok(txn_hash)
         },
         _ => {
             panic!("unhandled txn type {:?}", txn_envelope.tx_type());
         },
     }
+}
 
-    let txn_hash = "0xe670ec64341771606e55d6b4ca35a1a6b75ee3d5145a99d05921026d1527331";
-    Ok(txn_hash.to_string())
+// polycli polls receipts to get the eth_sendRawTransaction status
+// it logs cumulativeGasUsed and transactionHash
+// TODO: return null if the transaction is not yet included onto the blockchain, return status=0 for errors
+pub async fn claim_endpoint_txn_receipt(
+    _service: ServiceState,
+    txn_hash: String,
+) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope>>> {
+    let status = true;
+
+    let mut receipt_inner = ReceiptWithBloom::<Receipt<Log>>::default();
+    receipt_inner.receipt.status = Eip658Value::Eip658(status);
+    receipt_inner.receipt.cumulative_gas_used = 0;
+
+    let receipt = TransactionReceipt {
+        inner: ReceiptEnvelope::Eip1559(receipt_inner),
+        transaction_hash: TxHash::from_str(&txn_hash)?,
+        transaction_index: None,
+        block_hash: None,
+        block_number: None,
+        gas_used: 0,
+        effective_gas_price: 0,
+        blob_gas_used: None,
+        blob_gas_price: None,
+        from: Default::default(),
+        to: None,
+        contract_address: None,
+    };
+    Ok(Some(receipt))
 }
