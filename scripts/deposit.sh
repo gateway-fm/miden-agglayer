@@ -12,7 +12,7 @@ args=(
 	--destination-network 1001
 	--legacy=false
 	# --dry-run
-    # --token-address string # address of ERC20 token to use (default is zero)
+	# --token-address string # address of ERC20 token to use (default is zero)
 )
 
 polycli ulxly bridge asset "${args[@]}"

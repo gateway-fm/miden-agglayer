@@ -10,14 +10,14 @@ fi
 
 args=(
 	# L2 RPC node
-	--rpc-url http://localhost:12345
+	--rpc-url http://localhost:8125
 	--insecure
 	# default pre-funded dev account
 	--private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 	--bridge-address 0x78908F7A87d589fdB46bdd5EfE7892C5aD6001b6
 	# AggKit bridge service REST endpoint (see http://localhost:5579/bridge/v1/swagger )
-    --bridge-service-url http://localhost:5579
-    # L1 chain ID
+	--bridge-service-url http://localhost:5579
+	# L1 chain ID
 	--deposit-network 0
 	# L2 rollup chain ID
 	--chain-id 1001

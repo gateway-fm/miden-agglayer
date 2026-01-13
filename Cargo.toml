@@ -1,4 +1,5 @@
 [package]
+description  = "Miden AggLayer integration service"
 edition      = "2024"
 exclude      = [".github/"]
 license      = "MIT"
