@@ -66,7 +66,16 @@ and then rerun the setup commands from scratch.
 
 ### L1 to Miden bridging local test
 
-Having the miden-agglayer service running:
+Start a local Miden node:
+
+    make start-node
+
+Run the miden-agglayer service in IDE or CLI:
+
+    make build
+    ./target/release/miden-agglayer
+
+Having it running:
 
     ./scripts/deposit.sh    # deposit tokens on L1 for bridging
     ./scripts/claim.sh <N>  # sends a claim transaction on Miden

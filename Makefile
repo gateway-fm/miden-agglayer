@@ -61,12 +61,11 @@ test-docs: ## Run documentation tests
 
 .PHONY: start-node
 start-node: ## Start the testing node server
-	# TODO
-	# RUST_LOG=info cargo run --release --package node-builder --locked
+	RUST_LOG=info cargo run --release --bin test_node --locked
 
 .PHONY: stop-node
 stop-node: ## Stop the testing node server
-	-pkill -f "node-builder"
+	-pkill -f "test_node"
 	sleep 1
 
 # --- Building ------------------------------------------------------------------------------------
