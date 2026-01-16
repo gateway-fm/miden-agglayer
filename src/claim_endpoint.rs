@@ -45,7 +45,7 @@ alloy_core::sol! {
 }
 
 pub async fn claim_endpoint_dry_run(
-    State(_service): State<ServiceState>,
+    State(service): State<ServiceState>,
     Json(request): Json<ClaimRequest>,
 ) -> Json<ClaimResponse> {
     tracing::debug!("chain_id: {:?}", request.chain_id);
@@ -57,6 +57,8 @@ pub async fn claim_endpoint_dry_run(
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
         let params = claimAssetCall::abi_decode(&params_encoded);
         tracing::debug!("claimAsset call params: {:?}", params);
+
+        service.miden_client.with().await.expect("miden client call failed");
     } else {
         panic!("unhandled txn method {:?}", params_encoded);
     }
@@ -65,7 +67,7 @@ pub async fn claim_endpoint_dry_run(
 }
 
 pub async fn claim_endpoint_raw_txn(
-    _service: ServiceState,
+    service: ServiceState,
     input: String,
 ) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
@@ -84,6 +86,8 @@ pub async fn claim_endpoint_raw_txn(
             if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
                 let params = claimAssetCall::abi_decode(params_encoded)?;
                 tracing::debug!("claimAsset call params: {:?}", params);
+
+                service.miden_client.with().await?;
             } else {
                 panic!("unhandled txn method {:?}", params_encoded);
             }

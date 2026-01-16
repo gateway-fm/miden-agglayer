@@ -27,10 +27,13 @@ async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
 
-    let mut client = MidenClient::new(command.miden_store_dir).await?;
-    client.sync().await?;
+    let client = MidenClient::new(command.miden_store_dir)?;
+    let state = ServiceState::new(client);
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
-    service::serve(url, ServiceState {}).await?;
+    service::serve(url, state.clone()).await?;
+
+    state.miden_client.join()?;
+
     Ok(())
 }
