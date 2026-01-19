@@ -58,7 +58,12 @@ pub async fn claim_endpoint_dry_run(
         let params = claimAssetCall::abi_decode(&params_encoded);
         tracing::debug!("claimAsset call params: {:?}", params);
 
-        service.miden_client.with().await.expect("miden client call failed");
+        let future = service.miden_client.with(|client| {
+            Box::new(async {
+                client.sync_state().await.unwrap();
+            })
+        });
+        future.await.expect("miden client call failed");
     } else {
         panic!("unhandled txn method {:?}", params_encoded);
     }
@@ -87,7 +92,12 @@ pub async fn claim_endpoint_raw_txn(
                 let params = claimAssetCall::abi_decode(params_encoded)?;
                 tracing::debug!("claimAsset call params: {:?}", params);
 
-                service.miden_client.with().await?;
+                let future = service.miden_client.with(|client| {
+                    Box::new(async {
+                        client.sync_state().await.unwrap();
+                    })
+                });
+                future.await?;
             } else {
                 panic!("unhandled txn method {:?}", params_encoded);
             }

@@ -6,11 +6,27 @@ use miden_client::rpc::Endpoint;
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use std::env;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+type BoxFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
+type BoxFutureFactory = Box<
+    dyn for<'c> FnOnce(&'c mut miden_client::Client<FilesystemKeyStore>) -> BoxFuture<'c>
+        + Send
+        + 'static,
+>;
+
+struct Request {
+    response_sender: oneshot::Sender<()>,
+    closure: BoxFutureFactory,
+}
 
 pub struct MidenClient {
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
+    sender: mpsc::Sender<Request>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -20,17 +36,20 @@ impl MidenClient {
     pub fn new(store_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
 
+        let (sender, receiver) = mpsc::channel::<Request>(1);
+
         let runtime = tokio::runtime::Runtime::new()?;
         let task = thread::spawn(move || -> anyhow::Result<()> {
-            let result =
-                runtime.block_on(tokio::task::LocalSet::new().run_until(Self::run(store_dir)));
+            let result = runtime
+                .block_on(tokio::task::LocalSet::new().run_until(Self::run(store_dir, receiver)));
             if let Err(err) = &result {
                 tracing::error!("MidenClient::run stopped: {err}");
             }
             result
         });
 
-        Ok(Self { task: std::sync::Mutex::new(Some(task)) })
+        let task = std::sync::Mutex::new(Some(task));
+        Ok(Self { task, sender })
     }
 
     fn default_store_dir() -> PathBuf {
@@ -49,7 +68,7 @@ impl MidenClient {
         }
     }
 
-    async fn run(store_dir: PathBuf) -> anyhow::Result<()> {
+    async fn run(store_dir: PathBuf, mut receiver: mpsc::Receiver<Request>) -> anyhow::Result<()> {
         // node client
         let node_endpoint = Endpoint::localhost();
         let node_timeout_ms: u64 = 10_000;
@@ -68,10 +87,33 @@ impl MidenClient {
 
         client.sync_state().await?;
 
+        while let Some(request) = receiver.recv().await {
+            (request.closure)(&mut client).await;
+            request.response_sender.send(()).unwrap_or(());
+        }
+
         Ok(())
     }
 
-    pub async fn with(&self) -> anyhow::Result<()> {
-        todo!()
+    // https://users.rust-lang.org/t/function-that-takes-an-async-closure/61663/2
+    pub async fn with<Fn>(&self, closure: Fn) -> anyhow::Result<()>
+    where
+        Fn: for<'c> FnOnce(
+            &'c mut miden_client::Client<FilesystemKeyStore>,
+        ) -> Box<dyn Future<Output = ()> + 'c>,
+        Fn: Send + 'static,
+    {
+        let (response_sender, response_receiver) = oneshot::channel::<()>();
+
+        let request = Request {
+            response_sender,
+            closure: Box::new(|client| Box::into_pin(closure(client))),
+        };
+        if self.sender.send(request).await.is_err() {
+            anyhow::bail!("MidenClient::with: failed to queue a request - receiver is closed");
+        }
+
+        response_receiver.await?;
+        Ok(())
     }
 }
