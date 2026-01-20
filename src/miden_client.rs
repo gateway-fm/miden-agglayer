@@ -12,7 +12,7 @@ use std::thread;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-type BoxFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
+type BoxFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 type BoxFutureFactory = Box<
     dyn for<'c> FnOnce(&'c mut miden_client::Client<FilesystemKeyStore>) -> BoxFuture<'c>
         + Send
@@ -20,7 +20,7 @@ type BoxFutureFactory = Box<
 >;
 
 struct Request {
-    response_sender: oneshot::Sender<()>,
+    response_sender: oneshot::Sender<anyhow::Result<()>>,
     closure: BoxFutureFactory,
 }
 
@@ -88,8 +88,8 @@ impl MidenClient {
         client.sync_state().await?;
 
         while let Some(request) = receiver.recv().await {
-            (request.closure)(&mut client).await;
-            request.response_sender.send(()).unwrap_or(());
+            let result = (request.closure)(&mut client).await;
+            request.response_sender.send(result).unwrap_or(());
         }
 
         Ok(())
@@ -100,10 +100,10 @@ impl MidenClient {
     where
         Fn: for<'c> FnOnce(
             &'c mut miden_client::Client<FilesystemKeyStore>,
-        ) -> Box<dyn Future<Output = ()> + 'c>,
+        ) -> Box<dyn Future<Output = anyhow::Result<()>> + 'c>,
         Fn: Send + 'static,
     {
-        let (response_sender, response_receiver) = oneshot::channel::<()>();
+        let (response_sender, response_receiver) = oneshot::channel::<anyhow::Result<()>>();
 
         let request = Request {
             response_sender,
@@ -113,7 +113,9 @@ impl MidenClient {
             anyhow::bail!("MidenClient::with: failed to queue a request - receiver is closed");
         }
 
-        response_receiver.await?;
-        Ok(())
+        let Ok(result) = response_receiver.await else {
+            anyhow::bail!("MidenClient::with: failed to get a response - receiver is closed");
+        };
+        result
     }
 }
