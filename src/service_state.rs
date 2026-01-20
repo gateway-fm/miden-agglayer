@@ -1,4 +1,4 @@
-use miden_agglayer::miden_client::MidenClient;
+use miden_agglayer_service::MidenClient;
 use std::sync::Arc;
 
 #[derive(Clone)]

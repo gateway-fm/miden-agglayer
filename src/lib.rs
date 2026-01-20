@@ -1,4 +1,7 @@
+pub mod claim;
 pub mod logging;
-pub mod miden_client;
+mod miden_client;
 
 pub const COMPONENT: &str = "miden-agglayer";
+
+pub use miden_client::MidenClient;

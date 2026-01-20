@@ -1,7 +1,6 @@
 use crate::service_state::ServiceState;
 use clap::Parser;
-use miden_agglayer::miden_client::MidenClient;
-use miden_agglayer::*;
+use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
 use url::Url;

@@ -7,6 +7,8 @@ use alloy_core::sol_types::SolCall;
 use axum::Json;
 use axum::extract::State;
 use hex::FromHexError;
+use miden_agglayer_service::claim::claimAssetCall;
+use miden_agglayer_service::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -26,24 +28,6 @@ pub struct ClaimRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ClaimResponse {}
 
-alloy_core::sol! {
-    // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L556
-    #[derive(Debug)]
-    function claimAsset(
-        bytes32[32] calldata smtProofLocalExitRoot,
-        bytes32[32] calldata smtProofRollupExitRoot,
-        uint256 globalIndex,
-        bytes32 mainnetExitRoot,
-        bytes32 rollupExitRoot,
-        uint32 originNetwork,
-        address originTokenAddress,
-        uint32 destinationNetwork,
-        address destinationAddress,
-        uint256 amount,
-        bytes calldata metadata
-    );
-}
-
 pub async fn claim_endpoint_dry_run(
     State(service): State<ServiceState>,
     Json(request): Json<ClaimRequest>,
@@ -55,15 +39,14 @@ pub async fn claim_endpoint_dry_run(
         return Json(ClaimResponse {});
     };
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
-        let params = claimAssetCall::abi_decode(&params_encoded);
+        let params =
+            claimAssetCall::abi_decode(&params_encoded).expect("claimAssetCall::abi_decode failed");
         tracing::debug!("claimAsset call params: {:?}", params);
 
-        let future = service.miden_client.with(|client| {
-            Box::new(async {
-                client.sync_state().await.unwrap();
-            })
-        });
-        future.await.expect("miden client call failed");
+        let txn_id = claim::publish_claim(params, &service.miden_client)
+            .await
+            .expect("miden client call failed");
+        tracing::debug!("published claim txn_id: {txn_id}");
     } else {
         panic!("unhandled txn method {:?}", params_encoded);
     }
@@ -92,12 +75,8 @@ pub async fn claim_endpoint_raw_txn(
                 let params = claimAssetCall::abi_decode(params_encoded)?;
                 tracing::debug!("claimAsset call params: {:?}", params);
 
-                let future = service.miden_client.with(|client| {
-                    Box::new(async {
-                        client.sync_state().await.unwrap();
-                    })
-                });
-                future.await?;
+                let txn_id = claim::publish_claim(params, &service.miden_client).await?;
+                tracing::debug!("published claim txn_id: {txn_id}");
             } else {
                 panic!("unhandled txn method {:?}", params_encoded);
             }
