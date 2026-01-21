@@ -12,12 +12,11 @@ use std::thread;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+pub type MidenClientLib = miden_client::Client<FilesystemKeyStore>;
+
 type BoxFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
-type BoxFutureFactory = Box<
-    dyn for<'c> FnOnce(&'c mut miden_client::Client<FilesystemKeyStore>) -> BoxFuture<'c>
-        + Send
-        + 'static,
->;
+type BoxFutureFactory =
+    Box<dyn for<'c> FnOnce(&'c mut MidenClientLib) -> BoxFuture<'c> + Send + 'static>;
 
 struct Request {
     response_sender: oneshot::Sender<anyhow::Result<()>>,
@@ -99,7 +98,7 @@ impl MidenClient {
     pub async fn with<Fn>(&self, closure: Fn) -> anyhow::Result<()>
     where
         Fn: for<'c> FnOnce(
-            &'c mut miden_client::Client<FilesystemKeyStore>,
+            &'c mut MidenClientLib,
         ) -> Box<dyn Future<Output = anyhow::Result<()>> + 'c>,
         Fn: Send + 'static,
     {

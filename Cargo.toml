@@ -24,6 +24,7 @@ serde_json         = { version = "1.0" }
 thiserror          = { default-features = false, version = "2.0" }
 tokio              = { features = ["macros", "rt-multi-thread"], version = "1.48" }
 tokio-stream       = { version = "0.1" }
+toml               = { version = "0.9" }
 tower              = { version = "0.5" }
 tower-http         = { features = ["cors", "set-header"], version = "0.6" }
 tracing            = { version = "0.1" }

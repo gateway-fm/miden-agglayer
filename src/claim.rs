@@ -1,20 +1,14 @@
-use crate::miden_client::MidenClient;
+use crate::accounts_config::AccountsConfig;
+use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{Bytes, FixedBytes, U256};
-use miden_base_agglayer::{
-    ClaimNoteParams, create_agglayer_faucet_builder, create_bridge_account_builder,
-};
-use miden_client::Word;
-use miden_client::account::component::BasicWallet;
-use miden_client::auth::NoAuth;
-use miden_client::keystore::FilesystemKeyStore;
+use miden_base_agglayer::ClaimNoteParams;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::Felt;
-use miden_protocol::account::{Account, AccountComponent, AccountId};
+use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::crypto::utils::bytes_to_packed_u32_elements;
 use miden_protocol::note::{Note, NoteTag};
 use miden_protocol::transaction::{OutputNote, TransactionId};
-use rand::Rng;
 use std::cmp::min;
 use std::sync::{Arc, OnceLock};
 
@@ -91,53 +85,32 @@ impl From<claimAssetCall> for ClaimNoteInputs {
     }
 }
 
-// TODO: remove
-fn create_existing_agglayer_faucet(
-    seed: Word,
-    token_symbol: &str,
-    decimals: u8,
-    max_supply: Felt,
-    bridge_account_id: AccountId,
-) -> Account {
-    create_agglayer_faucet_builder(seed, token_symbol, decimals, max_supply, bridge_account_id)
-        .with_auth_component(AccountComponent::from(NoAuth))
-        .build()
-        .expect("Agglayer faucet account should be valid")
-}
-
-// TODO: remove
-fn create_existing_bridge_account(seed: Word) -> Account {
-    create_bridge_account_builder(seed)
-        .with_auth_component(AccountComponent::from(NoAuth))
-        .build()
-        .expect("Bridge account should be valid")
+// TODO: obtain a faucet from registry for a given origin_token_address
+fn find_target_faucet(
+    token_address: alloy::primitives::Address,
+    accounts: &AccountsConfig,
+) -> AccountId {
+    if token_address.to_string() == "0x0000000000000000000000000000000000000000" {
+        accounts.faucet_eth.0
+    } else {
+        accounts.faucet_agg.0
+    }
 }
 
 fn create_claim(
     params: claimAssetCall,
-    bridge_account_id: AccountId,
+    faucet: AccountId,
+    accounts: AccountsConfig,
     rng_mut: &mut impl FeltRng,
 ) -> anyhow::Result<Note> {
-    // TODO: obtain a faucet from registry for a given origin_token_address
-    let agglayer_faucet = create_existing_agglayer_faucet(
-        rng_mut.draw_word(),
-        "AGG",
-        8u8,
-        Felt::new(1000000),
-        bridge_account_id,
-    );
+    let claim_note_creator = accounts.service.0;
 
-    // TODO: setup a single global account for the service
-    let claim_note_creator = Account::builder(rng_mut.random())
-        .with_component(BasicWallet)
-        .with_auth_component(AccountComponent::from(NoAuth))
-        .build()?;
-
-    // TODO: remove when output_note_tag and destination_account_id are removed from ClaimNoteParams
-    let destination_account = Account::builder(rng_mut.random())
-        .with_component(BasicWallet)
-        .with_auth_component(AccountComponent::from(NoAuth))
-        .build()?;
+    let destination_account_id =
+        if params.destinationAddress.to_string() == "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" {
+            accounts.wallet_hardhat.0
+        } else {
+            accounts.wallet_satoshi.0
+        };
 
     let inputs = ClaimNoteInputs::from(params);
     let claim_params = ClaimNoteParams {
@@ -152,11 +125,11 @@ fn create_claim(
         destination_address: &inputs.destination_address,
         amount: inputs.amount_u256,
         metadata: inputs.metadata,
-        claim_note_creator_account_id: claim_note_creator.id(),
-        agglayer_faucet_account_id: agglayer_faucet.id(),
-        output_note_tag: NoteTag::with_account_target(destination_account.id()),
+        claim_note_creator_account_id: claim_note_creator,
+        agglayer_faucet_account_id: faucet,
+        output_note_tag: NoteTag::with_account_target(destination_account_id),
         p2id_serial_number: rng_mut.draw_word(),
-        destination_account_id: destination_account.id(),
+        destination_account_id,
         rng: rng_mut,
     };
 
@@ -166,32 +139,31 @@ fn create_claim(
 
 async fn publish_claim_internal(
     params: claimAssetCall,
-    client: &mut miden_client::Client<FilesystemKeyStore>,
+    client: &mut MidenClientLib,
+    accounts: AccountsConfig,
 ) -> anyhow::Result<TransactionId> {
-    // TODO: use a predefined bridge account
-    let bridge_account = create_existing_bridge_account(client.rng().draw_word());
-    tracing::debug!("publish_claim: bridge account id = {}", bridge_account.id());
-
-    let claim_note = create_claim(params, bridge_account.id(), client.rng())?;
+    let faucet = find_target_faucet(params.originTokenAddress, &accounts);
+    let claim_note = create_claim(params, faucet, accounts, client.rng())?;
 
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes([OutputNote::Full(claim_note); 1])
         .build()?;
 
-    let txn_id = client.submit_new_transaction(bridge_account.id(), txn_request).await?;
+    let txn_id = client.submit_new_transaction(faucet, txn_request).await?;
     Ok(txn_id)
 }
 
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
+    accounts: crate::AccountsConfig,
 ) -> anyhow::Result<TransactionId> {
     let result = Arc::new(OnceLock::<TransactionId>::new());
     let result_internal = result.clone();
 
     let future = client.with(|client| {
         Box::new(async move {
-            let txn_id = publish_claim_internal(params, client).await?;
+            let txn_id = publish_claim_internal(params, client, accounts.0).await?;
             result_internal.set(txn_id).unwrap();
             Ok(())
         })

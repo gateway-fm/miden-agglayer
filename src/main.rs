@@ -19,6 +19,10 @@ struct Command {
     /// Directory for miden-client data [default: $HOME/.miden]
     #[arg(short, long)]
     miden_store_dir: Option<PathBuf>,
+
+    /// Create a new accounts config inside --miden-store-dir
+    #[arg(long)]
+    init: bool,
 }
 
 #[tokio::main]
@@ -26,8 +30,20 @@ async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
 
-    let client = MidenClient::new(command.miden_store_dir)?;
-    let state = ServiceState::new(client);
+    let miden_store_dir = command.miden_store_dir;
+    let client = MidenClient::new(miden_store_dir.clone())?;
+
+    if command.init || !config_path_exists(miden_store_dir.clone())? {
+        let config_path = init::init(&client, miden_store_dir.clone()).await?;
+        tracing::info!("new config created at {config_path:?}");
+    }
+    if command.init {
+        client.join()?;
+        return Ok(());
+    }
+
+    let accounts = load_config(miden_store_dir)?;
+    let state = ServiceState::new(client, accounts);
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;
