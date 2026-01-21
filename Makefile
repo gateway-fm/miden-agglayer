@@ -6,82 +6,99 @@ help: ## Show description of all commands
 
 # --- Linting -------------------------------------------------------------------------------------
 
-.PHONY: clippy
-clippy: ## Run Clippy with configs. We need two separate commands because the `testing-remote-prover` cannot be built along with the rest of the workspace. This is because they use different versions of the `miden-tx` crate which aren't compatible with each other.
-	cargo clippy --workspace --all-targets -- -D warnings
+.PHONY: clippy-fix
+clippy-fix: ## cargo clippy: fix problems if possible
+	cargo clippy --workspace --release --all-targets --quiet --fix --allow-dirty -- -D warnings
 
-.PHONY: fix
-fix: ## Run Fix with configs, building tests with proper features to avoid type split.
-	cargo fix --workspace --all-targets --allow-staged --allow-dirty
+.PHONY: clippy
+clippy: ## cargo clippy
+	cargo clippy --workspace --release --all-targets --quiet -- -D warnings
 
 .PHONY: format
-format: ## Run format using nightly toolchain
+format: ## Format Rust files
 	cargo fmt --all
 
 .PHONY: format-check
-format-check: ## Run format using nightly toolchain but only in check mode
+format-check: ## Check Rust files formatting
 	cargo fmt --all --check
 
 .PHONY: toml
-toml: ## Runs Format for all TOML files
-	taplo fmt
+toml: ## Format TOML files
+	RUST_LOG=warn taplo fmt
 
 .PHONY: toml-check
-toml-check: ## Runs Format for all TOML files but only in check mode
-	taplo fmt --check --verbose
+toml-check: ## Check TOML files formatting
+	RUST_LOG=warn taplo fmt --check
+
+.PHONY: typos-fix
+typos-fix: ## Fix spelling mistakes
+	typos --config ./.typos.toml --write-changes
 
 .PHONY: typos-check
-typos-check: ## Run typos to check for spelling mistakes
-	@typos --config ./.typos.toml
+typos-check: ## Check spelling mistakes
+	typos --config ./.typos.toml
+
+.PHONY: fmt
+fmt: format toml ## Format Rust and TOML files
+
+.PHONY: lint-fix
+lint-fix: format toml typos-fix clippy-fix ## Perform linting and fix problems if possible
 
 .PHONY: lint
-lint: format fix toml clippy typos-check ## Run all linting tasks at once (clippy, fixing, formatting, typos)
+lint: format-check toml-check typos-check clippy ## Perform linting
 
 # --- Documentation -------------------------------------------------------------------------------
 
 .PHONY: doc
-doc: ## Generate & check rust documentation. Ensure you have the nightly toolchain installed.
+doc: ## Generate Rust docs
 	RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo doc --lib --no-deps --all-features --keep-going --release
 
 .PHONY: doc-open
-doc-open: ## Generate & open rust documentation in browser. Ensure you have the nightly toolchain installed.
+doc-open: ## Generate Rust docs and open a browser
 	RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo doc --lib --no-deps --all-features --keep-going --release --open
 
 # --- Testing -------------------------------------------------------------------------------------
 
 .PHONY: test
 test: ## Run tests
-	cargo nextest run --workspace --release --lib
+	cargo nextest run --workspace --release --lib --no-tests pass
 
 .PHONY: test-docs
 test-docs: ## Run documentation tests
-	cargo test --doc
+	cargo test --doc --release
 
 # --- Integration testing -------------------------------------------------------------------------
 
 .PHONY: start-node
-start-node: ## Start the testing node server
+start-node: ## Start the test node
 	RUST_LOG=info cargo run --release --bin test_node --locked
 
 .PHONY: stop-node
-stop-node: ## Stop the testing node server
+stop-node: ## Stop the test node
 	-pkill -f "test_node"
 	sleep 1
+
+.PHONY: node
+node: start-node ## Start the test node
 
 # --- Building ------------------------------------------------------------------------------------
 
 .PHONY: build
-build: ## Build the CLI binary, client library and tests binary in release mode
-	CODEGEN=1 cargo build --workspace --release
+build: ## Build all the binaries
+	cargo build --workspace --release
 
 .PHONY: check
-check: ## Build the CLI binary and client library in release mode
+check: ## cargo check: compile without producing binaries
 	cargo check --workspace --release
+
+.PHONY: fix
+fix: ## cargo fix: cargo check and fix warnings if possible
+	cargo fix --workspace --release --all-targets --allow-staged --allow-dirty
 
 ## --- Setup --------------------------------------------------------------------------------------
 
 .PHONY: check-tools
-check-tools: ## Checks if development tools are installed
+check-tools: ## Check if development tools are installed
 	@echo "Checking development tools..."
 	@command -v mdbook        >/dev/null 2>&1 && echo "[OK] mdbook is installed"        || echo "[MISSING] mdbook       (make install-tools)"
 	@command -v typos         >/dev/null 2>&1 && echo "[OK] typos is installed"         || echo "[MISSING] typos        (make install-tools)"
@@ -89,7 +106,7 @@ check-tools: ## Checks if development tools are installed
 	@command -v taplo         >/dev/null 2>&1 && echo "[OK] taplo is installed"         || echo "[MISSING] taplo        (make install-tools)"
 
 .PHONY: install-tools
-install-tools: ## Installs Rust + Node tools required by the Makefile
+install-tools: ## Install development tools
 	@echo "Installing development tools..."
 	@rustup show active-toolchain >/dev/null 2>&1 || (echo "Rust toolchain not detected. Install rustup + toolchain first." && exit 1)
 	@RUST_TC=$$(rustup show active-toolchain | awk '{print $$1}'); \
