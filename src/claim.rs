@@ -101,7 +101,7 @@ fn create_existing_agglayer_faucet(
 ) -> Account {
     create_agglayer_faucet_builder(seed, token_symbol, decimals, max_supply, bridge_account_id)
         .with_auth_component(AccountComponent::from(NoAuth))
-        .build_existing()
+        .build()
         .expect("Agglayer faucet account should be valid")
 }
 
@@ -109,7 +109,7 @@ fn create_existing_agglayer_faucet(
 fn create_existing_bridge_account(seed: Word) -> Account {
     create_bridge_account_builder(seed)
         .with_auth_component(AccountComponent::from(NoAuth))
-        .build_existing()
+        .build()
         .expect("Bridge account should be valid")
 }
 
@@ -154,7 +154,7 @@ fn create_claim(
         metadata: inputs.metadata,
         claim_note_creator_account_id: claim_note_creator.id(),
         agglayer_faucet_account_id: agglayer_faucet.id(),
-        output_note_tag: NoteTag::from_account_id(destination_account.id()),
+        output_note_tag: NoteTag::with_account_target(destination_account.id()),
         p2id_serial_number: rng_mut.draw_word(),
         destination_account_id: destination_account.id(),
         rng: rng_mut,

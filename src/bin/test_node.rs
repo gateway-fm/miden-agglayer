@@ -1,3 +1,4 @@
+/*
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{env, fs, process};
@@ -31,5 +32,14 @@ async fn main() -> anyhow::Result<()> {
     handle.stop().await?;
     println!("Node stopped successfully");
 
+    Ok(())
+}
+*/
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // TODO: fix node-builder on miden-client after updating it to 0.13.2
+    // cargo update -p miden-node-block-producer -p miden-testing
+    // cargo build -p node-builder
     Ok(())
 }
