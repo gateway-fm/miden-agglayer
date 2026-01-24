@@ -71,11 +71,13 @@ test-docs: ## Run documentation tests
 
 .PHONY: start-node
 start-node: ## Start the test node
-	RUST_LOG=info cargo run --release --bin test_node --locked
+	# RUST_LOG=info cargo run --release --bin test_node --locked
+	../miden-node/target/release/miden-node bundled start --rpc.url "http://0.0.0.0:57291" --data-directory "${HOME}/.miden/node-data"
 
 .PHONY: stop-node
 stop-node: ## Stop the test node
-	-pkill -f "test_node"
+	# -pkill -f "test_node"
+	-pkill -f "miden-node"
 	sleep 1
 
 .PHONY: node
