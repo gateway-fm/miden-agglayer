@@ -24,6 +24,7 @@ struct Request {
 }
 
 pub struct MidenClient {
+    keystore: Arc<FilesystemKeyStore>,
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
     sender: mpsc::Sender<Request>,
 }
@@ -34,13 +35,18 @@ const _: () = assert_sync::<MidenClient>();
 impl MidenClient {
     pub fn new(store_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
+        let keystore = Self::create_keystore(store_dir.clone())?;
+        let keystore_for_run = keystore.clone();
 
         let (sender, receiver) = mpsc::channel::<Request>(1);
 
         let runtime = tokio::runtime::Runtime::new()?;
         let task = thread::spawn(move || -> anyhow::Result<()> {
-            let result = runtime
-                .block_on(tokio::task::LocalSet::new().run_until(Self::run(store_dir, receiver)));
+            let result = runtime.block_on(tokio::task::LocalSet::new().run_until(Self::run(
+                store_dir,
+                keystore_for_run,
+                receiver,
+            )));
             if let Err(err) = &result {
                 tracing::error!("MidenClient::run stopped: {err}");
             }
@@ -48,13 +54,23 @@ impl MidenClient {
         });
 
         let task = std::sync::Mutex::new(Some(task));
-        Ok(Self { task, sender })
+        Ok(Self { keystore, task, sender })
     }
 
     fn default_store_dir() -> PathBuf {
         let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
         let base_dir = env::home_dir().unwrap_or(current_dir);
         base_dir.join(".miden")
+    }
+
+    fn create_keystore(store_dir: PathBuf) -> anyhow::Result<Arc<FilesystemKeyStore>> {
+        let keystore_path = store_dir.join("keystore");
+        let keystore = FilesystemKeyStore::new(keystore_path)?;
+        Ok(Arc::new(keystore))
+    }
+
+    pub fn get_keystore(&self) -> Arc<FilesystemKeyStore> {
+        self.keystore.clone()
     }
 
     pub fn join(&self) -> anyhow::Result<()> {
@@ -67,19 +83,19 @@ impl MidenClient {
         }
     }
 
-    async fn run(store_dir: PathBuf, mut receiver: mpsc::Receiver<Request>) -> anyhow::Result<()> {
+    async fn run(
+        store_dir: PathBuf,
+        keystore: Arc<FilesystemKeyStore>,
+        mut receiver: mpsc::Receiver<Request>,
+    ) -> anyhow::Result<()> {
         // node client
         let node_endpoint = Endpoint::localhost();
         let node_timeout_ms: u64 = 10_000;
 
-        // keystore
-        let keystore_path = store_dir.join("keystore");
-        let keystore = FilesystemKeyStore::new(keystore_path)?;
-
         let mut client = ClientBuilder::new()
             .grpc_client(&node_endpoint, Some(node_timeout_ms))
             .sqlite_store(store_dir.join("store.sqlite3"))
-            .authenticator(Arc::new(keystore))
+            .authenticator(keystore)
             .in_debug_mode(DebugMode::Enabled)
             .build()
             .await?;

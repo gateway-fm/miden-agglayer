@@ -4,9 +4,11 @@ use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
 use miden_base_agglayer::{create_agglayer_faucet_builder, create_bridge_account_builder};
 use miden_client::Felt;
-use miden_client::auth::NoAuth;
 use miden_client::crypto::FeltRng;
-use miden_protocol::account::{Account, AccountComponent, AccountId};
+use miden_client::keystore::FilesystemKeyStore;
+use miden_protocol::account::auth::AuthSecretKey;
+use miden_protocol::account::{Account, AccountId};
+use miden_standards::account::auth::AuthFalcon512Rpo;
 use miden_standards::account::wallets::BasicWallet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -35,9 +37,18 @@ impl From<Accounts> for AccountsConfig {
     }
 }
 
-async fn add_bridge(client: &mut MidenClientLib) -> anyhow::Result<Account> {
+fn add_auth_key(keystore: Arc<FilesystemKeyStore>) -> anyhow::Result<AuthFalcon512Rpo> {
+    let key_pair = AuthSecretKey::new_falcon512_rpo();
+    keystore.add_key(&key_pair)?;
+    Ok(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+}
+
+async fn add_bridge(
+    client: &mut MidenClientLib,
+    keystore: Arc<FilesystemKeyStore>,
+) -> anyhow::Result<Account> {
     let account = create_bridge_account_builder(client.rng().draw_word())
-        .with_auth_component(AccountComponent::from(NoAuth))
+        .with_auth_component(add_auth_key(keystore)?)
         .build()?;
     client.add_account(&account, false).await?;
     Ok(account)
@@ -45,6 +56,7 @@ async fn add_bridge(client: &mut MidenClientLib) -> anyhow::Result<Account> {
 
 async fn add_faucet(
     client: &mut MidenClientLib,
+    keystore: Arc<FilesystemKeyStore>,
     token_symbol: &str,
     decimals: u8,
     bridge_account_id: AccountId,
@@ -57,28 +69,34 @@ async fn add_faucet(
         max_supply,
         bridge_account_id,
     );
-    let account = builder.with_auth_component(AccountComponent::from(NoAuth)).build()?;
+    let account = builder.with_auth_component(add_auth_key(keystore)?).build()?;
     client.add_account(&account, false).await?;
     Ok(account)
 }
 
-async fn add_wallet(client: &mut MidenClientLib) -> anyhow::Result<Account> {
+async fn add_wallet(
+    client: &mut MidenClientLib,
+    keystore: Arc<FilesystemKeyStore>,
+) -> anyhow::Result<Account> {
     let account = Account::builder(client.rng().draw_word().into())
         .with_component(BasicWallet)
-        .with_auth_component(AccountComponent::from(NoAuth))
+        .with_auth_component(add_auth_key(keystore)?)
         .build()?;
     client.add_account(&account, false).await?;
     Ok(account)
 }
 
-async fn add_accounts(client: &mut MidenClientLib) -> anyhow::Result<Accounts> {
-    let service = add_wallet(client).await?;
-    let bridge = add_bridge(client).await?;
+async fn add_accounts(
+    client: &mut MidenClientLib,
+    keystore: Arc<FilesystemKeyStore>,
+) -> anyhow::Result<Accounts> {
+    let service = add_wallet(client, keystore.clone()).await?;
+    let bridge = add_bridge(client, keystore.clone()).await?;
     // TODO: fix decimals
-    let faucet_eth = add_faucet(client, "ETH", 8u8, bridge.id()).await?;
-    let faucet_agg = add_faucet(client, "AGG", 8u8, bridge.id()).await?;
-    let wallet_hardhat = add_wallet(client).await?;
-    let wallet_satoshi = add_wallet(client).await?;
+    let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 8u8, bridge.id()).await?;
+    let faucet_agg = add_faucet(client, keystore.clone(), "AGG", 8u8, bridge.id()).await?;
+    let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
+    let wallet_satoshi = add_wallet(client, keystore.clone()).await?;
     Ok(Accounts {
         service,
         bridge,
@@ -91,10 +109,11 @@ async fn add_accounts(client: &mut MidenClientLib) -> anyhow::Result<Accounts> {
 
 async fn init_internal(
     client: &mut MidenClientLib,
+    keystore: Arc<FilesystemKeyStore>,
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
-    let accounts = add_accounts(client).await?;
+    let accounts = add_accounts(client, keystore).await?;
     let config = AccountsConfig::from(accounts);
     let config_path = accounts_config::save_config(config, miden_store_dir)?;
     Ok(config_path)
@@ -106,10 +125,11 @@ pub async fn init(
 ) -> anyhow::Result<PathBuf> {
     let result = Arc::new(OnceLock::<PathBuf>::new());
     let result_internal = result.clone();
+    let keystore = client.get_keystore();
 
     let future = client.with(|client| {
         Box::new(async move {
-            let result = init_internal(client, miden_store_dir).await?;
+            let result = init_internal(client, keystore, miden_store_dir).await?;
             result_internal.set(result).unwrap();
             Ok(())
         })
