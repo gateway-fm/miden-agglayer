@@ -2,7 +2,7 @@ use crate::accounts_config;
 use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
-use miden_base_agglayer::{create_agglayer_faucet_builder, create_bridge_account_builder};
+use miden_base_agglayer::{create_agglayer_faucet, create_bridge_account_builder};
 use miden_client::Felt;
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::FilesystemKeyStore;
@@ -56,20 +56,18 @@ async fn add_bridge(
 
 async fn add_faucet(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
     token_symbol: &str,
     decimals: u8,
     bridge_account_id: AccountId,
 ) -> anyhow::Result<Account> {
     let max_supply = Felt::new(1000000);
-    let builder = create_agglayer_faucet_builder(
+    let account = create_agglayer_faucet(
         client.rng().draw_word(),
         token_symbol,
         decimals,
         max_supply,
         bridge_account_id,
     );
-    let account = builder.with_auth_component(add_auth_key(keystore)?).build()?;
     client.add_account(&account, false).await?;
     Ok(account)
 }
@@ -93,8 +91,8 @@ async fn add_accounts(
     let service = add_wallet(client, keystore.clone()).await?;
     let bridge = add_bridge(client, keystore.clone()).await?;
     // TODO: fix decimals
-    let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 8u8, bridge.id()).await?;
-    let faucet_agg = add_faucet(client, keystore.clone(), "AGG", 8u8, bridge.id()).await?;
+    let faucet_eth = add_faucet(client, "ETH", 8u8, bridge.id()).await?;
+    let faucet_agg = add_faucet(client, "AGG", 8u8, bridge.id()).await?;
     let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
     let wallet_satoshi = add_wallet(client, keystore.clone()).await?;
     Ok(Accounts {
