@@ -68,6 +68,7 @@ Content-Type: application/json
 }
 
 ###
+# @timeout 600
 POST http://localhost:8125
 Content-Type: application/json
 

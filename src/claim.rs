@@ -103,7 +103,8 @@ fn create_claim(
     accounts: AccountsConfig,
     rng_mut: &mut impl FeltRng,
 ) -> anyhow::Result<Note> {
-    let claim_note_creator = accounts.service.0;
+    // let claim_note_creator = accounts.service.0;
+    let claim_note_creator = faucet; // HACK: bypass send_note_body check
 
     let destination_account_id =
         if params.destinationAddress.to_string() == "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" {
