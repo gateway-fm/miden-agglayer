@@ -11,6 +11,8 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE: release
     steps:
       - uses: actions/checkout@main
       - uses: Swatinem/rust-cache@v2

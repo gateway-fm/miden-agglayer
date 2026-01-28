@@ -1,5 +1,8 @@
 .DEFAULT_GOAL := help
 
+CARGO_PROFILE ?= dev
+CARGO_RELEASE_ARG := $(if $(filter release,$(CARGO_PROFILE)),--release,)
+
 .PHONY: help
 help: ## Show description of all commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -8,11 +11,11 @@ help: ## Show description of all commands
 
 .PHONY: clippy-fix
 clippy-fix: ## cargo clippy: fix problems if possible
-	cargo clippy --workspace --release --all-targets --quiet --fix --allow-dirty -- -D warnings
+	cargo clippy --workspace --profile=$(CARGO_PROFILE) --all-targets --quiet --fix --allow-dirty -- -D warnings
 
 .PHONY: clippy
 clippy: ## cargo clippy
-	cargo clippy --workspace --release --all-targets --quiet -- -D warnings
+	cargo clippy --workspace --profile=$(CARGO_PROFILE) --all-targets --quiet -- -D warnings
 
 .PHONY: format
 format: ## Format Rust files
@@ -51,21 +54,21 @@ lint: format-check toml-check typos-check clippy ## Perform linting
 
 .PHONY: doc
 doc: ## Generate Rust docs
-	RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo doc --lib --no-deps --all-features --keep-going --release
+	RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo doc --lib --no-deps --all-features --keep-going --profile=$(CARGO_PROFILE)
 
 .PHONY: doc-open
 doc-open: ## Generate Rust docs and open a browser
-	RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo doc --lib --no-deps --all-features --keep-going --release --open
+	RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo doc --lib --no-deps --all-features --keep-going --profile=$(CARGO_PROFILE) --open
 
 # --- Testing -------------------------------------------------------------------------------------
 
 .PHONY: test
 test: ## Run tests
-	cargo nextest run --workspace --release --lib --no-tests pass
+	cargo nextest run --workspace $(CARGO_RELEASE_ARG) --lib --no-tests pass
 
 .PHONY: test-docs
 test-docs: ## Run documentation tests
-	cargo test --doc --release
+	cargo test --doc --profile=$(CARGO_PROFILE)
 
 # --- Integration testing -------------------------------------------------------------------------
 
@@ -79,7 +82,7 @@ node-init: ## Bootstrap the test node
 
 .PHONY: start-node
 start-node: ## Start the test node
-	@# RUST_LOG=info cargo run --release --bin test_node --locked
+	@# RUST_LOG=info cargo run --profile=$(CARGO_PROFILE) --bin test_node --locked
 	if [[ ! -d "$(NODE_DATA_DIR)" ]]; then $(MAKE) node-init; fi
 	../miden-node/target/release/miden-node bundled start --rpc.url "http://0.0.0.0:57291" --data-directory "$(NODE_DATA_DIR)"
 
@@ -96,15 +99,15 @@ node: start-node ## Start the test node
 
 .PHONY: build
 build: ## Build all the binaries
-	cargo build --workspace --release
+	cargo build --workspace --profile=$(CARGO_PROFILE)
 
 .PHONY: check
 check: ## cargo check: compile without producing binaries
-	cargo check --workspace --release
+	cargo check --workspace --profile=$(CARGO_PROFILE)
 
 .PHONY: fix
 fix: ## cargo fix: cargo check and fix warnings if possible
-	cargo fix --workspace --release --all-targets --allow-staged --allow-dirty
+	cargo fix --workspace --profile=$(CARGO_PROFILE) --all-targets --allow-staged --allow-dirty
 
 ## --- Setup --------------------------------------------------------------------------------------
 
