@@ -51,7 +51,7 @@ impl MidenClient {
                 receiver,
             )));
             if let Err(err) = &result {
-                tracing::error!("MidenClient::run stopped: {err}");
+                tracing::error!("MidenClient::run stopped: {err:#?}");
             }
             result
         });

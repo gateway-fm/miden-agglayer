@@ -48,22 +48,22 @@ pub async fn claim_endpoint_dry_run_result(
     State(service): State<ServiceState>,
     Json(request): Json<ClaimRequest>,
 ) -> anyhow::Result<()> {
-    tracing::debug!("chain_id: {:?}", request.chain_id);
-    tracing::debug!("to: {:?}", request.to);
+    tracing::debug!("chain_id: {}", request.chain_id);
+    tracing::debug!("to: {}", request.to);
 
     let params_encoded = hex_decode_prefixed(&request.input)?;
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
         let params = claimAssetCall::abi_decode(&params_encoded)?;
-        tracing::debug!("claimAsset call params: {:?}", params);
+        tracing::debug!("claimAsset call params: {params:?}");
 
         let result = claim::publish_claim(params, &service.miden_client, service.accounts).await;
         if let Err(err) = &result {
-            tracing::error!("publish_claim failed: {err:?}");
+            tracing::error!("publish_claim failed: {err:#?}");
         }
         let txn_id = result?;
         tracing::debug!("published claim txn_id: {txn_id}");
     } else {
-        anyhow::bail!("unhandled txn method {:?}", params_encoded);
+        anyhow::bail!("unhandled txn method {params_encoded:?}");
     }
 
     Ok(())
@@ -81,24 +81,24 @@ pub async fn claim_endpoint_raw_txn(
         TxEnvelope::Eip1559(txn_signed) => {
             let txn = txn_signed.tx();
             let txn_hash = *txn_signed.hash();
-            tracing::debug!("hash: {:?}", txn_hash);
-            tracing::debug!("chain_id: {:?}", txn.chain_id);
+            tracing::debug!("hash: {txn_hash}");
+            tracing::debug!("chain_id: {}", txn.chain_id);
             tracing::debug!("to: {:?}", txn.to);
 
             let params_encoded = &txn.input;
             if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
                 let params = claimAssetCall::abi_decode(params_encoded)?;
-                tracing::debug!("claimAsset call params: {:?}", params);
+                tracing::debug!("claimAsset call params: {params:?}");
 
                 let result =
                     claim::publish_claim(params, &service.miden_client, service.accounts).await;
                 if let Err(err) = &result {
-                    tracing::error!("publish_claim failed: {err:?}");
+                    tracing::error!("publish_claim failed: {err:#?}");
                 }
                 let txn_id = result?;
                 tracing::debug!("published claim txn_id: {txn_id}");
             } else {
-                panic!("unhandled txn method {:?}", params_encoded);
+                panic!("unhandled txn method {params_encoded:?}");
             }
 
             Ok(txn_hash)
