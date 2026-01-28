@@ -1,9 +1,8 @@
+use miden_client::rpc::Endpoint;
 use miden_protocol::account::AccountId;
-use miden_protocol::address::{CustomNetworkId, NetworkId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::{env, fs};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,8 +20,8 @@ pub struct AccountIdBech32(pub AccountId);
 
 impl Display for AccountIdBech32 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let net_id = CustomNetworkId::from_str("local").unwrap();
-        let str = self.0.to_bech32(NetworkId::Custom(Box::new(net_id)));
+        let net_id = Endpoint::localhost().to_network_id();
+        let str = self.0.to_bech32(net_id);
         write!(f, "{str}")
     }
 }
