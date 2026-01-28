@@ -69,14 +69,23 @@ test-docs: ## Run documentation tests
 
 # --- Integration testing -------------------------------------------------------------------------
 
+NODE_DATA_DIR = ${HOME}/.miden/node-data
+
+.PHONY: node-init
+node-init: ## Bootstrap the test node
+	rm -rf "$(NODE_DATA_DIR)"
+	mkdir -p "$(NODE_DATA_DIR)"
+	RUST_LOG=warn ../miden-node/target/release/miden-node bundled bootstrap --data-directory "$(NODE_DATA_DIR)" --accounts-directory "$(NODE_DATA_DIR)" --genesis-config-file ../miden-node/crates/store/src/genesis/config/samples/01-simple.toml
+
 .PHONY: start-node
 start-node: ## Start the test node
-	# RUST_LOG=info cargo run --release --bin test_node --locked
-	../miden-node/target/release/miden-node bundled start --rpc.url "http://0.0.0.0:57291" --data-directory "${HOME}/.miden/node-data"
+	@# RUST_LOG=info cargo run --release --bin test_node --locked
+	if [[ ! -d "$(NODE_DATA_DIR)" ]]; then $(MAKE) node-init; fi
+	../miden-node/target/release/miden-node bundled start --rpc.url "http://0.0.0.0:57291" --data-directory "$(NODE_DATA_DIR)"
 
 .PHONY: stop-node
 stop-node: ## Stop the test node
-	# -pkill -f "test_node"
+	@# -pkill -f "test_node"
 	-pkill -f "miden-node"
 	sleep 1
 
