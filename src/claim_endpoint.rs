@@ -43,9 +43,11 @@ pub async fn claim_endpoint_dry_run(
             claimAssetCall::abi_decode(&params_encoded).expect("claimAssetCall::abi_decode failed");
         tracing::debug!("claimAsset call params: {:?}", params);
 
-        let txn_id = claim::publish_claim(params, &service.miden_client, service.accounts)
-            .await
-            .expect("miden client call failed");
+        let result = claim::publish_claim(params, &service.miden_client, service.accounts).await;
+        if let Err(err) = &result {
+            tracing::error!("publish_claim failed: {err:?}");
+        }
+        let txn_id = result.expect("miden client call failed");
         tracing::debug!("published claim txn_id: {txn_id}");
     } else {
         panic!("unhandled txn method {:?}", params_encoded);
@@ -75,8 +77,12 @@ pub async fn claim_endpoint_raw_txn(
                 let params = claimAssetCall::abi_decode(params_encoded)?;
                 tracing::debug!("claimAsset call params: {:?}", params);
 
-                let txn_id =
-                    claim::publish_claim(params, &service.miden_client, service.accounts).await?;
+                let result =
+                    claim::publish_claim(params, &service.miden_client, service.accounts).await;
+                if let Err(err) = &result {
+                    tracing::error!("publish_claim failed: {err:?}");
+                }
+                let txn_id = result?;
                 tracing::debug!("published claim txn_id: {txn_id}");
             } else {
                 panic!("unhandled txn method {:?}", params_encoded);
