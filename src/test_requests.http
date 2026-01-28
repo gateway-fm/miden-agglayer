@@ -95,6 +95,7 @@ Content-Type: application/json
 }
 
 ###
+# @timeout 600
 POST http://localhost:8125/claim
 Content-Type: application/json
 

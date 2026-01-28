@@ -7,6 +7,7 @@ use alloy_core::sol_types::SolCall;
 use axum::Json;
 use axum::extract::State;
 use hex::FromHexError;
+use http::StatusCode;
 use miden_agglayer_service::claim::claimAssetCall;
 use miden_agglayer_service::*;
 use serde::{Deserialize, Serialize};
@@ -26,34 +27,46 @@ pub struct ClaimRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ClaimResponse {}
+pub struct ClaimResponse {
+    error: Option<String>,
+}
 
 pub async fn claim_endpoint_dry_run(
+    state: State<ServiceState>,
+    request: Json<ClaimRequest>,
+) -> (StatusCode, Json<ClaimResponse>) {
+    match claim_endpoint_dry_run_result(state, request).await {
+        Ok(_) => (StatusCode::OK, Json(ClaimResponse { error: None })),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ClaimResponse { error: Some(err.to_string()) }),
+        ),
+    }
+}
+
+pub async fn claim_endpoint_dry_run_result(
     State(service): State<ServiceState>,
     Json(request): Json<ClaimRequest>,
-) -> Json<ClaimResponse> {
+) -> anyhow::Result<()> {
     tracing::debug!("chain_id: {:?}", request.chain_id);
     tracing::debug!("to: {:?}", request.to);
 
-    let Ok(params_encoded) = hex_decode_prefixed(&request.input) else {
-        return Json(ClaimResponse {});
-    };
+    let params_encoded = hex_decode_prefixed(&request.input)?;
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
-        let params =
-            claimAssetCall::abi_decode(&params_encoded).expect("claimAssetCall::abi_decode failed");
+        let params = claimAssetCall::abi_decode(&params_encoded)?;
         tracing::debug!("claimAsset call params: {:?}", params);
 
         let result = claim::publish_claim(params, &service.miden_client, service.accounts).await;
         if let Err(err) = &result {
             tracing::error!("publish_claim failed: {err:?}");
         }
-        let txn_id = result.expect("miden client call failed");
+        let txn_id = result?;
         tracing::debug!("published claim txn_id: {txn_id}");
     } else {
-        panic!("unhandled txn method {:?}", params_encoded);
+        anyhow::bail!("unhandled txn method {:?}", params_encoded);
     }
 
-    Json(ClaimResponse {})
+    Ok(())
 }
 
 pub async fn claim_endpoint_raw_txn(
