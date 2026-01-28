@@ -104,8 +104,7 @@ async fn add_accounts(
 ) -> anyhow::Result<Accounts> {
     let service = add_wallet(client, keystore.clone()).await?;
     let bridge = add_bridge(client, keystore.clone()).await?;
-    // TODO: fix decimals
-    let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 8u8, bridge.id()).await?;
+    let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 18u8, bridge.id()).await?;
     let faucet_agg = add_faucet(client, keystore.clone(), "AGG", 8u8, bridge.id()).await?;
     let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
     let wallet_satoshi = add_wallet(client, keystore.clone()).await?;
