@@ -6,6 +6,7 @@ use miden_base_agglayer::{create_agglayer_faucet_builder, create_bridge_account_
 use miden_client::Felt;
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::FilesystemKeyStore;
+use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::account::{Account, AccountId};
 use miden_standards::account::auth::AuthFalcon512Rpo;
@@ -43,6 +44,14 @@ fn add_auth_key(keystore: Arc<FilesystemKeyStore>) -> anyhow::Result<AuthFalcon5
     Ok(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
 }
 
+async fn deploy_account(client: &mut MidenClientLib, account_id: AccountId) -> anyhow::Result<()> {
+    tracing::info!("deploying faucet account {} ...", AccountIdBech32(account_id));
+    let dummy_txn = TransactionRequestBuilder::new().build()?;
+    let txn_id = client.submit_new_transaction(account_id, dummy_txn).await?;
+    tracing::info!("deployed faucet account with txn_id {txn_id}");
+    Ok(())
+}
+
 async fn add_bridge(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
@@ -71,6 +80,9 @@ async fn add_faucet(
     );
     let account = builder.with_auth_component(add_auth_key(keystore)?).build()?;
     client.add_account(&account, false).await?;
+
+    deploy_account(client, account.id()).await?;
+
     Ok(account)
 }
 

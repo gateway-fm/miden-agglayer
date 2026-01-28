@@ -1,6 +1,7 @@
 use miden_protocol::account::AccountId;
 use miden_protocol::address::{CustomNetworkId, NetworkId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::{env, fs};
@@ -18,13 +19,20 @@ pub struct AccountsConfig {
 #[derive(Debug, Clone)]
 pub struct AccountIdBech32(pub AccountId);
 
+impl Display for AccountIdBech32 {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let net_id = CustomNetworkId::from_str("local").unwrap();
+        let str = self.0.to_bech32(NetworkId::Custom(Box::new(net_id)));
+        write!(f, "{str}")
+    }
+}
+
 impl Serialize for AccountIdBech32 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let net_id = CustomNetworkId::from_str("local").unwrap();
-        let str = self.0.to_bech32(NetworkId::Custom(Box::new(net_id)));
+        let str = self.to_string();
         serializer.serialize_str(&str)
     }
 }
