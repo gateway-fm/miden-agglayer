@@ -103,8 +103,7 @@ fn create_claim(
     accounts: AccountsConfig,
     rng_mut: &mut impl FeltRng,
 ) -> anyhow::Result<Note> {
-    // let claim_note_creator = accounts.service.0;
-    let claim_note_creator = faucet; // HACK: bypass send_note_body check
+    let claim_note_creator = accounts.service.0;
 
     let destination_account_id =
         if params.destinationAddress.to_string() == "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" {
@@ -143,6 +142,7 @@ async fn publish_claim_internal(
     client: &mut MidenClientLib,
     accounts: AccountsConfig,
 ) -> anyhow::Result<TransactionId> {
+    let service_account = accounts.service.0;
     let faucet = find_target_faucet(params.originTokenAddress, &accounts);
     let claim_note = create_claim(params, faucet, accounts, client.rng())?;
 
@@ -150,7 +150,7 @@ async fn publish_claim_internal(
         .own_output_notes([OutputNote::Full(claim_note); 1])
         .build()?;
 
-    let txn_id = client.submit_new_transaction(faucet, txn_request).await?;
+    let txn_id = client.submit_new_transaction(service_account, txn_request).await?;
     Ok(txn_id)
 }
 

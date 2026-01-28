@@ -69,10 +69,7 @@ async fn add_faucet(
         max_supply,
         bridge_account_id,
     );
-    let account = builder
-        .with_component(BasicWallet) // HACK: bypass build_create_notes_section checks
-        .with_auth_component(add_auth_key(keystore)?)
-        .build()?;
+    let account = builder.with_auth_component(add_auth_key(keystore)?).build()?;
     client.add_account(&account, false).await?;
     Ok(account)
 }
