@@ -8,7 +8,7 @@ use miden_client::crypto::FeltRng;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::AuthSecretKey;
-use miden_protocol::account::{Account, AccountId};
+use miden_protocol::account::{Account, AccountId, AccountStorageMode};
 use miden_standards::account::auth::AuthFalcon512Rpo;
 use miden_standards::account::wallets::BasicWallet;
 use std::path::PathBuf;
@@ -60,6 +60,9 @@ async fn add_bridge(
         .with_auth_component(add_auth_key(keystore)?)
         .build()?;
     client.add_account(&account, false).await?;
+
+    deploy_account(client, account.id()).await?;
+
     Ok(account)
 }
 
@@ -78,7 +81,9 @@ async fn add_faucet(
         max_supply,
         bridge_account_id,
     );
-    let account = builder.with_auth_component(add_auth_key(keystore)?).build()?;
+    let builder = builder.with_auth_component(add_auth_key(keystore)?);
+    let builder = builder.storage_mode(AccountStorageMode::Public).with_component(BasicWallet);
+    let account = builder.build()?;
     client.add_account(&account, false).await?;
 
     deploy_account(client, account.id()).await?;
