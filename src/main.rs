@@ -13,12 +13,16 @@ pub mod service_state;
 #[command(version, about, long_about = None)]
 struct Command {
     /// JSON-RPC HTTP service listening port
-    #[arg(short, long, default_value_t = 8125)]
+    #[arg(long, default_value_t = 8125)]
     port: u16,
 
     /// Directory for miden-client data [default: $HOME/.miden]
-    #[arg(short, long)]
+    #[arg(long)]
     miden_store_dir: Option<PathBuf>,
+
+    /// Miden node GRPC URL or a network name: "devnet" or "testnet" [default: http://localhost:57291]
+    #[arg(long)]
+    miden_node: Option<String>,
 
     /// Create a new accounts config inside --miden-store-dir
     #[arg(long)]
@@ -31,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
     logging::setup_tracing()?;
 
     let miden_store_dir = command.miden_store_dir;
-    let client = MidenClient::new(miden_store_dir.clone())?;
+    let client = MidenClient::new(miden_store_dir.clone(), command.miden_node)?;
 
     if command.init || !config_path_exists(miden_store_dir.clone())? {
         let config_path = init::init(&client, miden_store_dir.clone()).await?;

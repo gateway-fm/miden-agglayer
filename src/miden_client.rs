@@ -33,8 +33,10 @@ const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<MidenClient>();
 
 impl MidenClient {
-    pub fn new(store_dir: Option<PathBuf>) -> anyhow::Result<Self> {
+    pub fn new(store_dir: Option<PathBuf>, node_url: Option<String>) -> anyhow::Result<Self> {
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
+        let node_endpoint =
+            node_url.map(Self::parse_node_url).unwrap_or(Ok(Endpoint::localhost()))?;
         let keystore = Self::create_keystore(store_dir.clone())?;
         let keystore_for_run = keystore.clone();
 
@@ -44,6 +46,7 @@ impl MidenClient {
         let task = thread::spawn(move || -> anyhow::Result<()> {
             let result = runtime.block_on(tokio::task::LocalSet::new().run_until(Self::run(
                 store_dir,
+                node_endpoint,
                 keystore_for_run,
                 receiver,
             )));
@@ -61,6 +64,17 @@ impl MidenClient {
         let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
         let base_dir = env::home_dir().unwrap_or(current_dir);
         base_dir.join(".miden")
+    }
+
+    fn parse_node_url(node_url: String) -> anyhow::Result<Endpoint> {
+        match node_url.as_str() {
+            "devnet" => Ok(Endpoint::devnet()),
+            "testnet" => Ok(Endpoint::testnet()),
+            _ => {
+                let endpoint = Endpoint::try_from(node_url.as_str());
+                endpoint.map_err(|err| anyhow!(err))
+            },
+        }
     }
 
     fn create_keystore(store_dir: PathBuf) -> anyhow::Result<Arc<FilesystemKeyStore>> {
@@ -85,11 +99,11 @@ impl MidenClient {
 
     async fn run(
         store_dir: PathBuf,
+        node_endpoint: Endpoint,
         keystore: Arc<FilesystemKeyStore>,
         mut receiver: mpsc::Receiver<Request>,
     ) -> anyhow::Result<()> {
         // node client
-        let node_endpoint = Endpoint::localhost();
         let node_timeout_ms: u64 = 10_000;
 
         let mut client = ClientBuilder::new()
