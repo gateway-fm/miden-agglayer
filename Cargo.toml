@@ -8,6 +8,9 @@ readme       = "README.md"
 rust-version = "1.90"
 version      = "0.1.0"
 
+[profile.dev.package."*"]
+opt-level = 1
+
 [dependencies]
 alloy              = { features = ["consensus", "eips"], version = "1.5.2" }
 alloy-core         = { features = ["sol-types"], version = "1.5.2" }
