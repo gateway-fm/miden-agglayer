@@ -25,7 +25,7 @@ rand               = { default-features = false, version = "0.9" }
 serde              = { features = ["derive"], version = "1.0" }
 serde_json         = { version = "1.0" }
 thiserror          = { default-features = false, version = "2.0" }
-tokio              = { features = ["macros", "rt-multi-thread"], version = "1.48" }
+tokio              = { features = ["macros", "rt-multi-thread", "signal"], version = "1.48" }
 tokio-stream       = { version = "0.1" }
 toml               = { version = "0.9" }
 tower              = { version = "0.5" }

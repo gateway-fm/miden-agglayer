@@ -12,6 +12,7 @@ use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
 use miden_agglayer_service::COMPONENT;
 use tokio::net::TcpListener;
+use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -92,6 +93,26 @@ async fn json_rpc_endpoint(
     }
 }
 
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c().await.expect("failed to setup SIGINT handler");
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut terminate_signal = tokio::signal::unix::signal(SignalKind::terminate())
+        .expect("failed to setup SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.expect("failed to setup SIGINT handler");
+            tracing::info!("shutdown_signal: SIGINT");
+        },
+        _ = terminate_signal.recv() => {
+            tracing::info!("shutdown_signal: SIGTERM");
+        },
+    }
+}
+
 pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(json_rpc_endpoint))
@@ -120,5 +141,6 @@ pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
 
     tracing::info!(target: COMPONENT, address = %url, "Service started");
 
-    axum::serve(listener, app).await.map_err(Into::into)
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    Ok(())
 }
