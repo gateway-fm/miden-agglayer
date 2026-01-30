@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("new config created at {config_path:?}");
     }
     if command.init {
-        client.join()?;
+        client.shutdown()?;
         return Ok(());
     }
 
@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;
 
-    state.miden_client.join()?;
+    state.miden_client.shutdown()?;
 
     Ok(())
 }

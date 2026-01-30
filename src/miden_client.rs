@@ -27,6 +27,7 @@ pub struct MidenClient {
     keystore: Arc<FilesystemKeyStore>,
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
     sender: mpsc::Sender<Request>,
+    done_sender: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -41,6 +42,7 @@ impl MidenClient {
         let keystore_for_run = keystore.clone();
 
         let (sender, receiver) = mpsc::channel::<Request>(1);
+        let (done_sender, done_receiver) = oneshot::channel::<()>();
 
         let runtime = tokio::runtime::Runtime::new()?;
         let task = thread::spawn(move || -> anyhow::Result<()> {
@@ -49,6 +51,7 @@ impl MidenClient {
                 node_endpoint,
                 keystore_for_run,
                 receiver,
+                done_receiver,
             )));
             if let Err(err) = &result {
                 tracing::error!("MidenClient::run stopped: {err:#?}");
@@ -57,7 +60,8 @@ impl MidenClient {
         });
 
         let task = std::sync::Mutex::new(Some(task));
-        Ok(Self { keystore, task, sender })
+        let done_sender = std::sync::Mutex::new(Some(done_sender));
+        Ok(Self { keystore, task, sender, done_sender })
     }
 
     fn default_store_dir() -> PathBuf {
@@ -97,11 +101,28 @@ impl MidenClient {
         }
     }
 
+    pub fn close(&self) {
+        let mut done_sender_guard = self
+            .done_sender
+            .lock()
+            .expect("MidenClient::close has failed to lock the done_sender mutex");
+        let Some(done_sender) = done_sender_guard.take() else {
+            return;
+        };
+        _ = done_sender.send(());
+    }
+
+    pub fn shutdown(&self) -> anyhow::Result<()> {
+        self.close();
+        self.join()
+    }
+
     async fn run(
         store_dir: PathBuf,
         node_endpoint: Endpoint,
         keystore: Arc<FilesystemKeyStore>,
         mut receiver: mpsc::Receiver<Request>,
+        mut done_receiver: oneshot::Receiver<()>,
     ) -> anyhow::Result<()> {
         // node client
         let node_timeout_ms: u64 = 10_000;
@@ -116,9 +137,18 @@ impl MidenClient {
 
         client.sync_state().await?;
 
-        while let Some(request) = receiver.recv().await {
-            let result = (request.closure)(&mut client).await;
-            request.response_sender.send(result).unwrap_or(());
+        loop {
+            tokio::select! {
+                receiver_result = receiver.recv() => {
+                    let Some(request) = receiver_result else { break };
+                    let result = (request.closure)(&mut client).await;
+                    request.response_sender.send(result).unwrap_or(());
+                },
+                _ = &mut done_receiver => {
+                    tracing::debug!("MidenClient::run loop done");
+                    break;
+                }
+            }
         }
 
         Ok(())
