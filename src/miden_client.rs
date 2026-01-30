@@ -1,14 +1,16 @@
 use anyhow::anyhow;
-use miden_client::DebugMode;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
-use miden_client::rpc::Endpoint;
+use miden_client::rpc::{Endpoint, RpcError};
+use miden_client::sync::SyncSummary;
+use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use std::env;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -117,6 +119,25 @@ impl MidenClient {
         self.join()
     }
 
+    async fn sync(client: &mut MidenClientLib) -> anyhow::Result<SyncSummary> {
+        loop {
+            let result = client.sync_state().await;
+            match result {
+                Ok(summary) => {
+                    tracing::debug!("MidenClient::sync succeeded at block {}", summary.block_num);
+                    return Ok(summary);
+                },
+                Err(ClientError::RpcError(RpcError::ConnectionError(_))) => {
+                    tracing::error!(
+                        "MidenClient::sync failed to connect to the node, retrying in 5 seconds..."
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                },
+                Err(err) => anyhow::bail!(err),
+            }
+        }
+    }
+
     async fn run(
         store_dir: PathBuf,
         node_endpoint: Endpoint,
@@ -135,7 +156,15 @@ impl MidenClient {
             .build()
             .await?;
 
-        client.sync_state().await?;
+        // initial sync
+        tokio::select! {
+            _ = Self::sync(&mut client) => {},
+            _ = &mut done_receiver => {
+                tracing::debug!("MidenClient::run loop done");
+                return Ok(());
+            }
+        }
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
 
         loop {
             tokio::select! {
@@ -144,13 +173,17 @@ impl MidenClient {
                     let result = (request.closure)(&mut client).await;
                     request.response_sender.send(result).unwrap_or(());
                 },
-                _ = &mut done_receiver => {
-                    tracing::debug!("MidenClient::run loop done");
-                    break;
-                }
+                _ = sync_interval.tick() => {
+                    tokio::select! {
+                        _ = Self::sync(&mut client) => {},
+                        _ = &mut done_receiver => break,
+                    }
+                },
+                _ = &mut done_receiver => break,
             }
         }
 
+        tracing::debug!("MidenClient::run loop done");
         Ok(())
     }
 
