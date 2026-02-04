@@ -19,6 +19,7 @@ use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
 use url::Url;
 
 // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L71C19-L71C28
@@ -32,6 +33,8 @@ async fn json_rpc_endpoint(
 ) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let method = request.method.as_str();
+    tracing::debug!("JSON-RPC request: {}", method);
+
     match method {
         // polycli checks if the contract code exists
         // return a non-empty string to satisfy the check
@@ -136,7 +139,10 @@ async fn json_rpc_endpoint(
             }
         },
 
-        method => Ok(request.method_not_found(method)),
+        method => {
+            tracing::error!("JSON-RPC unsupported method: {}", method);
+            Ok(request.method_not_found(method))
+        },
     }
 }
 
@@ -170,6 +176,7 @@ pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
                     http::header::CACHE_CONTROL,
                     HeaderValue::from_static("no-cache"),
                 ))
+                .layer(TraceLayer::new_for_http())
                 .layer(
                     CorsLayer::new()
                         .allow_origin(tower_http::cors::Any)

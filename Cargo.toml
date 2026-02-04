@@ -29,7 +29,7 @@ tokio              = { features = ["macros", "rt-multi-thread", "signal"], versi
 tokio-stream       = { version = "0.1" }
 toml               = { version = "0.9" }
 tower              = { version = "0.5" }
-tower-http         = { features = ["cors", "set-header"], version = "0.6" }
+tower-http         = { features = ["cors", "set-header", "trace"], version = "0.6" }
 tracing            = { version = "0.1" }
 tracing-subscriber = { features = ["env-filter", "fmt", "json"], version = "0.3" }
 url                = { features = ["serde"], version = "2.5" }
