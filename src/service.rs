@@ -36,11 +36,26 @@ async fn json_rpc_endpoint(
     tracing::debug!("JSON-RPC request: {}", method);
 
     match method {
+        "eth_getBalance" => {
+            let _params: (String, String) = request.parse_params()?;
+            Ok(JsonRpcResponse::success(answer_id, "0x0"))
+        },
+
         // polycli checks if the contract code exists
         // return a non-empty string to satisfy the check
         "eth_getCode" => {
             let _params: (String, String) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x00"))
+        },
+
+        "eth_getStorageAt" => {
+            let _params: (String, String, String) = request.parse_params()?;
+            Ok(JsonRpcResponse::success(answer_id, format!("{:#066x}", 0)))
+        },
+
+        "eth_blockNumber" => {
+            // TODO: implement eth_blockNumber
+            Ok(JsonRpcResponse::success(answer_id, "0x0"))
         },
 
         // polycli estimates GasFeeCap using the latest header baseFeePerGas
@@ -54,8 +69,19 @@ async fn json_rpc_endpoint(
             Ok(JsonRpcResponse::success(answer_id, header))
         },
 
-        // polycli estimates GasTipCap (priority fee cap), return zero
-        "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+        "eth_getBlockByHash" => {
+            let _params: (String, bool) = request.parse_params()?;
+            let header = Header {
+                base_fee_per_gas: Some(0),
+                ..Default::default()
+            };
+            Ok(JsonRpcResponse::success(answer_id, header))
+        },
+
+        "eth_getBlockTransactionCountByNumber" => {
+            let _block_num_str: String = request.parse_params()?;
+            Ok(JsonRpcResponse::success(answer_id, "0x0"))
+        },
 
         // polycli sets a txn.Nonce from this method result
         // TODO: for replay protection and ordering this should be a monotonic counter per "from" account
@@ -63,6 +89,11 @@ async fn json_rpc_endpoint(
             let _params: (String, String) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         },
+
+        "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+
+        // polycli estimates GasTipCap (priority fee cap), return zero
+        "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
 
         // polycli estimates how much gas will be spent on a transaction, return zero
         "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
@@ -137,6 +168,12 @@ async fn json_rpc_endpoint(
                     Err(JsonRpcResponse::error(answer_id, error))
                 },
             }
+        },
+
+        "eth_getTransactionByHash" => {
+            let _txn_hash_str: String = request.parse_params()?;
+            // TODO: implement eth_getTransactionByHash
+            Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null))
         },
 
         method => {
