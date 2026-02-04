@@ -24,6 +24,10 @@ struct Command {
     #[arg(long)]
     miden_node: Option<String>,
 
+    /// L2 chain ID configured in the AggLayer
+    #[arg(long, default_value_t = 2)]
+    chain_id: u64,
+
     /// Create a new accounts config inside --miden-store-dir
     #[arg(long)]
     init: bool,
@@ -47,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let accounts = load_config(miden_store_dir)?;
-    let state = ServiceState::new(client, accounts);
+    let state = ServiceState::new(client, accounts, command.chain_id);
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;

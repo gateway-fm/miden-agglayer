@@ -1,3 +1,4 @@
+use crate::hex::hex_decode_prefixed;
 use crate::service_state::ServiceState;
 use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, TxEnvelope};
 use alloy::eips::Decodable2718;
@@ -6,16 +7,11 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy_core::sol_types::SolCall;
 use axum::Json;
 use axum::extract::State;
-use hex::FromHexError;
 use http::StatusCode;
 use miden_agglayer_service::claim::claimAssetCall;
 use miden_agglayer_service::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-
-fn hex_decode_prefixed(input: &str) -> Result<Vec<u8>, FromHexError> {
-    hex::decode(input.strip_prefix("0x").unwrap_or(input))
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -1,8 +1,10 @@
 use crate::claim_endpoint::claim_endpoint_dry_run;
 use crate::claim_endpoint::claim_endpoint_raw_txn;
 use crate::claim_endpoint::claim_endpoint_txn_receipt;
+use crate::hex::hex_decode_prefixed;
 use crate::service_state::ServiceState;
 use alloy::consensus::Header;
+use alloy_core::sol_types::SolCall;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
@@ -11,12 +13,18 @@ use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
 use miden_agglayer_service::COMPONENT;
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use url::Url;
+
+// https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L71C19-L71C28
+alloy_core::sol! {
+    uint32 public networkID;
+}
 
 async fn json_rpc_endpoint(
     State(service): State<ServiceState>,
@@ -55,6 +63,45 @@ async fn json_rpc_endpoint(
 
         // polycli estimates how much gas will be spent on a transaction, return zero
         "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+
+        "eth_chainId" => {
+            Ok(JsonRpcResponse::success(answer_id, format!("{:#x}", service.chain_id)))
+        },
+        "net_version" => Ok(JsonRpcResponse::success(answer_id, format!("{}", service.chain_id))),
+
+        // AggLayer requests current state of the bridge contract using eth_call,
+        // but currently everything is stubbed with zero except networkID
+        "eth_call" => {
+            #[derive(Debug, Deserialize)]
+            struct TransactionParam {
+                data: Option<String>,
+                input: Option<String>,
+            }
+            let params: (TransactionParam, String) = request.parse_params()?;
+            let txn_param = params.0;
+
+            if let Some(data_hex) = txn_param.data.or(txn_param.input) {
+                let Ok(data) = hex_decode_prefixed(&data_hex) else {
+                    let error = JsonRpcError::new(
+                        JsonRpcErrorReason::ApplicationError(3),
+                        String::from("bad transaction.data"),
+                        serde_json::Value::Null,
+                    );
+                    return Err(JsonRpcResponse::error(answer_id, error));
+                };
+
+                if data.starts_with(&networkIDCall::SELECTOR) {
+                    let chain_id = service.chain_id;
+                    let chain_id_hex = format!("{:#066x}", chain_id);
+                    return Ok(JsonRpcResponse::success(answer_id, chain_id_hex));
+                }
+            }
+
+            Ok(JsonRpcResponse::success(
+                answer_id,
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+            ))
+        },
 
         "eth_sendRawTransaction" => {
             let params: (String,) = request.parse_params()?;

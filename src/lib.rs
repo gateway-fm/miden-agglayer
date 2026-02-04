@@ -1,5 +1,6 @@
 mod accounts_config;
 pub mod claim;
+pub mod hex;
 pub mod init;
 pub mod logging;
 mod miden_client;
