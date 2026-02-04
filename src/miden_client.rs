@@ -25,6 +25,10 @@ struct Request {
     closure: BoxFutureFactory,
 }
 
+pub trait SyncListener: Send + Sync {
+    fn on_sync(&self, summary: SyncSummary);
+}
+
 pub struct MidenClient {
     keystore: Arc<FilesystemKeyStore>,
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
@@ -36,7 +40,11 @@ const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<MidenClient>();
 
 impl MidenClient {
-    pub fn new(store_dir: Option<PathBuf>, node_url: Option<String>) -> anyhow::Result<Self> {
+    pub fn new(
+        store_dir: Option<PathBuf>,
+        node_url: Option<String>,
+        sync_listener: Option<Arc<dyn SyncListener>>,
+    ) -> anyhow::Result<Self> {
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
         let node_endpoint =
             node_url.map(Self::parse_node_url).unwrap_or(Ok(Endpoint::localhost()))?;
@@ -54,6 +62,7 @@ impl MidenClient {
                 keystore_for_run,
                 receiver,
                 done_receiver,
+                sync_listener,
             )));
             if let Err(err) = &result {
                 tracing::error!("MidenClient::run stopped: {err:#?}");
@@ -138,12 +147,24 @@ impl MidenClient {
         }
     }
 
+    fn on_sync(
+        result: anyhow::Result<SyncSummary>,
+        listener: &Option<Arc<dyn SyncListener>>,
+    ) -> anyhow::Result<()> {
+        let summary = result?;
+        if let Some(listener) = listener {
+            listener.on_sync(summary);
+        }
+        Ok(())
+    }
+
     async fn run(
         store_dir: PathBuf,
         node_endpoint: Endpoint,
         keystore: Arc<FilesystemKeyStore>,
         mut receiver: mpsc::Receiver<Request>,
         mut done_receiver: oneshot::Receiver<()>,
+        sync_listener: Option<Arc<dyn SyncListener>>,
     ) -> anyhow::Result<()> {
         // node client
         let node_timeout_ms: u64 = 10_000;
@@ -158,7 +179,7 @@ impl MidenClient {
 
         // initial sync
         tokio::select! {
-            _ = Self::sync(&mut client) => {},
+            result = Self::sync(&mut client) => Self::on_sync(result, &sync_listener)?,
             _ = &mut done_receiver => {
                 tracing::debug!("MidenClient::run loop done");
                 return Ok(());
@@ -175,7 +196,7 @@ impl MidenClient {
                 },
                 _ = sync_interval.tick() => {
                     tokio::select! {
-                        _ = Self::sync(&mut client) => {},
+                        result = Self::sync(&mut client) => Self::on_sync(result, &sync_listener)?,
                         _ = &mut done_receiver => break,
                     }
                 },

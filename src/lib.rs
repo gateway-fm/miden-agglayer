@@ -1,4 +1,5 @@
 mod accounts_config;
+mod block_num_tracker;
 pub mod claim;
 pub mod hex;
 pub mod init;
@@ -7,6 +8,7 @@ mod miden_client;
 
 pub const COMPONENT: &str = "miden-agglayer";
 
+pub use block_num_tracker::BlockNumTracker;
 pub use miden_client::MidenClient;
 
 #[derive(Clone)]

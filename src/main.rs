@@ -3,6 +3,7 @@ use clap::Parser;
 use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use url::Url;
 
 mod claim_endpoint;
@@ -38,8 +39,14 @@ async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
 
+    let block_num_tracker = Arc::new(BlockNumTracker::new());
+
     let miden_store_dir = command.miden_store_dir;
-    let client = MidenClient::new(miden_store_dir.clone(), command.miden_node)?;
+    let client = MidenClient::new(
+        miden_store_dir.clone(),
+        command.miden_node,
+        Some(block_num_tracker.clone()),
+    )?;
 
     if command.init || !config_path_exists(miden_store_dir.clone())? {
         let config_path = init::init(&client, miden_store_dir.clone()).await?;
@@ -51,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let accounts = load_config(miden_store_dir)?;
-    let state = ServiceState::new(client, accounts, command.chain_id);
+    let state = ServiceState::new(client, accounts, command.chain_id, block_num_tracker);
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;

@@ -2,6 +2,7 @@ use crate::claim_endpoint::claim_endpoint_dry_run;
 use crate::claim_endpoint::claim_endpoint_raw_txn;
 use crate::claim_endpoint::claim_endpoint_txn_receipt;
 use crate::hex::hex_decode_prefixed;
+use crate::hex::hex_decode_u64;
 use crate::service_state::ServiceState;
 use alloy::consensus::Header;
 use alloy_core::sol_types::SolCall;
@@ -54,15 +55,31 @@ async fn json_rpc_endpoint(
         },
 
         "eth_blockNumber" => {
-            // TODO: implement eth_blockNumber
-            Ok(JsonRpcResponse::success(answer_id, "0x0"))
+            let block_num = service.block_num_tracker.latest();
+            let block_num_str = format!("{:#x}", block_num);
+            Ok(JsonRpcResponse::success(answer_id, block_num_str))
         },
 
         // polycli estimates GasFeeCap using the latest header baseFeePerGas
         // return a dummy header with zero baseFeePerGas to satisfy the client logic
         "eth_getBlockByNumber" => {
-            let _params: (String, bool) = request.parse_params()?;
+            let params: (String, bool) = request.parse_params()?;
+            let block_num = match params.0.as_str() {
+                "latest" => service.block_num_tracker.latest(),
+                any => {
+                    let Ok(num) = hex_decode_u64(any) else {
+                        let error = JsonRpcError::new(
+                            JsonRpcErrorReason::ApplicationError(4),
+                            String::from("bad block number"),
+                            serde_json::Value::Null,
+                        );
+                        return Err(JsonRpcResponse::error(answer_id, error));
+                    };
+                    num
+                },
+            };
             let header = Header {
+                number: block_num,
                 base_fee_per_gas: Some(0),
                 ..Default::default()
             };
