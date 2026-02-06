@@ -1,7 +1,7 @@
-use crate::claim_endpoint::claim_endpoint_raw_txn;
-use crate::claim_endpoint::claim_endpoint_txn_receipt;
 use crate::hex::hex_decode_prefixed;
 use crate::hex::hex_decode_u64;
+use crate::service_get_txn_receipt::service_get_txn_receipt;
+use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
 use alloy_core::sol_types::SolCall;
 use alloy_rpc_types_eth::Header;
@@ -157,7 +157,7 @@ async fn json_rpc_endpoint(
 
         "eth_sendRawTransaction" => {
             let params: (String,) = request.parse_params()?;
-            let result = claim_endpoint_raw_txn(service, params.0).await;
+            let result = service_send_raw_txn(service, params.0).await;
             match result {
                 Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
                 Err(error) => {
@@ -174,7 +174,7 @@ async fn json_rpc_endpoint(
         // polycli polls receipts to get the eth_sendRawTransaction status
         "eth_getTransactionReceipt" => {
             let params: (String,) = request.parse_params()?;
-            let result = claim_endpoint_txn_receipt(service, params.0).await;
+            let result = service_get_txn_receipt(service, params.0).await;
             match result {
                 Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
                 Err(error) => {

@@ -6,8 +6,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
-mod claim_endpoint;
 mod service;
+mod service_get_txn_receipt;
+mod service_send_raw_txn;
 pub mod service_state;
 
 #[derive(Parser, Debug)]
