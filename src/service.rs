@@ -4,7 +4,8 @@ use crate::service_get_txn_receipt::service_get_txn_receipt;
 use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
 use alloy_core::sol_types::SolCall;
-use alloy_rpc_types_eth::Header;
+use alloy_rpc_types_eth::Filter;
+use alloy_rpc_types_eth::{Header, Log};
 use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
@@ -192,6 +193,12 @@ async fn json_rpc_endpoint(
             let _txn_hash_str: (String,) = request.parse_params()?;
             // TODO: implement eth_getTransactionByHash
             Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null))
+        },
+
+        "eth_getLogs" => {
+            let _filter: (Filter,) = request.parse_params()?;
+            let logs = Vec::<Log>::new();
+            Ok(JsonRpcResponse::success(answer_id, logs))
         },
 
         method => {
