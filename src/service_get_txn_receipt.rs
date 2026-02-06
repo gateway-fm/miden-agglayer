@@ -8,10 +8,11 @@ use std::str::FromStr;
 // it logs cumulativeGasUsed and transactionHash
 // TODO: return null if the transaction is not yet included onto the blockchain, return status=0 for errors
 pub async fn service_get_txn_receipt(
-    _service: ServiceState,
+    service: ServiceState,
     txn_hash: String,
 ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope>>> {
     let status = true;
+    let block_num = service.block_num_tracker.latest();
 
     let mut receipt_inner = ReceiptWithBloom::<Receipt<Log>>::default();
     receipt_inner.receipt.status = Eip658Value::Eip658(status);
@@ -22,7 +23,7 @@ pub async fn service_get_txn_receipt(
         transaction_hash: TxHash::from_str(&txn_hash)?,
         transaction_index: None,
         block_hash: None,
-        block_number: None,
+        block_number: Some(block_num),
         gas_used: 0,
         effective_gas_price: 0,
         blob_gas_used: None,

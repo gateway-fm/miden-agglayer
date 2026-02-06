@@ -1,6 +1,7 @@
 mod accounts_config;
 mod block_num_tracker;
 pub mod claim;
+pub mod ger;
 pub mod hex;
 pub mod init;
 pub mod logging;

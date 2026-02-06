@@ -1,8 +1,12 @@
+use crate::COMPONENT;
+use crate::ger::latest_ger_update_event;
 use crate::hex::hex_decode_prefixed;
 use crate::hex::hex_decode_u64;
 use crate::service_get_txn_receipt::service_get_txn_receipt;
 use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
+use alloy::primitives::LogData;
+use alloy::sol_types::SolEvent;
 use alloy_core::sol_types::SolCall;
 use alloy_rpc_types_eth::Filter;
 use alloy_rpc_types_eth::{Header, Log};
@@ -13,7 +17,6 @@ use axum::routing::post;
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
-use miden_agglayer_service::COMPONENT;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
@@ -197,7 +200,14 @@ async fn json_rpc_endpoint(
 
         "eth_getLogs" => {
             let _filter: (Filter,) = request.parse_params()?;
-            let logs = Vec::<Log>::new();
+            let mut logs = Vec::<Log>::new();
+            if let Some((event, txn_hash, block_num)) = latest_ger_update_event() {
+                let mut log: Log<LogData> = Log::<LogData>::default();
+                log.inner.data = event.encode_log_data();
+                log.transaction_hash = Some(txn_hash);
+                log.block_number = Some(block_num);
+                logs.push(log);
+            }
             Ok(JsonRpcResponse::success(answer_id, logs))
         },
 
