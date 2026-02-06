@@ -5,65 +5,9 @@ use alloy::eips::Decodable2718;
 use alloy::primitives::{Log, TxHash};
 use alloy::rpc::types::TransactionReceipt;
 use alloy_core::sol_types::SolCall;
-use axum::Json;
-use axum::extract::State;
-use http::StatusCode;
 use miden_agglayer_service::claim::claimAssetCall;
 use miden_agglayer_service::*;
-use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClaimRequest {
-    chain_id: String,
-    input: String,
-    to: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClaimResponse {
-    error: Option<String>,
-}
-
-pub async fn claim_endpoint_dry_run(
-    state: State<ServiceState>,
-    request: Json<ClaimRequest>,
-) -> (StatusCode, Json<ClaimResponse>) {
-    match claim_endpoint_dry_run_result(state, request).await {
-        Ok(_) => (StatusCode::OK, Json(ClaimResponse { error: None })),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ClaimResponse { error: Some(err.to_string()) }),
-        ),
-    }
-}
-
-pub async fn claim_endpoint_dry_run_result(
-    State(service): State<ServiceState>,
-    Json(request): Json<ClaimRequest>,
-) -> anyhow::Result<()> {
-    tracing::debug!("chain_id: {}", request.chain_id);
-    tracing::debug!("to: {}", request.to);
-
-    let params_encoded = hex_decode_prefixed(&request.input)?;
-    if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
-        let params = claimAssetCall::abi_decode(&params_encoded)?;
-        tracing::debug!("claimAsset call params: {params:?}");
-
-        let result = claim::publish_claim(params, &service.miden_client, service.accounts).await;
-        if let Err(err) = &result {
-            tracing::error!("publish_claim failed: {err:#?}");
-        }
-        let txn_id = result?;
-        tracing::debug!("published claim txn_id: {txn_id}");
-    } else {
-        anyhow::bail!("unhandled txn method {params_encoded:?}");
-    }
-
-    Ok(())
-}
 
 pub async fn claim_endpoint_raw_txn(
     service: ServiceState,

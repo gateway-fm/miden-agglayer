@@ -1,4 +1,3 @@
-use crate::claim_endpoint::claim_endpoint_dry_run;
 use crate::claim_endpoint::claim_endpoint_raw_txn;
 use crate::claim_endpoint::claim_endpoint_txn_receipt;
 use crate::hex::hex_decode_prefixed;
@@ -225,7 +224,6 @@ async fn shutdown_signal() {
 pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(json_rpc_endpoint))
-        .route("/claim", post(claim_endpoint_dry_run))
         .layer(
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::if_not_present(
