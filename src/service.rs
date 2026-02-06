@@ -98,7 +98,7 @@ async fn json_rpc_endpoint(
         },
 
         "eth_getBlockTransactionCountByNumber" => {
-            let _block_num_str: String = request.parse_params()?;
+            let _block_num_str: (String,) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         },
 
@@ -190,7 +190,7 @@ async fn json_rpc_endpoint(
         },
 
         "eth_getTransactionByHash" => {
-            let _txn_hash_str: String = request.parse_params()?;
+            let _txn_hash_str: (String,) = request.parse_params()?;
             // TODO: implement eth_getTransactionByHash
             Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null))
         },
