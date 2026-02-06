@@ -2960,6 +2960,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "alloy-core",
+ "alloy-rpc-types-eth",
  "anyhow",
  "async-trait",
  "axum",

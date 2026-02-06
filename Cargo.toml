@@ -12,8 +12,10 @@ version      = "0.1.0"
 opt-level = 1
 
 [dependencies]
-alloy              = { features = ["consensus", "eips"], version = "1.5.2" }
-alloy-core         = { features = ["sol-types"], version = "1.5.2" }
+alloy               = { features = ["consensus", "eips"], version = "1.5.2" }
+alloy-core          = { features = ["sol-types"], version = "1.5.2" }
+alloy-rpc-types-eth = { version = "1.5.2" }
+
 anyhow             = { default-features = false, version = "1.0" }
 async-trait        = { version = "0.1" }
 axum               = { features = ["tokio"], version = "0.8" }

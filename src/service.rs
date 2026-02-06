@@ -4,8 +4,8 @@ use crate::claim_endpoint::claim_endpoint_txn_receipt;
 use crate::hex::hex_decode_prefixed;
 use crate::hex::hex_decode_u64;
 use crate::service_state::ServiceState;
-use alloy::consensus::Header;
 use alloy_core::sol_types::SolCall;
+use alloy_rpc_types_eth::Header;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
@@ -78,20 +78,22 @@ async fn json_rpc_endpoint(
                     num
                 },
             };
-            let header = Header {
+            let header = alloy::consensus::Header {
                 number: block_num,
                 base_fee_per_gas: Some(0),
                 ..Default::default()
             };
+            let header = Header::new(header);
             Ok(JsonRpcResponse::success(answer_id, header))
         },
 
         "eth_getBlockByHash" => {
             let _params: (String, bool) = request.parse_params()?;
-            let header = Header {
+            let header = alloy::consensus::Header {
                 base_fee_per_gas: Some(0),
                 ..Default::default()
             };
+            let header = Header::new(header);
             Ok(JsonRpcResponse::success(answer_id, header))
         },
 
