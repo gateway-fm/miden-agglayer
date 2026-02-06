@@ -161,6 +161,7 @@ async fn json_rpc_endpoint(
 
         "eth_sendRawTransaction" => {
             let params: (String,) = request.parse_params()?;
+            // tracing::debug!("eth_sendRawTransaction data: {:?}", params.0);
             let result = service_send_raw_txn(service, params.0).await;
             match result {
                 Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
