@@ -73,7 +73,7 @@ async fn add_faucet(
     decimals: u8,
     bridge_account_id: AccountId,
 ) -> anyhow::Result<Account> {
-    let max_supply = Felt::new(1000000);
+    let max_supply = Felt::try_from(0xffffffff00000000u64).unwrap();
     let builder = create_agglayer_faucet_builder(
         client.rng().draw_word(),
         token_symbol,
@@ -109,7 +109,7 @@ async fn add_accounts(
 ) -> anyhow::Result<Accounts> {
     let service = add_wallet(client, keystore.clone()).await?;
     let bridge = add_bridge(client, keystore.clone()).await?;
-    let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 18u8, bridge.id()).await?;
+    let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 8u8, bridge.id()).await?;
     let faucet_agg = add_faucet(client, keystore.clone(), "AGG", 8u8, bridge.id()).await?;
     let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
     let wallet_satoshi = add_wallet(client, keystore.clone()).await?;

@@ -1,4 +1,5 @@
 use crate::accounts_config::AccountsConfig;
+use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{Bytes, FixedBytes, U256};
 use miden_base_agglayer::ClaimNoteParams;
@@ -44,7 +45,7 @@ struct ClaimNoteInputs {
     origin_token_address: [u8; 20],
     destination_network: Felt,
     destination_address: [u8; 20],
-    amount_u256: [Felt; 8],
+    _amount_u256: [Felt; 8],
     metadata: [Felt; 8],
 }
 
@@ -82,27 +83,42 @@ impl From<claimAssetCall> for ClaimNoteInputs {
             origin_token_address: value.originTokenAddress.0.0,
             destination_network: Felt::from(value.destinationNetwork),
             destination_address: value.destinationAddress.0.0,
-            amount_u256: fixed_felts_from_u256(value.amount),
+            _amount_u256: fixed_felts_from_u256(value.amount),
             metadata: fixed_felts_from_bytes(value.metadata),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Faucet {
+    pub id: AccountId,
+    pub decimals: u8,
+    pub origin_token_decimals: u8,
 }
 
 // TODO: obtain a faucet from registry for a given origin_token_address
 fn find_target_faucet(
     token_address: alloy::primitives::Address,
     accounts: &AccountsConfig,
-) -> AccountId {
+) -> Faucet {
     if token_address.to_string() == "0x0000000000000000000000000000000000000000" {
-        accounts.faucet_eth.0
+        Faucet {
+            id: accounts.faucet_eth.0,
+            decimals: 8,
+            origin_token_decimals: 18,
+        }
     } else {
-        accounts.faucet_agg.0
+        Faucet {
+            id: accounts.faucet_agg.0,
+            decimals: 8,
+            origin_token_decimals: 8,
+        }
     }
 }
 
 fn create_claim(
     params: claimAssetCall,
-    faucet: AccountId,
+    faucet: Faucet,
     accounts: AccountsConfig,
     rng_mut: &mut impl FeltRng,
 ) -> anyhow::Result<(Note, AccountId, Word)> {
@@ -114,6 +130,8 @@ fn create_claim(
         } else {
             accounts.wallet_satoshi.0
         };
+
+    let amount = validate_amount(params.amount, faucet.origin_token_decimals, faucet.decimals)?;
 
     let inputs = ClaimNoteInputs::from(params);
     let p2id_serial_number = rng_mut.draw_word();
@@ -127,10 +145,10 @@ fn create_claim(
         origin_token_address: &inputs.origin_token_address,
         destination_network: inputs.destination_network,
         destination_address: &inputs.destination_address,
-        amount: inputs.amount_u256,
+        amount: fixed_felts_from_u256(U256::from(amount)),
         metadata: inputs.metadata,
         claim_note_creator_account_id: claim_note_creator,
-        agglayer_faucet_account_id: faucet,
+        agglayer_faucet_account_id: faucet.id,
         output_note_tag: NoteTag::with_account_target(destination_account_id),
         p2id_serial_number,
         destination_account_id,
@@ -197,7 +215,7 @@ async fn publish_claim_internal(
 
     let txn_id = consume_claim_by_faucet(
         claim_note_for_faucet,
-        faucet,
+        faucet.id,
         accounts.bridge.0,
         destination_account_id,
         p2id_serial_number,
