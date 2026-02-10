@@ -13,8 +13,10 @@ struct TransactionData {
     pub input: alloy::primitives::Bytes,
 }
 
-fn unwrap_txn_envelope(txn_envelope: EthereumTxEnvelope<TxEip4844Variant>) -> TransactionData {
-    match txn_envelope {
+fn unwrap_txn_envelope(
+    txn_envelope: EthereumTxEnvelope<TxEip4844Variant>,
+) -> anyhow::Result<TransactionData> {
+    let data = match txn_envelope {
         TxEnvelope::Eip1559(txn_signed) => {
             let hash = *txn_signed.hash();
             let txn = txn_signed.strip_signature();
@@ -26,16 +28,18 @@ fn unwrap_txn_envelope(txn_envelope: EthereumTxEnvelope<TxEip4844Variant>) -> Tr
             TransactionData { hash, input: txn.input }
         },
         _ => {
-            panic!("unhandled txn type {:?}", txn_envelope.tx_type());
+            tracing::error!("unhandled txn type {:?}", txn_envelope.tx_type());
+            anyhow::bail!("unhandled txn type {:?}", txn_envelope.tx_type());
         },
-    }
+    };
+    Ok(data)
 }
 
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
-    let txn = unwrap_txn_envelope(txn_envelope);
+    let txn = unwrap_txn_envelope(txn_envelope)?;
     let txn_hash = txn.hash;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
@@ -63,7 +67,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         }
         tracing::info!("inserted GER with eth txn: {txn_hash}");
     } else {
-        panic!("unhandled txn method {params_encoded:?}");
+        tracing::error!("unhandled txn method {params_encoded:?}");
+        anyhow::bail!("unhandled txn method {params_encoded:?}");
     }
 
     Ok(txn_hash)
