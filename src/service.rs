@@ -64,21 +64,11 @@ async fn json_rpc_endpoint(
     }
 
     match method {
-        "eth_getBalance" => {
-            let _params: (String, String) = request.parse_params()?;
-            Ok(JsonRpcResponse::success(answer_id, "0x0"))
-        },
-
         // polycli checks if the contract code exists
         // return a non-empty string to satisfy the check
         "eth_getCode" => {
             let _params: (String, String) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x00"))
-        },
-
-        "eth_getStorageAt" => {
-            let _params: (String, String, String) = request.parse_params()?;
-            Ok(JsonRpcResponse::success(answer_id, format!("{:#066x}", 0)))
         },
 
         "eth_blockNumber" => {
@@ -114,21 +104,6 @@ async fn json_rpc_endpoint(
             Ok(JsonRpcResponse::success(answer_id, header))
         },
 
-        "eth_getBlockByHash" => {
-            let _params: (String, bool) = request.parse_params()?;
-            let header = alloy::consensus::Header {
-                base_fee_per_gas: Some(0),
-                ..Default::default()
-            };
-            let header = Header::new(header);
-            Ok(JsonRpcResponse::success(answer_id, header))
-        },
-
-        "eth_getBlockTransactionCountByNumber" => {
-            let _block_num_str: (String,) = request.parse_params()?;
-            Ok(JsonRpcResponse::success(answer_id, "0x0"))
-        },
-
         // polycli sets a txn.Nonce from this method result
         // TODO: for replay protection and ordering this should be a monotonic counter per "from" account
         "eth_getTransactionCount" => {
@@ -147,7 +122,6 @@ async fn json_rpc_endpoint(
         "eth_chainId" => {
             Ok(JsonRpcResponse::success(answer_id, format!("{:#x}", service.chain_id)))
         },
-        "net_version" => Ok(JsonRpcResponse::success(answer_id, format!("{}", service.chain_id))),
 
         // AggLayer requests current state of the bridge contract using eth_call,
         // but currently everything is stubbed with zero except networkID
