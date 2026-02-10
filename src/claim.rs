@@ -201,7 +201,7 @@ async fn publish_claim_internal(
         .build()?;
 
     let txn_id = client.submit_new_transaction(accounts.service.0, txn_request).await?;
-    tracing::debug!("submitted claim note txn_id: {txn_id}");
+    tracing::debug!("submitted claim note txn: {txn_id}");
 
     loop {
         let summary = client.sync_state().await?;
@@ -211,8 +211,9 @@ async fn publish_claim_internal(
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }
-    tracing::debug!("committed claim note txn_id: {txn_id}");
+    tracing::debug!("committed claim note txn: {txn_id}");
 
+    tracing::debug!("consume_claim_by_faucet...");
     let txn_id = consume_claim_by_faucet(
         claim_note_for_faucet,
         faucet.id,

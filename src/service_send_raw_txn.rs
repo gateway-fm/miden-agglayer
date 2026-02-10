@@ -36,31 +36,35 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
     let txn = unwrap_txn_envelope(txn_envelope);
-    tracing::debug!("raw transaction hash: {}", txn.hash);
+    let txn_hash = txn.hash;
+    tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
     let params_encoded = &txn.input;
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
+        tracing::debug!("claimAsset call");
         let params = claimAssetCall::abi_decode(params_encoded)?;
-        tracing::debug!("claimAsset call params: {params:?}");
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
 
         let result = claim::publish_claim(params, &service.miden_client, service.accounts).await;
         if let Err(err) = &result {
             tracing::error!("publish_claim failed: {err:#?}");
         }
         let txn_id = result?;
-        tracing::debug!("published claim txn_id: {txn_id}");
+        tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
     } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
+        tracing::debug!("insertGlobalExitRoot call");
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
-        tracing::debug!("insertGlobalExitRoot call params: {params:?}");
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
 
         let block_num = service.block_num_tracker.latest();
-        let result = ger::insert_ger(params, txn.hash, block_num).await;
+        let result = ger::insert_ger(params, txn_hash, block_num).await;
         if let Err(err) = &result {
             tracing::error!("insert_ger failed: {err:#?}");
         }
+        tracing::info!("inserted GER with eth txn: {txn_hash}");
     } else {
         panic!("unhandled txn method {params_encoded:?}");
     }
 
-    Ok(txn.hash)
+    Ok(txn_hash)
 }

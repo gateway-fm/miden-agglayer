@@ -1,10 +1,9 @@
-use std::str::FromStr;
-
 use tracing::subscriber::Subscriber;
-use tracing_subscriber::layer::{Filter, SubscriberExt};
-use tracing_subscriber::{Layer, Registry};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-fn stdout_layer<S>() -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>
+fn stdout_layer<S>() -> Box<dyn Layer<S> + Send + Sync + 'static>
 where
     S: Subscriber,
     for<'a> S: tracing_subscriber::registry::LookupSpan<'a>,
@@ -23,37 +22,38 @@ where
 }
 
 /// Creates a filter from the `RUST_LOG` env var with a default of `INFO` if unset.
-///
-/// # Panics
-///
-/// Panics if `RUST_LOG` fails to parse.
-fn env_or_default_filter<S>() -> Box<dyn Filter<S> + Send + Sync + 'static> {
-    use tracing::level_filters::LevelFilter;
-    use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::filter::{FilterExt, Targets};
+fn env_or_default_filter() -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy()
+}
 
-    // `tracing` does not allow differentiating between invalid and missing env var so we manually
-    // do this instead. The alternative is to silently ignore parsing errors which I think is worse.
-    match std::env::var(EnvFilter::DEFAULT_ENV) {
-        Ok(rust_log) => FilterExt::boxed(
-            EnvFilter::from_str(&rust_log)
-                .expect("RUST_LOG should contain a valid filter configuration"),
-        ),
-        Err(std::env::VarError::NotUnicode(_)) => panic!("RUST_LOG contained non-unicode"),
-        Err(std::env::VarError::NotPresent) => {
-            // Default level is INFO, and additionally enable logs from axum extractor rejections.
-            FilterExt::boxed(
-                Targets::new()
-                    .with_default(LevelFilter::INFO)
-                    .with_target("axum::rejection", LevelFilter::TRACE),
-            )
-        },
+fn log_filter() -> anyhow::Result<EnvFilter> {
+    let directives = [
+        "h2=off",
+        "tower_http::trace=off",
+        "hyper_util::client=off",
+        "tower::buffer::worker=off",
+        "miden_client::sync=off",
+        "miden_prover=off",
+        "winter_prover=off",
+        "miden_processor=off",
+        "miden_client::transaction=off",
+        // more verbose debug logs
+        "miden_agglayer_service::service::debug=off",
+        "miden_agglayer_service::miden_client::sync::debug=off",
+        "miden_agglayer_service::service_send_raw_txn::debug=off",
+    ];
+    let mut filter = env_or_default_filter();
+    for directive in directives {
+        filter = filter.add_directive(directive.parse()?);
     }
+    Ok(filter)
 }
 
 pub fn setup_tracing() -> anyhow::Result<()> {
-    let subscriber = Registry::default().with(stdout_layer().with_filter(env_or_default_filter()));
-    tracing::subscriber::set_global_default(subscriber).map_err(Into::<anyhow::Error>::into)?;
+    let subscriber = Registry::default().with(stdout_layer().with_filter(log_filter()?));
+    tracing::subscriber::set_global_default(subscriber)?;
 
     // Register panic hook now that tracing is initialized.
     std::panic::set_hook(Box::new(|info| {

@@ -37,7 +37,31 @@ async fn json_rpc_endpoint(
 ) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let method = request.method.as_str();
-    tracing::debug!("JSON-RPC request: {}", method);
+    match method {
+        "eth_getBlockByNumber" => tracing::trace!("JSON-RPC {method}"),
+        "eth_call" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        },
+        "eth_gasPrice" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        },
+        "eth_estimateGas" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        },
+        "eth_getLogs" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        },
+        "eth_getTransactionCount" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        },
+        "eth_getTransactionByHash" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        },
+        "eth_getTransactionReceipt" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        },
+        _ => tracing::debug!("JSON-RPC {method}"),
+    }
 
     match method {
         "eth_getBalance" => {

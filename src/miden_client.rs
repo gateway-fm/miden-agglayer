@@ -133,7 +133,7 @@ impl MidenClient {
             let result = client.sync_state().await;
             match result {
                 Ok(summary) => {
-                    tracing::debug!("MidenClient::sync succeeded at block {}", summary.block_num);
+                    tracing::debug!(target: concat!(module_path!(), "::sync::debug"), "MidenClient::sync succeeded at block {}", summary.block_num);
                     return Ok(summary);
                 },
                 Err(ClientError::RpcError(RpcError::ConnectionError(_))) => {
