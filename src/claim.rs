@@ -1,4 +1,5 @@
 use crate::accounts_config::AccountsConfig;
+use crate::address_mapper::account_id_from_address_config;
 use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{Bytes, FixedBytes, U256};
@@ -124,12 +125,11 @@ fn create_claim(
 ) -> anyhow::Result<(Note, AccountId, Word)> {
     let claim_note_creator = accounts.service.0;
 
-    let destination_account_id =
-        if params.destinationAddress.to_string() == "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" {
-            accounts.wallet_hardhat.0
-        } else {
-            accounts.wallet_satoshi.0
-        };
+    let Some(destination_account_id) =
+        account_id_from_address_config(params.destinationAddress, &accounts)
+    else {
+        anyhow::bail!("create_claim: invalid destination address {}", params.destinationAddress);
+    };
 
     let amount = validate_amount(params.amount, faucet.origin_token_decimals, faucet.decimals)?;
 

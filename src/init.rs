@@ -33,7 +33,6 @@ impl From<Accounts> for AccountsConfig {
             faucet_eth: AccountIdBech32(accounts.faucet_eth.id()),
             faucet_agg: AccountIdBech32(accounts.faucet_agg.id()),
             wallet_hardhat: AccountIdBech32(accounts.wallet_hardhat.id()),
-            wallet_satoshi: AccountIdBech32(accounts.wallet_satoshi.id()),
         }
     }
 }

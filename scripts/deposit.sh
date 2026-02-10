@@ -3,6 +3,15 @@
 set -e
 set -o pipefail
 
+# $1 - beneficiary
+
+# hardhat default address
+beneficiary=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+if [[ -n "$1" ]]
+then
+    beneficiary="0x0000000000${1:2}"
+fi
+
 args=(
 	# L1 RPC node
 	--rpc-url http://$(kurtosis port print miden-cdk el-1-geth-lighthouse rpc)
@@ -14,8 +23,7 @@ args=(
 	--bridge-address 0xC8cbEBf950B9Df44d987c8619f092beA980fF038
 	# L2 rollup chain ID
 	--destination-network 2
-	# beneficiary
-	--destination-address 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+	--destination-address "$beneficiary"
 	--legacy=false
 	# --dry-run
 	# address of ERC20 token to use (default is zero)

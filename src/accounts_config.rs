@@ -12,7 +12,6 @@ pub struct AccountsConfig {
     pub faucet_eth: AccountIdBech32,
     pub faucet_agg: AccountIdBech32,
     pub wallet_hardhat: AccountIdBech32,
-    pub wallet_satoshi: AccountIdBech32,
 }
 
 #[derive(Debug, Clone)]

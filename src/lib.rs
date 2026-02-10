@@ -1,4 +1,5 @@
 mod accounts_config;
+mod address_mapper;
 mod amount;
 mod block_num_tracker;
 pub mod claim;
