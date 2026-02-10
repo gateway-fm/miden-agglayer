@@ -15,7 +15,7 @@ pub mod service_state;
 #[command(version, about, long_about = None)]
 struct Command {
     /// JSON-RPC HTTP service listening port
-    #[arg(long, default_value_t = 8125)]
+    #[arg(long, default_value_t = 8546)]
     port: u16,
 
     /// Directory for miden-client data [default: $HOME/.miden]
