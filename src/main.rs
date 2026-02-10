@@ -39,6 +39,7 @@ struct Command {
 async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
+    tracing::info!("{command:?}");
 
     let block_num_tracker = Arc::new(BlockNumTracker::new());
 
