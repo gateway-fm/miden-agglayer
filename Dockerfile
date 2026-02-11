@@ -6,7 +6,8 @@ RUN cargo build --profile=dev --bin=miden-agglayer-service
 
 FROM debian:bookworm-slim
 
-WORKDIR /app
+RUN apt-get update
+RUN apt-get install -y ca-certificates
 
 COPY --from=builder /usr/src/app/target/debug/miden-agglayer-service /usr/local/bin/
 RUN mkdir -p /var/lib/miden-agglayer-service

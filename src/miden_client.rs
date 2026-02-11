@@ -136,9 +136,9 @@ impl MidenClient {
                     tracing::debug!(target: concat!(module_path!(), "::sync::debug"), "MidenClient::sync succeeded at block {}", summary.block_num);
                     return Ok(summary);
                 },
-                Err(ClientError::RpcError(RpcError::ConnectionError(_))) => {
+                Err(ClientError::RpcError(RpcError::ConnectionError(err))) => {
                     tracing::error!(
-                        "MidenClient::sync failed to connect to the node, retrying in 5 seconds..."
+                        "MidenClient::sync failed to connect to the node: {err:?}, retrying in 5 seconds..."
                     );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 },
