@@ -109,6 +109,10 @@ check: ## cargo check: compile without producing binaries
 fix: ## cargo fix: cargo check and fix warnings if possible
 	cargo fix --workspace --profile=$(CARGO_PROFILE) --all-targets --allow-staged --allow-dirty
 
+.PHONY: docker
+docker: ## Build a docker image
+	docker build . -t miden-infra/miden-proxy:latest
+
 ## --- Setup --------------------------------------------------------------------------------------
 
 .PHONY: check-tools
