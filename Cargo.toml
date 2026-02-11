@@ -36,13 +36,22 @@ tracing            = { version = "0.1" }
 tracing-subscriber = { features = ["env-filter", "fmt", "json"], version = "0.3" }
 url                = { features = ["serde"], version = "2.5" }
 
-miden-base-agglayer       = { package = "miden-agglayer", version = "=0.13.2" }
-miden-client              = { features = ["tonic"], git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2" }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2" }
-miden-protocol            = { default-features = false, version = "=0.13.1" }
-# node-builder              = { git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2" }
+# miden-base
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.13.3" }
+miden-protocol      = { default-features = false, version = "=0.13.3" }
+miden-standards     = { default-features = false, version = "=0.13.3" }
 
-# pin transitive dependencies
-miden-protocol-macros = { version = "=0.13.1" }
-miden-standards       = { version = "=0.13.1" }
-miden-tx              = { version = "=0.13.1" }
+# miden-client
+miden-client = { default-features = false, features = [
+  "tonic",
+], git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
+# node-builder              = { git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
+
+# pin transitive dependencies of miden-client on miden-base
+miden-protocol-macros = { version = "=0.13.3" }
+miden-tx              = { default-features = false, version = "=0.13.3" }
+
+# pin transitive dependencies of miden-client on miden-node
+miden-node-proto-build     = { version = "=0.13.4" }
+miden-remote-prover-client = { version = "=0.13.4" }
