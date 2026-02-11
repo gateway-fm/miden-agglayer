@@ -88,7 +88,7 @@ async fn add_faucet(
         bridge_account_id,
     );
     let builder = builder.with_auth_component(AccountComponent::from(NoAuth));
-    let builder = builder.storage_mode(AccountStorageMode::Public);
+    let builder = builder.storage_mode(AccountStorageMode::Network);
     let builder = builder.with_component(BasicWallet);
     let account = builder.build()?;
     client.add_account(&account, false).await?;

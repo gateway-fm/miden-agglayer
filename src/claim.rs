@@ -4,16 +4,13 @@ use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{Bytes, FixedBytes, U256};
 use miden_base_agglayer::ClaimNoteParams;
-use miden_client::Word;
-use miden_client::rpc::domain::account::AccountStorageRequirements;
-use miden_client::transaction::{ForeignAccount, TransactionRequestBuilder};
+use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::crypto::utils::bytes_to_packed_u32_elements;
-use miden_protocol::note::{Note, NoteInputs, NoteRecipient, NoteTag};
+use miden_protocol::note::{Note, NoteTag};
 use miden_protocol::transaction::{OutputNote, TransactionId};
-use miden_standards::note::WellKnownNote;
 use std::cmp::min;
 use std::sync::{Arc, OnceLock};
 
@@ -122,7 +119,7 @@ fn create_claim(
     faucet: Faucet,
     accounts: AccountsConfig,
     rng_mut: &mut impl FeltRng,
-) -> anyhow::Result<(Note, AccountId, Word)> {
+) -> anyhow::Result<Note> {
     let claim_note_creator = accounts.service.0;
 
     let Some(destination_account_id) =
@@ -156,34 +153,7 @@ fn create_claim(
     };
 
     let claim_note = miden_base_agglayer::create_claim_note(claim_params)?;
-    Ok((claim_note, destination_account_id, p2id_serial_number))
-}
-
-async fn consume_claim_by_faucet(
-    claim_note: Note,
-    faucet: AccountId,
-    bridge: AccountId,
-    destination_account_id: AccountId,
-    p2id_serial_number: Word,
-    client: &mut MidenClientLib,
-) -> anyhow::Result<TransactionId> {
-    let p2id_inputs =
-        vec![destination_account_id.suffix(), destination_account_id.prefix().as_felt()];
-    let p2id_recipient = NoteRecipient::new(
-        p2id_serial_number,
-        WellKnownNote::P2ID.script(),
-        NoteInputs::new(p2id_inputs)?,
-    );
-
-    let foreign_bridge = ForeignAccount::public(bridge, AccountStorageRequirements::default())?;
-    let txn_request = TransactionRequestBuilder::new()
-        .input_notes([(claim_note, None); 1])
-        .expected_output_recipients(vec![p2id_recipient])
-        .foreign_accounts([foreign_bridge; 1])
-        .build()?;
-
-    let txn_id = client.submit_new_transaction(faucet, txn_request).await?;
-    Ok(txn_id)
+    Ok(claim_note)
 }
 
 async fn publish_claim_internal(
@@ -192,9 +162,7 @@ async fn publish_claim_internal(
     accounts: AccountsConfig,
 ) -> anyhow::Result<TransactionId> {
     let faucet = find_target_faucet(params.originTokenAddress, &accounts);
-    let (claim_note, destination_account_id, p2id_serial_number) =
-        create_claim(params, faucet, accounts.clone(), client.rng())?;
-    let claim_note_for_faucet = claim_note.clone();
+    let claim_note = create_claim(params, faucet, accounts.clone(), client.rng())?;
 
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes([OutputNote::Full(claim_note); 1])
@@ -203,26 +171,6 @@ async fn publish_claim_internal(
     let txn_id = client.submit_new_transaction(accounts.service.0, txn_request).await?;
     tracing::debug!("submitted claim note txn: {txn_id}");
 
-    loop {
-        let summary = client.sync_state().await?;
-        if summary.committed_transactions.contains(&txn_id) {
-            break;
-        } else {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
-    }
-    tracing::debug!("committed claim note txn: {txn_id}");
-
-    tracing::debug!("consume_claim_by_faucet...");
-    let txn_id = consume_claim_by_faucet(
-        claim_note_for_faucet,
-        faucet.id,
-        accounts.bridge.0,
-        destination_account_id,
-        p2id_serial_number,
-        client,
-    )
-    .await?;
     Ok(txn_id)
 }
 
