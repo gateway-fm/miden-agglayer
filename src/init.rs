@@ -42,11 +42,15 @@ fn add_auth_key(keystore: Arc<FilesystemKeyStore>) -> anyhow::Result<AuthFalcon5
     Ok(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
 }
 
-async fn deploy_account(client: &mut MidenClientLib, account_id: AccountId) -> anyhow::Result<()> {
-    tracing::info!("deploying faucet account {} ...", AccountIdBech32(account_id));
+async fn deploy_account(
+    client: &mut MidenClientLib,
+    account_id: AccountId,
+    name: &str,
+) -> anyhow::Result<()> {
+    tracing::info!("deploying {} account {} ...", name, AccountIdBech32(account_id));
     let dummy_txn = TransactionRequestBuilder::new().build()?;
     let txn_id = client.submit_new_transaction(account_id, dummy_txn).await?;
-    tracing::info!("deployed faucet account with txn_id {txn_id}");
+    tracing::info!("deployed {name} account with txn_id {txn_id}");
     Ok(())
 }
 
@@ -59,7 +63,7 @@ async fn add_bridge(
         .build()?;
     client.add_account(&account, false).await?;
 
-    deploy_account(client, account.id()).await?;
+    deploy_account(client, account.id(), "bridge").await?;
 
     Ok(account)
 }
@@ -84,7 +88,7 @@ async fn add_faucet(
     let account = builder.build()?;
     client.add_account(&account, false).await?;
 
-    deploy_account(client, account.id()).await?;
+    deploy_account(client, account.id(), format!("{token_symbol} faucet").as_str()).await?;
 
     Ok(account)
 }
