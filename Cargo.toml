@@ -55,3 +55,19 @@ miden-tx              = { default-features = false, version = "=0.13.3" }
 # pin transitive dependencies of miden-client on miden-node
 miden-node-proto-build     = { version = "=0.13.4" }
 miden-remote-prover-client = { version = "=0.13.4" }
+
+# pin transitive dependencies on miden-vm
+miden-air               = { default-features = false, version = "=0.20.2" }
+miden-assembly          = { default-features = false, version = "=0.20.2" }
+miden-assembly-syntax   = { default-features = false, version = "=0.20.2" }
+miden-core              = { default-features = false, version = "=0.20.2" }
+miden-core-lib          = { default-features = false, version = "=0.20.2" }
+miden-debug-types       = { default-features = false, version = "=0.20.2" }
+miden-mast-package      = { default-features = false, version = "=0.20.2" }
+miden-processor         = { default-features = false, version = "=0.20.2" }
+miden-prover            = { default-features = false, version = "=0.20.2" }
+miden-utils-core-derive = { default-features = false, version = "=0.20.2" }
+miden-utils-diagnostics = { default-features = false, version = "=0.20.2" }
+miden-utils-indexing    = { default-features = false, version = "=0.20.2" }
+miden-utils-sync        = { default-features = false, version = "=0.20.2" }
+miden-verifier          = { default-features = false, version = "=0.20.2" }
