@@ -1,11 +1,12 @@
 use anyhow::anyhow;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
-use miden_client::rpc::{Endpoint, RpcError};
+use miden_client::rpc::{Endpoint, GrpcError, RpcError};
 use miden_client::sync::SyncSummary;
 use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use std::env;
+use std::error::Error;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -128,6 +129,18 @@ impl MidenClient {
         self.join()
     }
 
+    fn unwrap_connection_error(client_err: ClientError) -> anyhow::Result<Box<dyn Error>> {
+        match client_err {
+            ClientError::RpcError(RpcError::ConnectionError(err)) => Ok(err),
+            ClientError::RpcError(RpcError::GrpcError {
+                error_kind: GrpcError::Unavailable,
+                source,
+                ..
+            }) => Ok(source.unwrap_or(Box::new(GrpcError::Unavailable))),
+            _ => Err(client_err.into()),
+        }
+    }
+
     async fn sync(client: &mut MidenClientLib) -> anyhow::Result<SyncSummary> {
         loop {
             let result = client.sync_state().await;
@@ -136,13 +149,13 @@ impl MidenClient {
                     tracing::debug!(target: concat!(module_path!(), "::sync::debug"), "MidenClient::sync succeeded at block {}", summary.block_num);
                     return Ok(summary);
                 },
-                Err(ClientError::RpcError(RpcError::ConnectionError(err))) => {
+                Err(client_err) => {
+                    let err = Self::unwrap_connection_error(client_err)?;
                     tracing::error!(
                         "MidenClient::sync failed to connect to the node: {err:?}, retrying in 5 seconds..."
                     );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 },
-                Err(err) => anyhow::bail!(err),
             }
         }
     }
