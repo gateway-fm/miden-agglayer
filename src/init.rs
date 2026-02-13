@@ -22,7 +22,6 @@ struct Accounts {
     faucet_eth: Account,
     faucet_agg: Account,
     wallet_hardhat: Account,
-    wallet_satoshi: Account,
 }
 
 impl From<Accounts> for AccountsConfig {
@@ -111,14 +110,12 @@ async fn add_accounts(
     let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 8u8, bridge.id()).await?;
     let faucet_agg = add_faucet(client, keystore.clone(), "AGG", 8u8, bridge.id()).await?;
     let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
-    let wallet_satoshi = add_wallet(client, keystore.clone()).await?;
     Ok(Accounts {
         service,
         bridge,
         faucet_eth,
         faucet_agg,
         wallet_hardhat,
-        wallet_satoshi,
     })
 }
 
