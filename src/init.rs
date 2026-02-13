@@ -9,8 +9,11 @@ use miden_client::keystore::FilesystemKeyStore;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::account::{Account, AccountId, AccountStorageMode};
+use miden_protocol::note::NoteType;
+use miden_protocol::transaction::OutputNote;
 use miden_standards::account::auth::AuthFalcon512Rpo;
 use miden_standards::account::wallets::BasicWallet;
+use miden_standards::note::create_p2id_note;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -123,6 +126,30 @@ async fn add_accounts(
     })
 }
 
+async fn register_p2id_script(
+    client: &mut MidenClientLib,
+    sender: AccountId,
+) -> anyhow::Result<()> {
+    tracing::info!("registering P2ID script...");
+    // dummy note to register its script on the node
+    let note = create_p2id_note(
+        sender,
+        /* target = */ sender,
+        /* assets = */ vec![],
+        NoteType::Public,
+        /* attachment = */ Default::default(),
+        client.rng(),
+    )?;
+
+    let txn = TransactionRequestBuilder::new()
+        .own_output_notes([OutputNote::Full(note); 1])
+        .build()?;
+
+    let txn_id = client.submit_new_transaction(sender, txn).await?;
+    tracing::info!("registered P2ID script with txn_id {txn_id}");
+    Ok(())
+}
+
 async fn init_internal(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
@@ -130,6 +157,7 @@ async fn init_internal(
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
     let accounts = add_accounts(client, keystore).await?;
+    register_p2id_script(client, accounts.service.id()).await?;
     let config = AccountsConfig::from(accounts);
     let config_path = accounts_config::save_config(config, miden_store_dir)?;
     Ok(config_path)
