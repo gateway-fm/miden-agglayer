@@ -8,10 +8,11 @@ use miden_client::crypto::FeltRng;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::AuthSecretKey;
-use miden_protocol::account::{Account, AccountId, AccountStorageMode};
+use miden_protocol::account::{Account, AccountComponent, AccountId, AccountStorageMode};
 use miden_protocol::note::NoteType;
 use miden_protocol::transaction::OutputNote;
 use miden_standards::account::auth::AuthFalcon512Rpo;
+use miden_standards::account::auth::NoAuth;
 use miden_standards::account::wallets::BasicWallet;
 use miden_standards::note::create_p2id_note;
 use std::path::PathBuf;
@@ -59,10 +60,10 @@ async fn deploy_account(
 
 async fn add_bridge(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    _keystore: Arc<FilesystemKeyStore>,
 ) -> anyhow::Result<Account> {
     let account = create_bridge_account_builder(client.rng().draw_word())
-        .with_auth_component(add_auth_key(keystore)?)
+        .with_auth_component(AccountComponent::from(NoAuth))
         .build()?;
     client.add_account(&account, false).await?;
 
@@ -73,7 +74,7 @@ async fn add_bridge(
 
 async fn add_faucet(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    _keystore: Arc<FilesystemKeyStore>,
     token_symbol: &str,
     decimals: u8,
     bridge_account_id: AccountId,
@@ -86,8 +87,9 @@ async fn add_faucet(
         max_supply,
         bridge_account_id,
     );
-    let builder = builder.with_auth_component(add_auth_key(keystore)?);
-    let builder = builder.storage_mode(AccountStorageMode::Public).with_component(BasicWallet);
+    let builder = builder.with_auth_component(AccountComponent::from(NoAuth));
+    let builder = builder.storage_mode(AccountStorageMode::Public);
+    let builder = builder.with_component(BasicWallet);
     let account = builder.build()?;
     client.add_account(&account, false).await?;
 
