@@ -5,7 +5,7 @@ use crate::hex::hex_decode_u64;
 use crate::service_get_txn_receipt::service_get_txn_receipt;
 use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
-use alloy::primitives::LogData;
+use alloy::primitives::{LogData, TxHash};
 use alloy::sol_types::SolEvent;
 use alloy_core::sol_types::SolCall;
 use alloy_rpc_types_eth::Filter;
@@ -18,6 +18,7 @@ use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
 use serde::Deserialize;
+use std::str::FromStr;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
@@ -191,9 +192,17 @@ async fn json_rpc_endpoint(
         },
 
         "eth_getTransactionByHash" => {
-            let _txn_hash_str: (String,) = request.parse_params()?;
-            // TODO: implement eth_getTransactionByHash
-            Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null))
+            let params: (String,) = request.parse_params()?;
+            let Ok(txn_hash) = TxHash::from_str(&params.0) else {
+                let error = JsonRpcError::new(
+                    JsonRpcErrorReason::InvalidParams,
+                    String::from("bad transaction hash"),
+                    serde_json::Value::Null,
+                );
+                return Err(JsonRpcResponse::error(answer_id, error));
+            };
+            let txn_opt = service.txn_manager.committed_txn(txn_hash);
+            Ok(JsonRpcResponse::success(answer_id, txn_opt))
         },
 
         "eth_getLogs" => {

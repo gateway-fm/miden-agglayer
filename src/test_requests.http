@@ -124,3 +124,16 @@ Content-Type: application/json
     "0x1536559b58d03e1152a02fa77af2a4bd38d3c3c30e5a6abec99946f403ab27f1"
   ]
 }
+
+###
+POST http://localhost:8546
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "eth_getTransactionByHash",
+  "params": [
+    "0xd9f6702caa311bacfa19e6fa5551a0726bc5fa4cc68f81afef9f01ef6edc0a23"
+  ]
+}

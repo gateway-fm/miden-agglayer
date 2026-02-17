@@ -1,6 +1,6 @@
 use crate::hex::hex_decode_prefixed;
 use crate::service_state::ServiceState;
-use alloy::consensus::{EthereumTxEnvelope, TxEip4844Variant, TxEnvelope};
+use alloy::consensus::TxEnvelope;
 use alloy::eips::Decodable2718;
 use alloy::primitives::TxHash;
 use alloy_core::sol_types::SolCall;
@@ -13,9 +13,7 @@ struct TransactionData {
     pub input: alloy::primitives::Bytes,
 }
 
-fn unwrap_txn_envelope(
-    txn_envelope: EthereumTxEnvelope<TxEip4844Variant>,
-) -> anyhow::Result<TransactionData> {
+fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionData> {
     let data = match txn_envelope {
         TxEnvelope::Eip1559(txn_signed) => {
             let hash = *txn_signed.hash();
@@ -39,7 +37,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
-    let txn = unwrap_txn_envelope(txn_envelope)?;
+    let txn = unwrap_txn_envelope(txn_envelope.clone())?;
     let txn_hash = txn.hash;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
@@ -53,7 +51,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         match result {
             Ok(txn_id) => {
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
-                service.txn_manager.begin(txn_hash, Some(txn_id))?;
+                service.txn_manager.begin(txn_hash, Some(txn_id), txn_envelope)?;
                 let block_num = service.block_num_tracker.latest();
                 service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
             },
@@ -72,7 +70,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         match result {
             Ok(_) => {
                 tracing::info!("inserted GER with eth txn: {txn_hash}");
-                service.txn_manager.begin(txn_hash, None)?;
+                service.txn_manager.begin(txn_hash, None, txn_envelope)?;
                 service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
             },
             Err(err) => {
