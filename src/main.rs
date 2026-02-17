@@ -42,12 +42,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("{command:?}");
 
     let block_num_tracker = Arc::new(BlockNumTracker::new());
+    let txn_manager = Arc::new(TxnManager::new());
 
     let miden_store_dir = command.miden_store_dir;
     let client = MidenClient::new(
         miden_store_dir.clone(),
         command.miden_node,
-        Some(block_num_tracker.clone()),
+        vec![block_num_tracker.clone(), txn_manager.clone()],
     )?;
 
     if command.init || !config_path_exists(miden_store_dir.clone())? {
@@ -60,7 +61,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let accounts = load_config(miden_store_dir)?;
-    let txn_manager = TxnManager::new();
     let state =
         ServiceState::new(client, accounts, command.chain_id, block_num_tracker, txn_manager);
 

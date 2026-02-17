@@ -18,7 +18,7 @@ impl BlockNumTracker {
 }
 
 impl SyncListener for BlockNumTracker {
-    fn on_sync(&self, summary: SyncSummary) {
+    fn on_sync(&self, summary: &SyncSummary) {
         let mut latest_ref = self.latest.write().unwrap();
         *latest_ref = summary.block_num.as_u64();
     }

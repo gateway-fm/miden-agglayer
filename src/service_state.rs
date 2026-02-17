@@ -19,14 +19,14 @@ impl ServiceState {
         accounts: AccountsConfig,
         chain_id: u64,
         block_num_tracker: Arc<BlockNumTracker>,
-        txn_manager: TxnManager,
+        txn_manager: Arc<TxnManager>,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
             accounts,
             chain_id,
             block_num_tracker,
-            txn_manager: Arc::new(txn_manager),
+            txn_manager,
         }
     }
 }

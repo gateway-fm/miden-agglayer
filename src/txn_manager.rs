@@ -1,7 +1,9 @@
+use crate::miden_client::SyncListener;
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::{Recovered, SignerRecoverable};
 use alloy::primitives::{Address, TxHash};
 use lru::LruCache;
+use miden_client::sync::SyncSummary;
 use miden_protocol::transaction::TransactionId;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
@@ -90,5 +92,11 @@ impl TxnManager {
 impl Default for TxnManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SyncListener for TxnManager {
+    fn on_sync(&self, _summary: &SyncSummary) {
+        // TODO: update result and block_num on pending transactions
     }
 }
