@@ -82,7 +82,6 @@ node-init: ## Bootstrap the test node
 
 .PHONY: start-node
 start-node: ## Start the test node
-	@# RUST_LOG=info cargo run --profile=$(CARGO_PROFILE) --bin test_node --locked
 	if [[ ! -d "$(NODE_DATA_DIR)" ]]; then $(MAKE) node-init; fi
 	RUST_LOG=info,miden_node_utils::tracing::grpc=off,miden_node_ntx_builder::builder=warn,miden_node_block_producer::batch_builder=warn,miden-block-producer=warn,miden_node_utils::lru_cache=off,miden-store=warn,miden_node_validator=warn,miden_node_ntx_builder::coordinator=warn,miden_node_ntx_builder::actor=warn,miden-ntx-builder=warn \
 	../miden-node/target/release/miden-node bundled start --rpc.url "http://0.0.0.0:57291" --data-directory "$(NODE_DATA_DIR)"

@@ -44,7 +44,6 @@ miden-client = { default-features = false, features = [
   "tonic",
 ], git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
 miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
-# node-builder              = { git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
 
 # pin transitive dependencies of miden-client on miden-base
 miden-protocol-macros = { version = "=0.13.3" }
