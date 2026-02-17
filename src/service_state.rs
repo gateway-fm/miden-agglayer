@@ -7,6 +7,7 @@ pub struct ServiceState {
     pub accounts: AccountsConfig,
     pub chain_id: u64,
     pub block_num_tracker: Arc<BlockNumTracker>,
+    pub txn_manager: Arc<TxnManager>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -18,12 +19,14 @@ impl ServiceState {
         accounts: AccountsConfig,
         chain_id: u64,
         block_num_tracker: Arc<BlockNumTracker>,
+        txn_manager: TxnManager,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
             accounts,
             chain_id,
             block_num_tracker,
+            txn_manager: Arc::new(txn_manager),
         }
     }
 }

@@ -60,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let accounts = load_config(miden_store_dir)?;
-    let state = ServiceState::new(client, accounts, command.chain_id, block_num_tracker);
+    let txn_manager = TxnManager::new();
+    let state =
+        ServiceState::new(client, accounts, command.chain_id, block_num_tracker, txn_manager);
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;

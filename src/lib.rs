@@ -8,11 +8,13 @@ pub mod hex;
 pub mod init;
 pub mod logging;
 mod miden_client;
+mod txn_manager;
 
 pub const COMPONENT: &str = "miden-agglayer";
 
 pub use block_num_tracker::BlockNumTracker;
 pub use miden_client::MidenClient;
+pub use txn_manager::TxnManager;
 
 #[derive(Clone)]
 pub struct AccountsConfig(accounts_config::AccountsConfig);

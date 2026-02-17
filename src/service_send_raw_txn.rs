@@ -50,11 +50,18 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
 
         let result = claim::publish_claim(params, &service.miden_client, service.accounts).await;
-        if let Err(err) = &result {
-            tracing::error!("publish_claim failed: {err:#?}");
+        match result {
+            Ok(txn_id) => {
+                tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
+                service.txn_manager.begin(txn_hash, Some(txn_id))?;
+                let block_num = service.block_num_tracker.latest();
+                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
+            },
+            Err(err) => {
+                tracing::error!("publish_claim failed: {err:#?}");
+                return Err(err);
+            },
         }
-        let txn_id = result?;
-        tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
     } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
         tracing::debug!("insertGlobalExitRoot call");
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
@@ -62,10 +69,17 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 
         let block_num = service.block_num_tracker.latest();
         let result = ger::insert_ger(params, txn_hash, block_num).await;
-        if let Err(err) = &result {
-            tracing::error!("insert_ger failed: {err:#?}");
+        match result {
+            Ok(_) => {
+                tracing::info!("inserted GER with eth txn: {txn_hash}");
+                service.txn_manager.begin(txn_hash, None)?;
+                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
+            },
+            Err(err) => {
+                tracing::error!("insert_ger failed: {err:#?}");
+                return Err(err);
+            },
         }
-        tracing::info!("inserted GER with eth txn: {txn_hash}");
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");
         anyhow::bail!("unhandled txn method {params_encoded:?}");

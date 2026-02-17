@@ -6,13 +6,16 @@ use std::str::FromStr;
 
 // polycli polls receipts to get the eth_sendRawTransaction status
 // it logs cumulativeGasUsed and transactionHash
-// TODO: return null if the transaction is not yet included onto the blockchain, return status=0 for errors
+// return null if the transaction is not yet included onto the blockchain, return status=0 for errors
 pub async fn service_get_txn_receipt(
     service: ServiceState,
     txn_hash: String,
 ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope>>> {
-    let status = true;
-    let block_num = service.block_num_tracker.latest();
+    let txn_hash = TxHash::from_str(&txn_hash)?;
+    let Some((result, block_num)) = service.txn_manager.receipt(txn_hash) else {
+        return Ok(None);
+    };
+    let status = result.is_ok();
 
     let mut receipt_inner = ReceiptWithBloom::<Receipt<Log>>::default();
     receipt_inner.receipt.status = Eip658Value::Eip658(status);
@@ -20,7 +23,7 @@ pub async fn service_get_txn_receipt(
 
     let receipt = TransactionReceipt {
         inner: ReceiptEnvelope::Eip1559(receipt_inner),
-        transaction_hash: TxHash::from_str(&txn_hash)?,
+        transaction_hash: txn_hash,
         transaction_index: None,
         block_hash: None,
         block_number: Some(block_num),

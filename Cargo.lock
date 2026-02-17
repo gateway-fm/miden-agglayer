@@ -2968,6 +2968,7 @@ dependencies = [
  "clap",
  "hex",
  "http",
+ "lru",
  "miden-agglayer",
  "miden-air",
  "miden-assembly",
