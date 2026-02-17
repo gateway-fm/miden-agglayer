@@ -32,6 +32,33 @@ alloy_core::sol! {
     uint32 public networkID;
 }
 
+#[repr(i32)]
+enum ServiceErrorCode {
+    SendRawTransaction = 1,
+    GetTransactionReceipt,
+}
+
+impl From<ServiceErrorCode> for JsonRpcErrorReason {
+    fn from(value: ServiceErrorCode) -> Self {
+        Self::ApplicationError(value as i32)
+    }
+}
+
+fn json_rpc_response_from_result<T: serde::Serialize>(
+    result: anyhow::Result<T>,
+    answer_id: axum_jrpc::Id,
+    error_code: ServiceErrorCode,
+) -> JrpcResult {
+    match result {
+        Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
+        Err(error) => {
+            let error =
+                JsonRpcError::new(error_code.into(), error.to_string(), serde_json::Value::Null);
+            Err(JsonRpcResponse::error(answer_id, error))
+        },
+    }
+}
+
 async fn json_rpc_endpoint(
     State(service): State<ServiceState>,
     request: JsonRpcExtractor,
@@ -87,7 +114,7 @@ async fn json_rpc_endpoint(
                 any => {
                     let Ok(num) = hex_decode_u64(any) else {
                         let error = JsonRpcError::new(
-                            JsonRpcErrorReason::ApplicationError(4),
+                            JsonRpcErrorReason::InvalidParams,
                             String::from("bad block number"),
                             serde_json::Value::Null,
                         );
@@ -138,7 +165,7 @@ async fn json_rpc_endpoint(
             if let Some(data_hex) = txn_param.data.or(txn_param.input) {
                 let Ok(data) = hex_decode_prefixed(&data_hex) else {
                     let error = JsonRpcError::new(
-                        JsonRpcErrorReason::ApplicationError(3),
+                        JsonRpcErrorReason::InvalidParams,
                         String::from("bad transaction.data"),
                         serde_json::Value::Null,
                     );
@@ -161,34 +188,18 @@ async fn json_rpc_endpoint(
         "eth_sendRawTransaction" => {
             let params: (String,) = request.parse_params()?;
             let result = service_send_raw_txn(service, params.0).await;
-            match result {
-                Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
-                Err(error) => {
-                    let error = JsonRpcError::new(
-                        JsonRpcErrorReason::ApplicationError(1),
-                        error.to_string(),
-                        serde_json::Value::Null,
-                    );
-                    Err(JsonRpcResponse::error(answer_id, error))
-                },
-            }
+            json_rpc_response_from_result(result, answer_id, ServiceErrorCode::SendRawTransaction)
         },
 
         // polycli polls receipts to get the eth_sendRawTransaction status
         "eth_getTransactionReceipt" => {
             let params: (String,) = request.parse_params()?;
             let result = service_get_txn_receipt(service, params.0).await;
-            match result {
-                Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
-                Err(error) => {
-                    let error = JsonRpcError::new(
-                        JsonRpcErrorReason::ApplicationError(2),
-                        error.to_string(),
-                        serde_json::Value::Null,
-                    );
-                    Err(JsonRpcResponse::error(answer_id, error))
-                },
-            }
+            json_rpc_response_from_result(
+                result,
+                answer_id,
+                ServiceErrorCode::GetTransactionReceipt,
+            )
         },
 
         "eth_getTransactionByHash" => {
