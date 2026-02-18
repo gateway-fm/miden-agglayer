@@ -1,7 +1,8 @@
 use crate::miden_client::SyncListener;
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::{Recovered, SignerRecoverable};
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, LogData, TxHash};
+use alloy_rpc_types_eth::{Filter, Log};
 use lru::LruCache;
 use miden_client::sync::SyncSummary;
 use miden_protocol::transaction::TransactionId;
@@ -15,6 +16,7 @@ struct TxnReceipt {
     signer: Address,
     result: Option<Result<(), String>>,
     block_num: u64,
+    logs: Vec<Log>,
 }
 
 pub struct TxnManager {
@@ -47,6 +49,7 @@ impl TxnManager {
             signer,
             result: None,
             block_num: 0,
+            logs: Vec::new(),
         };
         _ = transactions.put(txn_hash, receipt);
         Ok(())
@@ -57,6 +60,7 @@ impl TxnManager {
         txn_hash: TxHash,
         result: Result<(), String>,
         block_num: u64,
+        logs: Vec<LogData>,
     ) -> anyhow::Result<()> {
         let mut transactions = self.transactions.lock().unwrap();
         let Some(receipt) = transactions.get_mut(&txn_hash) else {
@@ -64,6 +68,16 @@ impl TxnManager {
         };
         receipt.result = Some(result);
         receipt.block_num = block_num;
+        receipt.logs = logs
+            .into_iter()
+            .map(|log_data| -> Log {
+                let mut log: Log<LogData> = Log::<LogData>::default();
+                log.inner.data = log_data;
+                log.transaction_hash = Some(txn_hash);
+                log.block_number = Some(block_num);
+                log
+            })
+            .collect();
         Ok(())
     }
 
@@ -86,6 +100,28 @@ impl TxnManager {
             effective_gas_price: None,
         };
         Some(txn)
+    }
+
+    pub fn logs(&self, filter: Filter) -> Vec<Log> {
+        tracing::trace!("TxnManager.logs filter: {:?}", filter);
+        let mut results = Vec::new();
+        let transactions = self.transactions.lock().unwrap();
+        for (_, receipt) in transactions.iter() {
+            for log in &receipt.logs {
+                let matches_block_range =
+                    filter.matches_block_range(log.block_number.unwrap_or_default());
+                if !matches_block_range {
+                    continue;
+                }
+                let matches_topics = filter.matches_topics(log.topics());
+                if !matches_topics {
+                    continue;
+                }
+                results.push(log.clone());
+            }
+        }
+
+        results
     }
 }
 

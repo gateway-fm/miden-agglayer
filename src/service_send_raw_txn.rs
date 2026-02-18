@@ -52,8 +52,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             Ok(txn_id) => {
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
                 service.txn_manager.begin(txn_hash, Some(txn_id), txn_envelope)?;
-                let block_num = service.block_num_tracker.latest();
-                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
+                let block_num = service.block_num_tracker.latest() + 1;
+                service.txn_manager.commit(txn_hash, Ok(()), block_num, Vec::new())?;
             },
             Err(err) => {
                 tracing::error!("publish_claim failed: {err:#?}");
@@ -65,13 +65,13 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
 
-        let block_num = service.block_num_tracker.latest();
-        let result = ger::insert_ger(params, txn_hash, block_num).await;
+        let result = ger::insert_ger(params).await;
         match result {
-            Ok(_) => {
+            Ok(log_data) => {
                 tracing::info!("inserted GER with eth txn: {txn_hash}");
                 service.txn_manager.begin(txn_hash, None, txn_envelope)?;
-                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
+                let block_num = service.block_num_tracker.latest() + 1;
+                service.txn_manager.commit(txn_hash, Ok(()), block_num, vec![log_data])?;
             },
             Err(err) => {
                 tracing::error!("insert_ger failed: {err:#?}");

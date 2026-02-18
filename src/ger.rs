@@ -1,6 +1,5 @@
-use alloy::primitives::{BlockNumber, FixedBytes, TxHash};
-use std::sync;
-use sync::Mutex;
+use alloy::primitives::{FixedBytes, LogData};
+use alloy::sol_types::SolEvent;
 
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/sovereignChains/GlobalExitRootManagerL2SovereignChain.sol#L166
@@ -26,22 +25,9 @@ impl UpdateHashChainValue {
     }
 }
 
-static LATEST_GER: Mutex<Option<(FixedBytes<32>, TxHash, BlockNumber)>> = Mutex::new(None);
-
-pub async fn insert_ger(
-    params: insertGlobalExitRootCall,
-    txn_hash: TxHash,
-    block_num: BlockNumber,
-) -> anyhow::Result<()> {
+pub async fn insert_ger(params: insertGlobalExitRootCall) -> anyhow::Result<LogData> {
     let new_ger = params.root;
-    let mut latest_ger = LATEST_GER.lock().unwrap();
-    *latest_ger = Some((new_ger, txn_hash, block_num));
-    Ok(())
-}
-
-pub fn latest_ger_update_event() -> Option<(UpdateHashChainValue, TxHash, BlockNumber)> {
-    let latest_ger_guard = LATEST_GER.lock().unwrap();
-    let latest_ger = (*latest_ger_guard)?;
-    let event = UpdateHashChainValue::new(latest_ger.0, FixedBytes::default());
-    Some((event, latest_ger.1, latest_ger.2))
+    let event = UpdateHashChainValue::new(new_ger, FixedBytes::default());
+    let log_data = event.encode_log_data();
+    Ok(log_data)
 }
