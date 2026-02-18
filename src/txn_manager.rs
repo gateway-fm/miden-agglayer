@@ -1,7 +1,7 @@
 use crate::miden_client::SyncListener;
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::{Recovered, SignerRecoverable};
-use alloy::primitives::{Address, LogData, TxHash};
+use alloy::primitives::{Address, BlockNumber, LogData, TxHash};
 use alloy_rpc_types_eth::{Filter, Log};
 use lru::LruCache;
 use miden_client::sync::SyncSummary;
@@ -15,7 +15,7 @@ struct TxnReceipt {
     envelope: TxEnvelope,
     signer: Address,
     result: Option<Result<(), String>>,
-    block_num: u64,
+    block_num: BlockNumber,
     logs: Vec<Log>,
 }
 
@@ -59,7 +59,7 @@ impl TxnManager {
         &self,
         txn_hash: TxHash,
         result: Result<(), String>,
-        block_num: u64,
+        block_num: BlockNumber,
         logs: Vec<LogData>,
     ) -> anyhow::Result<()> {
         let mut transactions = self.transactions.lock().unwrap();
@@ -81,7 +81,7 @@ impl TxnManager {
         Ok(())
     }
 
-    pub fn receipt(&self, txn_hash: TxHash) -> Option<(Result<(), String>, u64)> {
+    pub fn receipt(&self, txn_hash: TxHash) -> Option<(Result<(), String>, BlockNumber)> {
         let mut transactions = self.transactions.lock().unwrap();
         let receipt = transactions.get(&txn_hash)?;
         let result = receipt.result.clone()?;

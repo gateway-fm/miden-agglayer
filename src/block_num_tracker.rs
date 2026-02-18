@@ -1,9 +1,10 @@
 use crate::miden_client::SyncListener;
+use alloy::primitives::BlockNumber;
 use miden_client::sync::SyncSummary;
 use std::sync::RwLock;
 
 pub struct BlockNumTracker {
-    latest: RwLock<u64>,
+    latest: RwLock<BlockNumber>,
 }
 
 impl BlockNumTracker {
@@ -12,7 +13,7 @@ impl BlockNumTracker {
         Self { latest }
     }
 
-    pub fn latest(&self) -> u64 {
+    pub fn latest(&self) -> BlockNumber {
         *self.latest.read().unwrap()
     }
 }
