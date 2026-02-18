@@ -2,7 +2,7 @@ use crate::accounts_config::AccountsConfig;
 use crate::address_mapper::account_id_from_address_config;
 use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
-use alloy::primitives::{Bytes, FixedBytes, U256};
+use alloy::primitives::{BlockNumber, Bytes, FixedBytes, U256};
 use miden_base_agglayer::ClaimNoteParams;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::Felt;
@@ -156,36 +156,49 @@ fn create_claim(
     Ok(claim_note)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PublishClaimTxn {
+    pub txn_id: TransactionId,
+    pub expires_at: BlockNumber,
+}
+
 async fn publish_claim_internal(
     params: claimAssetCall,
     client: &mut MidenClientLib,
     accounts: AccountsConfig,
-) -> anyhow::Result<TransactionId> {
+    latest_block_num: BlockNumber,
+) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_target_faucet(params.originTokenAddress, &accounts);
     let claim_note = create_claim(params, faucet, accounts.clone(), client.rng())?;
 
+    const EXPIRATION_DELTA: u16 = 10;
+    let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
+
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes([OutputNote::Full(claim_note); 1])
+        .expiration_delta(EXPIRATION_DELTA)
         .build()?;
 
     let txn_id = client.submit_new_transaction(accounts.service.0, txn_request).await?;
     tracing::debug!("submitted claim note txn: {txn_id}");
 
-    Ok(txn_id)
+    Ok(PublishClaimTxn { txn_id, expires_at })
 }
 
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
     accounts: crate::AccountsConfig,
-) -> anyhow::Result<TransactionId> {
-    let result = Arc::new(OnceLock::<TransactionId>::new());
+    latest_block_num: BlockNumber,
+) -> anyhow::Result<PublishClaimTxn> {
+    let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_internal = result.clone();
 
-    let future = client.with(|client| {
+    let future = client.with(move |client| {
         Box::new(async move {
-            let txn_id = publish_claim_internal(params, client, accounts.0).await?;
-            result_internal.set(txn_id).unwrap();
+            let result_value =
+                publish_claim_internal(params, client, accounts.0, latest_block_num).await?;
+            result_internal.set(result_value).unwrap();
             Ok(())
         })
     });

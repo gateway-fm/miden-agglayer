@@ -11,12 +11,14 @@ use std::sync::Mutex;
 
 #[derive(Debug)]
 struct TxnReceipt {
-    _id: Option<TransactionId>,
+    id: Option<TransactionId>,
     envelope: TxEnvelope,
     signer: Address,
+    expires_at: Option<BlockNumber>,
+
     result: Option<Result<(), String>>,
     block_num: BlockNumber,
-    logs: Vec<Log>,
+    logs: Vec<LogData>,
 }
 
 pub struct TxnManager {
@@ -37,6 +39,8 @@ impl TxnManager {
         txn_hash: TxHash,
         txn_id: Option<TransactionId>,
         txn_envelope: TxEnvelope,
+        expires_at: Option<BlockNumber>,
+        logs: Vec<LogData>,
     ) -> anyhow::Result<()> {
         let mut transactions = self.transactions.lock().unwrap();
         if transactions.contains(&txn_hash) {
@@ -44,12 +48,13 @@ impl TxnManager {
         }
         let signer = txn_envelope.recover_signer()?;
         let receipt = TxnReceipt {
-            _id: txn_id,
+            id: txn_id,
             envelope: txn_envelope,
             signer,
+            expires_at,
             result: None,
             block_num: 0,
-            logs: Vec::new(),
+            logs,
         };
         _ = transactions.put(txn_hash, receipt);
         Ok(())
@@ -60,7 +65,6 @@ impl TxnManager {
         txn_hash: TxHash,
         result: Result<(), String>,
         block_num: BlockNumber,
-        logs: Vec<LogData>,
     ) -> anyhow::Result<()> {
         let mut transactions = self.transactions.lock().unwrap();
         let Some(receipt) = transactions.get_mut(&txn_hash) else {
@@ -68,16 +72,17 @@ impl TxnManager {
         };
         receipt.result = Some(result);
         receipt.block_num = block_num;
-        receipt.logs = logs
-            .into_iter()
-            .map(|log_data| -> Log {
-                let mut log: Log<LogData> = Log::<LogData>::default();
-                log.inner.data = log_data;
-                log.transaction_hash = Some(txn_hash);
-                log.block_number = Some(block_num);
-                log
-            })
-            .collect();
+
+        let txn_id = &receipt.id;
+        match &receipt.result {
+            Some(Ok(_)) => {
+                tracing::info!("TxnManager: committed eth txn: {txn_hash}; miden txn: {txn_id:?}")
+            },
+            Some(Err(err)) => tracing::error!(
+                "TxnManager: failed eth txn: {txn_hash}; miden txn: {txn_id:?}; reason: {err}"
+            ),
+            None => {},
+        }
         Ok(())
     }
 
@@ -102,26 +107,72 @@ impl TxnManager {
         Some(txn)
     }
 
+    fn make_log(log_data: LogData, txn_hash: TxHash, block_num: BlockNumber) -> Log {
+        let mut log = Log::<LogData>::default();
+        log.inner.data = log_data;
+        log.transaction_hash = Some(txn_hash);
+        log.block_number = Some(block_num);
+        log
+    }
+
     pub fn logs(&self, filter: Filter) -> Vec<Log> {
         tracing::trace!("TxnManager.logs filter: {:?}", filter);
-        let mut results = Vec::new();
+        let mut results: Vec<Log> = Vec::new();
         let transactions = self.transactions.lock().unwrap();
-        for (_, receipt) in transactions.iter() {
-            for log in &receipt.logs {
-                let matches_block_range =
-                    filter.matches_block_range(log.block_number.unwrap_or_default());
+        for (txn_hash, receipt) in transactions.iter() {
+            for log_data in &receipt.logs {
+                let matches_block_range = filter.matches_block_range(receipt.block_num);
                 if !matches_block_range {
                     continue;
                 }
-                let matches_topics = filter.matches_topics(log.topics());
+                let matches_topics = filter.matches_topics(log_data.topics());
                 if !matches_topics {
                     continue;
                 }
-                results.push(log.clone());
+                let log = Self::make_log(log_data.clone(), *txn_hash, receipt.block_num);
+                results.push(log);
             }
         }
 
         results
+    }
+
+    pub fn pending_txn_by_id(&self, id: TransactionId) -> Option<TxHash> {
+        let transactions = self.transactions.lock().unwrap();
+        for (txn_hash, receipt) in transactions.iter() {
+            if receipt.result.is_none() && (receipt.id == Some(id)) {
+                return Some(*txn_hash);
+            }
+        }
+        None
+    }
+
+    fn commit_pending(&self, ids: &Vec<TransactionId>, block_num: BlockNumber) {
+        for id in ids {
+            if let Some(hash) = self.pending_txn_by_id(*id) {
+                _ = self.commit(hash, Ok(()), block_num);
+            }
+        }
+    }
+
+    fn expired_pending(&self, block_num: BlockNumber) -> Vec<TxHash> {
+        let mut results = Vec::<TxHash>::new();
+        let transactions = self.transactions.lock().unwrap();
+        for (txn_hash, receipt) in transactions.iter() {
+            if receipt.result.is_none()
+                && (block_num >= receipt.expires_at.unwrap_or(BlockNumber::MAX))
+            {
+                results.push(*txn_hash);
+            }
+        }
+        results
+    }
+
+    fn expire_pending(&self, block_num: BlockNumber) {
+        let expired_hashes = self.expired_pending(block_num);
+        for hash in expired_hashes {
+            _ = self.commit(hash, Err(String::from("expired")), block_num);
+        }
     }
 }
 
@@ -132,7 +183,8 @@ impl Default for TxnManager {
 }
 
 impl SyncListener for TxnManager {
-    fn on_sync(&self, _summary: &SyncSummary) {
-        // TODO: update result and block_num on pending transactions
+    fn on_sync(&self, summary: &SyncSummary) {
+        self.commit_pending(&summary.committed_transactions, summary.block_num.as_u64());
+        self.expire_pending(summary.block_num.as_u64());
     }
 }

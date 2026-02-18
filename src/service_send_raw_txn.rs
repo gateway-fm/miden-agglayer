@@ -47,13 +47,24 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let params = claimAssetCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
 
-        let result = claim::publish_claim(params, &service.miden_client, service.accounts).await;
+        let result = claim::publish_claim(
+            params,
+            &service.miden_client,
+            service.accounts,
+            service.block_num_tracker.latest(),
+        )
+        .await;
         match result {
-            Ok(txn_id) => {
+            Ok(txn) => {
+                let txn_id = txn.txn_id;
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
-                service.txn_manager.begin(txn_hash, Some(txn_id), txn_envelope)?;
-                let block_num = service.block_num_tracker.latest() + 1;
-                service.txn_manager.commit(txn_hash, Ok(()), block_num, Vec::new())?;
+                service.txn_manager.begin(
+                    txn_hash,
+                    Some(txn_id),
+                    txn_envelope,
+                    Some(txn.expires_at),
+                    Vec::new(),
+                )?;
             },
             Err(err) => {
                 tracing::error!("publish_claim failed: {err:#?}");
@@ -69,9 +80,9 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         match result {
             Ok(log_data) => {
                 tracing::info!("inserted GER with eth txn: {txn_hash}");
-                service.txn_manager.begin(txn_hash, None, txn_envelope)?;
+                service.txn_manager.begin(txn_hash, None, txn_envelope, None, vec![log_data])?;
                 let block_num = service.block_num_tracker.latest() + 1;
-                service.txn_manager.commit(txn_hash, Ok(()), block_num, vec![log_data])?;
+                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
             },
             Err(err) => {
                 tracing::error!("insert_ger failed: {err:#?}");
