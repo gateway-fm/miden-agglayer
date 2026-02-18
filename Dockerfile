@@ -2,14 +2,14 @@ FROM rustlang/rust:nightly-bookworm-slim AS builder
 
 WORKDIR /usr/src/app
 COPY . .
-RUN cargo build --profile=dev --bin=miden-agglayer-service
+RUN cargo build --profile=release --bin=miden-agglayer-service
 
 FROM debian:bookworm-slim
 
 RUN apt-get update
 RUN apt-get install -y ca-certificates
 
-COPY --from=builder /usr/src/app/target/debug/miden-agglayer-service /usr/local/bin/
+COPY --from=builder /usr/src/app/target/release/miden-agglayer-service /usr/local/bin/
 RUN mkdir -p /var/lib/miden-agglayer-service
 
 # 8546 - JSON-RPC HTTP
