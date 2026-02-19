@@ -210,7 +210,7 @@ async fn json_rpc_endpoint(
                 );
                 return Err(JsonRpcResponse::error(answer_id, error));
             };
-            let txn_opt = service.txn_manager.committed_txn(txn_hash);
+            let txn_opt = service.txn_manager.txn(txn_hash);
             Ok(JsonRpcResponse::success(answer_id, txn_opt))
         },
 

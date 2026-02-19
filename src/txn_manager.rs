@@ -93,14 +93,18 @@ impl TxnManager {
         Some((result, receipt.block_num))
     }
 
-    pub fn committed_txn(&self, txn_hash: TxHash) -> Option<alloy::rpc::types::Transaction> {
+    pub fn txn(&self, txn_hash: TxHash) -> Option<alloy::rpc::types::Transaction> {
         let mut transactions = self.transactions.lock().unwrap();
         let receipt = transactions.get(&txn_hash)?;
         let envelope = receipt.envelope.clone();
         let txn = alloy::rpc::types::Transaction {
             inner: Recovered::new_unchecked(envelope, receipt.signer),
             block_hash: None,
-            block_number: Some(receipt.block_num),
+            block_number: if receipt.result.is_some() {
+                Some(receipt.block_num)
+            } else {
+                None
+            },
             transaction_index: None,
             effective_gas_price: None,
         };
