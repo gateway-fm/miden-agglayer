@@ -1,7 +1,9 @@
 FROM rustlang/rust:nightly-bookworm-slim AS builder
 
 WORKDIR /usr/src/app
-COPY . .
+COPY src src
+COPY axum-jrpc axum-jrpc
+COPY Cargo.* .
 RUN cargo build --profile=release --bin=miden-agglayer-service
 
 FROM debian:bookworm-slim
