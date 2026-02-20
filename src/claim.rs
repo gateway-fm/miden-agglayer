@@ -2,7 +2,8 @@ use crate::accounts_config::AccountsConfig;
 use crate::address_mapper::account_id_from_address_config;
 use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
-use alloy::primitives::{BlockNumber, Bytes, FixedBytes, U256};
+use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData, U256};
+use alloy::sol_types::SolEvent;
 use miden_base_agglayer::ClaimNoteParams;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::Felt;
@@ -29,6 +30,18 @@ alloy_core::sol! {
         address destinationAddress,
         uint256 amount,
         bytes calldata metadata
+    );
+}
+
+alloy_core::sol! {
+    // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L139
+    #[derive(Debug)]
+    event ClaimEvent(
+        uint256 globalIndex,
+        uint32 originNetwork,
+        address originAddress,
+        address destinationAddress,
+        uint256 amount
     );
 }
 
@@ -83,6 +96,18 @@ impl From<claimAssetCall> for ClaimNoteInputs {
             destination_address: value.destinationAddress.0.0,
             _amount_u256: fixed_felts_from_u256(value.amount),
             metadata: fixed_felts_from_bytes(value.metadata),
+        }
+    }
+}
+
+impl From<claimAssetCall> for ClaimEvent {
+    fn from(value: claimAssetCall) -> Self {
+        Self {
+            globalIndex: value.globalIndex,
+            originNetwork: value.originNetwork,
+            originAddress: value.originTokenAddress,
+            destinationAddress: value.destinationAddress,
+            amount: value.amount,
         }
     }
 }
@@ -156,10 +181,11 @@ fn create_claim(
     Ok(claim_note)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PublishClaimTxn {
     pub txn_id: TransactionId,
     pub expires_at: BlockNumber,
+    pub log: LogData,
 }
 
 async fn publish_claim_internal(
@@ -169,7 +195,7 @@ async fn publish_claim_internal(
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_target_faucet(params.originTokenAddress, &accounts);
-    let claim_note = create_claim(params, faucet, accounts.clone(), client.rng())?;
+    let claim_note = create_claim(params.clone(), faucet, accounts.clone(), client.rng())?;
 
     const EXPIRATION_DELTA: u16 = 10;
     let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
@@ -182,7 +208,10 @@ async fn publish_claim_internal(
     let txn_id = client.submit_new_transaction(accounts.service.0, txn_request).await?;
     tracing::debug!("submitted claim note txn: {txn_id}");
 
-    Ok(PublishClaimTxn { txn_id, expires_at })
+    let event = ClaimEvent::from(params);
+    let log = event.encode_log_data();
+
+    Ok(PublishClaimTxn { txn_id, expires_at, log })
 }
 
 pub async fn publish_claim(
@@ -204,5 +233,5 @@ pub async fn publish_claim(
     });
     future.await?;
 
-    Ok(*result.get().unwrap())
+    Ok(result.get().unwrap().clone())
 }

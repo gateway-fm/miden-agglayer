@@ -63,7 +63,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                     Some(txn_id),
                     txn_envelope,
                     Some(txn.expires_at),
-                    Vec::new(),
+                    vec![txn.log],
                 )?;
             },
             Err(err) => {
