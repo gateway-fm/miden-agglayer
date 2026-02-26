@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let client = MidenClient::new(
         miden_store_dir.clone(),
         command.miden_node,
-        vec![block_num_tracker.clone(), txn_manager.clone()],
+        vec![txn_manager.clone(), block_num_tracker.clone()],
     )?;
 
     if command.init || !config_path_exists(miden_store_dir.clone())? {
