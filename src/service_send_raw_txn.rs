@@ -3,10 +3,13 @@ use crate::service_state::ServiceState;
 use alloy::consensus::TxEnvelope;
 use alloy::eips::Decodable2718;
 use alloy::primitives::TxHash;
+use alloy::sol_types::SolEvent;
 use alloy_core::sol_types::SolCall;
 use miden_agglayer_service::claim::claimAssetCall;
+use miden_agglayer_service::exit::bridge_event_reversing_claim;
 use miden_agglayer_service::ger::insertGlobalExitRootCall;
 use miden_agglayer_service::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 struct TransactionData {
     pub hash: TxHash,
@@ -33,6 +36,8 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
     Ok(data)
 }
 
+static DEPOSIT_COUNT: AtomicU32 = AtomicU32::new(1);
+
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
@@ -58,12 +63,19 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             Ok(txn) => {
                 let txn_id = txn.txn_id;
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
+
+                let mut logs = vec![txn.log];
+                let deposit_count = DEPOSIT_COUNT.fetch_add(1, Ordering::SeqCst);
+                let reverse_event =
+                    bridge_event_reversing_claim(txn.event, service.chain_id, deposit_count);
+                logs.push(reverse_event.encode_log_data());
+
                 service.txn_manager.begin(
                     txn_hash,
                     Some(txn_id),
                     txn_envelope,
                     Some(txn.expires_at),
-                    vec![txn.log],
+                    logs,
                 )?;
             },
             Err(err) => {

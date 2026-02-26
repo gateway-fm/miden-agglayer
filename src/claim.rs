@@ -185,6 +185,7 @@ fn create_claim(
 pub struct PublishClaimTxn {
     pub txn_id: TransactionId,
     pub expires_at: BlockNumber,
+    pub event: ClaimEvent,
     pub log: LogData,
 }
 
@@ -211,7 +212,7 @@ async fn publish_claim_internal(
     let event = ClaimEvent::from(params);
     let log = event.encode_log_data();
 
-    Ok(PublishClaimTxn { txn_id, expires_at, log })
+    Ok(PublishClaimTxn { txn_id, expires_at, event, log })
 }
 
 pub async fn publish_claim(
