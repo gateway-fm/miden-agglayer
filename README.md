@@ -109,4 +109,5 @@ This requires several cargo tools:
 * `aggkit-001` container logs errors during GER insertion "failed to add tx to get monitored: already exists", see: https://github.com/agglayer/aggkit/issues/1479
 * only supports fixed faucets from the config file, waiting to implement a faucet registry
 * GER insertion is mocked, not forwarded to Miden
+* ClaimEvent is produced after the 1st ClaimNote service transaction succeeds. It must be delayed to wait for the NTX builder's 2nd transaction on the faucet to succeed (and produce P2ID) or fail.  
 * AggSender is not configured, L2-to-L1 flow not ready
