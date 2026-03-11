@@ -23,8 +23,10 @@ clap               = { features = ["derive"], version = "4.5" }
 hex                = { version = "0.4" }
 http               = { version = "1.3" }
 lru                = { default-features = false, version = "0.16" }
+parking_lot        = { version = "0.12" }
 serde              = { features = ["derive"], version = "1.0" }
 serde_json         = { version = "1.0" }
+sha3               = { version = "0.10" }
 thiserror          = { default-features = false, version = "2.0" }
 tokio              = { features = ["macros", "rt-multi-thread", "signal"], version = "1.48" }
 toml               = { version = "0.9" }
@@ -35,36 +37,13 @@ tracing-subscriber = { features = ["env-filter", "fmt", "json"], version = "0.3"
 url                = { features = ["serde"], version = "2.5" }
 
 # miden-base
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.13.3" }
-miden-protocol      = { default-features = false, version = "=0.13.3" }
-miden-standards     = { default-features = false, version = "=0.13.3" }
+miden-base-agglayer = { package = "miden-agglayer", version = "0.14.0-alpha" }
+miden-protocol      = { default-features = false, features = ["std"], version = "0.14.0-alpha" }
+miden-standards     = { default-features = false, version = "0.14.0-alpha" }
+miden-tx            = { default-features = false, version = "0.14.0-alpha" }
 
 # miden-client
 miden-client = { default-features = false, features = [
   "tonic",
-], git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "exp-agglayer-v0.2.2" }
-
-# pin transitive dependencies of miden-client on miden-base
-miden-protocol-macros = { version = "=0.13.3" }
-miden-tx              = { default-features = false, version = "=0.13.3" }
-
-# pin transitive dependencies of miden-client on miden-node
-miden-node-proto-build     = { version = "=0.13.4" }
-miden-remote-prover-client = { version = "=0.13.4" }
-
-# pin transitive dependencies on miden-vm
-miden-air               = { default-features = false, version = "=0.20.2" }
-miden-assembly          = { default-features = false, version = "=0.20.2" }
-miden-assembly-syntax   = { default-features = false, version = "=0.20.2" }
-miden-core              = { default-features = false, version = "=0.20.2" }
-miden-core-lib          = { default-features = false, version = "=0.20.2" }
-miden-debug-types       = { default-features = false, version = "=0.20.2" }
-miden-mast-package      = { default-features = false, version = "=0.20.2" }
-miden-processor         = { default-features = false, version = "=0.20.2" }
-miden-prover            = { default-features = false, version = "=0.20.2" }
-miden-utils-core-derive = { default-features = false, version = "=0.20.2" }
-miden-utils-diagnostics = { default-features = false, version = "=0.20.2" }
-miden-utils-indexing    = { default-features = false, version = "=0.20.2" }
-miden-utils-sync        = { default-features = false, version = "=0.20.2" }
-miden-verifier          = { default-features = false, version = "=0.20.2" }
+], git = "https://github.com/0xMiden/miden-client.git", branch = "agglayer-integration-tests" }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "agglayer-integration-tests" }

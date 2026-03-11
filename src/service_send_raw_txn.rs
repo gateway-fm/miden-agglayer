@@ -18,17 +18,23 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
         TxEnvelope::Eip1559(txn_signed) => {
             let hash = *txn_signed.hash();
             let txn = txn_signed.strip_signature();
-            TransactionData { hash, input: txn.input }
-        },
+            TransactionData {
+                hash,
+                input: txn.input,
+            }
+        }
         TxEnvelope::Legacy(txn_signed) => {
             let hash = *txn_signed.hash();
             let txn = txn_signed.strip_signature();
-            TransactionData { hash, input: txn.input }
-        },
+            TransactionData {
+                hash,
+                input: txn.input,
+            }
+        }
         _ => {
             tracing::error!("unhandled txn type {:?}", txn_envelope.tx_type());
             anyhow::bail!("unhandled txn type {:?}", txn_envelope.tx_type());
-        },
+        }
     };
     Ok(data)
 }
@@ -55,39 +61,63 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         )
         .await;
         match result {
-            Ok(txn) => {
-                let txn_id = txn.txn_id;
+            Ok(claim_result) => {
+                let txn_id = claim_result.txn_id;
+                let claim_note_id = claim_result.claim_note_id.clone();
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
                 service.txn_manager.begin(
                     txn_hash,
                     Some(txn_id),
                     txn_envelope,
-                    Some(txn.expires_at),
-                    vec![txn.log],
+                    Some(claim_result.expires_at),
+                    vec![claim_result.log],
                 )?;
-            },
+                // Defer receipt until CLAIM note is consumed by faucet
+                if let Some(note_id) = claim_note_id {
+                    let submit_block = service.block_num_tracker.latest();
+                    service.txn_manager.begin_awaiting_consumption(
+                        txn_hash,
+                        note_id,
+                        submit_block,
+                    )?;
+                }
+            }
             Err(err) => {
                 tracing::error!("publish_claim failed: {err:#?}");
                 return Err(err);
-            },
+            }
         }
     } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
         tracing::debug!("insertGlobalExitRoot call");
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
 
-        let result = ger::insert_ger(params).await;
+        let result = ger::insert_ger(
+            params,
+            &service.miden_client,
+            service.accounts.clone(),
+            &service.log_store,
+            &service.block_state,
+            txn_hash,
+        )
+        .await;
         match result {
-            Ok(log_data) => {
+            Ok(ger_result) => {
                 tracing::info!("inserted GER with eth txn: {txn_hash}");
-                service.txn_manager.begin(txn_hash, None, txn_envelope, None, vec![log_data])?;
-                let block_num = service.block_num_tracker.latest() + 1;
+                service.txn_manager.begin(
+                    txn_hash,
+                    None,
+                    txn_envelope,
+                    None,
+                    vec![ger_result.log_data],
+                )?;
+                let block_num = service.block_num_tracker.latest();
                 service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
-            },
+            }
             Err(err) => {
                 tracing::error!("insert_ger failed: {err:#?}");
                 return Err(err);
-            },
+            }
         }
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");

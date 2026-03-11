@@ -1,5 +1,7 @@
 use crate::service_state::ServiceState;
 use clap::Parser;
+use miden_agglayer_service::block_state::BlockState;
+use miden_agglayer_service::log_synthesis::LogStore;
 use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -43,12 +45,18 @@ async fn main() -> anyhow::Result<()> {
 
     let block_num_tracker = Arc::new(BlockNumTracker::new());
     let txn_manager = Arc::new(TxnManager::new());
+    let block_state = Arc::new(BlockState::new());
+    let log_store = Arc::new(LogStore::new());
 
     let miden_store_dir = command.miden_store_dir;
     let client = MidenClient::new(
         miden_store_dir.clone(),
         command.miden_node,
-        vec![txn_manager.clone(), block_num_tracker.clone()],
+        vec![
+            txn_manager.clone(),
+            block_num_tracker.clone(),
+            block_state.clone(),
+        ],
     )?;
 
     if command.init || !config_path_exists(miden_store_dir.clone())? {
@@ -61,8 +69,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let accounts = load_config(miden_store_dir)?;
-    let state =
-        ServiceState::new(client, accounts, command.chain_id, block_num_tracker, txn_manager);
+    let state = ServiceState::new(
+        client,
+        accounts,
+        command.chain_id,
+        block_num_tracker,
+        txn_manager,
+        block_state,
+        log_store,
+    );
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;

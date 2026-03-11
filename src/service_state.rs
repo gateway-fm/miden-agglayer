@@ -1,3 +1,5 @@
+use miden_agglayer_service::block_state::BlockState;
+use miden_agglayer_service::log_synthesis::LogStore;
 use miden_agglayer_service::*;
 use std::sync::Arc;
 
@@ -8,6 +10,8 @@ pub struct ServiceState {
     pub chain_id: u64,
     pub block_num_tracker: Arc<BlockNumTracker>,
     pub txn_manager: Arc<TxnManager>,
+    pub block_state: Arc<BlockState>,
+    pub log_store: Arc<LogStore>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -20,6 +24,8 @@ impl ServiceState {
         chain_id: u64,
         block_num_tracker: Arc<BlockNumTracker>,
         txn_manager: Arc<TxnManager>,
+        block_state: Arc<BlockState>,
+        log_store: Arc<LogStore>,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
@@ -27,6 +33,8 @@ impl ServiceState {
             chain_id,
             block_num_tracker,
             txn_manager,
+            block_state,
+            log_store,
         }
     }
 }

@@ -1,14 +1,16 @@
-mod accounts_config;
+pub mod accounts_config;
 mod address_mapper;
 mod amount;
 mod block_num_tracker;
+pub mod block_state;
 pub mod claim;
 pub mod exit;
 pub mod ger;
 pub mod hex;
 pub mod init;
+pub mod log_synthesis;
 pub mod logging;
-mod miden_client;
+pub mod miden_client;
 mod txn_manager;
 
 pub const COMPONENT: &str = "miden-agglayer";

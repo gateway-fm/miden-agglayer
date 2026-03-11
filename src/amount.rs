@@ -41,18 +41,28 @@ mod tests {
         let gwei = U256::from(10).pow(U256::from(9));
 
         assert_eq!(validate_amount(U256::from(123), 0, 0), Ok(123));
-        assert_eq!(validate_amount(U256::from(0), DECIMALS, DECIMALS_OUT), Ok(0));
+        assert_eq!(
+            validate_amount(U256::from(0), DECIMALS, DECIMALS_OUT),
+            Ok(0)
+        );
         assert_eq!(
             validate_amount(U256::from(123), DECIMALS, DECIMALS_OUT),
             Err(AmountError::LossyTruncation)
         );
-        assert_eq!(validate_amount(U256::from(1230).mul(gwei), DECIMALS, DECIMALS_OUT), Ok(123));
+        assert_eq!(
+            validate_amount(U256::from(1230).mul(gwei), DECIMALS, DECIMALS_OUT),
+            Ok(123)
+        );
         assert_eq!(
             validate_amount(U256::from(42).mul(eth_wei), DECIMALS, DECIMALS_OUT),
             Ok(4200000000)
         );
         assert_eq!(
-            validate_amount(U256::from(42).mul(eth_wei).add(U256::from(1)), DECIMALS, DECIMALS_OUT),
+            validate_amount(
+                U256::from(42).mul(eth_wei).add(U256::from(1)),
+                DECIMALS,
+                DECIMALS_OUT
+            ),
             Err(AmountError::LossyTruncation)
         );
         assert_eq!(
