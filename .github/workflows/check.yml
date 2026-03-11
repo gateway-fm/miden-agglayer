@@ -1,0 +1,22 @@
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE: release
+    steps:
+      - uses: actions/checkout@main
+      - uses: Swatinem/rust-cache@v2
+      - run: make install-tools
+      - run: make lint
+      - run: make build
+      - run: make test
