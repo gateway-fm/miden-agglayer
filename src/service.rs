@@ -6,7 +6,6 @@ use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
 use alloy::primitives::TxHash;
 use alloy_core::sol_types::SolCall;
-use alloy_rpc_types_eth::Filter;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
@@ -245,25 +244,18 @@ async fn json_rpc_endpoint(
         }
 
         "eth_getLogs" => {
-            // Combine logs from both LogStore (synthetic GER/claim events) and TxnManager
+            // Return synthetic logs from LogStore (GER/claim events with proper formatting).
+            // TxnManager logs are intentionally excluded: they duplicate LogStore entries
+            // but use alloy's Log type which serializes Optional fields as JSON null,
+            // causing Go's hexutil.Uint unmarshaling to fail in the bridge-service.
             let raw_params: (serde_json::Value,) = request.parse_params()?;
 
-            // Query LogStore for synthetic logs
             let log_filter: LogFilter =
-                serde_json::from_value(raw_params.0.clone()).unwrap_or_default();
+                serde_json::from_value(raw_params.0).unwrap_or_default();
             let current_block = service.block_num_tracker.latest();
             let synthetic_logs = service.log_store.get_logs(&log_filter, current_block);
-            let mut json_logs: Vec<serde_json::Value> =
+            let json_logs: Vec<serde_json::Value> =
                 synthetic_logs.iter().map(|l| l.to_json()).collect();
-
-            // Also query TxnManager for alloy-based logs
-            let filter: Filter = serde_json::from_value(raw_params.0).unwrap_or_default();
-            let txn_logs = service.txn_manager.logs(filter);
-            for log in &txn_logs {
-                if let Ok(v) = serde_json::to_value(log) {
-                    json_logs.push(v);
-                }
-            }
 
             Ok(JsonRpcResponse::success(answer_id, json_logs))
         }

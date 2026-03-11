@@ -76,7 +76,10 @@ pub async fn insert_ger(
     txn_hash: TxHash,
 ) -> anyhow::Result<GerInsertResult> {
     let ger_bytes: [u8; 32] = params.root.0;
-    let block_number = block_state.current_block_number();
+    // Store event at current_block + 1 so it appears in a block the bridge-service
+    // hasn't synced yet. With forceSyncChunk=true, the bridge never re-queries old
+    // blocks, so events at the current block are missed if the bridge already synced it.
+    let block_number = block_state.current_block_number() + 1;
     let block_hash = block_state.get_block_hash(block_number);
 
     // Check dedup before doing any work

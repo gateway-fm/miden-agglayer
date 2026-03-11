@@ -4,6 +4,7 @@ use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
 use miden_base_agglayer::{EthAddressFormat, create_agglayer_faucet, create_bridge_account};
 use miden_client::Felt;
+use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
@@ -86,7 +87,7 @@ async fn add_faucet(
     decimals: u8,
     bridge_account_id: AccountId,
 ) -> anyhow::Result<Account> {
-    let max_supply = Felt::try_from(0xffffffff00000000u64).unwrap();
+    let max_supply = Felt::new(FungibleAsset::MAX_AMOUNT);
     let origin_token_address = EthAddressFormat::new([0u8; 20]);
     let origin_network = 0u32;
     let scale = 10u8; // 18 (ETH) - 8 (Miden) = 10
