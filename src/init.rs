@@ -2,7 +2,9 @@ use crate::accounts_config;
 use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
-use miden_base_agglayer::{EthAddressFormat, create_agglayer_faucet, create_bridge_account};
+use miden_base_agglayer::{
+    ConfigAggBridgeNote, EthAddressFormat, create_agglayer_faucet, create_bridge_account,
+};
 use miden_client::Felt;
 use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
@@ -146,6 +148,35 @@ async fn add_accounts(
     })
 }
 
+async fn register_faucet_in_bridge(
+    client: &mut MidenClientLib,
+    service_id: AccountId,
+    bridge_id: AccountId,
+    faucet_id: AccountId,
+    faucet_name: &str,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        "registering {} faucet {} in bridge {}...",
+        faucet_name,
+        AccountIdBech32(faucet_id),
+        AccountIdBech32(bridge_id),
+    );
+
+    let note = ConfigAggBridgeNote::create(faucet_id, service_id, bridge_id, client.rng())
+        .map_err(|e| anyhow::anyhow!("failed to create ConfigAggBridgeNote: {e}"))?;
+
+    let txn = TransactionRequestBuilder::new()
+        .own_output_notes([OutputNote::Full(note); 1])
+        .build()?;
+
+    let txn_id = client.submit_new_transaction(service_id, txn).await?;
+    tracing::info!(
+        "registered {} faucet in bridge with txn_id {txn_id}",
+        faucet_name,
+    );
+    Ok(())
+}
+
 async fn register_p2id_script(
     client: &mut MidenClientLib,
     sender: AccountId,
@@ -177,6 +208,25 @@ async fn init_internal(
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
     let accounts = add_accounts(client, keystore).await?;
+
+    // Register faucets in bridge's faucet registry (required for CLAIM note FPI validation)
+    register_faucet_in_bridge(
+        client,
+        accounts.service.id(),
+        accounts.bridge.id(),
+        accounts.faucet_eth.id(),
+        "ETH",
+    )
+    .await?;
+    register_faucet_in_bridge(
+        client,
+        accounts.service.id(),
+        accounts.bridge.id(),
+        accounts.faucet_agg.id(),
+        "AGG",
+    )
+    .await?;
+
     register_p2id_script(client, accounts.service.id()).await?;
     let config = AccountsConfig::from(accounts);
     let config_path = accounts_config::save_config(config, miden_store_dir)?;

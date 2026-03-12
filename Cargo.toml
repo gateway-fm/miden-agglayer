@@ -17,6 +17,7 @@ alloy-core = { features = ["sol-types"], version = "1.5.2" }
 alloy-rpc-types-eth = { version = "1.5.2" }
 
 anyhow = { default-features = false, version = "1.0" }
+async-trait = "0.1"
 axum = { features = ["tokio"], version = "0.8" }
 axum-jrpc = { path = "axum-jrpc" }
 clap = { features = ["derive"], version = "4.5" }

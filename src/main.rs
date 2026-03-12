@@ -44,9 +44,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("{command:?}");
 
     let block_num_tracker = Arc::new(BlockNumTracker::new());
-    let txn_manager = Arc::new(TxnManager::new());
     let block_state = Arc::new(BlockState::new());
     let log_store = Arc::new(LogStore::new());
+    let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
 
     let miden_store_dir = command.miden_store_dir;
     let client = MidenClient::new(

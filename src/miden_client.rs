@@ -26,8 +26,12 @@ struct Request {
     closure: BoxFutureFactory,
 }
 
+#[async_trait::async_trait]
 pub trait SyncListener: Send + Sync {
     fn on_sync(&self, summary: &SyncSummary);
+    async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct MidenClient {
@@ -169,13 +173,15 @@ impl MidenClient {
         }
     }
 
-    fn on_sync(
+    async fn on_sync(
         result: anyhow::Result<SyncSummary>,
+        client: &mut MidenClientLib,
         listeners: &[Arc<dyn SyncListener>],
     ) -> anyhow::Result<()> {
         let summary = result?;
         for listener in listeners {
             listener.on_sync(&summary);
+            listener.on_post_sync(client).await?;
         }
         Ok(())
     }
@@ -201,7 +207,7 @@ impl MidenClient {
 
         // initial sync
         tokio::select! {
-            result = Self::sync(&mut client) => Self::on_sync(result, &sync_listeners)?,
+            result = Self::sync(&mut client) => Self::on_sync(result, &mut client, &sync_listeners).await?,
             _ = &mut done_receiver => {
                 tracing::debug!("MidenClient::run loop done");
                 return Ok(());
@@ -218,7 +224,7 @@ impl MidenClient {
                 },
                 _ = sync_interval.tick() => {
                     tokio::select! {
-                        result = Self::sync(&mut client) => Self::on_sync(result, &sync_listeners)?,
+                        result = Self::sync(&mut client) => Self::on_sync(result, &mut client, &sync_listeners).await?,
                         _ = &mut done_receiver => break,
                     }
                 },

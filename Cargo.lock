@@ -2997,6 +2997,7 @@ dependencies = [
  "alloy-core",
  "alloy-rpc-types-eth",
  "anyhow",
+ "async-trait",
  "axum",
  "axum-jrpc",
  "clap",

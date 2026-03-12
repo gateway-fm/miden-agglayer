@@ -1,13 +1,16 @@
-use crate::miden_client::SyncListener;
+use crate::block_state::BlockState;
+use crate::log_synthesis::{LogStore, SyntheticLog};
+use crate::miden_client::{MidenClientLib, SyncListener};
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::{Recovered, SignerRecoverable};
 use alloy::primitives::{Address, BlockNumber, LogData, TxHash};
 use alloy_rpc_types_eth::{Filter, Log};
 use lru::LruCache;
 use miden_client::sync::SyncSummary;
+use miden_protocol::note::NoteId;
 use miden_protocol::transaction::TransactionId;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Maximum blocks to wait for CLAIM note consumption before reverting.
 const CLAIM_CONSUMPTION_TIMEOUT_BLOCKS: u64 = 50;
@@ -31,16 +34,20 @@ struct TxnReceipt {
 
 pub struct TxnManager {
     transactions: Mutex<LruCache<TxHash, TxnReceipt>>,
+    log_store: Arc<LogStore>,
+    block_state: Arc<BlockState>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<TxnManager>();
 
 impl TxnManager {
-    pub fn new() -> Self {
+    pub fn new(log_store: Arc<LogStore>, block_state: Arc<BlockState>) -> Self {
         let transactions = LruCache::new(NonZeroUsize::new(10_000).unwrap());
         Self {
             transactions: Mutex::new(transactions),
+            log_store,
+            block_state,
         }
     }
 
@@ -147,8 +154,8 @@ impl TxnManager {
     pub fn receipt(&self, txn_hash: TxHash) -> Option<(Result<(), String>, BlockNumber)> {
         let transactions = self.transactions.lock().unwrap();
         let receipt = transactions.peek(&txn_hash)?;
-        // If awaiting consumption (has claim_note_id but no result), return None (pending)
-        if receipt.claim_note_id.is_some() && receipt.result.is_none() {
+        // If awaiting consumption (has claim_note_id), return None (pending) until cleared
+        if receipt.claim_note_id.is_some() {
             return None;
         }
         let result = receipt.result.clone()?;
@@ -279,17 +286,75 @@ impl TxnManager {
     }
 }
 
-impl Default for TxnManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+#[async_trait::async_trait]
 impl SyncListener for TxnManager {
     fn on_sync(&self, summary: &SyncSummary) {
         let block_num = summary.block_num.as_u64();
         self.commit_pending(&summary.committed_transactions, block_num);
         self.expire_pending(block_num);
         self.expire_timed_out_claims(block_num);
+    }
+
+    async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
+        let awaiting: Vec<(TxHash, String)> = {
+            let transactions = self.transactions.lock().unwrap();
+            transactions
+                .iter()
+                .filter_map(|(hash, receipt)| {
+                    // Only check consumption if the creation txn is already committed
+                    if receipt.result.is_some() {
+                        receipt.claim_note_id.as_ref().map(|id| (*hash, id.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        for (txn_hash, note_id_str) in awaiting {
+            let note_id = NoteId::try_from_hex(&note_id_str)
+                .map_err(|e| anyhow::anyhow!("bad note id {note_id_str}: {e}"))?;
+
+            // Query client for note status. miden-client::Client::get_input_note is async.
+            let note_opt = client
+                .get_input_note(note_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to get note {note_id_str}: {e}"))?;
+
+            if let Some(note) = note_opt
+                && note.is_consumed()
+            {
+                tracing::info!(
+                    "CLAIM note {note_id_str} consumed, finalizing eth txn {txn_hash}"
+                );
+
+                let mut transactions = self.transactions.lock().unwrap();
+                if let Some(receipt) = transactions.get_mut(&txn_hash) {
+                    receipt.claim_note_id = None;
+                    let logs = receipt.logs.clone();
+                    let block_num = receipt.block_num;
+                    let signer = receipt.signer;
+                    drop(transactions);
+
+                    // Add logs to LogStore once consumed
+                    for log_data in logs {
+                        let block_hash = self.block_state.get_block_hash(block_num);
+                        let log = SyntheticLog {
+                            address: format!("{:#x}", signer),
+                            topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
+                            data: log_data.data.to_string(),
+                            block_number: block_num,
+                            block_hash,
+                            transaction_hash: format!("{txn_hash:#x}"),
+                            transaction_index: 0,
+                            log_index: 0,
+                            removed: false,
+                        };
+                        self.log_store.add_log(log);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
