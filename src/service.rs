@@ -79,6 +79,12 @@ async fn json_rpc_endpoint(
         "eth_getLogs" => {
             tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
         }
+        "net_version" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        }
+        "eth_getBlockTransactionCountByNumber" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        }
         "eth_getTransactionCount" => {
             tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
         }
@@ -262,6 +268,15 @@ async fn json_rpc_endpoint(
 
         "eth_getBalance" => {
             let _params: (String, String) = request.parse_params()?;
+            Ok(JsonRpcResponse::success(answer_id, "0x0"))
+        }
+
+        "net_version" => {
+            Ok(JsonRpcResponse::success(answer_id, format!("{}", service.chain_id)))
+        }
+
+        "eth_getBlockTransactionCountByNumber" => {
+            let _params: (String,) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         }
 
