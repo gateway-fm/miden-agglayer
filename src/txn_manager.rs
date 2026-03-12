@@ -136,10 +136,10 @@ impl TxnManager {
         if receipt.result.is_some() {
             return false;
         }
-        if let Some(submit_block) = receipt.claim_submit_block {
-            if current_block > submit_block + CLAIM_CONSUMPTION_TIMEOUT_BLOCKS {
-                return true;
-            }
+        if let Some(submit_block) = receipt.claim_submit_block
+            && current_block > submit_block + CLAIM_CONSUMPTION_TIMEOUT_BLOCKS
+        {
+            return true;
         }
         false
     }
@@ -215,10 +215,10 @@ impl TxnManager {
 
     fn commit_pending(&self, ids: &[TransactionId], block_num: BlockNumber) {
         for id in ids {
-            if let Some(hash) = self.pending_txn_by_id(*id) {
-                if let Err(e) = self.commit(hash, Ok(()), block_num) {
-                    tracing::warn!("Failed to commit transaction {hash}: {e}");
-                }
+            if let Some(hash) = self.pending_txn_by_id(*id)
+                && let Err(e) = self.commit(hash, Ok(()), block_num)
+            {
+                tracing::warn!("Failed to commit transaction {hash}: {e}");
             }
         }
     }

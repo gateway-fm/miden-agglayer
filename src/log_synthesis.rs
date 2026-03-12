@@ -210,6 +210,7 @@ impl LogStore {
         self.pending_events.write().push(log);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_claim_event(
         &self,
         bridge_address: &str,
@@ -256,7 +257,7 @@ impl LogStore {
         let new_hash_chain = {
             let mut hash_chain = self.hash_chain_value.write();
             let mut hasher = Keccak256::new();
-            hasher.update(&*hash_chain);
+            hasher.update(*hash_chain);
             hasher.update(global_exit_root);
             let result: [u8; 32] = hasher.finalize().into();
             *hash_chain = result;

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const HARDHAT_ADDRESS: Address = Address::new([
-    0xf3, 0x9F, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xF6, 0xF4, 0xce, 0x6a, 0xB8, 0x82, 0x72, 0x79, 0xcf,
-    0xfF, 0xb9, 0x22, 0x66,
+    0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf,
+    0xff, 0xb9, 0x22, 0x66,
 ]);
 
 pub fn is_miden_compatible_address(address: Address) -> bool {
@@ -39,7 +39,7 @@ fn derive_account_id(address: Address) -> anyhow::Result<AccountId> {
 
     // Set metadata bits for RegularAccountUpdatableCode (0b01) + Public (0b00) + Version0 (0)
     // Byte 7 (LS byte of prefix): (storage_mode << 6) | (account_type << 4) | version
-    id_bytes[7] = (0b00 << 6) | (0b01 << 4) | 0b0000; // 0x10
+    id_bytes[7] = 0b01 << 4; // 0x10
 
     // Clear MSB of prefix (byte 0) — Felt requires < 2^63
     id_bytes[0] &= 0x7F;
