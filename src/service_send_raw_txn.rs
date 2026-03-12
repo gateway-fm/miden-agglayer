@@ -5,7 +5,7 @@ use alloy::eips::Decodable2718;
 use alloy::primitives::TxHash;
 use alloy_core::sol_types::SolCall;
 use miden_agglayer_service::claim::claimAssetCall;
-use miden_agglayer_service::ger::insertGlobalExitRootCall;
+use miden_agglayer_service::ger::{insertGlobalExitRootCall, updateExitRootCall};
 use miden_agglayer_service::*;
 
 struct TransactionData {
@@ -37,6 +37,33 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
         }
     };
     Ok(data)
+}
+
+fn handle_ger_result(
+    result: anyhow::Result<ger::GerInsertResult>,
+    txn_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    service: &ServiceState,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(ger_result) => {
+            tracing::info!("inserted GER with eth txn: {txn_hash}");
+            service.txn_manager.begin(
+                txn_hash,
+                None,
+                txn_envelope,
+                None,
+                vec![ger_result.log_data],
+            )?;
+            let block_num = service.block_num_tracker.latest();
+            service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
+            Ok(())
+        }
+        Err(err) => {
+            tracing::error!("insert_ger failed: {err:#?}");
+            Err(err)
+        }
+    }
 }
 
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
@@ -91,34 +118,26 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!("insertGlobalExitRoot call");
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
+        let ger_bytes: [u8; 32] = params.root.0;
 
-        let result = ger::insert_ger(
-            params,
-            &service.miden_client,
-            service.accounts.clone(),
-            &service.log_store,
-            &service.block_state,
+        handle_ger_result(
+            ger::insert_ger(ger_bytes, &service.miden_client, service.accounts.clone(), &service.log_store, &service.block_state, txn_hash).await,
             txn_hash,
-        )
-        .await;
-        match result {
-            Ok(ger_result) => {
-                tracing::info!("inserted GER with eth txn: {txn_hash}");
-                service.txn_manager.begin(
-                    txn_hash,
-                    None,
-                    txn_envelope,
-                    None,
-                    vec![ger_result.log_data],
-                )?;
-                let block_num = service.block_num_tracker.latest();
-                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
-            }
-            Err(err) => {
-                tracing::error!("insert_ger failed: {err:#?}");
-                return Err(err);
-            }
-        }
+            txn_envelope,
+            &service,
+        )?;
+    } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
+        tracing::debug!("updateExitRoot call");
+        let params = updateExitRootCall::abi_decode(params_encoded)?;
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
+        let ger_bytes = ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
+
+        handle_ger_result(
+            ger::insert_ger(ger_bytes, &service.miden_client, service.accounts.clone(), &service.log_store, &service.block_state, txn_hash).await,
+            txn_hash,
+            txn_envelope,
+            &service,
+        )?;
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");
         anyhow::bail!("unhandled txn method {params_encoded:?}");
