@@ -47,8 +47,9 @@ impl MidenClient {
         sync_listeners: Vec<Arc<dyn SyncListener>>,
     ) -> anyhow::Result<Self> {
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
-        let node_endpoint =
-            node_url.map(Self::parse_node_url).unwrap_or(Ok(Endpoint::localhost()))?;
+        let node_endpoint = node_url
+            .map(Self::parse_node_url)
+            .unwrap_or(Ok(Endpoint::localhost()))?;
         let keystore = Self::create_keystore(store_dir.clone())?;
         let keystore_for_run = keystore.clone();
 
@@ -73,7 +74,12 @@ impl MidenClient {
 
         let task = std::sync::Mutex::new(Some(task));
         let done_sender = std::sync::Mutex::new(Some(done_sender));
-        Ok(Self { keystore, task, sender, done_sender })
+        Ok(Self {
+            keystore,
+            task,
+            sender,
+            done_sender,
+        })
     }
 
     fn default_store_dir() -> PathBuf {
@@ -89,7 +95,7 @@ impl MidenClient {
             _ => {
                 let endpoint = Endpoint::try_from(node_url.as_str());
                 endpoint.map_err(|err| anyhow!(err))
-            },
+            }
         }
     }
 
@@ -104,9 +110,13 @@ impl MidenClient {
     }
 
     pub fn join(&self) -> anyhow::Result<()> {
-        let mut task_guard =
-            self.task.lock().expect("MidenClient::join has failed to lock the task mutex");
-        let Some(task) = task_guard.take() else { return Ok(()) };
+        let mut task_guard = self
+            .task
+            .lock()
+            .expect("MidenClient::join has failed to lock the task mutex");
+        let Some(task) = task_guard.take() else {
+            return Ok(());
+        };
         match task.join() {
             Ok(run_result) => run_result,
             Err(err) => Err(anyhow!("MidenClient::join error: {err:?}")),
@@ -132,11 +142,10 @@ impl MidenClient {
     fn unwrap_connection_error(client_err: ClientError) -> anyhow::Result<Box<dyn Error>> {
         match client_err {
             ClientError::RpcError(RpcError::ConnectionError(err)) => Ok(err),
-            ClientError::RpcError(RpcError::GrpcError {
+            ClientError::RpcError(RpcError::RequestError {
                 error_kind: GrpcError::Unavailable,
-                source,
                 ..
-            }) => Ok(source.unwrap_or(Box::new(GrpcError::Unavailable))),
+            }) => Ok(Box::new(GrpcError::Unavailable)),
             _ => Err(client_err.into()),
         }
     }
@@ -148,21 +157,21 @@ impl MidenClient {
                 Ok(summary) => {
                     tracing::debug!(target: concat!(module_path!(), "::sync::debug"), "MidenClient::sync succeeded at block {}", summary.block_num);
                     return Ok(summary);
-                },
+                }
                 Err(client_err) => {
                     let err = Self::unwrap_connection_error(client_err)?;
                     tracing::error!(
                         "MidenClient::sync failed to connect to the node: {err:?}, retrying in 5 seconds..."
                     );
                     tokio::time::sleep(Duration::from_secs(5)).await;
-                },
+                }
             }
         }
     }
 
     fn on_sync(
         result: anyhow::Result<SyncSummary>,
-        listeners: &Vec<Arc<dyn SyncListener>>,
+        listeners: &[Arc<dyn SyncListener>],
     ) -> anyhow::Result<()> {
         let summary = result?;
         for listener in listeners {

@@ -1,20 +1,27 @@
-mod accounts_config;
-mod address_mapper;
+pub mod accounts_config;
+pub mod address_mapper;
 mod amount;
 mod block_num_tracker;
+pub mod block_state;
 pub mod claim;
+pub mod claim_tracker;
 pub mod exit;
 pub mod ger;
 pub mod hex;
 pub mod init;
+pub mod log_synthesis;
 pub mod logging;
-mod miden_client;
+pub mod miden_client;
+pub mod nonce_tracker;
 mod txn_manager;
 
 pub const COMPONENT: &str = "miden-agglayer";
 
+pub use address_mapper::AddressMapper;
 pub use block_num_tracker::BlockNumTracker;
+pub use claim_tracker::ClaimTracker;
 pub use miden_client::MidenClient;
+pub use nonce_tracker::NonceTracker;
 pub use txn_manager::TxnManager;
 
 #[derive(Clone)]

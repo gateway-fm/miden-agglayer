@@ -2,19 +2,19 @@ use crate::accounts_config;
 use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
-use miden_base_agglayer::{create_agglayer_faucet_builder, create_bridge_account_builder};
+use miden_base_agglayer::{EthAddressFormat, create_agglayer_faucet, create_bridge_account};
 use miden_client::Felt;
+use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
-use miden_client::keystore::FilesystemKeyStore;
+use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
-use miden_protocol::account::auth::AuthSecretKey;
-use miden_protocol::account::{Account, AccountComponent, AccountId, AccountStorageMode};
+use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
+use miden_protocol::account::{Account, AccountId};
 use miden_protocol::note::NoteType;
 use miden_protocol::transaction::OutputNote;
-use miden_standards::account::auth::AuthFalcon512Rpo;
-use miden_standards::account::auth::NoAuth;
+use miden_standards::account::auth::AuthSingleSig;
 use miden_standards::account::wallets::BasicWallet;
-use miden_standards::note::create_p2id_note;
+use miden_standards::note::P2idNote;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -40,10 +40,13 @@ impl From<Accounts> for AccountsConfig {
     }
 }
 
-fn add_auth_key(keystore: Arc<FilesystemKeyStore>) -> anyhow::Result<AuthFalcon512Rpo> {
+fn create_auth_component() -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
     let key_pair = AuthSecretKey::new_falcon512_rpo();
-    keystore.add_key(&key_pair)?;
-    Ok(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+    let auth_component = AuthSingleSig::new(
+        key_pair.public_key().to_commitment(),
+        AuthScheme::Falcon512Rpo,
+    );
+    Ok((auth_component, key_pair))
 }
 
 async fn deploy_account(
@@ -51,7 +54,11 @@ async fn deploy_account(
     account_id: AccountId,
     name: &str,
 ) -> anyhow::Result<()> {
-    tracing::info!("deploying {} account {} ...", name, AccountIdBech32(account_id));
+    tracing::info!(
+        "deploying {} account {} ...",
+        name,
+        AccountIdBech32(account_id)
+    );
     let dummy_txn = TransactionRequestBuilder::new().build()?;
     let txn_id = client.submit_new_transaction(account_id, dummy_txn).await?;
     tracing::info!("deployed {name} account with txn_id {txn_id}");
@@ -61,10 +68,11 @@ async fn deploy_account(
 async fn add_bridge(
     client: &mut MidenClientLib,
     _keystore: Arc<FilesystemKeyStore>,
+    service_id: AccountId,
 ) -> anyhow::Result<Account> {
-    let account = create_bridge_account_builder(client.rng().draw_word())
-        .with_auth_component(AccountComponent::from(NoAuth))
-        .build()?;
+    // In 0.14, create_bridge_account takes (seed, bridge_admin_id, ger_manager_id)
+    // Use service account as both bridge_admin and ger_manager
+    let account = create_bridge_account(client.rng().draw_word(), service_id, service_id);
     client.add_account(&account, false).await?;
 
     deploy_account(client, account.id(), "bridge").await?;
@@ -79,21 +87,29 @@ async fn add_faucet(
     decimals: u8,
     bridge_account_id: AccountId,
 ) -> anyhow::Result<Account> {
-    let max_supply = Felt::try_from(0xffffffff00000000u64).unwrap();
-    let builder = create_agglayer_faucet_builder(
+    let max_supply = Felt::new(FungibleAsset::MAX_AMOUNT);
+    let origin_token_address = EthAddressFormat::new([0u8; 20]);
+    let origin_network = 0u32;
+    let scale = 10u8; // 18 (ETH) - 8 (Miden) = 10
+
+    let account = create_agglayer_faucet(
         client.rng().draw_word(),
         token_symbol,
         decimals,
         max_supply,
         bridge_account_id,
+        &origin_token_address,
+        origin_network,
+        scale,
     );
-    let builder = builder.with_auth_component(AccountComponent::from(NoAuth));
-    let builder = builder.storage_mode(AccountStorageMode::Network);
-    let builder = builder.with_component(BasicWallet);
-    let account = builder.build()?;
     client.add_account(&account, false).await?;
 
-    deploy_account(client, account.id(), format!("{token_symbol} faucet").as_str()).await?;
+    deploy_account(
+        client,
+        account.id(),
+        format!("{token_symbol} faucet").as_str(),
+    )
+    .await?;
 
     Ok(account)
 }
@@ -102,10 +118,12 @@ async fn add_wallet(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
 ) -> anyhow::Result<Account> {
+    let (auth_component, key_pair) = create_auth_component()?;
     let account = Account::builder(client.rng().draw_word().into())
         .with_component(BasicWallet)
-        .with_auth_component(add_auth_key(keystore)?)
+        .with_auth_component(auth_component)
         .build()?;
+    keystore.add_key(&key_pair, account.id()).await?;
     client.add_account(&account, false).await?;
     Ok(account)
 }
@@ -115,7 +133,7 @@ async fn add_accounts(
     keystore: Arc<FilesystemKeyStore>,
 ) -> anyhow::Result<Accounts> {
     let service = add_wallet(client, keystore.clone()).await?;
-    let bridge = add_bridge(client, keystore.clone()).await?;
+    let bridge = add_bridge(client, keystore.clone(), service.id()).await?;
     let faucet_eth = add_faucet(client, keystore.clone(), "ETH", 8u8, bridge.id()).await?;
     let faucet_agg = add_faucet(client, keystore.clone(), "AGG", 8u8, bridge.id()).await?;
     let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
@@ -134,7 +152,7 @@ async fn register_p2id_script(
 ) -> anyhow::Result<()> {
     tracing::info!("registering P2ID script...");
     // dummy note to register its script on the node
-    let note = create_p2id_note(
+    let note = P2idNote::create(
         sender,
         /* target = */ sender,
         /* assets = */ vec![],

@@ -1,5 +1,7 @@
 use crate::service_state::ServiceState;
 use clap::Parser;
+use miden_agglayer_service::block_state::BlockState;
+use miden_agglayer_service::log_synthesis::LogStore;
 use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -43,12 +45,18 @@ async fn main() -> anyhow::Result<()> {
 
     let block_num_tracker = Arc::new(BlockNumTracker::new());
     let txn_manager = Arc::new(TxnManager::new());
+    let block_state = Arc::new(BlockState::new());
+    let log_store = Arc::new(LogStore::new());
 
     let miden_store_dir = command.miden_store_dir;
     let client = MidenClient::new(
         miden_store_dir.clone(),
         command.miden_node,
-        vec![txn_manager.clone(), block_num_tracker.clone()],
+        vec![
+            txn_manager.clone(),
+            block_num_tracker.clone(),
+            block_state.clone(),
+        ],
     )?;
 
     if command.init || !config_path_exists(miden_store_dir.clone())? {
@@ -60,9 +68,29 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let accounts = load_config(miden_store_dir)?;
-    let state =
-        ServiceState::new(client, accounts, command.chain_id, block_num_tracker, txn_manager);
+    let accounts = load_config(miden_store_dir.clone())?;
+    let claim_persistence_path = miden_store_dir
+        .as_ref()
+        .map(|d| d.join("claimed_indices.json"));
+    let claim_tracker = Arc::new(ClaimTracker::new(claim_persistence_path)?);
+    let nonce_tracker = Arc::new(NonceTracker::new());
+    let address_persistence_path = miden_store_dir
+        .as_ref()
+        .map(|d| d.join("address_mappings.json"));
+    let address_mapper = Arc::new(AddressMapper::new(address_persistence_path)?);
+
+    let state = ServiceState::new(
+        client,
+        accounts,
+        command.chain_id,
+        block_num_tracker,
+        txn_manager,
+        block_state,
+        log_store,
+        claim_tracker,
+        nonce_tracker,
+        address_mapper,
+    );
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;
