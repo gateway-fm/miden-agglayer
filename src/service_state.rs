@@ -12,6 +12,7 @@ pub struct ServiceState {
     pub txn_manager: Arc<TxnManager>,
     pub block_state: Arc<BlockState>,
     pub log_store: Arc<LogStore>,
+    pub claim_tracker: Arc<ClaimTracker>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -26,6 +27,7 @@ impl ServiceState {
         txn_manager: Arc<TxnManager>,
         block_state: Arc<BlockState>,
         log_store: Arc<LogStore>,
+        claim_tracker: Arc<ClaimTracker>,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
@@ -35,6 +37,7 @@ impl ServiceState {
             txn_manager,
             block_state,
             log_store,
+            claim_tracker,
         }
     }
 }

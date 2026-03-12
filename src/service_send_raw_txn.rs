@@ -80,8 +80,10 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let params = claimAssetCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
 
+        service.claim_tracker.try_claim(params.globalIndex)?;
+
         let result = claim::publish_claim(
-            params,
+            params.clone(),
             &service.miden_client,
             service.accounts,
             service.block_num_tracker.latest(),
@@ -110,6 +112,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 }
             }
             Err(err) => {
+                service.claim_tracker.unclaim(&params.globalIndex);
                 tracing::error!("publish_claim failed: {err:#?}");
                 return Err(err);
             }

@@ -4,6 +4,7 @@ mod amount;
 mod block_num_tracker;
 pub mod block_state;
 pub mod claim;
+pub mod claim_tracker;
 pub mod exit;
 pub mod ger;
 pub mod hex;
@@ -16,6 +17,7 @@ mod txn_manager;
 pub const COMPONENT: &str = "miden-agglayer";
 
 pub use block_num_tracker::BlockNumTracker;
+pub use claim_tracker::ClaimTracker;
 pub use miden_client::MidenClient;
 pub use txn_manager::TxnManager;
 

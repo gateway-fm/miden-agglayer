@@ -68,7 +68,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let accounts = load_config(miden_store_dir)?;
+    let accounts = load_config(miden_store_dir.clone())?;
+    let claim_persistence_path = miden_store_dir.map(|d| d.join("claimed_indices.json"));
+    let claim_tracker = Arc::new(ClaimTracker::new(claim_persistence_path)?);
+
     let state = ServiceState::new(
         client,
         accounts,
@@ -77,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         txn_manager,
         block_state,
         log_store,
+        claim_tracker,
     );
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
