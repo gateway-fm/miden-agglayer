@@ -14,6 +14,7 @@ pub struct ServiceState {
     pub log_store: Arc<LogStore>,
     pub claim_tracker: Arc<ClaimTracker>,
     pub nonce_tracker: Arc<NonceTracker>,
+    pub address_mapper: Arc<AddressMapper>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -30,6 +31,7 @@ impl ServiceState {
         log_store: Arc<LogStore>,
         claim_tracker: Arc<ClaimTracker>,
         nonce_tracker: Arc<NonceTracker>,
+        address_mapper: Arc<AddressMapper>,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
@@ -41,6 +43,7 @@ impl ServiceState {
             log_store,
             claim_tracker,
             nonce_tracker,
+            address_mapper,
         }
     }
 }

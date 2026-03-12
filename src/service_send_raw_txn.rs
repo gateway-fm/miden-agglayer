@@ -88,6 +88,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             params.clone(),
             &service.miden_client,
             service.accounts,
+            service.address_mapper.clone(),
             service.block_num_tracker.latest(),
         )
         .await;

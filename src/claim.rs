@@ -1,5 +1,5 @@
 use crate::accounts_config::AccountsConfig;
-use crate::address_mapper::account_id_from_address_config;
+use crate::address_mapper::AddressMapper;
 use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
@@ -93,16 +93,12 @@ fn create_claim(
     params: claimAssetCall,
     faucet: Faucet,
     accounts: &AccountsConfig,
+    address_mapper: &AddressMapper,
     rng: &mut impl FeltRng,
 ) -> anyhow::Result<Note> {
     let sender = accounts.service.0;
 
-    if account_id_from_address_config(params.destinationAddress, accounts).is_none() {
-        anyhow::bail!(
-            "create_claim: invalid destination address {}",
-            params.destinationAddress
-        );
-    }
+    let _dest_account = address_mapper.resolve(params.destinationAddress, accounts)?;
 
     let amount = validate_amount(params.amount, faucet.origin_token_decimals, faucet.decimals)?;
 
@@ -157,10 +153,11 @@ async fn publish_claim_internal(
     params: claimAssetCall,
     client: &mut MidenClientLib,
     accounts: &AccountsConfig,
+    address_mapper: &AddressMapper,
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_target_faucet(params.originTokenAddress, accounts);
-    let claim_note = create_claim(params.clone(), faucet, accounts, client.rng())?;
+    let claim_note = create_claim(params.clone(), faucet, accounts, address_mapper, client.rng())?;
     let claim_note_id = claim_note.id().to_string();
 
     const EXPIRATION_DELTA: u16 = 10;
@@ -191,6 +188,7 @@ pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
     accounts: crate::AccountsConfig,
+    address_mapper: Arc<AddressMapper>,
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
@@ -200,7 +198,7 @@ pub async fn publish_claim(
         .with(move |client| {
             Box::new(async move {
                 let value =
-                    publish_claim_internal(params, client, &accounts.0, latest_block_num).await?;
+                    publish_claim_internal(params, client, &accounts.0, &address_mapper, latest_block_num).await?;
                 let _ = result_inner.set(value);
                 Ok(())
             })

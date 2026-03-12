@@ -1,5 +1,5 @@
 pub mod accounts_config;
-mod address_mapper;
+pub mod address_mapper;
 mod amount;
 mod block_num_tracker;
 pub mod block_state;
@@ -17,6 +17,7 @@ mod txn_manager;
 
 pub const COMPONENT: &str = "miden-agglayer";
 
+pub use address_mapper::AddressMapper;
 pub use block_num_tracker::BlockNumTracker;
 pub use claim_tracker::ClaimTracker;
 pub use miden_client::MidenClient;
