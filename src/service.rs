@@ -164,11 +164,10 @@ async fn json_rpc_endpoint(
             }
         }
 
-        // polycli sets a txn.Nonce from this method result
-        // TODO: for replay protection and ordering this should be a monotonic counter per "from" account
         "eth_getTransactionCount" => {
-            let _params: (String, String) = request.parse_params()?;
-            Ok(JsonRpcResponse::success(answer_id, "0x0"))
+            let params: (String, String) = request.parse_params()?;
+            let nonce = service.nonce_tracker.get(&params.0);
+            Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
         }
 
         "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x0")),

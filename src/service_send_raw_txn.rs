@@ -1,6 +1,7 @@
 use crate::hex::hex_decode_prefixed;
 use crate::service_state::ServiceState;
 use alloy::consensus::TxEnvelope;
+use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::primitives::TxHash;
 use alloy_core::sol_types::SolCall;
@@ -72,6 +73,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
     let txn = unwrap_txn_envelope(txn_envelope.clone())?;
     let txn_hash = txn.hash;
+    let signer = txn_envelope.recover_signer()?;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
     let params_encoded = &txn.input;
@@ -146,5 +148,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         anyhow::bail!("unhandled txn method {params_encoded:?}");
     }
 
+    service.nonce_tracker.increment(&format!("{signer:#x}"));
     Ok(txn_hash)
 }

@@ -6,6 +6,7 @@ pub mod block_state;
 pub mod claim;
 pub mod claim_tracker;
 pub mod exit;
+pub mod nonce_tracker;
 pub mod ger;
 pub mod hex;
 pub mod init;
@@ -19,6 +20,7 @@ pub const COMPONENT: &str = "miden-agglayer";
 pub use block_num_tracker::BlockNumTracker;
 pub use claim_tracker::ClaimTracker;
 pub use miden_client::MidenClient;
+pub use nonce_tracker::NonceTracker;
 pub use txn_manager::TxnManager;
 
 #[derive(Clone)]
