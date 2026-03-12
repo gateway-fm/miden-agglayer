@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const HARDHAT_ADDRESS: Address = Address::new([
-    0xf3, 0x9F, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xF6, 0xF4, 0xce, 0x6a, 0xB8, 0x82, 0x72, 0x79,
-    0xcf, 0xfF, 0xb9, 0x22, 0x66,
+    0xf3, 0x9F, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xF6, 0xF4, 0xce, 0x6a, 0xB8, 0x82, 0x72, 0x79, 0xcf,
+    0xfF, 0xb9, 0x22, 0x66,
 ]);
 
 pub fn is_miden_compatible_address(address: Address) -> bool {
@@ -90,11 +90,7 @@ impl AddressMapper {
 
     /// Resolve an Ethereum address to a Miden AccountId.
     /// Resolution order: hardhat special case → known mapping → zero-padding → derive new.
-    pub fn resolve(
-        &self,
-        address: Address,
-        config: &AccountsConfig,
-    ) -> anyhow::Result<AccountId> {
+    pub fn resolve(&self, address: Address, config: &AccountsConfig) -> anyhow::Result<AccountId> {
         // 1. Hardhat special case
         if address == HARDHAT_ADDRESS {
             return Ok(config.wallet_hardhat.0);
@@ -145,10 +141,7 @@ impl AddressMapper {
             return;
         }
         if let Err(e) = std::fs::rename(&tmp_path, path) {
-            tracing::error!(
-                "AddressMapper: failed to rename to {}: {e}",
-                path.display()
-            );
+            tracing::error!("AddressMapper: failed to rename to {}: {e}", path.display());
         }
     }
 }

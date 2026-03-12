@@ -255,8 +255,7 @@ async fn json_rpc_endpoint(
             // causing Go's hexutil.Uint unmarshaling to fail in the bridge-service.
             let raw_params: (serde_json::Value,) = request.parse_params()?;
 
-            let log_filter: LogFilter =
-                serde_json::from_value(raw_params.0).unwrap_or_default();
+            let log_filter: LogFilter = serde_json::from_value(raw_params.0).unwrap_or_default();
             let current_block = service.block_num_tracker.latest();
             let synthetic_logs = service.log_store.get_logs(&log_filter, current_block);
             let json_logs: Vec<serde_json::Value> =
@@ -270,9 +269,10 @@ async fn json_rpc_endpoint(
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         }
 
-        "net_version" => {
-            Ok(JsonRpcResponse::success(answer_id, format!("{}", service.chain_id)))
-        }
+        "net_version" => Ok(JsonRpcResponse::success(
+            answer_id,
+            format!("{}", service.chain_id),
+        )),
 
         "eth_getBlockTransactionCountByNumber" => {
             let _params: (String,) = request.parse_params()?;

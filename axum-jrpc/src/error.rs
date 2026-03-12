@@ -34,7 +34,7 @@ impl std::fmt::Display for JsonRpcErrorReason {
             JsonRpcErrorReason::ServerError(code) => write!(f, "Server error: {}", code),
             JsonRpcErrorReason::ApplicationError(code) => {
                 write!(f, "Application error: {}", code)
-            },
+            }
         }
     }
 }
@@ -49,7 +49,7 @@ impl From<JsonRpcErrorReason> for i32 {
             JsonRpcErrorReason::InternalError => INTERNAL_ERROR,
             JsonRpcErrorReason::ServerError(code) | JsonRpcErrorReason::ApplicationError(code) => {
                 code
-            },
+            }
         }
     }
 }
@@ -77,13 +77,22 @@ pub struct JsonRpcError {
 
 impl JsonRpcError {
     pub fn new(code: JsonRpcErrorReason, message: String, data: Value) -> Self {
-        Self { code: code.into(), message, data }
+        Self {
+            code: code.into(),
+            message,
+            data,
+        }
     }
 }
 
 impl std::fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", JsonRpcErrorReason::new(self.code), self.message)
+        write!(
+            f,
+            "{}: {}",
+            JsonRpcErrorReason::new(self.code),
+            self.message
+        )
     }
 }
 
@@ -92,7 +101,11 @@ impl From<anyhow::Error> for JsonRpcError {
     fn from(error: anyhow::Error) -> Self {
         let message = error.to_string();
         let data = Value::default();
-        Self { code: 1, message, data }
+        Self {
+            code: 1,
+            message,
+            data,
+        }
     }
 }
 

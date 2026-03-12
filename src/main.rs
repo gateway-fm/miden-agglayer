@@ -69,10 +69,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let accounts = load_config(miden_store_dir.clone())?;
-    let claim_persistence_path = miden_store_dir.as_ref().map(|d| d.join("claimed_indices.json"));
+    let claim_persistence_path = miden_store_dir
+        .as_ref()
+        .map(|d| d.join("claimed_indices.json"));
     let claim_tracker = Arc::new(ClaimTracker::new(claim_persistence_path)?);
     let nonce_tracker = Arc::new(NonceTracker::new());
-    let address_persistence_path = miden_store_dir.as_ref().map(|d| d.join("address_mappings.json"));
+    let address_persistence_path = miden_store_dir
+        .as_ref()
+        .map(|d| d.join("address_mappings.json"));
     let address_mapper = Arc::new(AddressMapper::new(address_persistence_path)?);
 
     let state = ServiceState::new(

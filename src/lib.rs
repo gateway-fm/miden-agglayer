@@ -6,13 +6,13 @@ pub mod block_state;
 pub mod claim;
 pub mod claim_tracker;
 pub mod exit;
-pub mod nonce_tracker;
 pub mod ger;
 pub mod hex;
 pub mod init;
 pub mod log_synthesis;
 pub mod logging;
 pub mod miden_client;
+pub mod nonce_tracker;
 mod txn_manager;
 
 pub const COMPONENT: &str = "miden-agglayer";

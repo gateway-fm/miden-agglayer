@@ -16,7 +16,11 @@ impl NonceTracker {
     }
 
     pub fn get(&self, address: &str) -> u64 {
-        *self.nonces.read().get(&address.to_lowercase()).unwrap_or(&0)
+        *self
+            .nonces
+            .read()
+            .get(&address.to_lowercase())
+            .unwrap_or(&0)
     }
 
     /// Increment nonce, returning the value before increment.

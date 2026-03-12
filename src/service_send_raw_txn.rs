@@ -127,7 +127,15 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let ger_bytes: [u8; 32] = params.root.0;
 
         handle_ger_result(
-            ger::insert_ger(ger_bytes, &service.miden_client, service.accounts.clone(), &service.log_store, &service.block_state, txn_hash).await,
+            ger::insert_ger(
+                ger_bytes,
+                &service.miden_client,
+                service.accounts.clone(),
+                &service.log_store,
+                &service.block_state,
+                txn_hash,
+            )
+            .await,
             txn_hash,
             txn_envelope,
             &service,
@@ -136,10 +144,19 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-        let ger_bytes = ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
+        let ger_bytes =
+            ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
 
         handle_ger_result(
-            ger::insert_ger(ger_bytes, &service.miden_client, service.accounts.clone(), &service.log_store, &service.block_state, txn_hash).await,
+            ger::insert_ger(
+                ger_bytes,
+                &service.miden_client,
+                service.accounts.clone(),
+                &service.log_store,
+                &service.block_state,
+                txn_hash,
+            )
+            .await,
             txn_hash,
             txn_envelope,
             &service,

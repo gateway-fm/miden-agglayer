@@ -157,7 +157,13 @@ async fn publish_claim_internal(
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_target_faucet(params.originTokenAddress, accounts);
-    let claim_note = create_claim(params.clone(), faucet, accounts, address_mapper, client.rng())?;
+    let claim_note = create_claim(
+        params.clone(),
+        faucet,
+        accounts,
+        address_mapper,
+        client.rng(),
+    )?;
     let claim_note_id = claim_note.id().to_string();
 
     const EXPIRATION_DELTA: u16 = 10;
@@ -197,8 +203,14 @@ pub async fn publish_claim(
     client
         .with(move |client| {
             Box::new(async move {
-                let value =
-                    publish_claim_internal(params, client, &accounts.0, &address_mapper, latest_block_num).await?;
+                let value = publish_claim_internal(
+                    params,
+                    client,
+                    &accounts.0,
+                    &address_mapper,
+                    latest_block_num,
+                )
+                .await?;
                 let _ = result_inner.set(value);
                 Ok(())
             })

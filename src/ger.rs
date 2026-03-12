@@ -158,7 +158,10 @@ mod tests {
     fn test_combined_ger_deterministic() {
         let mainnet = [0xAAu8; 32];
         let rollup = [0xBBu8; 32];
-        assert_eq!(combined_ger(&mainnet, &rollup), combined_ger(&mainnet, &rollup));
+        assert_eq!(
+            combined_ger(&mainnet, &rollup),
+            combined_ger(&mainnet, &rollup)
+        );
     }
 
     #[test]

@@ -230,7 +230,7 @@ where
                         Value::default(),
                     )),
                 })
-            },
+            }
         };
 
         cfg_if!(
@@ -312,7 +312,10 @@ impl JsonRpcResponse {
     where
         Id: From<ID>,
     {
-        Self { result, id: id.into() }
+        Self {
+            result,
+            id: id.into(),
+        }
     }
 
     /// Returns a response with the given result
@@ -356,7 +359,10 @@ impl JsonRpcResponse {
         Id: From<ID>,
     {
         let id = id.into();
-        JsonRpcResponse { result: JsonRpcAnswer::Error(error), id }
+        JsonRpcResponse {
+            result: JsonRpcAnswer::Error(error),
+            id,
+        }
     }
 }
 
@@ -400,7 +406,10 @@ impl<'de> Deserialize<'de> for JsonRpcResponse {
 
         let helper = Helper::deserialize(deserializer)?;
         if helper.jsonrpc == JSONRPC {
-            Ok(Self { result: helper.result, id: helper.id })
+            Ok(Self {
+                result: helper.result,
+                id: helper.id,
+            })
         } else {
             Err(D::Error::custom("Unknown jsonrpc version"))
         }
@@ -508,7 +517,10 @@ mod test {
 
         let error = JsonRpcResponse::error(0, error);
 
-        assert_eq!(serde_json::to_value(error).unwrap(), serde_json::to_value(response).unwrap());
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::to_value(response).unwrap()
+        );
     }
 
     async fn handler(value: JsonRpcExtractor) -> JrpcResult {
@@ -519,7 +531,7 @@ mod test {
                 let request: Test = value.parse_params()?;
                 let result = request.a + request.b;
                 Ok(JsonRpcResponse::success(answer_id, result))
-            },
+            }
             "sub" => {
                 let result: [i32; 2] = value.parse_params()?;
                 let result = match failing_sub(result[0], result[1]).await {
@@ -527,7 +539,7 @@ mod test {
                     Err(e) => return Err(JsonRpcResponse::error(answer_id, e.into())),
                 };
                 Ok(JsonRpcResponse::success(answer_id, result))
-            },
+            }
             "div" => {
                 let result: [i32; 2] = value.parse_params()?;
                 let result = match failing_div(result[0], result[1]).await {
@@ -536,7 +548,7 @@ mod test {
                 };
 
                 Ok(JsonRpcResponse::success(answer_id, result))
-            },
+            }
             method => Ok(value.method_not_found(method)),
         }
     }
