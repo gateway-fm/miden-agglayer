@@ -1,6 +1,7 @@
 use crate::COMPONENT;
 use crate::hex::hex_decode_prefixed;
 use crate::hex::hex_decode_u64;
+use crate::log_synthesis::LogFilter;
 use crate::service_get_txn_receipt::service_get_txn_receipt;
 use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
@@ -13,7 +14,6 @@ use axum::routing::post;
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
-use crate::log_synthesis::LogFilter;
 use serde::Deserialize;
 use std::str::FromStr;
 use tokio::net::TcpListener;
@@ -132,8 +132,14 @@ async fn json_rpc_endpoint(
             let full_txns = params.1;
             let block = service.block_state.get_block_by_number(block_num);
             match block {
-                Some(b) => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, b.to_json(full_txns))),
-                None => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, serde_json::Value::Null)),
+                Some(b) => Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                    answer_id,
+                    b.to_json(full_txns),
+                )),
+                None => Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                    answer_id,
+                    serde_json::Value::Null,
+                )),
             }
         }
 
@@ -159,8 +165,14 @@ async fn json_rpc_endpoint(
             let full_txns = params.1;
             let block = service.block_state.get_block_by_hash(&hash);
             match block {
-                Some(b) => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, b.to_json(full_txns))),
-                None => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, serde_json::Value::Null)),
+                Some(b) => Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                    answer_id,
+                    b.to_json(full_txns),
+                )),
+                None => Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                    answer_id,
+                    serde_json::Value::Null,
+                )),
             }
         }
 
@@ -258,10 +270,14 @@ async fn json_rpc_endpoint(
             let log_filter: LogFilter = serde_json::from_value(raw_params.0).unwrap_or_default();
             let current_block = service.block_num_tracker.latest();
             let synthetic_logs = service.log_store.get_logs(&log_filter, current_block);
-            let json_logs: Vec<serde_json::Value> =
-                synthetic_logs.iter().map(|l: &crate::log_synthesis::SyntheticLog| l.to_json()).collect();
+            let json_logs: Vec<serde_json::Value> = synthetic_logs
+                .iter()
+                .map(|l: &crate::log_synthesis::SyntheticLog| l.to_json())
+                .collect();
 
-            Ok(JsonRpcResponse::success::<Vec<serde_json::Value>, _>(answer_id, json_logs))
+            Ok(JsonRpcResponse::success::<Vec<serde_json::Value>, _>(
+                answer_id, json_logs,
+            ))
         }
 
         "eth_getBalance" => {

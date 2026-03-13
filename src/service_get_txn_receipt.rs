@@ -61,12 +61,10 @@ mod tests {
         let nonce_tracker = Arc::new(NonceTracker::new());
         let claim_tracker = Arc::new(ClaimTracker::new(None).unwrap());
         let address_mapper = Arc::new(AddressMapper::new(None).unwrap());
-        
+
         // Mock AccountsConfig - since it's a wrapper, we might need a way to create it.
         // For now, let's assume it can be empty.
-        let accounts = crate::load_config(None).unwrap_or_else(|_| {
-             unsafe { std::mem::zeroed() }
-        });
+        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
 
         ServiceState::new(
             miden_client,
@@ -94,7 +92,7 @@ mod tests {
     async fn test_service_get_txn_receipt_found() {
         let service = create_test_service();
         let txn_hash = TxHash::from([2u8; 32]);
-        
+
         // Mock a transaction in TxnManager
         // We need a TxEnvelope. Legacy is easiest to create dummy.
         let txn_envelope = TxEnvelope::Legacy(alloy::consensus::Signed::new_unchecked(
@@ -103,21 +101,23 @@ mod tests {
             txn_hash,
         ));
 
-        service.txn_manager.begin(
-            txn_hash,
-            None,
-            txn_envelope,
-            None,
-            vec![],
-        ).unwrap();
-        
+        service
+            .txn_manager
+            .begin(txn_hash, None, txn_envelope, None, vec![])
+            .unwrap();
+
         service.txn_manager.commit(txn_hash, Ok(()), 123).unwrap();
 
-        let result = service_get_txn_receipt(service, txn_hash.to_string()).await.unwrap();
+        let result = service_get_txn_receipt(service, txn_hash.to_string())
+            .await
+            .unwrap();
         assert!(result.is_some());
         let receipt = result.unwrap();
         assert_eq!(receipt.transaction_hash, txn_hash);
         assert_eq!(receipt.block_number, Some(123));
-        assert!(matches!(receipt.inner.as_receipt().unwrap().status, alloy::consensus::Eip658Value::Eip658(true)));
+        assert!(matches!(
+            receipt.inner.as_receipt().unwrap().status,
+            alloy::consensus::Eip658Value::Eip658(true)
+        ));
     }
 }

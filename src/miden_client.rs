@@ -88,14 +88,14 @@ impl MidenClient {
 
     #[cfg(test)]
     pub fn new_test() -> Self {
-        let store_dir = tempfile::tempdir().unwrap().into_path();
+        let store_dir = tempfile::tempdir().unwrap().keep();
         let keystore_path = store_dir.join("keystore");
         std::fs::create_dir_all(&keystore_path).unwrap();
         let keystore = FilesystemKeyStore::new(keystore_path).unwrap();
         let keystore = Arc::new(keystore);
         let (sender, mut receiver) = mpsc::channel::<Request>(1);
         let (done_sender, _done_receiver) = oneshot::channel::<()>();
-        
+
         // Start a mock task to handle 'with' calls
         thread::spawn(move || {
             while let Some(req) = receiver.blocking_recv() {
@@ -295,13 +295,15 @@ mod tests {
     #[tokio::test]
     async fn test_miden_client_test_with() {
         let client = MidenClient::new_test();
-        let res = client.with(|_client| {
-            Box::new(async move {
-                // This won't actually run in new_test's background thread
-                Ok(())
+        let res = client
+            .with(|_client| {
+                Box::new(async move {
+                    // This won't actually run in new_test's background thread
+                    Ok(())
+                })
             })
-        }).await;
-        
+            .await;
+
         // new_test background thread returns Ok(()) directly
         assert!(res.is_ok());
     }

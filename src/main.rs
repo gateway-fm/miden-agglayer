@@ -1,9 +1,9 @@
-use miden_agglayer_service::service_state::ServiceState;
-use miden_agglayer_service::*;
-use miden_agglayer_service::service;
+use clap::Parser;
 use miden_agglayer_service::block_state::BlockState;
 use miden_agglayer_service::log_synthesis::LogStore;
-use clap::Parser;
+use miden_agglayer_service::service;
+use miden_agglayer_service::service_state::ServiceState;
+use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;

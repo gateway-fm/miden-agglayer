@@ -83,8 +83,16 @@ async fn submit_ger_to_miden(
     let mut committed = false;
     for _ in 0..30 {
         // We can check if txn is in the store and has a block number
-        let txns = client.get_transactions(miden_client::store::TransactionFilter::All).await?;
-        if txns.iter().any(|t| t.id == tx_id && matches!(t.status, miden_client::transaction::TransactionStatus::Committed { .. })) {
+        let txns = client
+            .get_transactions(miden_client::store::TransactionFilter::All)
+            .await?;
+        if txns.iter().any(|t| {
+            t.id == tx_id
+                && matches!(
+                    t.status,
+                    miden_client::transaction::TransactionStatus::Committed { .. }
+                )
+        }) {
             committed = true;
             break;
         }

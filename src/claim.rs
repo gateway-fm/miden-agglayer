@@ -244,26 +244,30 @@ mod tests {
         let metadata = Bytes::from(vec![]);
         let hash = metadata_to_hash(&metadata);
         // keccak256("")
-        let expected = hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470").unwrap();
+        let expected =
+            hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+                .unwrap();
         assert_eq!(hash, expected.as_slice());
     }
 
     #[test]
     fn test_find_target_faucet_eth() {
-        let accounts = crate::load_config(None).unwrap_or_else(|_| {
-             unsafe { std::mem::zeroed() }
-        });
-        let faucet = find_target_faucet(address!("0000000000000000000000000000000000000000"), &accounts.0);
+        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        let faucet = find_target_faucet(
+            address!("0000000000000000000000000000000000000000"),
+            &accounts.0,
+        );
         assert_eq!(faucet.origin_token_decimals, 18);
         assert_eq!(faucet.decimals, 8);
     }
 
     #[test]
     fn test_find_target_faucet_agg() {
-        let accounts = crate::load_config(None).unwrap_or_else(|_| {
-             unsafe { std::mem::zeroed() }
-        });
-        let faucet = find_target_faucet(address!("742d35Cc6634C0532925a3b844Bc9e7595f41111"), &accounts.0);
+        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        let faucet = find_target_faucet(
+            address!("742d35Cc6634C0532925a3b844Bc9e7595f41111"),
+            &accounts.0,
+        );
         assert_eq!(faucet.origin_token_decimals, 8);
         assert_eq!(faucet.decimals, 8);
     }

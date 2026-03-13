@@ -26,8 +26,8 @@ pub use block_num_tracker::BlockNumTracker;
 pub use claim_tracker::ClaimTracker;
 pub use miden_client::MidenClient;
 pub use nonce_tracker::NonceTracker;
-pub use txn_manager::TxnManager;
 pub use service_state::ServiceState;
+pub use txn_manager::TxnManager;
 
 #[derive(Clone)]
 pub struct AccountsConfig(accounts_config::AccountsConfig);

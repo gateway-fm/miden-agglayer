@@ -1,13 +1,13 @@
+use crate::claim::claimAssetCall;
+use crate::ger::{insertGlobalExitRootCall, updateExitRootCall};
 use crate::hex::hex_decode_prefixed;
 use crate::service_state::ServiceState;
+use crate::*;
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::primitives::TxHash;
 use alloy_core::sol_types::SolCall;
-use crate::claim::claimAssetCall;
-use crate::ger::{insertGlobalExitRootCall, updateExitRootCall};
-use crate::*;
 
 struct TransactionData {
     pub hash: TxHash,
@@ -144,7 +144,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-        
+
         let mainnet_root = params.newMainnetExitRoot.0;
         let rollup_root = params.newRollupExitRoot.0;
         let combined_ger = ger::combined_ger(&mainnet_root, &rollup_root);
@@ -181,9 +181,9 @@ mod tests {
     use crate::nonce_tracker::NonceTracker;
     use crate::txn_manager::TxnManager;
     use crate::{AddressMapper, ClaimTracker, MidenClient, ServiceState};
-    use alloy::consensus::{TxEnvelope, Signed, TxLegacy};
-    use alloy::primitives::{TxHash, Signature};
+    use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
     use alloy::eips::Encodable2718;
+    use alloy::primitives::{Signature, TxHash};
     use std::sync::Arc;
 
     fn create_test_service() -> ServiceState {
@@ -195,10 +195,8 @@ mod tests {
         let nonce_tracker = Arc::new(NonceTracker::new());
         let claim_tracker = Arc::new(ClaimTracker::new(None).unwrap());
         let address_mapper = Arc::new(AddressMapper::new(None).unwrap());
-        
-        let accounts = crate::load_config(None).unwrap_or_else(|_| {
-             unsafe { std::mem::zeroed() }
-        });
+
+        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
 
         ServiceState::new(
             miden_client,
@@ -231,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn test_service_send_raw_txn_unhandled_method() {
         let service = create_test_service();
-        
+
         // Create a dummy transaction with some random input
         let txn = TxLegacy {
             input: alloy::primitives::bytes!("12345678"),
@@ -246,6 +244,11 @@ mod tests {
 
         let result = service_send_raw_txn(service, input_hex).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unhandled txn method"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unhandled txn method")
+        );
     }
 }
