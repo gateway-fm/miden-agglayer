@@ -8,6 +8,14 @@ readme = "README.md"
 rust-version = "1.90"
 version = "0.1.0"
 
+[[bin]]
+name = "miden-agglayer-service"
+path = "src/main.rs"
+
+[[bin]]
+name = "bridge-out-tool"
+path = "src/bin/bridge_out_tool.rs"
+
 [dev-dependencies]
 tempfile = "3.10"
 

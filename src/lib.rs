@@ -3,6 +3,8 @@ pub mod address_mapper;
 mod amount;
 mod block_num_tracker;
 pub mod block_state;
+pub mod bridge_address;
+pub mod bridge_out;
 pub mod claim;
 pub mod claim_tracker;
 pub mod exit;
@@ -30,7 +32,7 @@ pub use service_state::ServiceState;
 pub use txn_manager::TxnManager;
 
 #[derive(Clone)]
-pub struct AccountsConfig(accounts_config::AccountsConfig);
+pub struct AccountsConfig(pub accounts_config::AccountsConfig);
 pub use accounts_config::config_path_exists;
 
 pub fn load_config(miden_store_dir: Option<std::path::PathBuf>) -> anyhow::Result<AccountsConfig> {

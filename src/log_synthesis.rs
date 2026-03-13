@@ -11,6 +11,10 @@ use std::collections::HashMap;
 pub const CLAIM_EVENT_TOPIC: &str =
     "0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d";
 
+/// BridgeEvent topic hash: keccak256("BridgeEvent(uint8,uint32,address,uint32,address,uint256,bytes,uint32)")
+pub const BRIDGE_EVENT_TOPIC: &str =
+    "0x501781209a1f8899323b96b4ef08b168df93e0a90c673d1e4cce39366cb62f9b";
+
 /// UpdateHashChainValue topic hash: keccak256("UpdateHashChainValue(bytes32,bytes32)")
 /// Emitted by L2 GlobalExitRootManagerL2SovereignChain when a GER is inserted
 pub const UPDATE_HASH_CHAIN_VALUE_TOPIC: &str =
@@ -125,15 +129,19 @@ impl LogFilter {
 
             // SPECIAL CASE: The bridge-service filters logs by the Bridge contract address.
             // However, it ALSO needs UpdateHashChainValue logs which are emitted by the
-            // GlobalExitRoot contract. If the log is an UpdateHashChainValue, we allow it
-            // through even if the address doesn't match the filter.
-            let is_ger_update = log
-                .topics
-                .first()
-                .map(|t| t.to_lowercase() == UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase())
+            // GlobalExitRoot contract, and BridgeEvent logs which may use a different
+            // address. If the log is one of these types, we allow it through even if
+            // the address doesn't match the filter.
+            let topic0 = log.topics.first().map(|t| t.to_lowercase());
+            let is_passthrough = topic0
+                .as_ref()
+                .map(|t| {
+                    t == &UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()
+                        || t == &BRIDGE_EVENT_TOPIC.to_lowercase()
+                })
                 .unwrap_or(false);
 
-            if !matches_addr && !is_ger_update {
+            if !matches_addr && !is_passthrough {
                 return false;
             }
         }
@@ -283,6 +291,44 @@ impl LogStore {
                 format!("0x{}", hex::encode(new_hash_chain)),
             ],
             data: "0x".to_string(),
+            block_number,
+            block_hash,
+            transaction_hash: tx_hash.to_string(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+        self.add_log(log);
+    }
+
+    /// Record a BridgeEvent log for a bridge-out (L2 → L1) deposit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_bridge_event(
+        &self,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        deposit_count: u32,
+    ) {
+        let log = SyntheticLog {
+            address: bridge_address.to_string(),
+            topics: vec![BRIDGE_EVENT_TOPIC.to_string()],
+            data: crate::bridge_out::encode_bridge_event_data(
+                leaf_type,
+                origin_network,
+                origin_address,
+                destination_network,
+                destination_address,
+                amount,
+                deposit_count,
+            ),
             block_number,
             block_hash,
             transaction_hash: tx_hash.to_string(),

@@ -1,4 +1,5 @@
 use crate::block_state::BlockState;
+use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{LogStore, SyntheticLog};
 use crate::miden_client::{MidenClientLib, SyncListener};
 use alloy::consensus::TxEnvelope;
@@ -100,11 +101,10 @@ impl TxnManager {
                 // Add logs to LogStore immediately on commit.
                 // This ensures bridge-service sees events as soon as txn is finalized.
                 let logs = receipt.logs.clone();
-                let signer = receipt.signer;
                 let block_hash = self.block_state.get_block_hash(block_num);
                 for log_data in logs {
                     let log = SyntheticLog {
-                        address: format!("{:#x}", signer),
+                        address: get_bridge_address().to_string(),
                         topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
                         data: log_data.data.to_string(),
                         block_number: block_num,
@@ -350,13 +350,12 @@ impl SyncListener for TxnManager {
                     receipt.claim_note_id = None;
                     let logs = receipt.logs.clone();
                     let block_num = receipt.block_num;
-                    let signer = receipt.signer;
                     drop(transactions);
 
                     for log_data in logs {
                         let block_hash = self.block_state.get_block_hash(block_num);
                         let log = SyntheticLog {
-                            address: format!("{:#x}", signer),
+                            address: get_bridge_address().to_string(),
                             topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
                             data: log_data.data.to_string(),
                             block_number: block_num,

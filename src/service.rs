@@ -115,7 +115,7 @@ async fn json_rpc_endpoint(
         "eth_getBlockByNumber" => {
             let params: (String, bool) = request.parse_params()?;
             let block_num = match params.0.as_str() {
-                "latest" | "pending" => service.block_num_tracker.latest(),
+                "latest" | "pending" | "finalized" | "safe" => service.block_num_tracker.latest(),
                 "earliest" => 0,
                 any => {
                     let Ok(num) = hex_decode_u64(any) else {
@@ -301,6 +301,12 @@ async fn json_rpc_endpoint(
                 answer_id,
                 "0x0000000000000000000000000000000000000000000000000000000000000000",
             ))
+        }
+
+        // EthTxManager polls debug_traceTransaction — return empty result to avoid log spam
+        "debug_traceTransaction" => {
+            let _params: (String,) = request.parse_params()?;
+            Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null))
         }
 
         method => {
