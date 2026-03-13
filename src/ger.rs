@@ -76,9 +76,27 @@ async fn submit_ger_to_miden(
     tracing::info!(
         tx_id = %tx_id,
         ger = %hex::encode(ger_bytes),
-        "UpdateGerNote submitted to Miden node"
+        "UpdateGerNote submitted to Miden node, waiting for commit..."
     );
 
+    // Poll for transaction commitment (max 30s)
+    let mut committed = false;
+    for _ in 0..30 {
+        // We can check if txn is in the store and has a block number
+        let txns = client.get_transactions(miden_client::store::TransactionFilter::All).await?;
+        if txns.iter().any(|t| t.id == tx_id && matches!(t.status, miden_client::transaction::TransactionStatus::Committed { .. })) {
+            committed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        client.sync_state().await?; // Sync to get latest updates
+    }
+
+    if !committed {
+        anyhow::bail!("UpdateGerNote transaction {tx_id} not committed after 30s");
+    }
+
+    tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
     Ok(())
 }
 

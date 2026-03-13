@@ -12,16 +12,25 @@ const HARDHAT_ADDRESS: Address = Address::new([
 ]);
 
 pub fn is_miden_compatible_address(address: Address) -> bool {
-    address[0..5].iter().all(|b| *b == 0)
+    // The canonical EthAddressFormat embeds AccountId as:
+    //   [4 zero bytes] [prefix(8 bytes)] [suffix(8 bytes)]
+    // Only the first 4 bytes must be zero; byte 4 is the MSB of the prefix.
+    address[0..4].iter().all(|b| *b == 0)
 }
 
 pub fn account_id_from_address(address: Address) -> Option<AccountId> {
     if !is_miden_compatible_address(address) {
         return None;
     }
-    let mut id_bytes = [0u8; 15];
-    id_bytes.copy_from_slice(&address[5..]);
-    AccountId::try_from(id_bytes).ok()
+    // Extract prefix (8 bytes) and suffix (8 bytes) from canonical layout:
+    //   address[0..4]  = zero padding
+    //   address[4..12] = prefix (u64 big-endian)
+    //   address[12..20] = suffix (u64 big-endian)
+    let prefix = u64::from_be_bytes(address[4..12].try_into().ok()?);
+    let suffix = u64::from_be_bytes(address[12..20].try_into().ok()?);
+    let prefix_felt = miden_protocol::Felt::try_from(prefix).ok()?;
+    let suffix_felt = miden_protocol::Felt::try_from(suffix).ok()?;
+    AccountId::try_from([prefix_felt, suffix_felt]).ok()
 }
 
 /// Deterministically derive a Miden AccountId from an Ethereum address.
@@ -164,21 +173,22 @@ mod tests {
         assert!(!is_miden_compatible_address(address!(
             "0x742d35Cc6634C0532925a3b844Bc9e7595f41111"
         )));
+        // Canonical format: 4 zero bytes + 16 bytes of AccountId data
         assert!(is_miden_compatible_address(address!(
-            "0x000000000034C0532925a3b844Bc9e7595f41111"
+            "0x000000003d7c9747558851900f8206226dfbea00"
         )));
     }
 
     #[test]
     fn test_account_id_from_address() {
         let expected_account_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        let address = address!("0x00000000003d7c9747558851900f8206226dfbea");
+        // Canonical EthAddressFormat: [4 zero bytes][prefix(8)][suffix(8)]
+        // AccountId 0x3d7c9747558851900f8206226dfbea has:
+        //   prefix = 0x3d7c974755885190, suffix = 0x0f8206226dfbea00
+        let address = address!("0x000000003d7c9747558851900f8206226dfbea00");
         assert_eq!(account_id_from_address(address), Some(expected_account_id));
 
         assert_eq!(account_id_from_address(Address::from([42u8; 20])), None);
-
-        let invalid_address = address!("0x000000000034C0532925a3b844Bc9e7595f41111");
-        assert_eq!(account_id_from_address(invalid_address), None);
     }
 
     #[test]
@@ -209,10 +219,9 @@ mod tests {
     #[test]
     fn test_resolve_zero_padded_address() {
         let mapper = AddressMapper::new(None).unwrap();
-        let addr = address!("0x00000000003d7c9747558851900f8206226dfbea");
+        // Canonical format: 4 zero bytes + prefix(8) + suffix(8)
+        let addr = address!("0x000000003d7c9747558851900f8206226dfbea00");
         let expected = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        // Use a dummy config (won't be used for zero-padded addresses)
-        // We can't easily create a full config here, so test derive_account_id directly
         let result = account_id_from_address(addr);
         assert_eq!(result, Some(expected));
         // Verify the mapper doesn't store zero-padded addresses

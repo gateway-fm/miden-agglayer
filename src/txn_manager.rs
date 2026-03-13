@@ -3,7 +3,7 @@ use crate::log_synthesis::{LogStore, SyntheticLog};
 use crate::miden_client::{MidenClientLib, SyncListener};
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::{Recovered, SignerRecoverable};
-use alloy::primitives::{Address, BlockNumber, LogData, TxHash};
+use alloy::primitives::{Address, B256, BlockNumber, LogData, TxHash};
 use alloy_rpc_types_eth::{Filter, Log};
 use lru::LruCache;
 use miden_client::sync::SyncSummary;
@@ -95,7 +95,27 @@ impl TxnManager {
         let txn_id = &receipt.id;
         match &receipt.result {
             Some(Ok(_)) => {
-                tracing::info!("TxnManager: committed eth txn: {txn_hash}; miden txn: {txn_id:?}")
+                tracing::info!("TxnManager: committed eth txn: {txn_hash}; miden txn: {txn_id:?}");
+
+                // Add logs to LogStore immediately on commit.
+                // This ensures bridge-service sees events as soon as txn is finalized.
+                let logs = receipt.logs.clone();
+                let signer = receipt.signer;
+                let block_hash = self.block_state.get_block_hash(block_num);
+                for log_data in logs {
+                    let log = SyntheticLog {
+                        address: format!("{:#x}", signer),
+                        topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
+                        data: log_data.data.to_string(),
+                        block_number: block_num,
+                        block_hash,
+                        transaction_hash: format!("{txn_hash:#x}"),
+                        transaction_index: 0,
+                        log_index: 0,
+                        removed: false,
+                    };
+                    self.log_store.add_log(log);
+                }
             }
             Some(Err(err)) => tracing::error!(
                 "TxnManager: failed eth txn: {txn_hash}; miden txn: {txn_id:?}; reason: {err}"
@@ -283,6 +303,66 @@ impl TxnManager {
                 tracing::warn!("Failed to timeout claim {hash}: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::consensus::Signed;
+    use alloy::primitives::Signature;
+
+    fn create_test_txn_manager() -> (Arc<TxnManager>, Arc<LogStore>, Arc<BlockState>) {
+        let log_store = Arc::new(LogStore::new());
+        let block_state = Arc::new(BlockState::new());
+        let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
+        (txn_manager, log_store, block_state)
+    }
+
+    #[test]
+    fn test_txn_manager_lifecycle() {
+        let (txn_manager, log_store, _block_state) = create_test_txn_manager();
+        let txn_hash = TxHash::from([1u8; 32]);
+        let txn_envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            alloy::consensus::TxLegacy::default(),
+            Signature::test_signature(),
+            txn_hash,
+        ));
+
+        // Not found
+        assert!(txn_manager.receipt(txn_hash).is_none());
+
+        // Begin
+        txn_manager.begin(txn_hash, None, txn_envelope, None, vec![]).unwrap();
+        assert!(txn_manager.receipt(txn_hash).is_none());
+
+        // Commit
+        txn_manager.commit(txn_hash, Ok(()), 42).unwrap();
+        let (res, block_num) = txn_manager.receipt(txn_hash).unwrap();
+        assert!(res.is_ok());
+        assert_eq!(block_num, 42);
+        
+        // Logs should be added to LogStore if we had any
+    }
+
+    #[test]
+    fn test_txn_manager_with_logs() {
+        let (txn_manager, log_store, _block_state) = create_test_txn_manager();
+        let txn_hash = TxHash::from([2u8; 32]);
+        let txn_envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            alloy::consensus::TxLegacy::default(),
+            Signature::test_signature(),
+            txn_hash,
+        ));
+        
+        let log_data = LogData::new_unchecked(vec![B256::from([0xaa; 32])], alloy::primitives::bytes!("aabbcc"));
+        txn_manager.begin(txn_hash, None, txn_envelope, None, vec![log_data]).unwrap();
+        txn_manager.commit(txn_hash, Ok(()), 100).unwrap();
+
+        let filter = crate::log_synthesis::LogFilter::default();
+        let logs = log_store.get_logs(&filter, 100);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].transaction_hash, format!("{txn_hash:#x}"));
     }
 }
 

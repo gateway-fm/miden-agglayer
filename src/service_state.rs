@@ -1,6 +1,6 @@
-use miden_agglayer_service::block_state::BlockState;
-use miden_agglayer_service::log_synthesis::LogStore;
-use miden_agglayer_service::*;
+use crate::block_state::BlockState;
+use crate::log_synthesis::LogStore;
+use crate::*;
 use std::sync::Arc;
 
 #[derive(Clone)]

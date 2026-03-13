@@ -5,9 +5,9 @@ use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::primitives::TxHash;
 use alloy_core::sol_types::SolCall;
-use miden_agglayer_service::claim::claimAssetCall;
-use miden_agglayer_service::ger::{insertGlobalExitRootCall, updateExitRootCall};
-use miden_agglayer_service::*;
+use crate::claim::claimAssetCall;
+use crate::ger::{insertGlobalExitRootCall, updateExitRootCall};
+use crate::*;
 
 struct TransactionData {
     pub hash: TxHash,
@@ -144,12 +144,14 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-        let ger_bytes =
-            ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
+        
+        let mainnet_root = params.newMainnetExitRoot.0;
+        let rollup_root = params.newRollupExitRoot.0;
+        let combined_ger = ger::combined_ger(&mainnet_root, &rollup_root);
 
         handle_ger_result(
             ger::insert_ger(
-                ger_bytes,
+                combined_ger,
                 &service.miden_client,
                 service.accounts.clone(),
                 &service.log_store,
@@ -168,4 +170,82 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 
     service.nonce_tracker.increment(&format!("{signer:#x}"));
     Ok(txn_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block_num_tracker::BlockNumTracker;
+    use crate::block_state::BlockState;
+    use crate::log_synthesis::LogStore;
+    use crate::nonce_tracker::NonceTracker;
+    use crate::txn_manager::TxnManager;
+    use crate::{AddressMapper, ClaimTracker, MidenClient, ServiceState};
+    use alloy::consensus::{TxEnvelope, Signed, TxLegacy};
+    use alloy::primitives::{TxHash, Signature};
+    use alloy::eips::Encodable2718;
+    use std::sync::Arc;
+
+    fn create_test_service() -> ServiceState {
+        let log_store = Arc::new(LogStore::new());
+        let block_state = Arc::new(BlockState::new());
+        let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
+        let miden_client = MidenClient::new_test();
+        let block_num_tracker = Arc::new(BlockNumTracker::new());
+        let nonce_tracker = Arc::new(NonceTracker::new());
+        let claim_tracker = Arc::new(ClaimTracker::new(None).unwrap());
+        let address_mapper = Arc::new(AddressMapper::new(None).unwrap());
+        
+        let accounts = crate::load_config(None).unwrap_or_else(|_| {
+             unsafe { std::mem::zeroed() }
+        });
+
+        ServiceState::new(
+            miden_client,
+            accounts,
+            1,
+            block_num_tracker,
+            txn_manager,
+            block_state,
+            log_store,
+            claim_tracker,
+            nonce_tracker,
+            address_mapper,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_service_send_raw_txn_invalid_hex() {
+        let service = create_test_service();
+        let result = service_send_raw_txn(service, "invalid".to_string()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_service_send_raw_txn_invalid_rlp() {
+        let service = create_test_service();
+        let result = service_send_raw_txn(service, "0x1234".to_string()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_service_send_raw_txn_unhandled_method() {
+        let service = create_test_service();
+        
+        // Create a dummy transaction with some random input
+        let txn = TxLegacy {
+            input: alloy::primitives::bytes!("12345678"),
+            ..Default::default()
+        };
+        let signature = Signature::test_signature();
+        let signed_txn = Signed::new_unchecked(txn, signature, TxHash::default());
+        let envelope = TxEnvelope::Legacy(signed_txn);
+        let mut encoded = Vec::new();
+        envelope.encode_2718(&mut encoded);
+        let input_hex = format!("0x{}", ::hex::encode(encoded));
+
+        let result = service_send_raw_txn(service, input_hex).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unhandled txn method"));
+    }
 }

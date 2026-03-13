@@ -13,7 +13,7 @@ use axum::routing::post;
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
-use miden_agglayer_service::log_synthesis::LogFilter;
+use crate::log_synthesis::LogFilter;
 use serde::Deserialize;
 use std::str::FromStr;
 use tokio::net::TcpListener;
@@ -132,8 +132,8 @@ async fn json_rpc_endpoint(
             let full_txns = params.1;
             let block = service.block_state.get_block_by_number(block_num);
             match block {
-                Some(b) => Ok(JsonRpcResponse::success(answer_id, b.to_json(full_txns))),
-                None => Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null)),
+                Some(b) => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, b.to_json(full_txns))),
+                None => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, serde_json::Value::Null)),
             }
         }
 
@@ -159,8 +159,8 @@ async fn json_rpc_endpoint(
             let full_txns = params.1;
             let block = service.block_state.get_block_by_hash(&hash);
             match block {
-                Some(b) => Ok(JsonRpcResponse::success(answer_id, b.to_json(full_txns))),
-                None => Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null)),
+                Some(b) => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, b.to_json(full_txns))),
+                None => Ok(JsonRpcResponse::success::<serde_json::Value, _>(answer_id, serde_json::Value::Null)),
             }
         }
 
@@ -259,9 +259,9 @@ async fn json_rpc_endpoint(
             let current_block = service.block_num_tracker.latest();
             let synthetic_logs = service.log_store.get_logs(&log_filter, current_block);
             let json_logs: Vec<serde_json::Value> =
-                synthetic_logs.iter().map(|l| l.to_json()).collect();
+                synthetic_logs.iter().map(|l: &crate::log_synthesis::SyntheticLog| l.to_json()).collect();
 
-            Ok(JsonRpcResponse::success(answer_id, json_logs))
+            Ok(JsonRpcResponse::success::<Vec<serde_json::Value>, _>(answer_id, json_logs))
         }
 
         "eth_getBalance" => {
