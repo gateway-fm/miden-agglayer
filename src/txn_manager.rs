@@ -186,18 +186,52 @@ impl TxnManager {
         let transactions = self.transactions.lock().unwrap();
         let receipt = transactions.peek(&txn_hash)?;
         let envelope = receipt.envelope.clone();
+        let is_confirmed = receipt.result.is_some();
+        let block_num = receipt.block_num;
+        let signer = receipt.signer;
+        drop(transactions);
+
+        // For confirmed transactions, include block_hash and transaction_index.
+        // Go's ethclient.TransactionByHash checks:
+        //   if json.From != nil && json.BlockHash != nil { setSenderFromServer(...) }
+        // Without block_hash, Go falls back to RLP-based sender recovery which
+        // fails with alloy's serialization format.
         let txn = alloy::rpc::types::Transaction {
-            inner: Recovered::new_unchecked(envelope, receipt.signer),
-            block_hash: None,
-            block_number: if receipt.result.is_some() {
-                Some(receipt.block_num)
+            inner: Recovered::new_unchecked(envelope, signer),
+            block_hash: if is_confirmed {
+                Some(alloy::primitives::B256::from(
+                    self.block_state.get_block_hash(block_num),
+                ))
             } else {
                 None
             },
-            transaction_index: None,
-            effective_gas_price: None,
+            block_number: if is_confirmed { Some(block_num) } else { None },
+            transaction_index: if is_confirmed { Some(0) } else { None },
+            effective_gas_price: Some(0),
         };
         Some(txn)
+    }
+
+    /// Get the signer address for a transaction (used by debug_traceTransaction).
+    pub fn txn_signer(&self, txn_hash: TxHash) -> Option<Address> {
+        let transactions = self.transactions.lock().unwrap();
+        let receipt = transactions.peek(&txn_hash)?;
+        Some(receipt.signer)
+    }
+
+    /// Get call trace info for debug_traceTransaction: (from, to, input_hex).
+    pub fn txn_trace_info(&self, txn_hash: TxHash) -> Option<(String, String, String)> {
+        use alloy::consensus::Transaction;
+        let transactions = self.transactions.lock().unwrap();
+        let receipt = transactions.peek(&txn_hash)?;
+        let from = format!("{:#x}", receipt.signer);
+        let to = receipt
+            .envelope
+            .to()
+            .map(|a| format!("{a:#x}"))
+            .unwrap_or_default();
+        let input = format!("0x{}", hex::encode(receipt.envelope.input()));
+        Some((from, to, input))
     }
 
     fn make_log(log_data: LogData, txn_hash: TxHash, block_num: BlockNumber) -> Log {
@@ -414,6 +448,66 @@ mod tests {
         assert_eq!(block_num, 42);
 
         // Logs should be added to LogStore if we had any
+    }
+
+    #[test]
+    fn test_txn_block_hash_pending_vs_confirmed() {
+        let (txn_manager, _log_store, block_state) = create_test_txn_manager();
+        let txn_hash = TxHash::from([3u8; 32]);
+        let txn_envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            alloy::consensus::TxLegacy::default(),
+            Signature::test_signature(),
+            txn_hash,
+        ));
+
+        txn_manager
+            .begin(txn_hash, None, txn_envelope, None, vec![])
+            .unwrap();
+
+        // Pending: block_hash, block_number, transaction_index should be None
+        let pending = txn_manager.txn(txn_hash).unwrap();
+        assert!(pending.block_hash.is_none());
+        assert!(pending.block_number.is_none());
+        assert!(pending.transaction_index.is_none());
+
+        // Commit at block 42
+        txn_manager.commit(txn_hash, Ok(()), 42).unwrap();
+
+        // Confirmed: block_hash must match block_state, block_number = 42, index = 0
+        let confirmed = txn_manager.txn(txn_hash).unwrap();
+        let expected_hash = B256::from(block_state.get_block_hash(42));
+        assert_eq!(confirmed.block_hash, Some(expected_hash));
+        assert_eq!(confirmed.block_number, Some(42));
+        assert_eq!(confirmed.transaction_index, Some(0));
+    }
+
+    #[test]
+    fn test_txn_json_has_required_go_fields() {
+        let (txn_manager, _log_store, _block_state) = create_test_txn_manager();
+        let txn_hash = TxHash::from([4u8; 32]);
+        let txn_envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            alloy::consensus::TxLegacy::default(),
+            Signature::test_signature(),
+            txn_hash,
+        ));
+
+        txn_manager
+            .begin(txn_hash, None, txn_envelope, None, vec![])
+            .unwrap();
+        txn_manager.commit(txn_hash, Ok(()), 10).unwrap();
+
+        let txn = txn_manager.txn(txn_hash).unwrap();
+        let json = serde_json::to_value(&txn).unwrap();
+
+        // Go ethclient.TransactionByHash requires these fields for setSenderFromServer:
+        assert!(json.get("from").is_some(), "must have 'from'");
+        assert!(!json["from"].is_null(), "'from' must not be null");
+        assert!(json.get("blockHash").is_some(), "must have 'blockHash'");
+        assert!(!json["blockHash"].is_null(), "'blockHash' must not be null");
+        assert!(json.get("hash").is_some(), "must have 'hash'");
+
+        // Go also checks RawSignatureValues r != nil
+        assert!(json.get("r").is_some(), "must have 'r'");
     }
 
     #[test]

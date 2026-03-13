@@ -104,6 +104,27 @@ impl LogFilter {
             .unwrap_or(current_block)
     }
 
+    /// Check if the query's topic filter explicitly includes the given topic.
+    fn query_includes_topic(&self, topic: Option<&str>) -> bool {
+        let Some(topic) = topic else {
+            return false;
+        };
+        let Some(ref topic_filters) = self.topics else {
+            return false;
+        };
+        // Check if topic0 filter includes this topic
+        if let Some(Some(filter)) = topic_filters.first() {
+            let topic_lower = topic.to_lowercase();
+            return match filter {
+                TopicFilter::Single(t) => t.to_lowercase() == topic_lower,
+                TopicFilter::Multiple(topics) => {
+                    topics.iter().any(|t| t.to_lowercase() == topic_lower)
+                }
+            };
+        }
+        false
+    }
+
     pub fn matches(&self, log: &SyntheticLog, current_block: u64) -> bool {
         if let Some(ref block_hash) = self.block_hash {
             let log_hash = format!("0x{}", hex::encode(log.block_hash));
@@ -129,17 +150,30 @@ impl LogFilter {
 
             // SPECIAL CASE: The bridge-service filters logs by the Bridge contract address.
             // However, it ALSO needs UpdateHashChainValue logs which are emitted by the
-            // GlobalExitRoot contract, and BridgeEvent logs which may use a different
-            // address. If the log is one of these types, we allow it through even if
-            // the address doesn't match the filter.
-            let topic0 = log.topics.first().map(|t| t.to_lowercase());
-            let is_passthrough = topic0
-                .as_ref()
-                .map(|t| {
-                    t == &UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()
-                        || t == &BRIDGE_EVENT_TOPIC.to_lowercase()
-                })
-                .unwrap_or(false);
+            // GlobalExitRoot contract. If the query includes a topic filter that
+            // explicitly requests a passthrough topic, we allow it through even if
+            // the address doesn't match.
+            //
+            // Without the topic filter guard, queries by address only (like aggkit's
+            // L2BridgeSyncer) would receive UpdateHashChainValue logs that they can't
+            // decode, causing "input too short" errors.
+            let is_passthrough = if !matches_addr {
+                let topic0 = log.topics.first().map(|t| t.to_lowercase());
+                let is_passthrough_topic = topic0
+                    .as_ref()
+                    .map(|t| {
+                        t == &UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()
+                            || t == &BRIDGE_EVENT_TOPIC.to_lowercase()
+                    })
+                    .unwrap_or(false);
+
+                // Only passthrough if the query's topic filter explicitly includes
+                // this log's topic. This prevents leaking GER logs to consumers
+                // that query by address only.
+                is_passthrough_topic && self.query_includes_topic(topic0.as_deref())
+            } else {
+                false // address matches, no passthrough needed
+            };
 
             if !matches_addr && !is_passthrough {
                 return false;
@@ -554,5 +588,26 @@ mod tests {
         let logs = store.get_logs(&filter, 500);
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].block_number, 100);
+    }
+
+    #[test]
+    fn test_event_topic_hashes() {
+        // Verify topic constants match keccak256 of event signatures
+        let claim_sig = "ClaimEvent(uint256,uint32,address,address,uint256)";
+        let mut hasher = Keccak256::new();
+        hasher.update(claim_sig.as_bytes());
+        let claim_hash = format!("0x{}", hex::encode(<[u8; 32]>::from(hasher.finalize())));
+        assert_eq!(CLAIM_EVENT_TOPIC, claim_hash);
+
+        // Cross-check with alloy's sol! macro
+        use crate::claim::ClaimEvent;
+        use alloy_core::sol_types::SolEvent;
+        assert_eq!(CLAIM_EVENT_TOPIC, format!("{:#x}", ClaimEvent::SIGNATURE_HASH));
+
+        let bridge_sig = "BridgeEvent(uint8,uint32,address,uint32,address,uint256,bytes,uint32)";
+        let mut hasher2 = Keccak256::new();
+        hasher2.update(bridge_sig.as_bytes());
+        let bridge_hash = format!("0x{}", hex::encode(<[u8; 32]>::from(hasher2.finalize())));
+        assert_eq!(BRIDGE_EVENT_TOPIC, bridge_hash);
     }
 }

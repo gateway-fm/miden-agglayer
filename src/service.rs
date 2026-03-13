@@ -41,6 +41,40 @@ impl From<ServiceErrorCode> for JsonRpcErrorReason {
     }
 }
 
+/// Build a synthetic transaction JSON for bridge-out events that have no TxnManager entry.
+///
+/// AggSender's L2BridgeSyncer calls `eth_getTransactionByHash` for every log it receives,
+/// then extracts the sender via Go's `ethclient.TransactionByHash`. Go checks:
+///
+///   if json.From != nil && json.BlockHash != nil { setSenderFromServer(tx, from, blockHash) }
+///
+/// This function constructs a minimal Legacy transaction that Go can unmarshal and
+/// extract the sender from without falling back to RLP-based signature recovery.
+fn build_synthetic_tx_json(
+    txn_hash: TxHash,
+    log: &crate::log_synthesis::SyntheticLog,
+    chain_id: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "0x0",
+        "nonce": "0x0",
+        "gasPrice": "0x0",
+        "gas": "0x0",
+        "to": &log.address,
+        "value": "0x0",
+        "input": "0x",
+        "v": "0x1b",
+        "r": "0x1",
+        "s": "0x1",
+        "hash": format!("{txn_hash:#x}"),
+        "from": &log.address,
+        "blockHash": format!("0x{}", hex::encode(log.block_hash)),
+        "blockNumber": format!("0x{:x}", log.block_number),
+        "transactionIndex": "0x0",
+        "chainId": format!("0x{:x}", chain_id),
+    })
+}
+
 fn json_rpc_response_from_result<T: serde::Serialize>(
     result: anyhow::Result<T>,
     answer_id: axum_jrpc::Id,
@@ -256,8 +290,27 @@ async fn json_rpc_endpoint(
                 );
                 return Err(JsonRpcResponse::error(answer_id, error));
             };
-            let txn_opt = service.txn_manager.txn(txn_hash);
-            Ok(JsonRpcResponse::success(answer_id, txn_opt))
+
+            // Try TxnManager first (real transactions from eth_sendRawTransaction)
+            if let Some(txn) = service.txn_manager.txn(txn_hash) {
+                return Ok(JsonRpcResponse::success(answer_id, txn));
+            }
+
+            // Fallback: check LogStore for synthetic transactions (bridge-out events).
+            // BridgeOutScanner creates synthetic tx hashes for BridgeEvent logs that
+            // have no corresponding TxnManager entry. AggSender's L2BridgeSyncer
+            // queries eth_getTransactionByHash for each log to extract the sender.
+            let tx_hash_str = format!("{txn_hash:#x}");
+            let logs = service.log_store.get_logs_for_tx(&tx_hash_str);
+            if let Some(log) = logs.first() {
+                let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
+                return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
+            }
+
+            Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                answer_id,
+                serde_json::Value::Null,
+            ))
         }
 
         "eth_getLogs" => {
@@ -303,10 +356,41 @@ async fn json_rpc_endpoint(
             ))
         }
 
-        // EthTxManager polls debug_traceTransaction — return empty result to avoid log spam
+        // Aggkit's L2BridgeSyncer calls debug_traceTransaction with callTracer config
+        // to extract the sender of claim/bridge transactions. Returns a call trace
+        // with the correct sender and input data so aggkit can build certificates.
         "debug_traceTransaction" => {
-            let _params: (String,) = request.parse_params()?;
-            Ok(JsonRpcResponse::success(answer_id, serde_json::Value::Null))
+            // Accept 2 params: [txHash, {"tracer": "callTracer"}]
+            let params: (String, serde_json::Value) = request.parse_params()?;
+            let bridge_addr = crate::bridge_address::get_bridge_address();
+
+            // Try TxnManager for real transactions (has actual calldata)
+            if let Ok(hash) = TxHash::from_str(&params.0)
+                && let Some((from, to, input)) = service.txn_manager.txn_trace_info(hash)
+            {
+                return Ok(JsonRpcResponse::success(
+                    answer_id,
+                    serde_json::json!({
+                        "from": from,
+                        "to": if to.is_empty() { bridge_addr.to_string() } else { to },
+                        "value": "0x0",
+                        "input": input,
+                        "calls": []
+                    }),
+                ));
+            }
+
+            // Fallback for synthetic bridge-out txs: use bridge address as sender
+            Ok(JsonRpcResponse::success(
+                answer_id,
+                serde_json::json!({
+                    "from": bridge_addr,
+                    "to": bridge_addr,
+                    "value": "0x0",
+                    "input": "0x",
+                    "calls": []
+                }),
+            ))
         }
 
         method => {
@@ -370,4 +454,77 @@ pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_synthesis::SyntheticLog;
+
+    #[test]
+    fn test_build_synthetic_tx_json_format() {
+        let txn_hash = TxHash::from([5u8; 32]);
+        let log = SyntheticLog {
+            address: "0xc8cbebf950b9df44d987c8619f092bea980ff038".to_string(),
+            topics: vec![],
+            data: "0x".to_string(),
+            block_number: 100,
+            block_hash: [0xAA; 32],
+            transaction_hash: format!("{txn_hash:#x}"),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+
+        let json = build_synthetic_tx_json(txn_hash, &log, 2);
+
+        // Required by Go's types.Transaction.UnmarshalJSON
+        assert_eq!(json["type"], "0x0");
+        assert_eq!(json["nonce"], "0x0");
+        assert_eq!(json["gasPrice"], "0x0");
+        assert_eq!(json["gas"], "0x0");
+        assert_eq!(json["value"], "0x0");
+        assert_eq!(json["input"], "0x");
+
+        // Required by Go's ethclient for sender extraction
+        assert_eq!(json["from"], log.address);
+        assert!(
+            !json["blockHash"].is_null(),
+            "blockHash must not be null for Go setSenderFromServer"
+        );
+        assert_eq!(json["blockNumber"], "0x64");
+        assert_eq!(json["transactionIndex"], "0x0");
+
+        // Go checks RawSignatureValues: r must be non-nil
+        assert_eq!(json["v"], "0x1b");
+        assert_eq!(json["r"], "0x1");
+        assert_eq!(json["s"], "0x1");
+
+        // hash and chainId
+        assert_eq!(json["hash"], format!("{txn_hash:#x}"));
+        assert_eq!(json["chainId"], "0x2");
+    }
+
+    #[test]
+    fn test_build_synthetic_tx_json_different_blocks() {
+        let txn_hash = TxHash::from([6u8; 32]);
+        let log = SyntheticLog {
+            address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            topics: vec![],
+            data: "0x".to_string(),
+            block_number: 255,
+            block_hash: [0xBB; 32],
+            transaction_hash: "0xabc".to_string(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+
+        let json = build_synthetic_tx_json(txn_hash, &log, 1337);
+
+        assert_eq!(json["blockNumber"], "0xff");
+        assert_eq!(json["chainId"], "0x539");
+        assert_eq!(json["from"], log.address);
+        assert_eq!(json["to"], log.address);
+    }
 }
