@@ -26,8 +26,12 @@ struct Request {
     closure: BoxFutureFactory,
 }
 
+#[async_trait::async_trait]
 pub trait SyncListener: Send + Sync {
     fn on_sync(&self, summary: &SyncSummary);
+    async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct MidenClient {
@@ -80,6 +84,33 @@ impl MidenClient {
             sender,
             done_sender,
         })
+    }
+
+    #[cfg(test)]
+    pub fn new_test() -> Self {
+        let store_dir = tempfile::tempdir().unwrap().keep();
+        let keystore_path = store_dir.join("keystore");
+        std::fs::create_dir_all(&keystore_path).unwrap();
+        let keystore = FilesystemKeyStore::new(keystore_path).unwrap();
+        let keystore = Arc::new(keystore);
+        let (sender, mut receiver) = mpsc::channel::<Request>(1);
+        let (done_sender, _done_receiver) = oneshot::channel::<()>();
+
+        // Start a mock task to handle 'with' calls
+        thread::spawn(move || {
+            while let Some(req) = receiver.blocking_recv() {
+                // We can't actually run the closure because it needs MidenClientLib,
+                // which we don't have. But we can just signal success for tests.
+                let _ = req.response_sender.send(Ok(()));
+            }
+        });
+
+        Self {
+            keystore,
+            task: std::sync::Mutex::new(None),
+            sender,
+            done_sender: std::sync::Mutex::new(Some(done_sender)),
+        }
     }
 
     fn default_store_dir() -> PathBuf {
@@ -169,13 +200,15 @@ impl MidenClient {
         }
     }
 
-    fn on_sync(
+    async fn on_sync(
         result: anyhow::Result<SyncSummary>,
+        client: &mut MidenClientLib,
         listeners: &[Arc<dyn SyncListener>],
     ) -> anyhow::Result<()> {
         let summary = result?;
         for listener in listeners {
             listener.on_sync(&summary);
+            listener.on_post_sync(client).await?;
         }
         Ok(())
     }
@@ -201,7 +234,7 @@ impl MidenClient {
 
         // initial sync
         tokio::select! {
-            result = Self::sync(&mut client) => Self::on_sync(result, &sync_listeners)?,
+            result = Self::sync(&mut client) => Self::on_sync(result, &mut client, &sync_listeners).await?,
             _ = &mut done_receiver => {
                 tracing::debug!("MidenClient::run loop done");
                 return Ok(());
@@ -218,7 +251,7 @@ impl MidenClient {
                 },
                 _ = sync_interval.tick() => {
                     tokio::select! {
-                        result = Self::sync(&mut client) => Self::on_sync(result, &sync_listeners)?,
+                        result = Self::sync(&mut client) => Self::on_sync(result, &mut client, &sync_listeners).await?,
                         _ = &mut done_receiver => break,
                     }
                 },
@@ -252,5 +285,26 @@ impl MidenClient {
             anyhow::bail!("MidenClient::with: failed to get a response - receiver is closed");
         };
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_miden_client_test_with() {
+        let client = MidenClient::new_test();
+        let res = client
+            .with(|_client| {
+                Box::new(async move {
+                    // This won't actually run in new_test's background thread
+                    Ok(())
+                })
+            })
+            .await;
+
+        // new_test background thread returns Ok(()) directly
+        assert!(res.is_ok());
     }
 }

@@ -18,6 +18,7 @@ impl BlockNumTracker {
     }
 }
 
+#[async_trait::async_trait]
 impl SyncListener for BlockNumTracker {
     fn on_sync(&self, summary: &SyncSummary) {
         let mut latest_ref = self.latest.write().unwrap();

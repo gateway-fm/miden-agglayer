@@ -122,7 +122,18 @@ impl LogFilter {
                     addrs.iter().any(|a| a.to_lowercase() == log_addr)
                 }
             };
-            if !matches_addr {
+
+            // SPECIAL CASE: The bridge-service filters logs by the Bridge contract address.
+            // However, it ALSO needs UpdateHashChainValue logs which are emitted by the
+            // GlobalExitRoot contract. If the log is an UpdateHashChainValue, we allow it
+            // through even if the address doesn't match the filter.
+            let is_ger_update = log
+                .topics
+                .first()
+                .map(|t| t.to_lowercase() == UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase())
+                .unwrap_or(false);
+
+            if !matches_addr && !is_ger_update {
                 return false;
             }
         }

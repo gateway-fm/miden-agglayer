@@ -13,6 +13,10 @@ pub mod log_synthesis;
 pub mod logging;
 pub mod miden_client;
 pub mod nonce_tracker;
+pub mod service;
+pub mod service_get_txn_receipt;
+pub mod service_send_raw_txn;
+pub mod service_state;
 mod txn_manager;
 
 pub const COMPONENT: &str = "miden-agglayer";
@@ -22,6 +26,7 @@ pub use block_num_tracker::BlockNumTracker;
 pub use claim_tracker::ClaimTracker;
 pub use miden_client::MidenClient;
 pub use nonce_tracker::NonceTracker;
+pub use service_state::ServiceState;
 pub use txn_manager::TxnManager;
 
 #[derive(Clone)]

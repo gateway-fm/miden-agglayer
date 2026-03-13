@@ -1,17 +1,13 @@
-use crate::service_state::ServiceState;
 use clap::Parser;
 use miden_agglayer_service::block_state::BlockState;
 use miden_agglayer_service::log_synthesis::LogStore;
+use miden_agglayer_service::service;
+use miden_agglayer_service::service_state::ServiceState;
 use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
-
-mod service;
-mod service_get_txn_receipt;
-mod service_send_raw_txn;
-pub mod service_state;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -44,9 +40,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("{command:?}");
 
     let block_num_tracker = Arc::new(BlockNumTracker::new());
-    let txn_manager = Arc::new(TxnManager::new());
     let block_state = Arc::new(BlockState::new());
     let log_store = Arc::new(LogStore::new());
+    let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
 
     let miden_store_dir = command.miden_store_dir;
     let client = MidenClient::new(
@@ -71,12 +67,12 @@ async fn main() -> anyhow::Result<()> {
     let accounts = load_config(miden_store_dir.clone())?;
     let claim_persistence_path = miden_store_dir
         .as_ref()
-        .map(|d| d.join("claimed_indices.json"));
+        .map(|d: &PathBuf| d.join("claimed_indices.json"));
     let claim_tracker = Arc::new(ClaimTracker::new(claim_persistence_path)?);
     let nonce_tracker = Arc::new(NonceTracker::new());
     let address_persistence_path = miden_store_dir
         .as_ref()
-        .map(|d| d.join("address_mappings.json"));
+        .map(|d: &PathBuf| d.join("address_mappings.json"));
     let address_mapper = Arc::new(AddressMapper::new(address_persistence_path)?);
 
     let state = ServiceState::new(

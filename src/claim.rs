@@ -129,12 +129,13 @@ fn create_claim(
     Ok(note)
 }
 
-/// Compute metadata hash: keccak256 of metadata bytes, or zero for empty metadata.
+/// Compute metadata hash: keccak256 of metadata bytes.
+///
+/// The Solidity bridge contract always uses `keccak256(metadata)` in the leaf
+/// computation, even for empty metadata. For ETH deposits metadata is empty,
+/// so this returns `keccak256("")` = `0xc5d246...`, NOT all zeros.
 fn metadata_to_hash(metadata: &Bytes) -> [u8; 32] {
     use sha3::{Digest, Keccak256};
-    if metadata.is_empty() {
-        return [0u8; 32];
-    }
     let mut hasher = Keccak256::new();
     hasher.update(metadata.as_ref());
     hasher.finalize().into()
@@ -157,6 +158,16 @@ async fn publish_claim_internal(
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_target_faucet(params.originTokenAddress, accounts);
+
+    tracing::info!(
+        global_index = %params.globalIndex,
+        origin_network = %params.originNetwork,
+        dest_address = %params.destinationAddress,
+        amount = %params.amount,
+        faucet_id = %crate::accounts_config::AccountIdBech32(faucet.id),
+        "creating CLAIM note"
+    );
+
     let claim_note = create_claim(
         params.clone(),
         faucet,
@@ -177,7 +188,7 @@ async fn publish_claim_internal(
     let txn_id = client
         .submit_new_transaction(accounts.service.0, txn_request)
         .await?;
-    tracing::debug!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
+    tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
     let event = ClaimEvent::from(params);
     let log = event.encode_log_data();
@@ -221,4 +232,43 @@ pub async fn publish_claim(
         .get()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("publish_claim: closure completed but result was not set"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn test_metadata_to_hash_empty() {
+        let metadata = Bytes::from(vec![]);
+        let hash = metadata_to_hash(&metadata);
+        // keccak256("")
+        let expected =
+            hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+                .unwrap();
+        assert_eq!(hash, expected.as_slice());
+    }
+
+    #[test]
+    fn test_find_target_faucet_eth() {
+        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        let faucet = find_target_faucet(
+            address!("0000000000000000000000000000000000000000"),
+            &accounts.0,
+        );
+        assert_eq!(faucet.origin_token_decimals, 18);
+        assert_eq!(faucet.decimals, 8);
+    }
+
+    #[test]
+    fn test_find_target_faucet_agg() {
+        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        let faucet = find_target_faucet(
+            address!("742d35Cc6634C0532925a3b844Bc9e7595f41111"),
+            &accounts.0,
+        );
+        assert_eq!(faucet.origin_token_decimals, 8);
+        assert_eq!(faucet.decimals, 8);
+    }
 }

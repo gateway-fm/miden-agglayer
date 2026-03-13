@@ -225,6 +225,7 @@ impl Default for BlockState {
     }
 }
 
+#[async_trait::async_trait]
 impl SyncListener for BlockState {
     fn on_sync(&self, summary: &SyncSummary) {
         self.set_current_block(summary.block_num.as_u64());
