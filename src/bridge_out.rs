@@ -280,9 +280,11 @@ impl BridgeOutScanner {
 
         tracing::info!(
             note_id = %note_id_str,
+            synthetic_tx_hash = %tx_hash,
             deposit_count,
             destination_network,
             amount = origin_amount,
+            block_number,
             "emitted BridgeEvent for consumed B2AGG note"
         );
     }

@@ -251,9 +251,11 @@ async fn json_rpc_endpoint(
                 };
 
                 if data.starts_with(&networkIDCall::SELECTOR) {
-                    let chain_id = service.chain_id;
-                    let chain_id_hex = format!("{:#066x}", chain_id);
-                    return Ok(JsonRpcResponse::success(answer_id, chain_id_hex));
+                    // Return the rollup's network ID from RollupManager, NOT chain_id.
+                    // The bridge uses networkID() to determine which network deposits belong to.
+                    let network_id = service.network_id;
+                    let network_id_hex = format!("{:#066x}", network_id);
+                    return Ok(JsonRpcResponse::success(answer_id, network_id_hex));
                 }
             }
 
@@ -266,13 +268,30 @@ async fn json_rpc_endpoint(
         "eth_sendRawTransaction" => {
             let params: (String,) = request.parse_params()?;
             let result = service_send_raw_txn(service, params.0).await;
+            match &result {
+                Ok(hash) => tracing::info!("eth_sendRawTransaction: OK hash={hash}"),
+                Err(err) => tracing::info!("eth_sendRawTransaction: ERR {err:#}"),
+            }
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::SendRawTransaction)
         }
 
         // polycli polls receipts to get the eth_sendRawTransaction status
         "eth_getTransactionReceipt" => {
             let params: (String,) = request.parse_params()?;
+            let tx_hash_str = params.0.clone();
             let result = service_get_txn_receipt(service, params.0).await;
+            match &result {
+                Ok(Some(r)) => tracing::info!(
+                    "eth_getTransactionReceipt: FOUND hash={tx_hash_str} block={}",
+                    r.block_number.unwrap_or(0)
+                ),
+                Ok(None) => tracing::info!(
+                    "eth_getTransactionReceipt: NOT FOUND hash={tx_hash_str}"
+                ),
+                Err(err) => tracing::info!(
+                    "eth_getTransactionReceipt: ERR hash={tx_hash_str} {err:#}"
+                ),
+            }
             json_rpc_response_from_result(
                 result,
                 answer_id,
@@ -303,10 +322,20 @@ async fn json_rpc_endpoint(
             let tx_hash_str = format!("{txn_hash:#x}");
             let logs = service.log_store.get_logs_for_tx(&tx_hash_str);
             if let Some(log) = logs.first() {
+                tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
                 let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
                 return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
             }
 
+            // Unknown hash: return null.
+            // The EthTxManager checks TransactionByHash BEFORE sending to see if the
+            // tx is already "in the network". If we return a synthetic tx here, the
+            // EthTxManager skips SendTransaction entirely, and the receipt is never
+            // created — causing perpetual "not mined yet" polling.
+            tracing::debug!(
+                tx_hash = %tx_hash_str,
+                "eth_getTransactionByHash: unknown hash, returning null"
+            );
             Ok(JsonRpcResponse::success::<serde_json::Value, _>(
                 answer_id,
                 serde_json::Value::Null,
@@ -359,6 +388,10 @@ async fn json_rpc_endpoint(
         // Aggkit's L2BridgeSyncer calls debug_traceTransaction with callTracer config
         // to extract the sender of claim/bridge transactions. Returns a call trace
         // with the correct sender and input data so aggkit can build certificates.
+        //
+        // Aggkit's findCall() does DFS on the "calls" array looking for a subcall
+        // where "to" matches the bridge address. It does NOT check the root call.
+        // So we must include a subcall with to=bridge_address.
         "debug_traceTransaction" => {
             // Accept 2 params: [txHash, {"tracer": "callTracer"}]
             let params: (String, serde_json::Value) = request.parse_params()?;
@@ -368,27 +401,45 @@ async fn json_rpc_endpoint(
             if let Ok(hash) = TxHash::from_str(&params.0)
                 && let Some((from, to, input)) = service.txn_manager.txn_trace_info(hash)
             {
+                let call_to = if to.is_empty() { bridge_addr.to_string() } else { to };
                 return Ok(JsonRpcResponse::success(
                     answer_id,
                     serde_json::json!({
-                        "from": from,
-                        "to": if to.is_empty() { bridge_addr.to_string() } else { to },
+                        "type": "CALL",
+                        "from": &from,
+                        "to": &call_to,
                         "value": "0x0",
-                        "input": input,
-                        "calls": []
+                        "input": &input,
+                        "calls": [{
+                            "type": "DELEGATECALL",
+                            "from": &call_to,
+                            "to": &call_to,
+                            "value": "0x0",
+                            "input": &input,
+                            "calls": []
+                        }]
                     }),
                 ));
             }
 
-            // Fallback for synthetic bridge-out txs: use bridge address as sender
+            // Fallback for synthetic bridge-out txs: bridge address as both caller and target.
+            // Include bridge call as subcall so aggkit's findCall() can find it.
             Ok(JsonRpcResponse::success(
                 answer_id,
                 serde_json::json!({
+                    "type": "CALL",
                     "from": bridge_addr,
                     "to": bridge_addr,
                     "value": "0x0",
                     "input": "0x",
-                    "calls": []
+                    "calls": [{
+                        "type": "DELEGATECALL",
+                        "from": bridge_addr,
+                        "to": bridge_addr,
+                        "value": "0x0",
+                        "input": "0x",
+                        "calls": []
+                    }]
                 }),
             ))
         }

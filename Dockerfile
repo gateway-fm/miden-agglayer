@@ -31,8 +31,8 @@ RUN mkdir -p /var/lib/miden-agglayer-service
 EXPOSE 8546
 
 ENTRYPOINT ["miden-agglayer-service"]
+# chain_id and network_id read from CHAIN_ID / NETWORK_ID env vars (clap env support)
 CMD [ \
-    "--chain-id=2", \
     "--miden-node=http://miden-node-001:57291", \
     "--miden-store-dir=/var/lib/miden-agglayer-service", \
     "--port=8546" \

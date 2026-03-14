@@ -246,7 +246,15 @@ impl LogStore {
         *counter += 1;
 
         let block_num = log.block_number;
-        let tx_hash = log.transaction_hash.clone();
+        // Normalize tx hash key to lowercase for case-insensitive lookup
+        let tx_hash = log.transaction_hash.to_lowercase();
+
+        tracing::debug!(
+            tx_hash = %tx_hash,
+            block_number = block_num,
+            topic0 = log.topics.first().map(|t| &t[..20.min(t.len())]).unwrap_or("none"),
+            "LogStore: storing log"
+        );
 
         self.logs_by_block
             .write()
@@ -416,12 +424,25 @@ impl LogStore {
         result
     }
 
+    /// Return all stored tx hash keys (for diagnostics).
+    pub fn logs_by_tx_keys(&self) -> Vec<String> {
+        self.logs_by_tx.read().keys().cloned().collect()
+    }
+
     pub fn get_logs_for_tx(&self, tx_hash: &str) -> Vec<SyntheticLog> {
-        self.logs_by_tx
-            .read()
-            .get(tx_hash)
-            .cloned()
-            .unwrap_or_default()
+        let key = tx_hash.to_lowercase();
+        let map = self.logs_by_tx.read();
+        let result = map.get(&key).cloned().unwrap_or_default();
+        if result.is_empty() {
+            let stored_keys: Vec<&String> = map.keys().collect();
+            tracing::debug!(
+                lookup_key = %key,
+                stored_count = stored_keys.len(),
+                stored_keys = ?stored_keys.iter().take(10).collect::<Vec<_>>(),
+                "LogStore: get_logs_for_tx miss"
+            );
+        }
+        result
     }
 }
 
@@ -588,6 +609,62 @@ mod tests {
         let logs = store.get_logs(&filter, 500);
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].block_number, 100);
+    }
+
+    #[test]
+    fn test_bridge_event_roundtrip_lookup() {
+        // Simulates the exact flow: BridgeOutScanner stores a BridgeEvent,
+        // then eth_getTransactionByHash looks it up via get_logs_for_tx.
+        use alloy::primitives::TxHash;
+        use std::str::FromStr;
+
+        let store = LogStore::new();
+
+        // Step 1: Simulate BridgeOutScanner creating a synthetic tx hash
+        let note_id_str = "0x1234abcd5678ef90";
+        let tx_hash = {
+            let mut hasher = Keccak256::new();
+            hasher.update(b"miden-bridge-out-");
+            hasher.update(note_id_str.as_bytes());
+            let hash: [u8; 32] = hasher.finalize().into();
+            format!("0x{}", hex::encode(hash))
+        };
+
+        // Step 2: Store the BridgeEvent (as BridgeOutScanner does)
+        store.add_bridge_event(
+            "0xc8cbebf950b9df44d987c8619f092bea980ff038",
+            100,
+            [0xBB; 32],
+            &tx_hash,
+            0,
+            0,
+            &[0u8; 20],
+            1,
+            &[0x42; 20],
+            1000,
+            0,
+        );
+
+        // Step 3: Verify eth_getLogs returns the event with the correct transactionHash
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0x200".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 500);
+        assert_eq!(logs.len(), 1, "BridgeEvent should appear in eth_getLogs");
+        let log_tx_hash = &logs[0].transaction_hash;
+
+        // Step 4: Simulate eth_getTransactionByHash lookup
+        // The service parses the hash from the RPC param, then formats it back
+        let parsed_hash = TxHash::from_str(log_tx_hash).expect("should parse tx hash from log");
+        let lookup_key = format!("{parsed_hash:#x}");
+        let found = store.get_logs_for_tx(&lookup_key);
+        assert!(
+            !found.is_empty(),
+            "get_logs_for_tx should find the log. stored key from add_bridge_event: {tx_hash}, lookup key from TxHash round-trip: {lookup_key}"
+        );
+        assert_eq!(found[0].block_number, 100);
     }
 
     #[test]

@@ -25,9 +25,14 @@ struct Command {
     #[arg(long)]
     miden_node: Option<String>,
 
-    /// L2 chain ID configured in the AggLayer
-    #[arg(long, default_value_t = 2)]
+    /// L2 chain ID configured in the AggLayer (EVM chain ID for eth_chainId)
+    #[arg(long, default_value_t = 2, env = "CHAIN_ID")]
     chain_id: u64,
+
+    /// Rollup network ID assigned by the RollupManager (used by bridge's networkID())
+    /// This is NOT the same as chain_id — first rollup in RollupManager gets network ID 1.
+    #[arg(long, default_value_t = 1, env = "NETWORK_ID")]
+    network_id: u64,
 
     /// Create a new accounts config inside --miden-store-dir
     #[arg(long)]
@@ -112,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         client,
         accounts,
         command.chain_id,
+        command.network_id,
         block_num_tracker,
         txn_manager,
         block_state,

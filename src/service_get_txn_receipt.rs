@@ -22,11 +22,16 @@ pub async fn service_get_txn_receipt(
     receipt_inner.receipt.status = Eip658Value::Eip658(status);
     receipt_inner.receipt.cumulative_gas_used = 0;
 
+    // IMPORTANT: Go's hexutil.Uint.UnmarshalJSON cannot handle JSON null.
+    // All numeric fields must be present with valid hex values, otherwise
+    // Go's types.Receipt unmarshaling fails silently and the EthTxManager
+    // treats the tx as "not mined".
+    let block_hash = service.block_state.get_block_hash(block_num);
     let receipt = TransactionReceipt {
         inner: ReceiptEnvelope::Eip1559(receipt_inner),
         transaction_hash: txn_hash,
-        transaction_index: None,
-        block_hash: None,
+        transaction_index: Some(0),
+        block_hash: Some(alloy::primitives::B256::from(block_hash)),
         block_number: Some(block_num),
         gas_used: 0,
         effective_gas_price: 0,
@@ -69,6 +74,7 @@ mod tests {
         ServiceState::new(
             miden_client,
             accounts,
+            1,
             1,
             block_num_tracker,
             txn_manager,
@@ -115,6 +121,9 @@ mod tests {
         let receipt = result.unwrap();
         assert_eq!(receipt.transaction_hash, txn_hash);
         assert_eq!(receipt.block_number, Some(123));
+        // Go's hexutil.Uint can't unmarshal null, so these must be Some
+        assert_eq!(receipt.transaction_index, Some(0));
+        assert!(receipt.block_hash.is_some());
         assert!(matches!(
             receipt.inner.as_receipt().unwrap().status,
             alloy::consensus::Eip658Value::Eip658(true)
