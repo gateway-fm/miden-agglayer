@@ -53,13 +53,9 @@ fn handle_ger_result(
             // in LogStore by insert_ger() → add_ger_update_event(). Passing
             // log_data here would create a duplicate at the bridge address
             // instead of the GER contract address.
-            service.txn_manager.begin(
-                txn_hash,
-                None,
-                txn_envelope,
-                None,
-                vec![],
-            )?;
+            service
+                .txn_manager
+                .begin(txn_hash, None, txn_envelope, None, vec![])?;
             let block_num = service.block_num_tracker.latest();
             service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
             Ok(())

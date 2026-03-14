@@ -285,12 +285,12 @@ async fn json_rpc_endpoint(
                     "eth_getTransactionReceipt: FOUND hash={tx_hash_str} block={}",
                     r.block_number.unwrap_or(0)
                 ),
-                Ok(None) => tracing::info!(
-                    "eth_getTransactionReceipt: NOT FOUND hash={tx_hash_str}"
-                ),
-                Err(err) => tracing::info!(
-                    "eth_getTransactionReceipt: ERR hash={tx_hash_str} {err:#}"
-                ),
+                Ok(None) => {
+                    tracing::info!("eth_getTransactionReceipt: NOT FOUND hash={tx_hash_str}")
+                }
+                Err(err) => {
+                    tracing::info!("eth_getTransactionReceipt: ERR hash={tx_hash_str} {err:#}")
+                }
             }
             json_rpc_response_from_result(
                 result,
@@ -401,7 +401,11 @@ async fn json_rpc_endpoint(
             if let Ok(hash) = TxHash::from_str(&params.0)
                 && let Some((from, to, input)) = service.txn_manager.txn_trace_info(hash)
             {
-                let call_to = if to.is_empty() { bridge_addr.to_string() } else { to };
+                let call_to = if to.is_empty() {
+                    bridge_addr.to_string()
+                } else {
+                    to
+                };
                 return Ok(JsonRpcResponse::success(
                     answer_id,
                     serde_json::json!({

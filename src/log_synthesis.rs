@@ -679,7 +679,10 @@ mod tests {
         // Cross-check with alloy's sol! macro
         use crate::claim::ClaimEvent;
         use alloy_core::sol_types::SolEvent;
-        assert_eq!(CLAIM_EVENT_TOPIC, format!("{:#x}", ClaimEvent::SIGNATURE_HASH));
+        assert_eq!(
+            CLAIM_EVENT_TOPIC,
+            format!("{:#x}", ClaimEvent::SIGNATURE_HASH)
+        );
 
         let bridge_sig = "BridgeEvent(uint8,uint32,address,uint32,address,uint256,bytes,uint32)";
         let mut hasher2 = Keccak256::new();

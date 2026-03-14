@@ -174,7 +174,10 @@ impl TxnManager {
     pub fn receipt(&self, txn_hash: TxHash) -> Option<(Result<(), String>, BlockNumber)> {
         let transactions = self.transactions.lock().unwrap();
         let Some(receipt) = transactions.peek(&txn_hash) else {
-            tracing::debug!("TxnManager::receipt: hash {txn_hash} NOT in LRU (total={})", transactions.len());
+            tracing::debug!(
+                "TxnManager::receipt: hash {txn_hash} NOT in LRU (total={})",
+                transactions.len()
+            );
             return None;
         };
         // If awaiting consumption (has claim_note_id), return None (pending) until cleared
@@ -183,7 +186,9 @@ impl TxnManager {
             return None;
         }
         if receipt.result.is_none() {
-            tracing::debug!("TxnManager::receipt: hash {txn_hash} exists but result=None (uncommitted)");
+            tracing::debug!(
+                "TxnManager::receipt: hash {txn_hash} exists but result=None (uncommitted)"
+            );
             return None;
         }
         let result = receipt.result.clone()?;
