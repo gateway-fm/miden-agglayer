@@ -148,6 +148,11 @@ async fn add_accounts(
     })
 }
 
+/// Register a faucet in the bridge's faucet registry via ConfigAggBridgeNote.
+/// This is required for CLAIM note FPI (Foreign Procedure Invocation) validation:
+/// the bridge account must know which faucets are valid sources for claim operations.
+/// Without registration, claim transactions will fail FPI validation on the bridge.
+/// This operation is idempotent — re-registering an already-known faucet is safe.
 async fn register_faucet_in_bridge(
     client: &mut MidenClientLib,
     service_id: AccountId,

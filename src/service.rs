@@ -29,6 +29,65 @@ alloy_core::sol! {
     uint32 public networkID;
 }
 
+// https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L196
+alloy_core::sol! {
+    #[derive(Debug)]
+    function bridgeAsset(
+        uint32 destinationNetwork,
+        address destinationAddress,
+        uint256 amount,
+        address token,
+        bool forceUpdateGlobalExitRoot,
+        bytes permitData
+    );
+}
+
+/// Encode `bridgeAsset(...)` calldata from a BridgeEvent synthetic log.
+///
+/// The aggkit L2BridgeSyncer calls `debug_traceTransaction`, finds the subcall
+/// to the bridge address, then ABI-decodes the `input` as `bridgeAsset(...)`.
+/// Without proper calldata, it errors with "failed to extract bridge event data".
+fn encode_bridge_asset_from_log(log: &crate::log_synthesis::SyntheticLog) -> String {
+    let data_hex = log.data.strip_prefix("0x").unwrap_or(&log.data);
+    let Ok(data_bytes) = hex::decode(data_hex) else {
+        return "0x".to_string();
+    };
+
+    // BridgeEvent data layout (32 bytes each):
+    //   [0]  leafType (uint8)
+    //   [1]  originNetwork (uint32)
+    //   [2]  originAddress (address)
+    //   [3]  destinationNetwork (uint32)
+    //   [4]  destinationAddress (address)
+    //   [5]  amount (uint256)
+    //   [6]  metadata offset
+    //   [7]  depositCount (uint32)
+    if data_bytes.len() < 8 * 32 {
+        return "0x".to_string();
+    }
+
+    // Extract fields from 32-byte ABI words
+    let dest_net = u32::from_be_bytes(
+        data_bytes[3 * 32 + 28..3 * 32 + 32].try_into().unwrap_or([0; 4]),
+    );
+    let dest_addr: [u8; 20] = data_bytes[4 * 32 + 12..4 * 32 + 32]
+        .try_into()
+        .unwrap_or([0; 20]);
+    let amount = alloy::primitives::U256::from_be_slice(&data_bytes[5 * 32..6 * 32]);
+
+    // Encode as bridgeAsset(destNet, destAddr, amount, token=0, false, "")
+    let call = bridgeAssetCall {
+        destinationNetwork: dest_net,
+        destinationAddress: alloy::primitives::Address::from(dest_addr),
+        amount,
+        token: alloy::primitives::Address::ZERO,
+        forceUpdateGlobalExitRoot: false,
+        permitData: alloy::primitives::Bytes::new(),
+    };
+
+    format!("0x{}", hex::encode(SolCall::abi_encode(&call)))
+}
+
 #[repr(i32)]
 enum ServiceErrorCode {
     SendRawTransaction = 1,
@@ -126,6 +185,12 @@ async fn json_rpc_endpoint(
             tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
         }
         "eth_getTransactionReceipt" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        }
+        "zkevm_getLatestGlobalExitRoot" => {
+            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
+        }
+        "zkevm_getExitRootsByGER" => {
             tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
         }
         _ => tracing::debug!("JSON-RPC {method}"),
@@ -426,8 +491,21 @@ async fn json_rpc_endpoint(
                 ));
             }
 
-            // Fallback for synthetic bridge-out txs: bridge address as both caller and target.
-            // Include bridge call as subcall so aggkit's findCall() can find it.
+            // Fallback for synthetic bridge-out txs: look up the BridgeEvent log
+            // and encode proper bridgeAsset calldata so aggkit's L2BridgeSyncer
+            // can extract the bridge event data via findCall() + ABI decode.
+            let input_data = if let Ok(hash) = TxHash::from_str(&params.0) {
+                let tx_key = format!("{hash:#x}");
+                let logs = service.log_store.get_logs_for_tx(&tx_key);
+                if let Some(log) = logs.first() {
+                    encode_bridge_asset_from_log(log)
+                } else {
+                    "0x".to_string()
+                }
+            } else {
+                "0x".to_string()
+            };
+
             Ok(JsonRpcResponse::success(
                 answer_id,
                 serde_json::json!({
@@ -435,17 +513,75 @@ async fn json_rpc_endpoint(
                     "from": bridge_addr,
                     "to": bridge_addr,
                     "value": "0x0",
-                    "input": "0x",
+                    "input": &input_data,
                     "calls": [{
                         "type": "DELEGATECALL",
                         "from": bridge_addr,
                         "to": bridge_addr,
                         "value": "0x0",
-                        "input": "0x",
+                        "input": &input_data,
                         "calls": []
                     }]
                 }),
             ))
+        }
+
+        // Bridge-service's L2 synchronizer calls syncTrustedState() which queries
+        // the latest GER to track trusted exit roots. Returns the most recently
+        // inserted GER hash, or zero hash if none.
+        "zkevm_getLatestGlobalExitRoot" => {
+            let ger = service
+                .log_store
+                .get_latest_ger()
+                .unwrap_or([0u8; 32]);
+            Ok(JsonRpcResponse::success(
+                answer_id,
+                format!("0x{}", hex::encode(ger)),
+            ))
+        }
+
+        // Bridge-service calls ExitRootsByGER to get the exit roots and block info
+        // for a given GER. Returns null if the GER is not found (causes syncTrustedState
+        // to skip gracefully).
+        "zkevm_getExitRootsByGER" => {
+            let params: (String,) = request.parse_params()?;
+            let hash_hex = params.0.strip_prefix("0x").unwrap_or(&params.0);
+            let Ok(hash_bytes) = hex::decode(hash_hex) else {
+                let error = JsonRpcError::new(
+                    JsonRpcErrorReason::InvalidParams,
+                    String::from("bad GER hash"),
+                    serde_json::Value::Null,
+                );
+                return Err(JsonRpcResponse::error(answer_id, error));
+            };
+            let Ok(ger): Result<[u8; 32], _> = hash_bytes.try_into() else {
+                let error = JsonRpcError::new(
+                    JsonRpcErrorReason::InvalidParams,
+                    String::from("GER hash must be 32 bytes"),
+                    serde_json::Value::Null,
+                );
+                return Err(JsonRpcResponse::error(answer_id, error));
+            };
+
+            match service.log_store.get_ger_entry(&ger) {
+                Some(entry) => {
+                    let mainnet = entry.mainnet_exit_root.unwrap_or([0u8; 32]);
+                    let rollup = entry.rollup_exit_root.unwrap_or([0u8; 32]);
+                    Ok(JsonRpcResponse::success(
+                        answer_id,
+                        serde_json::json!({
+                            "blockNumber": format!("0x{:x}", entry.block_number),
+                            "timestamp": format!("0x{:x}", entry.timestamp),
+                            "mainnetExitRoot": format!("0x{}", hex::encode(mainnet)),
+                            "rollupExitRoot": format!("0x{}", hex::encode(rollup)),
+                        }),
+                    ))
+                }
+                None => Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                    answer_id,
+                    serde_json::Value::Null,
+                )),
+            }
         }
 
         method => {

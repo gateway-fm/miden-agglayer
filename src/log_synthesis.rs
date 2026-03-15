@@ -204,12 +204,22 @@ impl LogFilter {
     }
 }
 
+/// Metadata stored for each seen GER (used by zkevm_getExitRootsByGER)
+#[derive(Debug, Clone)]
+pub struct GerEntry {
+    pub mainnet_exit_root: Option<[u8; 32]>,
+    pub rollup_exit_root: Option<[u8; 32]>,
+    pub block_number: u64,
+    pub timestamp: u64,
+}
+
 /// Log store for synthetic logs
 pub struct LogStore {
     logs_by_block: RwLock<HashMap<u64, Vec<SyntheticLog>>>,
     logs_by_tx: RwLock<HashMap<String, Vec<SyntheticLog>>>,
     log_counter: RwLock<u64>,
-    seen_gers: RwLock<HashMap<[u8; 32], u64>>,
+    seen_gers: RwLock<HashMap<[u8; 32], GerEntry>>,
+    latest_ger: RwLock<Option<[u8; 32]>>,
     hash_chain_value: RwLock<[u8; 32]>,
     pending_events: RwLock<Vec<SyntheticLog>>,
 }
@@ -221,6 +231,7 @@ impl LogStore {
             logs_by_tx: RwLock::new(HashMap::new()),
             log_counter: RwLock::new(0),
             seen_gers: RwLock::new(HashMap::new()),
+            latest_ger: RwLock::new(None),
             hash_chain_value: RwLock::new([0u8; 32]),
             pending_events: RwLock::new(Vec::new()),
         }
@@ -230,14 +241,25 @@ impl LogStore {
         self.seen_gers.read().contains_key(ger)
     }
 
-    pub fn mark_ger_seen(&self, ger: &[u8; 32], block_number: u64) -> bool {
+    pub fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> bool {
         let mut seen = self.seen_gers.write();
         if seen.contains_key(ger) {
             false
         } else {
-            seen.insert(*ger, block_number);
+            seen.insert(*ger, entry);
+            *self.latest_ger.write() = Some(*ger);
             true
         }
+    }
+
+    /// Returns the most recently inserted GER hash.
+    pub fn get_latest_ger(&self) -> Option<[u8; 32]> {
+        *self.latest_ger.read()
+    }
+
+    /// Returns the full GerEntry for a given GER hash.
+    pub fn get_ger_entry(&self, ger: &[u8; 32]) -> Option<GerEntry> {
+        self.seen_gers.read().get(ger).cloned()
     }
 
     pub fn add_log(&self, mut log: SyntheticLog) {
@@ -312,8 +334,16 @@ impl LogStore {
         block_hash: [u8; 32],
         tx_hash: &str,
         global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
     ) {
-        self.mark_ger_seen(global_exit_root, block_number);
+        self.mark_ger_seen(global_exit_root, GerEntry {
+            mainnet_exit_root,
+            rollup_exit_root,
+            block_number,
+            timestamp,
+        });
 
         let new_hash_chain = {
             let mut hash_chain = self.hash_chain_value.write();
@@ -543,7 +573,7 @@ mod tests {
         let ger = [0x11; 32];
 
         assert!(!store.has_seen_ger(&ger));
-        store.add_ger_update_event(0, [0u8; 32], "0xTx1", &ger);
+        store.add_ger_update_event(0, [0u8; 32], "0xTx1", &ger, None, None, 0);
         assert!(store.has_seen_ger(&ger), "GER should be marked as seen");
 
         let filter = LogFilter {
@@ -562,10 +592,10 @@ mod tests {
         let ger1 = [0x11; 32];
         let ger2 = [0x22; 32];
 
-        store.add_ger_update_event(0, [0u8; 32], "0xTx1", &ger1);
+        store.add_ger_update_event(0, [0u8; 32], "0xTx1", &ger1, None, None, 0);
         let hash1 = *store.hash_chain_value.read();
 
-        store.add_ger_update_event(1, [1u8; 32], "0xTx2", &ger2);
+        store.add_ger_update_event(1, [1u8; 32], "0xTx2", &ger2, None, None, 0);
         let hash2 = *store.hash_chain_value.read();
 
         // hash1 = keccak256([0u8;32] || ger1)

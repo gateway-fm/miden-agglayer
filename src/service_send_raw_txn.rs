@@ -129,6 +129,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         handle_ger_result(
             ger::insert_ger(
                 ger_bytes,
+                None,
+                None,
                 &service.miden_client,
                 service.accounts.clone(),
                 &service.log_store,
@@ -152,6 +154,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         handle_ger_result(
             ger::insert_ger(
                 combined_ger,
+                Some(mainnet_root),
+                Some(rollup_root),
                 &service.miden_client,
                 service.accounts.clone(),
                 &service.log_store,

@@ -182,6 +182,11 @@ impl BlockState {
         GENESIS_TIMESTAMP + block_num * BLOCK_TIME
     }
 
+    /// Compute the deterministic timestamp for any block number.
+    pub fn get_block_timestamp(&self, block_num: u64) -> u64 {
+        Self::deterministic_timestamp(block_num)
+    }
+
     fn ensure_block_exists(&self, block_num: u64) {
         // Acquire both locks before mutating to prevent deadlock from
         // inconsistent lock ordering. Always: hash_to_number first, then blocks.

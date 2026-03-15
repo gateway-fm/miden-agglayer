@@ -79,9 +79,13 @@ async fn submit_ger_to_miden(
         "UpdateGerNote submitted to Miden node, waiting for commit..."
     );
 
-    // Poll for transaction commitment (max 30s)
+    // Poll for transaction commitment
+    let timeout_secs: u64 = std::env::var("GER_COMMIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
     let mut committed = false;
-    for _ in 0..30 {
+    for _ in 0..timeout_secs {
         // We can check if txn is in the store and has a block number
         let txns = client
             .get_transactions(miden_client::store::TransactionFilter::All)
@@ -101,7 +105,7 @@ async fn submit_ger_to_miden(
     }
 
     if !committed {
-        anyhow::bail!("UpdateGerNote transaction {tx_id} not committed after 30s");
+        anyhow::bail!("UpdateGerNote transaction {tx_id} not committed after {timeout_secs}s");
     }
 
     tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
@@ -110,6 +114,8 @@ async fn submit_ger_to_miden(
 
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
+    mainnet_exit_root: Option<[u8; 32]>,
+    rollup_exit_root: Option<[u8; 32]>,
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
     log_store: &Arc<LogStore>,
@@ -121,6 +127,7 @@ pub async fn insert_ger(
     // blocks, so events at the current block are missed if the bridge already synced it.
     let block_number = block_state.current_block_number() + 1;
     let block_hash = block_state.get_block_hash(block_number);
+    let timestamp = block_state.get_block_timestamp(block_number);
 
     // Check dedup before doing any work
     let is_new = !log_store.has_seen_ger(&ger_bytes);
@@ -144,7 +151,15 @@ pub async fn insert_ger(
 
         // Miden submission succeeded — now record the event
         let tx_hash_str = format!("{txn_hash:#x}");
-        log_store.add_ger_update_event(block_number, block_hash, &tx_hash_str, &ger_bytes);
+        log_store.add_ger_update_event(
+            block_number,
+            block_hash,
+            &tx_hash_str,
+            &ger_bytes,
+            mainnet_exit_root,
+            rollup_exit_root,
+            timestamp,
+        );
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),
