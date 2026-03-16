@@ -197,11 +197,12 @@ async fn json_rpc_endpoint(
     }
 
     match method {
-        // polycli checks if the contract code exists
-        // return a non-empty string to satisfy the check
+        // Return non-empty code for all addresses.
+        // Aggsender checks eth_getCode before calling eth_call on the rollup/bridge contracts.
+        // Returns 0xFE (INVALID opcode) to indicate contract exists but prevents execution.
         "eth_getCode" => {
             let _params: (String, String) = request.parse_params()?;
-            Ok(JsonRpcResponse::success(answer_id, "0x00"))
+            Ok(JsonRpcResponse::success(answer_id, "0xFE"))
         }
 
         "eth_blockNumber" => {
@@ -299,11 +300,13 @@ async fn json_rpc_endpoint(
         "eth_call" => {
             #[derive(Debug, Deserialize)]
             struct TransactionParam {
+                to: Option<String>,
                 data: Option<String>,
                 input: Option<String>,
             }
             let params: (TransactionParam, String) = request.parse_params()?;
             let txn_param = params.0;
+            let to_addr = txn_param.to.clone();
 
             if let Some(data_hex) = txn_param.data.or(txn_param.input) {
                 let Ok(data) = hex_decode_prefixed(&data_hex) else {
@@ -315,12 +318,34 @@ async fn json_rpc_endpoint(
                     return Err(JsonRpcResponse::error(answer_id, error));
                 };
 
+                if data.len() >= 4 {
+                    tracing::debug!(
+                        to = ?to_addr,
+                        selector = %format!("0x{}", alloy::hex::encode(&data[..4])),
+                        data_len = data.len(),
+                        "eth_call"
+                    );
+                }
+
                 if data.starts_with(&networkIDCall::SELECTOR) {
-                    // Return the rollup's network ID from RollupManager, NOT chain_id.
-                    // The bridge uses networkID() to determine which network deposits belong to.
                     let network_id = service.network_id;
                     let network_id_hex = format!("{:#066x}", network_id);
                     return Ok(JsonRpcResponse::success(answer_id, network_id_hex));
+                }
+
+                // Forward eth_call to L1 for rollup manager / rollup contract queries.
+                // The aggsender queries these L1 contracts via the L2 RPC to build certificates.
+                if let (Some(l1_url), Some(to)) = (&service.l1_rpc_url, &to_addr) {
+                    let to_lower = to.to_lowercase();
+                    let rollup_mgr = "0x6c6c009cc348976db4a908c92b24433d4f6eda43";
+                    let rollup_addr = "0x414e9e227e4b589af92200508af5399576530e4e";
+                    if to_lower == rollup_mgr || to_lower == rollup_addr {
+                        tracing::debug!(to = %to, "forwarding eth_call to L1");
+                        match forward_eth_call_to_l1(l1_url, &data_hex, to).await {
+                            Ok(result) => return Ok(JsonRpcResponse::success(answer_id, result)),
+                            Err(e) => tracing::warn!("L1 forward failed: {e:#}"),
+                        }
+                    }
                 }
             }
 
@@ -589,6 +614,30 @@ async fn json_rpc_endpoint(
             Ok(request.method_not_found(method))
         }
     }
+}
+
+/// Forward an eth_call to L1 for reading rollup contract state.
+async fn forward_eth_call_to_l1(
+    l1_rpc_url: &str,
+    data_hex: &str,
+    to_addr: &str,
+) -> anyhow::Result<String> {
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy_rpc_types_eth::TransactionRequest;
+
+    let provider = ProviderBuilder::new().connect_http(l1_rpc_url.parse()?);
+    let to: alloy::primitives::Address = to_addr.parse()?;
+    let data = crate::hex::hex_decode_prefixed(data_hex)?;
+
+    let result = provider
+        .call(
+            TransactionRequest::default()
+                .to(to)
+                .input(data.into()),
+        )
+        .await?;
+
+    Ok(format!("0x{}", alloy::hex::encode(&result)))
 }
 
 #[cfg(not(unix))]
