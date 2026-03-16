@@ -1,0 +1,68 @@
+# Build testing-node-builder from ajl-init-agglayer-tests branch
+# This branch has a WORKING E2E bridge-in + bridge-out test with the NTX builder
+# correctly consuming CLAIM notes via network transactions.
+FROM rust:1.91-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libsqlite3-dev \
+    protobuf-compiler \
+    git \
+    cmake \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# ajl-init-agglayer-tests branch has:
+# - miden-node deps at =0.14.0-alpha.3
+# - Working agglayer bridge-in + bridge-out E2E test
+# - NTX builder correctly processes network notes (CONFIG_AGG_BRIDGE, UPDATE_GER, CLAIM)
+RUN git clone --depth 1 --branch ajl-init-agglayer-tests \
+    https://github.com/0xMiden/miden-client.git .
+
+RUN git rev-parse HEAD > /tmp/miden-client-commit.txt && \
+    echo "Branch: ajl-init-agglayer-tests" >> /tmp/miden-client-commit.txt
+
+# Patch: bind RPC to 0.0.0.0 for Docker port forwarding
+RUN sed -i 's|format!("127.0.0.1:{}", self.rpc_port)|format!("0.0.0.0:{}", self.rpc_port)|' \
+    crates/testing/node-builder/src/lib.rs
+
+# Build the testing-node-builder binary
+RUN cargo build --release --package node-builder
+
+# Runtime
+FROM debian:bookworm-slim
+
+COPY --from=builder /tmp/miden-client-commit.txt /app/miden-client-commit.txt
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    libsqlite3-0 \
+    curl \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/testing-node-builder /usr/local/bin/
+
+EXPOSE 57291
+
+RUN mkdir -p /app/data
+
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    'echo "=== Miden Testing Node (ajl-init-agglayer-tests) ==="' \
+    'cat /app/miden-client-commit.txt' \
+    'export AGGLAYER_GENESIS="${AGGLAYER_GENESIS:-1}"' \
+    'echo "AGGLAYER_GENESIS=$AGGLAYER_GENESIS"' \
+    'exec testing-node-builder "$@"' \
+    > /usr/local/bin/entrypoint.sh && \
+    chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD []

@@ -21,7 +21,7 @@ RUN \
 FROM debian:bookworm-slim
 
 RUN apt-get update
-RUN apt-get install -y ca-certificates
+RUN apt-get install -y ca-certificates curl
 
 COPY --from=builder /usr/src/app/bin/miden-agglayer-service /usr/local/bin/
 COPY --from=builder /usr/src/app/bin/bridge-out-tool /usr/local/bin/

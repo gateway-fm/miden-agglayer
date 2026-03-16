@@ -136,3 +136,30 @@ install-tools: ## Install development tools
 	cargo install cargo-nextest --locked
 	cargo install taplo-cli --locked
 	@echo "Development tools installation complete!"
+
+# --- E2E Testing (docker-compose, no Kurtosis) -------------------------------------------
+
+E2E_COMPOSE := docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+
+.PHONY: e2e-setup
+e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
+	./scripts/setup-fixtures.sh
+
+.PHONY: e2e-up
+e2e-up: ## Start full E2E environment
+	$(E2E_COMPOSE) up -d --build --wait
+
+.PHONY: e2e-test
+e2e-test: ## Run bidirectional bridge E2E tests
+	./scripts/e2e-test.sh
+
+.PHONY: e2e
+e2e: e2e-up e2e-test e2e-down ## Full E2E cycle: start, test, teardown
+
+.PHONY: e2e-down
+e2e-down: ## Stop E2E environment
+	$(E2E_COMPOSE) down -v
+
+.PHONY: e2e-logs
+e2e-logs: ## Tail all E2E service logs
+	$(E2E_COMPOSE) logs -f

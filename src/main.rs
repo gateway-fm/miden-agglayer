@@ -37,6 +37,10 @@ struct Command {
     /// Create a new accounts config inside --miden-store-dir
     #[arg(long)]
     init: bool,
+
+    /// L1 RPC URL for reading exit roots during GER injection
+    #[arg(long, env = "L1_RPC_URL")]
+    l1_rpc_url: Option<String>,
 }
 
 #[tokio::main]
@@ -125,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         claim_tracker,
         nonce_tracker,
         address_mapper,
+        command.l1_rpc_url,
     );
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;

@@ -64,6 +64,25 @@ async fn deploy_account(
     let dummy_txn = TransactionRequestBuilder::new().build()?;
     let txn_id = client.submit_new_transaction(account_id, dummy_txn).await?;
     tracing::info!("deployed {name} account with txn_id {txn_id}");
+
+    // Wait for the transaction to be committed (like ajl test's wait_for_tx)
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        client.sync_state().await?;
+        let txns = client
+            .get_transactions(miden_client::store::TransactionFilter::All)
+            .await?;
+        if txns.iter().any(|t| {
+            t.id == txn_id
+                && matches!(
+                    t.status,
+                    miden_client::transaction::TransactionStatus::Committed { .. }
+                )
+        }) {
+            tracing::info!("deploy tx {txn_id} committed");
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -179,6 +198,30 @@ async fn register_faucet_in_bridge(
         "registered {} faucet in bridge with txn_id {txn_id}",
         faucet_name,
     );
+
+    // Wait for the tx to be committed + extra blocks for NTX builder to process the config note
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        client.sync_state().await?;
+        let txns = client
+            .get_transactions(miden_client::store::TransactionFilter::All)
+            .await?;
+        if txns.iter().any(|t| {
+            t.id == txn_id
+                && matches!(
+                    t.status,
+                    miden_client::transaction::TransactionStatus::Committed { .. }
+                )
+        }) {
+            tracing::info!("register faucet tx {txn_id} committed");
+            // Extra wait for NTX builder to process the config note
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                client.sync_state().await?;
+            }
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -213,6 +256,33 @@ async fn init_internal(
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
     let accounts = add_accounts(client, keystore).await?;
+
+    // Wait for the NTX builder to process account creation transactions
+    // before submitting notes that target those accounts.
+    tracing::info!("waiting for account transactions to settle...");
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        client.sync_state().await?;
+    }
+    tracing::info!("account settlement complete");
+
+    // Register the P2ID note tag for wallet_hardhat so sync discovers incoming P2ID notes.
+    // The faucet's MASM `note_tag::create_account_target` takes the top 14 bits of the
+    // account_id_prefix's high 32 bits: (prefix >> 32) & 0xFFFC0000
+    {
+        use miden_protocol::note::NoteTag;
+        let wallet_id = accounts.wallet_hardhat.id();
+        let prefix_u64 = wallet_id.prefix().as_felt().as_int();
+        let hi32 = (prefix_u64 >> 32) as u32;
+        let p2id_tag_value = hi32 & 0xFFFC0000u32; // top 14 bits
+        let raw_tag = NoteTag::from(p2id_tag_value);
+        tracing::info!(
+            raw_tag = %u32::from(raw_tag),
+            wallet = %AccountIdBech32(wallet_id),
+            "registering P2ID note tag for wallet"
+        );
+        client.add_note_tag(raw_tag).await?;
+    }
 
     // Register faucets in bridge's faucet registry (required for CLAIM note FPI validation)
     register_faucet_in_bridge(

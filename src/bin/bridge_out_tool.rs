@@ -122,6 +122,46 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow!("sync failed: {e}"))?;
     println!("[bridge-out] sync complete");
 
+    // Try to consume any Expected/Committed notes for the wallet
+    {
+        use miden_client::store::NoteFilter;
+        // Check for Expected notes (synced but not yet consumed)
+        let expected = client.get_input_notes(NoteFilter::Expected).await.unwrap_or_default();
+        let committed = client.get_input_notes(NoteFilter::Committed).await.unwrap_or_default();
+        println!("[bridge-out] notes: {} expected, {} committed", expected.len(), committed.len());
+
+        // Try consuming committed notes first (standard path)
+        let consumable = client.get_consumable_notes(Some(wallet_id)).await.unwrap_or_default();
+        if !consumable.is_empty() {
+            println!("[bridge-out] consuming {} notes...", consumable.len());
+            let notes: Vec<miden_protocol::note::Note> = consumable
+                .into_iter()
+                .filter_map(|(rec, _)| rec.try_into().ok())
+                .collect();
+            if !notes.is_empty() {
+                match TransactionRequestBuilder::new()
+                    .build_consume_notes(notes)
+                    .and_then(|req| Ok(req))
+                {
+                    Ok(req) => {
+                        match client.submit_new_transaction(wallet_id, req).await {
+                            Ok(tx) => {
+                                println!("[bridge-out] consumed notes: {tx}");
+                                // Wait for commit
+                                for _ in 0..10 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    client.sync_state().await.ok();
+                                }
+                            }
+                            Err(e) => println!("[bridge-out] consume failed: {e}"),
+                        }
+                    }
+                    Err(e) => println!("[bridge-out] build consume req failed: {e}"),
+                }
+            }
+        }
+    }
+
     // Check wallet balance
     let balance = client
         .account_reader(wallet_id)

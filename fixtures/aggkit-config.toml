@@ -1,0 +1,95 @@
+PathRWData = "/tmp"
+L1URL = "http://anvil:8545"
+L2URL = "http://miden-agglayer:8546"
+AggLayerURL = "agglayer:4443"
+AggchainProofURL = ""
+SequencerPrivateKeyPath = "/etc/aggkit/aggoracle.keystore"
+SequencerPrivateKeyPassword = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"
+
+rollupCreationBlockNumber = 1
+rollupManagerCreationBlockNumber = 1
+genesisBlockNumber = 1
+
+[Log]
+Level = "info"
+
+[L1Config]
+URL = "http://anvil:8545"
+chainId = "271828"
+polygonZkEVMGlobalExitRootAddress = "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+polygonRollupManagerAddress = "0x6c6c009cC348976dB4A908c92B24433d4F6edA43"
+polTokenAddress = "0xEdE9cf798E0fE25D35469493f43E88FeA4a5da0E"
+polygonZkEVMAddress = "0x414e9E227e4b589aF92200508aF5399576530E4e"
+BridgeAddr = "0xC8cbEBf950B9Df44d987c8619f092beA980fF038"
+
+[L2Config]
+GlobalExitRootAddr = "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa"
+BridgeAddr = "0xC8cbEBf950B9Df44d987c8619f092beA980fF038"
+
+[AggOracle]
+WaitPeriodNextGER = "5s"
+EnableAggOracleCommittee = false
+
+[AggOracle.EVMSender]
+GlobalExitRootL2 = "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa"
+WaitPeriodMonitorTx = "5s"
+
+[AggOracle.EVMSender.EthTxManager]
+FrequencyToMonitorTxs = "1s"
+WaitTxToBeMined = "2m"
+GasPriceMarginFactor = 1
+MaxGasPriceLimit = 0
+ForcedGas = 0
+
+[[AggOracle.EVMSender.EthTxManager.PrivateKeys]]
+Path = "/etc/aggkit/aggoracle.keystore"
+Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"
+
+[AggOracle.EVMSender.EthTxManager.Etherman]
+URL = "http://miden-agglayer:8546"
+L1ChainID = 2
+
+[AggSender]
+AggSenderPrivateKey = {Path = "/etc/aggkit/aggoracle.keystore", Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"}
+Mode = "PessimisticProof"
+CheckStatusCertificateInterval = "1s"
+TriggerCertMode = "ASAP"
+
+[AggSender.StorageRetainCertificatesPolicy]
+RetryCertAfterInError = true
+
+[AggSender.AggkitProverClient]
+UseTLS = false
+
+[AggSender.AgglayerClient]
+
+[[AggSender.AgglayerClient.APIRateLimits]]
+MethodName = "SendCertificate"
+[AggSender.AgglayerClient.APIRateLimits.RateLimit]
+NumRequests = 0
+
+[AggSender.AgglayerClient.GRPC]
+URL = "agglayer:4443"
+MinConnectTimeout = "5s"
+RequestTimeout = "300s"
+UseTLS = false
+
+[AggSender.AgglayerClient.GRPC.Retry]
+InitialBackoff = "1s"
+MaxBackoff = "10s"
+BackoffMultiplier = 2.0
+MaxAttempts = 20
+
+[BridgeL2Sync]
+BridgeAddr = "0xC8cbEBf950B9Df44d987c8619f092beA980fF038"
+BlockFinality = "LatestBlock"
+SyncFromInBridges = "false"
+
+[ReorgDetectorL2]
+FinalizedBlock = "LatestBlock"
+
+[L1InfoTreeSync]
+InitialBlock = 1
+
+[L2GERSync]
+BlockFinality = "LatestBlock"

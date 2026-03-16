@@ -180,15 +180,69 @@ async fn publish_claim_internal(
     const EXPIRATION_DELTA: u16 = 10;
     let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
 
+    // Sync state before submitting to ensure AccountInterface is fresh.
+    // Without this, the output note attachment may be lost during proving.
+    client.sync_state().await?;
+
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes([OutputNote::Full(claim_note); 1])
-        .expiration_delta(EXPIRATION_DELTA)
         .build()?;
 
-    let txn_id = client
-        .submit_new_transaction(accounts.service.0, txn_request)
+    // Execute and check the output notes before submission
+    let tx_result = client.execute_transaction(accounts.service.0, txn_request).await?;
+    let exec_tx = tx_result.executed_transaction();
+    for (i, note) in exec_tx.output_notes().iter().enumerate() {
+        let variant = match note {
+            miden_protocol::transaction::OutputNote::Full(n) => {
+                let att = n.metadata().attachment();
+                let att_default = att == &miden_protocol::note::NoteAttachment::default();
+                format!("Full(attachment_empty={})", att_default)
+            },
+            miden_protocol::transaction::OutputNote::Partial(_) => "Partial".to_string(),
+            miden_protocol::transaction::OutputNote::Header(_) => "Header".to_string(),
+        };
+        tracing::info!(note_idx = i, variant = %variant, "executed tx output note");
+    }
+
+    let proven_tx = client.prove_transaction(&tx_result).await?;
+    for (i, note) in proven_tx.output_notes().iter().enumerate() {
+        let variant = match note {
+            miden_protocol::transaction::OutputNote::Full(n) => {
+                let att = n.metadata().attachment();
+                let att_default = att == &miden_protocol::note::NoteAttachment::default();
+                format!("Full(attachment_empty={})", att_default)
+            },
+            miden_protocol::transaction::OutputNote::Partial(_) => "Partial".to_string(),
+            miden_protocol::transaction::OutputNote::Header(_) => "Header".to_string(),
+        };
+        tracing::info!(note_idx = i, variant = %variant, "proven tx output note");
+    }
+
+    let txn_id = tx_result.executed_transaction().id();
+    let _submission_height = client
+        .submit_proven_transaction(proven_tx, &tx_result)
         .await?;
+    client.apply_transaction(&tx_result, _submission_height).await?;
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
+
+    // Wait for tx to be committed (same pattern as init's deploy_account)
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        client.sync_state().await?;
+        let txns = client
+            .get_transactions(miden_client::store::TransactionFilter::All)
+            .await?;
+        if txns.iter().any(|t| {
+            t.id == txn_id
+                && matches!(
+                    t.status,
+                    miden_client::transaction::TransactionStatus::Committed { .. }
+                )
+        }) {
+            tracing::info!("claim tx {txn_id} committed to block");
+            break;
+        }
+    }
 
     let event = ClaimEvent::from(params);
     let log = event.encode_log_data();

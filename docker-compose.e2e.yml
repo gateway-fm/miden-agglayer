@@ -1,0 +1,151 @@
+services:
+  # ── L1 (Anvil with pre-deployed contracts) ─────────────────────────────────
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 &
+        ANVIL_PID=$$!
+        sleep 2
+        # Fund deployment accounts and replay contract deployment transactions
+        sh /state/replay-txs.sh
+        wait $$ANVIL_PID
+    ports:
+      - "8545:8545"
+    volumes:
+      - ./fixtures/l1-raw-txs.txt:/state/l1-raw-txs.txt:ro
+      - ./scripts/replay-txs.sh:/state/replay-txs.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "cast rpc eth_getCode 0xC8cbEBf950B9Df44d987c8619f092beA980fF038 latest --rpc-url http://localhost:8545 2>/dev/null | grep -v '0x$$'"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # ── Database ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bridge_user
+      POSTGRES_PASSWORD: bridge_password
+      POSTGRES_DB: bridge_db
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge_user -d bridge_db"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  # ── L2 Chain (Miden node in devnet mode) ────────────────────────────────────
+  miden-node:
+    image: miden-infra/miden-node:agglayer-v0.1
+    restart: on-failure
+    ports:
+      - "57291:57291"
+    environment:
+      RUST_LOG: "info,miden_node_ntx_builder=debug,miden_tx=debug"
+      AGGLAYER_GENESIS: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 57291 || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 15s
+
+    # ── L2 EVM Proxy (service under test) ──────────────────────────────────────
+  miden-agglayer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: on-failure
+    ports:
+      - "8546:8546"
+    environment:
+      CHAIN_ID: "${CHAIN_ID:-2}"
+      NETWORK_ID: "${NETWORK_ID:-1}"
+      BRIDGE_ADDRESS: "${BRIDGE_ADDRESS}"
+      L1_RPC_URL: "http://anvil:8545"
+      L1_GER_ADDRESS: "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+      RUST_LOG: "info"
+    command:
+      - "--port=8546"
+      - "--miden-node=http://miden-node:57291"
+      - "--miden-store-dir=/var/lib/miden-agglayer-service"
+    depends_on:
+      miden-node:
+        condition: service_healthy
+    healthcheck:
+      test: >-
+        curl -sf -X POST http://localhost:8546
+        -H "Content-Type: application/json"
+        -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 30s
+
+  # ── Bridge Service ─────────────────────────────────────────────────────────
+  bridge-service:
+    image: ghcr.io/0xpolygon/zkevm-bridge-service:v0.6.4-RC2
+    entrypoint: ["/app/zkevm-bridge"]
+    command: ["run", "--cfg", "/etc/zkevm/bridge-config.toml"]
+    ports:
+      - "18080:8080"
+      - "19090:9090"
+    volumes:
+      - ./fixtures/bridge-config.toml:/etc/zkevm/bridge-config.toml:ro
+      - ./fixtures/claimsponsor.keystore:/etc/zkevm/claimsponsor.keystore:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      anvil:
+        condition: service_healthy
+      miden-agglayer:
+        condition: service_healthy
+
+  # ── AggLayer (certificate aggregation) ─────────────────────────────────────
+  agglayer:
+    image: europe-west2-docker.pkg.dev/prj-polygonlabs-devtools-dev/public/agglayer:0.4.4-remove-agglayer-prover
+    restart: on-failure
+    command: ["/usr/local/bin/agglayer", "run", "--cfg=/etc/agglayer/config.toml"]
+    ports:
+      - "4443:4443"
+      - "4444:4444"
+    environment:
+      RUST_BACKTRACE: "1"
+    volumes:
+      - ./fixtures/agglayer-config.toml:/etc/agglayer/config.toml:ro
+      - ./fixtures/aggregator.keystore:/etc/agglayer/aggregator.keystore:ro
+      - agglayer_storage:/etc/agglayer/storage
+      - agglayer_backups:/etc/agglayer/backups
+    depends_on:
+      anvil:
+        condition: service_healthy
+
+  # ── AggKit (aggoracle + aggsender) ─────────────────────────────────────────
+  aggkit:
+    image: ghcr.io/agglayer/aggkit:0.9.0-rc2
+    restart: on-failure
+    command: ["run", "--cfg=/etc/aggkit/config.toml", "--components=aggoracle,aggsender"]
+    ports:
+      - "5576:5576"
+    volumes:
+      - ./fixtures/aggkit-config.toml:/etc/aggkit/config.toml:ro
+      - ./fixtures/aggoracle.keystore:/etc/aggkit/aggoracle.keystore:ro
+    depends_on:
+      anvil:
+        condition: service_healthy
+      miden-agglayer:
+        condition: service_healthy
+      agglayer:
+        condition: service_started
+
+volumes:
+  agglayer_storage:
+  agglayer_backups:
+
+networks:
+  default:
+    name: miden-e2e

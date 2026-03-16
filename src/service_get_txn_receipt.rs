@@ -83,6 +83,7 @@ mod tests {
             claim_tracker,
             nonce_tracker,
             address_mapper,
+            None,
         )
     }
 

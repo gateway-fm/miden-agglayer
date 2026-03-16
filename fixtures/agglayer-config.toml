@@ -1,0 +1,77 @@
+debug-mode = true
+mock-verifier = true
+
+[full-node-rpcs]
+1 = "http://miden-agglayer:8546"
+
+[proof-signers]
+1 = "0x5b06837A43bdC3dD9F114558DAf4B26ed49842Ed"
+
+[prover.mock-prover]
+proving-timeout = "5m"
+proving_request_timeout = "300s"
+
+[rpc]
+grpc-port = 4443
+readrpc-port = 4444
+host = "0.0.0.0"
+request-timeout = 180
+max-request-body-size = 104857600
+
+[grpc]
+max-decoding-message-size = 104857600
+
+[outbound.rpc.settle]
+max-retries = 3
+retry-interval = 7
+confirmations = 1
+settlement-timeout = 1200
+gas-multiplier-factor = 175
+
+[log]
+level = "debug"
+outputs = ["stderr"]
+format = "pretty"
+
+[auth.local]
+private-keys = [
+    { path = "/etc/agglayer/aggregator.keystore", password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m" },
+]
+
+[l1]
+chain-id = 271828
+node-url = "http://anvil:8545"
+ws-node-url = "ws://anvil:8545"
+rollup-manager-contract = "0x6c6c009cC348976dB4A908c92B24433d4F6edA43"
+polygon-zkevm-global-exit-root-v2-contract = "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+rpc-timeout = 45
+
+[l2]
+rpc-timeout = 45
+
+[telemetry]
+prometheus-addr = "0.0.0.0:9092"
+
+[rate-limiting]
+send-tx = "unlimited"
+[rate-limiting.network]
+
+[epoch.block-clock]
+epoch-duration = 15
+genesis-block = 1
+
+[shutdown]
+runtime-timeout = 5
+
+[certificate-orchestrator]
+input-backpressure-buffer-size = 1000
+
+[certificate-orchestrator.prover.sp1-local]
+
+[storage]
+db-path = "/etc/agglayer/storage"
+
+[storage.backup]
+path = "/etc/agglayer/backups"
+state-max-backup-count = 100
+pending-max-backup-count = 100
