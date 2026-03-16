@@ -16,6 +16,15 @@ impl BlockNumTracker {
     pub fn latest(&self) -> BlockNumber {
         *self.latest.read().unwrap()
     }
+
+    /// Advance the block number by 1 and return the new value.
+    /// Used to ensure synthetic logs are placed at a block the BridgeL2Sync
+    /// hasn't scanned yet.
+    pub fn advance(&self) -> BlockNumber {
+        let mut latest_ref = self.latest.write().unwrap();
+        *latest_ref += 1;
+        *latest_ref
+    }
 }
 
 #[async_trait::async_trait]

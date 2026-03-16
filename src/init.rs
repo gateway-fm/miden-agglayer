@@ -303,6 +303,7 @@ async fn init_internal(
     .await?;
 
     register_p2id_script(client, accounts.service.id()).await?;
+
     let config = AccountsConfig::from(accounts);
     let config_path = accounts_config::save_config(config, miden_store_dir)?;
     Ok(config_path)

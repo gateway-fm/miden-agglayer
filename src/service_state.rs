@@ -1,7 +1,27 @@
 use crate::block_state::BlockState;
 use crate::log_synthesis::LogStore;
 use crate::*;
+use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Tracks which Global Exit Roots have been injected into the bridge account.
+/// The aggoracle's `isGlobalExitRootInjected` check calls `globalExitRootMap(ger)`
+/// on the L2 GER contract; it expects a non-zero return for already-injected GERs.
+#[derive(Default)]
+pub struct GerTracker {
+    injected: RwLock<HashSet<[u8; 32]>>,
+}
+
+impl GerTracker {
+    pub fn mark_injected(&self, ger: [u8; 32]) {
+        self.injected.write().insert(ger);
+    }
+
+    pub fn is_injected(&self, ger: &[u8; 32]) -> bool {
+        self.injected.read().contains(ger)
+    }
+}
 
 #[derive(Clone)]
 pub struct ServiceState {
@@ -18,6 +38,7 @@ pub struct ServiceState {
     pub nonce_tracker: Arc<NonceTracker>,
     pub address_mapper: Arc<AddressMapper>,
     pub l1_rpc_url: Option<String>,
+    pub ger_tracker: Arc<GerTracker>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -52,6 +73,7 @@ impl ServiceState {
             nonce_tracker,
             address_mapper,
             l1_rpc_url,
+            ger_tracker: Arc::new(GerTracker::default()),
         }
     }
 }

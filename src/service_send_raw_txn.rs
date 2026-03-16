@@ -45,9 +45,11 @@ fn handle_ger_result(
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     service: &ServiceState,
+    ger_bytes: [u8; 32],
 ) -> anyhow::Result<()> {
     match result {
         Ok(_ger_result) => {
+            service.ger_tracker.mark_injected(ger_bytes);
             tracing::info!("inserted GER with eth txn: {txn_hash}");
             // Pass empty logs to TxnManager — the GER event is already stored
             // in LogStore by insert_ger() → add_ger_update_event(). Passing
@@ -91,6 +93,31 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 
         service.claim_tracker.try_claim(params.globalIndex)?;
 
+        // Emit ClaimEvent log IMMEDIATELY so the aggsender's BridgeL2Sync
+        // sees it as an imported_exit. We advance the block number first to ensure
+        // the log is at a block the BridgeL2Sync hasn't scanned yet.
+        {
+            use alloy::sol_types::SolEvent;
+            let event = claim::ClaimEvent::from(params.clone());
+            let log_data = event.encode_log_data();
+            // Advance to a fresh block so the BridgeL2Sync will pick up this log
+            let block_num = service.block_num_tracker.advance();
+            let block_hash = service.block_state.get_block_hash(block_num);
+            let claim_log = crate::log_synthesis::SyntheticLog {
+                address: crate::bridge_address::get_bridge_address().to_string(),
+                topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
+                data: log_data.data.to_string(),
+                block_number: block_num,
+                block_hash,
+                transaction_hash: format!("{txn_hash:#x}"),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            };
+            service.log_store.add_log(claim_log);
+            tracing::info!("emitted ClaimEvent at block {block_num} for aggsender imported_exit");
+        }
+
         let result = claim::publish_claim(
             params.clone(),
             &service.miden_client,
@@ -104,6 +131,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 let txn_id = claim_result.txn_id;
                 let claim_note_id = claim_result.claim_note_id.clone();
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
+
                 service.txn_manager.begin(
                     txn_hash,
                     Some(txn_id),
@@ -177,6 +205,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             txn_hash,
             txn_envelope,
             &service,
+            ger_bytes,
         )?;
     } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
         tracing::debug!("updateExitRoot call");
@@ -202,6 +231,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             txn_hash,
             txn_envelope,
             &service,
+            combined_ger,
         )?;
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");

@@ -333,6 +333,21 @@ async fn json_rpc_endpoint(
                     return Ok(JsonRpcResponse::success(answer_id, network_id_hex));
                 }
 
+                // globalExitRootMap(bytes32) → returns non-zero timestamp for injected GERs.
+                // The aggoracle checks this to avoid re-injecting the same GER.
+                const GLOBAL_EXIT_ROOT_MAP_SELECTOR: [u8; 4] = [0x25, 0x7b, 0x36, 0x32];
+                if data.starts_with(&GLOBAL_EXIT_ROOT_MAP_SELECTOR) && data.len() >= 36 {
+                    let mut ger = [0u8; 32];
+                    ger.copy_from_slice(&data[4..36]);
+                    if service.ger_tracker.is_injected(&ger) {
+                        // Return 1 (non-zero = injected)
+                        return Ok(JsonRpcResponse::success(
+                            answer_id,
+                            "0x0000000000000000000000000000000000000000000000000000000000000001",
+                        ));
+                    }
+                }
+
                 // Forward eth_call to L1 for rollup manager / rollup contract queries.
                 // The aggsender queries these L1 contracts via the L2 RPC to build certificates.
                 if let (Some(l1_url), Some(to)) = (&service.l1_rpc_url, &to_addr) {

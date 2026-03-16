@@ -16,7 +16,8 @@ for addr in \
     0x575c158b45ab2636bcf2b7030e91c9f43c4bd09c \
     0x8943545177806ed17b9f23f0a21ee5948ecaa776 \
     0xe34aaf64b29273b7d567fcfc40544c014eee9970 \
-    0x89435451be3fd8df1c67cff6b5bafe98ae10519a; do
+    0x89435451be3fd8df1c67cff6b5bafe98ae10519a \
+    0x635243A11B41072264Df6c9186e3f473402F94e9; do
     cast rpc anvil_setBalance "$addr" "0x84595161401484A000000" --rpc-url "$RPC" > /dev/null 2>&1
 done
 

@@ -52,11 +52,12 @@ L1ChainID = 2
 [AggSender]
 AggSenderPrivateKey = {Path = "/etc/aggkit/aggoracle.keystore", Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"}
 Mode = "PessimisticProof"
+RollupCreationBlockL1 = 90
 CheckStatusCertificateInterval = "1s"
 TriggerCertMode = "ASAP"
+RetryCertAfterInError = true
 
 [AggSender.StorageRetainCertificatesPolicy]
-RetryCertAfterInError = true
 
 [AggSender.AggkitProverClient]
 UseTLS = false
@@ -88,8 +89,12 @@ SyncFromInBridges = "false"
 [ReorgDetectorL2]
 FinalizedBlock = "LatestBlock"
 
+[ReorgDetectorL1]
+FinalizedBlock = "LatestBlock"
+
 [L1InfoTreeSync]
 InitialBlock = 1
+BlockFinality = "LatestBlock"
 
 [L2GERSync]
 BlockFinality = "LatestBlock"

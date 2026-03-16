@@ -165,6 +165,8 @@ async fn publish_claim_internal(
         dest_address = %params.destinationAddress,
         amount = %params.amount,
         faucet_id = %crate::accounts_config::AccountIdBech32(faucet.id),
+        mainnet_exit_root = %alloy::hex::encode(params.mainnetExitRoot.0),
+        rollup_exit_root = %alloy::hex::encode(params.rollupExitRoot.0),
         "creating CLAIM note"
     );
 
@@ -180,9 +182,17 @@ async fn publish_claim_internal(
     const EXPIRATION_DELTA: u16 = 10;
     let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
 
-    // Sync state before submitting to ensure AccountInterface is fresh.
-    // Without this, the output note attachment may be lost during proving.
-    client.sync_state().await?;
+    // Wait for the NTX builder to consume the UpdateGerNote on the bridge account.
+    // The CLAIM note's FPI calls assert_valid_ger which checks the bridge account's
+    // GER storage. If we submit the CLAIM before the GER is stored, it will fail.
+    // The miden-client integration tests wait 5 blocks between GER and CLAIM.
+    tracing::info!("waiting for GER to propagate to bridge account before submitting CLAIM...");
+    for i in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        client.sync_state().await?;
+        tracing::debug!(cycle = i, "GER propagation sync cycle");
+    }
+    tracing::info!("GER propagation wait complete, submitting CLAIM note");
 
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes([OutputNote::Full(claim_note); 1])

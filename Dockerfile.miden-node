@@ -1,4 +1,4 @@
-# Build testing-node-builder from ajl-init-agglayer-tests branch
+# Build testing-node-builder from agglayer-integration-tests branch
 # This branch has a WORKING E2E bridge-in + bridge-out test with the NTX builder
 # correctly consuming CLAIM notes via network transactions.
 FROM rust:1.91-slim-bookworm AS builder
@@ -15,15 +15,15 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# ajl-init-agglayer-tests branch has:
+# agglayer-integration-tests branch has:
 # - miden-node deps at =0.14.0-alpha.3
 # - Working agglayer bridge-in + bridge-out E2E test
 # - NTX builder correctly processes network notes (CONFIG_AGG_BRIDGE, UPDATE_GER, CLAIM)
-RUN git clone --depth 1 --branch ajl-init-agglayer-tests \
+RUN git clone --depth 1 --branch agglayer-integration-tests \
     https://github.com/0xMiden/miden-client.git .
 
 RUN git rev-parse HEAD > /tmp/miden-client-commit.txt && \
-    echo "Branch: ajl-init-agglayer-tests" >> /tmp/miden-client-commit.txt
+    echo "Branch: agglayer-integration-tests" >> /tmp/miden-client-commit.txt
 
 # Patch: bind RPC to 0.0.0.0 for Docker port forwarding
 RUN sed -i 's|format!("127.0.0.1:{}", self.rpc_port)|format!("0.0.0.0:{}", self.rpc_port)|' \
@@ -56,7 +56,7 @@ RUN mkdir -p /app/data
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -e' \
-    'echo "=== Miden Testing Node (ajl-init-agglayer-tests) ==="' \
+    'echo "=== Miden Testing Node (agglayer-integration-tests) ==="' \
     'cat /app/miden-client-commit.txt' \
     'export AGGLAYER_GENESIS="${AGGLAYER_GENESIS:-1}"' \
     'echo "AGGLAYER_GENESIS=$AGGLAYER_GENESIS"' \
