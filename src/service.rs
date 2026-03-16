@@ -282,10 +282,13 @@ async fn json_rpc_endpoint(
             Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
         }
 
-        "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+        // Return a non-zero gas price. The bridge-service's ClaimTxManager queries
+        // eth_gasPrice when building L1 claim txs. Returning 0 causes Anvil to silently
+        // drop the tx (doesn't meet base fee). 1 gwei is a safe default.
+        "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")), // 1 gwei
 
-        // polycli estimates GasTipCap (priority fee cap), return zero
-        "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+        // polycli estimates GasTipCap (priority fee cap), return 1 gwei
+        "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
 
         // polycli estimates how much gas will be spent on a transaction, return zero
         "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),

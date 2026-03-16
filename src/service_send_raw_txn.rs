@@ -84,6 +84,31 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let params = claimAssetCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
 
+        // Claims targeting a different network: forward to L1 for settlement.
+        // Only claims where destinationNetwork matches our network_id are processed
+        // as Miden CLAIM notes. All others go to L1.
+        if params.destinationNetwork != service.network_id as u32 {
+            if let Some(l1_url) = &service.l1_rpc_url {
+                tracing::info!(
+                    "forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}"
+                );
+                let provider = alloy::providers::ProviderBuilder::new()
+                    .connect_http(l1_url.parse().map_err(|e| anyhow::anyhow!("bad L1 URL: {e}"))?);
+                use alloy::providers::Provider;
+                let result = provider
+                    .raw_request::<_, String>(
+                        "eth_sendRawTransaction".into(),
+                        [&input],
+                    )
+                    .await;
+                match result {
+                    Ok(hash) => tracing::info!("L1 claim tx forwarded: {hash}"),
+                    Err(e) => tracing::warn!("L1 claim tx forward failed: {e:#}"),
+                }
+                return Ok(txn_hash);
+            }
+        }
+
         // Skip zero-amount claims (e.g., genesis batch deposit). These create
         // CLAIM notes that crash the NTX builder's faucet actor.
         if params.amount.is_zero() {
@@ -129,9 +154,13 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         match result {
             Ok(claim_result) => {
                 let txn_id = claim_result.txn_id;
-                let claim_note_id = claim_result.claim_note_id.clone();
+                let _claim_note_id = claim_result.claim_note_id.clone();
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
 
+                // Commit immediately — don't defer the receipt.
+                // The bridge-service's ClaimTxManager blocks until the receipt is
+                // available, preventing it from processing L2→L1 claims.
+                let block_num = service.block_num_tracker.latest();
                 service.txn_manager.begin(
                     txn_hash,
                     Some(txn_id),
@@ -139,15 +168,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                     Some(claim_result.expires_at),
                     vec![claim_result.log],
                 )?;
-                // Defer receipt until CLAIM note is consumed by faucet
-                if let Some(note_id) = claim_note_id {
-                    let submit_block = service.block_num_tracker.latest();
-                    service.txn_manager.begin_awaiting_consumption(
-                        txn_hash,
-                        note_id,
-                        submit_block,
-                    )?;
-                }
+                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
             }
             Err(err) => {
                 service.claim_tracker.unclaim(&params.globalIndex);

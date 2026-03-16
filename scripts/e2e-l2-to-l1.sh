@@ -96,35 +96,28 @@ wait_for "certificate settled" \
     300 10
 pass "Certificate settled on L1!"
 
-# ── Step 4: Claim on L1 via polycli ───────────────────────────────────────────
+# ── Step 4: Wait for L1 claim (bridge-service ClaimTxManager) ─────────────────
 log "Step 4/4: Claiming on L1..."
 L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
 log "L1 balance before: $L1_BAL_BEFORE"
 
-# Use polycli to claim the bridge-out deposit on L1
-if command -v polycli >/dev/null 2>&1; then
-    polycli ulxly claim asset \
-        --rpc-url "$L1_RPC" \
-        --bridge-address "$BRIDGE_ADDRESS" \
-        --bridge-service-url "http://localhost:18080" \
-        --private-key "$FUNDED_KEY" \
-        --deposit-network 1 \
-        --deposit-count 0 \
-        --dest-addr "$L1_DEST" \
-        --chain-id 271828 \
-        --transaction-receipt-timeout 30 2>&1 || true
-else
-    warn "polycli not found — attempting manual L1 claim..."
-fi
+# Claim the L2→L1 deposit on L1 via polycli
+polycli ulxly claim asset \
+    --rpc-url "$L1_RPC" \
+    --bridge-address "$BRIDGE_ADDRESS" \
+    --bridge-service-url "http://localhost:18080" \
+    --private-key "$FUNDED_KEY" \
+    --deposit-network 1 \
+    --deposit-count 0 \
+    --destination-address "$L1_DEST" \
+    --chain-id 271828 \
+    --transaction-receipt-timeout 30 2>&1
 
-sleep 5
 L1_BAL_AFTER=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
 if [[ "$L1_BAL_AFTER" != "$L1_BAL_BEFORE" ]]; then
     pass "L2→L1 COMPLETE! L1 balance: $L1_BAL_BEFORE → $L1_BAL_AFTER"
 else
-    warn "L1 balance unchanged. ClaimTxManager may need debugging."
-    warn "The certificate settled on L1 — the claim can be executed manually."
-    pass "L2→L1 pipeline verified up to L1 settlement"
+    fail "L1 balance unchanged after claim"
 fi
 
 echo ""
