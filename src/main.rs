@@ -1,9 +1,10 @@
 use clap::Parser;
 use miden_agglayer_service::block_state::BlockState;
-use miden_agglayer_service::bridge_out::{BridgeOutScanner, BridgeOutTracker};
-use miden_agglayer_service::log_synthesis::LogStore;
+use miden_agglayer_service::bridge_out::BridgeOutScanner;
 use miden_agglayer_service::service;
 use miden_agglayer_service::service_state::ServiceState;
+use miden_agglayer_service::store::memory::InMemoryStore;
+use miden_agglayer_service::store::StoreSyncListener;
 use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -41,6 +42,10 @@ struct Command {
     /// L1 RPC URL for reading exit roots during GER injection
     #[arg(long, env = "L1_RPC_URL")]
     l1_rpc_url: Option<String>,
+
+    /// PostgreSQL connection URL (enables PgStore instead of InMemoryStore)
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
 }
 
 #[tokio::main]
@@ -54,12 +59,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 1: Run init if needed (with a minimal client, no BridgeOutScanner)
     if needs_init {
-        let block_num_tracker = Arc::new(BlockNumTracker::new());
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
         let block_state = Arc::new(BlockState::new());
-        let log_store = Arc::new(LogStore::new());
-        let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
+        let sync_listener = Arc::new(StoreSyncListener::new(store, block_state.clone()));
+
         let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
-            vec![txn_manager, block_num_tracker, block_state];
+            vec![sync_listener, block_state];
 
         let init_client = MidenClient::new(
             miden_store_dir.clone(),
@@ -77,58 +82,54 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Phase 2: Load config (always exists at this point) and create full client
-    let block_num_tracker = Arc::new(BlockNumTracker::new());
+    // Phase 2: Create the store
+    let store: Arc<dyn Store> = if let Some(_db_url) = &command.database_url {
+        #[cfg(feature = "postgres")]
+        {
+            let pg = miden_agglayer_service::store::postgres::PgStore::new(_db_url).await?;
+            Arc::new(pg)
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            let _ = _db_url;
+            anyhow::bail!(
+                "--database-url requires the 'postgres' feature. \
+                 Rebuild with: cargo build --features postgres"
+            );
+        }
+    } else {
+        Arc::new(InMemoryStore::new())
+    };
+
+    // Phase 3: Load config and create full client
     let block_state = Arc::new(BlockState::new());
-    let log_store = Arc::new(LogStore::new());
-    let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
 
     let accounts = load_config(miden_store_dir.clone())?;
 
-    let bridge_out_persistence_path = miden_store_dir
-        .as_ref()
-        .map(|d: &PathBuf| d.join("bridge_out_tracker.json"));
-    let bridge_out_tracker = BridgeOutTracker::new(bridge_out_persistence_path)?;
     let bridge_account_id = accounts.0.bridge.0;
     let bridge_out_scanner = Arc::new(BridgeOutScanner::new(
-        log_store.clone(),
+        store.clone(),
         block_state.clone(),
         accounts.0.clone(),
-        bridge_out_tracker,
         bridge_account_id,
     ));
 
+    let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
     let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
-        txn_manager.clone(),
-        block_num_tracker.clone(),
+        sync_listener,
         block_state.clone(),
         bridge_out_scanner,
     ];
 
     let client = MidenClient::new(miden_store_dir.clone(), command.miden_node, sync_listeners)?;
 
-    let claim_persistence_path = miden_store_dir
-        .as_ref()
-        .map(|d: &PathBuf| d.join("claimed_indices.json"));
-    let claim_tracker = Arc::new(ClaimTracker::new(claim_persistence_path)?);
-    let nonce_tracker = Arc::new(NonceTracker::new());
-    let address_persistence_path = miden_store_dir
-        .as_ref()
-        .map(|d: &PathBuf| d.join("address_mappings.json"));
-    let address_mapper = Arc::new(AddressMapper::new(address_persistence_path)?);
-
     let state = ServiceState::new(
         client,
         accounts,
         command.chain_id,
         command.network_id,
-        block_num_tracker,
-        txn_manager,
+        store,
         block_state,
-        log_store,
-        claim_tracker,
-        nonce_tracker,
-        address_mapper,
         command.l1_rpc_url,
     );
 
@@ -156,7 +157,6 @@ async fn main() -> anyhow::Result<()> {
                     .map(|s| s.trim().parse().expect("invalid watch address"))
                     .collect(),
                 _ => {
-                    // Default: watch the signer's own address
                     vec![alloy::signers::Signer::address(&signer)]
                 }
             };

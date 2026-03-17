@@ -53,6 +53,10 @@ tracing-subscriber = { features = [
 ], version = "0.3" }
 url = { features = ["serde"], version = "2.5" }
 
+# postgres (optional)
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+
 # miden-base
 miden-base-agglayer = { package = "miden-agglayer", version = "0.14.0-alpha" }
 miden-protocol = { default-features = false, features = [
@@ -66,3 +70,7 @@ miden-client = { default-features = false, features = [
   "tonic",
 ], git = "https://github.com/0xMiden/miden-client.git", branch = "agglayer-integration-tests" }
 miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "agglayer-integration-tests" }
+
+[features]
+default = []
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]

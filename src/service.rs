@@ -43,30 +43,16 @@ alloy_core::sol! {
 }
 
 /// Encode `bridgeAsset(...)` calldata from a BridgeEvent synthetic log.
-///
-/// The aggkit L2BridgeSyncer calls `debug_traceTransaction`, finds the subcall
-/// to the bridge address, then ABI-decodes the `input` as `bridgeAsset(...)`.
-/// Without proper calldata, it errors with "failed to extract bridge event data".
 fn encode_bridge_asset_from_log(log: &crate::log_synthesis::SyntheticLog) -> String {
     let data_hex = log.data.strip_prefix("0x").unwrap_or(&log.data);
     let Ok(data_bytes) = hex::decode(data_hex) else {
         return "0x".to_string();
     };
 
-    // BridgeEvent data layout (32 bytes each):
-    //   [0]  leafType (uint8)
-    //   [1]  originNetwork (uint32)
-    //   [2]  originAddress (address)
-    //   [3]  destinationNetwork (uint32)
-    //   [4]  destinationAddress (address)
-    //   [5]  amount (uint256)
-    //   [6]  metadata offset
-    //   [7]  depositCount (uint32)
     if data_bytes.len() < 8 * 32 {
         return "0x".to_string();
     }
 
-    // Extract fields from 32-byte ABI words
     let dest_net = u32::from_be_bytes(
         data_bytes[3 * 32 + 28..3 * 32 + 32].try_into().unwrap_or([0; 4]),
     );
@@ -75,7 +61,6 @@ fn encode_bridge_asset_from_log(log: &crate::log_synthesis::SyntheticLog) -> Str
         .unwrap_or([0; 20]);
     let amount = alloy::primitives::U256::from_be_slice(&data_bytes[5 * 32..6 * 32]);
 
-    // Encode as bridgeAsset(destNet, destAddr, amount, token=0, false, "")
     let call = bridgeAssetCall {
         destinationNetwork: dest_net,
         destinationAddress: alloy::primitives::Address::from(dest_addr),
@@ -100,15 +85,6 @@ impl From<ServiceErrorCode> for JsonRpcErrorReason {
     }
 }
 
-/// Build a synthetic transaction JSON for bridge-out events that have no TxnManager entry.
-///
-/// AggSender's L2BridgeSyncer calls `eth_getTransactionByHash` for every log it receives,
-/// then extracts the sender via Go's `ethclient.TransactionByHash`. Go checks:
-///
-///   if json.From != nil && json.BlockHash != nil { setSenderFromServer(tx, from, blockHash) }
-///
-/// This function constructs a minimal Legacy transaction that Go can unmarshal and
-/// extract the sender from without falling back to RLP-based signature recovery.
 fn build_synthetic_tx_json(
     txn_hash: TxHash,
     log: &crate::log_synthesis::SyntheticLog,
@@ -197,25 +173,23 @@ async fn json_rpc_endpoint(
     }
 
     match method {
-        // Return non-empty code for all addresses.
-        // Aggsender checks eth_getCode before calling eth_call on the rollup/bridge contracts.
-        // Returns 0xFE (INVALID opcode) to indicate contract exists but prevents execution.
         "eth_getCode" => {
             let _params: (String, String) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0xFE"))
         }
 
         "eth_blockNumber" => {
-            let block_num = service.block_num_tracker.latest();
+            let block_num = service.store.get_latest_block_number().await;
             let block_num_str = format!("{:#x}", block_num);
             Ok(JsonRpcResponse::success(answer_id, block_num_str))
         }
 
-        // Return synthetic block with deterministic hash (prevents false reorg detection)
         "eth_getBlockByNumber" => {
             let params: (String, bool) = request.parse_params()?;
             let block_num = match params.0.as_str() {
-                "latest" | "pending" | "finalized" | "safe" => service.block_num_tracker.latest(),
+                "latest" | "pending" | "finalized" | "safe" => {
+                    service.store.get_latest_block_number().await
+                }
                 "earliest" => 0,
                 any => {
                     let Ok(num) = hex_decode_u64(any) else {
@@ -278,19 +252,12 @@ async fn json_rpc_endpoint(
 
         "eth_getTransactionCount" => {
             let params: (String, String) = request.parse_params()?;
-            let nonce = service.nonce_tracker.get(&params.0);
+            let nonce = service.store.nonce_get(&params.0).await;
             Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
         }
 
-        // Return a non-zero gas price. The bridge-service's ClaimTxManager queries
-        // eth_gasPrice when building L1 claim txs. Returning 0 causes Anvil to silently
-        // drop the tx (doesn't meet base fee). 1 gwei is a safe default.
-        "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")), // 1 gwei
-
-        // polycli estimates GasTipCap (priority fee cap), return 1 gwei
+        "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
-
-        // polycli estimates how much gas will be spent on a transaction, return zero
         "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
 
         "eth_chainId" => Ok(JsonRpcResponse::success(
@@ -298,8 +265,6 @@ async fn json_rpc_endpoint(
             format!("{:#x}", service.chain_id),
         )),
 
-        // AggLayer requests current state of the bridge contract using eth_call,
-        // but currently everything is stubbed with zero except networkID
         "eth_call" => {
             #[derive(Debug, Deserialize)]
             struct TransactionParam {
@@ -336,14 +301,11 @@ async fn json_rpc_endpoint(
                     return Ok(JsonRpcResponse::success(answer_id, network_id_hex));
                 }
 
-                // globalExitRootMap(bytes32) → returns non-zero timestamp for injected GERs.
-                // The aggoracle checks this to avoid re-injecting the same GER.
                 const GLOBAL_EXIT_ROOT_MAP_SELECTOR: [u8; 4] = [0x25, 0x7b, 0x36, 0x32];
                 if data.starts_with(&GLOBAL_EXIT_ROOT_MAP_SELECTOR) && data.len() >= 36 {
                     let mut ger = [0u8; 32];
                     ger.copy_from_slice(&data[4..36]);
-                    if service.ger_tracker.is_injected(&ger) {
-                        // Return 1 (non-zero = injected)
+                    if service.store.is_ger_injected(&ger).await {
                         return Ok(JsonRpcResponse::success(
                             answer_id,
                             "0x0000000000000000000000000000000000000000000000000000000000000001",
@@ -351,8 +313,6 @@ async fn json_rpc_endpoint(
                     }
                 }
 
-                // Forward eth_call to L1 for rollup manager / rollup contract queries.
-                // The aggsender queries these L1 contracts via the L2 RPC to build certificates.
                 if let (Some(l1_url), Some(to)) = (&service.l1_rpc_url, &to_addr) {
                     let to_lower = to.to_lowercase();
                     let rollup_mgr = "0x6c6c009cc348976db4a908c92b24433d4f6eda43";
@@ -383,7 +343,6 @@ async fn json_rpc_endpoint(
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::SendRawTransaction)
         }
 
-        // polycli polls receipts to get the eth_sendRawTransaction status
         "eth_getTransactionReceipt" => {
             let params: (String,) = request.parse_params()?;
             let tx_hash_str = params.0.clone();
@@ -418,28 +377,21 @@ async fn json_rpc_endpoint(
                 return Err(JsonRpcResponse::error(answer_id, error));
             };
 
-            // Try TxnManager first (real transactions from eth_sendRawTransaction)
-            if let Some(txn) = service.txn_manager.txn(txn_hash) {
+            // Try store first (real transactions from eth_sendRawTransaction)
+            if let Some(data) = service.store.txn_get(txn_hash).await {
+                let txn = data.to_rpc_transaction(txn_hash, &service.block_state);
                 return Ok(JsonRpcResponse::success(answer_id, txn));
             }
 
-            // Fallback: check LogStore for synthetic transactions (bridge-out events).
-            // BridgeOutScanner creates synthetic tx hashes for BridgeEvent logs that
-            // have no corresponding TxnManager entry. AggSender's L2BridgeSyncer
-            // queries eth_getTransactionByHash for each log to extract the sender.
+            // Fallback: synthetic transactions (bridge-out events)
             let tx_hash_str = format!("{txn_hash:#x}");
-            let logs = service.log_store.get_logs_for_tx(&tx_hash_str);
+            let logs = service.store.get_logs_for_tx(&tx_hash_str).await;
             if let Some(log) = logs.first() {
                 tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
                 let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
                 return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
             }
 
-            // Unknown hash: return null.
-            // The EthTxManager checks TransactionByHash BEFORE sending to see if the
-            // tx is already "in the network". If we return a synthetic tx here, the
-            // EthTxManager skips SendTransaction entirely, and the receipt is never
-            // created — causing perpetual "not mined yet" polling.
             tracing::debug!(
                 tx_hash = %tx_hash_str,
                 "eth_getTransactionByHash: unknown hash, returning null"
@@ -451,15 +403,10 @@ async fn json_rpc_endpoint(
         }
 
         "eth_getLogs" => {
-            // Return synthetic logs from LogStore (GER/claim events with proper formatting).
-            // TxnManager logs are intentionally excluded: they duplicate LogStore entries
-            // but use alloy's Log type which serializes Optional fields as JSON null,
-            // causing Go's hexutil.Uint unmarshaling to fail in the bridge-service.
             let raw_params: (serde_json::Value,) = request.parse_params()?;
-
             let log_filter: LogFilter = serde_json::from_value(raw_params.0).unwrap_or_default();
-            let current_block = service.block_num_tracker.latest();
-            let synthetic_logs = service.log_store.get_logs(&log_filter, current_block);
+            let current_block = service.store.get_latest_block_number().await;
+            let synthetic_logs = service.store.get_logs(&log_filter, current_block).await;
             let json_logs: Vec<serde_json::Value> = synthetic_logs
                 .iter()
                 .map(|l: &crate::log_synthesis::SyntheticLog| l.to_json())
@@ -493,22 +440,22 @@ async fn json_rpc_endpoint(
             ))
         }
 
-        // Aggkit's L2BridgeSyncer calls debug_traceTransaction with callTracer config
-        // to extract the sender of claim/bridge transactions. Returns a call trace
-        // with the correct sender and input data so aggkit can build certificates.
-        //
-        // Aggkit's findCall() does DFS on the "calls" array looking for a subcall
-        // where "to" matches the bridge address. It does NOT check the root call.
-        // So we must include a subcall with to=bridge_address.
         "debug_traceTransaction" => {
-            // Accept 2 params: [txHash, {"tracer": "callTracer"}]
             let params: (String, serde_json::Value) = request.parse_params()?;
             let bridge_addr = crate::bridge_address::get_bridge_address();
 
-            // Try TxnManager for real transactions (has actual calldata)
+            // Try store for real transactions (has actual calldata)
             if let Ok(hash) = TxHash::from_str(&params.0)
-                && let Some((from, to, input)) = service.txn_manager.txn_trace_info(hash)
+                && let Some(data) = service.store.txn_get(hash).await
             {
+                use alloy::consensus::Transaction;
+                let from = format!("{:#x}", data.signer);
+                let to = data
+                    .envelope
+                    .to()
+                    .map(|a| format!("{a:#x}"))
+                    .unwrap_or_default();
+                let input = format!("0x{}", hex::encode(data.envelope.input()));
                 let call_to = if to.is_empty() {
                     bridge_addr.to_string()
                 } else {
@@ -534,12 +481,10 @@ async fn json_rpc_endpoint(
                 ));
             }
 
-            // Fallback for synthetic bridge-out txs: look up the BridgeEvent log
-            // and encode proper bridgeAsset calldata so aggkit's L2BridgeSyncer
-            // can extract the bridge event data via findCall() + ABI decode.
+            // Fallback for synthetic bridge-out txs
             let input_data = if let Ok(hash) = TxHash::from_str(&params.0) {
                 let tx_key = format!("{hash:#x}");
-                let logs = service.log_store.get_logs_for_tx(&tx_key);
+                let logs = service.store.get_logs_for_tx(&tx_key).await;
                 if let Some(log) = logs.first() {
                     encode_bridge_asset_from_log(log)
                 } else {
@@ -569,13 +514,11 @@ async fn json_rpc_endpoint(
             ))
         }
 
-        // Bridge-service's L2 synchronizer calls syncTrustedState() which queries
-        // the latest GER to track trusted exit roots. Returns the most recently
-        // inserted GER hash, or zero hash if none.
         "zkevm_getLatestGlobalExitRoot" => {
             let ger = service
-                .log_store
+                .store
                 .get_latest_ger()
+                .await
                 .unwrap_or([0u8; 32]);
             Ok(JsonRpcResponse::success(
                 answer_id,
@@ -583,9 +526,6 @@ async fn json_rpc_endpoint(
             ))
         }
 
-        // Bridge-service calls ExitRootsByGER to get the exit roots and block info
-        // for a given GER. Returns null if the GER is not found (causes syncTrustedState
-        // to skip gracefully).
         "zkevm_getExitRootsByGER" => {
             let params: (String,) = request.parse_params()?;
             let hash_hex = params.0.strip_prefix("0x").unwrap_or(&params.0);
@@ -606,7 +546,7 @@ async fn json_rpc_endpoint(
                 return Err(JsonRpcResponse::error(answer_id, error));
             };
 
-            match service.log_store.get_ger_entry(&ger) {
+            match service.store.get_ger_entry(&ger).await {
                 Some(entry) => {
                     let mainnet = entry.mainnet_exit_root.unwrap_or([0u8; 32]);
                     let rollup = entry.rollup_exit_root.unwrap_or([0u8; 32]);
@@ -736,7 +676,6 @@ mod tests {
 
         let json = build_synthetic_tx_json(txn_hash, &log, 2);
 
-        // Required by Go's types.Transaction.UnmarshalJSON
         assert_eq!(json["type"], "0x0");
         assert_eq!(json["nonce"], "0x0");
         assert_eq!(json["gasPrice"], "0x0");
@@ -744,7 +683,6 @@ mod tests {
         assert_eq!(json["value"], "0x0");
         assert_eq!(json["input"], "0x");
 
-        // Required by Go's ethclient for sender extraction
         assert_eq!(json["from"], log.address);
         assert!(
             !json["blockHash"].is_null(),
@@ -753,12 +691,10 @@ mod tests {
         assert_eq!(json["blockNumber"], "0x64");
         assert_eq!(json["transactionIndex"], "0x0");
 
-        // Go checks RawSignatureValues: r must be non-nil
         assert_eq!(json["v"], "0x1b");
         assert_eq!(json["r"], "0x1");
         assert_eq!(json["s"], "0x1");
 
-        // hash and chainId
         assert_eq!(json["hash"], format!("{txn_hash:#x}"));
         assert_eq!(json["chainId"], "0x2");
     }

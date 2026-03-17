@@ -1,6 +1,4 @@
 use crate::accounts_config::AccountsConfig;
-use crate::block_state::BlockState;
-use crate::log_synthesis::LogStore;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{FixedBytes, LogData, TxHash};
 use alloy::sol_types::SolEvent;
@@ -161,8 +159,8 @@ pub async fn insert_ger(
     rollup_exit_root: Option<[u8; 32]>,
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
-    log_store: &Arc<LogStore>,
-    block_state: &Arc<BlockState>,
+    store: &Arc<dyn crate::store::Store>,
+    block_state: &Arc<crate::block_state::BlockState>,
     txn_hash: TxHash,
 ) -> anyhow::Result<GerInsertResult> {
     // Store event at current_block + 1 so it appears in a block the bridge-service
@@ -173,7 +171,7 @@ pub async fn insert_ger(
     let timestamp = block_state.get_block_timestamp(block_number);
 
     // Check dedup before doing any work
-    let is_new = !log_store.has_seen_ger(&ger_bytes);
+    let is_new = !store.has_seen_ger(&ger_bytes).await;
 
     if is_new {
         tracing::info!(
@@ -194,15 +192,17 @@ pub async fn insert_ger(
 
         // Miden submission succeeded — now record the event
         let tx_hash_str = format!("{txn_hash:#x}");
-        log_store.add_ger_update_event(
-            block_number,
-            block_hash,
-            &tx_hash_str,
-            &ger_bytes,
-            mainnet_exit_root,
-            rollup_exit_root,
-            timestamp,
-        );
+        store
+            .add_ger_update_event(
+                block_number,
+                block_hash,
+                &tx_hash_str,
+                &ger_bytes,
+                mainnet_exit_root,
+                rollup_exit_root,
+                timestamp,
+            )
+            .await;
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),

@@ -1,5 +1,5 @@
 use crate::accounts_config::AccountsConfig;
-use crate::address_mapper::AddressMapper;
+use crate::store::Store;
 use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
@@ -89,16 +89,16 @@ fn bytes32_array_to_smt_nodes(values: [FixedBytes<32>; 32]) -> [SmtNode; 32] {
     values.map(|v| SmtNode::new(v.0))
 }
 
-fn create_claim(
+async fn create_claim(
     params: claimAssetCall,
     faucet: Faucet,
     accounts: &AccountsConfig,
-    address_mapper: &AddressMapper,
+    store: &dyn Store,
     rng: &mut impl FeltRng,
 ) -> anyhow::Result<Note> {
     let sender = accounts.service.0;
 
-    let _dest_account = address_mapper.resolve(params.destinationAddress, accounts)?;
+    let _dest_account = crate::address_mapper::resolve_address(store, params.destinationAddress, accounts).await?;
 
     let amount = validate_amount(params.amount, faucet.origin_token_decimals, faucet.decimals)?;
 
@@ -154,7 +154,7 @@ async fn publish_claim_internal(
     params: claimAssetCall,
     client: &mut MidenClientLib,
     accounts: &AccountsConfig,
-    address_mapper: &AddressMapper,
+    store: &dyn Store,
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_target_faucet(params.originTokenAddress, accounts);
@@ -174,9 +174,9 @@ async fn publish_claim_internal(
         params.clone(),
         faucet,
         accounts,
-        address_mapper,
+        store,
         client.rng(),
-    )?;
+    ).await?;
     let claim_note_id = claim_note.id().to_string();
 
     const EXPIRATION_DELTA: u16 = 10;
@@ -271,7 +271,7 @@ pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
     accounts: crate::AccountsConfig,
-    address_mapper: Arc<AddressMapper>,
+    store: Arc<dyn Store>,
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
@@ -284,7 +284,7 @@ pub async fn publish_claim(
                     params,
                     client,
                     &accounts.0,
-                    &address_mapper,
+                    &*store,
                     latest_block_num,
                 )
                 .await?;

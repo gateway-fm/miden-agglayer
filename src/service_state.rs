@@ -1,27 +1,7 @@
 use crate::block_state::BlockState;
-use crate::log_synthesis::LogStore;
+use crate::store::Store;
 use crate::*;
-use parking_lot::RwLock;
-use std::collections::HashSet;
 use std::sync::Arc;
-
-/// Tracks which Global Exit Roots have been injected into the bridge account.
-/// The aggoracle's `isGlobalExitRootInjected` check calls `globalExitRootMap(ger)`
-/// on the L2 GER contract; it expects a non-zero return for already-injected GERs.
-#[derive(Default)]
-pub struct GerTracker {
-    injected: RwLock<HashSet<[u8; 32]>>,
-}
-
-impl GerTracker {
-    pub fn mark_injected(&self, ger: [u8; 32]) {
-        self.injected.write().insert(ger);
-    }
-
-    pub fn is_injected(&self, ger: &[u8; 32]) -> bool {
-        self.injected.read().contains(ger)
-    }
-}
 
 #[derive(Clone)]
 pub struct ServiceState {
@@ -30,34 +10,22 @@ pub struct ServiceState {
     pub chain_id: u64,
     /// Rollup network ID from RollupManager (used for bridge's networkID() call)
     pub network_id: u64,
-    pub block_num_tracker: Arc<BlockNumTracker>,
-    pub txn_manager: Arc<TxnManager>,
+    pub store: Arc<dyn Store>,
     pub block_state: Arc<BlockState>,
-    pub log_store: Arc<LogStore>,
-    pub claim_tracker: Arc<ClaimTracker>,
-    pub nonce_tracker: Arc<NonceTracker>,
-    pub address_mapper: Arc<AddressMapper>,
     pub l1_rpc_url: Option<String>,
-    pub ger_tracker: Arc<GerTracker>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<ServiceState>();
 
 impl ServiceState {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         miden_client: MidenClient,
         accounts: AccountsConfig,
         chain_id: u64,
         network_id: u64,
-        block_num_tracker: Arc<BlockNumTracker>,
-        txn_manager: Arc<TxnManager>,
+        store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
-        log_store: Arc<LogStore>,
-        claim_tracker: Arc<ClaimTracker>,
-        nonce_tracker: Arc<NonceTracker>,
-        address_mapper: Arc<AddressMapper>,
         l1_rpc_url: Option<String>,
     ) -> Self {
         Self {
@@ -65,15 +33,9 @@ impl ServiceState {
             accounts,
             chain_id,
             network_id,
-            block_num_tracker,
-            txn_manager,
+            store,
             block_state,
-            log_store,
-            claim_tracker,
-            nonce_tracker,
-            address_mapper,
             l1_rpc_url,
-            ger_tracker: Arc::new(GerTracker::default()),
         }
     }
 }

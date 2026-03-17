@@ -7,7 +7,6 @@
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
-use crate::log_synthesis::LogStore;
 use crate::miden_client::{MidenClientLib, SyncListener};
 use miden_base_agglayer::B2AggNote;
 use miden_client::store::InputNoteRecord;
@@ -15,111 +14,10 @@ use miden_client::store::NoteFilter;
 use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
 use miden_protocol::note::{NoteDetails, NoteStorage};
-use parking_lot::RwLock;
 use sha3::{Digest, Keccak256};
-use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 const LEAF_TYPE_ASSET: u8 = 0;
-
-// BRIDGE OUT TRACKER
-// ================================================================================================
-
-/// Persistent dedup tracker for processed B2AGG notes + monotonic deposit counter.
-pub struct BridgeOutTracker {
-    processed_notes: RwLock<HashSet<String>>,
-    deposit_counter: RwLock<u32>,
-    persistence_path: Option<PathBuf>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TrackerState {
-    processed_notes: Vec<String>,
-    deposit_counter: u32,
-}
-
-impl BridgeOutTracker {
-    pub fn new(persistence_path: Option<PathBuf>) -> anyhow::Result<Self> {
-        let (processed_notes, deposit_counter) = if let Some(ref path) = persistence_path {
-            if path.exists() {
-                let data = std::fs::read_to_string(path)?;
-                let state: TrackerState = serde_json::from_str(&data)?;
-                (
-                    state.processed_notes.into_iter().collect(),
-                    state.deposit_counter,
-                )
-            } else {
-                (HashSet::new(), 0)
-            }
-        } else {
-            (HashSet::new(), 0)
-        };
-        Ok(Self {
-            processed_notes: RwLock::new(processed_notes),
-            deposit_counter: RwLock::new(deposit_counter),
-            persistence_path,
-        })
-    }
-
-    pub fn is_processed(&self, note_id: &str) -> bool {
-        self.processed_notes.read().contains(note_id)
-    }
-
-    /// Mark a note as processed, increment deposit counter, persist.
-    /// Returns the deposit count assigned to this note.
-    pub fn mark_processed(&self, note_id: String) -> u32 {
-        let mut notes = self.processed_notes.write();
-        notes.insert(note_id);
-
-        let mut counter = self.deposit_counter.write();
-        let deposit_count = *counter;
-        *counter += 1;
-
-        drop(notes);
-        drop(counter);
-        self.persist();
-        deposit_count
-    }
-
-    fn persist(&self) {
-        let Some(ref path) = self.persistence_path else {
-            return;
-        };
-        let notes = self.processed_notes.read();
-        let counter = *self.deposit_counter.read();
-        let state = TrackerState {
-            processed_notes: notes.iter().cloned().collect(),
-            deposit_counter: counter,
-        };
-        drop(notes);
-
-        let Ok(data) = serde_json::to_string_pretty(&state) else {
-            tracing::error!("BridgeOutTracker: failed to serialize state");
-            return;
-        };
-        let tmp_path = path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp_path, &data) {
-            tracing::error!(
-                "BridgeOutTracker: failed to write {}: {e}",
-                tmp_path.display()
-            );
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, path) {
-            tracing::error!(
-                "BridgeOutTracker: failed to rename to {}: {e}",
-                path.display()
-            );
-        }
-    }
-}
-
-impl Default for BridgeOutTracker {
-    fn default() -> Self {
-        Self::new(None).unwrap()
-    }
-}
 
 // B2AGG NOTE PARSING
 // ================================================================================================
@@ -200,34 +98,31 @@ fn reverse_scale_amount(miden_amount: u64, scale: u8) -> u128 {
 
 /// Scans for consumed B2AGG notes and emits synthetic BridgeEvent logs.
 pub struct BridgeOutScanner {
-    log_store: Arc<LogStore>,
+    store: Arc<dyn crate::store::Store>,
     block_state: Arc<BlockState>,
     accounts: AccountsConfig,
-    tracker: BridgeOutTracker,
     _bridge_account_id: AccountId,
 }
 
 impl BridgeOutScanner {
     pub fn new(
-        log_store: Arc<LogStore>,
+        store: Arc<dyn crate::store::Store>,
         block_state: Arc<BlockState>,
         accounts: AccountsConfig,
-        tracker: BridgeOutTracker,
         bridge_account_id: AccountId,
     ) -> Self {
         Self {
-            log_store,
+            store,
             block_state,
             accounts,
-            tracker,
             _bridge_account_id: bridge_account_id,
         }
     }
 
-    fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) {
+    async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) {
         let note_id_str = note.id().to_string();
 
-        if self.tracker.is_processed(&note_id_str) {
+        if self.store.is_note_processed(&note_id_str).await {
             return;
         }
 
@@ -261,22 +156,24 @@ impl BridgeOutScanner {
         };
 
         let block_hash = self.block_state.get_block_hash(block_number);
-        let deposit_count = self.tracker.mark_processed(note_id_str.clone());
+        let deposit_count = self.store.mark_note_processed(note_id_str.clone()).await;
 
         // Emit BridgeEvent log
-        self.log_store.add_bridge_event(
-            get_bridge_address(),
-            block_number,
-            block_hash,
-            &tx_hash,
-            LEAF_TYPE_ASSET,
-            origin.origin_network,
-            &origin.origin_address,
-            destination_network,
-            &destination_address,
-            origin_amount,
-            deposit_count,
-        );
+        self.store
+            .add_bridge_event(
+                get_bridge_address(),
+                block_number,
+                block_hash,
+                &tx_hash,
+                LEAF_TYPE_ASSET,
+                origin.origin_network,
+                &origin.origin_address,
+                destination_network,
+                &destination_address,
+                origin_amount,
+                deposit_count,
+            )
+            .await;
 
         tracing::info!(
             note_id = %note_id_str,
@@ -308,7 +205,7 @@ impl SyncListener for BridgeOutScanner {
         let block_number = self.block_state.current_block_number() + 1;
 
         for note in &consumed_notes {
-            self.process_consumed_note(note, block_number);
+            self.process_consumed_note(note, block_number).await;
         }
 
         Ok(())
@@ -444,43 +341,5 @@ mod tests {
         assert_eq!(reverse_scale_amount(1000, 10), 10_000_000_000_000);
         // 1 unit with scale=18
         assert_eq!(reverse_scale_amount(1, 18), 1_000_000_000_000_000_000);
-    }
-
-    #[test]
-    fn test_bridge_out_tracker_dedup() {
-        let tracker = BridgeOutTracker::new(None).unwrap();
-        assert!(!tracker.is_processed("note1"));
-        let count = tracker.mark_processed("note1".to_string());
-        assert_eq!(count, 0);
-        assert!(tracker.is_processed("note1"));
-        let count2 = tracker.mark_processed("note2".to_string());
-        assert_eq!(count2, 1);
-    }
-
-    #[test]
-    fn test_bridge_out_tracker_persistence() {
-        let dir = std::env::temp_dir().join(format!(
-            "bridge_out_tracker_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bridge_out_tracker.json");
-
-        {
-            let tracker = BridgeOutTracker::new(Some(path.clone())).unwrap();
-            tracker.mark_processed("note_a".to_string());
-            tracker.mark_processed("note_b".to_string());
-        }
-
-        let tracker = BridgeOutTracker::new(Some(path.clone())).unwrap();
-        assert!(tracker.is_processed("note_a"));
-        assert!(tracker.is_processed("note_b"));
-        assert!(!tracker.is_processed("note_c"));
-        assert_eq!(*tracker.deposit_counter.read(), 2);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

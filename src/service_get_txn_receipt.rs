@@ -12,7 +12,7 @@ pub async fn service_get_txn_receipt(
     txn_hash: String,
 ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope>>> {
     let txn_hash = TxHash::from_str(&txn_hash)?;
-    let (result, block_num) = match service.txn_manager.receipt(txn_hash) {
+    let (result, block_num) = match service.store.txn_receipt(txn_hash).await {
         Some((result, block_num)) => (result, block_num),
         None => return Ok(None),
     };
@@ -47,44 +47,21 @@ pub async fn service_get_txn_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_num_tracker::BlockNumTracker;
     use crate::block_state::BlockState;
-    use crate::log_synthesis::LogStore;
-    use crate::nonce_tracker::NonceTracker;
-    use crate::txn_manager::TxnManager;
-    use crate::{AddressMapper, ClaimTracker, MidenClient};
+    use crate::store::TxnEntry;
+    use crate::MidenClient;
     use alloy::consensus::TxEnvelope;
-    use alloy::primitives::TxHash;
+    use alloy::primitives::{Address, TxHash};
     use std::sync::Arc;
 
     fn create_test_service() -> ServiceState {
-        let log_store = Arc::new(LogStore::new());
+        let store: Arc<dyn crate::store::Store> =
+            Arc::new(crate::store::memory::InMemoryStore::new());
         let block_state = Arc::new(BlockState::new());
-        let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
         let miden_client = MidenClient::new_test();
-        let block_num_tracker = Arc::new(BlockNumTracker::new());
-        let nonce_tracker = Arc::new(NonceTracker::new());
-        let claim_tracker = Arc::new(ClaimTracker::new(None).unwrap());
-        let address_mapper = Arc::new(AddressMapper::new(None).unwrap());
-
-        // Mock AccountsConfig - since it's a wrapper, we might need a way to create it.
-        // For now, let's assume it can be empty.
-        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
-
-        ServiceState::new(
-            miden_client,
-            accounts,
-            1,
-            1,
-            block_num_tracker,
-            txn_manager,
-            block_state,
-            log_store,
-            claim_tracker,
-            nonce_tracker,
-            address_mapper,
-            None,
-        )
+        let accounts =
+            crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        ServiceState::new(miden_client, accounts, 1, 1, store, block_state, None)
     }
 
     #[tokio::test]
@@ -98,9 +75,10 @@ mod tests {
     #[tokio::test]
     async fn test_service_get_txn_receipt_found() {
         let service = create_test_service();
+        let block_state = service.block_state.clone();
         let txn_hash = TxHash::from([2u8; 32]);
 
-        // Mock a transaction in TxnManager
+        // Mock a transaction in the store
         // We need a TxEnvelope. Legacy is easiest to create dummy.
         let txn_envelope = TxEnvelope::Legacy(alloy::consensus::Signed::new_unchecked(
             alloy::consensus::TxLegacy::default(),
@@ -109,11 +87,25 @@ mod tests {
         ));
 
         service
-            .txn_manager
-            .begin(txn_hash, None, txn_envelope, None, vec![])
+            .store
+            .txn_begin(
+                txn_hash,
+                TxnEntry {
+                    id: None,
+                    envelope: txn_envelope,
+                    signer: Address::ZERO,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
             .unwrap();
 
-        service.txn_manager.commit(txn_hash, Ok(()), 123).unwrap();
+        service
+            .store
+            .txn_commit(txn_hash, Ok(()), 123, block_state.get_block_hash(123))
+            .await
+            .unwrap();
 
         let result = service_get_txn_receipt(service, txn_hash.to_string())
             .await

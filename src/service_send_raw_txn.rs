@@ -2,11 +2,12 @@ use crate::claim::claimAssetCall;
 use crate::ger::{insertGlobalExitRootCall, updateExitRootCall};
 use crate::hex::hex_decode_prefixed;
 use crate::service_state::ServiceState;
+use crate::store::TxnEntry;
 use crate::*;
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash};
 use alloy_core::sol_types::SolCall;
 
 struct TransactionData {
@@ -40,7 +41,7 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
     Ok(data)
 }
 
-fn handle_ger_result(
+async fn handle_ger_result(
     result: anyhow::Result<ger::GerInsertResult>,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
@@ -49,17 +50,31 @@ fn handle_ger_result(
 ) -> anyhow::Result<()> {
     match result {
         Ok(_ger_result) => {
-            service.ger_tracker.mark_injected(ger_bytes);
+            service.store.mark_ger_injected(ger_bytes).await;
             tracing::info!("inserted GER with eth txn: {txn_hash}");
-            // Pass empty logs to TxnManager — the GER event is already stored
-            // in LogStore by insert_ger() → add_ger_update_event(). Passing
+            // Pass empty logs to store — the GER event is already stored
+            // by insert_ger() → add_ger_update_event(). Passing
             // log_data here would create a duplicate at the bridge address
             // instead of the GER contract address.
             service
-                .txn_manager
-                .begin(txn_hash, None, txn_envelope, None, vec![])?;
-            let block_num = service.block_num_tracker.latest();
-            service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
+                .store
+                .txn_begin(
+                    txn_hash,
+                    TxnEntry {
+                        id: None,
+                        envelope: txn_envelope,
+                        signer: Address::ZERO,
+                        expires_at: None,
+                        logs: vec![],
+                    },
+                )
+                .await?;
+            let block_num = service.store.get_latest_block_number().await;
+            let block_hash = service.block_state.get_block_hash(block_num);
+            service
+                .store
+                .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+                .await?;
             Ok(())
         }
         Err(err) => {
@@ -116,7 +131,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             return Ok(txn_hash);
         }
 
-        service.claim_tracker.try_claim(params.globalIndex)?;
+        service.store.try_claim(params.globalIndex).await?;
 
         // Emit ClaimEvent BEFORE publish_claim so the bridge-service's L2 sync
         // and the aggsender's BridgeL2Sync both see it as an imported_exit.
@@ -126,14 +141,14 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // is emitted after, the bridge-service detects the block-number gap as a
         // reorg and gets stuck in a resync loop.
         //
-        // Safety: claim_tracker.try_claim (above) prevents double-processing.
+        // Safety: store.try_claim (above) prevents double-processing.
         // If publish_claim fails, the bridge-service will retry the claimAsset tx.
         // The ClaimEvent data is fully determined by the claimAsset params.
         {
             use alloy::sol_types::SolEvent;
             let event = claim::ClaimEvent::from(params.clone());
             let log_data = event.encode_log_data();
-            let block_num = service.block_num_tracker.advance();
+            let block_num = service.store.advance_block_number().await;
             let block_hash = service.block_state.get_block_hash(block_num);
             let claim_log = crate::log_synthesis::SyntheticLog {
                 address: crate::bridge_address::get_bridge_address().to_string(),
@@ -146,7 +161,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 log_index: 0,
                 removed: false,
             };
-            service.log_store.add_log(claim_log);
+            service.store.add_log(claim_log).await;
             tracing::info!("emitted ClaimEvent at block {block_num} for aggsender imported_exit");
         }
 
@@ -154,8 +169,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             params.clone(),
             &service.miden_client,
             service.accounts,
-            service.address_mapper.clone(),
-            service.block_num_tracker.latest(),
+            service.store.clone(),
+            service.store.get_latest_block_number().await,
         )
         .await;
         match result {
@@ -163,18 +178,28 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 let txn_id = claim_result.txn_id;
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
 
-                let block_num = service.block_num_tracker.latest();
-                service.txn_manager.begin(
-                    txn_hash,
-                    Some(txn_id),
-                    txn_envelope,
-                    Some(claim_result.expires_at),
-                    vec![claim_result.log],
-                )?;
-                service.txn_manager.commit(txn_hash, Ok(()), block_num)?;
+                let block_num = service.store.get_latest_block_number().await;
+                let block_hash = service.block_state.get_block_hash(block_num);
+                service
+                    .store
+                    .txn_begin(
+                        txn_hash,
+                        TxnEntry {
+                            id: Some(txn_id),
+                            envelope: txn_envelope,
+                            signer,
+                            expires_at: Some(claim_result.expires_at),
+                            logs: vec![claim_result.log],
+                        },
+                    )
+                    .await?;
+                service
+                    .store
+                    .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+                    .await?;
             }
             Err(err) => {
-                service.claim_tracker.unclaim(&params.globalIndex);
+                service.store.unclaim(&params.globalIndex).await;
                 tracing::error!("publish_claim failed: {err:#?}");
                 return Err(err);
             }
@@ -221,7 +246,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 rollup_root,
                 &service.miden_client,
                 service.accounts.clone(),
-                &service.log_store,
+                &service.store,
                 &service.block_state,
                 txn_hash,
             )
@@ -230,7 +255,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             txn_envelope,
             &service,
             ger_bytes,
-        )?;
+        )
+        .await?;
     } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
         tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
@@ -247,7 +273,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 Some(rollup_root),
                 &service.miden_client,
                 service.accounts.clone(),
-                &service.log_store,
+                &service.store,
                 &service.block_state,
                 txn_hash,
             )
@@ -256,56 +282,33 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             txn_envelope,
             &service,
             combined_ger,
-        )?;
+        )
+        .await?;
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");
         anyhow::bail!("unhandled txn method {params_encoded:?}");
     }
 
-    service.nonce_tracker.increment(&format!("{signer:#x}"));
+    service.store.nonce_increment(&format!("{signer:#x}")).await;
     Ok(txn_hash)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_num_tracker::BlockNumTracker;
     use crate::block_state::BlockState;
-    use crate::log_synthesis::LogStore;
-    use crate::nonce_tracker::NonceTracker;
-    use crate::txn_manager::TxnManager;
-    use crate::{AddressMapper, ClaimTracker, MidenClient, ServiceState};
+    use crate::{MidenClient, ServiceState};
     use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
     use alloy::eips::Encodable2718;
     use alloy::primitives::{Signature, TxHash};
     use std::sync::Arc;
 
     fn create_test_service() -> ServiceState {
-        let log_store = Arc::new(LogStore::new());
+        let store: Arc<dyn crate::store::Store> = Arc::new(crate::store::memory::InMemoryStore::new());
         let block_state = Arc::new(BlockState::new());
-        let txn_manager = Arc::new(TxnManager::new(log_store.clone(), block_state.clone()));
         let miden_client = MidenClient::new_test();
-        let block_num_tracker = Arc::new(BlockNumTracker::new());
-        let nonce_tracker = Arc::new(NonceTracker::new());
-        let claim_tracker = Arc::new(ClaimTracker::new(None).unwrap());
-        let address_mapper = Arc::new(AddressMapper::new(None).unwrap());
-
         let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
-
-        ServiceState::new(
-            miden_client,
-            accounts,
-            1,
-            1,
-            block_num_tracker,
-            txn_manager,
-            block_state,
-            log_store,
-            claim_tracker,
-            nonce_tracker,
-            address_mapper,
-            None,
-        )
+        ServiceState::new(miden_client, accounts, 1, 1, store, block_state, None)
     }
 
     #[tokio::test]
