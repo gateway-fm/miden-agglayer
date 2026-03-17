@@ -118,14 +118,17 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 
         service.claim_tracker.try_claim(params.globalIndex)?;
 
-        // Emit ClaimEvent BEFORE publish_claim so the aggsender's BridgeL2Sync
-        // sees it as an imported_exit. Must be early because:
-        // 1. publish_claim takes ~15s (GER propagation wait)
-        // 2. The BridgeL2Sync continuously scans new blocks
-        // 3. If emitted after publish_claim, the bridge-service's L2 sync stalls
-        //    (block gap interpreted as reorg)
-        // Safety: claim_tracker.try_claim prevents double-claims, and bridge-service
-        // retries failed claims. The ClaimEvent data is fully determined by params.
+        // Emit ClaimEvent BEFORE publish_claim so the bridge-service's L2 sync
+        // and the aggsender's BridgeL2Sync both see it as an imported_exit.
+        //
+        // Why before: publish_claim takes ~15s (GER propagation wait). During that
+        // time, the bridge-service continuously syncs L2 blocks. If the ClaimEvent
+        // is emitted after, the bridge-service detects the block-number gap as a
+        // reorg and gets stuck in a resync loop.
+        //
+        // Safety: claim_tracker.try_claim (above) prevents double-processing.
+        // If publish_claim fails, the bridge-service will retry the claimAsset tx.
+        // The ClaimEvent data is fully determined by the claimAsset params.
         {
             use alloy::sol_types::SolEvent;
             let event = claim::ClaimEvent::from(params.clone());
@@ -160,7 +163,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 let txn_id = claim_result.txn_id;
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
 
-                // Commit immediately — don't defer the receipt.
                 let block_num = service.block_num_tracker.latest();
                 service.txn_manager.begin(
                     txn_hash,

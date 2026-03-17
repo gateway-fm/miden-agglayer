@@ -31,7 +31,6 @@ use alloy::consensus::Header;
 use alloy::primitives::{B64, B256, Bloom, U256};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 
 use crate::miden_client::SyncListener;
@@ -68,8 +67,12 @@ pub struct SyntheticBlock {
 
 impl SyntheticBlock {
     pub fn new(number: u64, timestamp: u64) -> Self {
-        let parent_hash = Self::deterministic_parent_hash(number);
         let hash = Self::compute_hash_for_number(number);
+        let parent_hash = if number == 0 {
+            [0u8; 32]
+        } else {
+            Self::compute_hash_for_number(number - 1)
+        };
         Self {
             number,
             hash,
@@ -80,22 +83,15 @@ impl SyntheticBlock {
         }
     }
 
-    fn deterministic_parent_hash(number: u64) -> [u8; 32] {
-        if number == 0 {
-            [0u8; 32]
-        } else {
-            let mut hasher = Keccak256::new();
-            hasher.update(format!("miden_parent_{}", number - 1).as_bytes());
-            hasher.finalize().into()
-        }
-    }
-
+    /// Build a block header for hash computation.
+    /// Uses a fixed parent_hash of ZERO to avoid recursion — the block hash
+    /// is purely a function of the block number, not the chain history.
+    /// The actual parent_hash in `SyntheticBlock` is set correctly in `new()`.
     fn build_header(number: u64) -> Header {
-        let parent_hash = Self::deterministic_parent_hash(number);
         let timestamp = GENESIS_TIMESTAMP + number * BLOCK_TIME;
 
         Header {
-            parent_hash: B256::from(parent_hash),
+            parent_hash: B256::ZERO,
             ommers_hash: B256::from(EMPTY_OMMERS_HASH),
             beneficiary: Default::default(),
             state_root: B256::ZERO,
