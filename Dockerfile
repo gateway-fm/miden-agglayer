@@ -14,7 +14,7 @@ RUN \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/app/target \
-    cargo build --profile=release --bin=miden-agglayer-service --bin=bridge-out-tool \
+    cargo build --profile=release --features=postgres --bin=miden-agglayer-service --bin=bridge-out-tool \
     && cp target/release/miden-agglayer-service bin/miden-agglayer-service \
     && cp target/release/bridge-out-tool bin/bridge-out-tool
 
