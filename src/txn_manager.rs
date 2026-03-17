@@ -8,13 +8,9 @@ use alloy::primitives::{Address, BlockNumber, LogData, TxHash};
 use alloy_rpc_types_eth::{Filter, Log};
 use lru::LruCache;
 use miden_client::sync::SyncSummary;
-use miden_protocol::note::NoteId;
 use miden_protocol::transaction::TransactionId;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
-
-/// Maximum blocks to wait for CLAIM note consumption before reverting.
-const CLAIM_CONSUMPTION_TIMEOUT_BLOCKS: u64 = 50;
 
 #[derive(Debug)]
 struct TxnReceipt {
@@ -26,11 +22,6 @@ struct TxnReceipt {
     result: Option<Result<(), String>>,
     block_num: BlockNumber,
     logs: Vec<LogData>,
-
-    /// CLAIM note ID for consumption tracking (deferred receipts)
-    claim_note_id: Option<String>,
-    /// Block at which the claim was submitted (for timeout tracking)
-    claim_submit_block: Option<BlockNumber>,
 }
 
 pub struct TxnManager {
@@ -73,8 +64,6 @@ impl TxnManager {
             result: None,
             block_num: 0,
             logs,
-            claim_note_id: None,
-            claim_submit_block: None,
         };
         _ = transactions.put(txn_hash, receipt);
         Ok(())
@@ -125,52 +114,6 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Mark a transaction as awaiting CLAIM note consumption.
-    /// Receipt will return None (pending) until consumption is confirmed or times out.
-    pub fn begin_awaiting_consumption(
-        &self,
-        txn_hash: TxHash,
-        claim_note_id: String,
-        submit_block: BlockNumber,
-    ) -> anyhow::Result<()> {
-        let mut transactions = self.transactions.lock().unwrap();
-        let Some(receipt) = transactions.get_mut(&txn_hash) else {
-            anyhow::bail!("TxnManager: transaction {txn_hash} not found");
-        };
-        receipt.claim_note_id = Some(claim_note_id);
-        receipt.claim_submit_block = Some(submit_block);
-        Ok(())
-    }
-
-    /// Check if a transaction is awaiting CLAIM note consumption.
-    pub fn is_awaiting_consumption(&self, txn_hash: TxHash) -> Option<(String, BlockNumber)> {
-        let transactions = self.transactions.lock().unwrap();
-        let receipt = transactions.peek(&txn_hash)?;
-        if receipt.result.is_some() {
-            return None; // already finalized
-        }
-        let note_id = receipt.claim_note_id.clone()?;
-        let submit_block = receipt.claim_submit_block?;
-        Some((note_id, submit_block))
-    }
-
-    /// Check if a claim has timed out (exceeded CLAIM_CONSUMPTION_TIMEOUT_BLOCKS).
-    pub fn check_claim_timeout(&self, txn_hash: TxHash, current_block: BlockNumber) -> bool {
-        let transactions = self.transactions.lock().unwrap();
-        let Some(receipt) = transactions.peek(&txn_hash) else {
-            return false;
-        };
-        if receipt.result.is_some() {
-            return false;
-        }
-        if let Some(submit_block) = receipt.claim_submit_block
-            && current_block > submit_block + CLAIM_CONSUMPTION_TIMEOUT_BLOCKS
-        {
-            return true;
-        }
-        false
-    }
-
     pub fn receipt(&self, txn_hash: TxHash) -> Option<(Result<(), String>, BlockNumber)> {
         let transactions = self.transactions.lock().unwrap();
         let Some(receipt) = transactions.peek(&txn_hash) else {
@@ -180,11 +123,6 @@ impl TxnManager {
             );
             return None;
         };
-        // If awaiting consumption (has claim_note_id), return None (pending) until cleared
-        if receipt.claim_note_id.is_some() {
-            tracing::debug!("TxnManager::receipt: hash {txn_hash} blocked by claim_note_id");
-            return None;
-        }
         if receipt.result.is_none() {
             tracing::debug!(
                 "TxnManager::receipt: hash {txn_hash} exists but result=None (uncommitted)"
@@ -319,38 +257,6 @@ impl TxnManager {
         }
     }
 
-    fn expire_timed_out_claims(&self, block_num: BlockNumber) {
-        let timed_out: Vec<TxHash> = {
-            let transactions = self.transactions.lock().unwrap();
-            transactions
-                .iter()
-                .filter_map(|(hash, receipt)| {
-                    if receipt.result.is_some() {
-                        return None;
-                    }
-                    let submit_block = receipt.claim_submit_block?;
-                    if block_num > submit_block + CLAIM_CONSUMPTION_TIMEOUT_BLOCKS {
-                        Some(*hash)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        for hash in timed_out {
-            tracing::warn!(
-                "Claim transaction {hash} timed out after {CLAIM_CONSUMPTION_TIMEOUT_BLOCKS} blocks"
-            );
-            if let Err(e) = self.commit(
-                hash,
-                Err(String::from("claim consumption timeout")),
-                block_num,
-            ) {
-                tracing::warn!("Failed to timeout claim {hash}: {e}");
-            }
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -359,64 +265,9 @@ impl SyncListener for TxnManager {
         let block_num = summary.block_num.as_u64();
         self.commit_pending(&summary.committed_transactions, block_num);
         self.expire_pending(block_num);
-        self.expire_timed_out_claims(block_num);
     }
 
-    async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
-        let awaiting: Vec<(TxHash, String)> = {
-            let transactions = self.transactions.lock().unwrap();
-            transactions
-                .iter()
-                .filter_map(|(hash, receipt)| {
-                    // Only check consumption if the creation txn is already committed
-                    if receipt.result.is_some() {
-                        receipt.claim_note_id.as_ref().map(|id| (*hash, id.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        for (txn_hash, note_id_str) in awaiting {
-            let note_id = NoteId::try_from_hex(&note_id_str)
-                .map_err(|e| anyhow::anyhow!("bad note id {note_id_str}: {e}"))?;
-
-            let note_opt = client
-                .get_input_note(note_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to get note {note_id_str}: {e}"))?;
-
-            if let Some(note) = note_opt
-                && note.is_consumed()
-            {
-                tracing::info!("CLAIM note {note_id_str} consumed, finalizing eth txn {txn_hash}");
-
-                let mut transactions = self.transactions.lock().unwrap();
-                if let Some(receipt) = transactions.get_mut(&txn_hash) {
-                    receipt.claim_note_id = None;
-                    let logs = receipt.logs.clone();
-                    let block_num = receipt.block_num;
-                    drop(transactions);
-
-                    for log_data in logs {
-                        let block_hash = self.block_state.get_block_hash(block_num);
-                        let log = SyntheticLog {
-                            address: get_bridge_address().to_string(),
-                            topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
-                            data: log_data.data.to_string(),
-                            block_number: block_num,
-                            block_hash,
-                            transaction_hash: format!("{txn_hash:#x}"),
-                            transaction_index: 0,
-                            log_index: 0,
-                            removed: false,
-                        };
-                        self.log_store.add_log(log);
-                    }
-                }
-            }
-        }
+    async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
         Ok(())
     }
 }

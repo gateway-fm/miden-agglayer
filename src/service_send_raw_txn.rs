@@ -118,14 +118,18 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 
         service.claim_tracker.try_claim(params.globalIndex)?;
 
-        // Emit ClaimEvent log IMMEDIATELY so the aggsender's BridgeL2Sync
-        // sees it as an imported_exit. We advance the block number first to ensure
-        // the log is at a block the BridgeL2Sync hasn't scanned yet.
+        // Emit ClaimEvent BEFORE publish_claim so the aggsender's BridgeL2Sync
+        // sees it as an imported_exit. Must be early because:
+        // 1. publish_claim takes ~15s (GER propagation wait)
+        // 2. The BridgeL2Sync continuously scans new blocks
+        // 3. If emitted after publish_claim, the bridge-service's L2 sync stalls
+        //    (block gap interpreted as reorg)
+        // Safety: claim_tracker.try_claim prevents double-claims, and bridge-service
+        // retries failed claims. The ClaimEvent data is fully determined by params.
         {
             use alloy::sol_types::SolEvent;
             let event = claim::ClaimEvent::from(params.clone());
             let log_data = event.encode_log_data();
-            // Advance to a fresh block so the BridgeL2Sync will pick up this log
             let block_num = service.block_num_tracker.advance();
             let block_hash = service.block_state.get_block_hash(block_num);
             let claim_log = crate::log_synthesis::SyntheticLog {
@@ -154,12 +158,9 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         match result {
             Ok(claim_result) => {
                 let txn_id = claim_result.txn_id;
-                let _claim_note_id = claim_result.claim_note_id.clone();
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
 
                 // Commit immediately — don't defer the receipt.
-                // The bridge-service's ClaimTxManager blocks until the receipt is
-                // available, preventing it from processing L2→L1 claims.
                 let block_num = service.block_num_tracker.latest();
                 service.txn_manager.begin(
                     txn_hash,

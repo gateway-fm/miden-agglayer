@@ -185,9 +185,11 @@ async fn publish_claim_internal(
     // Wait for the NTX builder to consume the UpdateGerNote on the bridge account.
     // The CLAIM note's FPI calls assert_valid_ger which checks the bridge account's
     // GER storage. If we submit the CLAIM before the GER is stored, it will fail.
-    // The miden-client integration tests wait 5 blocks between GER and CLAIM.
+    // Typically the GER note is consumed within ~5s (2-3 blocks). We wait 5 cycles
+    // of 3s (15s total) which gives the NTX builder plenty of time while keeping
+    // the overall claim latency reasonable.
     tracing::info!("waiting for GER to propagate to bridge account before submitting CLAIM...");
-    for i in 0..10 {
+    for i in 0..5 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         client.sync_state().await?;
         tracing::debug!(cycle = i, "GER propagation sync cycle");
