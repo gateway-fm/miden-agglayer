@@ -46,6 +46,22 @@ struct Command {
     /// PostgreSQL connection URL (enables PgStore instead of InMemoryStore)
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
+
+    /// Restore mode: reconstruct store state from miden node + L1, then exit
+    #[arg(long)]
+    restore: bool,
+
+    /// L1 bridge contract address (for restore + ClaimSettler)
+    #[arg(long, env = "BRIDGE_ADDRESS")]
+    bridge_address: Option<String>,
+
+    /// L1 GER contract address
+    #[arg(long, env = "L1_GER_ADDRESS", default_value = "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674")]
+    l1_ger_address: String,
+
+    /// L1 block to start scanning from during restore
+    #[arg(long, env = "L1_FROM_BLOCK", default_value_t = 0)]
+    l1_from_block: u64,
 }
 
 #[tokio::main]
@@ -122,6 +138,38 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     let client = MidenClient::new(miden_store_dir.clone(), command.miden_node, sync_listeners)?;
+
+    // Run restore if requested
+    if command.restore {
+        let l1_rpc = command.l1_rpc_url.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--restore requires --l1-rpc-url"))?;
+        let bridge_addr = command.bridge_address.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--restore requires --bridge-address"))?;
+
+        let result = miden_agglayer_service::restore::restore(
+            &store,
+            &client,
+            &accounts.0,
+            &block_state,
+            l1_rpc,
+            bridge_addr,
+            &command.l1_ger_address,
+            command.l1_from_block,
+        )
+        .await?;
+
+        tracing::info!(
+            "Restore complete: block={}, claims={}, bridge_outs={}, gers={}, logs={}",
+            result.block_number,
+            result.claims_restored,
+            result.bridge_outs_restored,
+            result.gers_restored,
+            result.logs_created,
+        );
+
+        client.shutdown()?;
+        return Ok(());
+    }
 
     let state = ServiceState::new(
         client,

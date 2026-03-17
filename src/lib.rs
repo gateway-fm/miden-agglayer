@@ -13,6 +13,7 @@ pub mod init;
 pub mod log_synthesis;
 pub mod logging;
 pub mod miden_client;
+pub mod restore;
 pub mod service;
 pub mod service_get_txn_receipt;
 pub mod service_send_raw_txn;
