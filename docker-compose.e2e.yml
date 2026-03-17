@@ -69,6 +69,9 @@ services:
       L1_RPC_URL: "http://anvil:8545"
       L1_GER_ADDRESS: "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
       RUST_LOG: "info"
+      CLAIM_SETTLER_ENABLED: "true"
+      BRIDGE_SERVICE_URL: "http://bridge-service:8080"
+      CLAIM_SETTLER_PRIVATE_KEY: "0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
     command:
       - "--port=8546"
       - "--miden-node=http://miden-node:57291"

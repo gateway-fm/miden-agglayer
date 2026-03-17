@@ -132,6 +132,52 @@ async fn main() -> anyhow::Result<()> {
         command.l1_rpc_url,
     );
 
+    // Optionally spawn the ClaimSettler background task
+    if std::env::var("CLAIM_SETTLER_ENABLED").unwrap_or_default() == "true" {
+        let bridge_service_url = std::env::var("BRIDGE_SERVICE_URL")
+            .unwrap_or_else(|_| "http://bridge-service:8080".to_string());
+        let l1_rpc_url = std::env::var("L1_RPC_URL")
+            .unwrap_or_else(|_| "http://localhost:8545".to_string());
+        let bridge_address: alloy::primitives::Address =
+            std::env::var("BRIDGE_ADDRESS")
+                .unwrap_or_default()
+                .parse()
+                .expect("BRIDGE_ADDRESS must be a valid address for ClaimSettler");
+        let private_key_hex = std::env::var("CLAIM_SETTLER_PRIVATE_KEY")
+            .expect("CLAIM_SETTLER_PRIVATE_KEY must be set when CLAIM_SETTLER_ENABLED=true");
+        let signer: alloy::signers::local::PrivateKeySigner = private_key_hex
+            .parse()
+            .expect("CLAIM_SETTLER_PRIVATE_KEY must be a valid hex private key");
+
+        let watch_addresses: Vec<alloy::primitives::Address> =
+            match std::env::var("CLAIM_SETTLER_WATCH_ADDRESSES") {
+                Ok(val) if !val.is_empty() => val
+                    .split(',')
+                    .map(|s| s.trim().parse().expect("invalid watch address"))
+                    .collect(),
+                _ => {
+                    // Default: watch the signer's own address
+                    vec![alloy::signers::Signer::address(&signer)]
+                }
+            };
+
+        let persistence_path = miden_store_dir
+            .as_ref()
+            .map(|d: &PathBuf| d.join("claim_settler_tracker.json"));
+
+        let settler_config = miden_agglayer_service::claim_settler::ClaimSettlerConfig {
+            bridge_service_url,
+            l1_rpc_url,
+            bridge_address,
+            signer,
+            watch_addresses,
+            persistence_path,
+        };
+        let settler = miden_agglayer_service::claim_settler::ClaimSettler::new(settler_config)?;
+        tokio::spawn(settler.run());
+        tracing::info!("ClaimSettler background task spawned");
+    }
+
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone()).await?;
 

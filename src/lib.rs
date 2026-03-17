@@ -6,6 +6,7 @@ pub mod block_state;
 pub mod bridge_address;
 pub mod bridge_out;
 pub mod claim;
+pub mod claim_settler;
 pub mod claim_tracker;
 pub mod exit;
 pub mod ger;

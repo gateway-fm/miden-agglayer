@@ -3069,6 +3069,7 @@ dependencies = [
  "miden-standards",
  "miden-tx",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "sha3",

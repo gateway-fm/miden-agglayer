@@ -89,64 +89,26 @@ wait_for "BridgeEvent in eth_getLogs" \
     120 5
 pass "BridgeEvent detected in L2"
 
-# ── Step 3: Wait for aggsender certificate ────────────────────────────────────
+# ── Step 3: Wait for settlement + ClaimSettler auto-claim on L1 ──────────────
+# Capture L1 balance before settlement so we detect the claim even if it's fast
+L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
+log "L1 balance before settlement: $L1_BAL_BEFORE"
+
 log "Step 3/4: Waiting for certificate settlement on AggLayer..."
 wait_for "certificate settled" \
     "docker logs miden-agglayer-aggkit-1 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
     300 10
 pass "Certificate settled on L1!"
 
-# ── Step 4: Wait for L1 claim (bridge-service ClaimTxManager) ─────────────────
-log "Step 4/4: Claiming on L1..."
-L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
-log "L1 balance before: $L1_BAL_BEFORE"
+# ── Step 4: Wait for ClaimSettler to auto-claim on L1 ─────────────────────────
+log "Step 4/4: Waiting for ClaimSettler to auto-claim on L1..."
 
-# Wait for bridge-service to sync the BridgeEvent from L2
-BRIDGE_SVC="http://localhost:18080"
-wait_for "bridge-service L2 deposit sync" \
-    "curl -sf '$BRIDGE_SVC/bridges/$L1_DEST' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if any(dep['network_id']==1 and dep['ready_for_claim'] for dep in d['deposits']) else 1)\"" \
+wait_for "L1 balance change (ClaimSettler auto-claim)" \
+    "[[ \$(cast balance --rpc-url $L1_RPC $L1_DEST 2>/dev/null) != '$L1_BAL_BEFORE' ]]" \
     120 5
-pass "Bridge-service synced L2→L1 deposit"
-
-# Query Merkle proof and deposit details, then claim on L1 via cast
-log "Building claimAsset tx..."
-PROOF_JSON=$(curl -sf "$BRIDGE_SVC/merkle-proof?deposit_cnt=0&net_id=1")
-DEP_JSON=$(curl -sf "$BRIDGE_SVC/bridges/$L1_DEST" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-for dep in d['deposits']:
-    if dep['network_id'] == 1:
-        print(json.dumps(dep))
-        break
-")
-
-# Extract proof arrays as solidity tuple format [bytes32,bytes32,...]
-SMT_LOCAL=$(echo "$PROOF_JSON" | python3 -c "import json,sys; p=json.load(sys.stdin)['proof']; print('[' + ','.join(p['merkle_proof']) + ']')")
-SMT_ROLLUP=$(echo "$PROOF_JSON" | python3 -c "import json,sys; p=json.load(sys.stdin)['proof']; print('[' + ','.join(p['rollup_merkle_proof']) + ']')")
-MAIN_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])")
-ROLLUP_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])")
-
-GLOBAL_INDEX=$(echo "$DEP_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['global_index'])")
-ORIG_NET=$(echo "$DEP_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['orig_net'])")
-ORIG_ADDR=$(echo "$DEP_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['orig_addr'])")
-DEST_NET=$(echo "$DEP_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['dest_net'])")
-DEST_ADDR_CLAIM=$(echo "$DEP_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['dest_addr'])")
-AMOUNT=$(echo "$DEP_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['amount'])")
-METADATA=$(echo "$DEP_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['metadata'])")
-
-cast send --rpc-url "$L1_RPC" \
-    --private-key "$FUNDED_KEY" \
-    "$BRIDGE_ADDRESS" \
-    "claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)" \
-    "$SMT_LOCAL" "$SMT_ROLLUP" "$GLOBAL_INDEX" "$MAIN_ROOT" "$ROLLUP_ROOT" \
-    "$ORIG_NET" "$ORIG_ADDR" "$DEST_NET" "$DEST_ADDR_CLAIM" "$AMOUNT" "$METADATA" 2>&1
 
 L1_BAL_AFTER=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
-if [[ "$L1_BAL_AFTER" != "$L1_BAL_BEFORE" ]]; then
-    pass "L2→L1 COMPLETE! L1 balance: $L1_BAL_BEFORE → $L1_BAL_AFTER"
-else
-    fail "L1 balance unchanged after claim"
-fi
+pass "L2→L1 COMPLETE! L1 balance: $L1_BAL_BEFORE → $L1_BAL_AFTER"
 
 echo ""
 log "======================================================================"
