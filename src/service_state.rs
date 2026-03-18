@@ -21,6 +21,7 @@ pub struct ServiceState {
 const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<ServiceState>();
 
+#[allow(clippy::too_many_arguments)]
 impl ServiceState {
     pub fn new(
         miden_client: MidenClient,

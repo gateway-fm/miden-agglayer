@@ -4,6 +4,7 @@
 //! deposit is recorded on the L2 side. This module scans for consumed B2AGG notes and
 //! emits synthetic `BridgeEvent` EVM logs so the bridge-service can index them.
 
+use anyhow::Context;
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
@@ -32,13 +33,14 @@ pub fn is_b2agg_note(details: &NoteDetails) -> bool {
 /// Storage layout (6 felts):
 /// - items()[0]: destination_network (u32, byte-swapped via u32::from_le_bytes(dest.to_be_bytes()))
 /// - items()[1..6]: destination_address (5 packed u32 felts = 20 bytes)
-pub fn parse_b2agg_storage(storage: &NoteStorage) -> (u32, [u8; 20]) {
+pub fn parse_b2agg_storage(storage: &NoteStorage) -> anyhow::Result<(u32, [u8; 20])> {
     let items = storage.items();
 
     // Reverse the byte-swap applied during note creation:
     // build_note_storage does: u32::from_le_bytes(destination_network.to_be_bytes())
     // So to recover: u32::from_le_bytes(felt_value.to_be_bytes())
-    let raw_network = items[0].as_int() as u32;
+    let raw_network = u32::try_from(items[0].as_int())
+        .context("destination_network overflow: felt value exceeds u32::MAX")?;
     let destination_network = u32::from_le_bytes(raw_network.to_be_bytes());
 
     // Reconstruct 20-byte address from 5 packed u32 felts (big-endian limb order).
@@ -47,11 +49,12 @@ pub fn parse_b2agg_storage(storage: &NoteStorage) -> (u32, [u8; 20]) {
     // each 4-byte chunk as a little-endian u32.
     let mut address = [0u8; 20];
     for i in 0..5 {
-        let limb = items[1 + i].as_int() as u32;
+        let limb = u32::try_from(items[1 + i].as_int())
+            .context("address limb overflow: felt value exceeds u32::MAX")?;
         address[i * 4..(i + 1) * 4].copy_from_slice(&limb.to_le_bytes());
     }
 
-    (destination_network, address)
+    Ok((destination_network, address))
 }
 
 // FAUCET ORIGIN RESOLUTION
@@ -68,29 +71,35 @@ pub struct FaucetOriginInfo {
 ///
 /// Currently hardcoded based on init.rs defaults:
 /// - faucet_eth: origin_address=[0;20], origin_network=0, scale=10
-/// - faucet_agg: origin_address=[0;20], origin_network=0, scale=0 (default)
-pub fn resolve_faucet_origin(faucet_id: AccountId, accounts: &AccountsConfig) -> FaucetOriginInfo {
+/// - faucet_agg: origin_address=[0;20], origin_network=0, scale=0
+pub fn resolve_faucet_origin(faucet_id: AccountId, accounts: &AccountsConfig) -> anyhow::Result<FaucetOriginInfo> {
     if faucet_id == accounts.faucet_eth.0 {
-        FaucetOriginInfo {
+        Ok(FaucetOriginInfo {
             origin_network: 0,
             origin_address: [0u8; 20],
             scale: 10,
-        }
-    } else {
-        // Default for faucet_agg and any unknown faucet
-        FaucetOriginInfo {
+        })
+    } else if faucet_id == accounts.faucet_agg.0 {
+        Ok(FaucetOriginInfo {
             origin_network: 0,
             origin_address: [0u8; 20],
             scale: 0,
-        }
+        })
+    } else {
+        anyhow::bail!(
+            "unknown faucet ID {faucet_id}: only ETH and AGG faucets are supported. \
+             Add new faucets to resolve_faucet_origin before bridging new tokens."
+        )
     }
 }
 
 /// Reverse-scale a Miden amount back to origin token decimals.
 /// origin_amount = miden_amount * 10^scale
-fn reverse_scale_amount(miden_amount: u64, scale: u8) -> u128 {
-    let factor = 10u128.pow(scale as u32);
-    (miden_amount as u128) * factor
+pub(crate) fn reverse_scale_amount(miden_amount: u64, scale: u8) -> anyhow::Result<u128> {
+    let factor = 10u128.checked_pow(scale as u32)
+        .context("reverse_scale_amount: 10^scale overflows u128")?;
+    (miden_amount as u128).checked_mul(factor)
+        .context("reverse_scale_amount: miden_amount * 10^scale overflows u128")
 }
 
 // BRIDGE OUT SCANNER
@@ -132,7 +141,13 @@ impl BridgeOutScanner {
         }
 
         // Parse B2AGG storage
-        let (destination_network, destination_address) = parse_b2agg_storage(details.storage());
+        let (destination_network, destination_address) = match parse_b2agg_storage(details.storage()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("B2AGG note {note_id_str}: failed to parse storage: {e:#}");
+                return;
+            }
+        };
 
         // Get the fungible asset
         let Some(fungible_asset) = details.assets().iter_fungible().next() else {
@@ -143,8 +158,20 @@ impl BridgeOutScanner {
         let miden_amount = fungible_asset.amount();
 
         // Resolve origin info
-        let origin = resolve_faucet_origin(faucet_id, &self.accounts);
-        let origin_amount = reverse_scale_amount(miden_amount, origin.scale);
+        let origin = match resolve_faucet_origin(faucet_id, &self.accounts) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("B2AGG note {note_id_str}: {e:#}");
+                return;
+            }
+        };
+        let origin_amount = match reverse_scale_amount(miden_amount, origin.scale) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("B2AGG note {note_id_str}: {e:#}");
+                return;
+            }
+        };
 
         // Generate synthetic tx hash
         let tx_hash = {
@@ -346,10 +373,12 @@ mod tests {
     #[test]
     fn test_reverse_scale_amount() {
         // No scaling
-        assert_eq!(reverse_scale_amount(1000, 0), 1000);
+        assert_eq!(reverse_scale_amount(1000, 0).unwrap(), 1000);
         // ETH: scale=10
-        assert_eq!(reverse_scale_amount(1000, 10), 10_000_000_000_000);
+        assert_eq!(reverse_scale_amount(1000, 10).unwrap(), 10_000_000_000_000);
         // 1 unit with scale=18
-        assert_eq!(reverse_scale_amount(1, 18), 1_000_000_000_000_000_000);
+        assert_eq!(reverse_scale_amount(1, 18).unwrap(), 1_000_000_000_000_000_000);
+        // Overflow: scale too large
+        assert!(reverse_scale_amount(1, 39).is_err());
     }
 }

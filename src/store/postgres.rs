@@ -143,8 +143,7 @@ impl Store for PgStore {
                  LIMIT 1000",
                 &[&from, &to],
             )
-            .await
-            .unwrap_or_default();
+            .await?;
 
         let logs: Vec<SyntheticLog> = rows
             .iter()
@@ -188,7 +187,7 @@ impl Store for PgStore {
                 &[&key],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         Ok(rows
             .iter()
@@ -224,7 +223,7 @@ impl Store for PgStore {
                 &[&ger.as_slice()],
             )
             .await
-            .unwrap_or_default();
+            ?;
         Ok(!rows.is_empty())
     }
 
@@ -246,8 +245,7 @@ impl Store for PgStore {
                     &(entry.timestamp as i64),
                 ],
             )
-            .await
-            .unwrap_or(0);
+            .await?;
         Ok(result > 0)
     }
 
@@ -259,7 +257,7 @@ impl Store for PgStore {
                 &[],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         Ok(rows.first().and_then(|r| {
             let bytes: &[u8] = r.get(0);
@@ -281,7 +279,7 @@ impl Store for PgStore {
                 &[&ger.as_slice()],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         Ok(rows.first().map(|r| {
             let mainnet: Option<&[u8]> = r.get(0);
@@ -309,7 +307,7 @@ impl Store for PgStore {
                 &[&ger.as_slice()],
             )
             .await
-            .unwrap_or_default();
+            ?;
         Ok(!rows.is_empty())
     }
 
@@ -519,7 +517,7 @@ impl Store for PgStore {
                 &[&hash_str],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -549,7 +547,7 @@ impl Store for PgStore {
                 &[&hash_str],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -583,7 +581,7 @@ impl Store for PgStore {
                 &[&hash_str],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         let logs: Vec<LogData> = log_rows
             .iter()
@@ -639,7 +637,7 @@ impl Store for PgStore {
                 &[&id_str],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         Ok(rows.first().and_then(|r| {
             let hash_str: &str = r.get(0);
@@ -676,7 +674,7 @@ impl Store for PgStore {
                 &[&(block_num as i64)],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         for row in &rows {
             let hash_str: &str = row.get(0);
@@ -700,7 +698,7 @@ impl Store for PgStore {
         let rows = client
             .query("SELECT nonce FROM nonces WHERE address = $1", &[&key])
             .await
-            .unwrap_or_default();
+            ?;
         Ok(rows.first().map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
     }
 
@@ -757,7 +755,7 @@ impl Store for PgStore {
                 &[&key],
             )
             .await
-            .unwrap_or_default();
+            ?;
         Ok(!rows.is_empty())
     }
 
@@ -772,7 +770,7 @@ impl Store for PgStore {
                 &[&key],
             )
             .await
-            .unwrap_or_default();
+            ?;
 
         Ok(rows.first().and_then(|r| {
             let val: &str = r.get(0);
@@ -804,7 +802,7 @@ impl Store for PgStore {
                 &[&note_id],
             )
             .await
-            .unwrap_or_default();
+            ?;
         Ok(!rows.is_empty())
     }
 

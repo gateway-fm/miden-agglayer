@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 use miden_agglayer_service::block_state::BlockState;
 use miden_agglayer_service::bridge_out::BridgeOutScanner;
@@ -195,28 +196,44 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Optionally spawn the ClaimSettler background task
-    if std::env::var("CLAIM_SETTLER_ENABLED").unwrap_or_default() == "true" {
+    let _settler_handle = if std::env::var("CLAIM_SETTLER_ENABLED").unwrap_or_default() == "true" {
         let bridge_service_url = std::env::var("BRIDGE_SERVICE_URL")
             .unwrap_or_else(|_| "http://bridge-service:8080".to_string());
         let l1_rpc_url = std::env::var("L1_RPC_URL")
             .unwrap_or_else(|_| "http://localhost:8545".to_string());
+
+        // Warn about non-HTTPS URLs in non-dev environments
+        if !bridge_service_url.starts_with("https://") && !bridge_service_url.contains("localhost") {
+            tracing::warn!("BRIDGE_SERVICE_URL is not HTTPS — vulnerable to MITM in production");
+        }
+        if !l1_rpc_url.starts_with("https://") && !l1_rpc_url.contains("localhost") {
+            tracing::warn!("L1_RPC_URL is not HTTPS — vulnerable to MITM in production");
+        }
+
         let bridge_address: alloy::primitives::Address =
             std::env::var("BRIDGE_ADDRESS")
                 .unwrap_or_default()
                 .parse()
-                .expect("BRIDGE_ADDRESS must be a valid address for ClaimSettler");
-        let private_key_hex = std::env::var("CLAIM_SETTLER_PRIVATE_KEY")
-            .expect("CLAIM_SETTLER_PRIVATE_KEY must be set when CLAIM_SETTLER_ENABLED=true");
-        let signer: alloy::signers::local::PrivateKeySigner = private_key_hex
-            .parse()
-            .expect("CLAIM_SETTLER_PRIVATE_KEY must be a valid hex private key");
+                .context("BRIDGE_ADDRESS must be a valid address for ClaimSettler")?;
+
+        // Read private key into a zeroizing wrapper
+        let private_key_hex = {
+            use zeroize::Zeroize;
+            let mut raw = std::env::var("CLAIM_SETTLER_PRIVATE_KEY")
+                .context("CLAIM_SETTLER_PRIVATE_KEY must be set when CLAIM_SETTLER_ENABLED=true")?;
+            let signer_result: Result<alloy::signers::local::PrivateKeySigner, _> = raw.parse();
+            raw.zeroize();
+            signer_result.context("CLAIM_SETTLER_PRIVATE_KEY must be a valid hex private key")?
+        };
+        let signer = private_key_hex;
 
         let watch_addresses: Vec<alloy::primitives::Address> =
             match std::env::var("CLAIM_SETTLER_WATCH_ADDRESSES") {
                 Ok(val) if !val.is_empty() => val
                     .split(',')
-                    .map(|s| s.trim().parse().expect("invalid watch address"))
-                    .collect(),
+                    .map(|s| s.trim().parse::<alloy::primitives::Address>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("CLAIM_SETTLER_WATCH_ADDRESSES contains invalid address")?,
                 _ => {
                     vec![alloy::signers::Signer::address(&signer)]
                 }
@@ -235,14 +252,17 @@ async fn main() -> anyhow::Result<()> {
             persistence_path,
         };
         let settler = miden_agglayer_service::claim_settler::ClaimSettler::new(settler_config)?;
-        tokio::spawn(settler.run());
+        let handle = tokio::spawn(settler.run());
         tracing::info!("ClaimSettler background task spawned");
-    }
+        Some(handle)
+    } else {
+        None
+    };
 
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
-        .expect("failed to install metrics recorder");
+        .context("failed to install metrics recorder")?;
     miden_agglayer_service::metrics::init_metrics();
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;

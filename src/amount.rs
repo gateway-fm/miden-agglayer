@@ -7,13 +7,17 @@ pub enum AmountError {
     LossyTruncation,
     #[error("overflow")]
     Overflow,
+    #[error("invalid decimals: origin {origin} < target {target}, scaling up is not supported")]
+    InvalidDecimals { origin: u8, target: u8 },
 }
 
 pub fn validate_amount(amount: U256, decimals: u8, decimals_out: u8) -> Result<u32, AmountError> {
-    assert!(
-        decimals >= decimals_out,
-        "amount decimals are less than expected in result, scaling up is not supported"
-    );
+    if decimals < decimals_out {
+        return Err(AmountError::InvalidDecimals {
+            origin: decimals,
+            target: decimals_out,
+        });
+    }
     let amount_scaled = if decimals == decimals_out {
         amount
     } else {

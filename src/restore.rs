@@ -218,12 +218,12 @@ async fn restore_claims_from_bridge_service(
                 continue;
             };
 
-            if dep.ready_for_claim.unwrap_or(false) && dep.dest_net == Some(1) {
-                if !store.is_claimed(&global_index).await? {
-                    if store.try_claim(global_index).await.is_ok() {
-                        count += 1;
-                    }
-                }
+            if dep.ready_for_claim.unwrap_or(false)
+                && dep.dest_net == Some(1)
+                && !store.is_claimed(&global_index).await?
+                && store.try_claim(global_index).await.is_ok()
+            {
+                count += 1;
             }
         }
     }
@@ -262,10 +262,10 @@ async fn restore_claims_from_l1(
         let data = log.data().data.as_ref();
         if data.len() >= 32 {
             let global_index = U256::from_be_slice(&data[..32]);
-            if !store.is_claimed(&global_index).await? {
-                if store.try_claim(global_index).await.is_ok() {
-                    count += 1;
-                }
+            if !store.is_claimed(&global_index).await?
+                && store.try_claim(global_index).await.is_ok()
+            {
+                count += 1;
             }
         }
     }
@@ -316,15 +316,33 @@ async fn restore_bridge_outs(
                     }
 
                     let (destination_network, destination_address) =
-                        parse_b2agg_storage(details.storage());
+                        match parse_b2agg_storage(details.storage()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+                                continue;
+                            }
+                        };
 
                     let Some(fungible_asset) = details.assets().iter_fungible().next() else {
                         continue;
                     };
                     let faucet_id = fungible_asset.faucet_id();
                     let miden_amount = fungible_asset.amount();
-                    let origin = resolve_faucet_origin(faucet_id, &accounts_clone);
-                    let origin_amount = (miden_amount as u128) * 10u128.pow(origin.scale as u32);
+                    let origin = match resolve_faucet_origin(faucet_id, &accounts_clone) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+                            continue;
+                        }
+                    };
+                    let origin_amount = match crate::bridge_out::reverse_scale_amount(miden_amount, origin.scale) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+                            continue;
+                        }
+                    };
 
                     let tx_hash = {
                         let mut hasher = Keccak256::new();

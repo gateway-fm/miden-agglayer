@@ -269,11 +269,11 @@ impl SyncListener for StoreSyncListener {
             block_num: summary.block_num.as_u64(),
             committed_ids: summary.committed_transactions.clone(),
         };
-        *self.pending.lock().unwrap() = Some(data);
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(data);
     }
 
     async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
-        let data = self.pending.lock().unwrap().take();
+        let data = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(data) = data {
             let block_hash = self.block_state.get_block_hash(data.block_num);
             self.store.set_latest_block_number(data.block_num).await?;

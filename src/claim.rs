@@ -77,6 +77,14 @@ fn find_target_faucet(
             origin_token_decimals: 18,
         }
     } else {
+        // Currently defaults all non-ETH tokens to AGG faucet.
+        // If a new token is bridged that isn't AGG, the decimal scaling may be wrong.
+        if !token_address.is_zero() {
+            tracing::debug!(
+                token_address = %token_address,
+                "find_target_faucet: mapping non-ETH token to AGG faucet (hardcoded)"
+            );
+        }
         Faucet {
             id: accounts.faucet_agg.0,
             decimals: 8,
@@ -238,6 +246,7 @@ async fn publish_claim_internal(
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
     // Wait for tx to be committed (same pattern as init's deploy_account)
+    let mut committed = false;
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         client.sync_state().await?;
@@ -252,8 +261,12 @@ async fn publish_claim_internal(
                 )
         }) {
             tracing::info!("claim tx {txn_id} committed to block");
+            committed = true;
             break;
         }
+    }
+    if !committed {
+        tracing::warn!("claim tx {txn_id} not committed after 20s polling — continuing anyway");
     }
 
     let event = ClaimEvent::from(params);

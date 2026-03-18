@@ -141,7 +141,6 @@ async fn main() -> anyhow::Result<()> {
             if !notes.is_empty() {
                 match TransactionRequestBuilder::new()
                     .build_consume_notes(notes)
-                    .and_then(|req| Ok(req))
                 {
                     Ok(req) => {
                         match client.submit_new_transaction(wallet_id, req).await {

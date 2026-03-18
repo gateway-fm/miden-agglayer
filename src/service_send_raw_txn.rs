@@ -88,6 +88,20 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
+
+    // Validate chain_id to prevent cross-chain replay attacks
+    let tx_chain_id = match &txn_envelope {
+        TxEnvelope::Eip1559(signed) => signed.tx().chain_id,
+        TxEnvelope::Legacy(signed) => signed.tx().chain_id.unwrap_or(0),
+        _ => 0,
+    };
+    if tx_chain_id != 0 && tx_chain_id != service.chain_id {
+        anyhow::bail!(
+            "chain_id mismatch: transaction has {tx_chain_id}, expected {}",
+            service.chain_id
+        );
+    }
+
     let txn = unwrap_txn_envelope(txn_envelope.clone())?;
     let txn_hash = txn.hash;
     let signer = txn_envelope.recover_signer()?;
@@ -102,18 +116,18 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // Claims targeting a different network: forward to L1 for settlement.
         // Only claims where destinationNetwork matches our network_id are processed
         // as Miden CLAIM notes. All others go to L1.
-        if params.destinationNetwork != service.network_id as u32 {
-            if let Some(l1_client) = &service.l1_client {
-                tracing::info!(
-                    "forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}"
-                );
-                let result = l1_client.send_raw_transaction(&input).await;
-                match result {
-                    Ok(hash) => tracing::info!("L1 claim tx forwarded: {hash}"),
-                    Err(e) => tracing::warn!("L1 claim tx forward failed: {e:#}"),
-                }
-                return Ok(txn_hash);
+        if params.destinationNetwork != service.network_id as u32
+            && let Some(l1_client) = &service.l1_client
+        {
+            tracing::info!(
+                "forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}"
+            );
+            let result = l1_client.send_raw_transaction(&input).await;
+            match result {
+                Ok(hash) => tracing::info!("L1 claim tx forwarded: {hash}"),
+                Err(e) => tracing::warn!("L1 claim tx forward failed: {e:#}"),
             }
+            return Ok(txn_hash);
         }
 
         // Skip zero-amount claims (e.g., genesis batch deposit). These create

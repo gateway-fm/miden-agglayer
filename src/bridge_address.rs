@@ -17,7 +17,16 @@ static BRIDGE_ADDRESS_CACHE: OnceLock<String> = OnceLock::new();
 /// `0xc8cbebf950b9df44d987c8619f092bea980ff038`.
 pub fn get_bridge_address() -> &'static str {
     BRIDGE_ADDRESS_CACHE.get_or_init(|| {
-        std::env::var("BRIDGE_ADDRESS").unwrap_or_else(|_| DEFAULT_BRIDGE_ADDRESS.to_string())
+        match std::env::var("BRIDGE_ADDRESS") {
+            Ok(addr) => addr,
+            Err(_) => {
+                tracing::warn!(
+                    "BRIDGE_ADDRESS not set, using default {DEFAULT_BRIDGE_ADDRESS}. \
+                     Set BRIDGE_ADDRESS for production deployments."
+                );
+                DEFAULT_BRIDGE_ADDRESS.to_string()
+            }
+        }
     })
 }
 

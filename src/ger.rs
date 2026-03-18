@@ -124,7 +124,8 @@ async fn submit_ger_to_miden(
     let timeout_secs: u64 = std::env::var("GER_COMMIT_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(30)
+        .clamp(5, 120);
     let mut committed = false;
     for _ in 0..timeout_secs {
         // We can check if txn is in the store and has a block number
@@ -153,6 +154,7 @@ async fn submit_ger_to_miden(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
     mainnet_exit_root: Option<[u8; 32]>,

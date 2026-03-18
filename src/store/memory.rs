@@ -414,10 +414,10 @@ impl Store for InMemoryStore {
         block_hash: [u8; 32],
     ) -> anyhow::Result<()> {
         for id in ids {
-            if let Some(hash) = self.txn_pending_by_miden_id(*id).await? {
-                if let Err(e) = self.txn_commit(hash, Ok(()), block_num, block_hash).await {
-                    tracing::warn!("Failed to commit transaction {hash}: {e}");
-                }
+            if let Some(hash) = self.txn_pending_by_miden_id(*id).await?
+                && let Err(e) = self.txn_commit(hash, Ok(()), block_num, block_hash).await
+            {
+                tracing::warn!("Failed to commit transaction {hash}: {e}");
             }
         }
         Ok(())
