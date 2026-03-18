@@ -335,11 +335,7 @@ mod tests {
         assert_eq!(client.test_call_count(), 0);
         assert!(!client.test_was_called());
 
-        let res = client
-            .with(|_client| {
-                Box::new(async move { Ok(()) })
-            })
-            .await;
+        let res = client.with(|_client| Box::new(async move { Ok(()) })).await;
 
         assert!(res.is_ok());
         assert_eq!(client.test_call_count(), 1);
@@ -355,17 +351,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_miden_client_test_with_error_response() {
-        let client =
-            MidenClient::new_test_with_response(Err(anyhow!("simulated failure")));
+        let client = MidenClient::new_test_with_response(Err(anyhow!("simulated failure")));
 
-        let res = client
-            .with(|_client| Box::new(async move { Ok(()) }))
-            .await;
+        let res = client.with(|_client| Box::new(async move { Ok(()) })).await;
 
         assert!(res.is_err());
-        assert!(
-            res.unwrap_err().to_string().contains("simulated failure")
-        );
+        assert!(res.unwrap_err().to_string().contains("simulated failure"));
         assert_eq!(client.test_call_count(), 1);
     }
 }

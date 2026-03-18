@@ -6,16 +6,15 @@
 use super::{Store, TxnData, TxnEntry};
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
-    GerEntry, LogFilter, SyntheticLog, L2_GLOBAL_EXIT_ROOT_ADDRESS,
-    UPDATE_HASH_CHAIN_VALUE_TOPIC,
+    GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
 use alloy::consensus::TxEnvelope;
 use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use deadpool_postgres::{Manager, Pool};
+use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::transaction::TransactionId;
-use miden_protocol::Word;
 use sha3::{Digest, Keccak256};
 use tokio_postgres::types::ToSql;
 
@@ -222,8 +221,7 @@ impl Store for PgStore {
                 "SELECT 1 FROM ger_entries WHERE ger_hash = $1",
                 &[&ger.as_slice()],
             )
-            .await
-            ?;
+            .await?;
         Ok(!rows.is_empty())
     }
 
@@ -256,8 +254,7 @@ impl Store for PgStore {
                 "SELECT ger_hash FROM ger_entries ORDER BY created_at DESC LIMIT 1",
                 &[],
             )
-            .await
-            ?;
+            .await?;
 
         Ok(rows.first().and_then(|r| {
             let bytes: &[u8] = r.get(0);
@@ -287,11 +284,21 @@ impl Store for PgStore {
             GerEntry {
                 mainnet_exit_root: mainnet.and_then(|v| {
                     let mut buf = [0u8; 32];
-                    if v.len() == 32 { buf.copy_from_slice(v); Some(buf) } else { None }
+                    if v.len() == 32 {
+                        buf.copy_from_slice(v);
+                        Some(buf)
+                    } else {
+                        None
+                    }
                 }),
                 rollup_exit_root: rollup.and_then(|v| {
                     let mut buf = [0u8; 32];
-                    if v.len() == 32 { buf.copy_from_slice(v); Some(buf) } else { None }
+                    if v.len() == 32 {
+                        buf.copy_from_slice(v);
+                        Some(buf)
+                    } else {
+                        None
+                    }
                 }),
                 block_number: r.get::<_, i64>(2) as u64,
                 timestamp: r.get::<_, i64>(3) as u64,
@@ -306,8 +313,7 @@ impl Store for PgStore {
                 "SELECT is_injected FROM ger_entries WHERE ger_hash = $1 AND is_injected = TRUE",
                 &[&ger.as_slice()],
             )
-            .await
-            ?;
+            .await?;
         Ok(!rows.is_empty())
     }
 
@@ -516,8 +522,7 @@ impl Store for PgStore {
                 "SELECT status, error_message, block_number FROM transactions WHERE tx_hash = $1",
                 &[&hash_str],
             )
-            .await
-            ?;
+            .await?;
 
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -580,8 +585,7 @@ impl Store for PgStore {
                 "SELECT topics, data FROM transaction_logs WHERE tx_hash = $1",
                 &[&hash_str],
             )
-            .await
-            ?;
+            .await?;
 
         let logs: Vec<LogData> = log_rows
             .iter()
@@ -624,10 +628,7 @@ impl Store for PgStore {
         }))
     }
 
-    async fn txn_pending_by_miden_id(
-        &self,
-        id: TransactionId,
-    ) -> anyhow::Result<Option<TxHash>> {
+    async fn txn_pending_by_miden_id(&self, id: TransactionId) -> anyhow::Result<Option<TxHash>> {
         let client = self.pool.get().await?;
         let id_str = id.to_hex();
 
@@ -636,8 +637,7 @@ impl Store for PgStore {
                 "SELECT tx_hash FROM transactions WHERE miden_tx_id = $1 AND status = 'pending'",
                 &[&id_str],
             )
-            .await
-            ?;
+            .await?;
 
         Ok(rows.first().and_then(|r| {
             let hash_str: &str = r.get(0);
@@ -661,11 +661,7 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn txn_expire_pending(
-        &self,
-        block_num: u64,
-        block_hash: [u8; 32],
-    ) -> anyhow::Result<()> {
+    async fn txn_expire_pending(&self, block_num: u64, block_hash: [u8; 32]) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
 
         let rows = client
@@ -697,8 +693,7 @@ impl Store for PgStore {
         let key = addr.to_lowercase();
         let rows = client
             .query("SELECT nonce FROM nonces WHERE address = $1", &[&key])
-            .await
-            ?;
+            .await?;
         Ok(rows.first().map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
     }
 
@@ -754,8 +749,7 @@ impl Store for PgStore {
                 "SELECT 1 FROM claimed_indices WHERE global_index = $1",
                 &[&key],
             )
-            .await
-            ?;
+            .await?;
         Ok(!rows.is_empty())
     }
 
@@ -769,8 +763,7 @@ impl Store for PgStore {
                 "SELECT miden_account FROM address_mappings WHERE eth_address = $1",
                 &[&key],
             )
-            .await
-            ?;
+            .await?;
 
         Ok(rows.first().and_then(|r| {
             let val: &str = r.get(0);
@@ -801,8 +794,7 @@ impl Store for PgStore {
                 "SELECT 1 FROM bridge_out_processed WHERE note_id = $1",
                 &[&note_id],
             )
-            .await
-            ?;
+            .await?;
         Ok(!rows.is_empty())
     }
 

@@ -88,9 +88,7 @@ pub(crate) fn build_synthetic_tx_json(
 }
 
 /// Encode `bridgeAsset(...)` calldata from a BridgeEvent synthetic log.
-pub(crate) fn encode_bridge_asset_from_log(
-    log: &crate::log_synthesis::SyntheticLog,
-) -> String {
+pub(crate) fn encode_bridge_asset_from_log(log: &crate::log_synthesis::SyntheticLog) -> String {
     let data_hex = log.data.strip_prefix("0x").unwrap_or(&log.data);
     let Ok(data_bytes) = hex::decode(data_hex) else {
         return "0x".to_string();
@@ -101,7 +99,9 @@ pub(crate) fn encode_bridge_asset_from_log(
     }
 
     let dest_net = u32::from_be_bytes(
-        data_bytes[3 * 32 + 28..3 * 32 + 32].try_into().unwrap_or([0; 4]),
+        data_bytes[3 * 32 + 28..3 * 32 + 32]
+            .try_into()
+            .unwrap_or([0; 4]),
     );
     let dest_addr: [u8; 20] = data_bytes[4 * 32 + 12..4 * 32 + 32]
         .try_into()

@@ -23,7 +23,9 @@ async fn pg_store() -> PgStore {
             std::process::exit(0);
         }
     };
-    PgStore::new(&url).await.expect("failed to connect to PgStore")
+    PgStore::new(&url)
+        .await
+        .expect("failed to connect to PgStore")
 }
 
 /// Reset the service_state singleton to defaults before each test.
@@ -229,8 +231,13 @@ async fn test_pgstore_nonces() {
     let store = pg_store().await;
 
     // Use a unique address to avoid collisions with other tests
-    let addr = format!("0xnonce_test_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let addr = format!(
+        "0xnonce_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     assert_eq!(store.nonce_get(&addr).await.unwrap(), 0);
 
@@ -294,8 +301,13 @@ async fn test_pgstore_address_mappings() {
 async fn test_pgstore_bridge_out() {
     let store = pg_store().await;
 
-    let note_id = format!("test_note_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let note_id = format!(
+        "test_note_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     assert!(!store.is_note_processed(&note_id).await.unwrap());
 

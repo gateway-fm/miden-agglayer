@@ -5,8 +5,8 @@ use miden_agglayer_service::bridge_out::BridgeOutScanner;
 use miden_agglayer_service::l1_client::{AlloyL1Client, L1Client};
 use miden_agglayer_service::service;
 use miden_agglayer_service::service_state::ServiceState;
-use miden_agglayer_service::store::memory::InMemoryStore;
 use miden_agglayer_service::store::StoreSyncListener;
+use miden_agglayer_service::store::memory::InMemoryStore;
 use miden_agglayer_service::*;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -58,15 +58,27 @@ struct Command {
     bridge_address: Option<String>,
 
     /// L1 GER contract address
-    #[arg(long, env = "L1_GER_ADDRESS", default_value = "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674")]
+    #[arg(
+        long,
+        env = "L1_GER_ADDRESS",
+        default_value = "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+    )]
     l1_ger_address: String,
 
     /// L1 RollupManager contract address (eth_call forwarding)
-    #[arg(long, env = "ROLLUP_MANAGER_ADDRESS", default_value = "0x6c6c009cc348976db4a908c92b24433d4f6eda43")]
+    #[arg(
+        long,
+        env = "ROLLUP_MANAGER_ADDRESS",
+        default_value = "0x6c6c009cc348976db4a908c92b24433d4f6eda43"
+    )]
     rollup_manager_address: String,
 
     /// L1 Rollup contract address (eth_call forwarding)
-    #[arg(long, env = "ROLLUP_ADDRESS", default_value = "0x414e9e227e4b589af92200508af5399576530e4e")]
+    #[arg(
+        long,
+        env = "ROLLUP_ADDRESS",
+        default_value = "0x414e9e227e4b589af92200508af5399576530e4e"
+    )]
     rollup_address: String,
 
     /// L1 block to start scanning from during restore
@@ -141,19 +153,20 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
-    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
-        sync_listener,
-        block_state.clone(),
-        bridge_out_scanner,
-    ];
+    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
+        vec![sync_listener, block_state.clone(), bridge_out_scanner];
 
     let client = MidenClient::new(miden_store_dir.clone(), command.miden_node, sync_listeners)?;
 
     // Run restore if requested
     if command.restore {
-        let l1_rpc = command.l1_rpc_url.as_deref()
+        let l1_rpc = command
+            .l1_rpc_url
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--restore requires --l1-rpc-url"))?;
-        let bridge_addr = command.bridge_address.as_deref()
+        let bridge_addr = command
+            .bridge_address
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--restore requires --bridge-address"))?;
 
         let result = miden_agglayer_service::restore::restore(
@@ -199,22 +212,22 @@ async fn main() -> anyhow::Result<()> {
     let _settler_handle = if std::env::var("CLAIM_SETTLER_ENABLED").unwrap_or_default() == "true" {
         let bridge_service_url = std::env::var("BRIDGE_SERVICE_URL")
             .unwrap_or_else(|_| "http://bridge-service:8080".to_string());
-        let l1_rpc_url = std::env::var("L1_RPC_URL")
-            .unwrap_or_else(|_| "http://localhost:8545".to_string());
+        let l1_rpc_url =
+            std::env::var("L1_RPC_URL").unwrap_or_else(|_| "http://localhost:8545".to_string());
 
         // Warn about non-HTTPS URLs in non-dev environments
-        if !bridge_service_url.starts_with("https://") && !bridge_service_url.contains("localhost") {
+        if !bridge_service_url.starts_with("https://") && !bridge_service_url.contains("localhost")
+        {
             tracing::warn!("BRIDGE_SERVICE_URL is not HTTPS — vulnerable to MITM in production");
         }
         if !l1_rpc_url.starts_with("https://") && !l1_rpc_url.contains("localhost") {
             tracing::warn!("L1_RPC_URL is not HTTPS — vulnerable to MITM in production");
         }
 
-        let bridge_address: alloy::primitives::Address =
-            std::env::var("BRIDGE_ADDRESS")
-                .unwrap_or_default()
-                .parse()
-                .context("BRIDGE_ADDRESS must be a valid address for ClaimSettler")?;
+        let bridge_address: alloy::primitives::Address = std::env::var("BRIDGE_ADDRESS")
+            .unwrap_or_default()
+            .parse()
+            .context("BRIDGE_ADDRESS must be a valid address for ClaimSettler")?;
 
         // Read private key into a zeroizing wrapper
         let private_key_hex = {

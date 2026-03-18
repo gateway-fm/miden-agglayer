@@ -4,7 +4,7 @@
 //! modules across the crate can set up a `ServiceState` without duplication
 //! or `unsafe { std::mem::zeroed() }`.
 
-use crate::accounts_config::{AccountsConfig as InnerAccountsConfig, AccountIdBech32};
+use crate::accounts_config::{AccountIdBech32, AccountsConfig as InnerAccountsConfig};
 use crate::block_state::BlockState;
 use crate::store::memory::InMemoryStore;
 use crate::{AccountsConfig, MidenClient, ServiceState};

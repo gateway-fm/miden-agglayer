@@ -57,7 +57,9 @@ impl ClaimSettlerTracker {
     }
 
     fn persist(&self) {
-        let Some(ref path) = self.persistence_path else { return };
+        let Some(ref path) = self.persistence_path else {
+            return;
+        };
         let deposits = self.claimed_deposits.read();
         let state = SettlerState {
             claimed_deposits: deposits.iter().copied().collect(),
@@ -130,7 +132,11 @@ pub struct ClaimSettler {
 impl ClaimSettler {
     pub fn new(config: ClaimSettlerConfig) -> anyhow::Result<Self> {
         let tracker = ClaimSettlerTracker::new(config.persistence_path.clone())?;
-        Ok(Self { config, tracker, http: reqwest::Client::new() })
+        Ok(Self {
+            config,
+            tracker,
+            http: reqwest::Client::new(),
+        })
     }
 
     pub async fn run(self) {

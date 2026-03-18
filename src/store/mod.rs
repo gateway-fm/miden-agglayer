@@ -127,21 +127,14 @@ pub trait Store: Send + Sync + 'static {
         tx_hash: TxHash,
     ) -> anyhow::Result<Option<(Result<(), String>, u64)>>;
     async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>>;
-    async fn txn_pending_by_miden_id(
-        &self,
-        id: TransactionId,
-    ) -> anyhow::Result<Option<TxHash>>;
+    async fn txn_pending_by_miden_id(&self, id: TransactionId) -> anyhow::Result<Option<TxHash>>;
     async fn txn_commit_pending(
         &self,
         ids: &[TransactionId],
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()>;
-    async fn txn_expire_pending(
-        &self,
-        block_num: u64,
-        block_hash: [u8; 32],
-    ) -> anyhow::Result<()>;
+    async fn txn_expire_pending(&self, block_num: u64, block_hash: [u8; 32]) -> anyhow::Result<()>;
 
     // === Nonces ===
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
@@ -273,7 +266,11 @@ impl SyncListener for StoreSyncListener {
     }
 
     async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
-        let data = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let data = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(data) = data {
             let block_hash = self.block_state.get_block_hash(data.block_num);
             self.store.set_latest_block_number(data.block_num).await?;

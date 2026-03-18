@@ -4,11 +4,11 @@
 //! deposit is recorded on the L2 side. This module scans for consumed B2AGG notes and
 //! emits synthetic `BridgeEvent` EVM logs so the bridge-service can index them.
 
-use anyhow::Context;
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
 use crate::miden_client::{MidenClientLib, SyncListener};
+use anyhow::Context;
 use miden_base_agglayer::B2AggNote;
 use miden_client::store::InputNoteRecord;
 use miden_client::store::NoteFilter;
@@ -72,7 +72,10 @@ pub struct FaucetOriginInfo {
 /// Currently hardcoded based on init.rs defaults:
 /// - faucet_eth: origin_address=[0;20], origin_network=0, scale=10
 /// - faucet_agg: origin_address=[0;20], origin_network=0, scale=0
-pub fn resolve_faucet_origin(faucet_id: AccountId, accounts: &AccountsConfig) -> anyhow::Result<FaucetOriginInfo> {
+pub fn resolve_faucet_origin(
+    faucet_id: AccountId,
+    accounts: &AccountsConfig,
+) -> anyhow::Result<FaucetOriginInfo> {
     if faucet_id == accounts.faucet_eth.0 {
         Ok(FaucetOriginInfo {
             origin_network: 0,
@@ -96,9 +99,11 @@ pub fn resolve_faucet_origin(faucet_id: AccountId, accounts: &AccountsConfig) ->
 /// Reverse-scale a Miden amount back to origin token decimals.
 /// origin_amount = miden_amount * 10^scale
 pub(crate) fn reverse_scale_amount(miden_amount: u64, scale: u8) -> anyhow::Result<u128> {
-    let factor = 10u128.checked_pow(scale as u32)
+    let factor = 10u128
+        .checked_pow(scale as u32)
         .context("reverse_scale_amount: 10^scale overflows u128")?;
-    (miden_amount as u128).checked_mul(factor)
+    (miden_amount as u128)
+        .checked_mul(factor)
         .context("reverse_scale_amount: miden_amount * 10^scale overflows u128")
 }
 
@@ -131,7 +136,12 @@ impl BridgeOutScanner {
     async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) {
         let note_id_str = note.id().to_string();
 
-        if self.store.is_note_processed(&note_id_str).await.unwrap_or(false) {
+        if self
+            .store
+            .is_note_processed(&note_id_str)
+            .await
+            .unwrap_or(false)
+        {
             return;
         }
 
@@ -141,13 +151,14 @@ impl BridgeOutScanner {
         }
 
         // Parse B2AGG storage
-        let (destination_network, destination_address) = match parse_b2agg_storage(details.storage()) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("B2AGG note {note_id_str}: failed to parse storage: {e:#}");
-                return;
-            }
-        };
+        let (destination_network, destination_address) =
+            match parse_b2agg_storage(details.storage()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("B2AGG note {note_id_str}: failed to parse storage: {e:#}");
+                    return;
+                }
+            };
 
         // Get the fungible asset
         let Some(fungible_asset) = details.assets().iter_fungible().next() else {
@@ -192,7 +203,8 @@ impl BridgeOutScanner {
         };
 
         // Emit BridgeEvent log
-        if let Err(e) = self.store
+        if let Err(e) = self
+            .store
             .add_bridge_event(
                 get_bridge_address(),
                 block_number,
@@ -377,7 +389,10 @@ mod tests {
         // ETH: scale=10
         assert_eq!(reverse_scale_amount(1000, 10).unwrap(), 10_000_000_000_000);
         // 1 unit with scale=18
-        assert_eq!(reverse_scale_amount(1, 18).unwrap(), 1_000_000_000_000_000_000);
+        assert_eq!(
+            reverse_scale_amount(1, 18).unwrap(),
+            1_000_000_000_000_000_000
+        );
         // Overflow: scale too large
         assert!(reverse_scale_amount(1, 39).is_err());
     }

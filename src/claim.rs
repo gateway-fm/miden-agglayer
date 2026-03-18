@@ -1,7 +1,7 @@
 use crate::accounts_config::AccountsConfig;
-use crate::store::Store;
 use crate::amount::validate_amount;
 use crate::miden_client::{MidenClient, MidenClientLib};
+use crate::store::Store;
 use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
 use alloy::sol_types::SolEvent;
 use miden_base_agglayer::{
@@ -106,7 +106,8 @@ async fn create_claim(
 ) -> anyhow::Result<Note> {
     let sender = accounts.service.0;
 
-    let _dest_account = crate::address_mapper::resolve_address(store, params.destinationAddress, accounts).await?;
+    let _dest_account =
+        crate::address_mapper::resolve_address(store, params.destinationAddress, accounts).await?;
 
     let amount = validate_amount(params.amount, faucet.origin_token_decimals, faucet.decimals)?;
 
@@ -178,13 +179,7 @@ async fn publish_claim_internal(
         "creating CLAIM note"
     );
 
-    let claim_note = create_claim(
-        params.clone(),
-        faucet,
-        accounts,
-        store,
-        client.rng(),
-    ).await?;
+    let claim_note = create_claim(params.clone(), faucet, accounts, store, client.rng()).await?;
     let claim_note_id = claim_note.id().to_string();
 
     const EXPIRATION_DELTA: u16 = 10;
@@ -209,7 +204,9 @@ async fn publish_claim_internal(
         .build()?;
 
     // Execute and check the output notes before submission
-    let tx_result = client.execute_transaction(accounts.service.0, txn_request).await?;
+    let tx_result = client
+        .execute_transaction(accounts.service.0, txn_request)
+        .await?;
     let exec_tx = tx_result.executed_transaction();
     for (i, note) in exec_tx.output_notes().iter().enumerate() {
         let variant = match note {
@@ -217,7 +214,7 @@ async fn publish_claim_internal(
                 let att = n.metadata().attachment();
                 let att_default = att == &miden_protocol::note::NoteAttachment::default();
                 format!("Full(attachment_empty={})", att_default)
-            },
+            }
             miden_protocol::transaction::OutputNote::Partial(_) => "Partial".to_string(),
             miden_protocol::transaction::OutputNote::Header(_) => "Header".to_string(),
         };
@@ -231,7 +228,7 @@ async fn publish_claim_internal(
                 let att = n.metadata().attachment();
                 let att_default = att == &miden_protocol::note::NoteAttachment::default();
                 format!("Full(attachment_empty={})", att_default)
-            },
+            }
             miden_protocol::transaction::OutputNote::Partial(_) => "Partial".to_string(),
             miden_protocol::transaction::OutputNote::Header(_) => "Header".to_string(),
         };
@@ -242,7 +239,9 @@ async fn publish_claim_internal(
     let _submission_height = client
         .submit_proven_transaction(proven_tx, &tx_result)
         .await?;
-    client.apply_transaction(&tx_result, _submission_height).await?;
+    client
+        .apply_transaction(&tx_result, _submission_height)
+        .await?;
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
     // Wait for tx to be committed (same pattern as init's deploy_account)
@@ -293,14 +292,9 @@ pub async fn publish_claim(
     client
         .with(move |client| {
             Box::new(async move {
-                let value = publish_claim_internal(
-                    params,
-                    client,
-                    &accounts.0,
-                    &*store,
-                    latest_block_num,
-                )
-                .await?;
+                let value =
+                    publish_claim_internal(params, client, &accounts.0, &*store, latest_block_num)
+                        .await?;
                 let _ = result_inner.set(value);
                 Ok(())
             })

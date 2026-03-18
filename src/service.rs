@@ -5,7 +5,7 @@ use crate::service_eth_call::service_eth_call;
 use crate::service_get_logs::service_get_logs;
 use crate::service_get_txn_receipt::service_get_txn_receipt;
 use crate::service_helpers::{
-    build_synthetic_tx_json, json_rpc_response_from_result, store_error, ServiceErrorCode,
+    ServiceErrorCode, build_synthetic_tx_json, json_rpc_response_from_result, store_error,
 };
 use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
@@ -50,10 +50,17 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
     let method = method_name.as_str();
     match method {
         "eth_getBlockByNumber" => tracing::trace!("JSON-RPC {method}"),
-        "eth_call" | "eth_gasPrice" | "eth_estimateGas" | "eth_getLogs" | "net_version"
-        | "eth_getBlockTransactionCountByNumber" | "eth_getTransactionCount"
-        | "eth_getTransactionByHash" | "eth_getTransactionReceipt"
-        | "zkevm_getLatestGlobalExitRoot" | "zkevm_getExitRootsByGER" => {
+        "eth_call"
+        | "eth_gasPrice"
+        | "eth_estimateGas"
+        | "eth_getLogs"
+        | "net_version"
+        | "eth_getBlockTransactionCountByNumber"
+        | "eth_getTransactionCount"
+        | "eth_getTransactionByHash"
+        | "eth_getTransactionReceipt"
+        | "zkevm_getLatestGlobalExitRoot"
+        | "zkevm_getExitRootsByGER" => {
             tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
         }
         _ => tracing::debug!("JSON-RPC {method}"),
@@ -271,9 +278,7 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
         "zkevm_getLatestGlobalExitRoot" => service_zkevm_get_latest_ger(service, request).await,
 
-        "zkevm_getExitRootsByGER" => {
-            service_zkevm_get_exit_roots_by_ger(service, request).await
-        }
+        "zkevm_getExitRootsByGER" => service_zkevm_get_exit_roots_by_ger(service, request).await,
 
         method => {
             tracing::error!("JSON-RPC unsupported method: {}", method);

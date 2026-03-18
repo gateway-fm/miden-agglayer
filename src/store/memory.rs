@@ -2,8 +2,7 @@
 
 use super::{Store, TxnData, TxnEntry};
 use crate::log_synthesis::{
-    GerEntry, LogFilter, SyntheticLog, L2_GLOBAL_EXIT_ROOT_ADDRESS,
-    UPDATE_HASH_CHAIN_VALUE_TOPIC,
+    GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use lru::LruCache;
@@ -72,9 +71,7 @@ impl InMemoryStore {
             latest_ger: RwLock::new(None),
             hash_chain_value: RwLock::new([0u8; 32]),
             injected_gers: RwLock::new(HashSet::new()),
-            transactions: Mutex::new(
-                LruCache::new(NonZeroUsize::new(10_000).unwrap()),
-            ),
+            transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
             claimed: RwLock::new(HashSet::new()),
             address_mappings: RwLock::new(HashMap::new()),
@@ -334,16 +331,11 @@ impl Store for InMemoryStore {
         }; // Mutex dropped before any .await
 
         if let Some(logs) = logs_to_add {
-            let bridge_address =
-                crate::bridge_address::get_bridge_address().to_string();
+            let bridge_address = crate::bridge_address::get_bridge_address().to_string();
             for log_data in logs {
                 let log = SyntheticLog {
                     address: bridge_address.clone(),
-                    topics: log_data
-                        .topics()
-                        .iter()
-                        .map(|t| t.to_string())
-                        .collect(),
+                    topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
                     data: log_data.data.to_string(),
                     block_number: block_num,
                     block_hash,
@@ -367,9 +359,7 @@ impl Store for InMemoryStore {
             return Ok(None);
         };
         if receipt.result.is_none() {
-            tracing::debug!(
-                "Store::txn_receipt: {tx_hash} exists but result=None (uncommitted)"
-            );
+            tracing::debug!("Store::txn_receipt: {tx_hash} exists but result=None (uncommitted)");
             return Ok(None);
         }
         let Some(result) = receipt.result.clone() else {
@@ -394,10 +384,7 @@ impl Store for InMemoryStore {
         }))
     }
 
-    async fn txn_pending_by_miden_id(
-        &self,
-        id: TransactionId,
-    ) -> anyhow::Result<Option<TxHash>> {
+    async fn txn_pending_by_miden_id(&self, id: TransactionId) -> anyhow::Result<Option<TxHash>> {
         let txns = self.transactions.lock();
         for (tx_hash, receipt) in txns.iter() {
             if receipt.result.is_none() && receipt.id == Some(id) {
@@ -423,17 +410,12 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn txn_expire_pending(
-        &self,
-        block_num: u64,
-        block_hash: [u8; 32],
-    ) -> anyhow::Result<()> {
+    async fn txn_expire_pending(&self, block_num: u64, block_hash: [u8; 32]) -> anyhow::Result<()> {
         let expired: Vec<TxHash> = {
             let txns = self.transactions.lock();
             txns.iter()
                 .filter(|(_, r)| {
-                    r.result.is_none()
-                        && block_num >= r.expires_at.unwrap_or(u64::MAX)
+                    r.result.is_none() && block_num >= r.expires_at.unwrap_or(u64::MAX)
                 })
                 .map(|(h, _)| *h)
                 .collect()
@@ -452,11 +434,7 @@ impl Store for InMemoryStore {
     // ── Nonces ───────────────────────────────────────────────────
 
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
-        Ok(*self
-            .nonces
-            .read()
-            .get(&addr.to_lowercase())
-            .unwrap_or(&0))
+        Ok(*self.nonces.read().get(&addr.to_lowercase()).unwrap_or(&0))
     }
 
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64> {
@@ -473,9 +451,7 @@ impl Store for InMemoryStore {
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
         let mut claimed = self.claimed.write();
         if !claimed.insert(global_index) {
-            anyhow::bail!(
-                "claim already submitted for global_index {global_index}"
-            );
+            anyhow::bail!("claim already submitted for global_index {global_index}");
         }
         Ok(())
     }
@@ -556,10 +532,16 @@ mod tests {
     async fn test_bridge_out_tracker() {
         let store = InMemoryStore::new();
         assert!(!store.is_note_processed("note1").await.unwrap());
-        let c = store.mark_note_processed("note1".to_string()).await.unwrap();
+        let c = store
+            .mark_note_processed("note1".to_string())
+            .await
+            .unwrap();
         assert_eq!(c, 0);
         assert!(store.is_note_processed("note1").await.unwrap());
-        let c2 = store.mark_note_processed("note2".to_string()).await.unwrap();
+        let c2 = store
+            .mark_note_processed("note2".to_string())
+            .await
+            .unwrap();
         assert_eq!(c2, 1);
     }
 
@@ -721,10 +703,12 @@ mod tests {
         let addr = Address::from([42u8; 20]);
         assert!(store.get_address_mapping(&addr).await.unwrap().is_none());
 
-        let miden_id =
-            AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let miden_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
         store.set_address_mapping(addr, miden_id).await.unwrap();
-        assert_eq!(store.get_address_mapping(&addr).await.unwrap(), Some(miden_id));
+        assert_eq!(
+            store.get_address_mapping(&addr).await.unwrap(),
+            Some(miden_id)
+        );
     }
 
     #[tokio::test]

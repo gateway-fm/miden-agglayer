@@ -86,9 +86,8 @@ pub async fn restore(
 
     // Phase 3: Scan miden consumed B2AGG notes
     tracing::info!("Phase 3: scanning miden consumed B2AGG notes...");
-    let (bridge_outs, logs) = restore_bridge_outs(
-        store, miden_client, accounts, block_state, next_block,
-    ).await?;
+    let (bridge_outs, logs) =
+        restore_bridge_outs(store, miden_client, accounts, block_state, next_block).await?;
     next_block += if logs > 0 { 1 } else { 0 };
     total_logs += logs;
     tracing::info!("Phase 3 complete: {bridge_outs} bridge-outs, {logs} logs");
@@ -106,9 +105,7 @@ pub async fn restore(
 
     // Phase 6: Verify
     tracing::info!("Phase 6: verification");
-    tracing::info!(
-        "  claims={claims}, bridge_outs={bridge_outs}, gers={gers}, logs={total_logs}"
-    );
+    tracing::info!("  claims={claims}, bridge_outs={bridge_outs}, gers={gers}, logs={total_logs}");
     tracing::info!("=== RESTORE: complete ===");
 
     Ok(RestoreResult {
@@ -242,7 +239,9 @@ async fn restore_claims_from_l1(
     let provider = ProviderBuilder::new().connect_http(l1_rpc_url.parse()?);
     let latest_block = provider.get_block_number().await?;
 
-    let topic = CLAIM_EVENT_TOPIC.strip_prefix("0x").unwrap_or(CLAIM_EVENT_TOPIC);
+    let topic = CLAIM_EVENT_TOPIC
+        .strip_prefix("0x")
+        .unwrap_or(CLAIM_EVENT_TOPIC);
     let topic_bytes = hex::decode(topic)?;
     let mut topic_b256 = [0u8; 32];
     topic_b256.copy_from_slice(&topic_bytes);
@@ -315,14 +314,15 @@ async fn restore_bridge_outs(
                         continue;
                     }
 
-                    let (destination_network, destination_address) =
-                        match parse_b2agg_storage(details.storage()) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
-                                continue;
-                            }
-                        };
+                    let (destination_network, destination_address) = match parse_b2agg_storage(
+                        details.storage(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+                            continue;
+                        }
+                    };
 
                     let Some(fungible_asset) = details.assets().iter_fungible().next() else {
                         continue;
@@ -336,7 +336,10 @@ async fn restore_bridge_outs(
                             continue;
                         }
                     };
-                    let origin_amount = match crate::bridge_out::reverse_scale_amount(miden_amount, origin.scale) {
+                    let origin_amount = match crate::bridge_out::reverse_scale_amount(
+                        miden_amount,
+                        origin.scale,
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
@@ -352,7 +355,8 @@ async fn restore_bridge_outs(
                         format!("0x{}", hex::encode(hash))
                     };
 
-                    let deposit_count = store_clone.mark_note_processed(note_id_str.clone()).await?;
+                    let deposit_count =
+                        store_clone.mark_note_processed(note_id_str.clone()).await?;
 
                     store_clone
                         .add_bridge_event(
@@ -501,4 +505,3 @@ async fn restore_gers(
     let (count, logs) = *result.lock().unwrap();
     Ok((count, logs))
 }
-

@@ -119,9 +119,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         if params.destinationNetwork != service.network_id as u32
             && let Some(l1_client) = &service.l1_client
         {
-            tracing::info!(
-                "forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}"
-            );
+            tracing::info!("forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}");
             let result = l1_client.send_raw_transaction(&input).await;
             match result {
                 Ok(hash) => tracing::info!("L1 claim tx forwarded: {hash}"),
@@ -139,38 +137,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 
         service.store.try_claim(params.globalIndex).await?;
 
-        // Emit ClaimEvent BEFORE publish_claim so the bridge-service's L2 sync
-        // and the aggsender's BridgeL2Sync both see it as an imported_exit.
-        //
-        // Why before: publish_claim takes ~15s (GER propagation wait). During that
-        // time, the bridge-service continuously syncs L2 blocks. If the ClaimEvent
-        // is emitted after, the bridge-service detects the block-number gap as a
-        // reorg and gets stuck in a resync loop.
-        //
-        // Safety: store.try_claim (above) prevents double-processing.
-        // If publish_claim fails, the bridge-service will retry the claimAsset tx.
-        // The ClaimEvent data is fully determined by the claimAsset params.
-        {
-            use alloy::sol_types::SolEvent;
-            let event = claim::ClaimEvent::from(params.clone());
-            let log_data = event.encode_log_data();
-            let block_num = service.store.advance_block_number().await?;
-            let block_hash = service.block_state.get_block_hash(block_num);
-            let claim_log = crate::log_synthesis::SyntheticLog {
-                address: crate::bridge_address::get_bridge_address().to_string(),
-                topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
-                data: log_data.data.to_string(),
-                block_number: block_num,
-                block_hash,
-                transaction_hash: format!("{txn_hash:#x}"),
-                transaction_index: 0,
-                log_index: 0,
-                removed: false,
-            };
-            service.store.add_log(claim_log).await?;
-            tracing::info!("emitted ClaimEvent at block {block_num} for aggsender imported_exit");
-        }
-
         let result = claim::publish_claim(
             params.clone(),
             &service.miden_client,
@@ -184,8 +150,34 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 let txn_id = claim_result.txn_id;
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
 
-                let block_num = service.store.get_latest_block_number().await?;
+                // Emit ClaimEvent AFTER successful publish_claim.
+                // This ensures the event only appears in the store when the
+                // CLAIM note actually exists on Miden — no state divergence
+                // on failure. We advance the block number so the event appears
+                // in a fresh block the bridge-service hasn't synced yet.
+                let block_num = service.store.advance_block_number().await?;
                 let block_hash = service.block_state.get_block_hash(block_num);
+                {
+                    use alloy::sol_types::SolEvent;
+                    let event = claim::ClaimEvent::from(params.clone());
+                    let log_data = event.encode_log_data();
+                    let claim_log = crate::log_synthesis::SyntheticLog {
+                        address: crate::bridge_address::get_bridge_address().to_string(),
+                        topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
+                        data: log_data.data.to_string(),
+                        block_number: block_num,
+                        block_hash,
+                        transaction_hash: format!("{txn_hash:#x}"),
+                        transaction_index: 0,
+                        log_index: 0,
+                        removed: false,
+                    };
+                    service.store.add_log(claim_log).await?;
+                    tracing::info!(
+                        "emitted ClaimEvent at block {block_num} after successful claim"
+                    );
+                }
+
                 service
                     .store
                     .txn_begin(
@@ -293,7 +285,10 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         anyhow::bail!("unhandled txn method {params_encoded:?}");
     }
 
-    service.store.nonce_increment(&format!("{signer:#x}")).await?;
+    service
+        .store
+        .nonce_increment(&format!("{signer:#x}"))
+        .await?;
     Ok(txn_hash)
 }
 
@@ -365,7 +360,10 @@ mod tests {
         let input_hex = encode_legacy_tx(calldata);
 
         let result = service_send_raw_txn(service, input_hex).await;
-        assert!(result.is_ok(), "insertGlobalExitRoot should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "insertGlobalExitRoot should succeed: {result:?}"
+        );
 
         // GER should be marked as seen and injected in the store
         assert!(store.has_seen_ger(&ger_bytes).await.unwrap());
@@ -381,7 +379,10 @@ mod tests {
             ..Default::default()
         };
         let logs = store.get_logs(&filter, 0xFFFF).await.unwrap();
-        assert!(!logs.is_empty(), "expected at least one log from GER insertion");
+        assert!(
+            !logs.is_empty(),
+            "expected at least one log from GER insertion"
+        );
         assert!(
             logs.iter().any(|l| l.topics.first().map(|t| t.as_str())
                 == Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)),
@@ -411,7 +412,10 @@ mod tests {
         let input_hex = encode_legacy_tx(calldata);
 
         let result = service_send_raw_txn(service, input_hex).await;
-        assert!(result.is_ok(), "zero-amount claimAsset should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "zero-amount claimAsset should succeed: {result:?}"
+        );
 
         // The claim should NOT be recorded (try_claim is never called for zero-amount)
         assert!(
@@ -433,20 +437,24 @@ mod tests {
                     == Some(crate::log_synthesis::CLAIM_EVENT_TOPIC)
             })
             .collect();
-        assert!(claim_logs.is_empty(), "zero-amount claim should not emit ClaimEvent");
+        assert!(
+            claim_logs.is_empty(),
+            "zero-amount claim should not emit ClaimEvent"
+        );
     }
 
     /// Test that a valid claimAsset call with non-zero amount:
     /// 1. Marks the claim in the store via try_claim
-    /// 2. Emits a ClaimEvent log BEFORE calling publish_claim
-    /// 3. Invokes the MidenClient (publish_claim calls .with())
+    /// 2. Invokes the MidenClient (publish_claim calls .with())
+    /// 3. Emits ClaimEvent only AFTER successful claim execution
     ///
-    /// Note: The test MidenClient stub returns Ok(()) without executing the
-    /// closure, so publish_claim's OnceLock is never set and it returns an
-    /// error. However, the ClaimEvent is emitted before publish_claim runs,
-    /// so we can still verify it. On failure, the claim is unclaimed.
+    /// The test MidenClient stub returns Ok(()) without executing the
+    /// closure, so publish_claim's OnceLock is never set and it returns
+    /// an error. The ClaimEvent must NOT appear in the store since the
+    /// claim failed — this prevents state divergence between what
+    /// bridge-service believes and what Miden actually holds.
     #[tokio::test]
-    async fn test_claim_asset_emits_claim_event() {
+    async fn test_claim_asset_no_event_on_failure() {
         let service = create_test_service();
         let store = service.store.clone();
         let miden_client = service.miden_client.clone();
@@ -470,7 +478,8 @@ mod tests {
 
         // publish_claim will fail because the test stub doesn't execute the
         // closure (no real MidenClientLib). That's expected.
-        let _result = service_send_raw_txn(service, input_hex).await;
+        let result = service_send_raw_txn(service, input_hex).await;
+        assert!(result.is_err(), "publish_claim should fail with test stub");
 
         // The MidenClient should have been called (publish_claim uses .with())
         assert!(
@@ -478,8 +487,8 @@ mod tests {
             "MidenClient should have been invoked by publish_claim"
         );
 
-        // The ClaimEvent log is emitted BEFORE publish_claim, so it should
-        // be in the store regardless of whether publish_claim succeeded.
+        // ClaimEvent must NOT be in the store — it's only emitted after
+        // successful claim execution, preventing state divergence.
         let filter = crate::log_synthesis::LogFilter {
             from_block: Some("0x0".to_string()),
             to_block: Some("0xFFFF".to_string()),
@@ -494,8 +503,8 @@ mod tests {
             })
             .collect();
         assert!(
-            !claim_logs.is_empty(),
-            "expected ClaimEvent log emitted before publish_claim"
+            claim_logs.is_empty(),
+            "ClaimEvent must not be emitted when publish_claim fails"
         );
 
         // On publish_claim failure, the claim is rolled back via unclaim()
