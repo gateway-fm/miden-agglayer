@@ -154,7 +154,16 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 // This ensures the event only appears in the store when the
                 // CLAIM note actually exists on Miden — no state divergence
                 // on failure. We advance the block number so the event appears
-                // in a fresh block the bridge-service hasn't synced yet.
+                // in a fresh block the aggsender hasn't synced yet (it needs
+                // ClaimEvent as an imported_exit for certificate generation).
+                //
+                // Known issue: the bridge-service's L2 sync will see this ClaimEvent
+                // and try to store it, but the ClaimTxManager already recorded the
+                // claim when its tx was mined — causing a duplicate key error that
+                // blocks L2 sync. This is a bridge-service bug (no ON CONFLICT
+                // handling in processClaim). It doesn't affect L1→L2 correctness
+                // or certificate settlement, only the bridge-service's ability to
+                // sync subsequent L2 blocks for L2→L1 claim indexing.
                 let block_num = service.store.advance_block_number().await?;
                 let block_hash = service.block_state.get_block_hash(block_num);
                 {
