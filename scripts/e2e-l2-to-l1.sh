@@ -13,6 +13,12 @@ source "$FIXTURES_DIR/.env"
 L1_RPC="http://localhost:8545"
 L2_RPC="http://localhost:8546"
 
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
+AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
+AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
+
+WEI_PER_MIDEN_UNIT=10000000000  # 10^10: 18 ETH - 8 Miden decimals
+
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 L1_DEST=$(cast wallet address --private-key "$FUNDED_KEY")
 
@@ -21,6 +27,8 @@ log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
 warn() { echo -e "${YELLOW}[$(date +%H:%M:%S)] WARN:${NC} $*"; }
 fail() { echo -e "${RED}[$(date +%H:%M:%S)] FAIL:${NC} $*" >&2; exit 1; }
 pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
+
+TEST_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
@@ -39,7 +47,7 @@ wait_for() {
 command -v cast >/dev/null || fail "cast (foundry) not found"
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 not reachable"
 
-ACCOUNTS=$(docker exec miden-agglayer-miden-agglayer-1 \
+ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || fail "miden-agglayer not initialized yet"
 WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
@@ -56,7 +64,7 @@ log "L1 dest: $L1_DEST"
 
 # ── Check wallet balance ──────────────────────────────────────────────────────
 log "Checking wallet balance..."
-BAL_OUT=$(docker exec miden-agglayer-miden-agglayer-1 bridge-out-tool \
+BAL_OUT=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
     --store-dir /var/lib/miden-agglayer-service \
     --node-url http://miden-node:57291 \
     --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
@@ -69,11 +77,12 @@ if [[ -z "$BALANCE" || "$BALANCE" == "0" ]]; then
 fi
 
 BRIDGE_AMOUNT=$((BALANCE / 2))
-log "Bridge-out amount: $BRIDGE_AMOUNT (half of balance)"
+EXPECTED_L1_CHANGE=$((BRIDGE_AMOUNT * WEI_PER_MIDEN_UNIT))
+log "Bridge-out amount: $BRIDGE_AMOUNT Miden units (expect +$EXPECTED_L1_CHANGE wei on L1)"
 
 # ── Step 1: Create B2AGG note (bridge-out) ────────────────────────────────────
 log "Step 1/4: Creating B2AGG bridge-out note..."
-docker exec miden-agglayer-miden-agglayer-1 bridge-out-tool \
+docker exec $AGGLAYER_CONTAINER bridge-out-tool \
     --store-dir /var/lib/miden-agglayer-service \
     --node-url http://miden-node:57291 \
     --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
@@ -96,7 +105,7 @@ log "L1 balance before settlement: $L1_BAL_BEFORE"
 
 log "Step 3/4: Waiting for certificate settlement on AggLayer..."
 wait_for "certificate settled" \
-    "docker logs miden-agglayer-aggkit-1 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
+    "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
     300 10
 pass "Certificate settled on L1!"
 
@@ -108,7 +117,16 @@ wait_for "L1 balance change (ClaimSettler auto-claim)" \
     120 5
 
 L1_BAL_AFTER=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
-pass "L2→L1 COMPLETE! L1 balance: $L1_BAL_BEFORE → $L1_BAL_AFTER"
+ACTUAL_L1_CHANGE=$((L1_BAL_AFTER - L1_BAL_BEFORE))
+# The ClaimSettler signs with the same key as L1_DEST, so gas is deducted from the
+# same account that receives the claim. Allow up to 0.01 ETH for gas costs.
+MAX_GAS_COST=10000000000000000  # 0.01 ETH
+MIN_EXPECTED=$((EXPECTED_L1_CHANGE - MAX_GAS_COST))
+if [[ "$ACTUAL_L1_CHANGE" -lt "$MIN_EXPECTED" || "$ACTUAL_L1_CHANGE" -gt "$EXPECTED_L1_CHANGE" ]]; then
+    fail "L1 balance change out of range: got $ACTUAL_L1_CHANGE wei, expected ~$EXPECTED_L1_CHANGE wei ($BRIDGE_AMOUNT Miden * 10^10, minus gas)"
+fi
+GAS_USED=$((EXPECTED_L1_CHANGE - ACTUAL_L1_CHANGE))
+pass "L2→L1 COMPLETE! L1 balance: $L1_BAL_BEFORE → $L1_BAL_AFTER (+$ACTUAL_L1_CHANGE wei, gas: $GAS_USED wei)"
 
 echo ""
 log "======================================================================"

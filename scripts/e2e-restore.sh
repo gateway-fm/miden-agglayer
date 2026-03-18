@@ -29,7 +29,8 @@ PG_PORT="5434"
 PG_USER="agglayer"
 PG_PASS="agglayer"
 PG_DB="agglayer_store"
-CONTAINER="miden-agglayer-miden-agglayer-1"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
+CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }

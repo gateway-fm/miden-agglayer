@@ -14,15 +14,22 @@ L1_RPC="http://localhost:8545"
 L2_RPC="http://localhost:8546"
 BRIDGE_SERVICE_URL="http://localhost:18080"
 
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
+AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
+
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 DEST_NETWORK=1  # Miden network ID from RollupManager
-DEPOSIT_AMOUNT="10000000000000" # 10 trillion wei → 10_000_000 Miden units after 10^10 scale
+DEPOSIT_AMOUNT="10000000000000" # 10^13 wei → 1000 Miden units (scale 10^10: 18 ETH - 8 Miden decimals)
+WEI_PER_MIDEN_UNIT=10000000000  # 10^10
+EXPECTED_L2_BALANCE=$((DEPOSIT_AMOUNT / WEI_PER_MIDEN_UNIT))
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
 warn() { echo -e "${YELLOW}[$(date +%H:%M:%S)] WARN:${NC} $*"; }
 fail() { echo -e "${RED}[$(date +%H:%M:%S)] FAIL:${NC} $*" >&2; exit 1; }
 pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
+
+TEST_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
@@ -44,7 +51,7 @@ curl -sf "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000
     || fail "Bridge service not reachable at $BRIDGE_SERVICE_URL"
 
 # ── Get account IDs ──────────────────────────────────────────────────────────
-ACCOUNTS=$(docker exec miden-agglayer-miden-agglayer-1 \
+ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || fail "miden-agglayer not initialized yet"
 WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
@@ -53,7 +60,7 @@ FAUCET_ID=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
 
 # Get wallet's zero-padded Ethereum address (required by MASM to_account_id)
 # bridge-out-tool prints "wallet: 0x<hex>" even if balance check fails
-WALLET_HEX=$(docker exec miden-agglayer-miden-agglayer-1 bridge-out-tool \
+WALLET_HEX=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
     --store-dir /var/lib/miden-agglayer-service \
     --node-url http://miden-node:57291 \
     --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
@@ -69,7 +76,7 @@ log "  L1→L2 Deposit + Claim"
 log "======================================================================"
 log "Wallet:  $WALLET_ID ($WALLET_HEX)"
 log "Dest:    $DEST_ADDR (zero-padded, network $DEST_NETWORK)"
-log "Amount:  $DEPOSIT_AMOUNT wei"
+log "Amount:  $DEPOSIT_AMOUNT wei (expect $EXPECTED_L2_BALANCE Miden units)"
 
 # ── Step 1: Deposit on L1 ────────────────────────────────────────────────────
 log "Step 1/5: Depositing on L1..."
@@ -93,14 +100,14 @@ pass "Deposit is ready_for_claim"
 # ── Step 3: Wait for CLAIM note submission ────────────────────────────────────
 log "Step 3/5: Waiting for ClaimTxManager auto-claim..."
 wait_for "claim tx submitted" \
-    "docker logs miden-agglayer-miden-agglayer-1 2>&1 | grep -q 'submitted claim note txn'" \
+    "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'submitted claim note txn'" \
     120 5
 pass "CLAIM note submitted to Miden"
 
 # ── Step 4: Wait for CLAIM note to commit ──────────────────────────────────
 log "Step 4/5: Waiting for CLAIM commit + NTX builder processing..."
 wait_for "claim tx committed" \
-    "docker logs miden-agglayer-miden-agglayer-1 2>&1 | grep -q 'claim tx.*committed to block'" \
+    "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'claim tx.*committed to block'" \
     60 3
 pass "CLAIM committed — waiting for NTX builder to create P2ID..."
 
@@ -109,7 +116,7 @@ log "Step 5/5: Checking wallet balance (sync + consume P2ID notes)..."
 BALANCE=0
 for attempt in $(seq 1 15); do
     sleep 10
-    BAL_OUT=$(docker exec miden-agglayer-miden-agglayer-1 bridge-out-tool \
+    BAL_OUT=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
         --store-dir /var/lib/miden-agglayer-service \
         --node-url http://miden-node:57291 \
         --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
@@ -122,10 +129,12 @@ for attempt in $(seq 1 15); do
     fi
 done
 
-if [[ -n "$BALANCE" && "$BALANCE" != "0" ]]; then
-    pass "L1→L2 COMPLETE! Wallet balance: $BALANCE"
-else
+if [[ -z "$BALANCE" || "$BALANCE" == "0" ]]; then
     fail "Wallet balance is still 0 after 2.5 minutes"
+elif [[ "$BALANCE" -ne "$EXPECTED_L2_BALANCE" ]]; then
+    fail "Balance mismatch: got $BALANCE, expected $EXPECTED_L2_BALANCE (from $DEPOSIT_AMOUNT wei / 10^10)"
+else
+    pass "L1→L2 COMPLETE! Wallet balance: $BALANCE (expected $EXPECTED_L2_BALANCE)"
 fi
 
 echo ""

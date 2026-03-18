@@ -12,7 +12,7 @@ pub async fn service_get_txn_receipt(
     txn_hash: String,
 ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope>>> {
     let txn_hash = TxHash::from_str(&txn_hash)?;
-    let (result, block_num) = match service.store.txn_receipt(txn_hash).await {
+    let (result, block_num) = match service.store.txn_receipt(txn_hash).await? {
         Some((result, block_num)) => (result, block_num),
         None => return Ok(None),
     };
@@ -47,22 +47,10 @@ pub async fn service_get_txn_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_state::BlockState;
     use crate::store::TxnEntry;
-    use crate::MidenClient;
+    use crate::test_helpers::create_test_service;
     use alloy::consensus::TxEnvelope;
     use alloy::primitives::{Address, TxHash};
-    use std::sync::Arc;
-
-    fn create_test_service() -> ServiceState {
-        let store: Arc<dyn crate::store::Store> =
-            Arc::new(crate::store::memory::InMemoryStore::new());
-        let block_state = Arc::new(BlockState::new());
-        let miden_client = MidenClient::new_test();
-        let accounts =
-            crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
-        ServiceState::new(miden_client, accounts, 1, 1, store, block_state, None)
-    }
 
     #[tokio::test]
     async fn test_service_get_txn_receipt_not_found() {

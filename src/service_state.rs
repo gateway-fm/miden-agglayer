@@ -1,4 +1,5 @@
 use crate::block_state::BlockState;
+use crate::l1_client::L1Client;
 use crate::store::Store;
 use crate::*;
 use std::sync::Arc;
@@ -12,7 +13,9 @@ pub struct ServiceState {
     pub network_id: u64,
     pub store: Arc<dyn Store>,
     pub block_state: Arc<BlockState>,
-    pub l1_rpc_url: Option<String>,
+    pub l1_client: Option<Arc<dyn L1Client>>,
+    pub rollup_manager_address: String,
+    pub rollup_address: String,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -26,7 +29,9 @@ impl ServiceState {
         network_id: u64,
         store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
-        l1_rpc_url: Option<String>,
+        l1_client: Option<Arc<dyn L1Client>>,
+        rollup_manager_address: String,
+        rollup_address: String,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
@@ -35,7 +40,9 @@ impl ServiceState {
             network_id,
             store,
             block_state,
-            l1_rpc_url,
+            l1_client,
+            rollup_manager_address,
+            rollup_address,
         }
     }
 }

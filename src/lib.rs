@@ -10,15 +10,24 @@ pub mod exit;
 pub mod ger;
 pub mod hex;
 pub mod init;
+pub mod l1_client;
 pub mod log_synthesis;
 pub mod logging;
+pub mod metrics;
 pub mod miden_client;
 pub mod restore;
 pub mod service;
+pub(crate) mod service_debug;
+pub(crate) mod service_eth_call;
+pub(crate) mod service_get_logs;
 pub mod service_get_txn_receipt;
+pub(crate) mod service_helpers;
 pub mod service_send_raw_txn;
 pub mod service_state;
+pub(crate) mod service_zkevm;
 pub mod store;
+#[cfg(test)]
+pub mod test_helpers;
 
 pub const COMPONENT: &str = "miden-agglayer";
 

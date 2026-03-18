@@ -10,6 +10,8 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -39,6 +41,8 @@ pub struct MidenClient {
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
     sender: mpsc::Sender<Request>,
     done_sender: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    call_count: Arc<AtomicUsize>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -83,11 +87,20 @@ impl MidenClient {
             task,
             sender,
             done_sender,
+            #[cfg(test)]
+            call_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     #[cfg(test)]
     pub fn new_test() -> Self {
+        Self::new_test_with_response(Ok(()))
+    }
+
+    /// Creates a test stub that returns the given response for every `.with()` call.
+    /// Also tracks how many times `.with()` was called.
+    #[cfg(test)]
+    pub fn new_test_with_response(response: anyhow::Result<()>) -> Self {
         let store_dir = tempfile::tempdir().unwrap().keep();
         let keystore_path = store_dir.join("keystore");
         std::fs::create_dir_all(&keystore_path).unwrap();
@@ -96,12 +109,23 @@ impl MidenClient {
         let (sender, mut receiver) = mpsc::channel::<Request>(1);
         let (done_sender, _done_receiver) = oneshot::channel::<()>();
 
-        // Start a mock task to handle 'with' calls
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // Convert the response into a reusable error message (if error) for the background thread
+        let response_err_msg = match &response {
+            Ok(()) => None,
+            Err(e) => Some(format!("{e:#}")),
+        };
+
         thread::spawn(move || {
             while let Some(req) = receiver.blocking_recv() {
-                // We can't actually run the closure because it needs MidenClientLib,
-                // which we don't have. But we can just signal success for tests.
-                let _ = req.response_sender.send(Ok(()));
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                let result = match &response_err_msg {
+                    None => Ok(()),
+                    Some(msg) => Err(anyhow!(msg.clone())),
+                };
+                let _ = req.response_sender.send(result);
             }
         });
 
@@ -110,7 +134,20 @@ impl MidenClient {
             task: std::sync::Mutex::new(None),
             sender,
             done_sender: std::sync::Mutex::new(Some(done_sender)),
+            call_count,
         }
+    }
+
+    /// Returns the number of times `.with()` was called on this test stub.
+    #[cfg(test)]
+    pub fn test_call_count(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns true if `.with()` was called at least once.
+    #[cfg(test)]
+    pub fn test_was_called(&self) -> bool {
+        self.test_call_count() > 0
     }
 
     fn default_store_dir() -> PathBuf {
@@ -293,18 +330,42 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_miden_client_test_with() {
+    async fn test_miden_client_test_tracks_calls() {
         let client = MidenClient::new_test();
+        assert_eq!(client.test_call_count(), 0);
+        assert!(!client.test_was_called());
+
         let res = client
             .with(|_client| {
-                Box::new(async move {
-                    // This won't actually run in new_test's background thread
-                    Ok(())
-                })
+                Box::new(async move { Ok(()) })
             })
             .await;
 
-        // new_test background thread returns Ok(()) directly
         assert!(res.is_ok());
+        assert_eq!(client.test_call_count(), 1);
+        assert!(client.test_was_called());
+
+        // Second call increments
+        client
+            .with(|_client| Box::new(async move { Ok(()) }))
+            .await
+            .unwrap();
+        assert_eq!(client.test_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_miden_client_test_with_error_response() {
+        let client =
+            MidenClient::new_test_with_response(Err(anyhow!("simulated failure")));
+
+        let res = client
+            .with(|_client| Box::new(async move { Ok(()) }))
+            .await;
+
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err().to_string().contains("simulated failure")
+        );
+        assert_eq!(client.test_call_count(), 1);
     }
 }

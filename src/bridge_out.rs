@@ -122,7 +122,7 @@ impl BridgeOutScanner {
     async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) {
         let note_id_str = note.id().to_string();
 
-        if self.store.is_note_processed(&note_id_str).await {
+        if self.store.is_note_processed(&note_id_str).await.unwrap_or(false) {
             return;
         }
 
@@ -156,10 +156,16 @@ impl BridgeOutScanner {
         };
 
         let block_hash = self.block_state.get_block_hash(block_number);
-        let deposit_count = self.store.mark_note_processed(note_id_str.clone()).await;
+        let deposit_count = match self.store.mark_note_processed(note_id_str.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("failed to mark note processed: {e}");
+                return;
+            }
+        };
 
         // Emit BridgeEvent log
-        self.store
+        if let Err(e) = self.store
             .add_bridge_event(
                 get_bridge_address(),
                 block_number,
@@ -173,7 +179,11 @@ impl BridgeOutScanner {
                 origin_amount,
                 deposit_count,
             )
-            .await;
+            .await
+        {
+            tracing::error!("failed to add bridge event: {e}");
+            return;
+        }
 
         tracing::info!(
             note_id = %note_id_str,

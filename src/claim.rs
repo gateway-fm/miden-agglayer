@@ -303,6 +303,7 @@ pub async fn publish_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::test_accounts_config;
     use alloy::primitives::address;
 
     #[test]
@@ -318,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_find_target_faucet_eth() {
-        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        let accounts = test_accounts_config();
         let faucet = find_target_faucet(
             address!("0000000000000000000000000000000000000000"),
             &accounts.0,
@@ -329,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_find_target_faucet_agg() {
-        let accounts = crate::load_config(None).unwrap_or_else(|_| unsafe { std::mem::zeroed() });
+        let accounts = test_accounts_config();
         let faucet = find_target_faucet(
             address!("742d35Cc6634C0532925a3b844Bc9e7595f41111"),
             &accounts.0,

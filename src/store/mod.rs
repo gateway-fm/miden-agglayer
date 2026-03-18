@@ -8,6 +8,8 @@
 pub mod memory;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(all(test, feature = "postgres"))]
+mod postgres_tests;
 
 use crate::block_state::BlockState;
 use crate::log_synthesis::{GerEntry, LogFilter, SyntheticLog};
@@ -76,24 +78,28 @@ impl TxnData {
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + 'static {
     // === Block number ===
-    async fn get_latest_block_number(&self) -> u64;
-    async fn set_latest_block_number(&self, n: u64);
+    async fn get_latest_block_number(&self) -> anyhow::Result<u64>;
+    async fn set_latest_block_number(&self, n: u64) -> anyhow::Result<()>;
     /// Increment block number by 1 and return the new value.
-    async fn advance_block_number(&self) -> u64;
+    async fn advance_block_number(&self) -> anyhow::Result<u64>;
 
     // === Synthetic logs ===
-    async fn add_log(&self, log: SyntheticLog);
-    async fn get_logs(&self, filter: &LogFilter, current_block: u64) -> Vec<SyntheticLog>;
-    async fn get_logs_for_tx(&self, tx_hash: &str) -> Vec<SyntheticLog>;
+    async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;
+    async fn get_logs(
+        &self,
+        filter: &LogFilter,
+        current_block: u64,
+    ) -> anyhow::Result<Vec<SyntheticLog>>;
+    async fn get_logs_for_tx(&self, tx_hash: &str) -> anyhow::Result<Vec<SyntheticLog>>;
 
     // === GER state ===
-    async fn has_seen_ger(&self, ger: &[u8; 32]) -> bool;
+    async fn has_seen_ger(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
     /// Mark GER as seen. Returns true if newly inserted.
-    async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> bool;
-    async fn get_latest_ger(&self) -> Option<[u8; 32]>;
-    async fn get_ger_entry(&self, ger: &[u8; 32]) -> Option<GerEntry>;
-    async fn is_ger_injected(&self, ger: &[u8; 32]) -> bool;
-    async fn mark_ger_injected(&self, ger: [u8; 32]);
+    async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool>;
+    async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>>;
+    async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>>;
+    async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
+    async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()>;
     /// Atomically: mark GER seen, update hash chain, emit UpdateHashChainValue log.
     #[allow(clippy::too_many_arguments)]
     async fn add_ger_update_event(
@@ -105,7 +111,7 @@ pub trait Store: Send + Sync + 'static {
         mainnet_exit_root: Option<[u8; 32]>,
         rollup_exit_root: Option<[u8; 32]>,
         timestamp: u64,
-    );
+    ) -> anyhow::Result<()>;
 
     // === Transactions ===
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()>;
@@ -116,35 +122,45 @@ pub trait Store: Send + Sync + 'static {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()>;
-    async fn txn_receipt(&self, tx_hash: TxHash) -> Option<(Result<(), String>, u64)>;
-    async fn txn_get(&self, tx_hash: TxHash) -> Option<TxnData>;
-    async fn txn_pending_by_miden_id(&self, id: TransactionId) -> Option<TxHash>;
+    async fn txn_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<Option<(Result<(), String>, u64)>>;
+    async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>>;
+    async fn txn_pending_by_miden_id(
+        &self,
+        id: TransactionId,
+    ) -> anyhow::Result<Option<TxHash>>;
     async fn txn_commit_pending(
         &self,
         ids: &[TransactionId],
         block_num: u64,
         block_hash: [u8; 32],
-    );
-    async fn txn_expire_pending(&self, block_num: u64, block_hash: [u8; 32]);
+    ) -> anyhow::Result<()>;
+    async fn txn_expire_pending(
+        &self,
+        block_num: u64,
+        block_hash: [u8; 32],
+    ) -> anyhow::Result<()>;
 
     // === Nonces ===
-    async fn nonce_get(&self, addr: &str) -> u64;
+    async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
-    async fn nonce_increment(&self, addr: &str) -> u64;
+    async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;
 
     // === Claims ===
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()>;
-    async fn unclaim(&self, global_index: &U256);
-    async fn is_claimed(&self, global_index: &U256) -> bool;
+    async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()>;
+    async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool>;
 
     // === Address mappings ===
-    async fn get_address_mapping(&self, eth: &Address) -> Option<AccountId>;
-    async fn set_address_mapping(&self, eth: Address, miden: AccountId);
+    async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>>;
+    async fn set_address_mapping(&self, eth: Address, miden: AccountId) -> anyhow::Result<()>;
 
     // === Bridge-out ===
-    async fn is_note_processed(&self, note_id: &str) -> bool;
+    async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
     /// Mark note as processed, return the deposit count assigned to it.
-    async fn mark_note_processed(&self, note_id: String) -> u32;
+    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
 
     // === Convenience: claim event log ===
     #[allow(clippy::too_many_arguments)]
@@ -159,7 +175,7 @@ pub trait Store: Send + Sync + 'static {
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
         amount: u64,
-    ) {
+    ) -> anyhow::Result<()> {
         let log = SyntheticLog {
             address: bridge_address.to_string(),
             topics: vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
@@ -177,7 +193,7 @@ pub trait Store: Send + Sync + 'static {
             log_index: 0,
             removed: false,
         };
-        self.add_log(log).await;
+        self.add_log(log).await
     }
 
     // === Convenience: bridge event log ===
@@ -195,7 +211,7 @@ pub trait Store: Send + Sync + 'static {
         destination_address: &[u8; 20],
         amount: u128,
         deposit_count: u32,
-    ) {
+    ) -> anyhow::Result<()> {
         let log = SyntheticLog {
             address: bridge_address.to_string(),
             topics: vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()],
@@ -215,7 +231,7 @@ pub trait Store: Send + Sync + 'static {
             log_index: 0,
             removed: false,
         };
-        self.add_log(log).await;
+        self.add_log(log).await
     }
 }
 
@@ -260,13 +276,13 @@ impl SyncListener for StoreSyncListener {
         let data = self.pending.lock().unwrap().take();
         if let Some(data) = data {
             let block_hash = self.block_state.get_block_hash(data.block_num);
-            self.store.set_latest_block_number(data.block_num).await;
+            self.store.set_latest_block_number(data.block_num).await?;
             self.store
                 .txn_commit_pending(&data.committed_ids, data.block_num, block_hash)
-                .await;
+                .await?;
             self.store
                 .txn_expire_pending(data.block_num, block_hash)
-                .await;
+                .await?;
         }
         Ok(())
     }

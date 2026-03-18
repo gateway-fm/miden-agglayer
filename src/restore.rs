@@ -9,25 +9,41 @@
 //! Phase 1: Sync miden state → get current block number
 //! Phase 2: Scan L1 ClaimEvent logs → rebuild claimed_indices
 //! Phase 3: Scan miden consumed B2AGG notes → rebuild bridge-out + deposit counter
-//! Phase 4: Scan L1 for GER insertions (chronological) → rebuild GER set + hash chain
-//! Phase 5: Reconstruct synthetic logs from phases 2-4
-//! Phase 6: Verify counts against L1 sources
+//! Phase 4: Scan consumed UpdateGerNote notes on Miden → rebuild GER set + hash chain
+//! Phase 5: Update block number to cover all synthetic logs
+//! Phase 6: Verify counts
+//!
+//! ## GER restoration via consumed notes
+//!
+//! For recovery we only care about consumed notes — actually injected GERs.
+//! L1 is the wrong source because it knows about GERs that may never have been
+//! injected into Miden; you'd have to call the node to verify anyway.
+//!
+//! When the proxy injects a GER, it creates an UpdateGerNote that gets consumed
+//! by the Miden bridge account. The Miden node retains consumed notes, so we can
+//! scan them to reconstruct the full GER history without any L1 dependency.
+//!
+//! Each consumed UpdateGerNote stores the GER as 8 Felts in note storage.
+//! The consumption block number gives us the ordering for hash chain reconstruction.
+//!
+//! See: https://github.com/0xMiden/protocol/issues/2341
 //!
 //! ## Known Limitations (TODOs for miden-node API enhancements)
 //!
-//! - B2AGG note filtering is done client-side (no server-side script root filter)
+//! - B2AGG/GER note filtering is done client-side (no server-side script root filter)
+//!   TODO: switch to NoteFilter::ConsumedByScriptRoot when available
 //! - No block range queries for notes (full scan from genesis)
-//! - Storage map enumeration not available (GER cross-validation skipped)
+//!   TODO: switch to dedicated get_gers() endpoint when Marti's team ships it
 
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
 use crate::bridge_out::{is_b2agg_note, parse_b2agg_storage, resolve_faucet_origin};
-use crate::ger::combined_ger;
 use crate::log_synthesis::CLAIM_EVENT_TOPIC;
 use crate::miden_client::MidenClient;
 use crate::store::Store;
 use alloy::primitives::U256;
+use miden_base_agglayer::UpdateGerNote;
 use miden_client::store::NoteFilter;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
@@ -42,6 +58,7 @@ pub struct RestoreResult {
 }
 
 /// Run the full restore algorithm.
+#[allow(clippy::too_many_arguments)]
 pub async fn restore(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
@@ -49,7 +66,6 @@ pub async fn restore(
     block_state: &Arc<BlockState>,
     l1_rpc_url: &str,
     bridge_address: &str,
-    l1_ger_address: &str,
     from_l1_block: u64,
 ) -> anyhow::Result<RestoreResult> {
     tracing::info!("=== RESTORE: starting state reconstruction ===");
@@ -77,17 +93,15 @@ pub async fn restore(
     total_logs += logs;
     tracing::info!("Phase 3 complete: {bridge_outs} bridge-outs, {logs} logs");
 
-    // Phase 4: Scan L1 GER insertions
-    tracing::info!("Phase 4: scanning L1 GER insertions...");
-    let (gers, ger_logs) = restore_gers(
-        store, l1_rpc_url, l1_ger_address, bridge_address, block_state, next_block, from_l1_block,
-    ).await?;
+    // Phase 4: Scan consumed UpdateGerNote notes on Miden
+    tracing::info!("Phase 4: scanning consumed UpdateGerNote notes on Miden...");
+    let (gers, ger_logs) = restore_gers(store, miden_client, block_state, next_block).await?;
     total_logs += ger_logs;
     tracing::info!("Phase 4 complete: {gers} GERs, {ger_logs} logs");
 
     // Phase 5: Update block number to cover all synthetic logs
     let final_block = next_block + if ger_logs > 0 { 1 } else { 0 };
-    store.set_latest_block_number(final_block).await;
+    store.set_latest_block_number(final_block).await?;
     tracing::info!("Phase 5: block number set to {final_block}");
 
     // Phase 6: Verify
@@ -123,7 +137,7 @@ async fn sync_miden_block(
 
     // The sync listener should have updated the block number,
     // but if restore runs before listeners are active, read from miden directly
-    let block_num = store.get_latest_block_number().await;
+    let block_num = store.get_latest_block_number().await?;
     Ok(block_num)
 }
 
@@ -205,7 +219,7 @@ async fn restore_claims_from_bridge_service(
             };
 
             if dep.ready_for_claim.unwrap_or(false) && dep.dest_net == Some(1) {
-                if !store.is_claimed(&global_index).await {
+                if !store.is_claimed(&global_index).await? {
                     if store.try_claim(global_index).await.is_ok() {
                         count += 1;
                     }
@@ -248,7 +262,7 @@ async fn restore_claims_from_l1(
         let data = log.data().data.as_ref();
         if data.len() >= 32 {
             let global_index = U256::from_be_slice(&data[..32]);
-            if !store.is_claimed(&global_index).await {
+            if !store.is_claimed(&global_index).await? {
                 if store.try_claim(global_index).await.is_ok() {
                     count += 1;
                 }
@@ -297,7 +311,7 @@ async fn restore_bridge_outs(
                     }
 
                     let note_id_str = note.id().to_string();
-                    if store_clone.is_note_processed(&note_id_str).await {
+                    if store_clone.is_note_processed(&note_id_str).await? {
                         continue;
                     }
 
@@ -320,7 +334,7 @@ async fn restore_bridge_outs(
                         format!("0x{}", hex::encode(hash))
                     };
 
-                    let deposit_count = store_clone.mark_note_processed(note_id_str.clone()).await;
+                    let deposit_count = store_clone.mark_note_processed(note_id_str.clone()).await?;
 
                     store_clone
                         .add_bridge_event(
@@ -336,7 +350,7 @@ async fn restore_bridge_outs(
                             origin_amount,
                             deposit_count,
                         )
-                        .await;
+                        .await?;
 
                     tracing::info!(
                         note_id = %note_id_str,
@@ -358,102 +372,115 @@ async fn restore_bridge_outs(
     Ok((count, logs))
 }
 
-/// Phase 4: scan L1 for GER-related transactions and rebuild GER state + hash chain.
-/// Returns (gers_restored, logs_created).
-#[allow(clippy::too_many_arguments)]
+/// Phase 4: scan consumed UpdateGerNote notes to rebuild GER state.
+///
+/// For recovery we only care about consumed notes — actually injected GERs.
+/// Each UpdateGerNote stores the GER as 8 Felts in note storage. We extract it,
+/// reconstruct the full GER bytes, and rebuild the hash chain in consumption order.
+///
+/// Currently reads consumed notes via the miden-client gRPC sync.
+/// TODO: switch to a dedicated API endpoint (get_gers() or
+/// NoteFilter::ConsumedByScriptRoot) when the Miden team ships it.
+///
+/// See: https://github.com/0xMiden/protocol/issues/2341
 async fn restore_gers(
     store: &Arc<dyn Store>,
-    l1_rpc_url: &str,
-    l1_ger_address: &str,
-    bridge_address: &str,
+    miden_client: &MidenClient,
     block_state: &Arc<BlockState>,
     restore_block: u64,
-    from_block: u64,
 ) -> anyhow::Result<(usize, usize)> {
-    use alloy::providers::{Provider, ProviderBuilder};
+    let store_clone = store.clone();
+    let block_state_clone = block_state.clone();
 
-    let provider = ProviderBuilder::new().connect_http(l1_rpc_url.parse()?);
-    let latest_block = provider.get_block_number().await?;
-    let _ger_addr: alloy::primitives::Address = l1_ger_address.parse()?;
-    let _bridge_addr: alloy::primitives::Address = bridge_address.parse()?;
+    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let result_inner = result.clone();
 
-    // Strategy: fetch current L1 exit roots and compute the GER.
-    // For a full history, we'd need to scan L1 insertGlobalExitRoot tx logs,
-    // but the bridge-service + aggoracle handle that flow.
-    //
-    // For restore, we rebuild from the aggoracle's perspective:
-    // scan L1 blocks for insertGlobalExitRoot calls to the bridge contract.
-    // The aggoracle calls insertGlobalExitRoot(bytes32 root) on the L2 GER contract,
-    // which is proxied through miden-agglayer as eth_sendRawTransaction.
-    //
-    // Since we can't replay aggoracle txs, we instead:
-    // 1. Get all UpdateHashChainValue events from L1 bridge (they're on L2, not L1)
-    //    Actually, those are synthetic L2 events, not on L1.
-    // 2. Fetch the current L1 exit roots and inject the combined GER.
-    //    This gives us the latest GER, not history.
-    //
-    // For full history reconstruction, scan the bridge-service's DB
-    // or replay from L1 deposit events. For now, inject the latest GER.
-    //
-    // TODO: When miden-node adds storage map enumeration, cross-validate
-    // the bridge account's GER map against what we reconstruct.
+    miden_client
+        .with(move |client| {
+            Box::new(async move {
+                let consumed_notes = client
+                    .get_input_notes(NoteFilter::Consumed)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
-    let mut ger_count = 0usize;
-    let mut log_count = 0usize;
+                let ger_script_root = UpdateGerNote::script_root();
+                let block_hash = block_state_clone.get_block_hash(restore_block);
+                let timestamp = block_state_clone.get_block_timestamp(restore_block);
+                let mut ger_count = 0usize;
+                let mut log_count = 0usize;
 
-    // Get current L1 exit roots
-    match crate::ger::fetch_l1_exit_roots(l1_rpc_url, l1_ger_address).await {
-        Ok((mainnet_root, rollup_root)) => {
-            let ger = combined_ger(&mainnet_root, &rollup_root);
+                // Filter for UpdateGerNote notes by script root
+                // TODO: When miden-node adds NoteFilter::ConsumedByScriptRoot,
+                // replace client-side filtering with server-side filter
+                for note in &consumed_notes {
+                    let details = note.details();
+                    if details.script().root() != ger_script_root {
+                        continue;
+                    }
 
-            if !store.has_seen_ger(&ger).await {
-                let block_hash = block_state.get_block_hash(restore_block);
-                let timestamp = block_state.get_block_timestamp(restore_block);
-                let tx_hash = format!(
-                    "0x{}",
-                    hex::encode(Keccak256::digest(b"restore-ger"))
-                );
+                    // Extract GER from note storage (8 Felts = 32 bytes)
+                    let storage = details.storage();
+                    let items = storage.items();
+                    if items.len() < UpdateGerNote::NUM_STORAGE_ITEMS {
+                        tracing::warn!(
+                            note_id = %note.id(),
+                            storage_len = items.len(),
+                            "restore: UpdateGerNote has unexpected storage size, skipping"
+                        );
+                        continue;
+                    }
 
-                store
-                    .add_ger_update_event(
-                        restore_block,
-                        block_hash,
-                        &tx_hash,
-                        &ger,
-                        Some(mainnet_root),
-                        Some(rollup_root),
-                        timestamp,
-                    )
-                    .await;
+                    // Reconstruct the 32-byte GER from Felt elements.
+                    // ExitRoot stores as 8 Felts, each holding 4 bytes (big-endian u32).
+                    // Convert back: take lower 32 bits of each Felt, concatenate.
+                    let mut ger_bytes = [0u8; 32];
+                    for (i, felt) in items.iter().take(8).enumerate() {
+                        let v: u32 = felt.as_int() as u32;
+                        ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+                    }
 
-                store.mark_ger_injected(ger).await;
+                    if store_clone.has_seen_ger(&ger_bytes).await? {
+                        continue;
+                    }
 
-                tracing::info!(
-                    ger = %hex::encode(ger),
-                    mainnet = %hex::encode(mainnet_root),
-                    rollup = %hex::encode(rollup_root),
-                    "restore: injected current L1 GER"
-                );
+                    let tx_hash = {
+                        let mut hasher = Keccak256::new();
+                        hasher.update(b"restore-ger-miden-");
+                        hasher.update(note.id().to_string().as_bytes());
+                        format!("0x{}", hex::encode(hasher.finalize()))
+                    };
 
-                ger_count += 1;
-                log_count += 1;
-            }
-        }
-        Err(e) => {
-            tracing::warn!("restore: failed to fetch L1 exit roots: {e:#}");
-        }
-    }
+                    store_clone
+                        .add_ger_update_event(
+                            restore_block,
+                            block_hash,
+                            &tx_hash,
+                            &ger_bytes,
+                            None, // mainnet/rollup roots not stored in note
+                            None,
+                            timestamp,
+                        )
+                        .await?;
 
-    // TODO: For full GER history reconstruction, scan L1 blocks for
-    // insertGlobalExitRoot transactions sent to the GER contract.
-    // This requires indexing L1 transaction calldata, not just event logs.
-    // The bridge-service does this via its L1 synchronizer.
-    //
-    // For now, the latest GER is sufficient because:
-    // - The aggoracle will re-inject any missing GERs on next poll
-    // - The hash chain will be rebuilt incrementally as new GERs arrive
+                    store_clone.mark_ger_injected(ger_bytes).await?;
 
-    let _ = (latest_block, from_block); // suppress unused warnings
+                    tracing::info!(
+                        note_id = %note.id(),
+                        ger = %hex::encode(ger_bytes),
+                        "restore: rebuilt GER from consumed UpdateGerNote"
+                    );
 
-    Ok((ger_count, log_count))
+                    ger_count += 1;
+                    log_count += 1;
+                }
+
+                *result_inner.lock().unwrap() = (ger_count, log_count);
+                Ok(())
+            })
+        })
+        .await?;
+
+    let (count, logs) = *result.lock().unwrap();
+    Ok((count, logs))
 }
+

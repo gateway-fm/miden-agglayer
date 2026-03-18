@@ -171,7 +171,7 @@ pub async fn insert_ger(
     let timestamp = block_state.get_block_timestamp(block_number);
 
     // Check dedup before doing any work
-    let is_new = !store.has_seen_ger(&ger_bytes).await;
+    let is_new = !store.has_seen_ger(&ger_bytes).await?;
 
     if is_new {
         tracing::info!(
@@ -202,7 +202,7 @@ pub async fn insert_ger(
                 rollup_exit_root,
                 timestamp,
             )
-            .await;
+            .await?;
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),

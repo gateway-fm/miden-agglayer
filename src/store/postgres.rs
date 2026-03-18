@@ -15,6 +15,7 @@ use alloy::primitives::{Address, LogData, TxHash, U256};
 use deadpool_postgres::{Manager, Pool};
 use miden_protocol::account::AccountId;
 use miden_protocol::transaction::TransactionId;
+use miden_protocol::Word;
 use sha3::{Digest, Keccak256};
 use tokio_postgres::types::ToSql;
 
@@ -36,51 +37,57 @@ impl PgStore {
     }
 }
 
+/// Parse a TransactionId hex string (from `TransactionId::to_hex()`) back to a
+/// `TransactionId`. The format is `0x` followed by 64 hex chars representing
+/// 32 bytes (4 little-endian Felt u64s).
+fn parse_transaction_id(hex_str: &str) -> Option<TransactionId> {
+    let word = Word::parse(hex_str).ok()?;
+    Some(TransactionId::from_raw(word))
+}
+
 #[async_trait::async_trait]
 impl Store for PgStore {
     // ── Block number ─────────────────────────────────────────────
 
-    async fn get_latest_block_number(&self) -> u64 {
-        let client = self.pool.get().await.unwrap();
+    async fn get_latest_block_number(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
         let row = client
             .query_one(
                 "SELECT latest_block_number FROM service_state WHERE id = 1",
                 &[],
             )
-            .await
-            .unwrap();
+            .await?;
         let val: i64 = row.get(0);
-        val as u64
+        Ok(val as u64)
     }
 
-    async fn set_latest_block_number(&self, n: u64) {
-        let client = self.pool.get().await.unwrap();
+    async fn set_latest_block_number(&self, n: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
         client
             .execute(
                 "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
                 &[&(n as i64)],
             )
-            .await
-            .unwrap();
+            .await?;
+        Ok(())
     }
 
-    async fn advance_block_number(&self) -> u64 {
-        let client = self.pool.get().await.unwrap();
+    async fn advance_block_number(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
         let row = client
             .query_one(
                 "UPDATE service_state SET latest_block_number = latest_block_number + 1, updated_at = now() WHERE id = 1 RETURNING latest_block_number",
                 &[],
             )
-            .await
-            .unwrap();
+            .await?;
         let val: i64 = row.get(0);
-        val as u64
+        Ok(val as u64)
     }
 
     // ── Logs ─────────────────────────────────────────────────────
 
-    async fn add_log(&self, log: SyntheticLog) {
-        let client = self.pool.get().await.unwrap();
+    async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
 
         // Get and increment log_counter atomically
         let row = client
@@ -88,8 +95,7 @@ impl Store for PgStore {
                 "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
                 &[],
             )
-            .await
-            .unwrap();
+            .await?;
         let log_index: i64 = row.get(0);
 
         let topics: Vec<&str> = log.topics.iter().map(|s| s.as_str()).collect();
@@ -109,18 +115,22 @@ impl Store for PgStore {
                     &log.removed,
                 ],
             )
-            .await
-            .unwrap();
+            .await?;
 
         tracing::debug!(
             block_number = log.block_number,
             tx_hash = %log.transaction_hash,
             "PgStore: log inserted"
         );
+        Ok(())
     }
 
-    async fn get_logs(&self, filter: &LogFilter, current_block: u64) -> Vec<SyntheticLog> {
-        let client = self.pool.get().await.unwrap();
+    async fn get_logs(
+        &self,
+        filter: &LogFilter,
+        current_block: u64,
+    ) -> anyhow::Result<Vec<SyntheticLog>> {
+        let client = self.pool.get().await?;
         let from = filter.from_block_number(current_block) as i64;
         let to = filter.to_block_number(current_block) as i64;
 
@@ -159,13 +169,14 @@ impl Store for PgStore {
             })
             .collect();
 
-        logs.into_iter()
+        Ok(logs
+            .into_iter()
             .filter(|l| filter.matches(l, current_block))
-            .collect()
+            .collect())
     }
 
-    async fn get_logs_for_tx(&self, tx_hash: &str) -> Vec<SyntheticLog> {
-        let client = self.pool.get().await.unwrap();
+    async fn get_logs_for_tx(&self, tx_hash: &str) -> anyhow::Result<Vec<SyntheticLog>> {
+        let client = self.pool.get().await?;
         let key = tx_hash.to_lowercase();
 
         let rows = client
@@ -179,7 +190,8 @@ impl Store for PgStore {
             .await
             .unwrap_or_default();
 
-        rows.iter()
+        Ok(rows
+            .iter()
             .map(|r| {
                 let bh_bytes: &[u8] = r.get(5);
                 let mut bh = [0u8; 32];
@@ -199,13 +211,13 @@ impl Store for PgStore {
                     removed: r.get(8),
                 }
             })
-            .collect()
+            .collect())
     }
 
     // ── GER ──────────────────────────────────────────────────────
 
-    async fn has_seen_ger(&self, ger: &[u8; 32]) -> bool {
-        let client = self.pool.get().await.unwrap();
+    async fn has_seen_ger(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
         let rows = client
             .query(
                 "SELECT 1 FROM ger_entries WHERE ger_hash = $1",
@@ -213,11 +225,11 @@ impl Store for PgStore {
             )
             .await
             .unwrap_or_default();
-        !rows.is_empty()
+        Ok(!rows.is_empty())
     }
 
-    async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> bool {
-        let client = self.pool.get().await.unwrap();
+    async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
         let mainnet: Option<Vec<u8>> = entry.mainnet_exit_root.map(|r| r.to_vec());
         let rollup: Option<Vec<u8>> = entry.rollup_exit_root.map(|r| r.to_vec());
 
@@ -236,11 +248,11 @@ impl Store for PgStore {
             )
             .await
             .unwrap_or(0);
-        result > 0
+        Ok(result > 0)
     }
 
-    async fn get_latest_ger(&self) -> Option<[u8; 32]> {
-        let client = self.pool.get().await.unwrap();
+    async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        let client = self.pool.get().await?;
         let rows = client
             .query(
                 "SELECT ger_hash FROM ger_entries ORDER BY created_at DESC LIMIT 1",
@@ -249,7 +261,7 @@ impl Store for PgStore {
             .await
             .unwrap_or_default();
 
-        rows.first().and_then(|r| {
+        Ok(rows.first().and_then(|r| {
             let bytes: &[u8] = r.get(0);
             let mut buf = [0u8; 32];
             if bytes.len() == 32 {
@@ -258,11 +270,11 @@ impl Store for PgStore {
             } else {
                 None
             }
-        })
+        }))
     }
 
-    async fn get_ger_entry(&self, ger: &[u8; 32]) -> Option<GerEntry> {
-        let client = self.pool.get().await.unwrap();
+    async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>> {
+        let client = self.pool.get().await?;
         let rows = client
             .query(
                 "SELECT mainnet_exit_root, rollup_exit_root, block_number, timestamp FROM ger_entries WHERE ger_hash = $1",
@@ -271,7 +283,7 @@ impl Store for PgStore {
             .await
             .unwrap_or_default();
 
-        rows.first().map(|r| {
+        Ok(rows.first().map(|r| {
             let mainnet: Option<&[u8]> = r.get(0);
             let rollup: Option<&[u8]> = r.get(1);
             GerEntry {
@@ -286,11 +298,11 @@ impl Store for PgStore {
                 block_number: r.get::<_, i64>(2) as u64,
                 timestamp: r.get::<_, i64>(3) as u64,
             }
-        })
+        }))
     }
 
-    async fn is_ger_injected(&self, ger: &[u8; 32]) -> bool {
-        let client = self.pool.get().await.unwrap();
+    async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
         let rows = client
             .query(
                 "SELECT is_injected FROM ger_entries WHERE ger_hash = $1 AND is_injected = TRUE",
@@ -298,20 +310,20 @@ impl Store for PgStore {
             )
             .await
             .unwrap_or_default();
-        !rows.is_empty()
+        Ok(!rows.is_empty())
     }
 
-    async fn mark_ger_injected(&self, ger: [u8; 32]) {
-        let client = self.pool.get().await.unwrap();
-        // Upsert: if not in ger_entries yet, insert with is_injected=true
-        let _ = client
+    async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
             .execute(
                 "INSERT INTO ger_entries (ger_hash, block_number, timestamp, is_injected)
                  VALUES ($1, 0, 0, TRUE)
                  ON CONFLICT (ger_hash) DO UPDATE SET is_injected = TRUE",
                 &[&ger.as_slice()],
             )
-            .await;
+            .await?;
+        Ok(())
     }
 
     async fn add_ger_update_event(
@@ -323,7 +335,7 @@ impl Store for PgStore {
         mainnet_exit_root: Option<[u8; 32]>,
         rollup_exit_root: Option<[u8; 32]>,
         timestamp: u64,
-    ) {
+    ) -> anyhow::Result<()> {
         self.mark_ger_seen(
             global_exit_root,
             GerEntry {
@@ -333,17 +345,18 @@ impl Store for PgStore {
                 timestamp,
             },
         )
-        .await;
+        .await?;
 
-        // Atomically read + update hash chain
-        let client = self.pool.get().await.unwrap();
-        let row = client
+        // Task 2: Wrap hash chain read-compute-write in a DB transaction
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        let row = txn
             .query_one(
-                "SELECT hash_chain_value FROM service_state WHERE id = 1",
+                "SELECT hash_chain_value FROM service_state WHERE id = 1 FOR UPDATE",
                 &[],
             )
-            .await
-            .unwrap();
+            .await?;
         let old_bytes: &[u8] = row.get(0);
         let mut old_chain = [0u8; 32];
         if old_bytes.len() == 32 {
@@ -355,13 +368,13 @@ impl Store for PgStore {
         hasher.update(global_exit_root);
         let new_chain: [u8; 32] = hasher.finalize().into();
 
-        client
-            .execute(
-                "UPDATE service_state SET hash_chain_value = $1, updated_at = now() WHERE id = 1",
-                &[&new_chain.as_slice()],
-            )
-            .await
-            .unwrap();
+        txn.execute(
+            "UPDATE service_state SET hash_chain_value = $1, updated_at = now() WHERE id = 1",
+            &[&new_chain.as_slice()],
+        )
+        .await?;
+
+        txn.commit().await?;
 
         let log = SyntheticLog {
             address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
@@ -378,7 +391,7 @@ impl Store for PgStore {
             log_index: 0,
             removed: false,
         };
-        self.add_log(log).await;
+        self.add_log(log).await
     }
 
     // ── Transactions ─────────────────────────────────────────────
@@ -386,7 +399,7 @@ impl Store for PgStore {
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         let hash_str = format!("{tx_hash:#x}");
-        let miden_id = entry.id.map(|id| id.to_string());
+        let miden_id = entry.id.map(|id| id.to_hex());
         let signer_str = format!("{:#x}", entry.signer);
 
         // Serialize envelope to RLP bytes
@@ -484,7 +497,7 @@ impl Store for PgStore {
                     log_index: 0,
                     removed: false,
                 };
-                self.add_log(log).await;
+                self.add_log(log).await?;
             }
         } else if let Err(ref err) = result {
             tracing::error!("PgStore: failed txn {tx_hash}: {err}");
@@ -493,8 +506,11 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn txn_receipt(&self, tx_hash: TxHash) -> Option<(Result<(), String>, u64)> {
-        let client = self.pool.get().await.ok()?;
+    async fn txn_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<Option<(Result<(), String>, u64)>> {
+        let client = self.pool.get().await?;
         let hash_str = format!("{tx_hash:#x}");
 
         let rows = client
@@ -505,23 +521,25 @@ impl Store for PgStore {
             .await
             .unwrap_or_default();
 
-        let row = rows.first()?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
         let status: &str = row.get(0);
         let error_msg: Option<&str> = row.get(1);
         let block_num: i64 = row.get(2);
 
         match status {
-            "success" => Some((Ok(()), block_num as u64)),
-            "failed" => Some((
+            "success" => Ok(Some((Ok(()), block_num as u64))),
+            "failed" => Ok(Some((
                 Err(error_msg.unwrap_or("unknown error").to_string()),
                 block_num as u64,
-            )),
-            _ => None, // pending
+            ))),
+            _ => Ok(None), // pending
         }
     }
 
-    async fn txn_get(&self, tx_hash: TxHash) -> Option<TxnData> {
-        let client = self.pool.get().await.ok()?;
+    async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>> {
+        let client = self.pool.get().await?;
         let hash_str = format!("{tx_hash:#x}");
 
         let rows = client
@@ -533,7 +551,9 @@ impl Store for PgStore {
             .await
             .unwrap_or_default();
 
-        let row = rows.first()?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
         let envelope_bytes: &[u8] = row.get(1);
         let signer_str: &str = row.get(2);
         let expires_at: Option<i64> = row.get(3);
@@ -543,8 +563,12 @@ impl Store for PgStore {
 
         // Deserialize envelope
         use alloy::eips::Decodable2718;
-        let envelope = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).ok()?;
-        let signer: Address = signer_str.parse().ok()?;
+        let Some(envelope) = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).ok() else {
+            return Ok(None);
+        };
+        let Some(signer) = signer_str.parse::<Address>().ok() else {
+            return Ok(None);
+        };
 
         let result = match status {
             "success" => Some(Ok(())),
@@ -580,21 +604,18 @@ impl Store for PgStore {
             })
             .collect();
 
+        // Task 3: Deserialize TransactionId from stored hex string
         let miden_id_str: Option<&str> = row.get(0);
         let id = miden_id_str.and_then(|s| {
-            // TransactionId is a digest; parse from hex
-            let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                // TransactionId::new takes [Felt; 4] — skip for now
-                None
+            let hex_str = if s.starts_with("0x") {
+                s.to_string()
             } else {
-                None
-            }
+                format!("0x{s}")
+            };
+            parse_transaction_id(&hex_str)
         });
 
-        Some(TxnData {
+        Ok(Some(TxnData {
             id,
             envelope,
             signer,
@@ -602,12 +623,15 @@ impl Store for PgStore {
             result,
             block_num: block_num as u64,
             logs,
-        })
+        }))
     }
 
-    async fn txn_pending_by_miden_id(&self, id: TransactionId) -> Option<TxHash> {
-        let client = self.pool.get().await.ok()?;
-        let id_str = id.to_string();
+    async fn txn_pending_by_miden_id(
+        &self,
+        id: TransactionId,
+    ) -> anyhow::Result<Option<TxHash>> {
+        let client = self.pool.get().await?;
+        let id_str = id.to_hex();
 
         let rows = client
             .query(
@@ -617,10 +641,10 @@ impl Store for PgStore {
             .await
             .unwrap_or_default();
 
-        rows.first().and_then(|r| {
+        Ok(rows.first().and_then(|r| {
             let hash_str: &str = r.get(0);
             hash_str.parse().ok()
-        })
+        }))
     }
 
     async fn txn_commit_pending(
@@ -628,21 +652,23 @@ impl Store for PgStore {
         ids: &[TransactionId],
         block_num: u64,
         block_hash: [u8; 32],
-    ) {
+    ) -> anyhow::Result<()> {
         for id in ids {
-            if let Some(hash) = self.txn_pending_by_miden_id(*id).await {
+            if let Some(hash) = self.txn_pending_by_miden_id(*id).await? {
                 if let Err(e) = self.txn_commit(hash, Ok(()), block_num, block_hash).await {
                     tracing::warn!("PgStore: failed to commit transaction {hash}: {e}");
                 }
             }
         }
+        Ok(())
     }
 
-    async fn txn_expire_pending(&self, block_num: u64, block_hash: [u8; 32]) {
-        let client = match self.pool.get().await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+    async fn txn_expire_pending(
+        &self,
+        block_num: u64,
+        block_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
 
         let rows = client
             .query(
@@ -663,22 +689,23 @@ impl Store for PgStore {
                 }
             }
         }
+        Ok(())
     }
 
     // ── Nonces ───────────────────────────────────────────────────
 
-    async fn nonce_get(&self, addr: &str) -> u64 {
-        let client = self.pool.get().await.unwrap();
+    async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
         let key = addr.to_lowercase();
         let rows = client
             .query("SELECT nonce FROM nonces WHERE address = $1", &[&key])
             .await
             .unwrap_or_default();
-        rows.first().map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0)
+        Ok(rows.first().map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
     }
 
-    async fn nonce_increment(&self, addr: &str) -> u64 {
-        let client = self.pool.get().await.unwrap();
+    async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
         let key = addr.to_lowercase();
         let row = client
             .query_one(
@@ -687,9 +714,8 @@ impl Store for PgStore {
                  RETURNING nonce - 1",
                 &[&key],
             )
-            .await
-            .unwrap();
-        row.get::<_, i64>(0) as u64
+            .await?;
+        Ok(row.get::<_, i64>(0) as u64)
     }
 
     // ── Claims ───────────────────────────────────────────────────
@@ -710,19 +736,20 @@ impl Store for PgStore {
         }
     }
 
-    async fn unclaim(&self, global_index: &U256) {
-        let client = self.pool.get().await.unwrap();
+    async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
         let key = format!("{global_index:#x}");
-        let _ = client
+        client
             .execute(
                 "DELETE FROM claimed_indices WHERE global_index = $1",
                 &[&key],
             )
-            .await;
+            .await?;
+        Ok(())
     }
 
-    async fn is_claimed(&self, global_index: &U256) -> bool {
-        let client = self.pool.get().await.unwrap();
+    async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
         let key = format!("{global_index:#x}");
         let rows = client
             .query(
@@ -731,13 +758,13 @@ impl Store for PgStore {
             )
             .await
             .unwrap_or_default();
-        !rows.is_empty()
+        Ok(!rows.is_empty())
     }
 
     // ── Address mappings ─────────────────────────────────────────
 
-    async fn get_address_mapping(&self, eth: &Address) -> Option<AccountId> {
-        let client = self.pool.get().await.ok()?;
+    async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>> {
+        let client = self.pool.get().await?;
         let key = format!("{eth:#x}");
         let rows = client
             .query(
@@ -747,29 +774,30 @@ impl Store for PgStore {
             .await
             .unwrap_or_default();
 
-        rows.first().and_then(|r| {
+        Ok(rows.first().and_then(|r| {
             let val: &str = r.get(0);
             AccountId::from_hex(val).ok()
-        })
+        }))
     }
 
-    async fn set_address_mapping(&self, eth: Address, miden: AccountId) {
-        let client = self.pool.get().await.unwrap();
+    async fn set_address_mapping(&self, eth: Address, miden: AccountId) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
         let key = format!("{eth:#x}");
         let val = miden.to_hex();
-        let _ = client
+        client
             .execute(
                 "INSERT INTO address_mappings (eth_address, miden_account) VALUES ($1, $2)
                  ON CONFLICT (eth_address) DO UPDATE SET miden_account = $2",
                 &[&key, &val],
             )
-            .await;
+            .await?;
+        Ok(())
     }
 
     // ── Bridge-out ───────────────────────────────────────────────
 
-    async fn is_note_processed(&self, note_id: &str) -> bool {
-        let client = self.pool.get().await.unwrap();
+    async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
         let rows = client
             .query(
                 "SELECT 1 FROM bridge_out_processed WHERE note_id = $1",
@@ -777,11 +805,11 @@ impl Store for PgStore {
             )
             .await
             .unwrap_or_default();
-        !rows.is_empty()
+        Ok(!rows.is_empty())
     }
 
-    async fn mark_note_processed(&self, note_id: String) -> u32 {
-        let client = self.pool.get().await.unwrap();
+    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
+        let client = self.pool.get().await?;
         let row = client
             .query_one(
                 "WITH counter AS (
@@ -793,8 +821,7 @@ impl Store for PgStore {
                  RETURNING deposit_count",
                 &[&note_id],
             )
-            .await
-            .unwrap();
-        row.get::<_, i32>(0) as u32
+            .await?;
+        Ok(row.get::<_, i32>(0) as u32)
     }
 }

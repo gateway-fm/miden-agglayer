@@ -94,23 +94,24 @@ impl Default for InMemoryStore {
 impl Store for InMemoryStore {
     // ── Block number ─────────────────────────────────────────────
 
-    async fn get_latest_block_number(&self) -> u64 {
-        *self.latest_block_number.read()
+    async fn get_latest_block_number(&self) -> anyhow::Result<u64> {
+        Ok(*self.latest_block_number.read())
     }
 
-    async fn set_latest_block_number(&self, n: u64) {
+    async fn set_latest_block_number(&self, n: u64) -> anyhow::Result<()> {
         *self.latest_block_number.write() = n;
+        Ok(())
     }
 
-    async fn advance_block_number(&self) -> u64 {
+    async fn advance_block_number(&self) -> anyhow::Result<u64> {
         let mut num = self.latest_block_number.write();
         *num += 1;
-        *num
+        Ok(*num)
     }
 
     // ── Logs ─────────────────────────────────────────────────────
 
-    async fn add_log(&self, mut log: SyntheticLog) {
+    async fn add_log(&self, mut log: SyntheticLog) -> anyhow::Result<()> {
         let mut counter = self.log_counter.write();
         log.log_index = *counter;
         *counter += 1;
@@ -139,9 +140,14 @@ impl Store for InMemoryStore {
             .push(log.clone());
 
         self.pending_events.write().push(log);
+        Ok(())
     }
 
-    async fn get_logs(&self, filter: &LogFilter, current_block: u64) -> Vec<SyntheticLog> {
+    async fn get_logs(
+        &self,
+        filter: &LogFilter,
+        current_block: u64,
+    ) -> anyhow::Result<Vec<SyntheticLog>> {
         let from = filter.from_block_number(current_block);
         let to = filter.to_block_number(current_block);
 
@@ -171,10 +177,10 @@ impl Store for InMemoryStore {
                 break;
             }
         }
-        result
+        Ok(result)
     }
 
-    async fn get_logs_for_tx(&self, tx_hash: &str) -> Vec<SyntheticLog> {
+    async fn get_logs_for_tx(&self, tx_hash: &str) -> anyhow::Result<Vec<SyntheticLog>> {
         let key = tx_hash.to_lowercase();
         let map = self.logs_by_tx.read();
         let result = map.get(&key).cloned().unwrap_or_default();
@@ -187,40 +193,41 @@ impl Store for InMemoryStore {
                 "Store: get_logs_for_tx miss"
             );
         }
-        result
+        Ok(result)
     }
 
     // ── GER ──────────────────────────────────────────────────────
 
-    async fn has_seen_ger(&self, ger: &[u8; 32]) -> bool {
-        self.seen_gers.read().contains_key(ger)
+    async fn has_seen_ger(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.seen_gers.read().contains_key(ger))
     }
 
-    async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> bool {
+    async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool> {
         let mut seen = self.seen_gers.write();
         if seen.contains_key(ger) {
-            false
+            Ok(false)
         } else {
             seen.insert(*ger, entry);
             *self.latest_ger.write() = Some(*ger);
-            true
+            Ok(true)
         }
     }
 
-    async fn get_latest_ger(&self) -> Option<[u8; 32]> {
-        *self.latest_ger.read()
+    async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        Ok(*self.latest_ger.read())
     }
 
-    async fn get_ger_entry(&self, ger: &[u8; 32]) -> Option<GerEntry> {
-        self.seen_gers.read().get(ger).cloned()
+    async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>> {
+        Ok(self.seen_gers.read().get(ger).cloned())
     }
 
-    async fn is_ger_injected(&self, ger: &[u8; 32]) -> bool {
-        self.injected_gers.read().contains(ger)
+    async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.injected_gers.read().contains(ger))
     }
 
-    async fn mark_ger_injected(&self, ger: [u8; 32]) {
+    async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()> {
         self.injected_gers.write().insert(ger);
+        Ok(())
     }
 
     async fn add_ger_update_event(
@@ -232,7 +239,7 @@ impl Store for InMemoryStore {
         mainnet_exit_root: Option<[u8; 32]>,
         rollup_exit_root: Option<[u8; 32]>,
         timestamp: u64,
-    ) {
+    ) -> anyhow::Result<()> {
         self.mark_ger_seen(
             global_exit_root,
             GerEntry {
@@ -242,7 +249,7 @@ impl Store for InMemoryStore {
                 timestamp,
             },
         )
-        .await;
+        .await?;
 
         let new_hash_chain = {
             let mut hash_chain = self.hash_chain_value.write();
@@ -269,7 +276,7 @@ impl Store for InMemoryStore {
             log_index: 0,
             removed: false,
         };
-        self.add_log(log).await;
+        self.add_log(log).await
     }
 
     // ── Transactions ─────────────────────────────────────────────
@@ -345,29 +352,38 @@ impl Store for InMemoryStore {
                     log_index: 0,
                     removed: false,
                 };
-                self.add_log(log).await;
+                self.add_log(log).await?;
             }
         }
         Ok(())
     }
 
-    async fn txn_receipt(&self, tx_hash: TxHash) -> Option<(Result<(), String>, u64)> {
+    async fn txn_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<Option<(Result<(), String>, u64)>> {
         let txns = self.transactions.lock();
-        let receipt = txns.peek(&tx_hash)?;
+        let Some(receipt) = txns.peek(&tx_hash) else {
+            return Ok(None);
+        };
         if receipt.result.is_none() {
             tracing::debug!(
                 "Store::txn_receipt: {tx_hash} exists but result=None (uncommitted)"
             );
-            return None;
+            return Ok(None);
         }
-        let result = receipt.result.clone()?;
-        Some((result, receipt.block_num))
+        let Some(result) = receipt.result.clone() else {
+            return Ok(None);
+        };
+        Ok(Some((result, receipt.block_num)))
     }
 
-    async fn txn_get(&self, tx_hash: TxHash) -> Option<TxnData> {
+    async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>> {
         let txns = self.transactions.lock();
-        let receipt = txns.peek(&tx_hash)?;
-        Some(TxnData {
+        let Some(receipt) = txns.peek(&tx_hash) else {
+            return Ok(None);
+        };
+        Ok(Some(TxnData {
             id: receipt.id,
             envelope: receipt.envelope.clone(),
             signer: receipt.signer,
@@ -375,17 +391,20 @@ impl Store for InMemoryStore {
             result: receipt.result.clone(),
             block_num: receipt.block_num,
             logs: receipt.logs.clone(),
-        })
+        }))
     }
 
-    async fn txn_pending_by_miden_id(&self, id: TransactionId) -> Option<TxHash> {
+    async fn txn_pending_by_miden_id(
+        &self,
+        id: TransactionId,
+    ) -> anyhow::Result<Option<TxHash>> {
         let txns = self.transactions.lock();
         for (tx_hash, receipt) in txns.iter() {
             if receipt.result.is_none() && receipt.id == Some(id) {
-                return Some(*tx_hash);
+                return Ok(Some(*tx_hash));
             }
         }
-        None
+        Ok(None)
     }
 
     async fn txn_commit_pending(
@@ -393,17 +412,22 @@ impl Store for InMemoryStore {
         ids: &[TransactionId],
         block_num: u64,
         block_hash: [u8; 32],
-    ) {
+    ) -> anyhow::Result<()> {
         for id in ids {
-            if let Some(hash) = self.txn_pending_by_miden_id(*id).await {
+            if let Some(hash) = self.txn_pending_by_miden_id(*id).await? {
                 if let Err(e) = self.txn_commit(hash, Ok(()), block_num, block_hash).await {
                     tracing::warn!("Failed to commit transaction {hash}: {e}");
                 }
             }
         }
+        Ok(())
     }
 
-    async fn txn_expire_pending(&self, block_num: u64, block_hash: [u8; 32]) {
+    async fn txn_expire_pending(
+        &self,
+        block_num: u64,
+        block_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
         let expired: Vec<TxHash> = {
             let txns = self.transactions.lock();
             txns.iter()
@@ -422,25 +446,26 @@ impl Store for InMemoryStore {
                 tracing::warn!("Failed to expire transaction {hash}: {e}");
             }
         }
+        Ok(())
     }
 
     // ── Nonces ───────────────────────────────────────────────────
 
-    async fn nonce_get(&self, addr: &str) -> u64 {
-        *self
+    async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
+        Ok(*self
             .nonces
             .read()
             .get(&addr.to_lowercase())
-            .unwrap_or(&0)
+            .unwrap_or(&0))
     }
 
-    async fn nonce_increment(&self, addr: &str) -> u64 {
+    async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64> {
         let key = addr.to_lowercase();
         let mut nonces = self.nonces.write();
         let nonce = nonces.entry(key).or_insert(0);
         let prev = *nonce;
         *nonce += 1;
-        prev
+        Ok(prev)
     }
 
     // ── Claims ───────────────────────────────────────────────────
@@ -455,36 +480,38 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn unclaim(&self, global_index: &U256) {
+    async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()> {
         self.claimed.write().remove(global_index);
+        Ok(())
     }
 
-    async fn is_claimed(&self, global_index: &U256) -> bool {
-        self.claimed.read().contains(global_index)
+    async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool> {
+        Ok(self.claimed.read().contains(global_index))
     }
 
     // ── Address mappings ─────────────────────────────────────────
 
-    async fn get_address_mapping(&self, eth: &Address) -> Option<AccountId> {
-        self.address_mappings.read().get(eth).copied()
+    async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>> {
+        Ok(self.address_mappings.read().get(eth).copied())
     }
 
-    async fn set_address_mapping(&self, eth: Address, miden: AccountId) {
+    async fn set_address_mapping(&self, eth: Address, miden: AccountId) -> anyhow::Result<()> {
         self.address_mappings.write().insert(eth, miden);
+        Ok(())
     }
 
     // ── Bridge-out ───────────────────────────────────────────────
 
-    async fn is_note_processed(&self, note_id: &str) -> bool {
-        self.processed_notes.read().contains(note_id)
+    async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
+        Ok(self.processed_notes.read().contains(note_id))
     }
 
-    async fn mark_note_processed(&self, note_id: String) -> u32 {
+    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
         self.processed_notes.write().insert(note_id);
         let mut counter = self.deposit_counter.write();
         let deposit_count = *counter;
         *counter += 1;
-        deposit_count
+        Ok(deposit_count)
     }
 }
 
@@ -496,43 +523,43 @@ mod tests {
     #[tokio::test]
     async fn test_block_number() {
         let store = InMemoryStore::new();
-        assert_eq!(store.get_latest_block_number().await, 0);
-        store.set_latest_block_number(42).await;
-        assert_eq!(store.get_latest_block_number().await, 42);
-        assert_eq!(store.advance_block_number().await, 43);
-        assert_eq!(store.get_latest_block_number().await, 43);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 0);
+        store.set_latest_block_number(42).await.unwrap();
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 42);
+        assert_eq!(store.advance_block_number().await.unwrap(), 43);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 43);
     }
 
     #[tokio::test]
     async fn test_nonce() {
         let store = InMemoryStore::new();
-        assert_eq!(store.nonce_get("0xABC").await, 0);
-        assert_eq!(store.nonce_increment("0xABC").await, 0);
-        assert_eq!(store.nonce_increment("0xABC").await, 1);
-        assert_eq!(store.nonce_get("0xabc").await, 2);
+        assert_eq!(store.nonce_get("0xABC").await.unwrap(), 0);
+        assert_eq!(store.nonce_increment("0xABC").await.unwrap(), 0);
+        assert_eq!(store.nonce_increment("0xABC").await.unwrap(), 1);
+        assert_eq!(store.nonce_get("0xabc").await.unwrap(), 2);
     }
 
     #[tokio::test]
     async fn test_claims() {
         let store = InMemoryStore::new();
         let idx = U256::from(42u64);
-        assert!(!store.is_claimed(&idx).await);
+        assert!(!store.is_claimed(&idx).await.unwrap());
         store.try_claim(idx).await.unwrap();
-        assert!(store.is_claimed(&idx).await);
+        assert!(store.is_claimed(&idx).await.unwrap());
         assert!(store.try_claim(idx).await.is_err());
-        store.unclaim(&idx).await;
-        assert!(!store.is_claimed(&idx).await);
+        store.unclaim(&idx).await.unwrap();
+        assert!(!store.is_claimed(&idx).await.unwrap());
         store.try_claim(idx).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_bridge_out_tracker() {
         let store = InMemoryStore::new();
-        assert!(!store.is_note_processed("note1").await);
-        let c = store.mark_note_processed("note1".to_string()).await;
+        assert!(!store.is_note_processed("note1").await.unwrap());
+        let c = store.mark_note_processed("note1".to_string()).await.unwrap();
         assert_eq!(c, 0);
-        assert!(store.is_note_processed("note1").await);
-        let c2 = store.mark_note_processed("note2".to_string()).await;
+        assert!(store.is_note_processed("note1").await.unwrap());
+        let c2 = store.mark_note_processed("note2".to_string()).await.unwrap();
         assert_eq!(c2, 1);
     }
 
@@ -540,18 +567,19 @@ mod tests {
     async fn test_ger_dedup() {
         let store = InMemoryStore::new();
         let ger = [0x11; 32];
-        assert!(!store.has_seen_ger(&ger).await);
+        assert!(!store.has_seen_ger(&ger).await.unwrap());
         store
             .add_ger_update_event(0, [0u8; 32], "0xTx1", &ger, None, None, 0)
-            .await;
-        assert!(store.has_seen_ger(&ger).await);
+            .await
+            .unwrap();
+        assert!(store.has_seen_ger(&ger).await.unwrap());
 
         let filter = LogFilter {
             from_block: Some("0x0".to_string()),
             to_block: Some("0x100".to_string()),
             ..Default::default()
         };
-        let logs = store.get_logs(&filter, 100).await;
+        let logs = store.get_logs(&filter, 100).await.unwrap();
         assert_eq!(logs.len(), 1);
     }
 
@@ -563,12 +591,14 @@ mod tests {
 
         store
             .add_ger_update_event(0, [0u8; 32], "0xTx1", &ger1, None, None, 0)
-            .await;
+            .await
+            .unwrap();
         let hash1 = *store.hash_chain_value.read();
 
         store
             .add_ger_update_event(1, [1u8; 32], "0xTx2", &ger2, None, None, 0)
-            .await;
+            .await
+            .unwrap();
         let hash2 = *store.hash_chain_value.read();
 
         let mut hasher = Keccak256::new();
@@ -600,14 +630,15 @@ mod tests {
                 &[0x33; 20],
                 1000,
             )
-            .await;
+            .await
+            .unwrap();
 
         let filter = LogFilter {
             from_block: Some("0x0".to_string()),
             to_block: Some("0x200".to_string()),
             ..Default::default()
         };
-        let logs = store.get_logs(&filter, 500).await;
+        let logs = store.get_logs(&filter, 500).await.unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].block_number, 100);
     }
@@ -627,7 +658,8 @@ mod tests {
                 log_index: 0,
                 removed: false,
             })
-            .await;
+            .await
+            .unwrap();
 
         let filter = LogFilter {
             from_block: Some("0x0".to_string()),
@@ -637,7 +669,7 @@ mod tests {
             ))]),
             ..Default::default()
         };
-        let logs = store.get_logs(&filter, 500).await;
+        let logs = store.get_logs(&filter, 500).await.unwrap();
         assert_eq!(logs.len(), 1);
     }
 
@@ -655,7 +687,7 @@ mod tests {
         ));
 
         // Not found
-        assert!(store.txn_receipt(tx_hash).await.is_none());
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
 
         // Begin
         store
@@ -671,14 +703,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(store.txn_receipt(tx_hash).await.is_none());
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
 
         // Commit
         store
             .txn_commit(tx_hash, Ok(()), 42, [0u8; 32])
             .await
             .unwrap();
-        let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap();
+        let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
         assert!(res.is_ok());
         assert_eq!(block_num, 42);
     }
@@ -687,20 +719,20 @@ mod tests {
     async fn test_address_mappings() {
         let store = InMemoryStore::new();
         let addr = Address::from([42u8; 20]);
-        assert!(store.get_address_mapping(&addr).await.is_none());
+        assert!(store.get_address_mapping(&addr).await.unwrap().is_none());
 
         let miden_id =
             AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        store.set_address_mapping(addr, miden_id).await;
-        assert_eq!(store.get_address_mapping(&addr).await, Some(miden_id));
+        store.set_address_mapping(addr, miden_id).await.unwrap();
+        assert_eq!(store.get_address_mapping(&addr).await.unwrap(), Some(miden_id));
     }
 
     #[tokio::test]
     async fn test_ger_injected() {
         let store = InMemoryStore::new();
         let ger = [0xAA; 32];
-        assert!(!store.is_ger_injected(&ger).await);
-        store.mark_ger_injected(ger).await;
-        assert!(store.is_ger_injected(&ger).await);
+        assert!(!store.is_ger_injected(&ger).await.unwrap());
+        store.mark_ger_injected(ger).await.unwrap();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
     }
 }

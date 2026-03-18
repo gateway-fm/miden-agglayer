@@ -70,7 +70,7 @@ pub async fn resolve_address(
         return Ok(config.wallet_hardhat.0);
     }
     // 2. Check existing mapping from store
-    if let Some(id) = store.get_address_mapping(&address).await {
+    if let Some(id) = store.get_address_mapping(&address).await? {
         return Ok(id);
     }
     // 3. Try zero-padding (native Miden address)
@@ -84,7 +84,7 @@ pub async fn resolve_address(
         miden_account = %id.to_hex(),
         "AddressMapper: derived new mapping"
     );
-    store.set_address_mapping(address, id).await;
+    store.set_address_mapping(address, id).await?;
     Ok(id)
 }
 

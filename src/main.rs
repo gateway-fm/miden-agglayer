@@ -1,6 +1,7 @@
 use clap::Parser;
 use miden_agglayer_service::block_state::BlockState;
 use miden_agglayer_service::bridge_out::BridgeOutScanner;
+use miden_agglayer_service::l1_client::{AlloyL1Client, L1Client};
 use miden_agglayer_service::service;
 use miden_agglayer_service::service_state::ServiceState;
 use miden_agglayer_service::store::memory::InMemoryStore;
@@ -58,6 +59,14 @@ struct Command {
     /// L1 GER contract address
     #[arg(long, env = "L1_GER_ADDRESS", default_value = "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674")]
     l1_ger_address: String,
+
+    /// L1 RollupManager contract address (eth_call forwarding)
+    #[arg(long, env = "ROLLUP_MANAGER_ADDRESS", default_value = "0x6c6c009cc348976db4a908c92b24433d4f6eda43")]
+    rollup_manager_address: String,
+
+    /// L1 Rollup contract address (eth_call forwarding)
+    #[arg(long, env = "ROLLUP_ADDRESS", default_value = "0x414e9e227e4b589af92200508af5399576530e4e")]
+    rollup_address: String,
 
     /// L1 block to start scanning from during restore
     #[arg(long, env = "L1_FROM_BLOCK", default_value_t = 0)]
@@ -153,7 +162,6 @@ async fn main() -> anyhow::Result<()> {
             &block_state,
             l1_rpc,
             bridge_addr,
-            &command.l1_ger_address,
             command.l1_from_block,
         )
         .await?;
@@ -171,6 +179,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let l1_client: Option<Arc<dyn L1Client>> = command.l1_rpc_url.map(|url| {
+        Arc::new(AlloyL1Client::new(url, command.l1_ger_address.clone())) as Arc<dyn L1Client>
+    });
     let state = ServiceState::new(
         client,
         accounts,
@@ -178,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
         command.network_id,
         store,
         block_state,
-        command.l1_rpc_url,
+        l1_client,
+        command.rollup_manager_address,
+        command.rollup_address,
     );
 
     // Optionally spawn the ClaimSettler background task
@@ -226,8 +239,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("ClaimSettler background task spawned");
     }
 
+    // Initialize metrics
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install metrics recorder");
+    miden_agglayer_service::metrics::init_metrics();
+
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
-    service::serve(url, state.clone()).await?;
+    service::serve(url, state.clone(), metrics_handle).await?;
 
     state.miden_client.shutdown()?;
 
