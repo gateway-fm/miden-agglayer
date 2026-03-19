@@ -24,6 +24,8 @@ case "$test_filter" in
     all)
         "$SCRIPT_DIR/e2e-l1-to-l2.sh"
         echo ""
+        "$SCRIPT_DIR/e2e-ger-decomposition.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-l2-to-l1.sh"
         ;;
     l1-to-l2)
@@ -32,9 +34,12 @@ case "$test_filter" in
     l2-to-l1)
         "$SCRIPT_DIR/e2e-l2-to-l1.sh"
         ;;
+    ger-decomposition)
+        "$SCRIPT_DIR/e2e-ger-decomposition.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|l1-to-l2|l2-to-l1]" >&2
+        echo "Usage: $0 [all|l1-to-l2|l2-to-l1|ger-decomposition]" >&2
         exit 1
         ;;
 esac
