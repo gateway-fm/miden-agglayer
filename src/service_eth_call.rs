@@ -1,5 +1,7 @@
 use crate::hex::hex_decode_prefixed;
-use crate::service_helpers::networkIDCall;
+use crate::service_helpers::{
+    ServiceErrorCode, json_rpc_response_from_result, networkIDCall, store_error,
+};
 use crate::service_state::ServiceState;
 use alloy_core::sol_types::SolCall;
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
@@ -51,7 +53,12 @@ pub(crate) async fn service_eth_call(
         if data.starts_with(&GLOBAL_EXIT_ROOT_MAP_SELECTOR) && data.len() >= 36 {
             let mut ger = [0u8; 32];
             ger.copy_from_slice(&data[4..36]);
-            if service.store.is_ger_injected(&ger).await.unwrap_or(false) {
+            if service
+                .store
+                .is_ger_injected(&ger)
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?
+            {
                 return Ok(JsonRpcResponse::success(
                     answer_id,
                     "0x0000000000000000000000000000000000000000000000000000000000000001",
@@ -65,10 +72,11 @@ pub(crate) async fn service_eth_call(
                 || to_lower == service.rollup_address.to_lowercase()
             {
                 tracing::debug!(to = %to, "forwarding eth_call to L1");
-                match forward_eth_call_to_l1(l1_client.as_ref(), &data_hex, to).await {
-                    Ok(result) => return Ok(JsonRpcResponse::success(answer_id, result)),
-                    Err(e) => tracing::warn!("L1 forward failed: {e:#}"),
-                }
+                return json_rpc_response_from_result(
+                    forward_eth_call_to_l1(l1_client.as_ref(), &data_hex, to).await,
+                    answer_id,
+                    ServiceErrorCode::EthCall,
+                );
             }
         }
     }

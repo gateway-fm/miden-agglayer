@@ -218,6 +218,24 @@ impl Store for InMemoryStore {
         Ok(self.seen_gers.read().get(ger).cloned())
     }
 
+    async fn set_ger_exit_roots(
+        &self,
+        ger: &[u8; 32],
+        mainnet_exit_root: [u8; 32],
+        rollup_exit_root: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let mut seen = self.seen_gers.write();
+        let entry = seen.entry(*ger).or_insert(GerEntry {
+            mainnet_exit_root: None,
+            rollup_exit_root: None,
+            block_number: 0,
+            timestamp: 0,
+        });
+        entry.mainnet_exit_root = Some(mainnet_exit_root);
+        entry.rollup_exit_root = Some(rollup_exit_root);
+        Ok(())
+    }
+
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
         Ok(self.injected_gers.read().contains(ger))
     }
@@ -488,6 +506,11 @@ impl Store for InMemoryStore {
         let deposit_count = *counter;
         *counter += 1;
         Ok(deposit_count)
+    }
+
+    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
+        self.processed_notes.write().remove(note_id);
+        Ok(())
     }
 }
 

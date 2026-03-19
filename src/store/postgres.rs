@@ -306,6 +306,28 @@ impl Store for PgStore {
         }))
     }
 
+    async fn set_ger_exit_roots(
+        &self,
+        ger: &[u8; 32],
+        mainnet_exit_root: [u8; 32],
+        rollup_exit_root: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let mainnet = mainnet_exit_root.to_vec();
+        let rollup = rollup_exit_root.to_vec();
+        client
+            .execute(
+                "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
+                 VALUES ($1, $2, $3, 0, 0)
+                 ON CONFLICT (ger_hash) DO UPDATE
+                 SET mainnet_exit_root = EXCLUDED.mainnet_exit_root,
+                     rollup_exit_root = EXCLUDED.rollup_exit_root",
+                &[&ger.as_slice(), &mainnet, &rollup],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;
         let rows = client
@@ -340,20 +362,24 @@ impl Store for PgStore {
         rollup_exit_root: Option<[u8; 32]>,
         timestamp: u64,
     ) -> anyhow::Result<()> {
-        self.mark_ger_seen(
-            global_exit_root,
-            GerEntry {
-                mainnet_exit_root,
-                rollup_exit_root,
-                block_number,
-                timestamp,
-            },
-        )
-        .await?;
-
-        // Task 2: Wrap hash chain read-compute-write in a DB transaction
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
+
+        let mainnet: Option<Vec<u8>> = mainnet_exit_root.map(|root| root.to_vec());
+        let rollup: Option<Vec<u8>> = rollup_exit_root.map(|root| root.to_vec());
+        txn.execute(
+            "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (ger_hash) DO NOTHING",
+            &[
+                &global_exit_root.as_slice(),
+                &mainnet as &(dyn ToSql + Sync),
+                &rollup as &(dyn ToSql + Sync),
+                &(block_number as i64),
+                &(timestamp as i64),
+            ],
+        )
+        .await?;
 
         let row = txn
             .query_one(
@@ -378,24 +404,41 @@ impl Store for PgStore {
         )
         .await?;
 
-        txn.commit().await?;
-
-        let log = SyntheticLog {
-            address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
-            topics: vec![
-                UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
-                format!("0x{}", hex::encode(global_exit_root)),
-                format!("0x{}", hex::encode(new_chain)),
+        let row = txn
+            .query_one(
+                "UPDATE service_state
+                 SET log_counter = log_counter + 1, updated_at = now()
+                 WHERE id = 1
+                 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+        let topics = vec![
+            UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+            format!("0x{}", hex::encode(global_exit_root)),
+            format!("0x{}", hex::encode(new_chain)),
+        ];
+        let topic_refs: Vec<&str> = topics.iter().map(|topic| topic.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &L2_GLOBAL_EXIT_ROOT_ADDRESS,
+                &topic_refs,
+                &"0x",
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
             ],
-            data: "0x".to_string(),
-            block_number,
-            block_hash,
-            transaction_hash: tx_hash.to_string(),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-        self.add_log(log).await
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(())
     }
 
     // ── Transactions ─────────────────────────────────────────────
@@ -813,5 +856,16 @@ impl Store for PgStore {
             )
             .await?;
         Ok(row.get::<_, i32>(0) as u32)
+    }
+
+    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM bridge_out_processed WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?;
+        Ok(())
     }
 }

@@ -225,7 +225,6 @@ pub async fn insert_ger(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_combined_ger_keccak256() {
         let mainnet = [0x01u8; 32];
@@ -256,4 +255,5 @@ mod tests {
         let b = [0x02u8; 32];
         assert_ne!(combined_ger(&a, &b), combined_ger(&b, &a));
     }
+
 }

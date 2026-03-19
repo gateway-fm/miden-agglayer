@@ -244,7 +244,6 @@ async fn publish_claim_internal(
         .await?;
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
-    // Wait for tx to be committed (same pattern as init's deploy_account)
     let mut committed = false;
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -265,7 +264,7 @@ async fn publish_claim_internal(
         }
     }
     if !committed {
-        tracing::warn!("claim tx {txn_id} not committed after 20s polling — continuing anyway");
+        anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
 
     let event = ClaimEvent::from(params);

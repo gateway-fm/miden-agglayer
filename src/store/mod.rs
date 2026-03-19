@@ -98,6 +98,12 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool>;
     async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>>;
     async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>>;
+    async fn set_ger_exit_roots(
+        &self,
+        ger: &[u8; 32],
+        mainnet_exit_root: [u8; 32],
+        rollup_exit_root: [u8; 32],
+    ) -> anyhow::Result<()>;
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
     async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()>;
     /// Atomically: mark GER seen, update hash chain, emit UpdateHashChainValue log.
@@ -154,6 +160,8 @@ pub trait Store: Send + Sync + 'static {
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
     /// Mark note as processed, return the deposit count assigned to it.
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
+    /// Roll back a processed-note marker when later persistence fails.
+    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;
 
     // === Convenience: claim event log ===
     #[allow(clippy::too_many_arguments)]

@@ -7,7 +7,7 @@ use crate::*;
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, LogData, TxHash};
 use alloy_core::sol_types::SolCall;
 
 struct TransactionData {
@@ -45,36 +45,23 @@ async fn handle_ger_result(
     result: anyhow::Result<ger::GerInsertResult>,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
+    signer: Address,
     service: &ServiceState,
     ger_bytes: [u8; 32],
 ) -> anyhow::Result<()> {
     match result {
-        Ok(_ger_result) => {
+        Ok(ger_result) => {
             service.store.mark_ger_injected(ger_bytes).await?;
             tracing::info!("inserted GER with eth txn: {txn_hash}");
-            // Pass empty logs to store — the GER event is already stored
-            // by insert_ger() → add_ger_update_event(). Passing
-            // log_data here would create a duplicate at the bridge address
-            // instead of the GER contract address.
-            service
-                .store
-                .txn_begin(
-                    txn_hash,
-                    TxnEntry {
-                        id: None,
-                        envelope: txn_envelope,
-                        signer: Address::ZERO,
-                        expires_at: None,
-                        logs: vec![],
-                    },
-                )
-                .await?;
-            let block_num = service.store.get_latest_block_number().await?;
-            let block_hash = service.block_state.get_block_hash(block_num);
-            service
-                .store
-                .txn_commit(txn_hash, Ok(()), block_num, block_hash)
-                .await?;
+            record_local_success_at_block(
+                service,
+                txn_hash,
+                txn_envelope,
+                signer,
+                ger_result.block_number,
+                vec![],
+            )
+            .await?;
             Ok(())
         }
         Err(err) => {
@@ -82,6 +69,56 @@ async fn handle_ger_result(
             Err(err)
         }
     }
+}
+
+async fn record_local_pending_tx(
+    service: &ServiceState,
+    tx_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    expires_at: Option<u64>,
+    logs: Vec<LogData>,
+) -> anyhow::Result<()> {
+    service
+        .store
+        .txn_begin(
+            tx_hash,
+            TxnEntry {
+                id: None,
+                envelope: txn_envelope,
+                signer,
+                expires_at,
+                logs,
+            },
+        )
+        .await
+}
+
+async fn record_local_immediate_success(
+    service: &ServiceState,
+    tx_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    logs: Vec<LogData>,
+) -> anyhow::Result<()> {
+    let block_num = service.store.get_latest_block_number().await?;
+    record_local_success_at_block(service, tx_hash, txn_envelope, signer, block_num, logs).await
+}
+
+async fn record_local_success_at_block(
+    service: &ServiceState,
+    tx_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    block_num: u64,
+    logs: Vec<LogData>,
+) -> anyhow::Result<()> {
+    record_local_pending_tx(service, tx_hash, txn_envelope, signer, None, logs).await?;
+    let block_hash = service.block_state.get_block_hash(block_num);
+    service
+        .store
+        .txn_commit(tx_hash, Ok(()), block_num, block_hash)
+        .await
 }
 
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
@@ -116,15 +153,28 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // Claims targeting a different network: forward to L1 for settlement.
         // Only claims where destinationNetwork matches our network_id are processed
         // as Miden CLAIM notes. All others go to L1.
-        if params.destinationNetwork != service.network_id as u32
-            && let Some(l1_client) = &service.l1_client
-        {
+        if params.destinationNetwork != service.network_id as u32 {
+            let Some(l1_client) = &service.l1_client else {
+                anyhow::bail!(
+                    "claim targets destinationNetwork {} but L1 forwarding is not configured",
+                    params.destinationNetwork
+                );
+            };
             tracing::info!("forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}");
-            let result = l1_client.send_raw_transaction(&input).await;
-            match result {
-                Ok(hash) => tracing::info!("L1 claim tx forwarded: {hash}"),
-                Err(e) => tracing::warn!("L1 claim tx forward failed: {e:#}"),
+            let forwarded_hash = l1_client.send_raw_transaction(&input).await?;
+            if !forwarded_hash.eq_ignore_ascii_case(&format!("{txn_hash:#x}")) {
+                tracing::warn!(
+                    expected = %format!("{txn_hash:#x}"),
+                    actual = %forwarded_hash,
+                    "L1 returned a different transaction hash for forwarded claim"
+                );
             }
+            tracing::info!("L1 claim tx forwarded: {forwarded_hash}");
+            record_local_pending_tx(&service, txn_hash, txn_envelope, signer, None, vec![]).await?;
+            service
+                .store
+                .nonce_increment(&format!("{signer:#x}"))
+                .await?;
             return Ok(txn_hash);
         }
 
@@ -132,6 +182,12 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // CLAIM notes that crash the NTX builder's faucet actor.
         if params.amount.is_zero() {
             tracing::info!("skipping zero-amount claim (genesis batch)");
+            record_local_immediate_success(&service, txn_hash, txn_envelope, signer, vec![])
+                .await?;
+            service
+                .store
+                .nonce_increment(&format!("{signer:#x}"))
+                .await?;
             return Ok(txn_hash);
         }
 
@@ -147,46 +203,12 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         .await;
         match result {
             Ok(claim_result) => {
+                // Note: bridge-service will see this ClaimEvent from both ClaimTxManager and
+                // L2 sync, causing a duplicate key error. See fixtures/bridge-db-patch.sql.
                 let txn_id = claim_result.txn_id;
                 tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
-
-                // Emit ClaimEvent AFTER successful publish_claim.
-                // This ensures the event only appears in the store when the
-                // CLAIM note actually exists on Miden — no state divergence
-                // on failure. We advance the block number so the event appears
-                // in a fresh block the aggsender hasn't synced yet (it needs
-                // ClaimEvent as an imported_exit for certificate generation).
-                //
-                // Known issue: the bridge-service's L2 sync will see this ClaimEvent
-                // and try to store it, but the ClaimTxManager already recorded the
-                // claim when its tx was mined — causing a duplicate key error that
-                // blocks L2 sync. This is a bridge-service bug (no ON CONFLICT
-                // handling in processClaim). It doesn't affect L1→L2 correctness
-                // or certificate settlement, only the bridge-service's ability to
-                // sync subsequent L2 blocks for L2→L1 claim indexing.
                 let block_num = service.store.advance_block_number().await?;
                 let block_hash = service.block_state.get_block_hash(block_num);
-                {
-                    use alloy::sol_types::SolEvent;
-                    let event = claim::ClaimEvent::from(params.clone());
-                    let log_data = event.encode_log_data();
-                    let claim_log = crate::log_synthesis::SyntheticLog {
-                        address: crate::bridge_address::get_bridge_address().to_string(),
-                        topics: log_data.topics().iter().map(|t| t.to_string()).collect(),
-                        data: log_data.data.to_string(),
-                        block_number: block_num,
-                        block_hash,
-                        transaction_hash: format!("{txn_hash:#x}"),
-                        transaction_index: 0,
-                        log_index: 0,
-                        removed: false,
-                    };
-                    service.store.add_log(claim_log).await?;
-                    tracing::info!(
-                        "emitted ClaimEvent at block {block_num} after successful claim"
-                    );
-                }
-
                 service
                     .store
                     .txn_begin(
@@ -217,26 +239,21 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
         let ger_bytes: [u8; 32] = params.root.0;
 
-        // Look up individual exit roots from L1 so zkevm_getExitRootsByGER returns
-        // real values. Without this, bridge-service builds claims with zero roots.
+        // Resolve the combined GER to its L1 mainnet/rollup components.
+        // We only check the latest roots on L1 — if L1 has moved on (rare),
+        // the roots will be resolved lazily via zkevm_getExitRootsByGER.
         let (mainnet_root, rollup_root) = if let Some(l1_client) = &service.l1_client {
             match l1_client.fetch_exit_roots().await {
-                Ok((m, r)) => {
-                    let computed = ger::combined_ger(&m, &r);
-                    if computed == ger_bytes {
-                        tracing::info!(
-                            mainnet = %alloy::hex::encode(m),
-                            rollup = %alloy::hex::encode(r),
-                            "fetched exit roots from L1 (verified)"
-                        );
-                        (Some(m), Some(r))
-                    } else {
-                        tracing::warn!("L1 exit roots stale, storing without decomposition");
-                        (None, None)
-                    }
+                Ok((m, r)) if ger::combined_ger(&m, &r) == ger_bytes => {
+                    tracing::info!("fetched exit roots from L1 (verified)");
+                    (Some(m), Some(r))
+                }
+                Ok(_) => {
+                    tracing::debug!("L1 roots stale, will resolve lazily");
+                    (None, None)
                 }
                 Err(e) => {
-                    tracing::warn!("failed to fetch L1 exit roots: {e:#}");
+                    tracing::warn!("L1 fetch failed: {e:#}");
                     (None, None)
                 }
             }
@@ -258,6 +275,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             .await,
             txn_hash,
             txn_envelope,
+            signer,
             &service,
             ger_bytes,
         )
@@ -285,6 +303,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             .await,
             txn_hash,
             txn_envelope,
+            signer,
             &service,
             combined_ger,
         )
@@ -304,15 +323,92 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::create_test_service;
+    use crate::block_state::BlockState;
+    use crate::l1_client::L1Client;
+    use crate::store::memory::InMemoryStore;
+    use crate::test_helpers::{create_test_service, test_accounts_config};
     use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
     use alloy::eips::Encodable2718;
-    use alloy::primitives::{FixedBytes, Signature, TxHash, U256};
+    use alloy::primitives::{Bytes, FixedBytes, Signature, TxHash, U256};
+    use alloy::rpc::types::Filter;
     use alloy_core::sol_types::SolCall;
+    use alloy_rpc_types_eth::{Log, ReceiptEnvelope, TransactionReceipt};
+    use std::sync::Arc;
+
+    struct ForwardingL1Client {
+        forwarded_result: anyhow::Result<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl L1Client for ForwardingL1Client {
+        async fn eth_call(&self, _to: Address, _data: Bytes) -> anyhow::Result<Bytes> {
+            anyhow::bail!("unused")
+        }
+
+        async fn send_raw_transaction(&self, _raw_tx_hex: &str) -> anyhow::Result<String> {
+            self.forwarded_result
+                .as_ref()
+                .map(|hash| hash.clone())
+                .map_err(|err| anyhow::anyhow!("{err:#}"))
+        }
+
+        async fn fetch_exit_roots(&self) -> anyhow::Result<([u8; 32], [u8; 32])> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_block_number(&self) -> anyhow::Result<u64> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_logs(&self, _filter: &Filter) -> anyhow::Result<Vec<Log>> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_transaction_receipt(
+            &self,
+            _tx_hash: TxHash,
+        ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<Log>>>> {
+            Ok(None)
+        }
+    }
+
+    struct FetchExitRootsL1Client {
+        exit_roots: ([u8; 32], [u8; 32]),
+    }
+
+    #[async_trait::async_trait]
+    impl L1Client for FetchExitRootsL1Client {
+        async fn eth_call(&self, _to: Address, _data: Bytes) -> anyhow::Result<Bytes> {
+            anyhow::bail!("unused")
+        }
+
+        async fn send_raw_transaction(&self, _raw_tx_hex: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn fetch_exit_roots(&self) -> anyhow::Result<([u8; 32], [u8; 32])> {
+            Ok(self.exit_roots)
+        }
+
+        async fn get_block_number(&self) -> anyhow::Result<u64> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_logs(&self, _filter: &Filter) -> anyhow::Result<Vec<Log>> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_transaction_receipt(
+            &self,
+            _tx_hash: TxHash,
+        ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<Log>>>> {
+            Ok(None)
+        }
+    }
 
     /// Encode a legacy transaction with the given calldata into a hex string
     /// suitable for `service_send_raw_txn`.
-    fn encode_legacy_tx(input: Vec<u8>) -> String {
+    fn encode_legacy_tx(input: Vec<u8>) -> (String, Address) {
         let txn = TxLegacy {
             input: input.into(),
             ..Default::default()
@@ -320,9 +416,26 @@ mod tests {
         let signature = Signature::test_signature();
         let signed = Signed::new_unchecked(txn, signature, TxHash::default());
         let envelope = TxEnvelope::Legacy(signed);
+        let signer = envelope.recover_signer().expect("recover signer");
         let mut encoded = Vec::new();
         envelope.encode_2718(&mut encoded);
-        format!("0x{}", ::hex::encode(encoded))
+        (format!("0x{}", ::hex::encode(encoded)), signer)
+    }
+
+    fn create_test_service_with_l1(l1_client: Arc<dyn L1Client>) -> ServiceState {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let block_state = Arc::new(BlockState::new());
+        ServiceState::new(
+            crate::MidenClient::new_test(),
+            test_accounts_config(),
+            1,
+            1,
+            store,
+            block_state,
+            Some(l1_client),
+            String::new(),
+            String::new(),
+        )
     }
 
     #[tokio::test]
@@ -342,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn test_service_send_raw_txn_unhandled_method() {
         let service = create_test_service();
-        let input_hex = encode_legacy_tx(vec![0x12, 0x34, 0x56, 0x78]);
+        let (input_hex, _) = encode_legacy_tx(vec![0x12, 0x34, 0x56, 0x78]);
 
         let result = service_send_raw_txn(service, input_hex).await;
         assert!(result.is_err());
@@ -366,7 +479,7 @@ mod tests {
             root: FixedBytes::from(ger_bytes),
         }
         .abi_encode();
-        let input_hex = encode_legacy_tx(calldata);
+        let (input_hex, _) = encode_legacy_tx(calldata);
 
         let result = service_send_raw_txn(service, input_hex).await;
         assert!(
@@ -400,6 +513,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_insert_global_exit_root_persists_resolved_l1_exit_roots() {
+        let mainnet = [0x55; 32];
+        let rollup = [0x66; 32];
+        let ger_bytes = crate::ger::combined_ger(&mainnet, &rollup);
+        let service = create_test_service_with_l1(Arc::new(FetchExitRootsL1Client {
+            exit_roots: (mainnet, rollup),
+        }));
+        let store = service.store.clone();
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from(ger_bytes),
+        }
+        .abi_encode();
+        let (input_hex, _) = encode_legacy_tx(calldata);
+
+        service_send_raw_txn(service, input_hex).await.unwrap();
+
+        let entry = store.get_ger_entry(&ger_bytes).await.unwrap().unwrap();
+        assert_eq!(entry.mainnet_exit_root, Some(mainnet));
+        assert_eq!(entry.rollup_exit_root, Some(rollup));
+    }
+
+    #[tokio::test]
     async fn test_claim_asset_zero_amount_skipped() {
         let service = create_test_service();
         let store = service.store.clone();
@@ -418,19 +554,22 @@ mod tests {
             metadata: Default::default(),
         }
         .abi_encode();
-        let input_hex = encode_legacy_tx(calldata);
+        let (input_hex, signer) = encode_legacy_tx(calldata);
 
         let result = service_send_raw_txn(service, input_hex).await;
         assert!(
             result.is_ok(),
             "zero-amount claimAsset should succeed: {result:?}"
         );
+        let tx_hash = result.unwrap();
 
         // The claim should NOT be recorded (try_claim is never called for zero-amount)
         assert!(
             !store.is_claimed(&U256::from(1u64)).await.unwrap(),
             "zero-amount claim should not be recorded in store"
         );
+        assert_eq!(store.nonce_get(&format!("{signer:#x}")).await.unwrap(), 1);
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_some());
 
         // No ClaimEvent log should have been emitted
         let filter = crate::log_synthesis::LogFilter {
@@ -483,7 +622,7 @@ mod tests {
             metadata: Default::default(),
         }
         .abi_encode();
-        let input_hex = encode_legacy_tx(calldata);
+        let (input_hex, _) = encode_legacy_tx(calldata);
 
         // publish_claim will fail because the test stub doesn't execute the
         // closure (no real MidenClientLib). That's expected.
@@ -521,5 +660,64 @@ mod tests {
             !store.is_claimed(&global_index).await.unwrap(),
             "claim should be unclaimed after publish_claim failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_claim_tracks_pending_tx_and_nonce() {
+        let expected_hash = format!("{:#x}", TxHash::from([3u8; 32]));
+        let service = create_test_service_with_l1(Arc::new(ForwardingL1Client {
+            forwarded_result: Ok(expected_hash.clone()),
+        }));
+        let store = service.store.clone();
+
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: U256::from(9u64),
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 2,
+            destinationAddress: Address::ZERO,
+            amount: U256::from(1u64),
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+
+        let tx_hash = service_send_raw_txn(service, input_hex).await.unwrap();
+
+        assert_eq!(store.nonce_get(&format!("{signer:#x}")).await.unwrap(), 1);
+        assert!(store.txn_get(tx_hash).await.unwrap().is_some());
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_claim_does_not_ack_failed_l1_submission() {
+        let service = create_test_service_with_l1(Arc::new(ForwardingL1Client {
+            forwarded_result: Err(anyhow::anyhow!("upstream rejected tx")),
+        }));
+        let store = service.store.clone();
+
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: U256::from(10u64),
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 2,
+            destinationAddress: Address::ZERO,
+            amount: U256::from(1u64),
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+
+        let result = service_send_raw_txn(service, input_hex).await;
+        assert!(result.is_err());
+        assert_eq!(store.nonce_get(&format!("{signer:#x}")).await.unwrap(), 0);
     }
 }

@@ -11,8 +11,9 @@
 //! - `restore.rs` — runs at startup before ServiceState exists; still uses
 //!   `ger::fetch_l1_exit_roots()` and raw providers directly.
 
-use alloy::primitives::{Address, Bytes};
+use alloy::primitives::{Address, Bytes, TxHash};
 use alloy::rpc::types::{Filter, Log};
+use alloy_rpc_types_eth::{ReceiptEnvelope, TransactionReceipt};
 
 /// Trait for L1 (Ethereum) interactions used by the service layer.
 #[async_trait::async_trait]
@@ -31,6 +32,12 @@ pub trait L1Client: Send + Sync {
 
     /// Get logs matching a filter from L1.
     async fn get_logs(&self, filter: &Filter) -> anyhow::Result<Vec<Log>>;
+
+    /// Get a transaction receipt from L1.
+    async fn get_transaction_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<alloy_rpc_types_eth::Log>>>>;
 }
 
 /// Production L1 client backed by an alloy HTTP provider.
@@ -88,6 +95,16 @@ impl L1Client for AlloyL1Client {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         Ok(provider.get_logs(filter).await?)
     }
+
+    async fn get_transaction_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<alloy_rpc_types_eth::Log>>>> {
+        use alloy::providers::{Provider, ProviderBuilder};
+
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        Ok(provider.get_transaction_receipt(tx_hash).await?)
+    }
 }
 
 /// No-op L1 client for when L1 is not configured.
@@ -116,6 +133,13 @@ impl L1Client for NoOpL1Client {
     }
 
     async fn get_logs(&self, _filter: &Filter) -> anyhow::Result<Vec<Log>> {
+        anyhow::bail!("L1 not configured")
+    }
+
+    async fn get_transaction_receipt(
+        &self,
+        _tx_hash: TxHash,
+    ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<alloy_rpc_types_eth::Log>>>> {
         anyhow::bail!("L1 not configured")
     }
 }

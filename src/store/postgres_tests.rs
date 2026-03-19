@@ -12,20 +12,22 @@ use super::postgres::PgStore;
 use super::{Store, TxnEntry};
 use crate::log_synthesis::{GerEntry, LogFilter, SyntheticLog};
 use alloy::consensus::{TxEip1559, TxEnvelope};
-use alloy::primitives::{Address, LogData, TxHash, U256};
+use alloy::primitives::{Address, Signature, TxHash, U256};
 
 /// Helper: create a PgStore from DATABASE_URL or skip the test.
-async fn pg_store() -> PgStore {
+async fn pg_store() -> Option<PgStore> {
     let url = match std::env::var("DATABASE_URL") {
-        Ok(u) => u,
+        Ok(url) => url,
         Err(_) => {
             eprintln!("DATABASE_URL not set — skipping PgStore integration test");
-            std::process::exit(0);
+            return None;
         }
     };
-    PgStore::new(&url)
-        .await
-        .expect("failed to connect to PgStore")
+    Some(
+        PgStore::new(&url)
+            .await
+            .expect("failed to connect to PgStore"),
+    )
 }
 
 /// Reset the service_state singleton to defaults before each test.
@@ -55,7 +57,7 @@ fn dummy_txn_entry() -> TxnEntry {
         id: None,
         envelope: TxEnvelope::Eip1559(alloy::consensus::Signed::new_unchecked(
             tx,
-            alloy::primitives::PrimitiveSignature::new(U256::ZERO, U256::ZERO, false),
+            Signature::test_signature(),
             TxHash::ZERO,
         )),
         signer: Address::ZERO,
@@ -68,7 +70,9 @@ fn dummy_txn_entry() -> TxnEntry {
 
 #[tokio::test]
 async fn test_pgstore_block_number() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
     reset_state(&store).await;
 
     store.set_latest_block_number(42).await.unwrap();
@@ -83,7 +87,9 @@ async fn test_pgstore_block_number() {
 
 #[tokio::test]
 async fn test_pgstore_logs() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
     reset_state(&store).await;
 
     let log = dummy_log(10, "0xaaa");
@@ -93,7 +99,8 @@ async fn test_pgstore_logs() {
         from_block: Some("0xa".to_string()),
         to_block: Some("0xa".to_string()),
         address: None,
-        topics: vec![],
+        topics: None,
+        block_hash: None,
     };
     let results = store.get_logs(&filter, 10).await.unwrap();
     assert!(!results.is_empty(), "should find log at block 10");
@@ -106,7 +113,9 @@ async fn test_pgstore_logs() {
 
 #[tokio::test]
 async fn test_pgstore_ger_lifecycle() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
 
     let ger = [0x42u8; 32];
     let entry = GerEntry {
@@ -149,7 +158,9 @@ async fn test_pgstore_ger_lifecycle() {
 
 #[tokio::test]
 async fn test_pgstore_ger_update_event() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
     reset_state(&store).await;
     store.set_latest_block_number(50).await.unwrap();
 
@@ -171,7 +182,9 @@ async fn test_pgstore_ger_update_event() {
 
 #[tokio::test]
 async fn test_pgstore_txn_lifecycle() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
     reset_state(&store).await;
 
     let tx_hash = TxHash::from([0xBBu8; 32]);
@@ -207,7 +220,9 @@ async fn test_pgstore_txn_lifecycle() {
 
 #[tokio::test]
 async fn test_pgstore_txn_failure() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
     reset_state(&store).await;
 
     let tx_hash = TxHash::from([0xCCu8; 32]);
@@ -228,7 +243,9 @@ async fn test_pgstore_txn_failure() {
 
 #[tokio::test]
 async fn test_pgstore_nonces() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
 
     // Use a unique address to avoid collisions with other tests
     let addr = format!(
@@ -255,7 +272,9 @@ async fn test_pgstore_nonces() {
 
 #[tokio::test]
 async fn test_pgstore_claims() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
 
     let idx = U256::from(
         std::time::SystemTime::now()
@@ -281,7 +300,9 @@ async fn test_pgstore_claims() {
 
 #[tokio::test]
 async fn test_pgstore_address_mappings() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
 
     let eth = Address::from([0xAA; 20]);
 
@@ -299,7 +320,9 @@ async fn test_pgstore_address_mappings() {
 
 #[tokio::test]
 async fn test_pgstore_bridge_out() {
-    let store = pg_store().await;
+    let Some(store) = pg_store().await else {
+        return;
+    };
 
     let note_id = format!(
         "test_note_{}",
@@ -311,8 +334,9 @@ async fn test_pgstore_bridge_out() {
 
     assert!(!store.is_note_processed(&note_id).await.unwrap());
 
-    let count = store.mark_note_processed(note_id.clone()).await.unwrap();
-    assert!(count >= 0, "deposit count should be non-negative");
+    let _count = store.mark_note_processed(note_id.clone()).await.unwrap();
 
     assert!(store.is_note_processed(&note_id).await.unwrap());
+    store.unmark_note_processed(&note_id).await.unwrap();
+    assert!(!store.is_note_processed(&note_id).await.unwrap());
 }

@@ -138,101 +138,22 @@ async fn sync_miden_block(
     Ok(block_num)
 }
 
-/// Phase 2: rebuild claimed_indices from bridge-service deposits API.
-///
-/// The bridge-service tracks all deposits and their claim status. We query
-/// it to find deposits targeting our network that have been claimed.
+/// Phase 2: rebuild claimed_indices from authoritative L1 ClaimEvent logs.
 async fn restore_claims(
     store: &Arc<dyn Store>,
     l1_rpc_url: &str,
     bridge_address: &str,
-    _from_block: u64,
+    from_block: u64,
 ) -> anyhow::Result<usize> {
-    // Strategy 1: Query bridge-service REST API for claimed deposits
-    // The bridge-service URL may be available via BRIDGE_SERVICE_URL env var
-    let bridge_service_url = std::env::var("BRIDGE_SERVICE_URL")
-        .unwrap_or_else(|_| "http://localhost:18080".to_string());
-
-    // Try bridge-service API first
-    match restore_claims_from_bridge_service(store, &bridge_service_url).await {
-        Ok(n) => {
-            tracing::info!("restore: {n} claims from bridge-service API");
-            Ok(n)
-        }
-        Err(e) => {
-            tracing::warn!("restore: bridge-service API failed: {e:#}, falling back to L1 logs");
-            // Strategy 2: Fall back to L1 ClaimEvent logs on the bridge contract
-            restore_claims_from_l1(store, l1_rpc_url, bridge_address).await
-        }
-    }
+    restore_claims_from_l1(store, l1_rpc_url, bridge_address, from_block).await
 }
 
-/// Restore claims from bridge-service REST API.
-async fn restore_claims_from_bridge_service(
-    store: &Arc<dyn Store>,
-    bridge_service_url: &str,
-) -> anyhow::Result<usize> {
-    let client = reqwest::Client::new();
-
-    // Query deposits for the zero address (gets all deposits for all destinations)
-    // The bridge-service /bridges endpoint returns deposits by destination address
-    // We need to find all deposits that target our network (network_id=1)
-    let url = format!(
-        "{}/bridges/0x0000000000000000000000000000000000000000",
-        bridge_service_url.trim_end_matches('/')
-    );
-
-    let resp = client.get(&url).send().await?;
-    if !resp.status().is_success() {
-        // Try getting deposits for a wider range — the bridge-service may
-        // return all deposits if we query without address filter
-        anyhow::bail!("bridge-service returned {}", resp.status());
-    }
-
-    #[derive(serde::Deserialize)]
-    struct BridgesResponse {
-        deposits: Option<Vec<Deposit>>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Deposit {
-        global_index: Option<String>,
-        ready_for_claim: Option<bool>,
-        dest_net: Option<u32>,
-    }
-
-    let data: BridgesResponse = resp.json().await?;
-    let mut count = 0usize;
-
-    if let Some(deposits) = data.deposits {
-        for dep in &deposits {
-            // Only count deposits targeting our network (dest_net=1) that have been claimed
-            let Some(ref gi_str) = dep.global_index else {
-                continue;
-            };
-            let gi_str = gi_str.trim_start_matches("0x");
-            let Ok(global_index) = U256::from_str_radix(gi_str, 16) else {
-                continue;
-            };
-
-            if dep.ready_for_claim.unwrap_or(false)
-                && dep.dest_net == Some(1)
-                && !store.is_claimed(&global_index).await?
-                && store.try_claim(global_index).await.is_ok()
-            {
-                count += 1;
-            }
-        }
-    }
-
-    Ok(count)
-}
-
-/// Fallback: restore claims from L1 ClaimEvent logs.
+/// Restore claims from L1 ClaimEvent logs.
 async fn restore_claims_from_l1(
     store: &Arc<dyn Store>,
     l1_rpc_url: &str,
     bridge_address: &str,
+    from_block: u64,
 ) -> anyhow::Result<usize> {
     use alloy::providers::{Provider, ProviderBuilder};
 
@@ -251,7 +172,7 @@ async fn restore_claims_from_l1(
     let filter = alloy::rpc::types::Filter::new()
         .address(bridge_addr)
         .event_signature(alloy::primitives::B256::from(topic_b256))
-        .from_block(0u64)
+        .from_block(from_block)
         .to_block(latest_block);
 
     let logs = provider.get_logs(&filter).await?;
@@ -358,7 +279,7 @@ async fn restore_bridge_outs(
                     let deposit_count =
                         store_clone.mark_note_processed(note_id_str.clone()).await?;
 
-                    store_clone
+                    if let Err(err) = store_clone
                         .add_bridge_event(
                             bridge_address,
                             restore_block,
@@ -372,7 +293,11 @@ async fn restore_bridge_outs(
                             origin_amount,
                             deposit_count,
                         )
-                        .await?;
+                        .await
+                    {
+                        let _ = store_clone.unmark_note_processed(&note_id_str).await;
+                        return Err(err);
+                    }
 
                     tracing::info!(
                         note_id = %note_id_str,

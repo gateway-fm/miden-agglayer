@@ -210,13 +210,19 @@ impl BlockState {
     }
 
     pub fn add_transaction_to_block(&self, block_num: u64, tx_hash: String) {
+        self.ensure_block_exists(block_num);
         if let Some(block) = self.blocks.write().get_mut(&block_num) {
             block.transactions.push(tx_hash);
         }
     }
 
     pub fn get_block_hash(&self, block_num: u64) -> [u8; 32] {
-        SyntheticBlock::compute_hash_for_number(block_num)
+        self.ensure_block_exists(block_num);
+        self.blocks
+            .read()
+            .get(&block_num)
+            .map(|block| block.hash)
+            .unwrap_or_else(|| SyntheticBlock::compute_hash_for_number(block_num))
     }
 }
 

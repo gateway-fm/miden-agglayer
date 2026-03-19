@@ -1,7 +1,7 @@
 use crate::service_state::ServiceState;
-use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
-use alloy::primitives::{Log, TxHash};
-use alloy::rpc::types::TransactionReceipt;
+use alloy::consensus::Eip658Value;
+use alloy::primitives::TxHash;
+use alloy_rpc_types_eth::{Log, Receipt, ReceiptEnvelope, ReceiptWithBloom, TransactionReceipt};
 use std::str::FromStr;
 
 // polycli polls receipts to get the eth_sendRawTransaction status
@@ -10,11 +10,21 @@ use std::str::FromStr;
 pub async fn service_get_txn_receipt(
     service: ServiceState,
     txn_hash: String,
-) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope>>> {
+) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<Log>>>> {
     let txn_hash = TxHash::from_str(&txn_hash)?;
+    let local_tx = service.store.txn_get(txn_hash).await?;
     let (result, block_num) = match service.store.txn_receipt(txn_hash).await? {
         Some((result, block_num)) => (result, block_num),
-        None => return Ok(None),
+        None => {
+            let should_query_l1 = local_tx
+                .as_ref()
+                .map(|txn| txn.id.is_none())
+                .unwrap_or(true);
+            if should_query_l1 && let Some(l1_client) = &service.l1_client {
+                return l1_client.get_transaction_receipt(txn_hash).await;
+            }
+            return Ok(None);
+        }
     };
     let status = result.is_ok();
 
@@ -27,7 +37,7 @@ pub async fn service_get_txn_receipt(
     // Go's types.Receipt unmarshaling fails silently and the EthTxManager
     // treats the tx as "not mined".
     let block_hash = service.block_state.get_block_hash(block_num);
-    let receipt = TransactionReceipt {
+    let receipt: TransactionReceipt<ReceiptEnvelope<Log>> = TransactionReceipt {
         inner: ReceiptEnvelope::Eip1559(receipt_inner),
         transaction_hash: txn_hash,
         transaction_index: Some(0),
@@ -47,10 +57,50 @@ pub async fn service_get_txn_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_state::BlockState;
+    use crate::l1_client::L1Client;
     use crate::store::TxnEntry;
-    use crate::test_helpers::create_test_service;
+    use crate::store::memory::InMemoryStore;
+    use crate::test_helpers::{create_test_service, test_accounts_config};
     use alloy::consensus::TxEnvelope;
-    use alloy::primitives::{Address, TxHash};
+    use alloy::primitives::{Address, Bytes, TxHash};
+    use alloy::rpc::types::Filter;
+    use alloy_rpc_types_eth::Log;
+    use std::sync::Arc;
+
+    struct ReceiptStub {
+        receipt: Option<TransactionReceipt<ReceiptEnvelope<Log>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl L1Client for ReceiptStub {
+        async fn eth_call(&self, _to: Address, _data: Bytes) -> anyhow::Result<Bytes> {
+            anyhow::bail!("unused")
+        }
+
+        async fn send_raw_transaction(&self, _raw_tx_hex: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn fetch_exit_roots(&self) -> anyhow::Result<([u8; 32], [u8; 32])> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_block_number(&self) -> anyhow::Result<u64> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_logs(&self, _filter: &Filter) -> anyhow::Result<Vec<Log>> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_transaction_receipt(
+            &self,
+            _tx_hash: TxHash,
+        ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<Log>>>> {
+            Ok(self.receipt.clone())
+        }
+    }
 
     #[tokio::test]
     async fn test_service_get_txn_receipt_not_found() {
@@ -109,5 +159,44 @@ mod tests {
             receipt.inner.as_receipt().unwrap().status,
             alloy::consensus::Eip658Value::Eip658(true)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_service_get_txn_receipt_falls_back_to_l1() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let block_state = Arc::new(BlockState::new());
+        let tx_hash = TxHash::from([9u8; 32]);
+        let l1_receipt: TransactionReceipt<ReceiptEnvelope<Log>> = TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom::<Receipt<Log>>::default()),
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: Some(alloy::primitives::B256::from([7u8; 32])),
+            block_number: Some(55),
+            gas_used: 0,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+        };
+        let service = ServiceState::new(
+            crate::MidenClient::new_test(),
+            test_accounts_config(),
+            1,
+            1,
+            store,
+            block_state,
+            Some(Arc::new(ReceiptStub {
+                receipt: Some(l1_receipt.clone()),
+            })),
+            String::new(),
+            String::new(),
+        );
+
+        let result = service_get_txn_receipt(service, tx_hash.to_string())
+            .await
+            .unwrap();
+        assert_eq!(result, Some(l1_receipt));
     }
 }

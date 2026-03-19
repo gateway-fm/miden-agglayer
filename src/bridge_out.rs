@@ -221,6 +221,9 @@ impl BridgeOutScanner {
             .await
         {
             tracing::error!("failed to add bridge event: {e}");
+            if let Err(rollback_err) = self.store.unmark_note_processed(&note_id_str).await {
+                tracing::error!("failed to roll back processed note marker: {rollback_err}");
+            }
             return;
         }
 
