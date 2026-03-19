@@ -72,7 +72,7 @@ pub(crate) async fn service_zkevm_get_exit_roots_by_ger(
 
             // If either root is still unresolved, return null so bridge-service
             // retries on the next sync cycle instead of permanently storing
-            // fabricated zero roots. See plans/ger-decomposition-issue.md.
+            // fabricated zero roots. See docs/ger-decomposition.md.
             match (entry.mainnet_exit_root, entry.rollup_exit_root) {
                 (Some(mainnet), Some(rollup)) => Ok(JsonRpcResponse::success(
                     answer_id,

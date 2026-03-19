@@ -2,7 +2,7 @@
 # E2E test: GER decomposition issue — proves that unresolved exit roots
 # return null (not fabricated zero roots) from zkevm_getExitRootsByGER.
 #
-# Background (see plans/ger-decomposition-issue.md):
+# Background (see docs/ger-decomposition.md):
 #   When insertGlobalExitRoot(combinedGER) arrives and L1 has already advanced
 #   to a newer GER, we cannot decompose the combined hash back to its individual
 #   mainnet/rollup exit roots. Before the fix, we returned zero roots which
@@ -62,7 +62,7 @@ pgquery "SELECT 1" >/dev/null || fail "PostgreSQL not reachable on $PG_HOST:$PG_
 
 log "======================================================================"
 log "  GER Decomposition Bug — E2E Regression Test"
-log "  See: plans/ger-decomposition-issue.md"
+log "  See: docs/ger-decomposition.md"
 log "======================================================================"
 echo ""
 
@@ -151,7 +151,7 @@ else
         fail "BUG CONFIRMED: Unresolved GER returned zero roots instead of null!
          bridge-service would store these permanently via ON CONFLICT DO NOTHING.
          Claims against this GER would fail forever (Merkle root mismatch).
-         See plans/ger-decomposition-issue.md for the full root cause chain."
+         See docs/ger-decomposition.md for the full root cause chain."
     else
         fail "Unexpected non-null response for unresolved GER: $RESULT"
     fi
