@@ -195,6 +195,10 @@ e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test
 e2e-ger-decomposition: e2e-up ## Spin up stack + run GER decomposition bug regression test
 	./scripts/e2e-ger-decomposition.sh
 
+.PHONY: e2e-security
+e2e-security: e2e-up ## Spin up stack + run security E2E tests
+	./scripts/e2e-security.sh
+
 .PHONY: e2e
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 
