@@ -34,6 +34,39 @@ impl From<ServiceErrorCode> for JsonRpcErrorReason {
     }
 }
 
+/// Validate a hex-encoded 32-byte hash parameter from JSON-RPC requests.
+///
+/// Strips optional "0x" prefix, decodes hex, and verifies the result is exactly 32 bytes.
+/// Returns a `JsonRpcResponse` error on failure (suitable for `?` in JrpcResult functions).
+pub(crate) fn validate_hex_hash_param(
+    hex_str: &str,
+    field_name: &str,
+    answer_id: axum_jrpc::Id,
+) -> Result<[u8; 32], JsonRpcResponse> {
+    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = hex::decode(stripped).map_err(|_| {
+        JsonRpcResponse::error(
+            answer_id.clone(),
+            JsonRpcError::new(
+                JsonRpcErrorReason::InvalidParams,
+                format!("bad {field_name}"),
+                serde_json::Value::Null,
+            ),
+        )
+    })?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        JsonRpcResponse::error(
+            answer_id,
+            JsonRpcError::new(
+                JsonRpcErrorReason::InvalidParams,
+                format!("{field_name} must be 32 bytes"),
+                serde_json::Value::Null,
+            ),
+        )
+    })?;
+    Ok(arr)
+}
+
 pub(crate) fn store_error(answer_id: axum_jrpc::Id, e: anyhow::Error) -> JsonRpcResponse {
     JsonRpcResponse::error(
         answer_id,
@@ -95,19 +128,26 @@ pub(crate) fn encode_bridge_asset_from_log(log: &crate::log_synthesis::Synthetic
         return "0x".to_string();
     };
 
-    if data_bytes.len() < 8 * 32 {
+    // BridgeEvent ABI field offsets (each field is padded to 32 bytes)
+    const DEST_NET_OFFSET: usize = 3 * 32; // destinationNetwork
+    const DEST_ADDR_OFFSET: usize = 4 * 32; // destinationAddress
+    const AMOUNT_OFFSET: usize = 5 * 32; // amount
+    const MIN_DATA_LEN: usize = 8 * 32;
+
+    if data_bytes.len() < MIN_DATA_LEN {
         return "0x".to_string();
     }
 
     let dest_net = u32::from_be_bytes(
-        data_bytes[3 * 32 + 28..3 * 32 + 32]
+        data_bytes[DEST_NET_OFFSET + 28..DEST_NET_OFFSET + 32]
             .try_into()
             .unwrap_or([0; 4]),
     );
-    let dest_addr: [u8; 20] = data_bytes[4 * 32 + 12..4 * 32 + 32]
+    let dest_addr: [u8; 20] = data_bytes[DEST_ADDR_OFFSET + 12..DEST_ADDR_OFFSET + 32]
         .try_into()
         .unwrap_or([0; 20]);
-    let amount = alloy::primitives::U256::from_be_slice(&data_bytes[5 * 32..6 * 32]);
+    let amount =
+        alloy::primitives::U256::from_be_slice(&data_bytes[AMOUNT_OFFSET..AMOUNT_OFFSET + 32]);
 
     let call = bridgeAssetCall {
         destinationNetwork: dest_net,

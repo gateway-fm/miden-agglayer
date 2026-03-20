@@ -9,7 +9,13 @@ pub(crate) async fn service_get_logs(
 ) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let raw_params: (serde_json::Value,) = request.parse_params()?;
-    let log_filter: LogFilter = serde_json::from_value(raw_params.0).unwrap_or_default();
+    let log_filter: LogFilter = match serde_json::from_value(raw_params.0.clone()) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("eth_getLogs: failed to parse filter params, using default: {e}");
+            LogFilter::default()
+        }
+    };
     let current_block = service
         .store
         .get_latest_block_number()

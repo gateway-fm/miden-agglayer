@@ -37,7 +37,7 @@ async fn json_rpc_endpoint(
 
     let result = json_rpc_handler(service, request).await;
 
-    metrics::counter!("rpc_requests_total", "method" => method_name.clone()).increment(1);
+    metrics::counter!("rpc_requests_total", "method" => method_name.to_string()).increment(1);
     metrics::histogram!("rpc_request_duration_seconds", "method" => method_name)
         .record(start.elapsed().as_secs_f64());
 
@@ -119,23 +119,11 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
         "eth_getBlockByHash" => {
             let params: (String, bool) = request.parse_params()?;
-            let hash_hex = params.0.strip_prefix("0x").unwrap_or(&params.0);
-            let Ok(hash_bytes) = hex::decode(hash_hex) else {
-                let error = JsonRpcError::new(
-                    JsonRpcErrorReason::InvalidParams,
-                    String::from("bad block hash"),
-                    serde_json::Value::Null,
-                );
-                return Err(JsonRpcResponse::error(answer_id, error));
-            };
-            let Ok(hash): Result<[u8; 32], _> = hash_bytes.try_into() else {
-                let error = JsonRpcError::new(
-                    JsonRpcErrorReason::InvalidParams,
-                    String::from("block hash must be 32 bytes"),
-                    serde_json::Value::Null,
-                );
-                return Err(JsonRpcResponse::error(answer_id, error));
-            };
+            let hash = crate::service_helpers::validate_hex_hash_param(
+                &params.0,
+                "block hash",
+                answer_id.clone(),
+            )?;
             let full_txns = params.1;
             let block = service.block_state.get_block_by_hash(&hash);
             match block {

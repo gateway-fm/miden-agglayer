@@ -49,6 +49,7 @@ pub(crate) async fn service_eth_call(
             return Ok(JsonRpcResponse::success(answer_id, network_id_hex));
         }
 
+        // globalExitRootMap(bytes32) selector from PolygonZkEVMGlobalExitRootV2
         const GLOBAL_EXIT_ROOT_MAP_SELECTOR: [u8; 4] = [0x25, 0x7b, 0x36, 0x32];
         if data.starts_with(&GLOBAL_EXIT_ROOT_MAP_SELECTOR) && data.len() >= 36 {
             let mut ger = [0u8; 32];

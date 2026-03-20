@@ -56,7 +56,7 @@ CREATE INDEX idx_txns_miden_id ON transactions (miden_tx_id) WHERE miden_tx_id I
 -- Transaction log data (LogData attached at begin time)
 CREATE TABLE transaction_logs (
     id        BIGSERIAL PRIMARY KEY,
-    tx_hash   TEXT NOT NULL REFERENCES transactions(tx_hash),
+    tx_hash   TEXT NOT NULL REFERENCES transactions(tx_hash) ON DELETE CASCADE,
     topics    BYTEA[] NOT NULL,
     data      BYTEA NOT NULL
 );
@@ -88,10 +88,4 @@ CREATE TABLE bridge_out_processed (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Block -> transaction associations
-CREATE TABLE block_transactions (
-    block_number BIGINT NOT NULL,
-    tx_hash      TEXT NOT NULL,
-    tx_index     INT NOT NULL DEFAULT 0,
-    PRIMARY KEY (block_number, tx_hash)
-);
+-- Note: block_transactions table was removed — it was never referenced in code.

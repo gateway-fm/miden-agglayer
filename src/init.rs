@@ -20,7 +20,6 @@ use miden_standards::note::P2idNote;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct Accounts {
     service: Account,
@@ -66,22 +65,15 @@ async fn deploy_account(
     tracing::info!("deployed {name} account with txn_id {txn_id}");
 
     // Wait for the transaction to be committed (like ajl test's wait_for_tx)
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        client.sync_state().await?;
-        let txns = client
-            .get_transactions(miden_client::store::TransactionFilter::All)
-            .await?;
-        if txns.iter().any(|t| {
-            t.id == txn_id
-                && matches!(
-                    t.status,
-                    miden_client::transaction::TransactionStatus::Committed { .. }
-                )
-        }) {
-            tracing::info!("deploy tx {txn_id} committed");
-            break;
-        }
+    let committed = crate::miden_client::wait_for_transaction_commit(
+        client,
+        txn_id,
+        20,
+        std::time::Duration::from_secs(1),
+    )
+    .await?;
+    if committed {
+        tracing::info!("deploy tx {txn_id} committed");
     }
     Ok(())
 }
@@ -200,26 +192,19 @@ async fn register_faucet_in_bridge(
     );
 
     // Wait for the tx to be committed + extra blocks for NTX builder to process the config note
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        client.sync_state().await?;
-        let txns = client
-            .get_transactions(miden_client::store::TransactionFilter::All)
-            .await?;
-        if txns.iter().any(|t| {
-            t.id == txn_id
-                && matches!(
-                    t.status,
-                    miden_client::transaction::TransactionStatus::Committed { .. }
-                )
-        }) {
-            tracing::info!("register faucet tx {txn_id} committed");
-            // Extra wait for NTX builder to process the config note
-            for _ in 0..5 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                client.sync_state().await?;
-            }
-            break;
+    let committed = crate::miden_client::wait_for_transaction_commit(
+        client,
+        txn_id,
+        20,
+        std::time::Duration::from_secs(1),
+    )
+    .await?;
+    if committed {
+        tracing::info!("register faucet tx {txn_id} committed");
+        // Extra wait for NTX builder to process the config note
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            client.sync_state().await?;
         }
     }
     Ok(())

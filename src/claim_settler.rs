@@ -165,7 +165,12 @@ impl ClaimSettler {
         let url = format!("{}/bridges/{addr}", self.config.bridge_service_url);
         let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
-            return Ok(()); // bridge-service may not be ready yet
+            tracing::warn!(
+                status = %resp.status(),
+                address = %addr,
+                "ClaimSettler: bridge-service returned non-success status (may not be ready yet)"
+            );
+            return Ok(());
         }
         let body: BridgesResponse = resp.json().await?;
 
@@ -274,4 +279,95 @@ fn parse_u256(s: &str) -> anyhow::Result<U256> {
     let stripped = s.trim_start_matches("0x");
     let radix = if s.starts_with("0x") { 16 } else { 10 };
     Ok(U256::from_str_radix(stripped, radix)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_bytes32_valid() {
+        let hex_str = format!("0x{}", "aa".repeat(32));
+        let result = parse_bytes32(&hex_str).unwrap();
+        assert_eq!(result, FixedBytes::from([0xaa; 32]));
+    }
+
+    #[test]
+    fn test_parse_bytes32_no_prefix() {
+        let hex_str = "bb".repeat(32);
+        let result = parse_bytes32(&hex_str).unwrap();
+        assert_eq!(result, FixedBytes::from([0xbb; 32]));
+    }
+
+    #[test]
+    fn test_parse_bytes32_wrong_length() {
+        assert!(parse_bytes32("0xaabb").is_err());
+    }
+
+    #[test]
+    fn test_parse_bytes32_invalid_hex() {
+        assert!(parse_bytes32("0xzzzz").is_err());
+    }
+
+    #[test]
+    fn test_parse_u256_decimal() {
+        let result = parse_u256("12345").unwrap();
+        assert_eq!(result, U256::from(12345u64));
+    }
+
+    #[test]
+    fn test_parse_u256_hex() {
+        let result = parse_u256("0xff").unwrap();
+        assert_eq!(result, U256::from(255u64));
+    }
+
+    #[test]
+    fn test_parse_u256_zero() {
+        assert_eq!(parse_u256("0").unwrap(), U256::ZERO);
+        assert_eq!(parse_u256("0x0").unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn test_parse_proof_array_valid() {
+        let proofs: Vec<String> = (0..32).map(|i| format!("0x{}", format!("{:02x}", i).repeat(32))).collect();
+        let result = parse_proof_array(&proofs).unwrap();
+        assert_eq!(result[0], parse_bytes32(&proofs[0]).unwrap());
+        assert_eq!(result[31], parse_bytes32(&proofs[31]).unwrap());
+    }
+
+    #[test]
+    fn test_parse_proof_array_wrong_count() {
+        let proofs: Vec<String> = (0..31).map(|_| format!("0x{}", "00".repeat(32))).collect();
+        assert!(parse_proof_array(&proofs).is_err());
+    }
+
+    #[test]
+    fn test_claim_settler_tracker_in_memory() {
+        let tracker = ClaimSettlerTracker::new(None).unwrap();
+        assert!(!tracker.is_claimed(42));
+        tracker.mark_claimed(42);
+        assert!(tracker.is_claimed(42));
+        assert!(!tracker.is_claimed(43));
+    }
+
+    #[test]
+    fn test_claim_settler_tracker_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settler_state.json");
+
+        // Create and persist
+        {
+            let tracker = ClaimSettlerTracker::new(Some(path.clone())).unwrap();
+            tracker.mark_claimed(10);
+            tracker.mark_claimed(20);
+        }
+
+        // Reload and verify
+        {
+            let tracker = ClaimSettlerTracker::new(Some(path)).unwrap();
+            assert!(tracker.is_claimed(10));
+            assert!(tracker.is_claimed(20));
+            assert!(!tracker.is_claimed(30));
+        }
+    }
 }

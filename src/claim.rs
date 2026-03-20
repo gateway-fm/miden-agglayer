@@ -79,12 +79,10 @@ fn find_target_faucet(
     } else {
         // Currently defaults all non-ETH tokens to AGG faucet.
         // If a new token is bridged that isn't AGG, the decimal scaling may be wrong.
-        if !token_address.is_zero() {
-            tracing::debug!(
-                token_address = %token_address,
-                "find_target_faucet: mapping non-ETH token to AGG faucet (hardcoded)"
-            );
-        }
+        tracing::debug!(
+            token_address = %token_address,
+            "find_target_faucet: mapping non-ETH token to AGG faucet (hardcoded)"
+        );
         Faucet {
             id: accounts.faucet_agg.0,
             decimals: 8,
@@ -244,26 +242,16 @@ async fn publish_claim_internal(
         .await?;
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
-    let mut committed = false;
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        client.sync_state().await?;
-        let txns = client
-            .get_transactions(miden_client::store::TransactionFilter::All)
-            .await?;
-        if txns.iter().any(|t| {
-            t.id == txn_id
-                && matches!(
-                    t.status,
-                    miden_client::transaction::TransactionStatus::Committed { .. }
-                )
-        }) {
-            tracing::info!("claim tx {txn_id} committed to block");
-            committed = true;
-            break;
-        }
-    }
-    if !committed {
+    let committed = crate::miden_client::wait_for_transaction_commit(
+        client,
+        txn_id,
+        20,
+        std::time::Duration::from_secs(1),
+    )
+    .await?;
+    if committed {
+        tracing::info!("claim tx {txn_id} committed to block");
+    } else {
         anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
 
@@ -343,5 +331,49 @@ mod tests {
         );
         assert_eq!(faucet.origin_token_decimals, 8);
         assert_eq!(faucet.decimals, 8);
+    }
+
+    #[test]
+    fn test_metadata_to_hash_non_empty() {
+        let metadata = Bytes::from(vec![0x01, 0x02, 0x03]);
+        let hash = metadata_to_hash(&metadata);
+        // keccak256([0x01, 0x02, 0x03])
+        let expected =
+            hex::decode("f1885eda54b7a053318cd41e2093220dab15d65381b1157a3633a83bfd5c9239")
+                .unwrap();
+        assert_eq!(hash, expected.as_slice());
+    }
+
+    #[test]
+    fn test_claim_event_from_claim_asset_call() {
+        use alloy::primitives::{Address, U256};
+
+        let call = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: U256::from(42u64),
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 1,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 2,
+            destinationAddress: address!("1234567890abcdef1234567890abcdef12345678"),
+            amount: U256::from(1000u64),
+            metadata: Default::default(),
+        };
+        let event = ClaimEvent::from(call);
+        assert_eq!(event.globalIndex, U256::from(42u64));
+        assert_eq!(event.originNetwork, 1);
+        assert_eq!(event.amount, U256::from(1000u64));
+    }
+
+    #[test]
+    fn test_bytes32_array_to_smt_nodes_converts() {
+        let mut values = [FixedBytes::ZERO; 32];
+        values[0] = FixedBytes::from([0xAA; 32]);
+        values[31] = FixedBytes::from([0xBB; 32]);
+        let nodes = bytes32_array_to_smt_nodes(values);
+        // Verify we get back 32 nodes (basic structural check)
+        assert_eq!(nodes.len(), 32);
     }
 }

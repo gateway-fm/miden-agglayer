@@ -41,69 +41,75 @@ pub trait L1Client: Send + Sync {
 }
 
 /// Production L1 client backed by an alloy HTTP provider.
+///
+/// Caches a parsed URL to avoid re-parsing on every call. The underlying
+/// HTTP transport is stateless, so creating a provider per-call is cheap,
+/// but we avoid the repeated URL parse overhead.
 pub struct AlloyL1Client {
-    rpc_url: String,
+    rpc_url: url::Url,
     ger_address: String,
 }
 
 impl AlloyL1Client {
-    pub fn new(rpc_url: String, ger_address: String) -> Self {
-        Self {
-            rpc_url,
+    pub fn new(rpc_url: String, ger_address: String) -> anyhow::Result<Self> {
+        let parsed: url::Url = rpc_url.parse()?;
+        Ok(Self {
+            rpc_url: parsed,
             ger_address,
-        }
+        })
+    }
+
+    fn provider(&self) -> impl alloy::providers::Provider {
+        alloy::providers::ProviderBuilder::new().connect_http(self.rpc_url.clone())
     }
 }
 
 #[async_trait::async_trait]
 impl L1Client for AlloyL1Client {
     async fn eth_call(&self, to: Address, data: Bytes) -> anyhow::Result<Bytes> {
-        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::providers::Provider;
         use alloy_rpc_types_eth::TransactionRequest;
 
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        let result = provider
+        let result = self
+            .provider()
             .call(TransactionRequest::default().to(to).input(data.into()))
             .await?;
         Ok(result)
     }
 
     async fn send_raw_transaction(&self, raw_tx_hex: &str) -> anyhow::Result<String> {
-        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::providers::Provider;
 
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        let result = provider
+        let result = self
+            .provider()
             .raw_request::<_, String>("eth_sendRawTransaction".into(), [raw_tx_hex])
             .await?;
         Ok(result)
     }
 
     async fn fetch_exit_roots(&self) -> anyhow::Result<([u8; 32], [u8; 32])> {
-        crate::ger::fetch_l1_exit_roots(&self.rpc_url, &self.ger_address).await
+        crate::ger::fetch_l1_exit_roots(self.rpc_url.as_str(), &self.ger_address).await
     }
 
     async fn get_block_number(&self) -> anyhow::Result<u64> {
-        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::providers::Provider;
 
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        Ok(provider.get_block_number().await?)
+        Ok(self.provider().get_block_number().await?)
     }
 
     async fn get_logs(&self, filter: &Filter) -> anyhow::Result<Vec<Log>> {
-        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::providers::Provider;
 
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        Ok(provider.get_logs(filter).await?)
+        Ok(self.provider().get_logs(filter).await?)
     }
 
     async fn get_transaction_receipt(
         &self,
         tx_hash: TxHash,
     ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<alloy_rpc_types_eth::Log>>>> {
-        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::providers::Provider;
 
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        Ok(provider.get_transaction_receipt(tx_hash).await?)
+        Ok(self.provider().get_transaction_receipt(tx_hash).await?)
     }
 }
 

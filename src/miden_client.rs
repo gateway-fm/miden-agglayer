@@ -325,6 +325,34 @@ impl MidenClient {
     }
 }
 
+/// Poll until a transaction is committed on the Miden node.
+///
+/// Returns `true` if committed within the given number of attempts.
+pub async fn wait_for_transaction_commit(
+    client: &mut MidenClientLib,
+    txn_id: miden_protocol::transaction::TransactionId,
+    max_attempts: usize,
+    poll_interval: Duration,
+) -> anyhow::Result<bool> {
+    for _ in 0..max_attempts {
+        tokio::time::sleep(poll_interval).await;
+        client.sync_state().await?;
+        let txns = client
+            .get_transactions(miden_client::store::TransactionFilter::All)
+            .await?;
+        if txns.iter().any(|t| {
+            t.id == txn_id
+                && matches!(
+                    t.status,
+                    miden_client::transaction::TransactionStatus::Committed { .. }
+                )
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -121,6 +121,144 @@ async fn record_local_success_at_block(
         .await
 }
 
+/// Handle a claimAsset transaction: forward to L1, skip zero-amount, or publish claim.
+async fn handle_claim_asset(
+    service: &ServiceState,
+    params: claimAssetCall,
+    txn_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    raw_input: &str,
+) -> anyhow::Result<TxHash> {
+    // Claims targeting a different network: forward to L1 for settlement.
+    // Only claims where destinationNetwork matches our network_id are processed
+    // as Miden CLAIM notes. All others go to L1.
+    if params.destinationNetwork != service.network_id as u32 {
+        let Some(l1_client) = &service.l1_client else {
+            anyhow::bail!(
+                "claim targets destinationNetwork {} but L1 forwarding is not configured",
+                params.destinationNetwork
+            );
+        };
+        tracing::info!("forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}");
+        let forwarded_hash = l1_client.send_raw_transaction(raw_input).await?;
+        if !forwarded_hash.eq_ignore_ascii_case(&format!("{txn_hash:#x}")) {
+            tracing::warn!(
+                expected = %format!("{txn_hash:#x}"),
+                actual = %forwarded_hash,
+                "L1 returned a different transaction hash for forwarded claim"
+            );
+        }
+        tracing::info!("L1 claim tx forwarded: {forwarded_hash}");
+        record_local_pending_tx(service, txn_hash, txn_envelope, signer, None, vec![]).await?;
+        service
+            .store
+            .nonce_increment(&format!("{signer:#x}"))
+            .await?;
+        return Ok(txn_hash);
+    }
+
+    // Skip zero-amount claims (e.g., genesis batch deposit). These create
+    // CLAIM notes that crash the NTX builder's faucet actor.
+    if params.amount.is_zero() {
+        tracing::info!("skipping zero-amount claim (genesis batch)");
+        record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![]).await?;
+        service
+            .store
+            .nonce_increment(&format!("{signer:#x}"))
+            .await?;
+        return Ok(txn_hash);
+    }
+
+    // Lock the claim index. All error paths after this MUST unclaim.
+    service.store.try_claim(params.globalIndex).await?;
+    let result =
+        publish_and_record_claim(service, params.clone(), txn_hash, txn_envelope, signer).await;
+    if let Err(err) = result {
+        let _ = service.store.unclaim(&params.globalIndex).await;
+        tracing::error!("claim failed after lock: {err:#?}");
+        return Err(err);
+    }
+
+    service
+        .store
+        .nonce_increment(&format!("{signer:#x}"))
+        .await?;
+    Ok(txn_hash)
+}
+
+/// Publish a CLAIM note and record the transaction in the store.
+///
+/// Called after `try_claim` succeeds. The caller is responsible for calling
+/// `unclaim()` if this function returns an error.
+async fn publish_and_record_claim(
+    service: &ServiceState,
+    params: claimAssetCall,
+    txn_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+) -> anyhow::Result<()> {
+    let claim_result = claim::publish_claim(
+        params,
+        &service.miden_client,
+        service.accounts.clone(),
+        service.store.clone(),
+        service.store.get_latest_block_number().await?,
+    )
+    .await?;
+
+    // Note: bridge-service will see this ClaimEvent from both ClaimTxManager and
+    // L2 sync, causing a duplicate key error. See fixtures/bridge-db-patch.sql.
+    let txn_id = claim_result.txn_id;
+    tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
+    let block_num = service.store.advance_block_number().await?;
+    let block_hash = service.block_state.get_block_hash(block_num);
+    service
+        .store
+        .txn_begin(
+            txn_hash,
+            TxnEntry {
+                id: Some(txn_id),
+                envelope: txn_envelope,
+                signer,
+                expires_at: Some(claim_result.expires_at),
+                logs: vec![claim_result.log],
+            },
+        )
+        .await?;
+    service
+        .store
+        .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+        .await?;
+    Ok(())
+}
+
+/// Resolve the L1 exit root components for a given combined GER.
+///
+/// Returns `(mainnet_root, rollup_root)` — both `None` if L1 is unavailable or stale.
+async fn resolve_l1_exit_roots(
+    service: &ServiceState,
+    ger_bytes: [u8; 32],
+) -> (Option<[u8; 32]>, Option<[u8; 32]>) {
+    let Some(l1_client) = &service.l1_client else {
+        return (None, None);
+    };
+    match l1_client.fetch_exit_roots().await {
+        Ok((m, r)) if ger::combined_ger(&m, &r) == ger_bytes => {
+            tracing::info!("fetched exit roots from L1 (verified)");
+            (Some(m), Some(r))
+        }
+        Ok(_) => {
+            tracing::debug!("L1 roots stale, will resolve lazily");
+            (None, None)
+        }
+        Err(e) => {
+            tracing::warn!("L1 fetch failed: {e:#}");
+            (None, None)
+        }
+    }
+}
+
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
@@ -149,91 +287,10 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!("claimAsset call");
         let params = claimAssetCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
+        return handle_claim_asset(&service, params, txn_hash, txn_envelope, signer, &input).await;
+    }
 
-        // Claims targeting a different network: forward to L1 for settlement.
-        // Only claims where destinationNetwork matches our network_id are processed
-        // as Miden CLAIM notes. All others go to L1.
-        if params.destinationNetwork != service.network_id as u32 {
-            let Some(l1_client) = &service.l1_client else {
-                anyhow::bail!(
-                    "claim targets destinationNetwork {} but L1 forwarding is not configured",
-                    params.destinationNetwork
-                );
-            };
-            tracing::info!("forwarding L2→L1 claim to L1 (destinationNetwork=0), hash={txn_hash}");
-            let forwarded_hash = l1_client.send_raw_transaction(&input).await?;
-            if !forwarded_hash.eq_ignore_ascii_case(&format!("{txn_hash:#x}")) {
-                tracing::warn!(
-                    expected = %format!("{txn_hash:#x}"),
-                    actual = %forwarded_hash,
-                    "L1 returned a different transaction hash for forwarded claim"
-                );
-            }
-            tracing::info!("L1 claim tx forwarded: {forwarded_hash}");
-            record_local_pending_tx(&service, txn_hash, txn_envelope, signer, None, vec![]).await?;
-            service
-                .store
-                .nonce_increment(&format!("{signer:#x}"))
-                .await?;
-            return Ok(txn_hash);
-        }
-
-        // Skip zero-amount claims (e.g., genesis batch deposit). These create
-        // CLAIM notes that crash the NTX builder's faucet actor.
-        if params.amount.is_zero() {
-            tracing::info!("skipping zero-amount claim (genesis batch)");
-            record_local_immediate_success(&service, txn_hash, txn_envelope, signer, vec![])
-                .await?;
-            service
-                .store
-                .nonce_increment(&format!("{signer:#x}"))
-                .await?;
-            return Ok(txn_hash);
-        }
-
-        service.store.try_claim(params.globalIndex).await?;
-
-        let result = claim::publish_claim(
-            params.clone(),
-            &service.miden_client,
-            service.accounts,
-            service.store.clone(),
-            service.store.get_latest_block_number().await?,
-        )
-        .await;
-        match result {
-            Ok(claim_result) => {
-                // Note: bridge-service will see this ClaimEvent from both ClaimTxManager and
-                // L2 sync, causing a duplicate key error. See fixtures/bridge-db-patch.sql.
-                let txn_id = claim_result.txn_id;
-                tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
-                let block_num = service.store.advance_block_number().await?;
-                let block_hash = service.block_state.get_block_hash(block_num);
-                service
-                    .store
-                    .txn_begin(
-                        txn_hash,
-                        TxnEntry {
-                            id: Some(txn_id),
-                            envelope: txn_envelope,
-                            signer,
-                            expires_at: Some(claim_result.expires_at),
-                            logs: vec![claim_result.log],
-                        },
-                    )
-                    .await?;
-                service
-                    .store
-                    .txn_commit(txn_hash, Ok(()), block_num, block_hash)
-                    .await?;
-            }
-            Err(err) => {
-                let _ = service.store.unclaim(&params.globalIndex).await;
-                tracing::error!("publish_claim failed: {err:#?}");
-                return Err(err);
-            }
-        }
-    } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
+    if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
         tracing::debug!("insertGlobalExitRoot call");
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
@@ -242,24 +299,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // Resolve the combined GER to its L1 mainnet/rollup components.
         // We only check the latest roots on L1 — if L1 has moved on (rare),
         // the roots will be resolved lazily via zkevm_getExitRootsByGER.
-        let (mainnet_root, rollup_root) = if let Some(l1_client) = &service.l1_client {
-            match l1_client.fetch_exit_roots().await {
-                Ok((m, r)) if ger::combined_ger(&m, &r) == ger_bytes => {
-                    tracing::info!("fetched exit roots from L1 (verified)");
-                    (Some(m), Some(r))
-                }
-                Ok(_) => {
-                    tracing::debug!("L1 roots stale, will resolve lazily");
-                    (None, None)
-                }
-                Err(e) => {
-                    tracing::warn!("L1 fetch failed: {e:#}");
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
+        let (mainnet_root, rollup_root) = resolve_l1_exit_roots(&service, ger_bytes).await;
 
         handle_ger_result(
             ger::insert_ger(

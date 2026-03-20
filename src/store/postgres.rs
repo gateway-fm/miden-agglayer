@@ -22,6 +22,15 @@ pub struct PgStore {
     pool: Pool,
 }
 
+/// Convert a byte slice to a fixed 32-byte array, zero-padded if too short.
+fn bytes_to_array_32(bytes: &[u8]) -> [u8; 32] {
+    let mut arr = [0u8; 32];
+    if bytes.len() == 32 {
+        arr.copy_from_slice(bytes);
+    }
+    arr
+}
+
 impl PgStore {
     pub async fn new(database_url: &str) -> anyhow::Result<Self> {
         let config: tokio_postgres::Config = database_url.parse()?;
@@ -147,11 +156,7 @@ impl Store for PgStore {
         let logs: Vec<SyntheticLog> = rows
             .iter()
             .map(|r| {
-                let bh_bytes: &[u8] = r.get(5);
-                let mut bh = [0u8; 32];
-                if bh_bytes.len() == 32 {
-                    bh.copy_from_slice(bh_bytes);
-                }
+                let bh = bytes_to_array_32(r.get(5));
                 let topics: Vec<String> = r.get(2);
                 SyntheticLog {
                     log_index: r.get::<_, i64>(0) as u64,
@@ -191,11 +196,7 @@ impl Store for PgStore {
         Ok(rows
             .iter()
             .map(|r| {
-                let bh_bytes: &[u8] = r.get(5);
-                let mut bh = [0u8; 32];
-                if bh_bytes.len() == 32 {
-                    bh.copy_from_slice(bh_bytes);
-                }
+                let bh = bytes_to_array_32(r.get(5));
                 let topics: Vec<String> = r.get(2);
                 SyntheticLog {
                     log_index: r.get::<_, i64>(0) as u64,
@@ -258,10 +259,8 @@ impl Store for PgStore {
 
         Ok(rows.first().and_then(|r| {
             let bytes: &[u8] = r.get(0);
-            let mut buf = [0u8; 32];
             if bytes.len() == 32 {
-                buf.copy_from_slice(bytes);
-                Some(buf)
+                Some(bytes_to_array_32(bytes))
             } else {
                 None
             }
@@ -282,24 +281,12 @@ impl Store for PgStore {
             let mainnet: Option<&[u8]> = r.get(0);
             let rollup: Option<&[u8]> = r.get(1);
             GerEntry {
-                mainnet_exit_root: mainnet.and_then(|v| {
-                    let mut buf = [0u8; 32];
-                    if v.len() == 32 {
-                        buf.copy_from_slice(v);
-                        Some(buf)
-                    } else {
-                        None
-                    }
-                }),
-                rollup_exit_root: rollup.and_then(|v| {
-                    let mut buf = [0u8; 32];
-                    if v.len() == 32 {
-                        buf.copy_from_slice(v);
-                        Some(buf)
-                    } else {
-                        None
-                    }
-                }),
+                mainnet_exit_root: mainnet
+                    .filter(|v| v.len() == 32)
+                    .map(bytes_to_array_32),
+                rollup_exit_root: rollup
+                    .filter(|v| v.len() == 32)
+                    .map(bytes_to_array_32),
                 block_number: r.get::<_, i64>(2) as u64,
                 timestamp: r.get::<_, i64>(3) as u64,
             }
@@ -387,11 +374,7 @@ impl Store for PgStore {
                 &[],
             )
             .await?;
-        let old_bytes: &[u8] = row.get(0);
-        let mut old_chain = [0u8; 32];
-        if old_bytes.len() == 32 {
-            old_chain.copy_from_slice(old_bytes);
-        }
+        let old_chain = bytes_to_array_32(row.get(0));
 
         let mut hasher = Keccak256::new();
         hasher.update(old_chain);

@@ -309,11 +309,19 @@ async fn test_pgstore_address_mappings() {
     // No mapping initially
     assert!(store.get_address_mapping(&eth).await.unwrap().is_none());
 
-    // Set mapping — we need a valid AccountId. Use a well-known test value.
-    // AccountId requires specific format; let's use the store and just verify
-    // the round-trip works at the SQL level by checking None first.
-    // Since AccountId construction is complex, we verify the "no mapping" case
-    // and trust that set+get works if the SQL is correct (tested via InMemoryStore).
+    // Set + get round-trip
+    let miden_id =
+        miden_protocol::account::AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+    store.set_address_mapping(eth, miden_id).await.unwrap();
+    let retrieved = store.get_address_mapping(&eth).await.unwrap();
+    assert_eq!(retrieved, Some(miden_id));
+
+    // Overwrite with a different value
+    let miden_id2 =
+        miden_protocol::account::AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+    store.set_address_mapping(eth, miden_id2).await.unwrap();
+    let retrieved2 = store.get_address_mapping(&eth).await.unwrap();
+    assert_eq!(retrieved2, Some(miden_id2));
 }
 
 // ── Bridge-out ───────────────────────────────────────────────

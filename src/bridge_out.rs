@@ -136,13 +136,13 @@ impl BridgeOutScanner {
     async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) {
         let note_id_str = note.id().to_string();
 
-        if self
-            .store
-            .is_note_processed(&note_id_str)
-            .await
-            .unwrap_or(false)
-        {
-            return;
+        match self.store.is_note_processed(&note_id_str).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!("B2AGG note {note_id_str}: storage error checking processed state: {e:#}");
+                return;
+            }
         }
 
         let details = note.details();

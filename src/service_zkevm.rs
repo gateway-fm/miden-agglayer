@@ -1,6 +1,5 @@
 use crate::service_helpers::store_error;
 use crate::service_state::ServiceState;
-use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 
 pub(crate) async fn service_zkevm_get_latest_ger(
@@ -26,23 +25,11 @@ pub(crate) async fn service_zkevm_get_exit_roots_by_ger(
 ) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let params: (String,) = request.parse_params()?;
-    let hash_hex = params.0.strip_prefix("0x").unwrap_or(&params.0);
-    let Ok(hash_bytes) = hex::decode(hash_hex) else {
-        let error = JsonRpcError::new(
-            JsonRpcErrorReason::InvalidParams,
-            String::from("bad GER hash"),
-            serde_json::Value::Null,
-        );
-        return Err(JsonRpcResponse::error(answer_id, error));
-    };
-    let Ok(ger): Result<[u8; 32], _> = hash_bytes.try_into() else {
-        let error = JsonRpcError::new(
-            JsonRpcErrorReason::InvalidParams,
-            String::from("GER hash must be 32 bytes"),
-            serde_json::Value::Null,
-        );
-        return Err(JsonRpcResponse::error(answer_id, error));
-    };
+    let ger = crate::service_helpers::validate_hex_hash_param(
+        &params.0,
+        "GER hash",
+        answer_id.clone(),
+    )?;
 
     match service
         .store
