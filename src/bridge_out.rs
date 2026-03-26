@@ -30,9 +30,13 @@ pub fn is_b2agg_note(details: &NoteDetails) -> bool {
 
 /// Extract destination_network and destination_address from B2AGG note storage.
 ///
+/// The destination_address is a standard 20-byte EVM address (e.g. `0xAbC...123`),
+/// NOT a Miden account ID. It comes from the bridge contract's `bridgeAsset()` call
+/// and is stored in the note via `EthAddressFormat::to_elements()`.
+///
 /// Storage layout (6 felts):
 /// - items()[0]: destination_network (u32, byte-swapped via u32::from_le_bytes(dest.to_be_bytes()))
-/// - items()[1..6]: destination_address (5 packed u32 felts = 20 bytes)
+/// - items()[1..6]: destination_address (5 packed u32 felts = 20 bytes EVM address)
 pub fn parse_b2agg_storage(storage: &NoteStorage) -> anyhow::Result<(u32, [u8; 20])> {
     let items = storage.items();
 
