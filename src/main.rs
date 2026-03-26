@@ -47,12 +47,21 @@ struct Command {
     /// Restore mode: reconstruct store state from miden node, then exit
     #[arg(long)]
     restore: bool,
+
+    /// L1 bridge contract address used for synthetic log emission
+    #[arg(
+        long,
+        env = "BRIDGE_ADDRESS",
+        default_value = miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS
+    )]
+    bridge_address: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
+    miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
     tracing::info!("{command:?}");
 
     let miden_store_dir = command.miden_store_dir;
