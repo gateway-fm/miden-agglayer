@@ -35,7 +35,7 @@ format = "pretty"
 
 [auth.local]
 private-keys = [
-    { path = "/etc/agglayer/aggregator.keystore", password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m" },
+  { path = "/etc/agglayer/aggregator.keystore", password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m" },
 ]
 
 [l1]

@@ -50,7 +50,7 @@ URL = "http://miden-agglayer:8546"
 L1ChainID = 2
 
 [AggSender]
-AggSenderPrivateKey = {Path = "/etc/aggkit/aggoracle.keystore", Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"}
+AggSenderPrivateKey = { Path = "/etc/aggkit/aggoracle.keystore", Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m" }
 Mode = "PessimisticProof"
 RollupCreationBlockL1 = 90
 CheckStatusCertificateInterval = "1s"
