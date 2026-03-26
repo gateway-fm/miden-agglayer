@@ -36,15 +36,5 @@ pub fn create_test_service() -> ServiceState {
     let block_state = Arc::new(BlockState::new());
     let miden_client = MidenClient::new_test();
     let accounts = test_accounts_config();
-    ServiceState::new(
-        miden_client,
-        accounts,
-        1,
-        1,
-        store,
-        block_state,
-        None,
-        String::new(),
-        String::new(),
-    )
+    ServiceState::new(miden_client, accounts, 1, 1, store, block_state)
 }

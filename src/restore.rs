@@ -1,27 +1,23 @@
-//! Restore — Reconstruct PgStore state from miden node + L1.
+//! Restore — Reconstruct PgStore state from miden node.
 //!
 //! This module implements disaster recovery: when the PostgreSQL store is
 //! empty (fresh deploy or data loss), it rebuilds all state from authoritative
-//! sources (L1 chain events, miden node consumed notes, miden sync state).
+//! sources (miden node consumed notes, miden sync state).
 //!
 //! ## Algorithm
 //!
 //! Phase 1: Sync miden state → get current block number
-//! Phase 2: Scan L1 ClaimEvent logs → rebuild claimed_indices
-//! Phase 3: Scan miden consumed B2AGG notes → rebuild bridge-out + deposit counter
-//! Phase 4: Scan consumed UpdateGerNote notes on Miden → rebuild GER set + hash chain
-//! Phase 5: Update block number to cover all synthetic logs
-//! Phase 6: Verify counts
+//! Phase 2: Scan miden consumed B2AGG notes → rebuild bridge-out + deposit counter
+//! Phase 3: Scan consumed UpdateGerNote notes on Miden → rebuild GER set + hash chain
+//! Phase 4: Update block number to cover all synthetic logs
+//! Phase 5: Verify counts
 //!
 //! ## GER restoration via consumed notes
 //!
 //! For recovery we only care about consumed notes — actually injected GERs.
-//! L1 is the wrong source because it knows about GERs that may never have been
-//! injected into Miden; you'd have to call the node to verify anyway.
-//!
 //! When the proxy injects a GER, it creates an UpdateGerNote that gets consumed
 //! by the Miden bridge account. The Miden node retains consumed notes, so we can
-//! scan them to reconstruct the full GER history without any L1 dependency.
+//! scan them to reconstruct the full GER history.
 //!
 //! Each consumed UpdateGerNote stores the GER as 8 Felts in note storage.
 //! The consumption block number gives us the ordering for hash chain reconstruction.
@@ -39,10 +35,8 @@ use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
 use crate::bridge_out::{is_b2agg_note, parse_b2agg_storage, resolve_faucet_origin};
-use crate::log_synthesis::CLAIM_EVENT_TOPIC;
 use crate::miden_client::MidenClient;
 use crate::store::Store;
-use alloy::primitives::U256;
 use miden_base_agglayer::UpdateGerNote;
 use miden_client::store::NoteFilter;
 use sha3::{Digest, Keccak256};
@@ -51,22 +45,17 @@ use std::sync::Arc;
 /// Result of a restore operation.
 pub struct RestoreResult {
     pub block_number: u64,
-    pub claims_restored: usize,
     pub bridge_outs_restored: usize,
     pub gers_restored: usize,
     pub logs_created: usize,
 }
 
 /// Run the full restore algorithm.
-#[allow(clippy::too_many_arguments)]
 pub async fn restore(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
-    l1_rpc_url: &str,
-    bridge_address: &str,
-    from_l1_block: u64,
 ) -> anyhow::Result<RestoreResult> {
     tracing::info!("=== RESTORE: starting state reconstruction ===");
 
@@ -79,38 +68,32 @@ pub async fn restore(
     let mut next_block = block_num + 1;
     let mut total_logs = 0usize;
 
-    // Phase 2: Scan L1 ClaimEvent logs
-    tracing::info!("Phase 2: scanning L1 ClaimEvent logs...");
-    let claims = restore_claims(store, l1_rpc_url, bridge_address, from_l1_block).await?;
-    tracing::info!("Phase 2 complete: {claims} claims restored");
-
-    // Phase 3: Scan miden consumed B2AGG notes
-    tracing::info!("Phase 3: scanning miden consumed B2AGG notes...");
+    // Phase 2: Scan miden consumed B2AGG notes
+    tracing::info!("Phase 2: scanning miden consumed B2AGG notes...");
     let (bridge_outs, logs) =
         restore_bridge_outs(store, miden_client, accounts, block_state, next_block).await?;
     next_block += if logs > 0 { 1 } else { 0 };
     total_logs += logs;
-    tracing::info!("Phase 3 complete: {bridge_outs} bridge-outs, {logs} logs");
+    tracing::info!("Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs");
 
-    // Phase 4: Scan consumed UpdateGerNote notes on Miden
-    tracing::info!("Phase 4: scanning consumed UpdateGerNote notes on Miden...");
+    // Phase 3: Scan consumed UpdateGerNote notes on Miden
+    tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
     let (gers, ger_logs) = restore_gers(store, miden_client, block_state, next_block).await?;
     total_logs += ger_logs;
-    tracing::info!("Phase 4 complete: {gers} GERs, {ger_logs} logs");
+    tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
 
-    // Phase 5: Update block number to cover all synthetic logs
+    // Phase 4: Update block number to cover all synthetic logs
     let final_block = next_block + if ger_logs > 0 { 1 } else { 0 };
     store.set_latest_block_number(final_block).await?;
-    tracing::info!("Phase 5: block number set to {final_block}");
+    tracing::info!("Phase 4: block number set to {final_block}");
 
-    // Phase 6: Verify
-    tracing::info!("Phase 6: verification");
-    tracing::info!("  claims={claims}, bridge_outs={bridge_outs}, gers={gers}, logs={total_logs}");
+    // Phase 5: Verify
+    tracing::info!("Phase 5: verification");
+    tracing::info!("  bridge_outs={bridge_outs}, gers={gers}, logs={total_logs}");
     tracing::info!("=== RESTORE: complete ===");
 
     Ok(RestoreResult {
         block_number: final_block,
-        claims_restored: claims,
         bridge_outs_restored: bridge_outs,
         gers_restored: gers,
         logs_created: total_logs,
@@ -122,7 +105,6 @@ async fn sync_miden_block(
     miden_client: &MidenClient,
     store: &Arc<dyn Store>,
 ) -> anyhow::Result<u64> {
-    // Trigger a sync to get the latest block
     miden_client
         .with(|client| {
             Box::new(async move {
@@ -132,68 +114,11 @@ async fn sync_miden_block(
         })
         .await?;
 
-    // The sync listener should have updated the block number,
-    // but if restore runs before listeners are active, read from miden directly
     let block_num = store.get_latest_block_number().await?;
     Ok(block_num)
 }
 
-/// Phase 2: rebuild claimed_indices from authoritative L1 ClaimEvent logs.
-async fn restore_claims(
-    store: &Arc<dyn Store>,
-    l1_rpc_url: &str,
-    bridge_address: &str,
-    from_block: u64,
-) -> anyhow::Result<usize> {
-    restore_claims_from_l1(store, l1_rpc_url, bridge_address, from_block).await
-}
-
-/// Restore claims from L1 ClaimEvent logs.
-async fn restore_claims_from_l1(
-    store: &Arc<dyn Store>,
-    l1_rpc_url: &str,
-    bridge_address: &str,
-    from_block: u64,
-) -> anyhow::Result<usize> {
-    use alloy::providers::{Provider, ProviderBuilder};
-
-    let provider = ProviderBuilder::new().connect_http(l1_rpc_url.parse()?);
-    let latest_block = provider.get_block_number().await?;
-
-    let topic = CLAIM_EVENT_TOPIC
-        .strip_prefix("0x")
-        .unwrap_or(CLAIM_EVENT_TOPIC);
-    let topic_bytes = hex::decode(topic)?;
-    let mut topic_b256 = [0u8; 32];
-    topic_b256.copy_from_slice(&topic_bytes);
-
-    let bridge_addr: alloy::primitives::Address = bridge_address.parse()?;
-
-    let filter = alloy::rpc::types::Filter::new()
-        .address(bridge_addr)
-        .event_signature(alloy::primitives::B256::from(topic_b256))
-        .from_block(from_block)
-        .to_block(latest_block);
-
-    let logs = provider.get_logs(&filter).await?;
-    let mut count = 0usize;
-
-    for log in &logs {
-        let data = log.data().data.as_ref();
-        if data.len() >= 32 {
-            let global_index = U256::from_be_slice(&data[..32]);
-            if !store.is_claimed(&global_index).await?
-                && store.try_claim(global_index).await.is_ok()
-            {
-                count += 1;
-            }
-        }
-    }
-
-    Ok(count)
-}
-
-/// Phase 3: scan miden consumed B2AGG notes and rebuild bridge-out state.
+/// Phase 2: scan miden consumed B2AGG notes and rebuild bridge-out state.
 /// Returns (notes_processed, logs_created).
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
@@ -222,8 +147,6 @@ async fn restore_bridge_outs(
                 let mut count = 0usize;
                 let mut logs = 0usize;
 
-                // TODO: When miden-node adds NoteFilter::ConsumedByScriptRoot,
-                // replace client-side filtering with server-side filter
                 for note in &consumed_notes {
                     let details = note.details();
                     if !is_b2agg_note(details) {
@@ -319,17 +242,7 @@ async fn restore_bridge_outs(
     Ok((count, logs))
 }
 
-/// Phase 4: scan consumed UpdateGerNote notes to rebuild GER state.
-///
-/// For recovery we only care about consumed notes — actually injected GERs.
-/// Each UpdateGerNote stores the GER as 8 Felts in note storage. We extract it,
-/// reconstruct the full GER bytes, and rebuild the hash chain in consumption order.
-///
-/// Currently reads consumed notes via the miden-client gRPC sync.
-/// TODO: switch to a dedicated API endpoint (get_gers() or
-/// NoteFilter::ConsumedByScriptRoot) when the Miden team ships it.
-///
-/// See: https://github.com/0xMiden/protocol/issues/2341
+/// Phase 3: scan consumed UpdateGerNote notes to rebuild GER state.
 async fn restore_gers(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
@@ -356,16 +269,12 @@ async fn restore_gers(
                 let mut ger_count = 0usize;
                 let mut log_count = 0usize;
 
-                // Filter for UpdateGerNote notes by script root
-                // TODO: When miden-node adds NoteFilter::ConsumedByScriptRoot,
-                // replace client-side filtering with server-side filter
                 for note in &consumed_notes {
                     let details = note.details();
                     if details.script().root() != ger_script_root {
                         continue;
                     }
 
-                    // Extract GER from note storage (8 Felts = 32 bytes)
                     let storage = details.storage();
                     let items = storage.items();
                     if items.len() < UpdateGerNote::NUM_STORAGE_ITEMS {
@@ -377,9 +286,6 @@ async fn restore_gers(
                         continue;
                     }
 
-                    // Reconstruct the 32-byte GER from Felt elements.
-                    // ExitRoot stores as 8 Felts, each holding 4 bytes (big-endian u32).
-                    // Convert back: take lower 32 bits of each Felt, concatenate.
                     let mut ger_bytes = [0u8; 32];
                     for (i, felt) in items.iter().take(8).enumerate() {
                         let v: u32 = felt.as_int() as u32;
@@ -403,7 +309,7 @@ async fn restore_gers(
                             block_hash,
                             &tx_hash,
                             &ger_bytes,
-                            None, // mainnet/rollup roots not stored in note
+                            None,
                             None,
                             timestamp,
                         )

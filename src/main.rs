@@ -2,7 +2,6 @@ use anyhow::Context;
 use clap::Parser;
 use miden_agglayer_service::block_state::BlockState;
 use miden_agglayer_service::bridge_out::BridgeOutScanner;
-use miden_agglayer_service::l1_client::{AlloyL1Client, L1Client};
 use miden_agglayer_service::service;
 use miden_agglayer_service::service_state::ServiceState;
 use miden_agglayer_service::store::StoreSyncListener;
@@ -41,49 +40,13 @@ struct Command {
     #[arg(long)]
     init: bool,
 
-    /// L1 RPC URL for reading exit roots during GER injection
-    #[arg(long, env = "L1_RPC_URL")]
-    l1_rpc_url: Option<String>,
-
     /// PostgreSQL connection URL (enables PgStore instead of InMemoryStore)
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
 
-    /// Restore mode: reconstruct store state from miden node + L1, then exit
+    /// Restore mode: reconstruct store state from miden node, then exit
     #[arg(long)]
     restore: bool,
-
-    /// L1 bridge contract address (for restore + ClaimSettler)
-    #[arg(long, env = "BRIDGE_ADDRESS")]
-    bridge_address: Option<String>,
-
-    /// L1 GER contract address
-    #[arg(
-        long,
-        env = "L1_GER_ADDRESS",
-        default_value = "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
-    )]
-    l1_ger_address: String,
-
-    /// L1 RollupManager contract address (eth_call forwarding)
-    #[arg(
-        long,
-        env = "ROLLUP_MANAGER_ADDRESS",
-        default_value = "0x6c6c009cc348976db4a908c92b24433d4f6eda43"
-    )]
-    rollup_manager_address: String,
-
-    /// L1 Rollup contract address (eth_call forwarding)
-    #[arg(
-        long,
-        env = "ROLLUP_ADDRESS",
-        default_value = "0x414e9e227e4b589af92200508af5399576530e4e"
-    )]
-    rollup_address: String,
-
-    /// L1 block to start scanning from during restore
-    #[arg(long, env = "L1_FROM_BLOCK", default_value_t = 0)]
-    l1_from_block: u64,
 }
 
 #[tokio::main]
@@ -160,30 +123,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Run restore if requested
     if command.restore {
-        let l1_rpc = command
-            .l1_rpc_url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--restore requires --l1-rpc-url"))?;
-        let bridge_addr = command
-            .bridge_address
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--restore requires --bridge-address"))?;
-
         let result = miden_agglayer_service::restore::restore(
             &store,
             &client,
             &accounts.0,
             &block_state,
-            l1_rpc,
-            bridge_addr,
-            command.l1_from_block,
         )
         .await?;
 
         tracing::info!(
-            "Restore complete: block={}, claims={}, bridge_outs={}, gers={}, logs={}",
+            "Restore complete: block={}, bridge_outs={}, gers={}, logs={}",
             result.block_number,
-            result.claims_restored,
             result.bridge_outs_restored,
             result.gers_restored,
             result.logs_created,
@@ -193,15 +143,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let l1_client: Option<Arc<dyn L1Client>> = command
-        .l1_rpc_url
-        .map(|url| -> anyhow::Result<Arc<dyn L1Client>> {
-            Ok(Arc::new(AlloyL1Client::new(
-                url,
-                command.l1_ger_address.clone(),
-            )?))
-        })
-        .transpose()?;
     let state = ServiceState::new(
         client,
         accounts,
@@ -209,74 +150,7 @@ async fn main() -> anyhow::Result<()> {
         command.network_id,
         store,
         block_state,
-        l1_client,
-        command.rollup_manager_address,
-        command.rollup_address,
     );
-
-    // Optionally spawn the ClaimSettler background task
-    let _settler_handle = if std::env::var("CLAIM_SETTLER_ENABLED").unwrap_or_default() == "true" {
-        let bridge_service_url = std::env::var("BRIDGE_SERVICE_URL")
-            .unwrap_or_else(|_| "http://bridge-service:8080".to_string());
-        let l1_rpc_url =
-            std::env::var("L1_RPC_URL").unwrap_or_else(|_| "http://localhost:8545".to_string());
-
-        // Warn about non-HTTPS URLs in non-dev environments
-        if !bridge_service_url.starts_with("https://") && !bridge_service_url.contains("localhost")
-        {
-            tracing::warn!("BRIDGE_SERVICE_URL is not HTTPS — vulnerable to MITM in production");
-        }
-        if !l1_rpc_url.starts_with("https://") && !l1_rpc_url.contains("localhost") {
-            tracing::warn!("L1_RPC_URL is not HTTPS — vulnerable to MITM in production");
-        }
-
-        let bridge_address: alloy::primitives::Address = std::env::var("BRIDGE_ADDRESS")
-            .unwrap_or_default()
-            .parse()
-            .context("BRIDGE_ADDRESS must be a valid address for ClaimSettler")?;
-
-        // Read private key into a zeroizing wrapper
-        let private_key_hex = {
-            use zeroize::Zeroize;
-            let mut raw = std::env::var("CLAIM_SETTLER_PRIVATE_KEY")
-                .context("CLAIM_SETTLER_PRIVATE_KEY must be set when CLAIM_SETTLER_ENABLED=true")?;
-            let signer_result: Result<alloy::signers::local::PrivateKeySigner, _> = raw.parse();
-            raw.zeroize();
-            signer_result.context("CLAIM_SETTLER_PRIVATE_KEY must be a valid hex private key")?
-        };
-        let signer = private_key_hex;
-
-        let watch_addresses: Vec<alloy::primitives::Address> =
-            match std::env::var("CLAIM_SETTLER_WATCH_ADDRESSES") {
-                Ok(val) if !val.is_empty() => val
-                    .split(',')
-                    .map(|s| s.trim().parse::<alloy::primitives::Address>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("CLAIM_SETTLER_WATCH_ADDRESSES contains invalid address")?,
-                _ => {
-                    vec![alloy::signers::Signer::address(&signer)]
-                }
-            };
-
-        let persistence_path = miden_store_dir
-            .as_ref()
-            .map(|d: &PathBuf| d.join("claim_settler_tracker.json"));
-
-        let settler_config = miden_agglayer_service::claim_settler::ClaimSettlerConfig {
-            bridge_service_url,
-            l1_rpc_url,
-            bridge_address,
-            signer,
-            watch_addresses,
-            persistence_path,
-        };
-        let settler = miden_agglayer_service::claim_settler::ClaimSettler::new(settler_config)?;
-        let handle = tokio::spawn(settler.run());
-        tracing::info!("ClaimSettler background task spawned");
-        Some(handle)
-    } else {
-        None
-    };
 
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()

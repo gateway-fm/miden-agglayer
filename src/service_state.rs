@@ -1,5 +1,4 @@
 use crate::block_state::BlockState;
-use crate::l1_client::L1Client;
 use crate::store::Store;
 use crate::*;
 use std::sync::Arc;
@@ -13,15 +12,11 @@ pub struct ServiceState {
     pub network_id: u64,
     pub store: Arc<dyn Store>,
     pub block_state: Arc<BlockState>,
-    pub l1_client: Option<Arc<dyn L1Client>>,
-    pub rollup_manager_address: String,
-    pub rollup_address: String,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<ServiceState>();
 
-#[allow(clippy::too_many_arguments)]
 impl ServiceState {
     pub fn new(
         miden_client: MidenClient,
@@ -30,9 +25,6 @@ impl ServiceState {
         network_id: u64,
         store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
-        l1_client: Option<Arc<dyn L1Client>>,
-        rollup_manager_address: String,
-        rollup_address: String,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
@@ -41,9 +33,6 @@ impl ServiceState {
             network_id,
             store,
             block_state,
-            l1_client,
-            rollup_manager_address,
-            rollup_address,
         }
     }
 }

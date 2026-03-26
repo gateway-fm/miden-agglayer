@@ -1,7 +1,5 @@
 use crate::hex::hex_decode_prefixed;
-use crate::service_helpers::{
-    ServiceErrorCode, json_rpc_response_from_result, networkIDCall, store_error,
-};
+use crate::service_helpers::{networkIDCall, store_error};
 use crate::service_state::ServiceState;
 use alloy_core::sol_types::SolCall;
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
@@ -66,36 +64,10 @@ pub(crate) async fn service_eth_call(
                 ));
             }
         }
-
-        if let (Some(l1_client), Some(to)) = (&service.l1_client, &to_addr) {
-            let to_lower = to.to_lowercase();
-            if to_lower == service.rollup_manager_address.to_lowercase()
-                || to_lower == service.rollup_address.to_lowercase()
-            {
-                tracing::debug!(to = %to, "forwarding eth_call to L1");
-                return json_rpc_response_from_result(
-                    forward_eth_call_to_l1(l1_client.as_ref(), &data_hex, to).await,
-                    answer_id,
-                    ServiceErrorCode::EthCall,
-                );
-            }
-        }
     }
 
     Ok(JsonRpcResponse::success(
         answer_id,
         "0x0000000000000000000000000000000000000000000000000000000000000000",
     ))
-}
-
-/// Forward an eth_call to L1 for reading rollup contract state.
-async fn forward_eth_call_to_l1(
-    l1_client: &dyn crate::l1_client::L1Client,
-    data_hex: &str,
-    to_addr: &str,
-) -> anyhow::Result<String> {
-    let to: alloy::primitives::Address = to_addr.parse()?;
-    let data = crate::hex::hex_decode_prefixed(data_hex)?;
-    let result = l1_client.eth_call(to, data.into()).await?;
-    Ok(format!("0x{}", alloy::hex::encode(&result)))
 }
