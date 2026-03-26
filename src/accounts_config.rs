@@ -65,9 +65,7 @@ fn sanitize_store_dir(dir: &PathBuf) -> anyhow::Result<PathBuf> {
         // After resolving symlinks, re-verify there are no `..` segments.
         for component in canonical.components() {
             if matches!(component, Component::ParentDir) {
-                anyhow::bail!(
-                    "path traversal detected after canonicalization: {canonical:?}"
-                );
+                anyhow::bail!("path traversal detected after canonicalization: {canonical:?}");
             }
         }
         return Ok(canonical);
