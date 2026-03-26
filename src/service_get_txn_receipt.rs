@@ -16,9 +16,7 @@ pub async fn service_get_txn_receipt(
     let (result, block_num) = match service.store.txn_receipt(txn_hash).await? {
         Some((result, block_num)) => (result, block_num),
         None => {
-            let should_query_l1 = local_tx
-                .as_ref()
-                .is_none_or(|txn| txn.id.is_none());
+            let should_query_l1 = local_tx.as_ref().is_none_or(|txn| txn.id.is_none());
             if should_query_l1 && let Some(l1_client) = &service.l1_client {
                 return l1_client.get_transaction_receipt(txn_hash).await;
             }

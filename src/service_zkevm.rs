@@ -25,11 +25,8 @@ pub(crate) async fn service_zkevm_get_exit_roots_by_ger(
 ) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let params: (String,) = request.parse_params()?;
-    let ger = crate::service_helpers::validate_hex_hash_param(
-        &params.0,
-        "GER hash",
-        answer_id.clone(),
-    )?;
+    let ger =
+        crate::service_helpers::validate_hex_hash_param(&params.0, "GER hash", answer_id.clone())?;
 
     match service
         .store
@@ -42,9 +39,7 @@ pub(crate) async fn service_zkevm_get_exit_roots_by_ger(
                 && let Some(l1_client) = &service.l1_client
             {
                 match l1_client.fetch_exit_roots().await {
-                    Ok((mainnet, rollup))
-                        if crate::ger::combined_ger(&mainnet, &rollup) == ger =>
-                    {
+                    Ok((mainnet, rollup)) if crate::ger::combined_ger(&mainnet, &rollup) == ger => {
                         service
                             .store
                             .set_ger_exit_roots(&ger, mainnet, rollup)

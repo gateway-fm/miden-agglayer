@@ -196,7 +196,10 @@ async fn main() -> anyhow::Result<()> {
     let l1_client: Option<Arc<dyn L1Client>> = command
         .l1_rpc_url
         .map(|url| -> anyhow::Result<Arc<dyn L1Client>> {
-            Ok(Arc::new(AlloyL1Client::new(url, command.l1_ger_address.clone())?))
+            Ok(Arc::new(AlloyL1Client::new(
+                url,
+                command.l1_ger_address.clone(),
+            )?))
         })
         .transpose()?;
     let state = ServiceState::new(

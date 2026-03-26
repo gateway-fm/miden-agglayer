@@ -329,7 +329,9 @@ mod tests {
 
     #[test]
     fn test_parse_proof_array_valid() {
-        let proofs: Vec<String> = (0..32).map(|i| format!("0x{}", format!("{:02x}", i).repeat(32))).collect();
+        let proofs: Vec<String> = (0..32)
+            .map(|i| format!("0x{}", format!("{:02x}", i).repeat(32)))
+            .collect();
         let result = parse_proof_array(&proofs).unwrap();
         assert_eq!(result[0], parse_bytes32(&proofs[0]).unwrap());
         assert_eq!(result[31], parse_bytes32(&proofs[31]).unwrap());

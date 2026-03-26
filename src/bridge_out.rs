@@ -140,7 +140,9 @@ impl BridgeOutScanner {
             Ok(true) => return,
             Ok(false) => {}
             Err(e) => {
-                tracing::error!("B2AGG note {note_id_str}: storage error checking processed state: {e:#}");
+                tracing::error!(
+                    "B2AGG note {note_id_str}: storage error checking processed state: {e:#}"
+                );
                 return;
             }
         }

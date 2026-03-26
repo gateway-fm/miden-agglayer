@@ -255,5 +255,4 @@ mod tests {
         let b = [0x02u8; 32];
         assert_ne!(combined_ger(&a, &b), combined_ger(&b, &a));
     }
-
 }

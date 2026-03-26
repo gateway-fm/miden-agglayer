@@ -281,12 +281,8 @@ impl Store for PgStore {
             let mainnet: Option<&[u8]> = r.get(0);
             let rollup: Option<&[u8]> = r.get(1);
             GerEntry {
-                mainnet_exit_root: mainnet
-                    .filter(|v| v.len() == 32)
-                    .map(bytes_to_array_32),
-                rollup_exit_root: rollup
-                    .filter(|v| v.len() == 32)
-                    .map(bytes_to_array_32),
+                mainnet_exit_root: mainnet.filter(|v| v.len() == 32).map(bytes_to_array_32),
+                rollup_exit_root: rollup.filter(|v| v.len() == 32).map(bytes_to_array_32),
                 block_number: r.get::<_, i64>(2) as u64,
                 timestamp: r.get::<_, i64>(3) as u64,
             }
