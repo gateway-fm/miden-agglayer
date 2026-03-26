@@ -342,7 +342,8 @@ mod tests {
             let block = blocks.get(&n).unwrap();
             let parent = blocks.get(&(n - 1)).unwrap();
             assert_eq!(
-                block.parent_hash, parent.hash,
+                block.parent_hash,
+                parent.hash,
                 "Block {n}'s parent_hash must equal block {}'s hash",
                 n - 1
             );

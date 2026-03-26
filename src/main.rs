@@ -132,13 +132,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Run restore if requested
     if command.restore {
-        let result = miden_agglayer_service::restore::restore(
-            &store,
-            &client,
-            &accounts.0,
-            &block_state,
-        )
-        .await?;
+        let result =
+            miden_agglayer_service::restore::restore(&store, &client, &accounts.0, &block_state)
+                .await?;
 
         tracing::info!(
             "Restore complete: block={}, bridge_outs={}, gers={}, logs={}",

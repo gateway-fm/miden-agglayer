@@ -213,7 +213,6 @@ async fn publish_and_record_claim(
     Ok(())
 }
 
-
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
