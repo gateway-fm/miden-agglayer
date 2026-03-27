@@ -238,8 +238,32 @@ impl SyncListener for BridgeOutScanner {
         // blocks, so events at the current block are missed if the bridge already synced it.
         let block_number = self.block_state.current_block_number() + 1;
 
+        let mut emitted = false;
         for note in &consumed_notes {
+            let was_processed = self
+                .store
+                .is_note_processed(&note.id().to_string())
+                .await
+                .unwrap_or(true);
             self.process_consumed_note(note, block_number).await;
+            if !was_processed {
+                emitted = true;
+            }
+        }
+
+        // Advance the store's latest_block_number so that eth_blockNumber returns
+        // a value that includes the block containing our BridgeEvent. Without this,
+        // the bridge-service won't query the new block if the Miden node doesn't
+        // produce new blocks (no transactions to drive sync forward).
+        if emitted {
+            let current_latest = self.store.get_latest_block_number().await.unwrap_or(0);
+            if block_number > current_latest {
+                self.store.set_latest_block_number(block_number).await?;
+                tracing::info!(
+                    block_number,
+                    "advanced latest_block_number to include BridgeEvent"
+                );
+            }
         }
 
         Ok(())

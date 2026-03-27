@@ -94,10 +94,11 @@ services:
     restart: on-failure
     ports:
       - "8546:8546"
+    env_file:
+      - ./fixtures/.env
     environment:
       CHAIN_ID: "${CHAIN_ID:-2}"
       NETWORK_ID: "${NETWORK_ID:-1}"
-      BRIDGE_ADDRESS: "${BRIDGE_ADDRESS}"
       DATABASE_URL: "host=agglayer-postgres user=agglayer password=agglayer dbname=agglayer_store"
       RUST_LOG: "info"
     command:

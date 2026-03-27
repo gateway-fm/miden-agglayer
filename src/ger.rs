@@ -205,6 +205,12 @@ pub async fn insert_ger(
                 timestamp,
             )
             .await?;
+
+        // Advance latest_block_number so bridge-service queries the new block
+        let current_latest = store.get_latest_block_number().await.unwrap_or(0);
+        if block_number > current_latest {
+            store.set_latest_block_number(block_number).await?;
+        }
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),
