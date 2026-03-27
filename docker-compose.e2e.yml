@@ -59,11 +59,13 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - |
-        echo "Running miden-agglayer migration..."
+        echo "Running miden-agglayer migrations..."
         PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/001_initial.sql
-        echo "Migration complete."
+        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/002_faucet_registry.sql
+        echo "Migrations complete."
     volumes:
       - ./migrations/001_initial.sql:/migrations/001_initial.sql:ro
+      - ./migrations/002_faucet_registry.sql:/migrations/002_faucet_registry.sql:ro
     depends_on:
       agglayer-postgres:
         condition: service_healthy

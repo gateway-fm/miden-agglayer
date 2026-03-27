@@ -123,12 +123,11 @@ async fn sync_miden_block(
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
-    accounts: &AccountsConfig,
+    _accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
-    let accounts_clone = accounts.clone();
     let block_state_clone = block_state.clone();
 
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
@@ -173,7 +172,7 @@ async fn restore_bridge_outs(
                     };
                     let faucet_id = fungible_asset.faucet_id();
                     let miden_amount = fungible_asset.amount();
-                    let origin = match resolve_faucet_origin(faucet_id, &accounts_clone) {
+                    let origin = match resolve_faucet_origin(faucet_id, &*store_clone).await {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");

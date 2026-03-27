@@ -23,6 +23,24 @@ use std::sync::Arc;
 
 // ── Types ────────────────────────────────────────────────────────────
 
+/// Faucet registry entry — metadata for a bridged token's Miden faucet.
+#[derive(Debug, Clone)]
+pub struct FaucetEntry {
+    pub faucet_id: AccountId,
+    /// EVM token contract address on origin chain (zero = native ETH).
+    pub origin_address: [u8; 20],
+    /// Origin chain network ID (0 = Ethereum mainnet).
+    pub origin_network: u32,
+    /// Token symbol, e.g. "ETH", "USDC".
+    pub symbol: String,
+    /// Token decimals on the origin chain (e.g. 18 for ETH).
+    pub origin_decimals: u8,
+    /// Token decimals on Miden (typically 8).
+    pub miden_decimals: u8,
+    /// Decimal scaling factor: `origin_decimals - miden_decimals`.
+    pub scale: u8,
+}
+
 /// Data for registering a new transaction.
 pub struct TxnEntry {
     pub id: Option<TransactionId>,
@@ -162,6 +180,20 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
     /// Roll back a processed-note marker when later persistence fails.
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;
+
+    // === Faucet registry ===
+    /// Register or update a faucet entry (upsert by faucet_id).
+    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()>;
+    /// Look up a faucet by its L1 origin token address and network.
+    async fn get_faucet_by_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<Option<FaucetEntry>>;
+    /// Look up a faucet by its Miden account ID.
+    async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>>;
+    /// List all registered faucets.
+    async fn list_faucets(&self) -> anyhow::Result<Vec<FaucetEntry>>;
 
     // === Convenience: claim event log ===
     #[allow(clippy::too_many_arguments)]

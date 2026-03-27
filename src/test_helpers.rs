@@ -7,6 +7,7 @@
 use crate::accounts_config::{AccountIdBech32, AccountsConfig as InnerAccountsConfig};
 use crate::block_state::BlockState;
 use crate::store::memory::InMemoryStore;
+use crate::store::{FaucetEntry, Store};
 use crate::{AccountsConfig, MidenClient, ServiceState};
 use miden_protocol::account::AccountId;
 use std::sync::Arc;
@@ -23,10 +24,43 @@ pub fn test_accounts_config() -> AccountsConfig {
     AccountsConfig(InnerAccountsConfig {
         service: dummy_account_id(),
         bridge: dummy_account_id(),
-        faucet_eth: dummy_account_id(),
-        faucet_agg: dummy_account_id(),
+        faucet_eth: Some(dummy_account_id()),
+        faucet_agg: Some(dummy_account_id()),
         wallet_hardhat: dummy_account_id(),
     })
+}
+
+/// A second distinct test account ID for the AGG faucet.
+const TEST_ACCOUNT_HEX_2: &str = "0x3d7c9747558851900f8206226dfbeb";
+
+/// Seed the faucet registry with default ETH and AGG faucets for testing.
+pub async fn seed_test_faucets(store: &dyn Store) {
+    let eth_id = AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap();
+    let agg_id = AccountId::from_hex(TEST_ACCOUNT_HEX_2).unwrap();
+    store
+        .register_faucet(FaucetEntry {
+            faucet_id: eth_id,
+            origin_address: [0u8; 20],
+            origin_network: 0,
+            symbol: "ETH".into(),
+            origin_decimals: 18,
+            miden_decimals: 8,
+            scale: 10,
+        })
+        .await
+        .unwrap();
+    store
+        .register_faucet(FaucetEntry {
+            faucet_id: agg_id,
+            origin_address: [0xAA; 20],
+            origin_network: 0,
+            symbol: "AGG".into(),
+            origin_decimals: 8,
+            miden_decimals: 8,
+            scale: 0,
+        })
+        .await
+        .unwrap();
 }
 
 /// Create a `ServiceState` backed by `InMemoryStore` and a test `MidenClient`

@@ -268,6 +268,31 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
         "zkevm_getExitRootsByGER" => service_zkevm_get_exit_roots_by_ger(service, request).await,
 
+        "admin_registerFaucet" => {
+            let params: (crate::service_admin::RegisterFaucetParams,) = request.parse_params()?;
+            let result = crate::service_admin::admin_register_faucet(service, params.0).await;
+            json_rpc_response_from_result(result, answer_id, ServiceErrorCode::AdminRegisterFaucet)
+        }
+
+        "admin_listFaucets" => {
+            let faucets = service.store.list_faucets().await.unwrap_or_default();
+            let list: Vec<serde_json::Value> = faucets
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "faucet_id": f.faucet_id.to_hex(),
+                        "symbol": f.symbol,
+                        "origin_address": format!("0x{}", hex::encode(f.origin_address)),
+                        "origin_network": f.origin_network,
+                        "origin_decimals": f.origin_decimals,
+                        "miden_decimals": f.miden_decimals,
+                        "scale": f.scale,
+                    })
+                })
+                .collect();
+            Ok(JsonRpcResponse::success(answer_id, serde_json::json!(list)))
+        }
+
         method => {
             tracing::error!("JSON-RPC unsupported method: {}", method);
             Ok(request.method_not_found(method))

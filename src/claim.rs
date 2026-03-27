@@ -1,7 +1,8 @@
 use crate::accounts_config::AccountsConfig;
 use crate::amount::validate_amount;
+use crate::faucet_ops;
 use crate::miden_client::{MidenClient, MidenClientLib};
-use crate::store::Store;
+use crate::store::{FaucetEntry, Store};
 use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
 use alloy::sol_types::SolEvent;
 use miden_base_agglayer::{
@@ -65,30 +66,77 @@ struct Faucet {
     origin_token_decimals: u8,
 }
 
-// TODO: obtain a faucet from registry for a given origin_token_address
-fn find_target_faucet(
+/// Look up a faucet for the given origin token, auto-creating one if not found.
+///
+/// On the first bridge of a new ERC-20 token, the faucet is created on Miden,
+/// registered in the bridge, and saved to the Store — all automatically.
+async fn find_or_create_faucet(
     token_address: alloy::primitives::Address,
+    origin_network: u32,
+    metadata: &Bytes,
+    store: &dyn Store,
+    client: &mut MidenClientLib,
     accounts: &AccountsConfig,
-) -> Faucet {
-    if token_address.is_zero() {
-        Faucet {
-            id: accounts.faucet_eth.0,
-            decimals: 8,
-            origin_token_decimals: 18,
-        }
-    } else {
-        // Currently defaults all non-ETH tokens to AGG faucet.
-        // If a new token is bridged that isn't AGG, the decimal scaling may be wrong.
-        tracing::debug!(
-            token_address = %token_address,
-            "find_target_faucet: mapping non-ETH token to AGG faucet (hardcoded)"
-        );
-        Faucet {
-            id: accounts.faucet_agg.0,
-            decimals: 8,
-            origin_token_decimals: 8,
-        }
+) -> anyhow::Result<Faucet> {
+    // 1. Try store lookup first
+    if let Some(entry) = store
+        .get_faucet_by_origin(&token_address.0.0, origin_network)
+        .await?
+    {
+        return Ok(Faucet {
+            id: entry.faucet_id,
+            decimals: entry.miden_decimals,
+            origin_token_decimals: entry.origin_decimals,
+        });
     }
+
+    // 2. Auto-create: parse token metadata from claimAsset call
+    let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
+    let miden_decimals: u8 = 8;
+    let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
+        anyhow::anyhow!(
+            "origin decimals {origin_decimals} < miden decimals {miden_decimals} for token {token_address}"
+        )
+    })?;
+
+    tracing::info!(
+        token_address = %token_address,
+        symbol = %symbol,
+        origin_decimals,
+        scale,
+        "auto-creating faucet for new ERC-20 token"
+    );
+
+    // 3. Create faucet on Miden, deploy, register in bridge
+    let faucet_account = faucet_ops::create_and_register_faucet(
+        client,
+        &symbol,
+        miden_decimals,
+        &token_address.0.0,
+        origin_network,
+        scale,
+        accounts.service.0,
+        accounts.bridge.0,
+    )
+    .await?;
+
+    // 4. Save to store
+    let entry = FaucetEntry {
+        faucet_id: faucet_account.id(),
+        origin_address: token_address.0.0,
+        origin_network,
+        symbol,
+        origin_decimals,
+        miden_decimals,
+        scale,
+    };
+    store.register_faucet(entry).await?;
+
+    Ok(Faucet {
+        id: faucet_account.id(),
+        decimals: miden_decimals,
+        origin_token_decimals: origin_decimals,
+    })
 }
 
 fn bytes32_array_to_smt_nodes(values: [FixedBytes<32>; 32]) -> [SmtNode; 32] {
@@ -164,7 +212,15 @@ async fn publish_claim_internal(
     store: &dyn Store,
     latest_block_num: BlockNumber,
 ) -> anyhow::Result<PublishClaimTxn> {
-    let faucet = find_target_faucet(params.originTokenAddress, accounts);
+    let faucet = find_or_create_faucet(
+        params.originTokenAddress,
+        params.originNetwork,
+        &params.metadata,
+        store,
+        client,
+        accounts,
+    )
+    .await?;
 
     tracing::info!(
         global_index = %params.globalIndex,
@@ -297,7 +353,8 @@ pub async fn publish_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::test_accounts_config;
+    use crate::store::memory::InMemoryStore;
+    use crate::test_helpers::seed_test_faucets;
     use alloy::primitives::address;
 
     #[test]
@@ -311,26 +368,27 @@ mod tests {
         assert_eq!(hash, expected.as_slice());
     }
 
-    #[test]
-    fn test_find_target_faucet_eth() {
-        let accounts = test_accounts_config();
-        let faucet = find_target_faucet(
-            address!("0000000000000000000000000000000000000000"),
-            &accounts.0,
-        );
-        assert_eq!(faucet.origin_token_decimals, 18);
-        assert_eq!(faucet.decimals, 8);
+    #[tokio::test]
+    async fn test_find_faucet_eth_from_store() {
+        let store = InMemoryStore::new();
+        seed_test_faucets(&store).await;
+        let entry = store
+            .get_faucet_by_origin(&[0u8; 20], 0)
+            .await
+            .unwrap()
+            .expect("ETH faucet should be registered");
+        assert_eq!(entry.origin_decimals, 18);
+        assert_eq!(entry.miden_decimals, 8);
+        assert_eq!(entry.symbol, "ETH");
     }
 
-    #[test]
-    fn test_find_target_faucet_agg() {
-        let accounts = test_accounts_config();
-        let faucet = find_target_faucet(
-            address!("742d35Cc6634C0532925a3b844Bc9e7595f41111"),
-            &accounts.0,
-        );
-        assert_eq!(faucet.origin_token_decimals, 8);
-        assert_eq!(faucet.decimals, 8);
+    #[tokio::test]
+    async fn test_find_faucet_unknown_returns_none() {
+        let store = InMemoryStore::new();
+        seed_test_faucets(&store).await;
+        // Address not registered in the test seed
+        let entry = store.get_faucet_by_origin(&[0xBB; 20], 0).await.unwrap();
+        assert!(entry.is_none());
     }
 
     #[test]

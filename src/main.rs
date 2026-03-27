@@ -116,13 +116,39 @@ async fn main() -> anyhow::Result<()> {
 
     let accounts = load_config(miden_store_dir.clone())?;
 
-    let bridge_account_id = accounts.0.bridge.0;
-    let bridge_out_scanner = Arc::new(BridgeOutScanner::new(
-        store.clone(),
-        block_state.clone(),
-        accounts.0.clone(),
-        bridge_account_id,
-    ));
+    // Seed faucet registry if empty (first startup or InMemoryStore)
+    if store.list_faucets().await?.is_empty() {
+        use miden_agglayer_service::store::FaucetEntry;
+        if let (Some(faucet_eth), Some(faucet_agg)) =
+            (&accounts.0.faucet_eth, &accounts.0.faucet_agg)
+        {
+            store
+                .register_faucet(FaucetEntry {
+                    faucet_id: faucet_eth.0,
+                    origin_address: [0u8; 20],
+                    origin_network: 0,
+                    symbol: "ETH".into(),
+                    origin_decimals: 18,
+                    miden_decimals: 8,
+                    scale: 10,
+                })
+                .await?;
+            store
+                .register_faucet(FaucetEntry {
+                    faucet_id: faucet_agg.0,
+                    origin_address: [0u8; 20],
+                    origin_network: 0,
+                    symbol: "AGG".into(),
+                    origin_decimals: 8,
+                    miden_decimals: 8,
+                    scale: 0,
+                })
+                .await?;
+            tracing::info!("seeded faucet registry with default ETH and AGG faucets");
+        }
+    }
+
+    let bridge_out_scanner = Arc::new(BridgeOutScanner::new(store.clone(), block_state.clone()));
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
     let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =

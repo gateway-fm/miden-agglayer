@@ -25,6 +25,7 @@ alloy_core::sol! {
 pub(crate) enum ServiceErrorCode {
     SendRawTransaction = 1,
     GetTransactionReceipt,
+    AdminRegisterFaucet,
 }
 
 impl From<ServiceErrorCode> for JsonRpcErrorReason {

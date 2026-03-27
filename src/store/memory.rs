@@ -1,6 +1,6 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
-use super::{Store, TxnData, TxnEntry};
+use super::{FaucetEntry, Store, TxnData, TxnEntry};
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
@@ -54,6 +54,9 @@ pub struct InMemoryStore {
     // Bridge-out
     processed_notes: RwLock<HashSet<String>>,
     deposit_counter: RwLock<u32>,
+
+    // Faucet registry
+    faucets: RwLock<Vec<FaucetEntry>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -77,6 +80,7 @@ impl InMemoryStore {
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashSet::new()),
             deposit_counter: RwLock::new(0),
+            faucets: RwLock::new(Vec::new()),
         }
     }
 }
@@ -512,6 +516,39 @@ impl Store for InMemoryStore {
         self.processed_notes.write().remove(note_id);
         Ok(())
     }
+
+    // ── Faucet registry ──────────────────────────────────────────
+
+    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+        let mut faucets = self.faucets.write();
+        if let Some(existing) = faucets.iter_mut().find(|f| f.faucet_id == entry.faucet_id) {
+            *existing = entry;
+        } else {
+            faucets.push(entry);
+        }
+        Ok(())
+    }
+
+    async fn get_faucet_by_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<Option<FaucetEntry>> {
+        let faucets = self.faucets.read();
+        Ok(faucets
+            .iter()
+            .find(|f| f.origin_address == *origin_address && f.origin_network == origin_network)
+            .cloned())
+    }
+
+    async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>> {
+        let faucets = self.faucets.read();
+        Ok(faucets.iter().find(|f| f.faucet_id == faucet_id).cloned())
+    }
+
+    async fn list_faucets(&self) -> anyhow::Result<Vec<FaucetEntry>> {
+        Ok(self.faucets.read().clone())
+    }
 }
 
 #[cfg(test)]
@@ -741,5 +778,116 @@ mod tests {
         assert!(!store.is_ger_injected(&ger).await.unwrap());
         store.mark_ger_injected(ger).await.unwrap();
         assert!(store.is_ger_injected(&ger).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_faucet_registry() {
+        let store = InMemoryStore::new();
+        let faucet_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+
+        // Initially empty
+        assert!(store.list_faucets().await.unwrap().is_empty());
+        assert!(store.get_faucet_by_id(faucet_id).await.unwrap().is_none());
+        assert!(
+            store
+                .get_faucet_by_origin(&[0u8; 20], 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Register ETH faucet
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: [0u8; 20],
+                origin_network: 0,
+                symbol: "ETH".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+            })
+            .await
+            .unwrap();
+
+        // Lookup by ID
+        let entry = store.get_faucet_by_id(faucet_id).await.unwrap().unwrap();
+        assert_eq!(entry.symbol, "ETH");
+        assert_eq!(entry.scale, 10);
+
+        // Lookup by origin
+        let entry = store
+            .get_faucet_by_origin(&[0u8; 20], 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.faucet_id, faucet_id);
+
+        // List
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
+
+        // Upsert (update symbol)
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: [0u8; 20],
+                origin_network: 0,
+                symbol: "WETH".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+            })
+            .await
+            .unwrap();
+        let entry = store.get_faucet_by_id(faucet_id).await.unwrap().unwrap();
+        assert_eq!(entry.symbol, "WETH");
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_faucet_registry_dynamic_erc20_bidirectional() {
+        // Simulate: register a new ERC-20 (USDC), then resolve it for bridge-out
+        let store = InMemoryStore::new();
+        let usdc_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+
+        // Simulate auto-creation during first L1→L2 claim
+        let usdc_origin = [0xA0; 20]; // USDC contract address
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: usdc_id,
+                origin_address: usdc_origin,
+                origin_network: 0,
+                symbol: "USDC".into(),
+                origin_decimals: 6,
+                miden_decimals: 6,
+                scale: 0,
+            })
+            .await
+            .unwrap();
+
+        // L1→L2 claim lookup: find faucet by origin address
+        let claim_faucet = store
+            .get_faucet_by_origin(&usdc_origin, 0)
+            .await
+            .unwrap()
+            .expect("USDC faucet should be found for L1→L2 claim");
+        assert_eq!(claim_faucet.symbol, "USDC");
+        assert_eq!(claim_faucet.origin_decimals, 6);
+        assert_eq!(claim_faucet.scale, 0);
+
+        // L2→L1 bridge-out lookup: find faucet by Miden account ID
+        let bridge_out_faucet = store
+            .get_faucet_by_id(usdc_id)
+            .await
+            .unwrap()
+            .expect("USDC faucet should be found for L2→L1 bridge-out");
+        assert_eq!(bridge_out_faucet.origin_address, usdc_origin);
+        assert_eq!(bridge_out_faucet.origin_network, 0);
+        assert_eq!(bridge_out_faucet.scale, 0);
+
+        // Verify amount scaling: 1000 USDC with scale=0 → no change
+        let origin_amount =
+            crate::bridge_out::reverse_scale_amount(1000, bridge_out_faucet.scale).unwrap();
+        assert_eq!(origin_amount, 1000);
     }
 }

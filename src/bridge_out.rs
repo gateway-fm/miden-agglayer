@@ -4,7 +4,6 @@
 //! deposit is recorded on the L2 side. This module scans for consumed B2AGG notes and
 //! emits synthetic `BridgeEvent` EVM logs so the bridge-service can index them.
 
-use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
 use crate::miden_client::{MidenClientLib, SyncListener};
@@ -71,33 +70,22 @@ pub struct FaucetOriginInfo {
     pub scale: u8,
 }
 
-/// Resolve faucet origin info by matching against known faucet account IDs.
-///
-/// Currently hardcoded based on init.rs defaults:
-/// - faucet_eth: origin_address=[0;20], origin_network=0, scale=10
-/// - faucet_agg: origin_address=[0;20], origin_network=0, scale=0
-pub fn resolve_faucet_origin(
+/// Resolve faucet origin info from the dynamic faucet registry.
+pub async fn resolve_faucet_origin(
     faucet_id: AccountId,
-    accounts: &AccountsConfig,
+    store: &dyn crate::store::Store,
 ) -> anyhow::Result<FaucetOriginInfo> {
-    if faucet_id == accounts.faucet_eth.0 {
-        Ok(FaucetOriginInfo {
-            origin_network: 0,
-            origin_address: [0u8; 20],
-            scale: 10,
-        })
-    } else if faucet_id == accounts.faucet_agg.0 {
-        Ok(FaucetOriginInfo {
-            origin_network: 0,
-            origin_address: [0u8; 20],
-            scale: 0,
-        })
-    } else {
-        anyhow::bail!(
-            "unknown faucet ID {faucet_id}: only ETH and AGG faucets are supported. \
-             Add new faucets to resolve_faucet_origin before bridging new tokens."
+    let entry = store.get_faucet_by_id(faucet_id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown faucet ID {faucet_id}: not found in faucet registry. \
+                 Register the faucet via admin_registerFaucet or bridge a claim first."
         )
-    }
+    })?;
+    Ok(FaucetOriginInfo {
+        origin_network: entry.origin_network,
+        origin_address: entry.origin_address,
+        scale: entry.scale,
+    })
 }
 
 /// Reverse-scale a Miden amount back to origin token decimals.
@@ -118,23 +106,11 @@ pub(crate) fn reverse_scale_amount(miden_amount: u64, scale: u8) -> anyhow::Resu
 pub struct BridgeOutScanner {
     store: Arc<dyn crate::store::Store>,
     block_state: Arc<BlockState>,
-    accounts: AccountsConfig,
-    _bridge_account_id: AccountId,
 }
 
 impl BridgeOutScanner {
-    pub fn new(
-        store: Arc<dyn crate::store::Store>,
-        block_state: Arc<BlockState>,
-        accounts: AccountsConfig,
-        bridge_account_id: AccountId,
-    ) -> Self {
-        Self {
-            store,
-            block_state,
-            accounts,
-            _bridge_account_id: bridge_account_id,
-        }
+    pub fn new(store: Arc<dyn crate::store::Store>, block_state: Arc<BlockState>) -> Self {
+        Self { store, block_state }
     }
 
     async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) {
@@ -174,8 +150,8 @@ impl BridgeOutScanner {
         let faucet_id = fungible_asset.faucet_id();
         let miden_amount = fungible_asset.amount();
 
-        // Resolve origin info
-        let origin = match resolve_faucet_origin(faucet_id, &self.accounts) {
+        // Resolve origin info from faucet registry
+        let origin = match resolve_faucet_origin(faucet_id, &*self.store).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("B2AGG note {note_id_str}: {e:#}");
