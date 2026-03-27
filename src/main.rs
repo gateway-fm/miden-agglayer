@@ -116,12 +116,12 @@ async fn main() -> anyhow::Result<()> {
 
     let accounts = load_config(miden_store_dir.clone())?;
 
-    // Seed faucet registry if empty (first startup or InMemoryStore)
+    // Seed faucet registry if empty (first startup or InMemoryStore).
+    // Only ETH is seeded by default; other tokens (AGG, ERC-20s) are
+    // auto-created when first bridged via the dynamic faucet registry.
     if store.list_faucets().await?.is_empty() {
         use miden_agglayer_service::store::FaucetEntry;
-        if let (Some(faucet_eth), Some(faucet_agg)) =
-            (&accounts.0.faucet_eth, &accounts.0.faucet_agg)
-        {
+        if let Some(faucet_eth) = &accounts.0.faucet_eth {
             store
                 .register_faucet(FaucetEntry {
                     faucet_id: faucet_eth.0,
@@ -133,10 +133,19 @@ async fn main() -> anyhow::Result<()> {
                     scale: 10,
                 })
                 .await?;
+            tracing::info!("seeded faucet registry with default ETH faucet");
+        }
+        // AGG/POL faucet: registered when first bridged (origin address
+        // depends on the L1 POL token contract, which varies per deployment).
+        if let Some(faucet_agg) = &accounts.0.faucet_agg {
+            // Register by faucet_id only so bridge-out can resolve it.
+            // Use a placeholder origin; the real origin is set on first bridge.
+            let mut agg_origin = [0u8; 20];
+            agg_origin[0] = 0x01; // Distinct from ETH's zero address
             store
                 .register_faucet(FaucetEntry {
                     faucet_id: faucet_agg.0,
-                    origin_address: [0u8; 20],
+                    origin_address: agg_origin,
                     origin_network: 0,
                     symbol: "AGG".into(),
                     origin_decimals: 8,
@@ -144,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
                     scale: 0,
                 })
                 .await?;
-            tracing::info!("seeded faucet registry with default ETH and AGG faucets");
+            tracing::info!("seeded faucet registry with default AGG faucet");
         }
     }
 

@@ -75,7 +75,7 @@ wait_for() {
 command -v cast >/dev/null || fail "cast (foundry) not found"
 command -v forge >/dev/null || fail "forge (foundry) not found"
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 (Anvil) not reachable"
-curl -sf "$L2_RPC" -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' >/dev/null \
+curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' >/dev/null \
     || fail "L2 proxy not reachable"
 
 ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
@@ -106,10 +106,11 @@ log "Amount:  $BRIDGE_AMOUNT base units (expect $EXPECTED_L2_BALANCE Miden units
 
 # ── Step 1: Deploy TestToken ERC-20 on Anvil ──────────────────────────────────
 log "Step 1/7: Deploying TestToken ERC-20 on Anvil..."
-DEPLOY_OUT=$(forge create --rpc-url "$L1_RPC" \
+DEPLOY_OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" \
+    --rpc-url "$L1_RPC" \
     --private-key "$FUNDED_KEY" \
-    --constructor-args "TestToken" "TT" "$TOKEN_DECIMALS" "$TOKEN_INITIAL_SUPPLY" \
-    "$FIXTURES_DIR/TestToken.sol:TestToken" 2>&1)
+    --broadcast \
+    --constructor-args "TestToken" "TT" "$TOKEN_DECIMALS" "$TOKEN_INITIAL_SUPPLY" 2>&1)
 TOKEN_ADDR=$(echo "$DEPLOY_OUT" | grep "Deployed to:" | awk '{print $NF}')
 [[ -z "$TOKEN_ADDR" ]] && fail "Failed to deploy TestToken: $DEPLOY_OUT"
 pass "TestToken deployed at $TOKEN_ADDR"
@@ -121,7 +122,7 @@ TOKEN_DEC=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "decimals()(uint8)")
 log "Token: name=$TOKEN_NAME, symbol=$TOKEN_SYMBOL, decimals=$TOKEN_DEC"
 
 # Check admin_listFaucets before bridging
-FAUCETS_BEFORE=$(curl -sf "$L2_RPC" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' \
+FAUCETS_BEFORE=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' \
     | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))")
 log "Faucets registered before bridge: $FAUCETS_BEFORE"
 
@@ -170,7 +171,7 @@ pass "CLAIM committed to Miden block"
 
 # ── Step 4: Verify faucet was auto-created ────────────────────────────────────
 log "Step 4/7: Verifying faucet auto-creation..."
-FAUCETS_AFTER=$(curl -sf "$L2_RPC" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}')
+FAUCETS_AFTER=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}')
 FAUCET_COUNT=$(echo "$FAUCETS_AFTER" | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))")
 log "Faucets registered after bridge: $FAUCET_COUNT (was $FAUCETS_BEFORE)"
 
