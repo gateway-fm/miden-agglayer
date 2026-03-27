@@ -78,6 +78,13 @@ log "Wallet:  $WALLET_ID ($WALLET_HEX)"
 log "Dest:    $DEST_ADDR (zero-padded, network $DEST_NETWORK)"
 log "Amount:  $DEPOSIT_AMOUNT wei (expect $EXPECTED_L2_BALANCE Miden units)"
 
+# Work around aggkit aggoracle "already exists" bug (agglayer/aggkit#1479).
+AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
+docker exec "${COMPOSE_PROJECT_NAME}-postgres-1" psql -U bridge_user -d bridge_db -c \
+    "DELETE FROM sync.monitored_txs WHERE owner = 'aggoracle';" >/dev/null 2>&1 || true
+docker restart "${AGGKIT_CONTAINER}" >/dev/null 2>&1 || true
+sleep 5
+
 # ── Step 1: Deposit on L1 ────────────────────────────────────────────────────
 log "Step 1/5: Depositing on L1..."
 TX=$(cast send --rpc-url "$L1_RPC" \
