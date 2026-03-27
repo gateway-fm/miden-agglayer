@@ -127,6 +127,16 @@ FAUCETS_BEFORE=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"js
 log "Faucets registered before bridge: $FAUCETS_BEFORE"
 
 # ── Step 2: Approve + Bridge L1→L2 ───────────────────────────────────────────
+# Work around aggkit aggoracle "already exists" bug (agglayer/aggkit#1479).
+# The aggoracle stops injecting GERs after this error because it treats
+# "already exists" as fatal. Fixed in aggkit v0.8.2+ but our E2E uses v0.9.0-rc2.
+# Clearing monitored_txs and restarting forces the aggoracle to re-process.
+log "Clearing aggoracle state + restarting aggkit (aggkit#1479 workaround)..."
+docker exec miden-agglayer-postgres-1 psql -U bridge_user -d bridge_db -c \
+    "DELETE FROM sync.monitored_txs WHERE owner = 'aggoracle';" >/dev/null 2>&1 || true
+docker restart "${AGGKIT_CONTAINER}" >/dev/null 2>&1 || true
+sleep 10
+
 log "Step 2/7: Approving bridge contract to spend TestToken..."
 cast send --rpc-url "$L1_RPC" \
     --private-key "$FUNDED_KEY" \
@@ -319,12 +329,15 @@ else
     fail "L1 claim transaction failed"
 fi
 
-# Verify L1 token balance change
+# Verify L1 token balance change (use python for big number arithmetic)
 L1_TOKEN_BAL_AFTER=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
-L1_CHANGE=$((L1_TOKEN_BAL_AFTER - L1_TOKEN_BAL_BEFORE))
-log "L1 TestToken balance: $L1_TOKEN_BAL_BEFORE → $L1_TOKEN_BAL_AFTER (+$L1_CHANGE)"
+# Strip any trailing annotations like "[9.999e23]" from cast output
+L1_TOKEN_BAL_BEFORE_CLEAN=$(echo "$L1_TOKEN_BAL_BEFORE" | awk '{print $1}')
+L1_TOKEN_BAL_AFTER_CLEAN=$(echo "$L1_TOKEN_BAL_AFTER" | awk '{print $1}')
+L1_CHANGE=$(python3 -c "print(int('$L1_TOKEN_BAL_AFTER_CLEAN') - int('$L1_TOKEN_BAL_BEFORE_CLEAN'))")
+log "L1 TestToken balance: $L1_TOKEN_BAL_BEFORE_CLEAN → $L1_TOKEN_BAL_AFTER_CLEAN (+$L1_CHANGE)"
 
-if [[ "$L1_CHANGE" -ne "$EXPECTED_L1_TOKENS" ]]; then
+if [[ "$L1_CHANGE" != "$EXPECTED_L1_TOKENS" ]]; then
     fail "L1 token balance change mismatch: got $L1_CHANGE, expected $EXPECTED_L1_TOKENS"
 fi
 
