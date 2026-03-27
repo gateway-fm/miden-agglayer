@@ -75,8 +75,10 @@ wait_for() {
 command -v cast >/dev/null || fail "cast (foundry) not found"
 command -v forge >/dev/null || fail "forge (foundry) not found"
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 (Anvil) not reachable"
-curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' >/dev/null \
-    || fail "L2 proxy not reachable"
+# Wait for L2 proxy to be healthy (may be restarting from prior test's GER cascade)
+wait_for "L2 proxy healthy" \
+    "curl -sf '$L2_RPC' -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}' >/dev/null" \
+    60 3
 
 ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \

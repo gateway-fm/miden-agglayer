@@ -24,11 +24,11 @@ case "$test_filter" in
     all)
         "$SCRIPT_DIR/e2e-l1-to-l2.sh"
         echo ""
+        "$SCRIPT_DIR/e2e-l2-to-l1.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-ger-decomposition.sh"
         echo ""
         "$SCRIPT_DIR/e2e-security.sh"
-        echo ""
-        "$SCRIPT_DIR/e2e-l2-to-l1.sh"
         echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
         ;;
