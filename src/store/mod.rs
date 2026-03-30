@@ -313,14 +313,7 @@ impl SyncListener for StoreSyncListener {
             .take();
         if let Some(data) = data {
             let block_hash = self.block_state.get_block_hash(data.block_num);
-            // Only advance — never regress. insert_ger and bridge_out may have
-            // already pushed latest_block_number ahead of the Miden sync block;
-            // overwriting it would cause the bridge to see blocks going backwards
-            // and trigger checkReorg.
-            let current = self.store.get_latest_block_number().await.unwrap_or(0);
-            if data.block_num > current {
-                self.store.set_latest_block_number(data.block_num).await?;
-            }
+            self.store.set_latest_block_number(data.block_num).await?;
             self.store
                 .txn_commit_pending(&data.committed_ids, data.block_num, block_hash)
                 .await?;

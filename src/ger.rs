@@ -168,11 +168,7 @@ pub async fn insert_ger(
     // Check dedup before doing any work
     let is_new = !store.has_seen_ger(&ger_bytes).await?;
 
-    // Block number is assigned lazily — only computed after the Miden TX commits.
-    // The Miden submission takes ~6-13s; if we captured current_block + 1 upfront,
-    // on_sync would advance past that block before we write the log, and the
-    // bridge's forceSyncChunk=true means it never revisits old blocks.
-    let mut block_number = block_state.current_block_number() + 1;
+    let mut block_number = store.get_latest_block_number().await.unwrap_or(0);
 
     if is_new {
         tracing::info!(
@@ -190,9 +186,12 @@ pub async fn insert_ger(
             })
             .await?;
 
-        // Assign block number now, after the Miden TX has committed, so
-        // current_block reflects the latest sync and +1 is genuinely ahead.
-        block_number = block_state.current_block_number() + 1;
+        // Assign block number AFTER the Miden TX commits. Use
+        // latest_block_number + 1 (not current_block + 1) so the log lands
+        // in a block the bridge hasn't queried yet. on_post_sync advances
+        // latest_block_number during the proving window, so current_block + 1
+        // can fall within a range the bridge already scanned.
+        block_number = store.get_latest_block_number().await.unwrap_or(0) + 1;
         let block_hash = block_state.get_block_hash(block_number);
         let timestamp = block_state.get_block_timestamp(block_number);
 
@@ -210,11 +209,8 @@ pub async fn insert_ger(
             )
             .await?;
 
-        // Advance latest_block_number so bridge-service queries the new block
-        let current_latest = store.get_latest_block_number().await.unwrap_or(0);
-        if block_number > current_latest {
-            store.set_latest_block_number(block_number).await?;
-        }
+        // Advance latest_block_number so bridge-service sees the new block
+        store.set_latest_block_number(block_number).await?;
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),
