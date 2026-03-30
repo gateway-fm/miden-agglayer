@@ -165,20 +165,18 @@ pub async fn insert_ger(
     block_state: &Arc<crate::block_state::BlockState>,
     txn_hash: TxHash,
 ) -> anyhow::Result<GerInsertResult> {
-    // Store event at current_block + 1 so it appears in a block the bridge-service
-    // hasn't synced yet. With forceSyncChunk=true, the bridge never re-queries old
-    // blocks, so events at the current block are missed if the bridge already synced it.
-    let block_number = block_state.current_block_number() + 1;
-    let block_hash = block_state.get_block_hash(block_number);
-    let timestamp = block_state.get_block_timestamp(block_number);
-
     // Check dedup before doing any work
     let is_new = !store.has_seen_ger(&ger_bytes).await?;
+
+    // Block number is assigned lazily — only computed after the Miden TX commits.
+    // The Miden submission takes ~6-13s; if we captured current_block + 1 upfront,
+    // on_sync would advance past that block before we write the log, and the
+    // bridge's forceSyncChunk=true means it never revisits old blocks.
+    let mut block_number = block_state.current_block_number() + 1;
 
     if is_new {
         tracing::info!(
             ger = %hex::encode(ger_bytes),
-            block_number,
             "GER injection: submitting to Miden..."
         );
 
@@ -191,6 +189,12 @@ pub async fn insert_ger(
                 )
             })
             .await?;
+
+        // Assign block number now, after the Miden TX has committed, so
+        // current_block reflects the latest sync and +1 is genuinely ahead.
+        block_number = block_state.current_block_number() + 1;
+        let block_hash = block_state.get_block_hash(block_number);
+        let timestamp = block_state.get_block_timestamp(block_number);
 
         // Miden submission succeeded — now record the event
         let tx_hash_str = format!("{txn_hash:#x}");
