@@ -119,8 +119,9 @@ async fn submit_ger_to_miden(
         client.sync_state().await?;
         // Refresh bridge account state from the node. The bridge is a
         // Network (public) account, so import_account_by_id works.
-        if let Err(e) = client.import_account_by_id(bridge_id).await {
-            tracing::debug!(attempt, "bridge re-import: {e:#}");
+        match client.import_account_by_id(bridge_id).await {
+            Ok(()) => tracing::info!(attempt, "bridge account re-imported from node"),
+            Err(e) => tracing::warn!(attempt, "bridge re-import failed: {e:#}"),
         }
 
         let ger = ExitRoot::new(ger_bytes);
@@ -140,7 +141,7 @@ async fn submit_ger_to_miden(
             Ok(id) => id,
             Err(e) => {
                 if attempt < 2 {
-                    tracing::warn!(attempt, "GER TX failed, retrying: {e:#}");
+                    tracing::warn!(attempt, "GER TX failed, retrying: {e:#?}");
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
