@@ -105,6 +105,8 @@ services:
       - "--port=8546"
       - "--miden-node=http://miden-node:57291"
       - "--miden-store-dir=/var/lib/miden-agglayer-service"
+      - "--l1-rpc-url=http://anvil:8545"
+      - "--ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
     depends_on:
       miden-node:
         condition: service_healthy
@@ -160,7 +162,7 @@ services:
 
   # ── AggKit (aggoracle + aggsender) ─────────────────────────────────────────
   aggkit:
-    image: ghcr.io/agglayer/aggkit:0.9.0-rc2
+    image: ghcr.io/agglayer/aggkit:0.8.3-rc1
     restart: on-failure
     command: ["run", "--cfg=/etc/aggkit/config.toml", "--components=aggoracle,aggsender"]
     ports:

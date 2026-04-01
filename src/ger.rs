@@ -104,6 +104,11 @@ async fn submit_ger_to_miden(
     let service_id = accounts.service.0;
     let bridge_id = accounts.bridge.0;
 
+    // Sync state before building the transaction to ensure we have the
+    // latest account commitments (the NTX builder may have modified the
+    // bridge account since our last sync).
+    client.sync_state().await?;
+
     let note = UpdateGerNote::create(ger, service_id, bridge_id, client.rng())?;
     tracing::info!(note_id = %note.id(), "UpdateGerNote created");
 

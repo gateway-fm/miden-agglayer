@@ -129,16 +129,6 @@ FAUCETS_BEFORE=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"js
 log "Faucets registered before bridge: $FAUCETS_BEFORE"
 
 # ── Step 2: Approve + Bridge L1→L2 ───────────────────────────────────────────
-# Work around aggkit aggoracle "already exists" bug (agglayer/aggkit#1479).
-# The aggoracle stops injecting GERs after this error because it treats
-# "already exists" as fatal. Fixed in aggkit v0.8.2+ but our E2E uses v0.9.0-rc2.
-# Clearing monitored_txs and restarting forces the aggoracle to re-process.
-log "Clearing aggoracle state + restarting aggkit (aggkit#1479 workaround)..."
-docker exec miden-agglayer-postgres-1 psql -U bridge_user -d bridge_db -c \
-    "DELETE FROM sync.monitored_txs WHERE owner = 'aggoracle';" >/dev/null 2>&1 || true
-docker restart "${AGGKIT_CONTAINER}" >/dev/null 2>&1 || true
-sleep 10
-
 log "Step 2/7: Approving bridge contract to spend TestToken..."
 cast send --rpc-url "$L1_RPC" \
     --private-key "$FUNDED_KEY" \

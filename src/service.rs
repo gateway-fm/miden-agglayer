@@ -100,6 +100,19 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                         );
                         return Err(JsonRpcResponse::error(answer_id, error));
                     };
+                    // Return null for blocks beyond the chain tip to avoid
+                    // ensure_block_exists iterating over billions of synthetic blocks.
+                    let latest = service
+                        .store
+                        .get_latest_block_number()
+                        .await
+                        .map_err(|e| store_error(answer_id.clone(), e))?;
+                    if num > latest {
+                        return Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                            answer_id,
+                            serde_json::Value::Null,
+                        ));
+                    }
                     num
                 }
             };

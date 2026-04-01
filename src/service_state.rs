@@ -12,6 +12,10 @@ pub struct ServiceState {
     pub network_id: u64,
     pub store: Arc<dyn Store>,
     pub block_state: Arc<BlockState>,
+    /// L1 RPC URL for resolving exit roots from the L1 GER contract
+    pub l1_rpc_url: Option<String>,
+    /// L1 GER contract address
+    pub ger_l1_address: Option<String>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -33,6 +37,8 @@ impl ServiceState {
             network_id,
             store,
             block_state,
+            l1_rpc_url: None,
+            ger_l1_address: None,
         }
     }
 }

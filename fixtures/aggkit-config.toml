@@ -27,7 +27,7 @@ GlobalExitRootAddr = "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa"
 BridgeAddr = "0xC8cbEBf950B9Df44d987c8619f092beA980fF038"
 
 [AggOracle]
-WaitPeriodNextGER = "5s"
+WaitPeriodNextGER = "2s"
 EnableAggOracleCommittee = false
 
 [AggOracle.EVMSender]
@@ -95,6 +95,7 @@ FinalizedBlock = "LatestBlock"
 [L1InfoTreeSync]
 InitialBlock = 1
 BlockFinality = "LatestBlock"
+WaitForNewBlocksPeriod = "1s"
 
 [L2GERSync]
 BlockFinality = "LatestBlock"

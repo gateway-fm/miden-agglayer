@@ -55,6 +55,14 @@ struct Command {
         default_value = miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS
     )]
     bridge_address: String,
+
+    /// L1 RPC URL for resolving exit roots (enables full GER resolution)
+    #[arg(long, env = "L1_RPC_URL")]
+    l1_rpc_url: Option<String>,
+
+    /// L1 GER contract address for exit root resolution
+    #[arg(long, env = "GER_L1_ADDRESS")]
+    ger_l1_address: Option<String>,
 }
 
 #[tokio::main]
@@ -183,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let state = ServiceState::new(
+    let mut state = ServiceState::new(
         client,
         accounts,
         command.chain_id,
@@ -191,6 +199,8 @@ async fn main() -> anyhow::Result<()> {
         store,
         block_state,
     );
+    state.l1_rpc_url = command.l1_rpc_url;
+    state.ger_l1_address = command.ger_l1_address;
 
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
