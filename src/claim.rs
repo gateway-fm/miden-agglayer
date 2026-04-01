@@ -92,7 +92,7 @@ async fn find_or_create_faucet(
 
     // 2. Auto-create: parse token metadata from claimAsset call
     let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
-    let miden_decimals: u8 = 8;
+    let miden_decimals: u8 = origin_decimals.min(8);
     let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
         anyhow::anyhow!(
             "origin decimals {origin_decimals} < miden decimals {miden_decimals} for token {token_address}"

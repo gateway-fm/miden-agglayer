@@ -1,7 +1,6 @@
 use crate::accounts_config::AccountsConfig;
 use alloy::primitives::Address;
 use miden_protocol::account::AccountId;
-use sha3::{Digest, Keccak256};
 
 const HARDHAT_ADDRESS: Address = Address::new([
     0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf,
@@ -30,36 +29,8 @@ pub fn account_id_from_address(address: Address) -> Option<AccountId> {
     AccountId::try_from([prefix_felt, suffix_felt]).ok()
 }
 
-/// Deterministically derive a Miden AccountId from an Ethereum address.
-///
-/// Uses keccak256("miden-agglayer-addr-v1" || address_bytes) as seed, then
-/// sets metadata bits for RegularAccountUpdatableCode + Public + Version0.
-fn derive_account_id(address: Address) -> anyhow::Result<AccountId> {
-    let mut hasher = Keccak256::new();
-    hasher.update(b"miden-agglayer-addr-v1");
-    hasher.update(address.as_slice());
-    let hash: [u8; 32] = hasher.finalize().into();
-
-    let mut id_bytes = [0u8; 15];
-    id_bytes.copy_from_slice(&hash[..15]);
-
-    // Set metadata bits for RegularAccountUpdatableCode (0b01) + Public (0b00) + Version0 (0)
-    // Byte 7 (LS byte of prefix): (storage_mode << 6) | (account_type << 4) | version
-    id_bytes[7] = 0b01 << 4; // 0x10
-
-    // Clear MSB of prefix (byte 0) — Felt requires < 2^63
-    id_bytes[0] &= 0x7F;
-
-    // Clear 32nd MSB of prefix (byte 3, bit 0)
-    id_bytes[3] &= 0xFE;
-
-    // Clear MSB of suffix (byte 8) — Felt requires < 2^63
-    id_bytes[8] &= 0x7F;
-
-    AccountId::try_from(id_bytes)
-        .map_err(|e| anyhow::anyhow!("failed to derive AccountId for {address}: {e}"))
-}
-
+/// Resolve an Ethereum address to a Miden AccountId.
+/// Resolution order: hardhat special case → known mapping → zero-padding.
 pub async fn resolve_address(
     store: &dyn crate::store::Store,
     address: Address,
@@ -77,15 +48,7 @@ pub async fn resolve_address(
     if let Some(id) = account_id_from_address(address) {
         return Ok(id);
     }
-    // 4. Derive deterministically and store
-    let id = derive_account_id(address)?;
-    tracing::info!(
-        eth_address = %address,
-        miden_account = %id.to_hex(),
-        "AddressMapper: derived new mapping"
-    );
-    store.set_address_mapping(address, id).await?;
-    Ok(id)
+    anyhow::bail!("no known Miden AccountId for Ethereum address {address}")
 }
 
 #[cfg(test)]
@@ -116,31 +79,6 @@ mod tests {
         assert_eq!(account_id_from_address(address), Some(expected_account_id));
 
         assert_eq!(account_id_from_address(Address::from([42u8; 20])), None);
-    }
-
-    #[test]
-    fn test_derive_account_id_deterministic() {
-        let addr = address!("0x742d35Cc6634C0532925a3b844Bc9e7595f41111");
-        let id1 = derive_account_id(addr).unwrap();
-        let id2 = derive_account_id(addr).unwrap();
-        assert_eq!(id1, id2);
-    }
-
-    #[test]
-    fn test_derive_account_id_different_inputs() {
-        let addr1 = address!("0x742d35Cc6634C0532925a3b844Bc9e7595f41111");
-        let addr2 = address!("0x742d35Cc6634C0532925a3b844Bc9e7595f42222");
-        let id1 = derive_account_id(addr1).unwrap();
-        let id2 = derive_account_id(addr2).unwrap();
-        assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn test_derive_account_id_is_regular_public() {
-        let addr = address!("0xdead00000000000000000000000000000000beef");
-        let id = derive_account_id(addr).unwrap();
-        assert!(id.is_regular_account());
-        assert!(id.is_public());
     }
 
     #[tokio::test]
