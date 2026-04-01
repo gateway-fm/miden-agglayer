@@ -199,6 +199,10 @@ e2e-ger-decomposition: e2e-up ## Spin up stack + run GER decomposition bug regre
 e2e-security: e2e-up ## Spin up stack + run security E2E tests
 	./scripts/e2e-security.sh
 
+.PHONY: e2e-fuzz
+e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
+	./scripts/e2e-fuzz-bridge.sh
+
 .PHONY: e2e
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 

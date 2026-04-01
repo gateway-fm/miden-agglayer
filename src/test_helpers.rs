@@ -27,6 +27,7 @@ pub fn test_accounts_config() -> AccountsConfig {
         faucet_eth: Some(dummy_account_id()),
         faucet_agg: Some(dummy_account_id()),
         wallet_hardhat: dummy_account_id(),
+        ger_manager: None,
     })
 }
 

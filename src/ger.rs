@@ -100,16 +100,31 @@ async fn submit_ger_to_miden(
     ger_bytes: [u8; 32],
     accounts: &AccountsConfig,
 ) -> anyhow::Result<()> {
-    let service_id = accounts.service.0;
+    // Use the dedicated ger_manager account for GER injection. This avoids
+    // stale state errors: the service account is continuously modified by
+    // the NTX builder (claim processing), making its state commitment
+    // unpredictable. The ger_manager account is only used for GER injection,
+    // so its state is stable between submissions.
+    let ger_manager_id = accounts
+        .ger_manager
+        .as_ref()
+        .map(|a| a.0)
+        .unwrap_or(accounts.service.0);
     let bridge_id = accounts.bridge.0;
 
-    // Retry up to 3 times — concurrent claims can change the service account's
-    // state commitment between sync and TX submission.
+    // Retry up to 3 times. Re-import the bridge account (Network/public)
+    // before each attempt so the NoteScreener has the latest asset tree.
+    // See docs/ger-note-screening-bypass.md for full analysis.
     for attempt in 0..3u32 {
         client.sync_state().await?;
+        // Refresh bridge account state from the node. The bridge is a
+        // Network (public) account, so import_account_by_id works.
+        if let Err(e) = client.import_account_by_id(bridge_id).await {
+            tracing::debug!(attempt, "bridge re-import: {e:#}");
+        }
 
         let ger = ExitRoot::new(ger_bytes);
-        let note = UpdateGerNote::create(ger, service_id, bridge_id, client.rng())?;
+        let note = UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
         if attempt == 0 {
             tracing::info!(note_id = %note.id(), "UpdateGerNote created");
         }
@@ -118,26 +133,24 @@ async fn submit_ger_to_miden(
             .own_output_notes(vec![OutputNote::Full(note)])
             .build()?;
 
-        let tx_id = match client.submit_new_transaction(service_id, tx_request).await {
+        let tx_id = match client
+            .submit_new_transaction(ger_manager_id, tx_request)
+            .await
+        {
             Ok(id) => id,
             Err(e) => {
-                let msg = format!("{e:#}");
-                if msg.contains("initial state commitment") && attempt < 2 {
-                    tracing::warn!(
-                        attempt,
-                        "GER TX rejected (stale commitment), retrying after sync..."
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if attempt < 2 {
+                    tracing::warn!(attempt, "GER TX failed, retrying: {e:#}");
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
-                return Err(anyhow::anyhow!("{msg}"));
+                return Err(anyhow::anyhow!("{e:#}"));
             }
         };
 
         tracing::info!(
             tx_id = %tx_id,
             ger = %hex::encode(ger_bytes),
-            attempt,
             "UpdateGerNote submitted to Miden node, waiting for commit..."
         );
 
@@ -167,14 +180,16 @@ async fn submit_ger_to_miden(
         }
 
         if !committed {
-            anyhow::bail!("UpdateGerNote transaction {tx_id} not committed after {timeout_secs}s");
+            anyhow::bail!(
+                "UpdateGerNote transaction {tx_id} not committed after {timeout_secs}s"
+            );
         }
 
         tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
         return Ok(());
     }
 
-    anyhow::bail!("GER injection failed after 3 attempts due to stale commitment")
+    anyhow::bail!("GER injection failed after 3 attempts")
 }
 
 #[allow(clippy::too_many_arguments)]

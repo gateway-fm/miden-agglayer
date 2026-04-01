@@ -24,6 +24,7 @@ struct Accounts {
     faucet_eth: Account,
     faucet_agg: Account,
     wallet_hardhat: Account,
+    ger_manager: Account,
 }
 
 impl From<Accounts> for AccountsConfig {
@@ -34,6 +35,7 @@ impl From<Accounts> for AccountsConfig {
             faucet_eth: Some(AccountIdBech32(accounts.faucet_eth.id())),
             faucet_agg: Some(AccountIdBech32(accounts.faucet_agg.id())),
             wallet_hardhat: AccountIdBech32(accounts.wallet_hardhat.id()),
+            ger_manager: Some(AccountIdBech32(accounts.ger_manager.id())),
         }
     }
 }
@@ -79,10 +81,9 @@ async fn add_bridge(
     client: &mut MidenClientLib,
     _keystore: Arc<FilesystemKeyStore>,
     service_id: AccountId,
+    ger_manager_id: AccountId,
 ) -> anyhow::Result<Account> {
-    // In 0.14, create_bridge_account takes (seed, bridge_admin_id, ger_manager_id)
-    // Use service account as both bridge_admin and ger_manager
-    let account = create_bridge_account(client.rng().draw_word(), service_id, service_id);
+    let account = create_bridge_account(client.rng().draw_word(), service_id, ger_manager_id);
     client.add_account(&account, false).await?;
 
     deploy_account(client, account.id(), "bridge").await?;
@@ -128,12 +129,33 @@ async fn add_wallet(
     Ok(account)
 }
 
+/// Create a Network (public) wallet account for GER injection.
+/// Must be public so import_account_by_id can refresh its state after
+/// the NoteScreener bypass skips apply_transaction.
+async fn add_public_wallet(
+    client: &mut MidenClientLib,
+    keystore: Arc<FilesystemKeyStore>,
+) -> anyhow::Result<Account> {
+    use miden_protocol::account::AccountStorageMode;
+    let (auth_component, key_pair) = create_auth_component()?;
+    let account = Account::builder(client.rng().draw_word().into())
+        .storage_mode(AccountStorageMode::Network)
+        .with_component(BasicWallet)
+        .with_auth_component(auth_component)
+        .build()?;
+    keystore.add_key(&key_pair, account.id()).await?;
+    client.add_account(&account, false).await?;
+    Ok(account)
+}
+
 async fn add_accounts(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
 ) -> anyhow::Result<Accounts> {
     let service = add_wallet(client, keystore.clone()).await?;
-    let bridge = add_bridge(client, keystore.clone(), service.id()).await?;
+    let ger_manager = add_wallet(client, keystore.clone()).await?;
+    deploy_account(client, ger_manager.id(), "ger_manager").await?;
+    let bridge = add_bridge(client, keystore.clone(), service.id(), ger_manager.id()).await?;
     // ETH: 18 origin decimals, 8 miden decimals → scale=10
     let faucet_eth = add_faucet(
         client,
@@ -165,6 +187,7 @@ async fn add_accounts(
         faucet_eth,
         faucet_agg,
         wallet_hardhat,
+        ger_manager,
     })
 }
 

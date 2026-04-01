@@ -47,9 +47,12 @@ case "$test_filter" in
     security)
         "$SCRIPT_DIR/e2e-security.sh"
         ;;
+    fuzz)
+        "$SCRIPT_DIR/e2e-fuzz-bridge.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security]" >&2
+        echo "Usage: $0 [all|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz]" >&2
         exit 1
         ;;
 esac

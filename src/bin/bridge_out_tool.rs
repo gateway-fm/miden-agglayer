@@ -209,6 +209,13 @@ async fn main() -> anyhow::Result<()> {
 
     println!("[bridge-out] B2AGG note created");
 
+    // Re-import bridge account so the NoteScreener has the latest asset tree.
+    // Without this, submit_new_transaction fails with FetchAssetWitnessFailed
+    // after CLAIM modified the bridge account.
+    if let Err(e) = client.import_account_by_id(bridge_id).await {
+        eprintln!("[bridge-out] bridge re-import: {e} (may already be tracked)");
+    }
+
     // Submit transaction
     let tx_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![OutputNote::Full(b2agg)])

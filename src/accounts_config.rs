@@ -17,6 +17,11 @@ pub struct AccountsConfig {
     #[serde(default)]
     pub faucet_agg: Option<AccountIdBech32>,
     pub wallet_hardhat: AccountIdBech32,
+    /// Dedicated account for GER injection. Separate from `service` so the
+    /// NTX builder's modifications to the service account don't cause stale
+    /// state errors when submitting UpdateGerNotes.
+    #[serde(default)]
+    pub ger_manager: Option<AccountIdBech32>,
 }
 
 #[derive(Debug, Clone)]
