@@ -100,63 +100,81 @@ async fn submit_ger_to_miden(
     ger_bytes: [u8; 32],
     accounts: &AccountsConfig,
 ) -> anyhow::Result<()> {
-    let ger = ExitRoot::new(ger_bytes);
     let service_id = accounts.service.0;
     let bridge_id = accounts.bridge.0;
 
-    // Sync state before building the transaction to ensure we have the
-    // latest account commitments (the NTX builder may have modified the
-    // bridge account since our last sync).
-    client.sync_state().await?;
+    // Retry up to 3 times — concurrent claims can change the service account's
+    // state commitment between sync and TX submission.
+    for attempt in 0..3u32 {
+        client.sync_state().await?;
 
-    let note = UpdateGerNote::create(ger, service_id, bridge_id, client.rng())?;
-    tracing::info!(note_id = %note.id(), "UpdateGerNote created");
-
-    let tx_request = TransactionRequestBuilder::new()
-        .own_output_notes(vec![OutputNote::Full(note)])
-        .build()?;
-
-    let tx_id = client
-        .submit_new_transaction(service_id, tx_request)
-        .await?;
-    tracing::info!(
-        tx_id = %tx_id,
-        ger = %hex::encode(ger_bytes),
-        "UpdateGerNote submitted to Miden node, waiting for commit..."
-    );
-
-    // Poll for transaction commitment
-    let timeout_secs: u64 = std::env::var("GER_COMMIT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
-        .clamp(5, 120);
-    let mut committed = false;
-    for _ in 0..timeout_secs {
-        // We can check if txn is in the store and has a block number
-        let txns = client
-            .get_transactions(miden_client::store::TransactionFilter::All)
-            .await?;
-        if txns.iter().any(|t| {
-            t.id == tx_id
-                && matches!(
-                    t.status,
-                    miden_client::transaction::TransactionStatus::Committed { .. }
-                )
-        }) {
-            committed = true;
-            break;
+        let ger = ExitRoot::new(ger_bytes);
+        let note = UpdateGerNote::create(ger, service_id, bridge_id, client.rng())?;
+        if attempt == 0 {
+            tracing::info!(note_id = %note.id(), "UpdateGerNote created");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        client.sync_state().await?; // Sync to get latest updates
+
+        let tx_request = TransactionRequestBuilder::new()
+            .own_output_notes(vec![OutputNote::Full(note)])
+            .build()?;
+
+        let tx_id = match client.submit_new_transaction(service_id, tx_request).await {
+            Ok(id) => id,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("initial state commitment") && attempt < 2 {
+                    tracing::warn!(
+                        attempt,
+                        "GER TX rejected (stale commitment), retrying after sync..."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+        };
+
+        tracing::info!(
+            tx_id = %tx_id,
+            ger = %hex::encode(ger_bytes),
+            attempt,
+            "UpdateGerNote submitted to Miden node, waiting for commit..."
+        );
+
+        // Poll for transaction commitment
+        let timeout_secs: u64 = std::env::var("GER_COMMIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30)
+            .clamp(5, 120);
+        let mut committed = false;
+        for _ in 0..timeout_secs {
+            let txns = client
+                .get_transactions(miden_client::store::TransactionFilter::All)
+                .await?;
+            if txns.iter().any(|t| {
+                t.id == tx_id
+                    && matches!(
+                        t.status,
+                        miden_client::transaction::TransactionStatus::Committed { .. }
+                    )
+            }) {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            client.sync_state().await?;
+        }
+
+        if !committed {
+            anyhow::bail!("UpdateGerNote transaction {tx_id} not committed after {timeout_secs}s");
+        }
+
+        tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
+        return Ok(());
     }
 
-    if !committed {
-        anyhow::bail!("UpdateGerNote transaction {tx_id} not committed after {timeout_secs}s");
-    }
-
-    tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
-    Ok(())
+    anyhow::bail!("GER injection failed after 3 attempts due to stale commitment")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -173,7 +191,7 @@ pub async fn insert_ger(
     // Check dedup before doing any work
     let is_new = !store.has_seen_ger(&ger_bytes).await?;
 
-    let mut block_number = block_state.current_block_number() + 1;
+    let mut block_number = 0u64; // assigned by store.advance_block_number() after Miden commit
 
     if is_new {
         tracing::info!(
@@ -191,9 +209,9 @@ pub async fn insert_ger(
             })
             .await?;
 
-        // Re-assign block number after the Miden TX has committed so
-        // current_block reflects the latest sync and +1 is genuinely ahead.
-        block_number = block_state.current_block_number() + 1;
+        // Use the store's sequential block counter so GER events and claim
+        // events never collide on the same block number.
+        block_number = store.advance_block_number().await?;
         let block_hash = block_state.get_block_hash(block_number);
         let timestamp = block_state.get_block_timestamp(block_number);
 
@@ -210,12 +228,6 @@ pub async fn insert_ger(
                 timestamp,
             )
             .await?;
-
-        // Advance latest_block_number so bridge-service queries the new block
-        let current_latest = store.get_latest_block_number().await.unwrap_or(0);
-        if block_number > current_latest {
-            store.set_latest_block_number(block_number).await?;
-        }
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),

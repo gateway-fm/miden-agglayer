@@ -178,38 +178,25 @@ async fn publish_and_record_claim(
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<()> {
+    // ClaimEvent recording happens inside the MidenClient closure (cancellation-safe).
+    let latest_block = service.store.get_latest_block_number().await?;
     let claim_result = claim::publish_claim(
         params,
         &service.miden_client,
         service.accounts.clone(),
         service.store.clone(),
-        service.store.get_latest_block_number().await?,
+        service.block_state.clone(),
+        latest_block,
+        txn_hash,
+        txn_envelope,
+        signer,
     )
     .await?;
-
-    // Note: bridge-service will see this ClaimEvent from both ClaimTxManager and
-    // L2 sync, causing a duplicate key error. See fixtures/bridge-db-patch.sql.
-    let txn_id = claim_result.txn_id;
-    tracing::info!("published claim with eth txn: {txn_hash}; miden txn: {txn_id}");
-    let block_num = service.store.advance_block_number().await?;
-    let block_hash = service.block_state.get_block_hash(block_num);
-    service
-        .store
-        .txn_begin(
-            txn_hash,
-            TxnEntry {
-                id: Some(txn_id),
-                envelope: txn_envelope,
-                signer,
-                expires_at: Some(claim_result.expires_at),
-                logs: vec![claim_result.log],
-            },
-        )
-        .await?;
-    service
-        .store
-        .txn_commit(txn_hash, Ok(()), block_num, block_hash)
-        .await?;
+    tracing::info!(
+        eth_tx = %txn_hash,
+        miden_tx = %claim_result.txn_id,
+        "claim published and ClaimEvent recorded"
+    );
     Ok(())
 }
 

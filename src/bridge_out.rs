@@ -233,37 +233,27 @@ impl SyncListener for BridgeOutScanner {
             .await
             .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
-        // Store events at current_block + 1 so they appear in a block the bridge-service
-        // hasn't synced yet. With forceSyncChunk=true, the bridge never re-queries old
-        // blocks, so events at the current block are missed if the bridge already synced it.
-        let block_number = self.block_state.current_block_number() + 1;
-
-        let mut emitted = false;
         for note in &consumed_notes {
+            // Only process B2AGG notes — other consumed notes (CLAIM, UpdateGerNote)
+            // must not trigger block advancement or they race with GER event writes.
+            if !is_b2agg_note(note.details()) {
+                continue;
+            }
             let was_processed = self
                 .store
                 .is_note_processed(&note.id().to_string())
                 .await
                 .unwrap_or(true);
+            if was_processed {
+                continue;
+            }
+            // Use atomic block counter to avoid collisions with GER/claim events.
+            let block_number = self.store.advance_block_number().await?;
             self.process_consumed_note(note, block_number).await;
-            if !was_processed {
-                emitted = true;
-            }
-        }
-
-        // Advance the store's latest_block_number so that eth_blockNumber returns
-        // a value that includes the block containing our BridgeEvent. Without this,
-        // the bridge-service won't query the new block if the Miden node doesn't
-        // produce new blocks (no transactions to drive sync forward).
-        if emitted {
-            let current_latest = self.store.get_latest_block_number().await.unwrap_or(0);
-            if block_number > current_latest {
-                self.store.set_latest_block_number(block_number).await?;
-                tracing::info!(
-                    block_number,
-                    "advanced latest_block_number to include BridgeEvent"
-                );
-            }
+            tracing::info!(
+                block_number,
+                "advanced latest_block_number to include BridgeEvent"
+            );
         }
 
         Ok(())

@@ -322,12 +322,19 @@ async fn publish_claim_internal(
     })
 }
 
+/// Publish a claim and record the ClaimEvent inside the MidenClient closure.
+/// Recording happens before the result is sent back, making it cancellation-safe:
+/// even if the HTTP caller disconnects, the event is already in the store.
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: Arc<dyn Store>,
+    block_state: std::sync::Arc<crate::block_state::BlockState>,
     latest_block_num: BlockNumber,
+    txn_hash: alloy::primitives::TxHash,
+    txn_envelope: alloy::consensus::TxEnvelope,
+    signer: alloy::primitives::Address,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
@@ -338,6 +345,31 @@ pub async fn publish_claim(
                 let value =
                     publish_claim_internal(params, client, &accounts.0, &*store, latest_block_num)
                         .await?;
+
+                // Record the ClaimEvent INSIDE the closure — cancellation-safe.
+                let block_num = store.advance_block_number().await?;
+                let block_hash = block_state.get_block_hash(block_num);
+                store
+                    .txn_begin(
+                        txn_hash,
+                        crate::store::TxnEntry {
+                            id: Some(value.txn_id),
+                            envelope: txn_envelope,
+                            signer,
+                            expires_at: Some(value.expires_at),
+                            logs: vec![value.log.clone()],
+                        },
+                    )
+                    .await?;
+                store
+                    .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+                    .await?;
+                tracing::info!(
+                    eth_tx = %txn_hash,
+                    block_num,
+                    "ClaimEvent recorded (cancellation-safe)"
+                );
+
                 let _ = result_inner.set(value);
                 Ok(())
             })
