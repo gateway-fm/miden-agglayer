@@ -2,14 +2,15 @@
 //!
 //! Synthesizes ClaimEvent and UpdateHashChainValue logs from Miden transactions.
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
-use std::collections::HashMap;
 
 /// ClaimEvent topic hash: keccak256("ClaimEvent(uint256,uint32,address,address,uint256)")
 pub const CLAIM_EVENT_TOPIC: &str =
     "0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d";
+
+/// BridgeEvent topic hash: keccak256("BridgeEvent(uint8,uint32,address,uint32,address,uint256,bytes,uint32)")
+pub const BRIDGE_EVENT_TOPIC: &str =
+    "0x501781209a1f8899323b96b4ef08b168df93e0a90c673d1e4cce39366cb62f9b";
 
 /// UpdateHashChainValue topic hash: keccak256("UpdateHashChainValue(bytes32,bytes32)")
 /// Emitted by L2 GlobalExitRootManagerL2SovereignChain when a GER is inserted
@@ -100,6 +101,27 @@ impl LogFilter {
             .unwrap_or(current_block)
     }
 
+    /// Check if the query's topic filter explicitly includes the given topic.
+    fn query_includes_topic(&self, topic: Option<&str>) -> bool {
+        let Some(topic) = topic else {
+            return false;
+        };
+        let Some(ref topic_filters) = self.topics else {
+            return false;
+        };
+        // Check if topic0 filter includes this topic
+        if let Some(Some(filter)) = topic_filters.first() {
+            let topic_lower = topic.to_lowercase();
+            return match filter {
+                TopicFilter::Single(t) => t.to_lowercase() == topic_lower,
+                TopicFilter::Multiple(topics) => {
+                    topics.iter().any(|t| t.to_lowercase() == topic_lower)
+                }
+            };
+        }
+        false
+    }
+
     pub fn matches(&self, log: &SyntheticLog, current_block: u64) -> bool {
         if let Some(ref block_hash) = self.block_hash {
             let log_hash = format!("0x{}", hex::encode(log.block_hash));
@@ -125,15 +147,32 @@ impl LogFilter {
 
             // SPECIAL CASE: The bridge-service filters logs by the Bridge contract address.
             // However, it ALSO needs UpdateHashChainValue logs which are emitted by the
-            // GlobalExitRoot contract. If the log is an UpdateHashChainValue, we allow it
-            // through even if the address doesn't match the filter.
-            let is_ger_update = log
-                .topics
-                .first()
-                .map(|t| t.to_lowercase() == UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase())
-                .unwrap_or(false);
+            // GlobalExitRoot contract. If the query includes a topic filter that
+            // explicitly requests a passthrough topic, we allow it through even if
+            // the address doesn't match.
+            //
+            // Without the topic filter guard, queries by address only (like aggkit's
+            // L2BridgeSyncer) would receive UpdateHashChainValue logs that they can't
+            // decode, causing "input too short" errors.
+            let is_passthrough = if !matches_addr {
+                let topic0 = log.topics.first().map(|t| t.to_lowercase());
+                let is_passthrough_topic = topic0
+                    .as_ref()
+                    .map(|t| {
+                        t == &UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()
+                            || t == &BRIDGE_EVENT_TOPIC.to_lowercase()
+                    })
+                    .unwrap_or(false);
 
-            if !matches_addr && !is_ger_update {
+                // Only passthrough if the query's topic filter explicitly includes
+                // this log's topic. This prevents leaking GER logs to consumers
+                // that query by address only.
+                is_passthrough_topic && self.query_includes_topic(topic0.as_deref())
+            } else {
+                false // address matches, no passthrough needed
+            };
+
+            if !matches_addr && !is_passthrough {
                 return false;
             }
         }
@@ -162,196 +201,18 @@ impl LogFilter {
     }
 }
 
-/// Log store for synthetic logs
-pub struct LogStore {
-    logs_by_block: RwLock<HashMap<u64, Vec<SyntheticLog>>>,
-    logs_by_tx: RwLock<HashMap<String, Vec<SyntheticLog>>>,
-    log_counter: RwLock<u64>,
-    seen_gers: RwLock<HashMap<[u8; 32], u64>>,
-    hash_chain_value: RwLock<[u8; 32]>,
-    pending_events: RwLock<Vec<SyntheticLog>>,
+/// Metadata stored for each seen GER (used by zkevm_getExitRootsByGER)
+#[derive(Debug, Clone)]
+pub struct GerEntry {
+    pub mainnet_exit_root: Option<[u8; 32]>,
+    pub rollup_exit_root: Option<[u8; 32]>,
+    pub block_number: u64,
+    pub timestamp: u64,
 }
 
-impl LogStore {
-    pub fn new() -> Self {
-        Self {
-            logs_by_block: RwLock::new(HashMap::new()),
-            logs_by_tx: RwLock::new(HashMap::new()),
-            log_counter: RwLock::new(0),
-            seen_gers: RwLock::new(HashMap::new()),
-            hash_chain_value: RwLock::new([0u8; 32]),
-            pending_events: RwLock::new(Vec::new()),
-        }
-    }
+// LogStore has been replaced by the Store trait — see src/store/mod.rs
 
-    pub fn has_seen_ger(&self, ger: &[u8; 32]) -> bool {
-        self.seen_gers.read().contains_key(ger)
-    }
-
-    pub fn mark_ger_seen(&self, ger: &[u8; 32], block_number: u64) -> bool {
-        let mut seen = self.seen_gers.write();
-        if seen.contains_key(ger) {
-            false
-        } else {
-            seen.insert(*ger, block_number);
-            true
-        }
-    }
-
-    pub fn add_log(&self, mut log: SyntheticLog) {
-        let mut counter = self.log_counter.write();
-        log.log_index = *counter;
-        *counter += 1;
-
-        let block_num = log.block_number;
-        let tx_hash = log.transaction_hash.clone();
-
-        self.logs_by_block
-            .write()
-            .entry(block_num)
-            .or_default()
-            .push(log.clone());
-
-        self.logs_by_tx
-            .write()
-            .entry(tx_hash)
-            .or_default()
-            .push(log.clone());
-
-        self.pending_events.write().push(log);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_claim_event(
-        &self,
-        bridge_address: &str,
-        block_number: u64,
-        block_hash: [u8; 32],
-        tx_hash: &str,
-        global_index: &[u8; 32],
-        origin_network: u32,
-        origin_address: &[u8; 20],
-        destination_address: &[u8; 20],
-        amount: u64,
-    ) {
-        let log = SyntheticLog {
-            address: bridge_address.to_string(),
-            topics: vec![CLAIM_EVENT_TOPIC.to_string()],
-            data: encode_claim_event_data(
-                global_index,
-                origin_network,
-                origin_address,
-                destination_address,
-                amount,
-            ),
-            block_number,
-            block_hash,
-            transaction_hash: tx_hash.to_string(),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-        self.add_log(log);
-    }
-
-    /// Record an UpdateHashChainValue log for a GER injection.
-    /// Caller is responsible for dedup (check `has_seen_ger` first).
-    pub fn add_ger_update_event(
-        &self,
-        block_number: u64,
-        block_hash: [u8; 32],
-        tx_hash: &str,
-        global_exit_root: &[u8; 32],
-    ) {
-        self.mark_ger_seen(global_exit_root, block_number);
-
-        let new_hash_chain = {
-            let mut hash_chain = self.hash_chain_value.write();
-            let mut hasher = Keccak256::new();
-            hasher.update(*hash_chain);
-            hasher.update(global_exit_root);
-            let result: [u8; 32] = hasher.finalize().into();
-            *hash_chain = result;
-            result
-        };
-
-        let log = SyntheticLog {
-            address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
-            topics: vec![
-                UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
-                format!("0x{}", hex::encode(global_exit_root)),
-                format!("0x{}", hex::encode(new_hash_chain)),
-            ],
-            data: "0x".to_string(),
-            block_number,
-            block_hash,
-            transaction_hash: tx_hash.to_string(),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-        self.add_log(log);
-    }
-
-    pub fn get_logs(&self, filter: &LogFilter, current_block: u64) -> Vec<SyntheticLog> {
-        let mut result = Vec::new();
-
-        let from = filter.from_block_number(current_block);
-        let to = filter.to_block_number(current_block);
-
-        // Drain pending events: events in-range are already in logs_by_block,
-        // events too old are returned at their original block (the normal scan
-        // won't find them, so we include them directly), future events stay pending.
-        {
-            let mut pending = self.pending_events.write();
-            let mut remaining = Vec::new();
-            for evt in pending.drain(..) {
-                if evt.block_number <= to {
-                    // In range or older — already in logs_by_block, will be found by scan.
-                    // If older than `from`, the scan still covers it via logs_by_block
-                    // since add_log() stored it at the original block_number.
-                } else {
-                    // Future event — keep pending for next query.
-                    remaining.push(evt);
-                }
-            }
-            *pending = remaining;
-        }
-
-        // Normal block-range scan
-        let logs_by_block = self.logs_by_block.read();
-        for block_num in from..=to {
-            if let Some(logs) = logs_by_block.get(&block_num) {
-                for log in logs {
-                    if filter.matches(log, current_block) {
-                        result.push(log.clone());
-                    }
-                }
-            }
-            if result.len() >= 1000 {
-                break;
-            }
-        }
-
-        result
-    }
-
-    pub fn get_logs_for_tx(&self, tx_hash: &str) -> Vec<SyntheticLog> {
-        self.logs_by_tx
-            .read()
-            .get(tx_hash)
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-impl Default for LogStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn encode_claim_event_data(
+pub fn encode_claim_event_data(
     global_index: &[u8; 32],
     origin_network: u32,
     origin_address: &[u8; 20],
@@ -437,76 +298,29 @@ mod tests {
     }
 
     #[test]
-    fn test_ger_dedup_tracking() {
-        let store = LogStore::new();
-        let ger = [0x11; 32];
+    fn test_event_topic_hashes() {
+        use sha3::{Digest, Keccak256};
 
-        assert!(!store.has_seen_ger(&ger));
-        store.add_ger_update_event(0, [0u8; 32], "0xTx1", &ger);
-        assert!(store.has_seen_ger(&ger), "GER should be marked as seen");
-
-        let filter = LogFilter {
-            from_block: Some("0x0".to_string()),
-            to_block: Some("0x100".to_string()),
-            ..Default::default()
-        };
-        let logs = store.get_logs(&filter, 100);
-        assert_eq!(logs.len(), 1);
-    }
-
-    #[test]
-    fn test_hash_chain_incremental() {
-        let store = LogStore::new();
-
-        let ger1 = [0x11; 32];
-        let ger2 = [0x22; 32];
-
-        store.add_ger_update_event(0, [0u8; 32], "0xTx1", &ger1);
-        let hash1 = *store.hash_chain_value.read();
-
-        store.add_ger_update_event(1, [1u8; 32], "0xTx2", &ger2);
-        let hash2 = *store.hash_chain_value.read();
-
-        // hash1 = keccak256([0u8;32] || ger1)
+        let claim_sig = "ClaimEvent(uint256,uint32,address,address,uint256)";
         let mut hasher = Keccak256::new();
-        hasher.update([0u8; 32]);
-        hasher.update(ger1);
-        let expected1: [u8; 32] = hasher.finalize().into();
-        assert_eq!(hash1, expected1);
+        hasher.update(claim_sig.as_bytes());
+        let claim_hash = format!("0x{}", hex::encode(<[u8; 32]>::from(hasher.finalize())));
+        assert_eq!(CLAIM_EVENT_TOPIC, claim_hash);
 
-        // hash2 = keccak256(hash1 || ger2) — must chain from hash1, not from zero
-        let mut hasher = Keccak256::new();
-        hasher.update(expected1);
-        hasher.update(ger2);
-        let expected2: [u8; 32] = hasher.finalize().into();
-        assert_eq!(hash2, expected2);
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_log_store_add_and_query() {
-        let store = LogStore::new();
-
-        store.add_claim_event(
-            "0xBridge",
-            100,
-            [0xAA; 32],
-            "0xTxHash",
-            &[0x11; 32],
-            1,
-            &[0x22; 20],
-            &[0x33; 20],
-            1000,
+        use crate::claim::ClaimEvent;
+        use alloy_core::sol_types::SolEvent;
+        assert_eq!(
+            CLAIM_EVENT_TOPIC,
+            format!("{:#x}", ClaimEvent::SIGNATURE_HASH)
         );
 
-        let filter = LogFilter {
-            from_block: Some("0x0".to_string()),
-            to_block: Some("0x200".to_string()),
-            ..Default::default()
-        };
-
-        let logs = store.get_logs(&filter, 500);
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].block_number, 100);
+        let bridge_sig = "BridgeEvent(uint8,uint32,address,uint32,address,uint256,bytes,uint32)";
+        let mut hasher2 = Keccak256::new();
+        hasher2.update(bridge_sig.as_bytes());
+        let bridge_hash = format!("0x{}", hex::encode(<[u8; 32]>::from(hasher2.finalize())));
+        assert_eq!(BRIDGE_EVENT_TOPIC, bridge_hash);
     }
+
+    // LogStore-based tests (ger dedup, hash chain, log add/query, bridge event roundtrip)
+    // have been moved to src/store/memory.rs tests.
 }

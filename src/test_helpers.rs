@@ -1,0 +1,75 @@
+//! Shared test utilities for the miden-agglayer crate.
+//!
+//! Provides `create_test_service()` and `test_accounts_config()` so that test
+//! modules across the crate can set up a `ServiceState` without duplication
+//! or `unsafe { std::mem::zeroed() }`.
+
+use crate::accounts_config::{AccountIdBech32, AccountsConfig as InnerAccountsConfig};
+use crate::block_state::BlockState;
+use crate::store::memory::InMemoryStore;
+use crate::store::{FaucetEntry, Store};
+use crate::{AccountsConfig, MidenClient, ServiceState};
+use miden_protocol::account::AccountId;
+use std::sync::Arc;
+
+/// A valid hex-encoded AccountId used across all test fixtures.
+const TEST_ACCOUNT_HEX: &str = "0x3d7c9747558851900f8206226dfbea";
+
+fn dummy_account_id() -> AccountIdBech32 {
+    AccountIdBech32(AccountId::from_hex(TEST_ACCOUNT_HEX).expect("valid test account ID"))
+}
+
+/// Build an `AccountsConfig` with valid (but dummy) account IDs.
+pub fn test_accounts_config() -> AccountsConfig {
+    AccountsConfig(InnerAccountsConfig {
+        service: dummy_account_id(),
+        bridge: dummy_account_id(),
+        faucet_eth: Some(dummy_account_id()),
+        faucet_agg: Some(dummy_account_id()),
+        wallet_hardhat: dummy_account_id(),
+        ger_manager: None,
+    })
+}
+
+/// A second distinct test account ID for the AGG faucet.
+const TEST_ACCOUNT_HEX_2: &str = "0x3d7c9747558851900f8206226dfbeb";
+
+/// Seed the faucet registry with default ETH and AGG faucets for testing.
+pub async fn seed_test_faucets(store: &dyn Store) {
+    let eth_id = AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap();
+    let agg_id = AccountId::from_hex(TEST_ACCOUNT_HEX_2).unwrap();
+    store
+        .register_faucet(FaucetEntry {
+            faucet_id: eth_id,
+            origin_address: [0u8; 20],
+            origin_network: 0,
+            symbol: "ETH".into(),
+            origin_decimals: 18,
+            miden_decimals: 8,
+            scale: 10,
+        })
+        .await
+        .unwrap();
+    store
+        .register_faucet(FaucetEntry {
+            faucet_id: agg_id,
+            origin_address: [0xAA; 20],
+            origin_network: 0,
+            symbol: "AGG".into(),
+            origin_decimals: 8,
+            miden_decimals: 8,
+            scale: 0,
+        })
+        .await
+        .unwrap();
+}
+
+/// Create a `ServiceState` backed by `InMemoryStore` and a test `MidenClient`
+/// stub (no real Miden node connection). Suitable for unit tests.
+pub fn create_test_service() -> ServiceState {
+    let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+    let block_state = Arc::new(BlockState::new());
+    let miden_client = MidenClient::new_test();
+    let accounts = test_accounts_config();
+    ServiceState::new(miden_client, accounts, 1, 1, store, block_state)
+}

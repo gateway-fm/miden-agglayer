@@ -1,20 +1,24 @@
 use crate::COMPONENT;
-use crate::hex::hex_decode_prefixed;
 use crate::hex::hex_decode_u64;
-use crate::log_synthesis::LogFilter;
+use crate::service_debug::service_debug_trace_transaction;
+use crate::service_eth_call::service_eth_call;
+use crate::service_get_logs::service_get_logs;
 use crate::service_get_txn_receipt::service_get_txn_receipt;
+use crate::service_helpers::{
+    ServiceErrorCode, build_synthetic_tx_json, json_rpc_response_from_result, store_error,
+};
 use crate::service_send_raw_txn::service_send_raw_txn;
 use crate::service_state::ServiceState;
+use crate::service_zkevm::{service_zkevm_get_exit_roots_by_ger, service_zkevm_get_latest_ger};
 use alloy::primitives::TxHash;
-use alloy_core::sol_types::SolCall;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
-use axum::routing::post;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use http::HeaderValue;
-use serde::Deserialize;
 use std::str::FromStr;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
@@ -24,98 +28,68 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use url::Url;
 
-// https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L71C19-L71C28
-alloy_core::sol! {
-    uint32 public networkID;
-}
-
-#[repr(i32)]
-enum ServiceErrorCode {
-    SendRawTransaction = 1,
-    GetTransactionReceipt,
-}
-
-impl From<ServiceErrorCode> for JsonRpcErrorReason {
-    fn from(value: ServiceErrorCode) -> Self {
-        Self::ApplicationError(value as i32)
-    }
-}
-
-fn json_rpc_response_from_result<T: serde::Serialize>(
-    result: anyhow::Result<T>,
-    answer_id: axum_jrpc::Id,
-    error_code: ServiceErrorCode,
-) -> JrpcResult {
-    match result {
-        Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
-        Err(error) => {
-            let error = JsonRpcError::new(
-                error_code.into(),
-                error.to_string(),
-                serde_json::Value::Null,
-            );
-            Err(JsonRpcResponse::error(answer_id, error))
-        }
-    }
-}
-
 async fn json_rpc_endpoint(
     State(service): State<ServiceState>,
     request: JsonRpcExtractor,
 ) -> JrpcResult {
+    let start = std::time::Instant::now();
+    let method_name = request.method.clone();
+
+    let result = json_rpc_handler(service, request).await;
+
+    metrics::counter!("rpc_requests_total", "method" => method_name.to_string()).increment(1);
+    metrics::histogram!("rpc_request_duration_seconds", "method" => method_name)
+        .record(start.elapsed().as_secs_f64());
+
+    result
+}
+
+async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> JrpcResult {
     let answer_id = request.get_answer_id();
-    let method = request.method.as_str();
+    let method_name = request.method.clone();
+    let method = method_name.as_str();
     match method {
         "eth_getBlockByNumber" => tracing::trace!("JSON-RPC {method}"),
-        "eth_call" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "eth_gasPrice" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "eth_estimateGas" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "eth_getLogs" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "net_version" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "eth_getBlockTransactionCountByNumber" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "eth_getTransactionCount" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "eth_getTransactionByHash" => {
-            tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
-        }
-        "eth_getTransactionReceipt" => {
+        "eth_call"
+        | "eth_gasPrice"
+        | "eth_estimateGas"
+        | "eth_getLogs"
+        | "net_version"
+        | "eth_getBlockTransactionCountByNumber"
+        | "eth_getTransactionCount"
+        | "eth_getTransactionByHash"
+        | "eth_getTransactionReceipt"
+        | "zkevm_getLatestGlobalExitRoot"
+        | "zkevm_getExitRootsByGER" => {
             tracing::debug!(target: concat!(module_path!(), "::debug"), "JSON-RPC {method}")
         }
         _ => tracing::debug!("JSON-RPC {method}"),
     }
 
     match method {
-        // polycli checks if the contract code exists
-        // return a non-empty string to satisfy the check
         "eth_getCode" => {
             let _params: (String, String) = request.parse_params()?;
-            Ok(JsonRpcResponse::success(answer_id, "0x00"))
+            Ok(JsonRpcResponse::success(answer_id, "0xFE"))
         }
 
         "eth_blockNumber" => {
-            let block_num = service.block_num_tracker.latest();
+            let block_num = service
+                .store
+                .get_latest_block_number()
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?;
             let block_num_str = format!("{:#x}", block_num);
             Ok(JsonRpcResponse::success(answer_id, block_num_str))
         }
 
-        // Return synthetic block with deterministic hash (prevents false reorg detection)
         "eth_getBlockByNumber" => {
             let params: (String, bool) = request.parse_params()?;
             let block_num = match params.0.as_str() {
-                "latest" | "pending" => service.block_num_tracker.latest(),
+                "latest" | "pending" | "finalized" | "safe" => service
+                    .store
+                    .get_latest_block_number()
+                    .await
+                    .map_err(|e| store_error(answer_id.clone(), e))?,
                 "earliest" => 0,
                 any => {
                     let Ok(num) = hex_decode_u64(any) else {
@@ -126,6 +100,19 @@ async fn json_rpc_endpoint(
                         );
                         return Err(JsonRpcResponse::error(answer_id, error));
                     };
+                    // Return null for blocks beyond the chain tip to avoid
+                    // ensure_block_exists iterating over billions of synthetic blocks.
+                    let latest = service
+                        .store
+                        .get_latest_block_number()
+                        .await
+                        .map_err(|e| store_error(answer_id.clone(), e))?;
+                    if num > latest {
+                        return Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                            answer_id,
+                            serde_json::Value::Null,
+                        ));
+                    }
                     num
                 }
             };
@@ -145,23 +132,11 @@ async fn json_rpc_endpoint(
 
         "eth_getBlockByHash" => {
             let params: (String, bool) = request.parse_params()?;
-            let hash_hex = params.0.strip_prefix("0x").unwrap_or(&params.0);
-            let Ok(hash_bytes) = hex::decode(hash_hex) else {
-                let error = JsonRpcError::new(
-                    JsonRpcErrorReason::InvalidParams,
-                    String::from("bad block hash"),
-                    serde_json::Value::Null,
-                );
-                return Err(JsonRpcResponse::error(answer_id, error));
-            };
-            let Ok(hash): Result<[u8; 32], _> = hash_bytes.try_into() else {
-                let error = JsonRpcError::new(
-                    JsonRpcErrorReason::InvalidParams,
-                    String::from("block hash must be 32 bytes"),
-                    serde_json::Value::Null,
-                );
-                return Err(JsonRpcResponse::error(answer_id, error));
-            };
+            let hash = crate::service_helpers::validate_hex_hash_param(
+                &params.0,
+                "block hash",
+                answer_id.clone(),
+            )?;
             let full_txns = params.1;
             let block = service.block_state.get_block_by_hash(&hash);
             match block {
@@ -178,16 +153,16 @@ async fn json_rpc_endpoint(
 
         "eth_getTransactionCount" => {
             let params: (String, String) = request.parse_params()?;
-            let nonce = service.nonce_tracker.get(&params.0);
+            let nonce = service
+                .store
+                .nonce_get(&params.0)
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?;
             Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
         }
 
-        "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
-
-        // polycli estimates GasTipCap (priority fee cap), return zero
-        "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
-
-        // polycli estimates how much gas will be spent on a transaction, return zero
+        "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
+        "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
 
         "eth_chainId" => Ok(JsonRpcResponse::success(
@@ -195,50 +170,34 @@ async fn json_rpc_endpoint(
             format!("{:#x}", service.chain_id),
         )),
 
-        // AggLayer requests current state of the bridge contract using eth_call,
-        // but currently everything is stubbed with zero except networkID
-        "eth_call" => {
-            #[derive(Debug, Deserialize)]
-            struct TransactionParam {
-                data: Option<String>,
-                input: Option<String>,
-            }
-            let params: (TransactionParam, String) = request.parse_params()?;
-            let txn_param = params.0;
-
-            if let Some(data_hex) = txn_param.data.or(txn_param.input) {
-                let Ok(data) = hex_decode_prefixed(&data_hex) else {
-                    let error = JsonRpcError::new(
-                        JsonRpcErrorReason::InvalidParams,
-                        String::from("bad transaction.data"),
-                        serde_json::Value::Null,
-                    );
-                    return Err(JsonRpcResponse::error(answer_id, error));
-                };
-
-                if data.starts_with(&networkIDCall::SELECTOR) {
-                    let chain_id = service.chain_id;
-                    let chain_id_hex = format!("{:#066x}", chain_id);
-                    return Ok(JsonRpcResponse::success(answer_id, chain_id_hex));
-                }
-            }
-
-            Ok(JsonRpcResponse::success(
-                answer_id,
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-            ))
-        }
+        "eth_call" => service_eth_call(service, request).await,
 
         "eth_sendRawTransaction" => {
             let params: (String,) = request.parse_params()?;
             let result = service_send_raw_txn(service, params.0).await;
+            match &result {
+                Ok(hash) => tracing::info!("eth_sendRawTransaction: OK hash={hash}"),
+                Err(err) => tracing::info!("eth_sendRawTransaction: ERR {err:#}"),
+            }
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::SendRawTransaction)
         }
 
-        // polycli polls receipts to get the eth_sendRawTransaction status
         "eth_getTransactionReceipt" => {
             let params: (String,) = request.parse_params()?;
+            let tx_hash_str = params.0.clone();
             let result = service_get_txn_receipt(service, params.0).await;
+            match &result {
+                Ok(Some(r)) => tracing::info!(
+                    "eth_getTransactionReceipt: FOUND hash={tx_hash_str} block={}",
+                    r.block_number.unwrap_or(0)
+                ),
+                Ok(None) => {
+                    tracing::info!("eth_getTransactionReceipt: NOT FOUND hash={tx_hash_str}")
+                }
+                Err(err) => {
+                    tracing::info!("eth_getTransactionReceipt: ERR hash={tx_hash_str} {err:#}")
+                }
+            }
             json_rpc_response_from_result(
                 result,
                 answer_id,
@@ -256,29 +215,42 @@ async fn json_rpc_endpoint(
                 );
                 return Err(JsonRpcResponse::error(answer_id, error));
             };
-            let txn_opt = service.txn_manager.txn(txn_hash);
-            Ok(JsonRpcResponse::success(answer_id, txn_opt))
-        }
 
-        "eth_getLogs" => {
-            // Return synthetic logs from LogStore (GER/claim events with proper formatting).
-            // TxnManager logs are intentionally excluded: they duplicate LogStore entries
-            // but use alloy's Log type which serializes Optional fields as JSON null,
-            // causing Go's hexutil.Uint unmarshaling to fail in the bridge-service.
-            let raw_params: (serde_json::Value,) = request.parse_params()?;
+            // Try store first (real transactions from eth_sendRawTransaction)
+            if let Some(data) = service
+                .store
+                .txn_get(txn_hash)
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?
+            {
+                let txn = data.to_rpc_transaction(txn_hash, &service.block_state);
+                return Ok(JsonRpcResponse::success(answer_id, txn));
+            }
 
-            let log_filter: LogFilter = serde_json::from_value(raw_params.0).unwrap_or_default();
-            let current_block = service.block_num_tracker.latest();
-            let synthetic_logs = service.log_store.get_logs(&log_filter, current_block);
-            let json_logs: Vec<serde_json::Value> = synthetic_logs
-                .iter()
-                .map(|l: &crate::log_synthesis::SyntheticLog| l.to_json())
-                .collect();
+            // Fallback: synthetic transactions (bridge-out events)
+            let tx_hash_str = format!("{txn_hash:#x}");
+            let logs = service
+                .store
+                .get_logs_for_tx(&tx_hash_str)
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?;
+            if let Some(log) = logs.first() {
+                tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
+                let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
+                return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
+            }
 
-            Ok(JsonRpcResponse::success::<Vec<serde_json::Value>, _>(
-                answer_id, json_logs,
+            tracing::debug!(
+                tx_hash = %tx_hash_str,
+                "eth_getTransactionByHash: unknown hash, returning null"
+            );
+            Ok(JsonRpcResponse::success::<serde_json::Value, _>(
+                answer_id,
+                serde_json::Value::Null,
             ))
         }
+
+        "eth_getLogs" => service_get_logs(service, request).await,
 
         "eth_getBalance" => {
             let _params: (String, String) = request.parse_params()?;
@@ -301,6 +273,37 @@ async fn json_rpc_endpoint(
                 answer_id,
                 "0x0000000000000000000000000000000000000000000000000000000000000000",
             ))
+        }
+
+        "debug_traceTransaction" => service_debug_trace_transaction(service, request).await,
+
+        "zkevm_getLatestGlobalExitRoot" => service_zkevm_get_latest_ger(service, request).await,
+
+        "zkevm_getExitRootsByGER" => service_zkevm_get_exit_roots_by_ger(service, request).await,
+
+        "admin_registerFaucet" => {
+            let params: (crate::service_admin::RegisterFaucetParams,) = request.parse_params()?;
+            let result = crate::service_admin::admin_register_faucet(service, params.0).await;
+            json_rpc_response_from_result(result, answer_id, ServiceErrorCode::AdminRegisterFaucet)
+        }
+
+        "admin_listFaucets" => {
+            let faucets = service.store.list_faucets().await.unwrap_or_default();
+            let list: Vec<serde_json::Value> = faucets
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "faucet_id": f.faucet_id.to_hex(),
+                        "symbol": f.symbol,
+                        "origin_address": format!("0x{}", hex::encode(f.origin_address)),
+                        "origin_network": f.origin_network,
+                        "origin_decimals": f.origin_decimals,
+                        "miden_decimals": f.miden_decimals,
+                        "scale": f.scale,
+                    })
+                })
+                .collect();
+            Ok(JsonRpcResponse::success(answer_id, serde_json::json!(list)))
         }
 
         method => {
@@ -332,9 +335,18 @@ async fn shutdown_signal() {
     }
 }
 
-pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
+async fn health_check() -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "status": "ok" }))
+}
+
+pub async fn serve(
+    url: Url,
+    state: ServiceState,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(json_rpc_endpoint))
+        .route("/health", get(health_check))
         .layer(
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::if_not_present(
@@ -349,7 +361,11 @@ pub async fn serve(url: Url, state: ServiceState) -> anyhow::Result<()> {
                         .allow_headers([http::header::CONTENT_TYPE]),
                 ),
         )
-        .with_state(state);
+        .with_state(state)
+        .route(
+            "/metrics",
+            get(move || async move { metrics_handle.render() }),
+        );
 
     let listener = url
         .socket_addrs(|| None)

@@ -63,8 +63,34 @@ doc-open: ## Generate Rust docs and open a browser
 # --- Testing -------------------------------------------------------------------------------------
 
 .PHONY: test
-test: ## Run tests
+test: test-unit test-e2e ## Run everything: unit tests, then spin up stack and run E2E
+
+.PHONY: test-unit
+test-unit: ## Run unit tests (no docker needed)
+	cargo test --workspace --profile=$(CARGO_PROFILE) --lib
+
+.PHONY: test-e2e
+test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
+	@echo "╔══════════════════════════════════════════════════════════════╗"
+	@echo "║  Starting E2E stack (Anvil, Miden node, PG, bridge, aggkit) ║"
+	@echo "╚══════════════════════════════════════════════════════════════╝"
+	$(E2E_COMPOSE) up -d --build --wait
+	@echo ""
+	@echo "Stack is up — running E2E tests..."
+	@echo ""
+	./scripts/e2e-test.sh; EXIT_CODE=$$?; \
+		echo ""; \
+		echo "Tearing down stack..."; \
+		$(E2E_COMPOSE) down -v; \
+		exit $$EXIT_CODE
+
+.PHONY: test-nextest
+test-nextest: ## Run unit tests via cargo-nextest (faster, needs install-tools)
 	cargo nextest run --workspace $(CARGO_RELEASE_ARG) --lib --no-tests pass
+
+.PHONY: test-postgres
+test-postgres: ## Run PgStore integration tests (needs DATABASE_URL)
+	cargo test --workspace --profile=$(CARGO_PROFILE) --features postgres --lib -- pgstore
 
 .PHONY: test-docs
 test-docs: ## Run documentation tests
@@ -136,3 +162,54 @@ install-tools: ## Install development tools
 	cargo install cargo-nextest --locked
 	cargo install taplo-cli --locked
 	@echo "Development tools installation complete!"
+
+# --- E2E Testing (docker-compose, no Kurtosis) -------------------------------------------
+
+E2E_COMPOSE := docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+
+.PHONY: e2e-setup
+e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
+	./scripts/setup-fixtures.sh
+
+.PHONY: e2e-up
+e2e-up: ## Start full E2E environment
+	$(E2E_COMPOSE) up -d --build --wait
+
+.PHONY: e2e-test
+e2e-test: ## Run E2E tests (assumes stack is already up)
+	./scripts/e2e-test.sh
+
+.PHONY: e2e-l1-to-l2
+e2e-l1-to-l2: e2e-up ## Spin up stack + run L1→L2 deposit + claim test
+	./scripts/e2e-l1-to-l2.sh
+
+.PHONY: e2e-l2-to-l1
+e2e-l2-to-l1: e2e-up ## Spin up stack + run L2→L1 bridge-out test
+	./scripts/e2e-l2-to-l1.sh
+
+.PHONY: e2e-restore
+e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test
+	./scripts/e2e-restore.sh
+
+.PHONY: e2e-ger-decomposition
+e2e-ger-decomposition: e2e-up ## Spin up stack + run GER decomposition bug regression test
+	./scripts/e2e-ger-decomposition.sh
+
+.PHONY: e2e-security
+e2e-security: e2e-up ## Spin up stack + run security E2E tests
+	./scripts/e2e-security.sh
+
+.PHONY: e2e-fuzz
+e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
+	./scripts/e2e-fuzz-bridge.sh
+
+.PHONY: e2e
+e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
+
+.PHONY: e2e-down
+e2e-down: ## Stop E2E environment
+	$(E2E_COMPOSE) down -v
+
+.PHONY: e2e-logs
+e2e-logs: ## Tail all E2E service logs
+	$(E2E_COMPOSE) logs -f

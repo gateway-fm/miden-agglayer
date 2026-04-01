@@ -22,16 +22,14 @@
 //! `keccak256(rlp(header))` hash. This is the same computation Go's ethclient
 //! performs, so the hashes always match.
 //!
-//! All header fields are pure functions of block number alone — no state, no
-//! caching needed. Parent hash uses a simple deterministic scheme (not recursive
-//! RLP computation) since the bridge only checks per-block hash consistency,
-//! not parent-child hash chains.
+//! The parent_hash field in each header is the RLP hash of the previous block's
+//! header, forming a proper hash chain. Hash computation is iterative from genesis
+//! to avoid recursion, and results are cached in BlockState.
 
 use alloy::consensus::Header;
 use alloy::primitives::{B64, B256, Bloom, U256};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 
 use crate::miden_client::SyncListener;
@@ -67,35 +65,12 @@ pub struct SyntheticBlock {
 }
 
 impl SyntheticBlock {
-    pub fn new(number: u64, timestamp: u64) -> Self {
-        let parent_hash = Self::deterministic_parent_hash(number);
-        let hash = Self::compute_hash_for_number(number);
-        Self {
-            number,
-            hash,
-            parent_hash,
-            timestamp,
-            state_root: [0u8; 32],
-            transactions: Vec::new(),
-        }
-    }
-
-    fn deterministic_parent_hash(number: u64) -> [u8; 32] {
-        if number == 0 {
-            [0u8; 32]
-        } else {
-            let mut hasher = Keccak256::new();
-            hasher.update(format!("miden_parent_{}", number - 1).as_bytes());
-            hasher.finalize().into()
-        }
-    }
-
-    fn build_header(number: u64) -> Header {
-        let parent_hash = Self::deterministic_parent_hash(number);
+    /// Build a block header for hash computation.
+    fn build_header(number: u64, parent_hash: B256) -> Header {
         let timestamp = GENESIS_TIMESTAMP + number * BLOCK_TIME;
 
         Header {
-            parent_hash: B256::from(parent_hash),
+            parent_hash,
             ommers_hash: B256::from(EMPTY_OMMERS_HASH),
             beneficiary: Default::default(),
             state_root: B256::ZERO,
@@ -115,14 +90,18 @@ impl SyntheticBlock {
         }
     }
 
+    /// Compute the hash for a block number by building the entire chain from
+    /// genesis. This is O(N) but results should be cached by BlockState.
     pub fn compute_hash_for_number(number: u64) -> [u8; 32] {
-        let header = Self::build_header(number);
-        header.hash_slow().0
+        let mut parent_hash = B256::ZERO;
+        for n in 0..=number {
+            let header = Self::build_header(n, parent_hash);
+            parent_hash = header.hash_slow();
+        }
+        parent_hash.0
     }
 
     pub fn to_json(&self, _full_transactions: bool) -> serde_json::Value {
-        // Note: full_transactions=true should return full tx objects, but our
-        // synthetic blocks only store tx hashes, so both cases return the same.
         let txs = serde_json::json!(self.transactions);
 
         serde_json::json!({
@@ -151,7 +130,10 @@ impl SyntheticBlock {
     }
 }
 
-/// Block state tracking for synthetic EVM blocks
+/// Block state tracking for synthetic EVM blocks.
+///
+/// Caches block hashes so the iterative chain computation only runs once per
+/// block number. Blocks are created on demand and never evicted.
 pub struct BlockState {
     blocks: RwLock<HashMap<u64, SyntheticBlock>>,
     hash_to_number: RwLock<HashMap<[u8; 32], u64>>,
@@ -182,6 +164,11 @@ impl BlockState {
         GENESIS_TIMESTAMP + block_num * BLOCK_TIME
     }
 
+    /// Compute the deterministic timestamp for any block number.
+    pub fn get_block_timestamp(&self, block_num: u64) -> u64 {
+        Self::deterministic_timestamp(block_num)
+    }
+
     fn ensure_block_exists(&self, block_num: u64) {
         // Acquire both locks before mutating to prevent deadlock from
         // inconsistent lock ordering. Always: hash_to_number first, then blocks.
@@ -191,9 +178,38 @@ impl BlockState {
             return;
         }
 
-        let block = SyntheticBlock::new(block_num, Self::deterministic_timestamp(block_num));
-        hash_to_number.insert(block.hash, block_num);
-        blocks.insert(block_num, block);
+        // Build the chain iteratively, reusing cached hashes where possible.
+        // Find the highest cached block below block_num to avoid recomputing
+        // the entire chain from genesis every time.
+        let mut start_from = 0u64;
+        let mut parent_hash = B256::ZERO;
+        for n in (0..block_num).rev() {
+            if let Some(cached) = blocks.get(&n) {
+                start_from = n + 1;
+                parent_hash = B256::from(cached.hash);
+                break;
+            }
+        }
+
+        for n in start_from..=block_num {
+            if let Some(cached) = blocks.get(&n) {
+                parent_hash = B256::from(cached.hash);
+                continue;
+            }
+            let header = SyntheticBlock::build_header(n, parent_hash);
+            let hash = header.hash_slow().0;
+            let block = SyntheticBlock {
+                number: n,
+                hash,
+                parent_hash: parent_hash.0,
+                timestamp: Self::deterministic_timestamp(n),
+                state_root: [0u8; 32],
+                transactions: Vec::new(),
+            };
+            parent_hash = B256::from(hash);
+            hash_to_number.insert(hash, n);
+            blocks.insert(n, block);
+        }
     }
 
     pub fn get_block_by_number(&self, block_num: u64) -> Option<SyntheticBlock> {
@@ -209,13 +225,19 @@ impl BlockState {
     }
 
     pub fn add_transaction_to_block(&self, block_num: u64, tx_hash: String) {
+        self.ensure_block_exists(block_num);
         if let Some(block) = self.blocks.write().get_mut(&block_num) {
             block.transactions.push(tx_hash);
         }
     }
 
     pub fn get_block_hash(&self, block_num: u64) -> [u8; 32] {
-        SyntheticBlock::compute_hash_for_number(block_num)
+        self.ensure_block_exists(block_num);
+        self.blocks
+            .read()
+            .get(&block_num)
+            .map(|block| block.hash)
+            .unwrap_or_else(|| SyntheticBlock::compute_hash_for_number(block_num))
     }
 }
 
@@ -252,9 +274,10 @@ mod tests {
 
     #[test]
     fn test_hash_is_real_rlp_hash() {
-        let header = SyntheticBlock::build_header(42);
+        let parent_hash = B256::ZERO; // genesis has no parent
+        let header = SyntheticBlock::build_header(0, parent_hash);
         let expected = header.hash_slow().0;
-        let actual = SyntheticBlock::compute_hash_for_number(42);
+        let actual = SyntheticBlock::compute_hash_for_number(0);
         assert_eq!(actual, expected, "Hash must be keccak256(rlp(header))");
     }
 
@@ -292,7 +315,72 @@ mod tests {
     #[test]
     fn test_get_block_hash_without_cache() {
         let state = BlockState::new();
-        let h = state.get_block_hash(999);
-        assert_eq!(h, SyntheticBlock::compute_hash_for_number(999));
+        let h = state.get_block_hash(50);
+        assert_eq!(h, SyntheticBlock::compute_hash_for_number(50));
+    }
+
+    /// Verify that parent_hash forms a proper chain: block N's parent_hash
+    /// equals block (N-1)'s hash, and the hash itself is keccak256(rlp(header))
+    /// with the correct parent_hash included.
+    #[test]
+    fn test_parent_hash_chain_integrity() {
+        let state = BlockState::new();
+
+        // Build a chain of 10 blocks
+        for i in 0..10 {
+            state.ensure_block_exists(i);
+        }
+
+        let blocks = state.blocks.read();
+
+        // Genesis parent_hash is zero
+        let genesis = blocks.get(&0).unwrap();
+        assert_eq!(genesis.parent_hash, [0u8; 32]);
+
+        // Each subsequent block's parent_hash must equal the previous block's hash
+        for n in 1..10u64 {
+            let block = blocks.get(&n).unwrap();
+            let parent = blocks.get(&(n - 1)).unwrap();
+            assert_eq!(
+                block.parent_hash,
+                parent.hash,
+                "Block {n}'s parent_hash must equal block {}'s hash",
+                n - 1
+            );
+        }
+
+        // Verify that the hash is keccak256(rlp(header)) with the correct parent_hash
+        for n in 0..10u64 {
+            let block = blocks.get(&n).unwrap();
+            let header = SyntheticBlock::build_header(n, B256::from(block.parent_hash));
+            let expected_hash = header.hash_slow().0;
+            assert_eq!(
+                block.hash, expected_hash,
+                "Block {n}'s hash must be keccak256(rlp(header)) with correct parent_hash"
+            );
+        }
+    }
+
+    /// Verify that Go's ethclient would compute the same hash from our JSON response.
+    /// The JSON includes parentHash, and Go computes header.Hash() from all fields.
+    #[test]
+    fn test_json_hash_matches_computed_hash() {
+        let state = BlockState::new();
+        let block = state.get_block_by_number(5).unwrap();
+        let json = block.to_json(false);
+
+        // The hash in the JSON must match what we'd get from RLP-hashing the header
+        // with the parentHash from the same JSON response.
+        let parent_hash_hex = json["parentHash"].as_str().unwrap();
+        let parent_hash_bytes = hex::decode(&parent_hash_hex[2..]).unwrap();
+        let mut parent_hash = [0u8; 32];
+        parent_hash.copy_from_slice(&parent_hash_bytes);
+
+        let header = SyntheticBlock::build_header(5, B256::from(parent_hash));
+        let recomputed = header.hash_slow().0;
+        assert_eq!(
+            block.hash, recomputed,
+            "JSON response hash must match keccak256(rlp(header)) using JSON's parentHash"
+        );
     }
 }

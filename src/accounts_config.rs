@@ -9,9 +9,19 @@ use std::{env, fs};
 pub struct AccountsConfig {
     pub service: AccountIdBech32,
     pub bridge: AccountIdBech32,
-    pub faucet_eth: AccountIdBech32,
-    pub faucet_agg: AccountIdBech32,
+    /// Legacy field — kept for backward compatibility with existing TOML configs.
+    /// New deployments use the dynamic faucet registry in the Store.
+    #[serde(default)]
+    pub faucet_eth: Option<AccountIdBech32>,
+    /// Legacy field — kept for backward compatibility with existing TOML configs.
+    #[serde(default)]
+    pub faucet_agg: Option<AccountIdBech32>,
     pub wallet_hardhat: AccountIdBech32,
+    /// Dedicated account for GER injection. Separate from `service` so the
+    /// NTX builder's modifications to the service account don't cause stale
+    /// state errors when submitting UpdateGerNotes.
+    #[serde(default)]
+    pub ger_manager: Option<AccountIdBech32>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,5 +1,5 @@
 use crate::block_state::BlockState;
-use crate::log_synthesis::LogStore;
+use crate::store::Store;
 use crate::*;
 use std::sync::Arc;
 
@@ -8,43 +8,37 @@ pub struct ServiceState {
     pub miden_client: Arc<MidenClient>,
     pub accounts: AccountsConfig,
     pub chain_id: u64,
-    pub block_num_tracker: Arc<BlockNumTracker>,
-    pub txn_manager: Arc<TxnManager>,
+    /// Rollup network ID from RollupManager (used for bridge's networkID() call)
+    pub network_id: u64,
+    pub store: Arc<dyn Store>,
     pub block_state: Arc<BlockState>,
-    pub log_store: Arc<LogStore>,
-    pub claim_tracker: Arc<ClaimTracker>,
-    pub nonce_tracker: Arc<NonceTracker>,
-    pub address_mapper: Arc<AddressMapper>,
+    /// L1 RPC URL for resolving exit roots from the L1 GER contract
+    pub l1_rpc_url: Option<String>,
+    /// L1 GER contract address
+    pub ger_l1_address: Option<String>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<ServiceState>();
 
 impl ServiceState {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         miden_client: MidenClient,
         accounts: AccountsConfig,
         chain_id: u64,
-        block_num_tracker: Arc<BlockNumTracker>,
-        txn_manager: Arc<TxnManager>,
+        network_id: u64,
+        store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
-        log_store: Arc<LogStore>,
-        claim_tracker: Arc<ClaimTracker>,
-        nonce_tracker: Arc<NonceTracker>,
-        address_mapper: Arc<AddressMapper>,
     ) -> Self {
         Self {
             miden_client: Arc::new(miden_client),
             accounts,
             chain_id,
-            block_num_tracker,
-            txn_manager,
+            network_id,
+            store,
             block_state,
-            log_store,
-            claim_tracker,
-            nonce_tracker,
-            address_mapper,
+            l1_rpc_url: None,
+            ger_l1_address: None,
         }
     }
 }

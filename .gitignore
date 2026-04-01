@@ -1,0 +1,22 @@
+# Build
+/target/
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Secrets — keystores contain private keys for test accounts
+fixtures/*.keystore
+
+# Large generated files — recreate with: make e2e-setup
+fixtures/anvil-state.json
+fixtures/combined.json
+fixtures/l1-transactions.json
+fixtures/l1-raw-txs.txt
+fixtures/.env
