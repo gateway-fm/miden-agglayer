@@ -322,9 +322,12 @@ async fn publish_claim_internal(
     })
 }
 
-/// Publish a claim and record the ClaimEvent inside the MidenClient closure.
-/// Recording happens before the result is sent back, making it cancellation-safe:
-/// even if the HTTP caller disconnects, the event is already in the store.
+/// Publish a claim using a fresh miden-client instance (Igor's approach).
+///
+/// Creates a new client per call to avoid stale account state from the
+/// long-lived MidenClient's background sync loop. After faucet creation
+/// or prior CLAIMs, the service account's state drifts in the long-lived
+/// client, causing `IncorrectAccountInitialCommitment` errors.
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
@@ -335,46 +338,120 @@ pub async fn publish_claim(
     txn_hash: alloy::primitives::TxHash,
     txn_envelope: alloy::consensus::TxEnvelope,
     signer: alloy::primitives::Address,
+    store_dir: std::path::PathBuf,
+    node_url: String,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
 
-    client
-        .with(move |client| {
-            Box::new(async move {
-                let value =
-                    publish_claim_internal(params, client, &accounts.0, &*store, latest_block_num)
-                        .await?;
-
-                // Record the ClaimEvent INSIDE the closure — cancellation-safe.
-                let block_num = store.advance_block_number().await?;
-                let block_hash = block_state.get_block_hash(block_num);
-                store
-                    .txn_begin(
-                        txn_hash,
-                        crate::store::TxnEntry {
-                            id: Some(value.txn_id),
-                            envelope: txn_envelope,
-                            signer,
-                            expires_at: Some(value.expires_at),
-                            logs: vec![value.log.clone()],
-                        },
+    if node_url.is_empty() {
+        // Test path: use the existing MidenClient
+        let result_test = result.clone();
+        client
+            .with(move |client| {
+                Box::new(async move {
+                    let value = publish_claim_internal(
+                        params,
+                        client,
+                        &accounts.0,
+                        &*store,
+                        latest_block_num,
                     )
                     .await?;
-                store
-                    .txn_commit(txn_hash, Ok(()), block_num, block_hash)
-                    .await?;
-                tracing::info!(
-                    eth_tx = %txn_hash,
-                    block_num,
-                    "ClaimEvent recorded (cancellation-safe)"
-                );
-
-                let _ = result_inner.set(value);
-                Ok(())
+                    let block_num = store.advance_block_number().await?;
+                    let block_hash = block_state.get_block_hash(block_num);
+                    store
+                        .txn_begin(
+                            txn_hash,
+                            crate::store::TxnEntry {
+                                id: Some(value.txn_id),
+                                envelope: txn_envelope,
+                                signer,
+                                expires_at: Some(value.expires_at),
+                                logs: vec![value.log.clone()],
+                            },
+                        )
+                        .await?;
+                    store
+                        .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+                        .await?;
+                    let _ = result_test.set(value);
+                    Ok(())
+                })
             })
+            .await?;
+        return result
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("publish_claim: result not set"));
+    }
+
+    let keystore = client.get_keystore();
+    let store_path = store_dir.join("store.sqlite3");
+
+    // Production path: fresh client per call (Igor's approach).
+    let store_clone = store.clone();
+    let accounts_inner = accounts.0.clone();
+    let join_result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            use ::miden_client::builder::ClientBuilder;
+            use ::miden_client::rpc::Endpoint;
+            use ::miden_client::DebugMode;
+            use ::miden_client_sqlite_store::ClientBuilderSqliteExt;
+
+            let ep = Endpoint::try_from(node_url.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid node URL: {e}"))?;
+            let mut client = ClientBuilder::new()
+                .grpc_client(&ep, Some(10_000))
+                .sqlite_store(store_path)
+                .authenticator(keystore)
+                .in_debug_mode(DebugMode::Enabled)
+                .build()
+                .await?;
+            client.sync_state().await?;
+
+            let value = publish_claim_internal(
+                params,
+                &mut client,
+                &accounts_inner,
+                &*store_clone,
+                latest_block_num,
+            )
+            .await?;
+
+            // Record the ClaimEvent — cancellation-safe.
+            let block_num = store_clone.advance_block_number().await?;
+            let block_hash = block_state.get_block_hash(block_num);
+            store_clone
+                .txn_begin(
+                    txn_hash,
+                    crate::store::TxnEntry {
+                        id: Some(value.txn_id),
+                        envelope: txn_envelope,
+                        signer,
+                        expires_at: Some(value.expires_at),
+                        logs: vec![value.log.clone()],
+                    },
+                )
+                .await?;
+            store_clone
+                .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+                .await?;
+            tracing::info!(
+                eth_tx = %txn_hash,
+                block_num,
+                "ClaimEvent recorded (cancellation-safe)"
+            );
+
+            let _ = result_inner.set(value);
+            Ok::<_, anyhow::Error>(())
         })
-        .await?;
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("claim spawn_blocking: {e}"))?;
+
+    join_result?;
 
     result
         .get()

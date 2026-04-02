@@ -114,12 +114,22 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow!("failed to build miden client: {e}"))?;
 
-    // Sync state
+    // Sync state — retry on transient errors (concurrent SQLite access with
+    // the running service can cause "failed to convert note record" errors).
     println!("[bridge-out] syncing state...");
-    client
-        .sync_state()
-        .await
-        .map_err(|e| anyhow!("sync failed: {e}"))?;
+    for sync_attempt in 0..5u32 {
+        match client.sync_state().await {
+            Ok(_) => break,
+            Err(e) if sync_attempt < 4 => {
+                eprintln!(
+                    "[bridge-out] sync attempt {} failed: {e}, retrying...",
+                    sync_attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => return Err(anyhow!("sync failed after 5 attempts: {e}")),
+        }
+    }
     println!("[bridge-out] sync complete");
 
     // Try to consume any Expected/Committed notes for the wallet
