@@ -240,29 +240,28 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // Resolve exit root components from L1, since insertGlobalExitRoot
         // only carries the combined hash. Without these, bridge-service
         // cannot mark deposits as ready_for_claim.
-        let (mainnet_root, rollup_root) =
-            match (&service.l1_rpc_url, &service.ger_l1_address) {
-                (Some(l1_rpc), Some(ger_addr)) => {
-                    match ger::fetch_l1_exit_roots(l1_rpc, ger_addr).await {
-                        Ok((m, r)) => {
-                            let computed = ger::combined_ger(&m, &r);
-                            if computed == ger_bytes {
-                                (Some(m), Some(r))
-                            } else {
-                                tracing::warn!(
-                                    "L1 exit roots don't match injected GER (L1 may have advanced), storing without roots"
-                                );
-                                (None, None)
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("failed to fetch L1 exit roots: {e:#}");
+        let (mainnet_root, rollup_root) = match (&service.l1_rpc_url, &service.ger_l1_address) {
+            (Some(l1_rpc), Some(ger_addr)) => {
+                match ger::fetch_l1_exit_roots(l1_rpc, ger_addr).await {
+                    Ok((m, r)) => {
+                        let computed = ger::combined_ger(&m, &r);
+                        if computed == ger_bytes {
+                            (Some(m), Some(r))
+                        } else {
+                            tracing::warn!(
+                                "L1 exit roots don't match injected GER (L1 may have advanced), storing without roots"
+                            );
                             (None, None)
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!("failed to fetch L1 exit roots: {e:#}");
+                        (None, None)
+                    }
                 }
-                _ => (None, None),
-            };
+            }
+            _ => (None, None),
+        };
 
         handle_ger_result(
             ger::insert_ger(

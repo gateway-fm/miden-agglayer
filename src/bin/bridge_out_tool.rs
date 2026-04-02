@@ -167,18 +167,16 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             if !notes.is_empty() {
                 match TransactionRequestBuilder::new().build_consume_notes(notes) {
-                    Ok(req) => {
-                        match client.submit_new_transaction(wallet_id, req).await {
-                            Ok(tx) => {
-                                println!("[bridge-out] consumed notes: {tx}");
-                                for _ in 0..10 {
-                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                    client.sync_state().await.ok();
-                                }
+                    Ok(req) => match client.submit_new_transaction(wallet_id, req).await {
+                        Ok(tx) => {
+                            println!("[bridge-out] consumed notes: {tx}");
+                            for _ in 0..10 {
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                client.sync_state().await.ok();
                             }
-                            Err(e) => println!("[bridge-out] consume failed: {e}"),
                         }
-                    }
+                        Err(e) => println!("[bridge-out] consume failed: {e}"),
+                    },
                     Err(e) => println!("[bridge-out] build consume req failed: {e}"),
                 }
             }
