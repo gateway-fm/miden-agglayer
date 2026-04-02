@@ -58,6 +58,10 @@ struct Args {
     /// Destination network (0 = Ethereum L1)
     #[arg(long, default_value_t = 0)]
     dest_network: u32,
+
+    /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
+    #[arg(long, env = "MIDEN_DEBUG")]
+    miden_debug: bool,
 }
 
 fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
@@ -98,10 +102,22 @@ async fn main() -> anyhow::Result<()> {
     if !keystore_path.exists() {
         return Err(anyhow!("keystore not found at {}", keystore_path.display()));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&keystore_path, perms)?;
+    }
 
     // Parse node endpoint
     let node_endpoint =
         Endpoint::try_from(args.node_url.as_str()).map_err(|e| anyhow!("invalid node URL: {e}"))?;
+
+    let mode = if args.miden_debug {
+        DebugMode::Enabled
+    } else {
+        DebugMode::Disabled
+    };
 
     // Build miden client from existing store
     let keystore = FilesystemKeyStore::new(keystore_path)?;
@@ -109,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         .grpc_client(&node_endpoint, Some(10_000))
         .sqlite_store(store_path)
         .authenticator(Arc::new(keystore))
-        .in_debug_mode(DebugMode::Enabled)
+        .in_debug_mode(mode)
         .build()
         .await
         .map_err(|e| anyhow!("failed to build miden client: {e}"))?;
@@ -125,7 +141,6 @@ async fn main() -> anyhow::Result<()> {
     // Try to consume any Expected/Committed notes for the wallet
     {
         use miden_client::store::NoteFilter;
-        // Check for Expected notes (synced but not yet consumed)
         let expected = client
             .get_input_notes(NoteFilter::Expected)
             .await
@@ -140,7 +155,6 @@ async fn main() -> anyhow::Result<()> {
             committed.len()
         );
 
-        // Try consuming committed notes first (standard path)
         let consumable = client
             .get_consumable_notes(Some(wallet_id))
             .await
@@ -157,7 +171,6 @@ async fn main() -> anyhow::Result<()> {
                         match client.submit_new_transaction(wallet_id, req).await {
                             Ok(tx) => {
                                 println!("[bridge-out] consumed notes: {tx}");
-                                // Wait for commit
                                 for _ in 0..10 {
                                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                     client.sync_state().await.ok();
@@ -215,6 +228,13 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = client.import_account_by_id(bridge_id).await {
         eprintln!("[bridge-out] bridge re-import: {e} (may already be tracked)");
     }
+
+    // Final sync right before submit to minimize the window where the service's
+    // background sync loop can change our shared SQLite state.
+    client
+        .sync_state()
+        .await
+        .map_err(|e| anyhow!("pre-submit sync failed: {e}"))?;
 
     // Submit transaction
     let tx_request = TransactionRequestBuilder::new()
