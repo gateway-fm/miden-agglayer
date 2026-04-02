@@ -190,6 +190,8 @@ async fn publish_and_record_claim(
         txn_hash,
         txn_envelope,
         signer,
+        service.miden_store_dir.clone(),
+        service.miden_node_url.clone(),
     )
     .await?;
     tracing::info!(
@@ -274,6 +276,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 &service.store,
                 &service.block_state,
                 txn_hash,
+                service.miden_store_dir.clone(),
+                service.miden_node_url.clone(),
             )
             .await,
             txn_hash,
@@ -302,6 +306,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 &service.store,
                 &service.block_state,
                 txn_hash,
+                service.miden_store_dir.clone(),
+                service.miden_node_url.clone(),
             )
             .await,
             txn_hash,

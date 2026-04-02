@@ -201,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
     );
     state.l1_rpc_url = command.l1_rpc_url;
     state.ger_l1_address = command.ger_l1_address;
+    state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
+    // miden_node was moved into MidenClient::new, re-read from env
+    state.miden_node_url = std::env::var("MIDEN_NODE_URL")
+        .unwrap_or_else(|_| "http://miden-node:57291".to_string());
 
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
