@@ -5,7 +5,7 @@ use alloy::primitives::{FixedBytes, LogData, TxHash};
 use alloy::sol_types::SolEvent;
 use alloy_rpc_types_eth::TransactionRequest;
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
-use miden_client::transaction::{OutputNote, TransactionRequestBuilder};
+use miden_client::transaction::TransactionRequestBuilder;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 
@@ -154,7 +154,7 @@ async fn submit_ger_to_miden(
                 }
 
                 let tx_request = TransactionRequestBuilder::new()
-                    .own_output_notes(vec![OutputNote::Full(note)])
+                    .own_output_notes(vec![note])
                     .build()?;
 
                 let tx_id = match client
@@ -269,7 +269,7 @@ pub async fn insert_ger(
                             client.rng(),
                         )?;
                         let tx_request = TransactionRequestBuilder::new()
-                            .own_output_notes(vec![OutputNote::Full(note)])
+                            .own_output_notes(vec![note])
                             .build()?;
                         client
                             .submit_new_transaction(ger_manager_id, tx_request)

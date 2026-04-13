@@ -7,6 +7,7 @@
 use crate::faucet_ops;
 use crate::service_state::ServiceState;
 use crate::store::FaucetEntry;
+use miden_base_agglayer::MetadataHash;
 use miden_protocol::account::AccountId;
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
@@ -18,6 +19,10 @@ pub struct RegisterFaucetParams {
     pub origin_network: u32,
     pub origin_decimals: u8,
     pub miden_decimals: u8,
+    /// Token display name used when computing the `MetadataHash`. Optional —
+    /// defaults to the symbol if not provided.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 pub async fn admin_register_faucet(
@@ -55,10 +60,19 @@ pub async fn admin_register_faucet(
     let service_id = accounts.service.0;
     let bridge_id = accounts.bridge.0;
 
+    // Compute MetadataHash from (name, symbol, origin_decimals) — matches the L1 bridge
+    // contract's `keccak256(abi.encode(name, symbol, decimals))`. Callers that skip the
+    // `name` field get `name = symbol`.
+    let metadata_name = params.name.clone().unwrap_or_else(|| params.symbol.clone());
+    let metadata_hash =
+        MetadataHash::from_token_info(&metadata_name, &params.symbol, params.origin_decimals);
+
     // Create, deploy, register in bridge (using OnceLock pattern like publish_claim)
     let result = Arc::new(OnceLock::<AccountId>::new());
     let result_inner = result.clone();
     let symbol_clone = params.symbol.clone();
+    let miden_decimals = params.miden_decimals;
+    let origin_network = params.origin_network;
 
     state
         .miden_client
@@ -67,12 +81,13 @@ pub async fn admin_register_faucet(
                 let account = faucet_ops::create_and_register_faucet(
                     client,
                     &symbol_clone,
-                    params.miden_decimals,
+                    miden_decimals,
                     &origin_address,
-                    params.origin_network,
+                    origin_network,
                     scale,
                     service_id,
                     bridge_id,
+                    metadata_hash,
                 )
                 .await?;
                 let _ = result_inner.set(account.id());

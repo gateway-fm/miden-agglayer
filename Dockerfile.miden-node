@@ -1,7 +1,8 @@
-# Build testing-node-builder from agglayer-integration-tests branch
-# This branch has a WORKING E2E bridge-in + bridge-out test with the NTX builder
-# correctly consuming CLAIM notes via network transactions.
-FROM rust:1.91-slim-bookworm AS builder
+# Build testing-node-builder from ajl-agglayer-integration-tests-v0.14.0 branch.
+# This is the first stable-0.14.x-compatible integration test branch; the CLAIM note
+# now targets the bridge (not the faucet), and the bridge gains an on-chain
+# token_registry_map alongside the faucet_registry_map.
+FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -15,16 +16,18 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# agglayer-integration-tests branch has:
-# - miden-node deps at =0.14.0-alpha.3
-# - Working agglayer bridge-in + bridge-out E2E test
-# - NTX builder correctly processes network notes (CONFIG_AGG_BRIDGE, UPDATE_GER, CLAIM)
+# ajl-agglayer-integration-tests-v0.14.0 branch has:
+# - miden-node + miden-protocol + miden-agglayer deps at 0.14 (stable, non-alpha)
+# - CLAIM notes targeting the bridge (not the faucet); bridge produces MINT note
+#   that the faucet consumes to create the final P2ID for the destination wallet
+# - Dual on-chain registration (faucet_registry_map + token_registry_map)
+# - EthAddress / EthEmbeddedAccountId type split
 # Pinned to specific commit for reproducible builds.
 RUN git clone https://github.com/0xMiden/miden-client.git . && \
-    git checkout ac3d953d6092a93e01b2a4bb9c464f395525390d
+    git checkout f7cdf263781999e8f81ba608f9c5a91218747d98
 
 RUN git rev-parse HEAD > /tmp/miden-client-commit.txt && \
-    echo "Branch: agglayer-integration-tests" >> /tmp/miden-client-commit.txt
+    echo "Branch: ajl-agglayer-integration-tests-v0.14.0" >> /tmp/miden-client-commit.txt
 
 # Patch: bind RPC to 0.0.0.0 for Docker port forwarding
 RUN sed -i 's|format!("127.0.0.1:{}", self.rpc_port)|format!("0.0.0.0:{}", self.rpc_port)|' \
@@ -57,9 +60,9 @@ RUN mkdir -p /app/data
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -e' \
-    'echo "=== Miden Testing Node (agglayer-integration-tests) ==="' \
+    'echo "=== Miden Testing Node (ajl-agglayer-integration-tests-v0.14.0) ==="' \
     'cat /app/miden-client-commit.txt' \
-    'export AGGLAYER_GENESIS="${AGGLAYER_GENESIS:-1}"' \
+    'export AGGLAYER_GENESIS="${AGGLAYER_GENESIS:-0}"' \
     'echo "AGGLAYER_GENESIS=$AGGLAYER_GENESIS"' \
     'exec testing-node-builder "$@"' \
     > /usr/local/bin/entrypoint.sh && \

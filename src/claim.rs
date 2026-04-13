@@ -6,7 +6,7 @@ use crate::store::{FaucetEntry, Store};
 use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
 use alloy::sol_types::SolEvent;
 use miden_base_agglayer::{
-    ClaimNoteStorage, EthAddressFormat, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
+    ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
     ProofData, SmtNode,
 };
 use miden_client::transaction::TransactionRequestBuilder;
@@ -14,7 +14,7 @@ use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::note::Note;
-use miden_protocol::transaction::{OutputNote, TransactionId};
+use miden_protocol::transaction::TransactionId;
 use std::sync::{Arc, OnceLock};
 
 alloy_core::sol! {
@@ -107,7 +107,13 @@ async fn find_or_create_faucet(
         "auto-creating faucet for new ERC-20 token"
     );
 
-    // 3. Create faucet on Miden, deploy, register in bridge
+    // 3. Create faucet on Miden, deploy, register in bridge. The faucet's stored
+    //    metadata_hash must match the CLAIM note's leaf_data.metadata_hash, which is
+    //    keccak256(metadata) (both empty for native ETH and abi.encode(name,symbol,decimals)
+    //    for ERC-20s). Using MetadataHash::from_abi_encoded on the raw metadata bytes matches
+    //    the L1 bridge contract exactly.
+    let metadata_hash = MetadataHash::from_abi_encoded(metadata.as_ref());
+
     let faucet_account = faucet_ops::create_and_register_faucet(
         client,
         &symbol,
@@ -117,6 +123,7 @@ async fn find_or_create_faucet(
         scale,
         accounts.service.0,
         accounts.bridge.0,
+        metadata_hash,
     )
     .await?;
 
@@ -167,33 +174,25 @@ async fn create_claim(
 
     let leaf_data = LeafData {
         origin_network: params.originNetwork,
-        origin_token_address: EthAddressFormat::new(params.originTokenAddress.0.0),
+        origin_token_address: EthAddress::new(params.originTokenAddress.0.0),
         destination_network: params.destinationNetwork,
-        destination_address: EthAddressFormat::new(params.destinationAddress.0.0),
+        destination_address: EthAddress::new(params.destinationAddress.0.0),
         amount: EthAmount::new(params.amount.to_be_bytes::<32>()),
-        metadata_hash: MetadataHash::new(metadata_to_hash(&params.metadata)),
+        metadata_hash: MetadataHash::from_abi_encoded(params.metadata.as_ref()),
     };
 
+    let _ = faucet; // retained for amount-scaling metadata; not used to target the note now.
     let storage = ClaimNoteStorage {
         proof_data,
         leaf_data,
         miden_claim_amount: Felt::from(amount),
     };
 
-    let note = miden_base_agglayer::create_claim_note(storage, faucet.id, sender, rng)?;
+    // CLAIM notes now target the bridge account (0.14.x). The bridge validates the proof and
+    // produces a MINT note targeted at the faucet. The faucet then creates the final P2ID note
+    // for the destination wallet (derived from leaf_data.destination_address).
+    let note = miden_base_agglayer::create_claim_note(storage, accounts.bridge.0, sender, rng)?;
     Ok(note)
-}
-
-/// Compute metadata hash: keccak256 of metadata bytes.
-///
-/// The Solidity bridge contract always uses `keccak256(metadata)` in the leaf
-/// computation, even for empty metadata. For ETH deposits metadata is empty,
-/// so this returns `keccak256("")` = `0xc5d246...`, NOT all zeros.
-fn metadata_to_hash(metadata: &Bytes) -> [u8; 32] {
-    use sha3::{Digest, Keccak256};
-    let mut hasher = Keccak256::new();
-    hasher.update(metadata.as_ref());
-    hasher.finalize().into()
 }
 
 #[derive(Debug, Clone)]
@@ -254,23 +253,20 @@ async fn publish_claim_internal(
     tracing::info!("GER propagation wait complete, submitting CLAIM note");
 
     let txn_request = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(claim_note); 1])
+        .own_output_notes(vec![claim_note])
         .build()?;
 
-    // Execute and check the output notes before submission
+    // Execute and check the output notes before submission. `ExecutedTransaction` still
+    // produces `RawOutputNote::{Full, Partial}`, but the proven transaction now produces
+    // `OutputNote::{Public, Private}` — 0.14.x renamed the final-form variants.
     let tx_result = client
         .execute_transaction(accounts.service.0, txn_request)
         .await?;
     let exec_tx = tx_result.executed_transaction();
     for (i, note) in exec_tx.output_notes().iter().enumerate() {
         let variant = match note {
-            miden_protocol::transaction::OutputNote::Full(n) => {
-                let att = n.metadata().attachment();
-                let att_default = att == &miden_protocol::note::NoteAttachment::default();
-                format!("Full(attachment_empty={})", att_default)
-            }
-            miden_protocol::transaction::OutputNote::Partial(_) => "Partial".to_string(),
-            miden_protocol::transaction::OutputNote::Header(_) => "Header".to_string(),
+            miden_protocol::transaction::RawOutputNote::Full(_) => "Full",
+            miden_protocol::transaction::RawOutputNote::Partial(_) => "Partial",
         };
         tracing::info!(note_idx = i, variant = %variant, "executed tx output note");
     }
@@ -278,13 +274,8 @@ async fn publish_claim_internal(
     let proven_tx = client.prove_transaction(&tx_result).await?;
     for (i, note) in proven_tx.output_notes().iter().enumerate() {
         let variant = match note {
-            miden_protocol::transaction::OutputNote::Full(n) => {
-                let att = n.metadata().attachment();
-                let att_default = att == &miden_protocol::note::NoteAttachment::default();
-                format!("Full(attachment_empty={})", att_default)
-            }
-            miden_protocol::transaction::OutputNote::Partial(_) => "Partial".to_string(),
-            miden_protocol::transaction::OutputNote::Header(_) => "Header".to_string(),
+            miden_protocol::transaction::OutputNote::Public(_) => "Public",
+            miden_protocol::transaction::OutputNote::Private(_) => "Private",
         };
         tracing::info!(note_idx = i, variant = %variant, "proven tx output note");
     }
@@ -327,7 +318,10 @@ async fn publish_claim_internal(
 /// Creates a new client per call to avoid stale account state from the
 /// long-lived MidenClient's background sync loop. After faucet creation
 /// or prior CLAIMs, the service account's state drifts in the long-lived
-/// client, causing `IncorrectAccountInitialCommitment` errors.
+/// client, causing `IncorrectAccountInitialCommitment` errors. Recording
+/// of the ClaimEvent happens before the result is sent back so the event
+/// is in the store even if the HTTP caller disconnects.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
@@ -467,14 +461,14 @@ mod tests {
     use alloy::primitives::address;
 
     #[test]
-    fn test_metadata_to_hash_empty() {
-        let metadata = Bytes::from(vec![]);
-        let hash = metadata_to_hash(&metadata);
-        // keccak256("")
+    fn test_metadata_hash_empty() {
+        // Empty metadata → keccak256("") → 0xc5d246...a470. This is what the L1 bridge
+        // contract puts in `leaf_data.metadata_hash` for native ETH deposits.
+        let hash = MetadataHash::from_abi_encoded(&[]);
         let expected =
             hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
                 .unwrap();
-        assert_eq!(hash, expected.as_slice());
+        assert_eq!(hash.as_bytes(), expected.as_slice());
     }
 
     #[tokio::test]
@@ -501,14 +495,14 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_to_hash_non_empty() {
-        let metadata = Bytes::from(vec![0x01, 0x02, 0x03]);
-        let hash = metadata_to_hash(&metadata);
-        // keccak256([0x01, 0x02, 0x03])
+    fn test_metadata_hash_non_empty() {
+        // Non-empty raw bytes → keccak256(bytes). Sanity check that
+        // `MetadataHash::from_abi_encoded` is just keccak256, not ABI-aware.
+        let hash = MetadataHash::from_abi_encoded(&[0x01, 0x02, 0x03]);
         let expected =
             hex::decode("f1885eda54b7a053318cd41e2093220dab15d65381b1157a3633a83bfd5c9239")
                 .unwrap();
-        assert_eq!(hash, expected.as_slice());
+        assert_eq!(hash.as_bytes(), expected.as_slice());
     }
 
     #[test]

@@ -6,13 +6,12 @@
 use crate::accounts_config::AccountIdBech32;
 use crate::miden_client::MidenClientLib;
 use alloy::primitives::{Address, Bytes};
-use miden_base_agglayer::{ConfigAggBridgeNote, EthAddressFormat, create_agglayer_faucet};
+use miden_base_agglayer::{ConfigAggBridgeNote, EthAddress, MetadataHash, create_agglayer_faucet};
 use miden_client::Felt;
 use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::{Account, AccountId};
-use miden_protocol::transaction::OutputNote;
 
 /// Create a faucet on Miden, deploy it, and register it in the bridge.
 ///
@@ -30,9 +29,10 @@ pub async fn create_and_register_faucet(
     scale: u8,
     service_id: AccountId,
     bridge_id: AccountId,
+    metadata_hash: MetadataHash,
 ) -> anyhow::Result<Account> {
     let max_supply = Felt::new(FungibleAsset::MAX_AMOUNT);
-    let origin_addr = EthAddressFormat::new(*origin_token_address);
+    let origin_addr = EthAddress::new(*origin_token_address);
 
     let account = create_agglayer_faucet(
         client.rng().draw_word(),
@@ -43,6 +43,7 @@ pub async fn create_and_register_faucet(
         &origin_addr,
         origin_network,
         scale,
+        metadata_hash,
     );
     client.add_account(&account, false).await?;
 
@@ -70,20 +71,30 @@ pub async fn create_and_register_faucet(
     }
 
     // Register in bridge
-    register_faucet_in_bridge(client, service_id, bridge_id, account.id(), symbol).await?;
+    register_faucet_in_bridge(
+        client,
+        service_id,
+        bridge_id,
+        account.id(),
+        &origin_addr,
+        symbol,
+    )
+    .await?;
 
     Ok(account)
 }
 
-/// Register a faucet in the bridge's faucet registry via ConfigAggBridgeNote.
+/// Register a faucet in the bridge's faucet and token registries via ConfigAggBridgeNote.
 ///
 /// Required for CLAIM note FPI validation: the bridge account must know which
-/// faucets are valid sources for claim operations. Idempotent.
+/// faucets are valid sources for claim operations, and the on-chain `token_registry_map`
+/// must map `hash(origin_token_address)` to the faucet's `AccountId`. Idempotent.
 pub async fn register_faucet_in_bridge(
     client: &mut MidenClientLib,
     service_id: AccountId,
     bridge_id: AccountId,
     faucet_id: AccountId,
+    origin_token_address: &EthAddress,
     faucet_name: &str,
 ) -> anyhow::Result<()> {
     tracing::info!(
@@ -93,11 +104,17 @@ pub async fn register_faucet_in_bridge(
         AccountIdBech32(bridge_id),
     );
 
-    let note = ConfigAggBridgeNote::create(faucet_id, service_id, bridge_id, client.rng())
-        .map_err(|e| anyhow::anyhow!("failed to create ConfigAggBridgeNote: {e}"))?;
+    let note = ConfigAggBridgeNote::create(
+        faucet_id,
+        origin_token_address,
+        service_id,
+        bridge_id,
+        client.rng(),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to create ConfigAggBridgeNote: {e}"))?;
 
     let txn = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(note); 1])
+        .own_output_notes(vec![note])
         .build()?;
 
     let txn_id = client.submit_new_transaction(service_id, txn).await?;

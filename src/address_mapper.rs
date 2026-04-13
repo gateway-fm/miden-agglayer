@@ -1,5 +1,6 @@
 use crate::accounts_config::AccountsConfig;
 use alloy::primitives::Address;
+use miden_base_agglayer::{EthAddress, EthEmbeddedAccountId};
 use miden_protocol::account::AccountId;
 
 const HARDHAT_ADDRESS: Address = Address::new([
@@ -8,7 +9,7 @@ const HARDHAT_ADDRESS: Address = Address::new([
 ]);
 
 pub fn is_miden_compatible_address(address: Address) -> bool {
-    // The canonical EthAddressFormat embeds AccountId as:
+    // The canonical EthEmbeddedAccountId encoding embeds AccountId as:
     //   [4 zero bytes] [prefix(8 bytes)] [suffix(8 bytes)]
     // Only the first 4 bytes must be zero; byte 4 is the MSB of the prefix.
     address[0..4].iter().all(|b| *b == 0)
@@ -18,15 +19,14 @@ pub fn account_id_from_address(address: Address) -> Option<AccountId> {
     if !is_miden_compatible_address(address) {
         return None;
     }
-    // Extract prefix (8 bytes) and suffix (8 bytes) from canonical layout:
-    //   address[0..4]  = zero padding
-    //   address[4..12] = prefix (u64 big-endian)
-    //   address[12..20] = suffix (u64 big-endian)
-    let prefix = u64::from_be_bytes(address[4..12].try_into().ok()?);
-    let suffix = u64::from_be_bytes(address[12..20].try_into().ok()?);
-    let prefix_felt = miden_protocol::Felt::try_from(prefix).ok()?;
-    let suffix_felt = miden_protocol::Felt::try_from(suffix).ok()?;
-    AccountId::try_from([prefix_felt, suffix_felt]).ok()
+    // 0.14.x: wrap the 20-byte EVM address and use the dedicated embedded-AccountId type.
+    // `EthEmbeddedAccountId::try_from(eth_addr)` validates the 4 leading zero bytes and
+    // reconstructs the inner AccountId; failure here means the address wasn't a valid
+    // zero-padded Miden id even though `is_miden_compatible_address` thought it was.
+    let eth_addr = EthAddress::new(address.0.0);
+    EthEmbeddedAccountId::try_from(eth_addr)
+        .ok()
+        .map(AccountId::from)
 }
 
 /// Resolve an Ethereum address to a Miden AccountId.
@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn test_account_id_from_address() {
         let expected_account_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        // Canonical EthAddressFormat: [4 zero bytes][prefix(8)][suffix(8)]
+        // Canonical EthEmbeddedAccountId: [4 zero bytes][prefix(8)][suffix(8)]
         // AccountId 0x3d7c9747558851900f8206226dfbea has:
         //   prefix = 0x3d7c974755885190, suffix = 0x0f8206226dfbea00
         let address = address!("0x000000003d7c9747558851900f8206226dfbea00");
