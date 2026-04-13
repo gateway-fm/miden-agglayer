@@ -247,9 +247,16 @@ impl SyncListener for BridgeOutScanner {
             if was_processed {
                 continue;
             }
-            // Use atomic block counter to avoid collisions with GER/claim events.
-            let block_number = self.store.advance_block_number().await?;
+            // Race-safe ordering: write the log at (current_latest + 1) BEFORE
+            // advancing `latest_block_number`. If we advance first, there's a
+            // window where `eth_blockNumber` returns N but no log exists at N —
+            // aggsender polls during that window, sees no bridges in [X, N],
+            // advances its cursor past N, and permanently misses our BridgeEvent.
+            // By writing the log first and then bumping `latest_block_number`,
+            // every reader who sees `latest >= N` also sees the log at N.
+            let block_number = self.store.get_latest_block_number().await? + 1;
             self.process_consumed_note(note, block_number).await;
+            self.store.set_latest_block_number(block_number).await?;
             tracing::info!(
                 block_number,
                 "advanced latest_block_number to include BridgeEvent"

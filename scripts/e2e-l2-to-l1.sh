@@ -34,7 +34,9 @@ wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
-    while ! eval "$cmd" 2>/dev/null; do
+    # Subshell with pipefail off — see e2e-dynamic-erc20.sh for the SIGPIPE
+    # rationale.
+    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
         echo -n "."

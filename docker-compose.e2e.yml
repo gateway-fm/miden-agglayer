@@ -101,6 +101,19 @@ services:
       NETWORK_ID: "${NETWORK_ID:-1}"
       DATABASE_URL: "host=agglayer-postgres user=agglayer password=agglayer dbname=agglayer_store"
       RUST_LOG: "info"
+      # Force all tmp I/O onto the bind-mounted dir so rocksdb / rusqlite
+      # atomic-rename operations stay on the same device. Without this,
+      # miden-client's on-disk store fails at startup with
+      # "Invalid cross-device link".
+      TMPDIR: /var/lib/miden-agglayer-service/tmp
+    volumes:
+      # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
+      # shares the miden-client sqlite store + keystore + bridge_accounts.toml with
+      # the main service container. A *named* volume trips sqlite's
+      # "Invalid cross-device link" at startup because the rusqlite temp file
+      # lives on a different device than the mount target; a bind mount keeps
+      # everything on the host filesystem and sidesteps the rename boundary.
+      - ./.miden-agglayer-data:/var/lib/miden-agglayer-service
     command:
       - "--port=8546"
       - "--miden-node=http://miden-node:57291"

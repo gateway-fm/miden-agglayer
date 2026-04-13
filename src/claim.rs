@@ -339,7 +339,13 @@ pub async fn publish_claim(
     let result_inner = result.clone();
 
     if node_url.is_empty() {
-        // Test path: use the existing MidenClient
+        // Test path: use the existing MidenClient.
+        //
+        // Race-safe ordering: write the txn+log at (current_latest + 1) BEFORE
+        // bumping `latest_block_number`. See the matching comment in
+        // `bridge_out.rs::on_post_sync`: advancing the counter first leaves a
+        // window where `eth_blockNumber` returns N but no log exists at block N
+        // yet, so aggsender / bridge-service skip the event entirely.
         let result_test = result.clone();
         client
             .with(move |client| {
@@ -352,7 +358,7 @@ pub async fn publish_claim(
                         latest_block_num,
                     )
                     .await?;
-                    let block_num = store.advance_block_number().await?;
+                    let block_num = store.get_latest_block_number().await? + 1;
                     let block_hash = block_state.get_block_hash(block_num);
                     store
                         .txn_begin(
@@ -369,6 +375,12 @@ pub async fn publish_claim(
                     store
                         .txn_commit(txn_hash, Ok(()), block_num, block_hash)
                         .await?;
+                    store.set_latest_block_number(block_num).await?;
+                    tracing::info!(
+                        eth_tx = %txn_hash,
+                        block_num,
+                        "ClaimEvent recorded (cancellation-safe)"
+                    );
                     let _ = result_test.set(value);
                     Ok(())
                 })
@@ -415,7 +427,10 @@ pub async fn publish_claim(
             .await?;
 
             // Record the ClaimEvent — cancellation-safe.
-            let block_num = store_clone.advance_block_number().await?;
+            // Race-safe ordering: write the txn+log at (current_latest + 1)
+            // BEFORE bumping `latest_block_number`. See `bridge_out.rs::on_post_sync`
+            // for the SIGPIPE/cursor-advance rationale.
+            let block_num = store_clone.get_latest_block_number().await? + 1;
             let block_hash = block_state.get_block_hash(block_num);
             store_clone
                 .txn_begin(
@@ -432,6 +447,7 @@ pub async fn publish_claim(
             store_clone
                 .txn_commit(txn_hash, Ok(()), block_num, block_hash)
                 .await?;
+            store_clone.set_latest_block_number(block_num).await?;
             tracing::info!(
                 eth_tx = %txn_hash,
                 block_num,

@@ -43,7 +43,9 @@ wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
-    while ! eval "$cmd" 2>/dev/null; do
+    # Subshell with pipefail off — see e2e-dynamic-erc20.sh for the SIGPIPE
+    # rationale.
+    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
         echo -n "."
@@ -96,7 +98,10 @@ echo ""
 # PART 2: Wipe PostgreSQL tables (simulate disaster)
 # ══════════════════════════════════════════════════════════════════════════════
 step "Part 2: Wiping all PostgreSQL tables (simulating data loss)..."
-pgquery "TRUNCATE service_state, synthetic_logs, ger_entries, transactions, transaction_logs, nonces, claimed_indices, address_mappings, bridge_out_processed, block_transactions CASCADE"
+# NOTE: keep this list in lockstep with migrations/*.sql. `block_transactions` was
+# removed from the schema but stuck around in this script until 0.14.x migration;
+# `faucet_registry` was added later.
+pgquery "TRUNCATE service_state, synthetic_logs, ger_entries, transactions, transaction_logs, nonces, claimed_indices, address_mappings, bridge_out_processed, faucet_registry CASCADE"
 # Re-insert the singleton service_state row
 pgquery "INSERT INTO service_state (id) VALUES (1)"
 

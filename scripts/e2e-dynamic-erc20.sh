@@ -62,7 +62,12 @@ wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
-    while ! eval "$cmd" 2>/dev/null; do
+    # Run the probe in a subshell with pipefail disabled. Otherwise patterns
+    # like `docker logs ... | grep -q X` spuriously fail: grep -q exits on the
+    # first match, sending SIGPIPE to docker logs, whose 141 exit code trips
+    # pipefail and makes the probe look like a miss even when the match is
+    # there. Dropping pipefail inside the probe lets grep's exit code decide.
+    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
         echo -n "."
@@ -254,21 +259,36 @@ wait_for "certificate settled" \
     300 10
 pass "Certificate settled on L1"
 
-# Wait for deposit in bridge-service
+# Wait for the SPECIFIC TestToken deposit to appear in bridge-service. When
+# running inside the full suite, `e2e-l2-to-l1.sh` already produced an ETH
+# deposit that's `ready_for_claim` — a loose filter would match that and the
+# subsequent claim would pick the wrong (already-claimed) deposit and fail.
+EXPECTED_ORIG_ADDR=$(python3 -c "print('$TOKEN_ADDR'.lower())")
 wait_for "L2 deposit in bridge-service" \
-    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 for dep in d.get('deposits',[])) else 1)\"" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('claim_tx_hash') or '')=='' and (dep.get('orig_addr') or '').lower()==want for dep in d.get('deposits',[])) else 1)\"" \
     120 5
 pass "TestToken L2→L1 deposit synced and ready_for_claim"
 
-# Claim on L1 (same pattern as e2e-l2-to-l1.sh)
+# Claim on L1. Filter by BOTH origin token address (to skip any unrelated ETH
+# deposits left over from e2e-l2-to-l1.sh when this test runs inside the full
+# suite) AND unclaimed status (claim_tx_hash is empty). Without these, the
+# picker would grab the already-claimed ETH deposit and fail at cast send.
 DEPOSITS_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$L1_DEST")
 DEPOSIT_INFO=$(echo "$DEPOSITS_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
+want = '$EXPECTED_ORIG_ADDR'
 for dep in d.get('deposits', []):
-    if dep.get('ready_for_claim') and dep.get('network_id') == 1:
-        print(json.dumps(dep))
-        break
+    if not dep.get('ready_for_claim'):
+        continue
+    if dep.get('network_id') != 1:
+        continue
+    if (dep.get('claim_tx_hash') or '') != '':
+        continue
+    if (dep.get('orig_addr') or '').lower() != want:
+        continue
+    print(json.dumps(dep))
+    break
 ")
 [[ -z "$DEPOSIT_INFO" ]] && fail "Could not find ready L2→L1 deposit"
 

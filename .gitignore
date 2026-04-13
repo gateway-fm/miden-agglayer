@@ -20,3 +20,4 @@ fixtures/combined.json
 fixtures/l1-transactions.json
 fixtures/l1-raw-txs.txt
 fixtures/.env
+.miden-agglayer-data/

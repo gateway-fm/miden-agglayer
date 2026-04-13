@@ -290,9 +290,13 @@ pub async fn insert_ger(
             .await?;
         }
 
-        // Use the store's sequential block counter so GER events and claim
-        // events never collide on the same block number.
-        block_number = store.advance_block_number().await?;
+        // Race-safe ordering: write the log at (current_latest + 1) BEFORE
+        // bumping `latest_block_number`. See the matching comment in
+        // `bridge_out.rs::on_post_sync`: if we advance the counter first,
+        // aggsender / bridge-service can poll `eth_blockNumber` in the window
+        // where `latest == N` but the log at block `N` hasn't been written yet,
+        // permanently skipping the GER event.
+        block_number = store.get_latest_block_number().await? + 1;
         let block_hash = block_state.get_block_hash(block_number);
         let timestamp = block_state.get_block_timestamp(block_number);
 
@@ -309,6 +313,7 @@ pub async fn insert_ger(
                 timestamp,
             )
             .await?;
+        store.set_latest_block_number(block_number).await?;
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),
