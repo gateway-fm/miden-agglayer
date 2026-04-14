@@ -53,6 +53,7 @@ impl MidenClient {
         store_dir: Option<PathBuf>,
         node_url: Option<String>,
         sync_listeners: Vec<Arc<dyn SyncListener>>,
+        debug_mode: bool,
     ) -> anyhow::Result<Self> {
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
         let node_endpoint = node_url
@@ -73,6 +74,7 @@ impl MidenClient {
                 receiver,
                 done_receiver,
                 sync_listeners,
+                debug_mode,
             )));
             if let Err(err) = &result {
                 tracing::error!("MidenClient::run stopped: {err:#?}");
@@ -169,6 +171,15 @@ impl MidenClient {
 
     fn create_keystore(store_dir: PathBuf) -> anyhow::Result<Arc<FilesystemKeyStore>> {
         let keystore_path = store_dir.join("keystore");
+        if !keystore_path.exists() {
+            std::fs::create_dir_all(&keystore_path)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(&keystore_path, perms)?;
+        }
         let keystore = FilesystemKeyStore::new(keystore_path)?;
         Ok(Arc::new(keystore))
     }
@@ -257,15 +268,21 @@ impl MidenClient {
         mut receiver: mpsc::Receiver<Request>,
         mut done_receiver: oneshot::Receiver<()>,
         sync_listeners: Vec<Arc<dyn SyncListener>>,
+        debug_mode: bool,
     ) -> anyhow::Result<()> {
         // node client
         let node_timeout_ms: u64 = 10_000;
+        let mode = if debug_mode {
+            DebugMode::Enabled
+        } else {
+            DebugMode::Disabled
+        };
 
         let mut client = ClientBuilder::new()
             .grpc_client(&node_endpoint, Some(node_timeout_ms))
             .sqlite_store(store_dir.join("store.sqlite3"))
             .authenticator(keystore)
-            .in_debug_mode(DebugMode::Enabled)
+            .in_debug_mode(mode)
             .build()
             .await?;
 

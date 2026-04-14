@@ -1,3 +1,7 @@
+# WARNING: This file contains TEST-ONLY credentials for the local E2E docker-compose stack.
+# DO NOT use these passwords in production. DO NOT copy this pattern for real deployments.
+# The .keystore files these passwords decrypt are gitignored; see .gitignore.
+
 debug-mode = true
 mock-verifier = true
 
