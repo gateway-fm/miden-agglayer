@@ -1,6 +1,7 @@
 use crate::block_state::BlockState;
 use crate::store::Store;
 use crate::*;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -16,6 +17,10 @@ pub struct ServiceState {
     pub l1_rpc_url: Option<String>,
     /// L1 GER contract address
     pub ger_l1_address: Option<String>,
+    /// Miden client store directory (for building fresh clients)
+    pub miden_store_dir: PathBuf,
+    /// Miden node URL (for building fresh clients)
+    pub miden_node_url: String,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -39,6 +44,8 @@ impl ServiceState {
             block_state,
             l1_rpc_url: None,
             ger_l1_address: None,
+            miden_store_dir: PathBuf::new(),
+            miden_node_url: String::new(),
         }
     }
 }

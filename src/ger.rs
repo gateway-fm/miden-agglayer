@@ -1,5 +1,6 @@
 use crate::accounts_config::AccountsConfig;
-use crate::miden_client::{MidenClient, MidenClientLib};
+use crate::miden_client::MidenClient;
+use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use alloy::primitives::{FixedBytes, LogData, TxHash};
 use alloy::sol_types::SolEvent;
 use alloy_rpc_types_eth::TransactionRequest;
@@ -95,10 +96,18 @@ pub struct GerInsertResult {
     pub is_new: bool,
 }
 
+/// Submit a GER to the Miden node using a fresh miden-client instance.
+///
+/// Creates a new client per call (like Igor's aggkit-proxy approach) to avoid
+/// stale state from the long-lived MidenClient's background sync loop.
+/// A fresh client syncs fresh state from the node, avoiding NoteScreener
+/// failures and account commitment drift after CLAIM processing.
 async fn submit_ger_to_miden(
-    client: &mut MidenClientLib,
     ger_bytes: [u8; 32],
     accounts: &AccountsConfig,
+    store_dir: std::path::PathBuf,
+    node_url: String,
+    keystore: Arc<miden_client::keystore::FilesystemKeyStore>,
 ) -> anyhow::Result<()> {
     // Use the dedicated ger_manager account for GER injection. This avoids
     // stale state errors: the service account is continuously modified by
@@ -112,138 +121,107 @@ async fn submit_ger_to_miden(
         .unwrap_or(accounts.service.0);
     let bridge_id = accounts.bridge.0;
 
-    // Retry up to 3 times. Re-import accounts (Network/public) before each
-    // attempt so the local client has fresh state from the node — equivalent
-    // to Igor's fresh-client-per-operation approach in aggkit-proxy.
-    // See docs/ger-note-screening-bypass.md for full analysis.
-    for attempt in 0..3u32 {
-        client.sync_state().await?;
-        // Refresh bridge account state (asset tree changes after CLAIM).
-        match client.import_account_by_id(bridge_id).await {
-            Ok(()) => tracing::info!(attempt, "bridge account re-imported from node"),
-            Err(e) => tracing::warn!(attempt, "bridge re-import failed: {e:#}"),
-        }
+    let store_path = store_dir.join("store.sqlite3");
 
-        let ger = ExitRoot::new(ger_bytes);
-        let note = UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
-        if attempt == 0 {
-            tracing::info!(note_id = %note.id(), "UpdateGerNote created");
-        }
+    // Run the entire GER injection in spawn_blocking with a dedicated runtime.
+    // This is Igor's approach: fresh client per operation. The miden-client
+    // types (Endpoint, Client) are !Send, so we can't hold them across .await
+    // points in the axum handler's future.
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            use ::miden_client::builder::ClientBuilder;
+            use ::miden_client::rpc::Endpoint;
+            use ::miden_client::DebugMode;
 
-        let tx_request = TransactionRequestBuilder::new()
-            .own_output_notes(vec![OutputNote::Full(note)])
-            .build()?;
+            for attempt in 0..3u32 {
+                let ep = Endpoint::try_from(node_url.as_str())
+                    .map_err(|e| anyhow::anyhow!("invalid node URL: {e}"))?;
+                let mut client = ClientBuilder::new()
+                    .grpc_client(&ep, Some(10_000))
+                    .sqlite_store(store_path.clone())
+                    .authenticator(keystore.clone())
+                    .in_debug_mode(DebugMode::Enabled)
+                    .build()
+                    .await?;
+                client.sync_state().await?;
 
-        // Try submit_new_transaction first — it bundles execute+prove+submit+apply
-        // and correctly updates the ger_manager's local state (nonce, commitment).
-        // If it fails due to the NoteScreener (stale bridge asset tree after CLAIM),
-        // fall back to the split pattern which bypasses the NoteScreener.
-        let tx_id = match client
-            .submit_new_transaction(ger_manager_id, tx_request.clone())
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                let err_str = format!("{e:#?}");
-                let is_note_screener = err_str.contains("NoteScreener")
-                    || err_str.contains("NoteChecker")
-                    || err_str.contains("FetchAssetWitness")
-                    || err_str.contains("note relevance");
-
-                if is_note_screener {
-                    tracing::warn!(
-                        attempt,
-                        "GER submit_new_transaction hit NoteScreener, falling back to split pattern"
-                    );
-                    // Split: execute → prove → submit (skip apply since it's the screener that fails)
-                    let tx_result = client
-                        .execute_transaction(ger_manager_id, tx_request)
-                        .await
-                        .map_err(|e2| anyhow::anyhow!("split execute: {e2:#}"))?;
-                    let proven = client
-                        .prove_transaction(&tx_result)
-                        .await
-                        .map_err(|e2| anyhow::anyhow!("split prove: {e2:#}"))?;
-                    let id = tx_result.executed_transaction().id();
-                    let height = client
-                        .submit_proven_transaction(proven, &tx_result)
-                        .await
-                        .map_err(|e2| anyhow::anyhow!("split submit: {e2:#}"))?;
-                    // Try apply but tolerate failure
-                    if let Err(e2) = client.apply_transaction(&tx_result, height).await {
-                        tracing::warn!(attempt, "split apply also failed (continuing): {e2:#}");
-                    }
-                    id
-                } else if attempt < 2 {
-                    tracing::warn!(attempt, "GER TX failed, retrying: {e:#?}");
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    continue;
-                } else {
-                    return Err(anyhow::anyhow!("{e:#}"));
+                let ger = ExitRoot::new(ger_bytes);
+                let note =
+                    UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
+                if attempt == 0 {
+                    tracing::info!(note_id = %note.id(), "UpdateGerNote created");
                 }
-            }
-        };
 
-        tracing::info!(
-            tx_id = %tx_id,
-            ger = %hex::encode(ger_bytes),
-            "UpdateGerNote submitted to Miden node, waiting for commit..."
-        );
+                let tx_request = TransactionRequestBuilder::new()
+                    .own_output_notes(vec![OutputNote::Full(note)])
+                    .build()?;
 
-        // Poll for transaction commitment. When the split fallback was used
-        // and apply_transaction failed, the TX isn't in the local store.
-        // Check the sync summary committed list + block advancement as fallbacks.
-        let start_block = client.sync_state().await?.block_num.as_u32();
-        let timeout_secs: u64 = std::env::var("GER_COMMIT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30)
-            .clamp(5, 120);
-        let mut committed = false;
-        for _ in 0..timeout_secs {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let summary = client.sync_state().await?;
-            // Check if the TX appears in the sync's committed list
-            if summary.committed_transactions.iter().any(|id| *id == tx_id) {
-                committed = true;
-                break;
-            }
-            // Also check local store (works when apply_transaction succeeded)
-            let txns = client
-                .get_transactions(miden_client::store::TransactionFilter::All)
-                .await?;
-            if txns.iter().any(|t| {
-                t.id == tx_id
-                    && matches!(
-                        t.status,
-                        miden_client::transaction::TransactionStatus::Committed { .. }
-                    )
-            }) {
-                committed = true;
-                break;
-            }
-            // If 3+ blocks have passed since we started polling, the TX
-            // was likely committed (the node accepted the proven TX).
-            if summary.block_num.as_u32() >= start_block.saturating_add(3) {
+                let tx_id = match client
+                    .submit_new_transaction(ger_manager_id, tx_request)
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        if attempt < 2 {
+                            tracing::warn!(attempt, "GER TX failed, retrying: {e:#?}");
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!("{e:#}"));
+                    }
+                };
+
                 tracing::info!(
                     tx_id = %tx_id,
-                    block = summary.block_num.as_u32(),
-                    "assuming GER TX committed (block advanced past submission)"
+                    ger = %hex::encode(ger_bytes),
+                    "UpdateGerNote submitted to Miden node, waiting for commit..."
                 );
-                committed = true;
-                break;
+
+                // Poll for commit
+                let timeout_secs: u64 = std::env::var("GER_COMMIT_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30)
+                    .clamp(5, 120);
+                let mut committed = false;
+                for _ in 0..timeout_secs {
+                    let txns = client
+                        .get_transactions(miden_client::store::TransactionFilter::All)
+                        .await?;
+                    if txns.iter().any(|t| {
+                        t.id == tx_id
+                            && matches!(
+                                t.status,
+                                miden_client::transaction::TransactionStatus::Committed {
+                                    ..
+                                }
+                            )
+                    }) {
+                        committed = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    client.sync_state().await?;
+                }
+
+                if !committed {
+                    anyhow::bail!(
+                        "UpdateGerNote transaction {tx_id} not committed after {timeout_secs}s"
+                    );
+                }
+
+                tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
+                return Ok(());
             }
-        }
 
-        if !committed {
-            anyhow::bail!("UpdateGerNote transaction {tx_id} not committed after {timeout_secs}s");
-        }
+            anyhow::bail!("GER injection failed after 3 attempts")
+        })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("GER spawn_blocking: {e}"))?;
 
-        tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
-        return Ok(());
-    }
-
-    anyhow::bail!("GER injection failed after 3 attempts")
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -256,6 +234,8 @@ pub async fn insert_ger(
     store: &Arc<dyn crate::store::Store>,
     block_state: &Arc<crate::block_state::BlockState>,
     txn_hash: TxHash,
+    store_dir: std::path::PathBuf,
+    node_url: String,
 ) -> anyhow::Result<GerInsertResult> {
     // Check dedup before doing any work
     let is_new = !store.has_seen_ger(&ger_bytes).await?;
@@ -268,15 +248,47 @@ pub async fn insert_ger(
             "GER injection: submitting to Miden..."
         );
 
-        // Submit to Miden first — only emit the log event on success
-        let inner_accounts = accounts.0.clone();
-        miden_client
-            .with(move |client| {
-                Box::new(
-                    async move { submit_ger_to_miden(client, ger_bytes, &inner_accounts).await },
-                )
-            })
+        if node_url.is_empty() {
+            // Test path: use the existing MidenClient
+            let inner_accounts = accounts.0.clone();
+            miden_client
+                .with(move |client| {
+                    Box::new(async move {
+                        client.sync_state().await?;
+                        let ger_manager_id = inner_accounts
+                            .ger_manager
+                            .as_ref()
+                            .map(|a| a.0)
+                            .unwrap_or(inner_accounts.service.0);
+                        let bridge_id = inner_accounts.bridge.0;
+                        let ger = ExitRoot::new(ger_bytes);
+                        let note = UpdateGerNote::create(
+                            ger,
+                            ger_manager_id,
+                            bridge_id,
+                            client.rng(),
+                        )?;
+                        let tx_request = TransactionRequestBuilder::new()
+                            .own_output_notes(vec![OutputNote::Full(note)])
+                            .build()?;
+                        client
+                            .submit_new_transaction(ger_manager_id, tx_request)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .await?;
+        } else {
+            // Production path: fresh client per call (Igor's approach)
+            submit_ger_to_miden(
+                ger_bytes,
+                &accounts.0,
+                store_dir.clone(),
+                node_url.clone(),
+                miden_client.get_keystore(),
+            )
             .await?;
+        }
 
         // Use the store's sequential block counter so GER events and claim
         // events never collide on the same block number.

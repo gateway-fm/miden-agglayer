@@ -250,7 +250,7 @@ L1_TOKEN_BAL_BEFORE=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(add
 log "L1 TestToken balance before claim: $L1_TOKEN_BAL_BEFORE"
 
 wait_for "certificate settled" \
-    "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
+    "docker logs $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
     300 10
 pass "Certificate settled on L1"
 
