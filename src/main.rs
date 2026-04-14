@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Command {
     /// JSON-RPC HTTP service listening port
@@ -63,6 +63,35 @@ struct Command {
     /// L1 GER contract address for exit root resolution
     #[arg(long, env = "GER_L1_ADDRESS")]
     ger_l1_address: Option<String>,
+
+    /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
+    #[arg(long, env = "MIDEN_DEBUG")]
+    miden_debug: bool,
+}
+
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Command")
+            .field("port", &self.port)
+            .field("miden_store_dir", &self.miden_store_dir)
+            .field("miden_node", &self.miden_node)
+            .field("chain_id", &self.chain_id)
+            .field("network_id", &self.network_id)
+            .field("init", &self.init)
+            .field(
+                "database_url",
+                &self.database_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("restore", &self.restore)
+            .field("bridge_address", &self.bridge_address)
+            .field(
+                "l1_rpc_url",
+                &self.l1_rpc_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("ger_l1_address", &self.ger_l1_address)
+            .field("miden_debug", &self.miden_debug)
+            .finish()
+    }
 }
 
 #[tokio::main]
@@ -88,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
             miden_store_dir.clone(),
             command.miden_node.clone(),
             sync_listeners,
+            command.miden_debug,
         )?;
 
         let config_path = init::init(&init_client, miden_store_dir.clone()).await?;
@@ -171,7 +201,12 @@ async fn main() -> anyhow::Result<()> {
     let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
         vec![sync_listener, block_state.clone(), bridge_out_scanner];
 
-    let client = MidenClient::new(miden_store_dir.clone(), command.miden_node, sync_listeners)?;
+    let client = MidenClient::new(
+        miden_store_dir.clone(),
+        command.miden_node,
+        sync_listeners,
+        command.miden_debug,
+    )?;
 
     // Run restore if requested
     if command.restore {
