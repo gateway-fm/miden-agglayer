@@ -1,11 +1,11 @@
 use crate::accounts_config::AccountsConfig;
 use crate::miden_client::MidenClient;
-use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use alloy::primitives::{FixedBytes, LogData, TxHash};
 use alloy::sol_types::SolEvent;
 use alloy_rpc_types_eth::TransactionRequest;
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
 use miden_client::transaction::TransactionRequestBuilder;
+use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 
@@ -127,12 +127,12 @@ async fn submit_ger_to_miden(
     // This is Igor's approach: fresh client per operation. The miden-client
     // types (Endpoint, Client) are !Send, so we can't hold them across .await
     // points in the axum handler's future.
-    let result = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
+            use ::miden_client::DebugMode;
             use ::miden_client::builder::ClientBuilder;
             use ::miden_client::rpc::Endpoint;
-            use ::miden_client::DebugMode;
 
             for attempt in 0..3u32 {
                 let ep = Endpoint::try_from(node_url.as_str())
@@ -147,8 +147,7 @@ async fn submit_ger_to_miden(
                 client.sync_state().await?;
 
                 let ger = ExitRoot::new(ger_bytes);
-                let note =
-                    UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
+                let note = UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
                 if attempt == 0 {
                     tracing::info!(note_id = %note.id(), "UpdateGerNote created");
                 }
@@ -193,9 +192,7 @@ async fn submit_ger_to_miden(
                         t.id == tx_id
                             && matches!(
                                 t.status,
-                                miden_client::transaction::TransactionStatus::Committed {
-                                    ..
-                                }
+                                miden_client::transaction::TransactionStatus::Committed { .. }
                             )
                     }) {
                         committed = true;
@@ -219,9 +216,7 @@ async fn submit_ger_to_miden(
         })
     })
     .await
-    .map_err(|e| anyhow::anyhow!("GER spawn_blocking: {e}"))?;
-
-    result
+    .map_err(|e| anyhow::anyhow!("GER spawn_blocking: {e}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,12 +257,8 @@ pub async fn insert_ger(
                             .unwrap_or(inner_accounts.service.0);
                         let bridge_id = inner_accounts.bridge.0;
                         let ger = ExitRoot::new(ger_bytes);
-                        let note = UpdateGerNote::create(
-                            ger,
-                            ger_manager_id,
-                            bridge_id,
-                            client.rng(),
-                        )?;
+                        let note =
+                            UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
                         let tx_request = TransactionRequestBuilder::new()
                             .own_output_notes(vec![note])
                             .build()?;

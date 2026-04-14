@@ -401,9 +401,9 @@ pub async fn publish_claim(
     let join_result = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
+            use ::miden_client::DebugMode;
             use ::miden_client::builder::ClientBuilder;
             use ::miden_client::rpc::Endpoint;
-            use ::miden_client::DebugMode;
             use ::miden_client_sqlite_store::ClientBuilderSqliteExt;
 
             let ep = Endpoint::try_from(node_url.as_str())
