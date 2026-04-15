@@ -35,7 +35,11 @@ wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
-    while ! eval "$cmd" 2>/dev/null; do
+    # Run the probe in a subshell with pipefail disabled — see full comment
+    # in e2e-dynamic-erc20.sh::wait_for. `docker logs ... | grep -q` tripped
+    # pipefail because grep -q closes the pipe early, docker logs takes
+    # SIGPIPE, and the 141 exit was propagating as "no match".
+    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
         echo -n "."

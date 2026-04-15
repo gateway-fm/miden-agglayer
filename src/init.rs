@@ -3,14 +3,13 @@ use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::faucet_ops;
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
-use miden_base_agglayer::create_bridge_account;
+use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
 use miden_protocol::account::{Account, AccountId};
 use miden_protocol::note::NoteType;
-use miden_protocol::transaction::OutputNote;
 use miden_standards::account::auth::AuthSingleSig;
 use miden_standards::account::wallets::BasicWallet;
 use miden_standards::note::P2idNote;
@@ -22,7 +21,6 @@ struct Accounts {
     service: Account,
     bridge: Account,
     faucet_eth: Account,
-    faucet_agg: Account,
     wallet_hardhat: Account,
     ger_manager: Account,
 }
@@ -33,18 +31,24 @@ impl From<Accounts> for AccountsConfig {
             service: AccountIdBech32(accounts.service.id()),
             bridge: AccountIdBech32(accounts.bridge.id()),
             faucet_eth: Some(AccountIdBech32(accounts.faucet_eth.id())),
-            faucet_agg: Some(AccountIdBech32(accounts.faucet_agg.id())),
+            // AGG genesis faucet removed during 0.14.x migration: it registered under origin
+            // [0u8; 20] which collides with ETH in the new on-chain token_registry_map. Any
+            // additional token (POL, USDC, …) is auto-created by find_or_create_faucet in
+            // claim.rs on first bridge.
+            faucet_agg: None,
             wallet_hardhat: AccountIdBech32(accounts.wallet_hardhat.id()),
             ger_manager: Some(AccountIdBech32(accounts.ger_manager.id())),
         }
     }
 }
 
-fn create_auth_component() -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
-    let key_pair = AuthSecretKey::new_falcon512_rpo();
+fn create_auth_component(
+    client: &mut MidenClientLib,
+) -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
     let auth_component = AuthSingleSig::new(
         key_pair.public_key().to_commitment(),
-        AuthScheme::Falcon512Rpo,
+        AuthScheme::Falcon512Poseidon2,
     );
     Ok((auth_component, key_pair))
 }
@@ -101,6 +105,7 @@ async fn add_faucet(
     scale: u8,
     service_id: AccountId,
     bridge_account_id: AccountId,
+    metadata_hash: MetadataHash,
 ) -> anyhow::Result<Account> {
     faucet_ops::create_and_register_faucet(
         client,
@@ -111,6 +116,7 @@ async fn add_faucet(
         scale,
         service_id,
         bridge_account_id,
+        metadata_hash,
     )
     .await
 }
@@ -119,27 +125,8 @@ async fn add_wallet(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
 ) -> anyhow::Result<Account> {
-    let (auth_component, key_pair) = create_auth_component()?;
+    let (auth_component, key_pair) = create_auth_component(client)?;
     let account = Account::builder(client.rng().draw_word().into())
-        .with_component(BasicWallet)
-        .with_auth_component(auth_component)
-        .build()?;
-    keystore.add_key(&key_pair, account.id()).await?;
-    client.add_account(&account, false).await?;
-    Ok(account)
-}
-
-/// Create a Network (public) wallet account for GER injection.
-/// Must be public so import_account_by_id can refresh its state after
-/// the NoteScreener bypass skips apply_transaction.
-async fn add_public_wallet(
-    client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
-) -> anyhow::Result<Account> {
-    use miden_protocol::account::AccountStorageMode;
-    let (auth_component, key_pair) = create_auth_component()?;
-    let account = Account::builder(client.rng().draw_word().into())
-        .storage_mode(AccountStorageMode::Network)
         .with_component(BasicWallet)
         .with_auth_component(auth_component)
         .build()?;
@@ -156,7 +143,9 @@ async fn add_accounts(
     let ger_manager = add_wallet(client, keystore.clone()).await?;
     deploy_account(client, ger_manager.id(), "ger_manager").await?;
     let bridge = add_bridge(client, keystore.clone(), service.id(), ger_manager.id()).await?;
-    // ETH: 18 origin decimals, 8 miden decimals → scale=10
+    // ETH: 18 origin decimals → 8 miden decimals (scale=10). Native ETH has empty metadata on
+    // the L1 bridge, so the faucet's stored metadata_hash is keccak256("") — matches any
+    // CLAIM leaf_data.metadata_hash for ETH deposits.
     let faucet_eth = add_faucet(
         client,
         "ETH",
@@ -166,18 +155,7 @@ async fn add_accounts(
         10,
         service.id(),
         bridge.id(),
-    )
-    .await?;
-    // AGG: 8 origin decimals, 8 miden decimals → scale=0
-    let faucet_agg = add_faucet(
-        client,
-        "AGG",
-        8,
-        &[0u8; 20],
-        0,
-        0,
-        service.id(),
-        bridge.id(),
+        MetadataHash::from_abi_encoded(&[]),
     )
     .await?;
     let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
@@ -185,7 +163,6 @@ async fn add_accounts(
         service,
         bridge,
         faucet_eth,
-        faucet_agg,
         wallet_hardhat,
         ger_manager,
     })
@@ -207,7 +184,7 @@ async fn register_p2id_script(
     )?;
 
     let txn = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(note); 1])
+        .own_output_notes(vec![note])
         .build()?;
 
     let txn_id = client.submit_new_transaction(sender, txn).await?;
@@ -238,7 +215,7 @@ async fn init_internal(
     {
         use miden_protocol::note::NoteTag;
         let wallet_id = accounts.wallet_hardhat.id();
-        let prefix_u64 = wallet_id.prefix().as_felt().as_int();
+        let prefix_u64 = wallet_id.prefix().as_felt().as_canonical_u64();
         let hi32 = (prefix_u64 >> 32) as u32;
         let p2id_tag_value = hi32 & 0xFFFC0000u32; // top 14 bits
         let raw_tag = NoteTag::from(p2id_tag_value);

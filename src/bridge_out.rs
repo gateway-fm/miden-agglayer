@@ -31,7 +31,7 @@ pub fn is_b2agg_note(details: &NoteDetails) -> bool {
 ///
 /// The destination_address is a standard 20-byte EVM address (e.g. `0xAbC...123`),
 /// NOT a Miden account ID. It comes from the bridge contract's `bridgeAsset()` call
-/// and is stored in the note via `EthAddressFormat::to_elements()`.
+/// and is stored in the note via `EthAddress::to_elements()`.
 ///
 /// Storage layout (6 felts):
 /// - items()[0]: destination_network (u32, byte-swapped via u32::from_le_bytes(dest.to_be_bytes()))
@@ -42,17 +42,17 @@ pub fn parse_b2agg_storage(storage: &NoteStorage) -> anyhow::Result<(u32, [u8; 2
     // Reverse the byte-swap applied during note creation:
     // build_note_storage does: u32::from_le_bytes(destination_network.to_be_bytes())
     // So to recover: u32::from_le_bytes(felt_value.to_be_bytes())
-    let raw_network = u32::try_from(items[0].as_int())
+    let raw_network = u32::try_from(items[0].as_canonical_u64())
         .context("destination_network overflow: felt value exceeds u32::MAX")?;
     let destination_network = u32::from_le_bytes(raw_network.to_be_bytes());
 
     // Reconstruct 20-byte address from 5 packed u32 felts (big-endian limb order).
     // Each felt holds a u32 value that represents 4 bytes in little-endian byte order.
-    // to_elements() in EthAddressFormat uses bytes_to_packed_u32_felts which reads
+    // to_elements() in EthAddress uses bytes_to_packed_u32_elements which reads
     // each 4-byte chunk as a little-endian u32.
     let mut address = [0u8; 20];
     for i in 0..5 {
-        let limb = u32::try_from(items[1 + i].as_int())
+        let limb = u32::try_from(items[1 + i].as_canonical_u64())
             .context("address limb overflow: felt value exceeds u32::MAX")?;
         address[i * 4..(i + 1) * 4].copy_from_slice(&limb.to_le_bytes());
     }
@@ -247,9 +247,16 @@ impl SyncListener for BridgeOutScanner {
             if was_processed {
                 continue;
             }
-            // Use atomic block counter to avoid collisions with GER/claim events.
-            let block_number = self.store.advance_block_number().await?;
+            // Race-safe ordering: write the log at (current_latest + 1) BEFORE
+            // advancing `latest_block_number`. If we advance first, there's a
+            // window where `eth_blockNumber` returns N but no log exists at N —
+            // aggsender polls during that window, sees no bridges in [X, N],
+            // advances its cursor past N, and permanently misses our BridgeEvent.
+            // By writing the log first and then bumping `latest_block_number`,
+            // every reader who sees `latest >= N` also sees the log at N.
+            let block_number = self.store.get_latest_block_number().await? + 1;
             self.process_consumed_note(note, block_number).await;
+            self.store.set_latest_block_number(block_number).await?;
             tracing::info!(
                 block_number,
                 "advanced latest_block_number to include BridgeEvent"

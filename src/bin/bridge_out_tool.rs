@@ -13,14 +13,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
-use miden_base_agglayer::{B2AggNote, EthAddressFormat};
+use miden_base_agglayer::{B2AggNote, EthAddress};
 use miden_client::DebugMode;
 use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;
 use miden_client::rpc::Endpoint;
-use miden_client::transaction::{OutputNote, TransactionRequestBuilder};
+use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 
@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Parse destination address
-    let l1_dest = EthAddressFormat::from_hex(&args.dest_address)
+    let l1_dest = EthAddress::from_hex(&args.dest_address)
         .map_err(|e| anyhow!("invalid dest address: {e}"))?;
 
     // Create B2AGG note
@@ -246,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Submit transaction
     let tx_request = TransactionRequestBuilder::new()
-        .own_output_notes(vec![OutputNote::Full(b2agg)])
+        .own_output_notes(vec![b2agg])
         .build()
         .map_err(|e| anyhow!("tx request build failed: {e}"))?;
 

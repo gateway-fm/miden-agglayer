@@ -5,7 +5,7 @@ exclude = [".github/"]
 license = "MIT"
 name = "miden-agglayer-service"
 readme = "README.md"
-rust-version = "1.90"
+rust-version = "1.93"
 version = "0.1.0"
 
 [[bin]]
@@ -68,19 +68,23 @@ url = { features = ["serde"], version = "2.5" }
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 
-# miden-base
-miden-base-agglayer = { package = "miden-agglayer", version = "0.14.0-alpha" }
+# miden-base — loose caret pins. Pinning to `=0.14.4` exactly caused a runtime
+# STARK verification regression in the miden-node NTX builder; the 0.14.6
+# transitive node deps that cargo picks when left alone are what actually work
+# with miden-client @ f7cdf26 in practice (confirmed by our first e2e-l1-to-l2
+# pass). Keep the caret; rely on the git rev pin below for reproducibility.
+miden-base-agglayer = { package = "miden-agglayer", version = "0.14" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "0.14.0-alpha" }
-miden-standards = { default-features = false, version = "0.14.0-alpha" }
-miden-tx = { default-features = false, version = "0.14.0-alpha" }
+], version = "0.14" }
+miden-standards = { default-features = false, version = "0.14" }
+miden-tx = { default-features = false, version = "0.14" }
 
-# miden-client
+# miden-client (pinned to ajl-agglayer-integration-tests-v0.14.0 branch head for reproducibility)
 miden-client = { default-features = false, features = [
   "tonic",
-], git = "https://github.com/0xMiden/miden-client.git", branch = "agglayer-integration-tests" }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "agglayer-integration-tests" }
+], git = "https://github.com/0xMiden/miden-client.git", rev = "f7cdf263781999e8f81ba608f9c5a91218747d98" }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", rev = "f7cdf263781999e8f81ba608f9c5a91218747d98" }
 
 [features]
 default = []

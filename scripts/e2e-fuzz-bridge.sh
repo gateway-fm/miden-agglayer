@@ -37,7 +37,7 @@ AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
 DEST_NETWORK=1
-BRIDGE_ADDRESS=$(grep 'BRIDGE_ADDRESS=' "$FIXTURES_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "0xC8cbEBf950B9Df44d987c8619f092beA980fF038")
+BRIDGE_ADDRESS=$(grep -E '^BRIDGE_ADDRESS=' "$FIXTURES_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || echo "0xC8cbEBf950B9Df44d987c8619f092beA980fF038")
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
@@ -52,7 +52,9 @@ FAILURES=0
 wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
     local elapsed=0
-    while ! eval "$cmd" 2>/dev/null; do
+    # Subshell with pipefail off — see e2e-dynamic-erc20.sh for the SIGPIPE
+    # rationale.
+    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         if [[ $elapsed -ge $timeout ]]; then
             return 1
@@ -72,16 +74,29 @@ curl -sf "$L2_RPC" -X POST -H "Content-Type: application/json" \
     -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' >/dev/null 2>&1 \
     || { echo "L2 proxy not reachable"; exit 1; }
 
-# Get wallet address from proxy
+# Get wallet + bridge + faucet account IDs from the toml (bech32) and resolve
+# the wallet's hex form via bridge-out-tool — the toml stores bech32 strings
+# (mlcl1...) not hex, so a naive grep won't produce a 0x-prefixed WALLET_HEX.
 ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) || true
-WALLET_HEX=""
-DEST_ADDR=""
-if [[ -n "${ACCOUNTS:-}" ]]; then
-    WALLET_HEX=$(echo "$ACCOUNTS" | grep 'wallet_hardhat' | head -1 | sed 's/.*"0x/0x/' | sed 's/".*//')
-    DEST_ADDR="0x00000000${WALLET_HEX#0x}00"
-fi
-[[ -z "$DEST_ADDR" ]] && { echo "Could not read wallet address"; exit 1; }
+[[ -z "${ACCOUNTS:-}" ]] && { echo "Could not read bridge_accounts.toml"; exit 1; }
+WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
+BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
+FAUCET_ID=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
+[[ -z "$WALLET_ID" || -z "$BRIDGE_ID" || -z "$FAUCET_ID" ]] \
+    && { echo "Could not parse wallet/bridge/faucet from bridge_accounts.toml"; exit 1; }
+
+# bridge-out-tool prints "wallet: 0x<hex>" even if the balance check fails
+WALLET_HEX=$(docker exec "$AGGLAYER_CONTAINER" bridge-out-tool \
+    --store-dir /var/lib/miden-agglayer-service \
+    --node-url http://miden-node:57291 \
+    --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
+    --amount 1 --dest-address 0xdead --dest-network 0 2>&1 | grep "wallet:" | awk '{print $NF}' || true)
+[[ -z "$WALLET_HEX" ]] && { echo "Could not resolve wallet hex via bridge-out-tool"; exit 1; }
+INNER="${WALLET_HEX#0x}"
+PREFIX="${INNER:0:16}"
+SUFFIX="${INNER:16:14}00"
+DEST_ADDR="0x00000000${PREFIX}${SUFFIX}"
 
 # Helper: get L2 wallet balance for a faucet
 l2_balance() {
@@ -91,16 +106,18 @@ l2_balance() {
         | python3 -c "import json,sys; r=json.load(sys.stdin); print(r.get('result','0'))" 2>/dev/null || echo "0"
 }
 
-# Helper: deploy an ERC-20 token
+# Helper: deploy an ERC-20 token. Uses fixtures/TestToken.sol (the same
+# contract e2e-dynamic-erc20.sh compiles against). The old `src/test_helpers/`
+# path no longer exists.
 deploy_token() {
     local name="$1" symbol="$2" decimals="$3" supply="$4"
-    # Use CREATE2 to get deterministic addresses based on salt
-    local salt=$(python3 -c "import hashlib; print('0x'+hashlib.sha256('${name}${symbol}${decimals}'.encode()).hexdigest())")
-    forge create --rpc-url "$L1_RPC" \
+    local out
+    out=$(forge create --rpc-url "$L1_RPC" \
         --private-key "$FUNDED_KEY" \
-        "src/test_helpers/TestToken.sol:TestToken" \
-        --constructor-args "$name" "$symbol" "$decimals" "$supply" \
-        --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['deployedTo'])" 2>/dev/null || echo ""
+        --broadcast \
+        "$FIXTURES_DIR/TestToken.sol:TestToken" \
+        --constructor-args "$name" "$symbol" "$decimals" "$supply" 2>&1) || { echo ""; return; }
+    echo "$out" | grep "Deployed to:" | awk '{print $NF}'
 }
 
 # Helper: bridge an ERC-20 token L1→L2

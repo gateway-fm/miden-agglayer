@@ -287,7 +287,7 @@ async fn restore_gers(
 
                     let mut ger_bytes = [0u8; 32];
                     for (i, felt) in items.iter().take(8).enumerate() {
-                        let v: u32 = felt.as_int() as u32;
+                        let v: u32 = felt.as_canonical_u64() as u32;
                         ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
                     }
 

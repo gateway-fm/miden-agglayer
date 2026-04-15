@@ -393,7 +393,7 @@ impl Store for PgStore {
             )
             .await?;
         let log_index: i64 = row.get(0);
-        let topics = vec![
+        let topics = [
             UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
             format!("0x{}", hex::encode(global_exit_root)),
             format!("0x{}", hex::encode(new_chain)),
@@ -611,7 +611,7 @@ impl Store for PgStore {
 
         let logs: Vec<LogData> = log_rows
             .iter()
-            .filter_map(|r| {
+            .map(|r| {
                 let topics_bytes: Vec<Vec<u8>> = r.get(0);
                 let data_bytes: Vec<u8> = r.get(1);
                 let topics: Vec<alloy::primitives::B256> = topics_bytes
@@ -624,7 +624,7 @@ impl Store for PgStore {
                         }
                     })
                     .collect();
-                Some(LogData::new_unchecked(topics, data_bytes.into()))
+                LogData::new_unchecked(topics, data_bytes.into())
             })
             .collect();
 
@@ -674,10 +674,10 @@ impl Store for PgStore {
         block_hash: [u8; 32],
     ) -> anyhow::Result<()> {
         for id in ids {
-            if let Some(hash) = self.txn_pending_by_miden_id(*id).await? {
-                if let Err(e) = self.txn_commit(hash, Ok(()), block_num, block_hash).await {
-                    tracing::warn!("PgStore: failed to commit transaction {hash}: {e}");
-                }
+            if let Some(hash) = self.txn_pending_by_miden_id(*id).await?
+                && let Err(e) = self.txn_commit(hash, Ok(()), block_num, block_hash).await
+            {
+                tracing::warn!("PgStore: failed to commit transaction {hash}: {e}");
             }
         }
         Ok(())
@@ -696,13 +696,12 @@ impl Store for PgStore {
 
         for row in &rows {
             let hash_str: &str = row.get(0);
-            if let Ok(hash) = hash_str.parse::<TxHash>() {
-                if let Err(e) = self
+            if let Ok(hash) = hash_str.parse::<TxHash>()
+                && let Err(e) = self
                     .txn_commit(hash, Err("expired".to_string()), block_num, block_hash)
                     .await
-                {
-                    tracing::warn!("PgStore: failed to expire transaction {hash}: {e}");
-                }
+            {
+                tracing::warn!("PgStore: failed to expire transaction {hash}: {e}");
             }
         }
         Ok(())
@@ -894,7 +893,7 @@ impl Store for PgStore {
             )
             .await?;
 
-        Ok(rows.first().and_then(|r| pg_row_to_faucet_entry(r)))
+        Ok(rows.first().and_then(pg_row_to_faucet_entry))
     }
 
     async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>> {
@@ -909,7 +908,7 @@ impl Store for PgStore {
             )
             .await?;
 
-        Ok(rows.first().and_then(|r| pg_row_to_faucet_entry(r)))
+        Ok(rows.first().and_then(pg_row_to_faucet_entry))
     }
 
     async fn list_faucets(&self) -> anyhow::Result<Vec<FaucetEntry>> {
@@ -923,10 +922,7 @@ impl Store for PgStore {
             )
             .await?;
 
-        Ok(rows
-            .iter()
-            .filter_map(|r| pg_row_to_faucet_entry(r))
-            .collect())
+        Ok(rows.iter().filter_map(pg_row_to_faucet_entry).collect())
     }
 }
 

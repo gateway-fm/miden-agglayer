@@ -25,19 +25,15 @@ pub fn test_accounts_config() -> AccountsConfig {
         service: dummy_account_id(),
         bridge: dummy_account_id(),
         faucet_eth: Some(dummy_account_id()),
-        faucet_agg: Some(dummy_account_id()),
+        faucet_agg: None,
         wallet_hardhat: dummy_account_id(),
         ger_manager: None,
     })
 }
 
-/// A second distinct test account ID for the AGG faucet.
-const TEST_ACCOUNT_HEX_2: &str = "0x3d7c9747558851900f8206226dfbeb";
-
-/// Seed the faucet registry with default ETH and AGG faucets for testing.
+/// Seed the faucet registry with the default ETH faucet for testing.
 pub async fn seed_test_faucets(store: &dyn Store) {
     let eth_id = AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap();
-    let agg_id = AccountId::from_hex(TEST_ACCOUNT_HEX_2).unwrap();
     store
         .register_faucet(FaucetEntry {
             faucet_id: eth_id,
@@ -47,18 +43,6 @@ pub async fn seed_test_faucets(store: &dyn Store) {
             origin_decimals: 18,
             miden_decimals: 8,
             scale: 10,
-        })
-        .await
-        .unwrap();
-    store
-        .register_faucet(FaucetEntry {
-            faucet_id: agg_id,
-            origin_address: [0xAA; 20],
-            origin_network: 0,
-            symbol: "AGG".into(),
-            origin_decimals: 8,
-            miden_decimals: 8,
-            scale: 0,
         })
         .await
         .unwrap();
