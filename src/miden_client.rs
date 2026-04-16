@@ -10,9 +10,9 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -85,17 +85,16 @@ impl MidenClient {
             let mut done_receiver = done_receiver;
 
             loop {
-                let result =
-                    runtime.block_on(local_set.run_until(Self::run(
-                        store_dir.clone(),
-                        node_endpoint.clone(),
-                        keystore_for_run.clone(),
-                        &mut receiver,
-                        &mut done_receiver,
-                        &sync_listeners,
-                        debug_mode,
-                        &alive_for_run,
-                    )));
+                let result = runtime.block_on(local_set.run_until(Self::run(
+                    store_dir.clone(),
+                    node_endpoint.clone(),
+                    keystore_for_run.clone(),
+                    &mut receiver,
+                    &mut done_receiver,
+                    &sync_listeners,
+                    debug_mode,
+                    &alive_for_run,
+                )));
 
                 match result {
                     Ok(()) => {
@@ -106,9 +105,7 @@ impl MidenClient {
                     Err(err) => {
                         alive_for_run.store(false, Ordering::Release);
                         metrics::counter!("miden_client_restarts_total").increment(1);
-                        tracing::error!(
-                            "MidenClient::run crashed: {err:#}, restarting in 5s..."
-                        );
+                        tracing::error!("MidenClient::run crashed: {err:#}, restarting in 5s...");
                         std::thread::sleep(Duration::from_secs(5));
                     }
                 }
@@ -258,7 +255,9 @@ impl MidenClient {
         self.join()
     }
 
-    pub(crate) fn unwrap_connection_error(client_err: ClientError) -> anyhow::Result<Box<dyn Error>> {
+    pub(crate) fn unwrap_connection_error(
+        client_err: ClientError,
+    ) -> anyhow::Result<Box<dyn Error>> {
         match client_err {
             ClientError::RpcError(RpcError::ConnectionError(err)) => Ok(err),
             ClientError::RpcError(RpcError::RequestError {
@@ -281,13 +280,15 @@ impl MidenClient {
                 Err(client_err) => {
                     match Self::unwrap_connection_error(client_err) {
                         Ok(conn_err) => {
-                            metrics::counter!("miden_sync_errors_total", "kind" => "connection").increment(1);
+                            metrics::counter!("miden_sync_errors_total", "kind" => "connection")
+                                .increment(1);
                             tracing::error!(
                                 "MidenClient::sync connection error: {conn_err:?}, retrying in {backoff:?}..."
                             );
                         }
                         Err(other_err) => {
-                            metrics::counter!("miden_sync_errors_total", "kind" => "other").increment(1);
+                            metrics::counter!("miden_sync_errors_total", "kind" => "other")
+                                .increment(1);
                             tracing::error!(
                                 "MidenClient::sync non-connection error: {other_err:#}, retrying in {backoff:?}..."
                             );
@@ -465,7 +466,9 @@ pub async fn wait_for_transaction_commit(
             }
         }
         if !sync_ok {
-            tracing::error!("wait_for_transaction_commit: sync failed after 3 retries, skipping poll");
+            tracing::error!(
+                "wait_for_transaction_commit: sync failed after 3 retries, skipping poll"
+            );
             continue;
         }
 
