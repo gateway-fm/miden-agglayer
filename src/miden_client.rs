@@ -10,12 +10,22 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+
+/// Minimum backoff delay for retries.
+const BACKOFF_MIN: Duration = Duration::from_secs(1);
+/// Maximum backoff delay for retries.
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(BACKOFF_MAX)
+}
 
 pub type MidenClientLib = miden_client::Client<FilesystemKeyStore>;
 
@@ -41,6 +51,7 @@ pub struct MidenClient {
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
     sender: mpsc::Sender<Request>,
     done_sender: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    alive: Arc<AtomicBool>,
     #[cfg(test)]
     call_count: Arc<AtomicUsize>,
 }
@@ -64,22 +75,44 @@ impl MidenClient {
 
         let (sender, receiver) = mpsc::channel::<Request>(1);
         let (done_sender, done_receiver) = oneshot::channel::<()>();
+        let alive = Arc::new(AtomicBool::new(false));
+        let alive_for_run = alive.clone();
 
         let runtime = tokio::runtime::Runtime::new()?;
         let task = thread::spawn(move || -> anyhow::Result<()> {
-            let result = runtime.block_on(tokio::task::LocalSet::new().run_until(Self::run(
-                store_dir,
-                node_endpoint,
-                keystore_for_run,
-                receiver,
-                done_receiver,
-                sync_listeners,
-                debug_mode,
-            )));
-            if let Err(err) = &result {
-                tracing::error!("MidenClient::run stopped: {err:#?}");
+            let local_set = tokio::task::LocalSet::new();
+            let mut receiver = receiver;
+            let mut done_receiver = done_receiver;
+
+            loop {
+                let result =
+                    runtime.block_on(local_set.run_until(Self::run(
+                        store_dir.clone(),
+                        node_endpoint.clone(),
+                        keystore_for_run.clone(),
+                        &mut receiver,
+                        &mut done_receiver,
+                        &sync_listeners,
+                        debug_mode,
+                        &alive_for_run,
+                    )));
+
+                match result {
+                    Ok(()) => {
+                        // Clean shutdown (done_receiver signalled)
+                        alive_for_run.store(false, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        alive_for_run.store(false, Ordering::Release);
+                        metrics::counter!("miden_client_restarts_total").increment(1);
+                        tracing::error!(
+                            "MidenClient::run crashed: {err:#}, restarting in 5s..."
+                        );
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                }
             }
-            result
         });
 
         let task = std::sync::Mutex::new(Some(task));
@@ -89,9 +122,15 @@ impl MidenClient {
             task,
             sender,
             done_sender,
+            alive,
             #[cfg(test)]
             call_count: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Returns true if the background thread is connected and syncing.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -136,6 +175,7 @@ impl MidenClient {
             task: std::sync::Mutex::new(None),
             sender,
             done_sender: std::sync::Mutex::new(Some(done_sender)),
+            alive: Arc::new(AtomicBool::new(true)),
             call_count,
         }
     }
@@ -218,7 +258,7 @@ impl MidenClient {
         self.join()
     }
 
-    fn unwrap_connection_error(client_err: ClientError) -> anyhow::Result<Box<dyn Error>> {
+    pub(crate) fn unwrap_connection_error(client_err: ClientError) -> anyhow::Result<Box<dyn Error>> {
         match client_err {
             ClientError::RpcError(RpcError::ConnectionError(err)) => Ok(err),
             ClientError::RpcError(RpcError::RequestError {
@@ -230,6 +270,7 @@ impl MidenClient {
     }
 
     async fn sync(client: &mut MidenClientLib) -> anyhow::Result<SyncSummary> {
+        let mut backoff = BACKOFF_MIN;
         loop {
             let result = client.sync_state().await;
             match result {
@@ -240,17 +281,20 @@ impl MidenClient {
                 Err(client_err) => {
                     match Self::unwrap_connection_error(client_err) {
                         Ok(conn_err) => {
+                            metrics::counter!("miden_sync_errors_total", "kind" => "connection").increment(1);
                             tracing::error!(
-                                "MidenClient::sync connection error: {conn_err:?}, retrying in 5s..."
+                                "MidenClient::sync connection error: {conn_err:?}, retrying in {backoff:?}..."
                             );
                         }
                         Err(other_err) => {
+                            metrics::counter!("miden_sync_errors_total", "kind" => "other").increment(1);
                             tracing::error!(
-                                "MidenClient::sync non-connection error: {other_err:#}, retrying in 5s..."
+                                "MidenClient::sync non-connection error: {other_err:#}, retrying in {backoff:?}..."
                             );
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_backoff(backoff);
                 }
             }
         }
@@ -269,16 +313,18 @@ impl MidenClient {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         store_dir: PathBuf,
         node_endpoint: Endpoint,
         keystore: Arc<FilesystemKeyStore>,
-        mut receiver: mpsc::Receiver<Request>,
-        mut done_receiver: oneshot::Receiver<()>,
-        sync_listeners: Vec<Arc<dyn SyncListener>>,
+        receiver: &mut mpsc::Receiver<Request>,
+        done_receiver: &mut oneshot::Receiver<()>,
+        sync_listeners: &[Arc<dyn SyncListener>],
         debug_mode: bool,
+        alive: &AtomicBool,
     ) -> anyhow::Result<()> {
-        // node client
+        // node client — retry build with exponential backoff
         let node_timeout_ms: u64 = 10_000;
         let mode = if debug_mode {
             DebugMode::Enabled
@@ -286,26 +332,53 @@ impl MidenClient {
             DebugMode::Disabled
         };
 
-        let mut client = ClientBuilder::new()
-            .grpc_client(&node_endpoint, Some(node_timeout_ms))
-            .sqlite_store(store_dir.join("store.sqlite3"))
-            .authenticator(keystore)
-            .in_debug_mode(mode)
-            .build()
-            .await?;
+        let mut client;
+        let mut backoff = BACKOFF_MIN;
+        loop {
+            let build_result = ClientBuilder::new()
+                .grpc_client(&node_endpoint, Some(node_timeout_ms))
+                .sqlite_store(store_dir.join("store.sqlite3"))
+                .authenticator(keystore.clone())
+                .in_debug_mode(mode)
+                .build()
+                .await;
+
+            match build_result {
+                Ok(c) => {
+                    client = c;
+                    break;
+                }
+                Err(err) => {
+                    metrics::counter!("miden_client_build_errors_total").increment(1);
+                    tracing::error!(
+                        "MidenClient build failed: {err:#}, retrying in {backoff:?}..."
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {},
+                        _ = &mut *done_receiver => {
+                            tracing::debug!("MidenClient::run shutdown during build retry");
+                            return Ok(());
+                        }
+                    }
+                    backoff = next_backoff(backoff);
+                }
+            }
+        }
 
         // initial sync
         tokio::select! {
             result = Self::sync(&mut client) => {
-                if let Err(err) = Self::on_sync(result, &mut client, &sync_listeners).await {
+                if let Err(err) = Self::on_sync(result, &mut client, sync_listeners).await {
                     tracing::error!("MidenClient initial sync listener error: {err:#}");
                 }
             },
-            _ = &mut done_receiver => {
+            _ = &mut *done_receiver => {
                 tracing::debug!("MidenClient::run loop done");
                 return Ok(());
             }
         }
+
+        alive.store(true, Ordering::Release);
         let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
 
         loop {
@@ -318,14 +391,14 @@ impl MidenClient {
                 _ = sync_interval.tick() => {
                     tokio::select! {
                         result = Self::sync(&mut client) => {
-                            if let Err(err) = Self::on_sync(result, &mut client, &sync_listeners).await {
+                            if let Err(err) = Self::on_sync(result, &mut client, sync_listeners).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
                         },
-                        _ = &mut done_receiver => break,
+                        _ = &mut *done_receiver => break,
                     }
                 },
-                _ = &mut done_receiver => break,
+                _ = &mut *done_receiver => break,
             }
         }
 
@@ -361,6 +434,7 @@ impl MidenClient {
 /// Poll until a transaction is committed on the Miden node.
 ///
 /// Returns `true` if committed within the given number of attempts.
+/// Connection errors during sync are retried up to 3 times per attempt.
 pub async fn wait_for_transaction_commit(
     client: &mut MidenClientLib,
     txn_id: miden_protocol::transaction::TransactionId,
@@ -369,7 +443,32 @@ pub async fn wait_for_transaction_commit(
 ) -> anyhow::Result<bool> {
     for _ in 0..max_attempts {
         tokio::time::sleep(poll_interval).await;
-        client.sync_state().await?;
+
+        // Retry sync on connection errors (up to 3 retries per poll attempt)
+        let mut sync_ok = false;
+        for retry in 0..3u32 {
+            match client.sync_state().await {
+                Ok(_) => {
+                    sync_ok = true;
+                    break;
+                }
+                Err(client_err) => match MidenClient::unwrap_connection_error(client_err) {
+                    Ok(conn_err) => {
+                        tracing::warn!(
+                            "wait_for_transaction_commit: sync connection error (retry {}/3): {conn_err:?}",
+                            retry + 1
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    Err(other_err) => return Err(other_err),
+                },
+            }
+        }
+        if !sync_ok {
+            tracing::error!("wait_for_transaction_commit: sync failed after 3 retries, skipping poll");
+            continue;
+        }
+
         let txns = client
             .get_transactions(miden_client::store::TransactionFilter::All)
             .await?;
