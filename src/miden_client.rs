@@ -238,10 +238,18 @@ impl MidenClient {
                     return Ok(summary);
                 }
                 Err(client_err) => {
-                    let err = Self::unwrap_connection_error(client_err)?;
-                    tracing::error!(
-                        "MidenClient::sync failed to connect to the node: {err:?}, retrying in 5 seconds..."
-                    );
+                    match Self::unwrap_connection_error(client_err) {
+                        Ok(conn_err) => {
+                            tracing::error!(
+                                "MidenClient::sync connection error: {conn_err:?}, retrying in 5s..."
+                            );
+                        }
+                        Err(other_err) => {
+                            tracing::error!(
+                                "MidenClient::sync non-connection error: {other_err:#}, retrying in 5s..."
+                            );
+                        }
+                    }
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -288,7 +296,11 @@ impl MidenClient {
 
         // initial sync
         tokio::select! {
-            result = Self::sync(&mut client) => Self::on_sync(result, &mut client, &sync_listeners).await?,
+            result = Self::sync(&mut client) => {
+                if let Err(err) = Self::on_sync(result, &mut client, &sync_listeners).await {
+                    tracing::error!("MidenClient initial sync listener error: {err:#}");
+                }
+            },
             _ = &mut done_receiver => {
                 tracing::debug!("MidenClient::run loop done");
                 return Ok(());
@@ -305,7 +317,11 @@ impl MidenClient {
                 },
                 _ = sync_interval.tick() => {
                     tokio::select! {
-                        result = Self::sync(&mut client) => Self::on_sync(result, &mut client, &sync_listeners).await?,
+                        result = Self::sync(&mut client) => {
+                            if let Err(err) = Self::on_sync(result, &mut client, &sync_listeners).await {
+                                tracing::error!("MidenClient sync listener error: {err:#}");
+                            }
+                        },
                         _ = &mut done_receiver => break,
                     }
                 },
