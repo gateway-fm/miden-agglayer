@@ -88,6 +88,8 @@ make build
 | `--rollup-address` | `ROLLUP_ADDRESS` | `0x414e...0e4e` | Rollup contract (eth_call forwarding) |
 | `--restore` | | | Reconstruct store from miden-node + L1, then exit |
 | `--init` | | | Initialize accounts config, then exit |
+| `--reset-miden-store` | | | Wipe miden-client sqlite before startup (preserves keystore + config) — see [Recovery](#recovery) |
+| `--unlock-miden-accounts` | | | Clear stale `locked` flags in miden-client sqlite, then exit — see [Recovery](#recovery) |
 
 ### ClaimSettler env vars
 
@@ -207,3 +209,59 @@ If the PostgreSQL store is lost, reconstruct state from authoritative sources:
 ```
 
 This scans the Miden node and L1 to rebuild claims, bridge-outs, GER entries, and synthetic logs.
+
+## Recovery
+
+When miden-client's local sqlite diverges from the node, the first tx submission
+surfaces it as an opaque `transaction conflicts with current mempool state` /
+`initial account commitment ... does not match current commitment ...` error.
+On startup, the proxy checks every managed account's lock status via the
+miden-client `AccountReader` API and logs an ERROR with a recovery hint if any
+account is locked. The `miden_locked_accounts_detected_total` metric is
+incremented too, so an alert can be wired to it.
+
+Two recovery modes are available:
+
+#### Surgical unlock — `--unlock-miden-accounts`
+
+Clears the `locked` flag on every row in miden-client's sqlite
+(`latest_account_headers` + `historical_account_headers`) and exits. Use this
+when the only symptom is a stale lock and the underlying on-chain state is
+actually fine.
+
+```bash
+./target/release/miden-agglayer-service \
+    --miden-store-dir /var/lib/miden \
+    --unlock-miden-accounts
+# then restart the proxy normally
+```
+
+Fast (milliseconds) and keeps all local state. Reaches into miden-client's
+private schema, so the operation may warn if miden-client bumps its schema;
+that's logged and non-fatal.
+
+#### Full reset — `--reset-miden-store`
+
+Deletes `store.sqlite3` (plus the `-wal`/`-shm` sidecars) so startup rebuilds
+an empty sqlite and re-syncs from the node. Keystore (private keys) and
+`bridge_accounts.toml` (on-chain account IDs) are preserved — wiping either
+would permanently lose control of the on-chain accounts.
+
+```bash
+./target/release/miden-agglayer-service \
+    --miden-node http://... \
+    --miden-store-dir /var/lib/miden \
+    --database-url postgres://... \
+    --reset-miden-store \
+    --restore
+```
+
+Combine with `--restore` to also rebuild the proxy's Postgres/in-memory store
+from on-chain notes in the same startup — otherwise the proxy resumes from a
+stale PgStore checkpoint.
+
+Caveat: after a reset the miden-client has an empty set of tracked accounts.
+Public accounts re-attach automatically via sync. Private accounts (if any)
+cannot be re-imported from the node alone — they would need a fresh `--init`
+(which mints new on-chain accounts and invalidates existing balances), so
+prefer `--unlock-miden-accounts` first when the divergence is recoverable.
