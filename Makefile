@@ -74,6 +74,7 @@ test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-containe
 	@echo "╔══════════════════════════════════════════════════════════════╗"
 	@echo "║  Starting E2E stack (Anvil, Miden node, PG, bridge, aggkit) ║"
 	@echo "╚══════════════════════════════════════════════════════════════╝"
+	@$(MAKE) --no-print-directory e2e-clean-data
 	$(E2E_COMPOSE) up -d --build --wait
 	@echo ""
 	@echo "Stack is up — running E2E tests..."
@@ -171,8 +172,19 @@ E2E_COMPOSE := docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
 	./scripts/setup-fixtures.sh
 
+.PHONY: e2e-clean-data
+e2e-clean-data: ## Wipe .miden-agglayer-data/ so proxy re-inits against the fresh miden-node
+	# The miden-node's genesis commitment is non-deterministic across container
+	# restarts, but the proxy's sqlite at .miden-agglayer-data/store.sqlite3
+	# pins a specific genesis. If we mount stale state into a fresh node, the
+	# client's sync is rejected with "accept header validation failed". Always
+	# start from a clean slate — the proxy's --init flow will redeploy accounts
+	# in ~45s, which is acceptable for E2E.
+	rm -rf .miden-agglayer-data
+	mkdir -p .miden-agglayer-data/tmp
+
 .PHONY: e2e-up
-e2e-up: ## Start full E2E environment
+e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)
 	$(E2E_COMPOSE) up -d --build --wait
 
 .PHONY: e2e-test

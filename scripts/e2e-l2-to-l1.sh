@@ -182,11 +182,12 @@ CLAIM_TX=$(cast send --rpc-url "$L1_RPC" \
     "$AMOUNT_CLAIM" "$METADATA_CLAIM" \
     2>&1)
 
-if echo "$CLAIM_TX" | grep -q "status.*1"; then
+STATUS=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="status"{print $2; exit}')
+if [[ "$STATUS" == "1" ]]; then
     pass "L1 claim transaction succeeded!"
 else
     warn "L1 claim tx output: $CLAIM_TX"
-    fail "L1 claim transaction failed"
+    fail "L1 claim transaction failed (status=$STATUS)"
 fi
 
 # Verify L1 balance change

@@ -256,46 +256,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Startup diagnostic: once the initial sync completes, check whether any
-    // managed account is marked `locked` in miden-client's local state. A
-    // stale lock is a symptom of a previous crash or commitment divergence and
-    // will otherwise surface later as opaque "transaction conflicts with
-    // current mempool state" errors on the first tx submission.
-    {
-        let client_ref = &client;
-        let accounts_ref = &accounts.0;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !client_ref.is_alive() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        if client_ref.is_alive() {
-            match miden_agglayer_service::recovery::detect_locked_accounts(client_ref, accounts_ref)
-                .await
-            {
-                Ok(locked) if !locked.is_empty() => {
-                    tracing::error!(
-                        "startup: {} managed account(s) are LOCKED in miden-client: {:?}. \
-                         This usually means local state diverged from the node. \
-                         Recovery: restart with --unlock-miden-accounts (surgical) or \
-                         --reset-miden-store --restore (full resync).",
-                        locked.len(),
-                        locked
-                    );
-                    ::metrics::counter!("miden_locked_accounts_detected_total")
-                        .increment(locked.len() as u64);
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!("startup: lock-status check failed: {err:#}");
-                }
-            }
-        } else {
-            tracing::warn!(
-                "startup: miden-client not alive within 30s — skipping lock-status check"
-            );
-        }
-    }
-
     let mut state = ServiceState::new(
         client,
         accounts,
@@ -316,6 +276,55 @@ async fn main() -> anyhow::Result<()> {
         .install_recorder()
         .context("failed to install metrics recorder")?;
     miden_agglayer_service::metrics::init_metrics();
+
+    // Startup diagnostic: once the initial sync completes, check whether any
+    // managed account is marked `locked` in miden-client's local state. A
+    // stale lock is a symptom of a previous crash or commitment divergence and
+    // will otherwise surface later as opaque "transaction conflicts with
+    // current mempool state" errors on the first tx submission.
+    //
+    // Runs in the background so it doesn't delay `service::serve`. Worst case,
+    // a locked account is flagged a few seconds into the proxy's lifetime
+    // instead of strictly before it serves traffic.
+    {
+        let diag_client = state.miden_client.clone();
+        let diag_accounts = state.accounts.0.clone();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !diag_client.is_alive() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if !diag_client.is_alive() {
+                tracing::warn!(
+                    "startup diagnostic: miden-client not alive within 120s — skipping lock-status check"
+                );
+                return;
+            }
+            match miden_agglayer_service::recovery::detect_locked_accounts(
+                &diag_client,
+                &diag_accounts,
+            )
+            .await
+            {
+                Ok(locked) if !locked.is_empty() => {
+                    tracing::error!(
+                        "startup diagnostic: {} managed account(s) are LOCKED in miden-client: {:?}. \
+                         This usually means local state diverged from the node. \
+                         Recovery: restart with --unlock-miden-accounts (surgical) or \
+                         --reset-miden-store --restore (full resync).",
+                        locked.len(),
+                        locked
+                    );
+                    ::metrics::counter!("miden_locked_accounts_detected_total")
+                        .increment(locked.len() as u64);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!("startup diagnostic: lock-status check failed: {err:#}");
+                }
+            }
+        });
+    }
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone(), metrics_handle).await?;

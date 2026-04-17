@@ -91,7 +91,11 @@ TX=$(cast send --rpc-url "$L1_RPC" \
     "$DEST_NETWORK" "$DEST_ADDR" "$DEPOSIT_AMOUNT" \
     0x0000000000000000000000000000000000000000 true 0x \
     --value "$DEPOSIT_AMOUNT" 2>&1)
-echo "$TX" | grep -q "status.*1" || fail "L1 deposit tx failed: $TX"
+# Parse the status field from cast's receipt dump (format: "status  1 (success)").
+# Using grep on "status.*1" is fragile — the receipt's logs blob contains other
+# text that the shell pipe sometimes fails to match reliably.
+STATUS=$(printf '%s\n' "$TX" | awk '$1=="status"{print $2; exit}')
+[[ "$STATUS" == "1" ]] || fail "L1 deposit tx failed (status=$STATUS): $TX"
 pass "L1 deposit succeeded"
 
 # ── Step 2: Wait for deposit to be ready_for_claim ────────────────────────────
