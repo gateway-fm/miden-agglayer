@@ -48,6 +48,22 @@ struct Command {
     #[arg(long)]
     restore: bool,
 
+    /// Big hammer recovery: wipe the miden-client sqlite store
+    /// (`store.sqlite3` + WAL/SHM) before starting so the proxy re-syncs from
+    /// the node. Keystore and `bridge_accounts.toml` are preserved.
+    ///
+    /// Combine with `--restore` to also rebuild the proxy store (PgStore /
+    /// InMemoryStore) from on-chain notes in the same startup.
+    #[arg(long)]
+    reset_miden_store: bool,
+
+    /// Surgical recovery: clear the `locked` flag on every account row in the
+    /// miden-client sqlite, then exit. Use when `--reset-miden-store` would
+    /// be overkill (i.e. the only symptom is a stale lock). Operator must
+    /// restart the proxy afterwards.
+    #[arg(long)]
+    unlock_miden_accounts: bool,
+
     /// L1 bridge contract address used for synthetic log emission
     #[arg(
         long,
@@ -83,6 +99,8 @@ impl std::fmt::Debug for Command {
                 &self.database_url.as_ref().map(|_| "[REDACTED]"),
             )
             .field("restore", &self.restore)
+            .field("reset_miden_store", &self.reset_miden_store)
+            .field("unlock_miden_accounts", &self.unlock_miden_accounts)
             .field("bridge_address", &self.bridge_address)
             .field(
                 "l1_rpc_url",
@@ -102,6 +120,37 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("{command:?}");
 
     let miden_store_dir = command.miden_store_dir;
+
+    // Resolve the effective store directory for recovery flags (which need a
+    // concrete path even when the user didn't pass `--miden-store-dir`).
+    let effective_store_dir = miden_store_dir.clone().unwrap_or_else(|| {
+        let base = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        base.join(".miden")
+    });
+
+    // Surgical recovery: clear stale `locked` flags in miden-client's sqlite
+    // and exit. Operator restarts the proxy afterwards.
+    if command.unlock_miden_accounts {
+        let cleared = miden_agglayer_service::recovery::unlock_miden_accounts(&effective_store_dir)
+            .context("failed to clear locked flags in miden-client sqlite")?;
+        tracing::info!(
+            "unlock_miden_accounts: cleared {cleared} locked row(s); restart the proxy to pick up the change"
+        );
+        return Ok(());
+    }
+
+    // Big hammer recovery: wipe miden-client sqlite so startup re-syncs from
+    // the node. Must happen before ClientBuilder opens the sqlite file.
+    if command.reset_miden_store {
+        let removed = miden_agglayer_service::recovery::reset_miden_store(&effective_store_dir)
+            .context("failed to reset miden-client sqlite store")?;
+        tracing::warn!(
+            "reset_miden_store: removed {removed} sqlite file(s) from {}; \
+             keystore and bridge_accounts.toml preserved",
+            effective_store_dir.display()
+        );
+    }
+
     let needs_init = command.init || !config_path_exists(miden_store_dir.clone())?;
 
     // Phase 1: Run init if needed (with a minimal client, no BridgeOutScanner)
@@ -227,6 +276,55 @@ async fn main() -> anyhow::Result<()> {
         .install_recorder()
         .context("failed to install metrics recorder")?;
     miden_agglayer_service::metrics::init_metrics();
+
+    // Startup diagnostic: once the initial sync completes, check whether any
+    // managed account is marked `locked` in miden-client's local state. A
+    // stale lock is a symptom of a previous crash or commitment divergence and
+    // will otherwise surface later as opaque "transaction conflicts with
+    // current mempool state" errors on the first tx submission.
+    //
+    // Runs in the background so it doesn't delay `service::serve`. Worst case,
+    // a locked account is flagged a few seconds into the proxy's lifetime
+    // instead of strictly before it serves traffic.
+    {
+        let diag_client = state.miden_client.clone();
+        let diag_accounts = state.accounts.0.clone();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !diag_client.is_alive() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if !diag_client.is_alive() {
+                tracing::warn!(
+                    "startup diagnostic: miden-client not alive within 120s — skipping lock-status check"
+                );
+                return;
+            }
+            match miden_agglayer_service::recovery::detect_locked_accounts(
+                &diag_client,
+                &diag_accounts,
+            )
+            .await
+            {
+                Ok(locked) if !locked.is_empty() => {
+                    tracing::error!(
+                        "startup diagnostic: {} managed account(s) are LOCKED in miden-client: {:?}. \
+                         This usually means local state diverged from the node. \
+                         Recovery: restart with --unlock-miden-accounts (surgical) or \
+                         --reset-miden-store --restore (full resync).",
+                        locked.len(),
+                        locked
+                    );
+                    ::metrics::counter!("miden_locked_accounts_detected_total")
+                        .increment(locked.len() as u64);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!("startup diagnostic: lock-status check failed: {err:#}");
+                }
+            }
+        });
+    }
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone(), metrics_handle).await?;

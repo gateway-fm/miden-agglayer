@@ -7,4 +7,13 @@ pub fn init_metrics() {
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
     describe_histogram!("rpc_request_duration_seconds", "JSON-RPC request duration");
+    describe_counter!(
+        "miden_client_build_errors_total",
+        "Failed attempts to build Miden client connection"
+    );
+    describe_counter!(
+        "miden_client_restarts_total",
+        "Background thread restarts after crash"
+    );
+    describe_counter!("miden_sync_errors_total", "Sync errors by kind");
 }

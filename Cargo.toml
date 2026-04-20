@@ -48,6 +48,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 http = { version = "1.3" }
 lru = { default-features = false, version = "0.16" }
 parking_lot = { version = "0.12" }
+# Direct dep so we can surgically clear stale `locked` flags in miden-client's
+# sqlite when a full --reset-miden-store would be overkill. Version matches
+# what miden-client-sqlite-store pulls in transitively.
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { features = ["derive"], version = "1.0" }
 serde_json = { version = "1.0" }
 sha3 = { version = "0.10" }

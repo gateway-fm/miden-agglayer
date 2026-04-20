@@ -335,8 +335,21 @@ async fn shutdown_signal() {
     }
 }
 
-async fn health_check() -> impl IntoResponse {
-    axum::Json(serde_json::json!({ "status": "ok" }))
+async fn health_check(State(service): State<ServiceState>) -> impl IntoResponse {
+    if service.miden_client.is_alive() {
+        (
+            http::StatusCode::OK,
+            axum::Json(serde_json::json!({ "status": "ok" })),
+        )
+    } else {
+        (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "degraded",
+                "reason": "node connection lost"
+            })),
+        )
+    }
 }
 
 pub async fn serve(

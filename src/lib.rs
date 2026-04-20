@@ -14,6 +14,7 @@ pub mod log_synthesis;
 pub mod logging;
 pub mod metrics;
 pub mod miden_client;
+pub mod recovery;
 pub mod restore;
 pub mod service;
 pub(crate) mod service_admin;

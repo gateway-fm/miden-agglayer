@@ -3326,6 +3326,7 @@ dependencies = [
  "miden-tx",
  "parking_lot",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha3",
