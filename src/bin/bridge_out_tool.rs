@@ -23,7 +23,7 @@ use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(version, about = "Create and submit a B2AGG bridge-out note")]
 struct Args {
     /// Path to the miden-client store directory (containing store.sqlite3 and keystore/)
@@ -61,6 +61,32 @@ struct Args {
     /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
     #[arg(long, env = "MIDEN_DEBUG")]
     miden_debug: bool,
+
+    /// API key sent as `authorization: Bearer <key>` on every outbound Miden gRPC call.
+    /// Needed when `--node-url` points at a gateway that rate-limits unauthenticated
+    /// traffic. Safe to omit for direct node access.
+    #[arg(long, env = "MIDEN_API_KEY")]
+    miden_api_key: Option<String>,
+}
+
+impl std::fmt::Debug for Args {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Args")
+            .field("store_dir", &self.store_dir)
+            .field("node_url", &self.node_url)
+            .field("wallet_id", &self.wallet_id)
+            .field("bridge_id", &self.bridge_id)
+            .field("faucet_id", &self.faucet_id)
+            .field("amount", &self.amount)
+            .field("dest_address", &self.dest_address)
+            .field("dest_network", &self.dest_network)
+            .field("miden_debug", &self.miden_debug)
+            .field(
+                "miden_api_key",
+                &self.miden_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
@@ -123,8 +149,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Build miden client from existing store
     let keystore = FilesystemKeyStore::new(keystore_path)?;
+    let rpc = miden_agglayer_service::miden_client::build_rpc_client(
+        &node_endpoint,
+        10_000,
+        args.miden_api_key.as_deref(),
+    );
     let mut client = ClientBuilder::new()
-        .grpc_client(&node_endpoint, Some(10_000))
+        .rpc(rpc)
         .sqlite_store(store_path)
         .authenticator(Arc::new(keystore))
         .in_debug_mode(mode)

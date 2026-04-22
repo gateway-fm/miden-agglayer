@@ -3436,8 +3436,8 @@ dependencies = [
 
 [[package]]
 name = "miden-client"
-version = "0.14.4"
-source = "git+https://github.com/0xMiden/miden-client.git?tag=v0.14.4#18d921f15754e7deaf0659916820abea52fbea03"
+version = "0.14.0"
+source = "git+https://github.com/revitteth/miden-client.git?rev=a415fb7038251eb49aa9b384c640f04c41060a56#a415fb7038251eb49aa9b384c640f04c41060a56"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3458,7 +3458,6 @@ dependencies = [
  "rand 0.9.3",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -3472,8 +3471,8 @@ dependencies = [
 
 [[package]]
 name = "miden-client-sqlite-store"
-version = "0.14.4"
-source = "git+https://github.com/0xMiden/miden-client.git?tag=v0.14.4#18d921f15754e7deaf0659916820abea52fbea03"
+version = "0.14.0"
+source = "git+https://github.com/revitteth/miden-client.git?rev=a415fb7038251eb49aa9b384c640f04c41060a56#a415fb7038251eb49aa9b384c640f04c41060a56"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3677,9 +3676,9 @@ dependencies = [
 
 [[package]]
 name = "miden-node-proto-build"
-version = "0.14.9"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e457758c9a6aa5f70f687f1081833f102572ee1d02baf549625868917495815"
+checksum = "289194699f5acd63feb735c692fab0ff2e77aa67bf67dfd2608e0c573591a14b"
 dependencies = [
  "build-rs",
  "fs-err",
@@ -3690,9 +3689,9 @@ dependencies = [
 
 [[package]]
 name = "miden-note-transport-proto-build"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec23738a2eee393524a849a8dce982ad824050cc54abde145d4fb62b92c84198"
+checksum = "5e183c4e36c155edea086b79cd4395d70e3a905eb86778827e12a8e0d0110d2b"
 dependencies = [
  "fs-err",
  "miette",

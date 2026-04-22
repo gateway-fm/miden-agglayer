@@ -132,6 +132,14 @@ struct Command {
     /// rather than silent runtime exposures.
     #[arg(long, env = "REQUIRE_HARDENING", default_value_t = false)]
     require_hardening: bool,
+
+    /// API key sent as `authorization: Bearer <key>` on every outbound Miden gRPC call.
+    ///
+    /// Required when the node sits behind a gateway that rate-limits unauthenticated
+    /// traffic (e.g. `miden-testnet.eu-central-8.gateway.fm`). Safe to omit when
+    /// targeting the node directly. Redacted in log output.
+    #[arg(long, env = "MIDEN_API_KEY")]
+    miden_api_key: Option<String>,
 }
 
 /// Validate the `--require-hardening` invariants. Returns a list of
@@ -206,6 +214,10 @@ impl std::fmt::Debug for Command {
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
             .field("require_hardening", &self.require_hardening)
+            .field(
+                "miden_api_key",
+                &self.miden_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -276,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
         let init_client = MidenClient::new(
             miden_store_dir.clone(),
             command.miden_node.clone(),
+            command.miden_api_key.clone(),
             sync_listeners,
             command.miden_debug,
         )?;
@@ -362,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
     let client = MidenClient::new(
         miden_store_dir.clone(),
         command.miden_node.clone(),
+        command.miden_api_key.clone(),
         sync_listeners,
         command.miden_debug,
     )?;
@@ -420,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
         miden_node_url = %state.miden_node_url,
         "fresh-client `publish_claim` path will dial this Miden node URL"
     );
+    state.miden_api_key = command.miden_api_key;
 
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -554,6 +569,7 @@ mod hardening_tests {
             rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
             require_hardening: require,
+            miden_api_key: None,
         }
     }
 

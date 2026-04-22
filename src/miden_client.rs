@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
-use miden_client::rpc::{Endpoint, GrpcError, RpcError};
+use miden_client::rpc::{Endpoint, GrpcClient, GrpcError, NodeRpcClient, RpcError};
 use miden_client::sync::SyncSummary;
 use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
@@ -63,6 +63,23 @@ pub fn parse_node_url(node_url: &str) -> anyhow::Result<Endpoint> {
     }
 }
 
+/// Builds an RPC client for the Miden node, optionally authenticating via a bearer token.
+///
+/// When `api_key` is `Some`, the returned client sends `authorization: Bearer <api_key>` on
+/// every outbound gRPC call — required when the node sits behind a rate-limiting gateway.
+/// Otherwise this behaves identically to `ClientBuilder::grpc_client()`.
+pub fn build_rpc_client(
+    endpoint: &Endpoint,
+    timeout_ms: u64,
+    api_key: Option<&str>,
+) -> Arc<dyn NodeRpcClient> {
+    let mut client = GrpcClient::new(endpoint, timeout_ms);
+    if let Some(key) = api_key {
+        client = client.with_header("authorization", format!("Bearer {key}"));
+    }
+    Arc::new(client)
+}
+
 pub struct MidenClient {
     keystore: Arc<FilesystemKeyStore>,
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
@@ -80,6 +97,7 @@ impl MidenClient {
     pub fn new(
         store_dir: Option<PathBuf>,
         node_url: Option<String>,
+        api_key: Option<String>,
         sync_listeners: Vec<Arc<dyn SyncListener>>,
         debug_mode: bool,
     ) -> anyhow::Result<Self> {
@@ -105,6 +123,7 @@ impl MidenClient {
                 let result = runtime.block_on(local_set.run_until(Self::run(
                     store_dir.clone(),
                     node_endpoint.clone(),
+                    api_key.clone(),
                     keystore_for_run.clone(),
                     &mut receiver,
                     &mut done_receiver,
@@ -328,6 +347,7 @@ impl MidenClient {
     async fn run(
         store_dir: PathBuf,
         node_endpoint: Endpoint,
+        api_key: Option<String>,
         keystore: Arc<FilesystemKeyStore>,
         receiver: &mut mpsc::Receiver<Request>,
         done_receiver: &mut oneshot::Receiver<()>,
@@ -347,7 +367,11 @@ impl MidenClient {
         let mut backoff = BACKOFF_MIN;
         loop {
             let build_result = ClientBuilder::new()
-                .grpc_client(&node_endpoint, Some(node_timeout_ms))
+                .rpc(build_rpc_client(
+                    &node_endpoint,
+                    node_timeout_ms,
+                    api_key.as_deref(),
+                ))
                 .sqlite_store(store_dir.join("store.sqlite3"))
                 .authenticator(keystore.clone())
                 .in_debug_mode(mode)
