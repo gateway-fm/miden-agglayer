@@ -1,6 +1,5 @@
 pub mod accounts_config;
 pub mod address_mapper;
-mod amount;
 pub mod block_state;
 pub mod bridge_address;
 pub mod bridge_out;
