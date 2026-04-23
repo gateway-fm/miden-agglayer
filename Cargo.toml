@@ -84,11 +84,25 @@ miden-protocol = { default-features = false, features = [
 miden-standards = { default-features = false, version = "0.14" }
 miden-tx = { default-features = false, version = "0.14" }
 
-# miden-client (pinned to ajl-agglayer-integration-tests-v0.14.0 branch head for reproducibility)
+# miden-client v0.14.4 (tagged release).
+#
+# Previously pinned to a commit on the `ajl-agglayer-integration-tests-v0.14.0` branch
+# (rev f7cdf263). That rev expected `TransactionHeader.output_notes = repeated NoteSyncRecord`
+# in proto-build 0.14.4–0.14.6 — a short-lived schema that miden-node v0.14.7+ reverted
+# back to `repeated NoteHeader` (miden-node commit cf0a333a). Running our client against
+# a v0.14.7+ server therefore produced `invalid wire type: SixtyFourBit (expected
+# LengthDelimited)` decode failures on every `SyncTransactions` response.
+#
+# v0.14.4 of miden-client (which includes miden-client PR #2008 "detect erased notes")
+# flipped its Rust decode path back to `Vec<NoteHeader>`, realigning client ↔ server.
+# Cargo's semver resolution now pulls miden-node-proto-build 0.14.9, matching the server
+# schema. The `ajl-agglayer-integration-tests-v0.14.0` branch only diverges in
+# integration-test code (test_utils/common.rs behind the `testing` feature), so losing
+# that branch does not affect miden-agglayer's library usage.
 miden-client = { default-features = false, features = [
   "tonic",
-], git = "https://github.com/0xMiden/miden-client.git", rev = "f7cdf263781999e8f81ba608f9c5a91218747d98" }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", rev = "f7cdf263781999e8f81ba608f9c5a91218747d98" }
+], git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.4" }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.4" }
 
 [features]
 default = []
