@@ -326,6 +326,41 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Observability heartbeat: emit one INFO line every HEARTBEAT_INTERVAL so operators
+    // tailing logs can distinguish a healthy-idle service from a hung one. Without this,
+    // a successfully-syncing service produces zero output — sync-success logs are at
+    // DEBUG level (target `miden_agglayer_service::miden_client::sync::debug`) and every
+    // other `info!` is event-driven. See `logging.rs` for how to opt into the per-sync
+    // debug line instead of / in addition to this heartbeat.
+    {
+        const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        let hb_client = state.miden_client.clone();
+        let hb_store = state.store.clone();
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            // Consume the immediate first tick; first heartbeat fires after one interval
+            // so it does not overlap with the "Service started" startup line.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let uptime_secs = started.elapsed().as_secs();
+                let miden_client_alive = hb_client.is_alive();
+                let latest_block = match hb_store.get_latest_block_number().await {
+                    Ok(n) => n.to_string(),
+                    Err(err) => format!("<err: {err:#}>"),
+                };
+                tracing::info!(
+                    target: "miden_agglayer_service::heartbeat",
+                    uptime_secs,
+                    miden_client_alive,
+                    latest_block,
+                    "heartbeat"
+                );
+            }
+        });
+    }
+
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
