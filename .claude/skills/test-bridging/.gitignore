@@ -1,0 +1,3 @@
+# Any per-env secrets file. Matches envs/bali.env.local, envs/staging.env.local, etc.
+envs/*.env.local
+.env.local

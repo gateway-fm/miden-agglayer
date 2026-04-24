@@ -1,0 +1,33 @@
+[package]
+name = "claim-note"
+version = "0.1.0"
+edition = "2021"
+description = "Consume a Miden claim note using a deterministic CLAIMER_SEED-derived account"
+publish = false
+
+[[bin]]
+name = "claim-note"
+path = "src/main.rs"
+
+[dependencies]
+# Miden client pinned at the same v0.14.4 release that miden-agglayer uses.
+# Realigns with miden-node v0.14.7+ proto schema (NoteHeader, not NoteSyncRecord).
+miden-client = { git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.4", default-features = false, features = ["tonic"] }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.4" }
+
+# Miden base crates pinned EXACTLY to 0.14.4. miden-protocol 0.14.5 renamed
+# `AuthScheme::Falcon512Rpo` → `Falcon512Poseidon2`; the agglayer runs against
+# miden-client v0.14.4 → miden-protocol 0.14.4 → Falcon512Rpo, so our claimer
+# account must use the same auth variant the agglayer expects.
+miden-protocol = { version = "=0.14.4", default-features = false, features = ["std"] }
+miden-standards = { version = "=0.14.4", default-features = false }
+
+# Crypto / RNG / hashing for deterministic account derivation.
+rand = "0.9"
+rand_chacha = "0.9"
+sha3 = "0.10"
+hex = "0.4"
+
+# Runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
