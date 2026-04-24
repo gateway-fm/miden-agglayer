@@ -374,7 +374,12 @@
     section.report { margin-top: 96px; scroll-margin-top: 80px; }
     section.report:first-of-type { margin-top: 0; }
 
-    /* Sticky chapter header — full viewport width, stays locked at top */
+    /* Scroll-driven collapse. Each sticky-head receives a --p custom prop
+       in [0..1], interpolated from JS based on how far its section has
+       scrolled past the viewport top. --p = 0 → full header with subway
+       map; --p = 1 → compact bar, map cross-faded out. */
+    .sticky-sentinel { display: none; } /* legacy — no longer used */
+
     .sticky-head {
       position: sticky; top: 0; z-index: 50;
       margin: 0 calc(50% - 50vw);
@@ -386,48 +391,76 @@
     }
     .sh-inner {
       max-width: 1160px; margin: 0 auto;
-      padding: 16px 40px;
       display: grid;
       grid-template-columns: auto 1fr auto;
-      gap: 28px; align-items: baseline;
+      align-items: baseline;
       font-family: var(--mono);
       font-size: 11px; font-weight: 500;
       letter-spacing: .14em; text-transform: uppercase;
       color: var(--muted);
       font-variant-numeric: tabular-nums;
+      /* scroll-interpolated box metrics */
+      padding: calc(14px - var(--p, 0) * 8px) 40px;
+      column-gap: calc(28px - var(--p, 0) * 16px);
+      row-gap: calc(14px - var(--p, 0) * 14px);
     }
-    .sh-tag { color: var(--accent); font-weight: 700; }
+    .sh-tag {
+      color: var(--accent); font-weight: 700;
+      font-size: calc(11px - var(--p, 0) * 1.5px);
+    }
     h2.sh-title {
       font-family: "Inter", sans-serif;
-      font-size: clamp(18px, 2.1vw, 24px);
       font-weight: 700;
-      letter-spacing: -.015em;
       text-transform: none;
       color: var(--text);
-      margin: 0; line-height: 1.05;
+      margin: 0; line-height: 1.1;
+      /* interpolate 22 → 12 */
+      font-size: calc(22px - var(--p, 0) * 10px);
+      letter-spacing: calc(-0.015em + var(--p, 0) * 0.012em);
     }
-    .sh-meta { display: flex; gap: 18px; align-items: baseline; flex-wrap: nowrap; }
-    .sh-dur { color: var(--muted); letter-spacing: .12em; }
+    .sh-meta {
+      display: flex; align-items: baseline; flex-wrap: nowrap;
+      gap: calc(18px - var(--p, 0) * 8px);
+    }
+    .sh-dur {
+      color: var(--muted); letter-spacing: .12em;
+      font-size: calc(11px - var(--p, 0) * 1.5px);
+    }
+    .pill {
+      padding: calc(3px - var(--p, 0) * 1px) calc(8px - var(--p, 0) * 2px) calc(2px - var(--p, 0) * 1px);
+      font-size: calc(10.5px - var(--p, 0) * 1.5px);
+    }
     @media (max-width: 900px) {
-      .sh-inner { grid-template-columns: 1fr; gap: 6px; padding: 12px 20px; }
-      .sh-meta { flex-wrap: wrap; gap: 12px; }
+      .sh-inner {
+        grid-template-columns: 1fr;
+        padding: calc(12px - var(--p, 0) * 6px) 20px;
+      }
+      .sh-meta { flex-wrap: wrap; gap: calc(12px - var(--p, 0) * 6px); }
+      h2.sh-title { font-size: calc(18px - var(--p, 0) * 6px); }
     }
 
     /* ============ Asset-path subway map (inside sticky-head) ============ */
     .sh-flow {
       grid-column: 1 / -1;
-      list-style: none; margin: 18px 0 2px; padding: 18px 0 2px;
+      list-style: none;
+      margin-top: calc(18px - var(--p, 0) * 18px);
+      margin-bottom: 0;
+      padding-top: calc(18px - var(--p, 0) * 18px);
+      padding-bottom: calc(28px - var(--p, 0) * 28px);
       border-top: 1px dashed var(--border);
+      border-top-width: calc(1px - var(--p, 0) * 1px);
       display: flex; align-items: flex-start; justify-content: space-between;
       position: relative;
       font-family: var(--mono);
       font-variant-numeric: tabular-nums;
       gap: 0;
       overflow-x: auto;
+      overflow-y: hidden;
       scrollbar-width: thin;
-    }
-    @media (max-width: 900px) {
-      .sh-flow { padding-bottom: 6px; }
+      /* cross-fade: opacity + max-height collapse driven by scroll */
+      opacity: calc(1 - var(--p, 0));
+      max-height: calc(140px - var(--p, 0) * 140px);
+      pointer-events: auto;
     }
 
     .stop {
@@ -470,9 +503,9 @@
     .edge {
       flex: 1 1 0;
       position: relative;
-      min-width: 22px;
+      min-width: 60px;
       height: 2px;
-      margin: 22px 4px 0;
+      margin: 22px 4px 18px;
       background: linear-gradient(90deg, var(--border), var(--muted-2) 50%, var(--border));
       align-self: flex-start;
     }
@@ -496,6 +529,33 @@
       top: 100%;
       width: 1px; height: 6px;
       background: var(--accent);
+    }
+    /* elapsed-time chip — rendered in a dedicated band BELOW the station names */
+    .edge[data-dt]::after {
+      content: attr(data-dt);
+      position: absolute;
+      left: 50%; top: 48px;       /* well below the name row (stop height ~44-48px) */
+      transform: translateX(-50%);
+      white-space: nowrap;
+      font-family: var(--mono);
+      font-size: 9px; font-weight: 500; letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+      padding: 3px 7px;
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+    }
+    .edge[data-dt][data-dt-emph]::after {
+      color: var(--text); font-weight: 700;
+      border-color: var(--text);
+    }
+    /* user-initiated action (user signs / sends a tx) */
+    .edge[data-dt][data-dt-user]::after {
+      color: var(--accent-deep); font-weight: 700;
+      border-color: var(--accent);
+      background: var(--accent-tint);
     }
 
     h2 {
@@ -737,6 +797,7 @@
 
     <!-- ================= DEPOSIT ================= -->
     <section class="report" id="deposit">
+      <div class="sticky-sentinel" aria-hidden="true"></div>
       <header class="sticky-head">
         <div class="sh-inner">
           <span class="sh-tag">§01 · L1→L2 Deposit</span>
@@ -747,17 +808,17 @@
           </span>
           <ol class="sh-flow" aria-label="Asset path">
             <li class="stop src"><span class="n">01</span><span class="mark"></span><span class="name">Sepolia</span></li>
-            <li class="edge"><span class="via">deposit</span></li>
+            <li class="edge" data-dt="≈13 m · ETH finality" data-dt-emph><span class="via">deposit</span></li>
             <li class="stop"><span class="n">02</span><span class="mark"></span><span class="name">AggLayer</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="≈1 m"></li>
             <li class="stop"><span class="n">03</span><span class="mark"></span><span class="name">AggKit</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="≈1 m"></li>
             <li class="stop"><span class="n">04</span><span class="mark"></span><span class="name">miden-agglayer</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="≈30 s · submit"></li>
             <li class="stop"><span class="n">05</span><span class="mark"></span><span class="name">Miden Node</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="≈5 s · 1 block"></li>
             <li class="stop"><span class="n">06</span><span class="mark"></span><span class="name">Claim Note</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="user · ≈2 m observed" data-dt-user></li>
             <li class="stop sink"><span class="n">07</span><span class="mark"></span><span class="name">P2ID Note</span></li>
           </ol>
         </div>
@@ -839,6 +900,7 @@
 
     <!-- ================= WITHDRAWAL ================= -->
     <section class="report" id="withdraw">
+      <div class="sticky-sentinel" aria-hidden="true"></div>
       <header class="sticky-head">
         <div class="sh-inner">
           <span class="sh-tag">§02 · L2→L1 Bridge-out</span>
@@ -849,13 +911,13 @@
           </span>
           <ol class="sh-flow" aria-label="Asset path">
             <li class="stop src"><span class="n">01</span><span class="mark"></span><span class="name">B2AGG Note</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="user · &lt;30 s" data-dt-user></li>
             <li class="stop"><span class="n">02</span><span class="mark"></span><span class="name">miden-agglayer</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="≈17 m · aggsender epoch" data-dt-emph></li>
             <li class="stop"><span class="n">03</span><span class="mark"></span><span class="name">Aggsender</span></li>
-            <li class="edge"><span class="via">cert · LER</span></li>
+            <li class="edge" data-dt="1 h 13 m · incl. retry" data-dt-emph><span class="via">cert · LER</span></li>
             <li class="stop"><span class="n">04</span><span class="mark"></span><span class="name">AggLayer</span></li>
-            <li class="edge"></li>
+            <li class="edge" data-dt="user · ≈13 m · claimAsset" data-dt-user></li>
             <li class="stop sink"><span class="n">05</span><span class="mark"></span><span class="name">Sepolia</span></li>
           </ol>
         </div>
@@ -1085,6 +1147,33 @@
       });
     };
     document.querySelectorAll('.card, .toc a').forEach(track);
+
+    // Scroll-driven cross-fade: each sticky-head receives a --p value in
+    // [0..1] based on how far its section has scrolled past the viewport
+    // top, so CSS interpolates the header from full (subway map + large
+    // title) to compact (single slim bar) without any jump.
+    const heads = Array.from(document.querySelectorAll('.sticky-head'));
+    const sections = heads.map(h => h.closest('section.report'));
+    const FADE_PX = 120; // pixels of scroll over which the cross-fade happens
+    let rafPending = false;
+    const updateStickyProgress = () => {
+      rafPending = false;
+      for (let i = 0; i < heads.length; i++) {
+        const rect = sections[i].getBoundingClientRect();
+        const scrolled = Math.max(0, -rect.top);
+        const p = Math.max(0, Math.min(1, scrolled / FADE_PX));
+        heads[i].style.setProperty('--p', p.toFixed(3));
+      }
+    };
+    const onStickyScroll = () => {
+      if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(updateStickyProgress);
+      }
+    };
+    document.addEventListener('scroll', onStickyScroll, { passive: true });
+    window.addEventListener('resize', onStickyScroll, { passive: true });
+    updateStickyProgress();
   </script>
 </body>
 </html>
