@@ -403,18 +403,31 @@ pub async fn publish_claim(
         rt.block_on(async {
             use ::miden_client::DebugMode;
             use ::miden_client::builder::ClientBuilder;
-            use ::miden_client::rpc::Endpoint;
             use ::miden_client_sqlite_store::ClientBuilderSqliteExt;
 
-            let ep = Endpoint::try_from(node_url.as_str())
-                .map_err(|e| anyhow::anyhow!("invalid node URL: {e}"))?;
+            // Resolve via the same helper `MidenClient::new` uses, so shortcut
+            // strings ("devnet" / "testnet") map to the same Endpoint across both
+            // code paths. See RD-856 — an asymmetric URL parse was how the fresh
+            // client ended up dialing the wrong hostname in the first place.
+            let ep = crate::miden_client::parse_node_url(&node_url)
+                .map_err(|e| anyhow::anyhow!("invalid node URL {node_url}: {e}"))?;
+            tracing::info!(
+                node_url = %node_url,
+                resolved = %ep,
+                "publish_claim: building fresh Miden client to dial node"
+            );
             let mut client = ClientBuilder::new()
                 .grpc_client(&ep, Some(10_000))
                 .sqlite_store(store_path)
                 .authenticator(keystore)
                 .in_debug_mode(DebugMode::Enabled)
                 .build()
-                .await?;
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "publish_claim: failed to build Miden client for {node_url}: {e}"
+                    )
+                })?;
             client.sync_state().await?;
 
             let value = publish_claim_internal(
