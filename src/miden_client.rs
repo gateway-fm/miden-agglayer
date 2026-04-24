@@ -46,6 +46,23 @@ pub trait SyncListener: Send + Sync {
     }
 }
 
+/// Shared node-URL resolver used by both the persistent `MidenClient` (background sync,
+/// GER injection) and the fresh-client path in `src/claim.rs::publish_claim`. Both code
+/// paths must dial the same node — funneling through this single function guarantees the
+/// shortcut strings (`"devnet"`, `"testnet"`) resolve identically, not just raw URLs.
+///
+/// Without this shared helper the two paths drifted: `MidenClient::new` used to resolve
+/// `"testnet"` to `https://rpc.testnet.miden.io` while `publish_claim` passed the literal
+/// string straight to `Endpoint::try_from`, which either fails or produces a wrong URL.
+/// See RD-856 for the diagnosis.
+pub fn parse_node_url(node_url: &str) -> anyhow::Result<Endpoint> {
+    match node_url {
+        "devnet" => Ok(Endpoint::devnet()),
+        "testnet" => Ok(Endpoint::testnet()),
+        _ => Endpoint::try_from(node_url).map_err(|err| anyhow!(err)),
+    }
+}
+
 pub struct MidenClient {
     keystore: Arc<FilesystemKeyStore>,
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
@@ -196,14 +213,7 @@ impl MidenClient {
     }
 
     fn parse_node_url(node_url: String) -> anyhow::Result<Endpoint> {
-        match node_url.as_str() {
-            "devnet" => Ok(Endpoint::devnet()),
-            "testnet" => Ok(Endpoint::testnet()),
-            _ => {
-                let endpoint = Endpoint::try_from(node_url.as_str());
-                endpoint.map_err(|err| anyhow!(err))
-            }
-        }
+        parse_node_url(&node_url)
     }
 
     fn create_keystore(store_dir: PathBuf) -> anyhow::Result<Arc<FilesystemKeyStore>> {

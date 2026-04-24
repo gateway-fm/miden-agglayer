@@ -233,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
 
     let client = MidenClient::new(
         miden_store_dir.clone(),
-        command.miden_node,
+        command.miden_node.clone(),
         sync_listeners,
         command.miden_debug,
     )?;
@@ -267,9 +267,21 @@ async fn main() -> anyhow::Result<()> {
     state.l1_rpc_url = command.l1_rpc_url;
     state.ger_l1_address = command.ger_l1_address;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
-    // miden_node was moved into MidenClient::new, re-read from env
-    state.miden_node_url =
-        std::env::var("MIDEN_NODE_URL").unwrap_or_else(|_| "http://miden-node:57291".to_string());
+    // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
+    // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.
+    // This used to read an independent `MIDEN_NODE_URL` env var with a `http://miden-node:57291`
+    // fallback; when the env var wasn't set by the deployment, fresh-client builds
+    // unconditionally failed with `dns error: Name or service not known` on the fallback
+    // hostname, while the persistent sync loop (which reads `command.miden_node`) kept
+    // working fine. Claims silently never landed. See RD-856.
+    state.miden_node_url = command
+        .miden_node
+        .clone()
+        .unwrap_or_else(|| "http://localhost:57291".to_string());
+    tracing::info!(
+        miden_node_url = %state.miden_node_url,
+        "fresh-client `publish_claim` path will dial this Miden node URL"
+    );
 
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()

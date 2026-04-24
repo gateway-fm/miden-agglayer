@@ -19,7 +19,6 @@ use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;
-use miden_client::rpc::Endpoint;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
@@ -109,9 +108,12 @@ async fn main() -> anyhow::Result<()> {
         std::fs::set_permissions(&keystore_path, perms)?;
     }
 
-    // Parse node endpoint
-    let node_endpoint =
-        Endpoint::try_from(args.node_url.as_str()).map_err(|e| anyhow!("invalid node URL: {e}"))?;
+    // Parse node endpoint via the shared resolver so the `devnet` / `testnet` shortcuts
+    // work the same way they do for the main service. Using `Endpoint::try_from` directly
+    // would silently reject those shortcuts (the same asymmetry that caused RD-856 on the
+    // fresh-client path in `src/claim.rs::publish_claim`).
+    let node_endpoint = miden_agglayer_service::miden_client::parse_node_url(&args.node_url)
+        .map_err(|e| anyhow!("invalid node URL {}: {e}", args.node_url))?;
 
     let mode = if args.miden_debug {
         DebugMode::Enabled
