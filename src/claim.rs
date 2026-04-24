@@ -155,12 +155,6 @@ fn scale_claim_amount(
     amount: &EthAmount,
     faucet: Faucet,
 ) -> Result<miden_protocol::Felt, anyhow::Error> {
-    // `find_or_create_faucet` enforces `origin_token_decimals >= decimals` when it
-    // creates a new faucet, but the same struct also gets rebuilt from stored
-    // `FaucetEntry` rows (store lookup path, operator-seeded rows, Postgres
-    // migrations). Don't panic if an existing row violates the invariant: return
-    // a clean error so `publish_claim` surfaces it to aggkit instead of aborting
-    // the `spawn_blocking` worker.
     let scale_byte = faucet
         .origin_token_decimals
         .checked_sub(faucet.decimals)
@@ -594,9 +588,6 @@ mod tests {
         assert_eq!(nodes.len(), 32);
     }
 
-    // Regression coverage for 0xMiden/protocol#2804: the scaling path must not
-    // impose an exact-divisibility rule or a u32 ceiling. Only the protocol-level
-    // FungibleAsset::MAX_AMOUNT cap applies.
     mod scale_claim_amount {
         use super::*;
         use alloy::primitives::U256;
@@ -620,8 +611,6 @@ mod tests {
 
         #[test]
         fn accepts_amount_above_old_u32_ceiling() {
-            // 43 * 10^18 wei previously failed with AmountError::Overflow
-            // (u32::MAX / 10^8 ≈ 42.949 whole tokens).
             let wei = U256::from(43u64).mul(U256::from(10u64).pow(U256::from(18u64)));
             let amount = scale_claim_amount(&eth_amount(wei), faucet(18, 8)).unwrap();
             assert_eq!(amount, Felt::try_from(4_300_000_000u64).unwrap());
@@ -629,8 +618,6 @@ mod tests {
 
         #[test]
         fn truncates_sub_unit_wei_remainder() {
-            // 42 * 10^18 + 1 wei previously failed with AmountError::LossyTruncation.
-            // We now silently floor; the full value is still preserved in leaf_data.amount.
             let wei = U256::from(42u64)
                 .mul(U256::from(10u64).pow(U256::from(18u64)))
                 .add(U256::from(1u64));
@@ -640,9 +627,6 @@ mod tests {
 
         #[test]
         fn rejects_amount_above_max_fungible_asset() {
-            // U256::MAX scaled by 10^10 still vastly exceeds FungibleAsset::MAX_AMOUNT,
-            // so the protocol-level ceiling kicks in (via EthAmount scaling). The error
-            // surfaces through the anyhow wrap in scale_claim_amount.
             let err = scale_claim_amount(&eth_amount(U256::MAX), faucet(18, 8)).unwrap_err();
             let msg = format!("{err}");
             assert!(
@@ -653,7 +637,6 @@ mod tests {
 
         #[test]
         fn passes_through_when_decimals_match() {
-            // 6-decimal USDC with miden_decimals=6 → scale exponent 0, identity scaling.
             let wei = U256::from(1_234_567u64);
             let amount = scale_claim_amount(&eth_amount(wei), faucet(6, 6)).unwrap();
             assert_eq!(amount, Felt::try_from(1_234_567u64).unwrap());
@@ -661,10 +644,6 @@ mod tests {
 
         #[test]
         fn rejects_faucet_with_inverted_decimals() {
-            // Store lookups skip the `origin_decimals >= miden_decimals` check that
-            // `find_or_create_faucet` runs for new faucets, so a corrupt or manually
-            // seeded FaucetEntry could produce an inverted layout. scale_claim_amount
-            // must return an error rather than panicking on the underflow.
             let err = scale_claim_amount(&eth_amount(U256::from(1u64)), faucet(6, 8)).unwrap_err();
             let msg = format!("{err}");
             assert!(
