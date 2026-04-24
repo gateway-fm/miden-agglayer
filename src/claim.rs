@@ -155,12 +155,25 @@ fn scale_claim_amount(
     amount: &EthAmount,
     faucet: Faucet,
 ) -> Result<miden_protocol::Felt, anyhow::Error> {
-    let scale = u32::from(
-        faucet
-            .origin_token_decimals
-            .checked_sub(faucet.decimals)
-            .expect("find_or_create_faucet enforces origin_token_decimals >= decimals"),
-    );
+    // `find_or_create_faucet` enforces `origin_token_decimals >= decimals` when it
+    // creates a new faucet, but the same struct also gets rebuilt from stored
+    // `FaucetEntry` rows (store lookup path, operator-seeded rows, Postgres
+    // migrations). Don't panic if an existing row violates the invariant: return
+    // a clean error so `publish_claim` surfaces it to aggkit instead of aborting
+    // the `spawn_blocking` worker.
+    let scale_byte = faucet
+        .origin_token_decimals
+        .checked_sub(faucet.decimals)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "faucet {} has miden_decimals ({}) > origin_token_decimals ({}); \
+                 invariant violated, refusing to compute scale",
+                faucet.id,
+                faucet.decimals,
+                faucet.origin_token_decimals,
+            )
+        })?;
+    let scale = u32::from(scale_byte);
     amount
         .scale_to_token_amount(scale)
         .map_err(|e| anyhow::anyhow!("claim amount is not representable on Miden: {e}"))
@@ -631,6 +644,20 @@ mod tests {
             let wei = U256::from(1_234_567u64);
             let amount = scale_claim_amount(&eth_amount(wei), faucet(6, 6)).unwrap();
             assert_eq!(amount, Felt::try_from(1_234_567u64).unwrap());
+        }
+
+        #[test]
+        fn rejects_faucet_with_inverted_decimals() {
+            // Store lookups skip the `origin_decimals >= miden_decimals` check that
+            // `find_or_create_faucet` runs for new faucets, so a corrupt or manually
+            // seeded FaucetEntry could produce an inverted layout. scale_claim_amount
+            // must return an error rather than panicking on the underflow.
+            let err = scale_claim_amount(&eth_amount(U256::from(1u64)), faucet(6, 8)).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("invariant violated"),
+                "unexpected error: {msg}"
+            );
         }
     }
 }
