@@ -155,6 +155,72 @@ async fn handle_claim_asset(
         return Ok(txn_hash);
     }
 
+    // RD-860 — swallow unresolvable-destination claims permanently. If the
+    // destination address can't be resolved to a Miden AccountId, record the
+    // unclaimable entry, emit the synthetic ClaimEvent so aggkit marks the
+    // globalIndex complete and stops retrying, and return success to the
+    // caller. Funds remain locked on L1; an operator rescue endpoint (tier 2,
+    // future work) would let ops re-process by registering a destination
+    // mapping and replaying.
+    //
+    // Ordering: this check runs BEFORE C6's GER pre-check because the
+    // unresolvable-destination state is permanent (no amount of GER
+    // propagation will change it), whereas a missing GER is transient. Doing
+    // RD-860 first means aggkit gets a single decisive swallow instead of
+    // grinding through GER-not-seen retries before eventually hitting the
+    // same swallow.
+    if let Err(err) = crate::address_mapper::resolve_address(
+        &*service.store,
+        params.destinationAddress,
+        &service.accounts.0,
+    )
+    .await
+    {
+        ::metrics::counter!(
+            "claim_unclaimable_total",
+            "reason" => crate::store::UnclaimableReason::UnresolvableDestination.as_str()
+        )
+        .increment(1);
+        let newly_recorded = service
+            .store
+            .record_unclaimable_claim(crate::store::UnclaimableClaim {
+                global_index: params.globalIndex,
+                destination_address: params.destinationAddress,
+                origin_network: params.originNetwork,
+                origin_address: params.originTokenAddress,
+                amount: params.amount,
+                reason: crate::store::UnclaimableReason::UnresolvableDestination,
+                eth_tx_hash: txn_hash,
+            })
+            .await?;
+        tracing::warn!(
+            global_index = %params.globalIndex,
+            destination = %params.destinationAddress,
+            origin_network = params.originNetwork,
+            origin_address = %params.originTokenAddress,
+            amount = %params.amount,
+            eth_tx = %txn_hash,
+            newly_recorded,
+            err = %err,
+            "claim: unresolvable destination — short-circuiting so aggkit stops retrying. \
+             Funds remain on L1 pending operator rescue (RD-860)."
+        );
+
+        // Emit the synthetic ClaimEvent even though no Miden funds moved. aggkit expects
+        // the event log on the eth tx receipt to mark the globalIndex claimed; without
+        // it, aggkit will retry forever. The unclaimable_claims table is the SOURCE OF
+        // TRUTH for reconciliation — anyone auditing flows MUST compare ClaimEvent
+        // counts against `unclaimable_claims` to see how many funds are truly on L1.
+        let event = crate::claim::ClaimEvent::from(params.clone());
+        let log = <crate::claim::ClaimEvent as alloy::sol_types::SolEvent>::encode_log_data(&event);
+        record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![log]).await?;
+        service
+            .store
+            .nonce_increment(&format!("{signer:#x}"))
+            .await?;
+        return Ok(txn_hash);
+    }
+
     // C6 — gate on `has_seen_ger` BEFORE acquiring the claim lock.
     //
     // The CLAIM note's leaf proof is internally consistent (built from L1
@@ -689,7 +755,12 @@ mod tests {
             originNetwork: 0,
             originTokenAddress: Address::ZERO,
             destinationNetwork: 1,
-            destinationAddress: Address::from([0x42; 20]),
+            // Zero-padded MidenAccountId — resolvable, so RD-860's
+            // unresolvable-destination short-circuit doesn't pre-empt the C6
+            // GER pre-check we're testing here.
+            destinationAddress: alloy::primitives::address!(
+                "0x000000003d7c9747558851900f8206226dfbea00"
+            ),
             amount: U256::from(1_000u64),
             metadata: Default::default(),
         }
@@ -716,6 +787,10 @@ mod tests {
         let miden_client = service.miden_client.clone();
 
         let global_index = U256::from(42u64);
+        // Zero-padded resolvable destination (see address_mapper::account_id_from_address
+        // test vectors). This ensures the claim gets PAST the RD-860 short-circuit and
+        // fails inside publish_claim against the test MidenClient stub — exercising the
+        // "ClaimEvent not emitted on publish_claim error" guarantee this test is for.
         let calldata = claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
@@ -725,7 +800,9 @@ mod tests {
             originNetwork: 0,
             originTokenAddress: Address::ZERO,
             destinationNetwork: 1,
-            destinationAddress: Address::from([0x42; 20]),
+            destinationAddress: alloy::primitives::address!(
+                "0x000000003d7c9747558851900f8206226dfbea00"
+            ),
             amount: U256::from(1_000_000u64),
             metadata: Default::default(),
         }
@@ -779,6 +856,94 @@ mod tests {
             !store.is_claimed(&global_index).await.unwrap(),
             "claim should be unclaimed after publish_claim failure"
         );
+    }
+
+    /// RD-860: a claim whose destination cannot be resolved is swallowed — we record
+    /// it in the `unclaimable_claims` store, emit a synthetic `ClaimEvent` so aggkit
+    /// stops retrying, and return success to the caller. Neither `try_claim` nor the
+    /// MidenClient publish path should be touched.
+    #[tokio::test]
+    async fn test_claim_asset_unresolvable_destination_swallowed() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let miden_client = service.miden_client.clone();
+
+        let global_index = U256::from(123u64);
+        // Non-zero-padded address with no store mapping — cannot be resolved by
+        // `address_mapper::resolve_address`, so the short-circuit path fires.
+        let dest = Address::from([0x42; 20]);
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: global_index,
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 7,
+            originTokenAddress: Address::from([0x11; 20]),
+            destinationNetwork: 1,
+            destinationAddress: dest,
+            amount: U256::from(1_000_000u64),
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+
+        let result = service_send_raw_txn(service, input_hex).await;
+        assert!(result.is_ok(), "swallow path must return Ok: {result:?}");
+        let tx_hash = result.unwrap();
+
+        // (1) globalIndex is NOT locked — short-circuit happened before try_claim.
+        assert!(
+            !store.is_claimed(&global_index).await.unwrap(),
+            "short-circuit must not lock globalIndex"
+        );
+
+        // (2) MidenClient was never invoked — publish_claim did not run.
+        assert!(
+            !miden_client.test_was_called(),
+            "MidenClient must not be invoked for an unresolvable destination"
+        );
+
+        // (3) unclaimable_claims record exists with the right fields.
+        let rec = store
+            .get_unclaimable_claim(&global_index)
+            .await
+            .unwrap()
+            .expect("unclaimable record must be present");
+        assert_eq!(rec.global_index, global_index);
+        assert_eq!(rec.destination_address, dest);
+        assert_eq!(rec.origin_network, 7);
+        assert_eq!(rec.origin_address, Address::from([0x11; 20]));
+        assert_eq!(rec.amount, U256::from(1_000_000u64));
+        assert_eq!(
+            rec.reason,
+            crate::store::UnclaimableReason::UnresolvableDestination
+        );
+        assert_eq!(rec.eth_tx_hash, tx_hash);
+
+        // (4) Exactly one synthetic ClaimEvent emitted (so aggkit marks done).
+        let filter = crate::log_synthesis::LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xFFFF".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xFFFF).await.unwrap();
+        let claim_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| {
+                l.topics.first().map(|t| t.as_str())
+                    == Some(crate::log_synthesis::CLAIM_EVENT_TOPIC)
+            })
+            .collect();
+        assert_eq!(
+            claim_logs.len(),
+            1,
+            "swallow path must emit exactly one ClaimEvent so aggkit stops retrying"
+        );
+
+        // (5) Nonce incremented and receipt recorded so the RPC client sees success.
+        assert_eq!(store.nonce_get(&format!("{signer:#x}")).await.unwrap(), 1);
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_some());
     }
 
     #[tokio::test]

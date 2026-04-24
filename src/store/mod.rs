@@ -50,6 +50,38 @@ pub struct TxnEntry {
     pub logs: Vec<LogData>,
 }
 
+/// Record of a claim we dropped because the destination could not be resolved to a
+/// Miden AccountId. See RD-860: storing these lets operators inspect the backlog and
+/// audit what happened to a user's funds when support asks about a specific deposit.
+#[derive(Debug, Clone)]
+pub struct UnclaimableClaim {
+    pub global_index: U256,
+    pub destination_address: Address,
+    pub origin_network: u32,
+    pub origin_address: Address,
+    pub amount: U256,
+    pub reason: UnclaimableReason,
+    pub eth_tx_hash: TxHash,
+}
+
+/// Why a claim was dropped. Currently only one variant; kept as an enum so we can
+/// extend it without touching the schema (the textual `reason` column carries the
+/// variant name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnclaimableReason {
+    /// `address_mapper::resolve_address` returned an error — the destination is neither
+    /// hardhat, store-registered, nor a zero-padded MidenAccountId.
+    UnresolvableDestination,
+}
+
+impl UnclaimableReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnresolvableDestination => "unresolvable_destination",
+        }
+    }
+}
+
 /// Full transaction data returned from the store.
 #[derive(Debug, Clone)]
 pub struct TxnData {
@@ -206,6 +238,21 @@ pub trait Store: Send + Sync + 'static {
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()>;
     async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()>;
     async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool>;
+
+    /// Record a claim we refused to process because its destination could not be
+    /// resolved. Idempotent by `global_index` — duplicate retries from aggkit must not
+    /// error or duplicate rows; the first record wins. Returns `true` if this was a new
+    /// insert (not a duplicate).
+    ///
+    /// See [RD-860] and `src/service_send_raw_txn::handle_claim_asset` for the
+    /// short-circuit path that calls this.
+    async fn record_unclaimable_claim(&self, entry: UnclaimableClaim) -> anyhow::Result<bool>;
+
+    /// Look up an unclaimable record by `global_index`. `None` if not dropped.
+    async fn get_unclaimable_claim(
+        &self,
+        global_index: &U256,
+    ) -> anyhow::Result<Option<UnclaimableClaim>>;
 
     // === Address mappings ===
     async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>>;
