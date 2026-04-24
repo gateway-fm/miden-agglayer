@@ -188,6 +188,7 @@ L1 claim:      <manual — see step 8>
 
 ## Known unknowns / first-run caveats
 
+- **aggsender dependency (blocking end-to-end)**: The L1-side settlement of a bridge-out relies on Ivan's `aggsender` + downstream bridge-service being live on this deployment. As of 2026-04-24 that isn't up. Running the skill **will** produce useful partial output (steps 1–7: the B2AGG submission on Miden + the synthetic `BridgeEvent` in the agglayer Loki stream), but step 8 (the `claimAsset` on Sepolia) cannot complete until aggsender is deployed. Hold on running end-to-end until Ivan confirms aggsender is up.
 - **Bridge account discovery**: Igor's pod has `/var/lib/miden-agglayer-service/bridge_accounts.toml`. No public endpoint exposes it. Skill blocks on `MIDEN_BRIDGE_ID` until you ask.
 - **B2AGG consumption**: The bridge account itself doesn't auto-consume B2AGG notes. Consumption is driven by the NTX (network tx) builder running inside miden-node. If the testnet node isn't running the NTX-enabled image, the note will sit unconsumed and the `BridgeOutScanner` will never see a consumption to emit against.
 - **Scanner tick vs submission timing**: the scanner's `on_post_sync` hook fires every sync cycle (default ~30s). Don't panic before 2× that.
