@@ -188,7 +188,10 @@ services:
 
   # ── AggKit (aggoracle + aggsender) ─────────────────────────────────────────
   aggkit:
-    image: ghcr.io/agglayer/aggkit:0.8.3-rc1
+    # Locally-built patched aggkit with UseUpdateExitRoot support (RD-862).
+    # See /Users/max/github/work/gateway/miden/aggkit branch rd-862/update-exit-root-mode.
+    # TODO: once the patch is upstreamed to agglayer/aggkit, switch back to a tagged image.
+    image: miden-agglayer/aggkit:rd-862
     restart: on-failure
     command: ["run", "--cfg=/etc/aggkit/config.toml", "--components=aggoracle,aggsender"]
     ports:

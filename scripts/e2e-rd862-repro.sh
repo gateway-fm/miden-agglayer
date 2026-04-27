@@ -41,9 +41,9 @@ FIXTURES_DIR="$PROJECT_DIR/fixtures"
 # shellcheck source=/dev/null
 source "$FIXTURES_DIR/.env"
 
-L1_RPC="${L1_RPC:-http://localhost:8545}"
-L2_RPC="${L2_RPC:-http://localhost:8546}"
-BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"
+L1_RPC="http://localhost:8545"
+L2_RPC="http://localhost:8546"
+BRIDGE_SERVICE_URL="http://localhost:18080"
 
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
 AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
@@ -92,7 +92,7 @@ FAUCET_ID=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
 
 WALLET_HEX=$(docker exec "$AGGLAYER_CONTAINER" bridge-out-tool \
     --store-dir /var/lib/miden-agglayer-service \
-    --node-url "${MIDEN_NODE_URL:-http://miden-node:57291}" \
+    --node-url http://miden-node:57291 \
     --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
     --amount 1 --dest-address 0xdead --dest-network 0 2>&1 \
     | grep "wallet:" | awk '{print $NF}' || true)
