@@ -1,5 +1,4 @@
 use crate::accounts_config::AccountsConfig;
-use crate::amount::validate_amount;
 use crate::faucet_ops;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::{FaucetEntry, Store};
@@ -10,7 +9,6 @@ use miden_base_agglayer::{
     ProofData, SmtNode,
 };
 use miden_client::transaction::TransactionRequestBuilder;
-use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::note::Note;
@@ -150,6 +148,31 @@ fn bytes32_array_to_smt_nodes(values: [FixedBytes<32>; 32]) -> [SmtNode; 32] {
     values.map(|v| SmtNode::new(v.0))
 }
 
+/// Scales an L1 deposit amount into a Miden fungible-token amount using the faucet's
+/// decimal layout. Sub-unit wei are truncated (the full value is still preserved in
+/// `leaf_data.amount`); the only hard failure is exceeding `FungibleAsset::MAX_AMOUNT`.
+fn scale_claim_amount(
+    amount: &EthAmount,
+    faucet: Faucet,
+) -> Result<miden_protocol::Felt, anyhow::Error> {
+    let scale_byte = faucet
+        .origin_token_decimals
+        .checked_sub(faucet.decimals)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "faucet {} has miden_decimals ({}) > origin_token_decimals ({}); \
+                 invariant violated, refusing to compute scale",
+                faucet.id,
+                faucet.decimals,
+                faucet.origin_token_decimals,
+            )
+        })?;
+    let scale = u32::from(scale_byte);
+    amount
+        .scale_to_token_amount(scale)
+        .map_err(|e| anyhow::anyhow!("claim amount is not representable on Miden: {e}"))
+}
+
 async fn create_claim(
     params: claimAssetCall,
     faucet: Faucet,
@@ -161,8 +184,6 @@ async fn create_claim(
 
     let _dest_account =
         crate::address_mapper::resolve_address(store, params.destinationAddress, accounts).await?;
-
-    let amount = validate_amount(params.amount, faucet.origin_token_decimals, faucet.decimals)?;
 
     let proof_data = ProofData {
         smt_proof_local_exit_root: bytes32_array_to_smt_nodes(params.smtProofLocalExitRoot),
@@ -181,11 +202,11 @@ async fn create_claim(
         metadata_hash: MetadataHash::from_abi_encoded(params.metadata.as_ref()),
     };
 
-    let _ = faucet; // retained for amount-scaling metadata; not used to target the note now.
+    let miden_claim_amount = scale_claim_amount(&leaf_data.amount, faucet)?;
     let storage = ClaimNoteStorage {
         proof_data,
         leaf_data,
-        miden_claim_amount: Felt::from(amount),
+        miden_claim_amount,
     };
 
     // CLAIM notes now target the bridge account (0.14.x). The bridge validates the proof and
@@ -565,5 +586,70 @@ mod tests {
         let nodes = bytes32_array_to_smt_nodes(values);
         // Verify we get back 32 nodes (basic structural check)
         assert_eq!(nodes.len(), 32);
+    }
+
+    mod scale_claim_amount {
+        use super::*;
+        use alloy::primitives::U256;
+        use miden_protocol::Felt;
+        use miden_protocol::account::AccountId;
+        use std::ops::{Add, Mul};
+
+        const DUMMY_ACCOUNT_HEX: &str = "0x3d7c9747558851900f8206226dfbea";
+
+        fn faucet(origin_decimals: u8, miden_decimals: u8) -> Faucet {
+            Faucet {
+                id: AccountId::from_hex(DUMMY_ACCOUNT_HEX).unwrap(),
+                decimals: miden_decimals,
+                origin_token_decimals: origin_decimals,
+            }
+        }
+
+        fn eth_amount(wei: U256) -> EthAmount {
+            EthAmount::new(wei.to_be_bytes::<32>())
+        }
+
+        #[test]
+        fn accepts_amount_above_old_u32_ceiling() {
+            let wei = U256::from(43u64).mul(U256::from(10u64).pow(U256::from(18u64)));
+            let amount = scale_claim_amount(&eth_amount(wei), faucet(18, 8)).unwrap();
+            assert_eq!(amount, Felt::try_from(4_300_000_000u64).unwrap());
+        }
+
+        #[test]
+        fn truncates_sub_unit_wei_remainder() {
+            let wei = U256::from(42u64)
+                .mul(U256::from(10u64).pow(U256::from(18u64)))
+                .add(U256::from(1u64));
+            let amount = scale_claim_amount(&eth_amount(wei), faucet(18, 8)).unwrap();
+            assert_eq!(amount, Felt::try_from(4_200_000_000u64).unwrap());
+        }
+
+        #[test]
+        fn rejects_amount_above_max_fungible_asset() {
+            let err = scale_claim_amount(&eth_amount(U256::MAX), faucet(18, 8)).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("claim amount is not representable on Miden"),
+                "unexpected error message: {msg}"
+            );
+        }
+
+        #[test]
+        fn passes_through_when_decimals_match() {
+            let wei = U256::from(1_234_567u64);
+            let amount = scale_claim_amount(&eth_amount(wei), faucet(6, 6)).unwrap();
+            assert_eq!(amount, Felt::try_from(1_234_567u64).unwrap());
+        }
+
+        #[test]
+        fn rejects_faucet_with_inverted_decimals() {
+            let err = scale_claim_amount(&eth_amount(U256::from(1u64)), faucet(6, 8)).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("invariant violated"),
+                "unexpected error: {msg}"
+            );
+        }
     }
 }
