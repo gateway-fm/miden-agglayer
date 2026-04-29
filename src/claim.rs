@@ -350,14 +350,32 @@ async fn publish_claim_internal(
     // Wait for the NTX builder to consume the UpdateGerNote on the bridge account.
     // The CLAIM note's FPI calls assert_valid_ger which checks the bridge account's
     // GER storage. If we submit the CLAIM before the GER is stored, it will fail.
-    // Typically the GER note is consumed within ~5s (2-3 blocks). We wait 5 cycles
-    // of 3s (15s total) which gives the NTX builder plenty of time while keeping
-    // the overall claim latency reasonable.
+    // Typically the GER note is consumed within ~5s (2-3 blocks). We wait up to 5
+    // cycles of 3s (15s total) which gives the NTX builder plenty of time.
+    //
+    // G6 — early-exit when aggkit already records the GER as injected. The
+    // `mark_ger_injected` flag is set when the proxy submits the GER inject
+    // tx; for any GER that's been through aggkit's own submit path within this
+    // process's lifetime, the bridge has already consumed it (or will within
+    // milliseconds). We still sync_state once to refresh, but skip the
+    // 4×3s = 12s of additional waiting in the common case.
+    let claim_ger = crate::ger::combined_ger(
+        &params.mainnetExitRoot.0,
+        &params.rollupExitRoot.0,
+    );
     tracing::info!("waiting for GER to propagate to bridge account before submitting CLAIM...");
     for i in 0..5 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         client.sync_state().await?;
         tracing::debug!(cycle = i, "GER propagation sync cycle");
+        if store.is_ger_injected(&claim_ger).await.unwrap_or(false) {
+            tracing::info!(
+                cycle = i,
+                "G6: GER recorded as injected by proxy — skipping remaining wait cycles"
+            );
+            ::metrics::counter!("rpc_claim_ger_wait_short_circuit_total").increment(1);
+            break;
+        }
     }
     tracing::info!("GER propagation wait complete, submitting CLAIM note");
 

@@ -96,4 +96,10 @@ pub fn init_metrics() {
          yet in `has_seen_ger` (C6). Caller should retry after the GER \
          is injected; the lock is NOT acquired so retries are cheap."
     );
+    describe_counter!(
+        "rpc_claim_ger_wait_short_circuit_total",
+        "Claim submission's GER-propagation wait exited early because \
+         the GER was already recorded as injected by the proxy (G6). \
+         Saves up to 12s per claim in the common case."
+    );
 }
