@@ -51,7 +51,12 @@ async fn handle_ger_result(
 ) -> anyhow::Result<()> {
     match result {
         Ok(ger_result) => {
-            service.store.mark_ger_injected(ger_bytes).await?;
+            // G4 — mark_ger_injected has moved to live INSIDE insert_ger,
+            // co-located with add_ger_update_event so a crash between them
+            // can't leave is_ger_injected returning false after the event
+            // has been logged. handle_ger_result no longer issues the
+            // mark separately.
+            let _ = ger_bytes; // kept for backward-compat; unused here.
             tracing::info!("inserted GER with eth txn: {txn_hash}");
             record_local_success_at_block(
                 service,

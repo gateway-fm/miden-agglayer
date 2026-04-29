@@ -182,7 +182,17 @@ pub async fn insert_ger(
         let block_hash = block_state.get_block_hash(block_number);
         let timestamp = block_state.get_block_timestamp(block_number);
 
-        // Miden submission succeeded — now record the event
+        // Miden submission succeeded — now record the event.
+        //
+        // G4 — call mark_ger_injected IMMEDIATELY after add_ger_update_event,
+        // not later from `handle_ger_result`. Pre-fix the two were in
+        // separate code paths: a process crash between them left
+        // `is_ger_injected` returning false even though the GER event
+        // had been logged. Operators querying `is_ger_injected` on
+        // restart would mistakenly retry the inject. Co-locating them
+        // narrows the window to a single store sequence (still not
+        // atomic — that's a Store-trait change — but no longer split
+        // across handler control flow).
         let tx_hash_str = format!("{txn_hash:#x}");
         store
             .add_ger_update_event(
@@ -195,6 +205,7 @@ pub async fn insert_ger(
                 timestamp,
             )
             .await?;
+        store.mark_ger_injected(ger_bytes).await?;
         store.set_latest_block_number(block_number).await?;
     } else {
         tracing::debug!(
