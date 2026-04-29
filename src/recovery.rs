@@ -74,6 +74,7 @@ pub fn unlock_miden_accounts(store_dir: &Path) -> Result<usize> {
     let conn =
         Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
     let mut total = 0;
+    let mut missing_tables = 0;
     for table in ["latest_account_headers", "historical_account_headers"] {
         let sql = format!("UPDATE {table} SET locked = 0 WHERE locked = 1");
         match conn.execute(&sql, []) {
@@ -90,11 +91,25 @@ pub fn unlock_miden_accounts(store_dir: &Path) -> Result<usize> {
                     "unlock_miden_accounts: skipping {table} (schema mismatch: {msg}); \
                      miden-client may have changed its schema"
                 );
+                missing_tables += 1;
             }
             Err(err) => {
                 return Err(err).with_context(|| format!("updating {table}"));
             }
         }
+    }
+    // C10 — fail loud if EVERY known table was missing. The previous
+    // implementation silently returned 0, masking a miden-client schema
+    // upgrade that would leave operators thinking the unlock succeeded
+    // when it actually no-op'd. Now we return Err so the operator knows
+    // surgical-unlock is no longer effective on this miden-client version
+    // and must use `--reset-miden-store` instead.
+    if missing_tables == 2 {
+        anyhow::bail!(
+            "unlock_miden_accounts: every known account-header table is missing — \
+             miden-client schema has changed. Use --reset-miden-store and re-sync \
+             from the node, or pin miden-client to a compatible version."
+        );
     }
     Ok(total)
 }
@@ -217,8 +232,15 @@ mod tests {
         assert_eq!(still_locked, 0);
     }
 
+    /// Self-review C10 — repro+regression. Pre-fix when EVERY known
+    /// account-header table was missing (full schema drift), the function
+    /// returned `Ok(0)` and the operator thought the surgical-unlock had
+    /// succeeded. The miden-client schema can change between releases and
+    /// the previous behaviour silently failed. Now the function fails
+    /// loud so operators see the schema mismatch and switch to
+    /// `--reset-miden-store`.
     #[test]
-    fn unlock_miden_accounts_survives_unknown_schema() {
+    fn c10_unlock_miden_accounts_fails_loud_on_total_schema_drift() {
         let dir = tempdir().unwrap();
         let db_path = sqlite_path(dir.path());
         let conn = Connection::open(&db_path).unwrap();
@@ -226,6 +248,34 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        assert_eq!(unlock_miden_accounts(dir.path()).unwrap(), 0);
+        let err = unlock_miden_accounts(dir.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("schema has changed"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("--reset-miden-store"),
+            "error must point operators at the recovery flag: {msg}"
+        );
+    }
+
+    /// One-table-missing partial drift still succeeds at clearing rows
+    /// in the surviving table (no false-positive C10 fail-loud).
+    #[test]
+    fn c10_unlock_miden_accounts_succeeds_with_partial_schema_drift() {
+        let dir = tempdir().unwrap();
+        let db_path = sqlite_path(dir.path());
+        let conn = Connection::open(&db_path).unwrap();
+        // Create only one of the two known tables, with a single locked row.
+        conn.execute_batch(
+            "CREATE TABLE latest_account_headers (id INTEGER, locked INTEGER);
+             INSERT INTO latest_account_headers VALUES (1, 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let n = unlock_miden_accounts(dir.path()).unwrap();
+        assert_eq!(n, 1, "should clear the row in the surviving table");
     }
 }
