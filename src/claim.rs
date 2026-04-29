@@ -273,11 +273,17 @@ async fn create_claim(
     accounts: &AccountsConfig,
     store: &dyn Store,
     rng: &mut impl FeltRng,
+    reject_zero_padding: bool,
 ) -> anyhow::Result<Note> {
     let sender = accounts.service.0;
 
-    let _dest_account =
-        crate::address_mapper::resolve_address(store, params.destinationAddress, accounts).await?;
+    let _dest_account = crate::address_mapper::resolve_address_with_policy(
+        store,
+        params.destinationAddress,
+        accounts,
+        reject_zero_padding,
+    )
+    .await?;
 
     let proof_data = build_canonical_proof_data(&params);
 
@@ -313,12 +319,14 @@ pub struct PublishClaimTxn {
     pub claim_note_id: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_claim_internal(
     params: claimAssetCall,
     client: &mut MidenClientLib,
     accounts: &AccountsConfig,
     store: &dyn Store,
     latest_block_num: BlockNumber,
+    reject_zero_padding: bool,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_or_create_faucet(
         params.originTokenAddress,
@@ -341,7 +349,15 @@ async fn publish_claim_internal(
         "creating CLAIM note"
     );
 
-    let claim_note = create_claim(params.clone(), faucet, accounts, store, client.rng()).await?;
+    let claim_note = create_claim(
+        params.clone(),
+        faucet,
+        accounts,
+        store,
+        client.rng(),
+        reject_zero_padding,
+    )
+    .await?;
     let claim_note_id = claim_note.id().to_string();
 
     const EXPIRATION_DELTA: u16 = 10;
@@ -461,6 +477,7 @@ pub async fn publish_claim(
     signer: alloy::primitives::Address,
     store_dir: std::path::PathBuf,
     node_url: String,
+    reject_zero_padding: bool,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
@@ -483,6 +500,7 @@ pub async fn publish_claim(
                         &accounts.0,
                         &*store,
                         latest_block_num,
+                        reject_zero_padding,
                     )
                     .await?;
                     let block_num = store.get_latest_block_number().await? + 1;
@@ -563,6 +581,7 @@ pub async fn publish_claim(
                 &accounts_inner,
                 &*store_clone,
                 latest_block_num,
+                reject_zero_padding,
             )
             .await?;
 

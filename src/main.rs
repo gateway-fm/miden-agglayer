@@ -113,6 +113,14 @@ struct Command {
     #[arg(long, env = "RATE_LIMIT_BURST", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST)]
     rate_limit_burst: u32,
 
+    /// Reject the address-mapper zero-padding fallback (C5). When set,
+    /// claims targeting an EVM address with no explicit store mapping are
+    /// rejected immediately instead of falling through to the structural
+    /// reconstruction. Production posture; default false for backward
+    /// compat with aggsender / aggoracle / hardhat dev flows.
+    #[arg(long, env = "REJECT_ZERO_PADDING_ADDRESSES", default_value_t = false)]
+    reject_zero_padding_addresses: bool,
+
     /// Production hardening invariant. When set, refuse to start if any of
     /// the following hardening flags are at their fail-open defaults:
     /// - `--admin-api-key` unset (admin endpoints accept any caller)
@@ -159,6 +167,7 @@ mod hardening_tests {
             allowed_signers: signers,
             rate_limit_per_second: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
+            reject_zero_padding_addresses: false,
             require_hardening: require,
         }
     }
@@ -463,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
     state.allowed_signers = command.allowed_signers;
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
+    state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
     // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.

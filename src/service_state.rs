@@ -81,6 +81,12 @@ pub struct ServiceState {
     pub rate_limit_per_second: u64,
     /// Per-IP rate limit burst (R13).
     pub rate_limit_burst: u32,
+    /// Reject the address-mapper zero-padding fallback (C5). When `true`,
+    /// claims targeting an EVM address with no explicit store mapping are
+    /// rejected immediately instead of falling through to the structural
+    /// reconstruction. Production posture; default false for backward
+    /// compatibility with aggsender / aggoracle / hardhat dev flows.
+    pub reject_zero_padding_addresses: bool,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -112,6 +118,7 @@ impl ServiceState {
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
+            reject_zero_padding_addresses: false,
         }
     }
 }
