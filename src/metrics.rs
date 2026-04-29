@@ -85,4 +85,9 @@ pub fn init_metrics() {
          reconstructed from the trailing 16 bytes. Account existence on \
          Miden is NOT verified — alert on unusual rates."
     );
+    describe_counter!(
+        "bridge_out_unknown_faucet_total",
+        "B2AGG note referenced a faucet not in the registry (B8). \
+         Quarantined to prevent silent re-loop on every sync tick."
+    );
 }

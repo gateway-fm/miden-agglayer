@@ -286,11 +286,38 @@ impl BridgeOutScanner {
         let faucet_id = fungible_asset.faucet_id();
         let miden_amount = fungible_asset.amount();
 
-        // Resolve origin info from faucet registry
+        // Resolve origin info from faucet registry.
+        //
+        // B8 — pre-fix this returned `false` without marking the note
+        // processed, so the next sync tick would observe the same note,
+        // re-attempt the lookup, log the same error, and loop forever.
+        // For an attacker who can submit B2AGG notes for unregistered
+        // faucets, that's a free DoS on the sync loop. Mark the note
+        // processed (consuming a deposit_count slot — not ideal, but the
+        // alternative is the infinite-loop) and emit a metric so
+        // operators can see the spike.
         let origin = match resolve_faucet_origin(faucet_id, &*self.store).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("B2AGG note {note_id_str}: {e:#}");
+                ::metrics::counter!("bridge_out_unknown_faucet_total").increment(1);
+                tracing::error!(
+                    target: "bridge_out",
+                    note_id = %note_id_str,
+                    faucet_id = %faucet_id,
+                    error = ?e,
+                    "B8: B2AGG note references an unregistered faucet — quarantining"
+                );
+                if let Err(mark_err) =
+                    self.store.mark_note_processed(note_id_str.clone()).await
+                {
+                    tracing::error!(
+                        target: "bridge_out",
+                        note_id = %note_id_str,
+                        error = ?mark_err,
+                        "B8: failed to mark unknown-faucet note as processed; \
+                         next tick will re-observe it"
+                    );
+                }
                 return false;
             }
         };
