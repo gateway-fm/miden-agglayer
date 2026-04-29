@@ -39,6 +39,16 @@ pub fn is_b2agg_note(details: &NoteDetails) -> bool {
 pub fn parse_b2agg_storage(storage: &NoteStorage) -> anyhow::Result<(u32, [u8; 20])> {
     let items = storage.items();
 
+    // Bounds-check up front so a truncated or malformed B2AGG storage cannot panic the
+    // sync loop. A bad note must not take down processing of every other consumed note
+    // in the same tick — surface as a parse error and let the caller quarantine.
+    if items.len() < 6 {
+        anyhow::bail!(
+            "B2AGG note storage too short: expected ≥6 felts (1 network + 5 address limbs), got {}",
+            items.len()
+        );
+    }
+
     // Reverse the byte-swap applied during note creation:
     // build_note_storage does: u32::from_le_bytes(destination_network.to_be_bytes())
     // So to recover: u32::from_le_bytes(felt_value.to_be_bytes())
@@ -401,5 +411,49 @@ mod tests {
         );
         // Overflow: scale too large
         assert!(reverse_scale_amount(1, 39).is_err());
+    }
+
+    /// Self-review B6 — repro+regression. A B2AGG note with fewer than 6 storage felts
+    /// (1 network word + 5 address limbs) is malformed. Before this guard,
+    /// `parse_b2agg_storage` would index `items[0]` and `items[1+i]` directly and panic
+    /// with index-out-of-bounds — taking down the entire sync loop for the rest of the
+    /// tick and dropping every other consumed note in the same batch on the floor.
+    /// Asserting clean Err return ensures the caller can quarantine the offending note
+    /// instead of aborting downstream B2AGG processing.
+    #[test]
+    fn b6_parse_b2agg_storage_short_payload_returns_clean_error() {
+        use miden_protocol::Felt;
+
+        // 1 felt only — short of the required 6.
+        let storage = NoteStorage::new(vec![Felt::new(0)]).unwrap();
+        let err = parse_b2agg_storage(&storage).expect_err("short storage must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("storage too short") && msg.contains("≥6 felts"),
+            "error should describe the bound: got {msg}"
+        );
+
+        // 5 felts — still short.
+        let storage = NoteStorage::new(vec![
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+        ])
+        .unwrap();
+        assert!(parse_b2agg_storage(&storage).is_err());
+
+        // 6 felts — exact minimum, must succeed.
+        let storage = NoteStorage::new(vec![
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+        ])
+        .unwrap();
+        assert!(parse_b2agg_storage(&storage).is_ok());
     }
 }
