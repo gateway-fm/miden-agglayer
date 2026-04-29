@@ -21,4 +21,10 @@ pub fn init_metrics() {
         "B2AGG bridge-outs whose destination_network equals our local network_id; \
          each one is a poison leaf that wedges the bridge (Cantina #13)"
     );
+    describe_counter!(
+        "bridge_let_divergence_total",
+        "Local Exit Tree divergence events (Cantina #9). Labels: \
+         kind=on_chain_ahead (private B2AGG was consumed) or \
+         kind=aggkit_ahead (local state corruption)."
+    );
 }
