@@ -34,6 +34,15 @@ use tower_http::trace::TraceLayer;
 /// posting megabytes of garbage is purely DoS. 256 KB is comfortable headroom for
 /// legitimate payloads (a typical `eth_sendRawTransaction` carrying a CLAIM proof is
 /// ~17 KB; an `eth_getLogs` with the maximum allowed filter arrays is well below 200 KB).
+///
+/// Decompression posture: the JSON-RPC route does NOT install
+/// `tower_http::decompression::DecompressionLayer`, so `Content-Encoding: gzip`
+/// (or any other encoding) reaches the JSON extractor as the compressed payload —
+/// `serde_json` then rejects it with a parse error. The 256 KB cap therefore
+/// applies to wire bytes, which is the right scope. If a future commit adds
+/// auto-decompression, that layer MUST be ordered after `RequestBodyLimitLayer`
+/// or supplemented with an output-size guard so a small gzip-bomb cannot
+/// inflate past the cap.
 pub const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 use url::Url;
 
@@ -634,10 +643,34 @@ fn build_cors_layer(allowed_origins: Option<&[String]>) -> tower_http::cors::Cor
             layer.allow_origin(tower_http::cors::Any)
         }
         Some(origins) => {
+            // R11 follow-up — RFC 6454 origin equality is scheme/host/port-wise
+            // and host is case-insensitive. tower-http does a literal byte-compare
+            // on `HeaderValue`, so `https://App.Example.com` and `https://app.example.com`
+            // are treated as different origins. Normalise here by lowercasing the
+            // input so an operator who deploys with checksum-cased hostnames in
+            // their dashboard still gets matched against the configured list.
+            let mut had_dropped = false;
             let parsed: Vec<HeaderValue> = origins
                 .iter()
-                .filter_map(|s| s.parse::<HeaderValue>().ok())
+                .filter_map(|s| {
+                    let normalised = s.to_ascii_lowercase();
+                    let Ok(v) = normalised.parse::<HeaderValue>() else {
+                        tracing::warn!(
+                            target: COMPONENT,
+                            "R11: dropping malformed CORS allow-list entry: {s:?}"
+                        );
+                        had_dropped = true;
+                        return None;
+                    };
+                    Some(v)
+                })
                 .collect();
+            if parsed.is_empty() && had_dropped {
+                tracing::error!(
+                    target: COMPONENT,
+                    "R11: every CORS allow-list entry failed to parse; layer is now closed"
+                );
+            }
             tracing::info!(
                 target: COMPONENT,
                 origins = ?origins,
