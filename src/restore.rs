@@ -190,13 +190,10 @@ async fn restore_bridge_outs(
                         }
                     };
 
-                    let tx_hash = {
-                        let mut hasher = Keccak256::new();
-                        hasher.update(b"miden-bridge-out-");
-                        hasher.update(note_id_str.as_bytes());
-                        let hash: [u8; 32] = hasher.finalize().into();
-                        format!("0x{}", hex::encode(hash))
-                    };
+                    // B5 — share the versioned domain-separated helper with
+                    // bridge_out so the tx_hash is byte-identical across
+                    // first-observation and restore paths (dedup-stable).
+                    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
 
                     let deposit_count =
                         store_clone.mark_note_processed(note_id_str.clone()).await?;
