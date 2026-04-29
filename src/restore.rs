@@ -146,7 +146,19 @@ async fn restore_bridge_outs(
                 let mut count = 0usize;
                 let mut logs = 0usize;
 
-                for note in &consumed_notes {
+                // G7 — sort B2AGG notes deterministically before assigning
+                // deposit_count. The Miden client returns consumed notes in
+                // store-arrival order, which can differ between runs (e.g.
+                // sync re-orderings, partial restores). Without sorting, the
+                // (note_id → deposit_count) mapping is non-deterministic
+                // across restore runs — two restores from the same on-chain
+                // state could produce different deposit_count assignments,
+                // breaking any consumer that joins on (note_id,
+                // deposit_count). Sort by note_id (stable across re-syncs).
+                let mut sorted: Vec<&_> = consumed_notes.iter().collect();
+                sorted.sort_by(|a, b| a.id().to_string().cmp(&b.id().to_string()));
+
+                for note in sorted {
                     let details = note.details();
                     if !is_b2agg_note(details) {
                         continue;
@@ -266,7 +278,17 @@ async fn restore_gers(
                 let mut ger_count = 0usize;
                 let mut log_count = 0usize;
 
-                for note in &consumed_notes {
+                // G7 — sort GER notes deterministically before reconstructing
+                // the hash chain. Iteration order from the miden client is
+                // insertion-order, but the GER hash chain is order-sensitive
+                // (each new value mixes into a rolling Keccak), so two
+                // restore runs over the same on-chain state could produce
+                // different chain values without sorting. Lex-sort by
+                // NoteId for stability.
+                let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
+                sorted_notes.sort_by(|a, b| a.id().to_string().cmp(&b.id().to_string()));
+
+                for note in sorted_notes {
                     let details = note.details();
                     if details.script().root() != ger_script_root {
                         continue;
