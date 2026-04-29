@@ -112,6 +112,56 @@ struct Command {
     /// Per-IP rate limit, burst capacity (R13). Default 60.
     #[arg(long, env = "RATE_LIMIT_BURST", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST)]
     rate_limit_burst: u32,
+
+    /// Production hardening invariant. When set, refuse to start if any of
+    /// the following hardening flags are at their fail-open defaults:
+    /// - `--admin-api-key` unset (admin endpoints accept any caller)
+    /// - `--allowed-signers` unset (any signer can submit txs)
+    /// - `--cors-allowed-origins` set to a wildcard `*`
+    ///
+    /// Operators deploying to mainnet should set `--require-hardening`
+    /// (env `REQUIRE_HARDENING`) to make these mistakes startup failures
+    /// rather than silent runtime exposures.
+    #[arg(long, env = "REQUIRE_HARDENING", default_value_t = false)]
+    require_hardening: bool,
+}
+
+/// Validate the `--require-hardening` invariants. Returns a list of
+/// reason strings naming each unsatisfied flag. Empty list = pass.
+fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
+    if !command.require_hardening {
+        return Ok(());
+    }
+    let mut reasons = Vec::new();
+    if command.admin_api_key.is_none() {
+        reasons.push(
+            "  - --admin-api-key is unset (admin_* methods would be open). \
+             Set ADMIN_API_KEY to a long random token."
+                .to_string(),
+        );
+    }
+    if command.allowed_signers.as_ref().is_none_or(|v| v.is_empty()) {
+        reasons.push(
+            "  - --allowed-signers is unset (eth_sendRawTransaction would accept \
+             any signer). Set ALLOWED_SIGNERS to a comma-separated allow-list."
+                .to_string(),
+        );
+    }
+    if let Some(origins) = command.cors_allowed_origins.as_ref() {
+        if origins.iter().any(|o| o == "*") {
+            reasons.push(
+                "  - --cors-allowed-origins contains a wildcard `*` (browsers from \
+                 any origin can hit state-mutating endpoints). Use an explicit \
+                 origin list."
+                    .to_string(),
+            );
+        }
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
 }
 
 impl std::fmt::Debug for Command {
@@ -143,6 +193,7 @@ impl std::fmt::Debug for Command {
             )
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
+            .field("require_hardening", &self.require_hardening)
             .finish()
     }
 }
@@ -153,6 +204,19 @@ async fn main() -> anyhow::Result<()> {
     logging::setup_tracing()?;
     miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
     tracing::info!("{command:?}");
+
+    // Hardening startup invariants — fail loud on fail-open production
+    // configurations. Reviewer-flagged (R1+R2+R11). Without this, an
+    // operator can launch the proxy with all three hardening flags at
+    // their fail-open defaults and the only signal is a faint info-level
+    // log line. Loud startup failure is the right escalation.
+    if let Err(reasons) = check_hardening_invariants(&command) {
+        anyhow::bail!(
+            "--require-hardening is set but the following invariants are not satisfied:\n{}\n\
+             Either set the listed flags or drop --require-hardening for dev mode.",
+            reasons.join("\n")
+        );
+    }
 
     let miden_store_dir = command.miden_store_dir;
 
