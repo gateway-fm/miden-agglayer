@@ -586,14 +586,33 @@ impl Store for PgStore {
         let error_msg: Option<&str> = row.get(5);
         let block_num: i64 = row.get(6);
 
-        // Deserialize envelope
+        // Deserialize envelope.
+        //
+        // S9 — return Err on decode failure rather than None. Pre-fix a
+        // corrupt or schema-drift envelope row was indistinguishable from
+        // "tx not found" — `eth_getTransactionByHash` would lie to clients.
+        // Surface the failure as a real error so operators see the
+        // corruption (and the metric counter increments).
         use alloy::eips::Decodable2718;
-        let Some(envelope) = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).ok() else {
-            return Ok(None);
-        };
-        let Some(signer) = signer_str.parse::<Address>().ok() else {
-            return Ok(None);
-        };
+        let envelope = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).map_err(|e| {
+            ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
+            tracing::error!(
+                target: "store::postgres",
+                tx_hash = %hash_str,
+                error = ?e,
+                "S9: TxEnvelope decode failed; returning error rather than masking as not-found"
+            );
+            anyhow::anyhow!(
+                "stored TxEnvelope for {hash_str} cannot be decoded ({e}); \
+                 row is corrupt or schema drifted"
+            )
+        })?;
+        let signer = signer_str.parse::<Address>().map_err(|e| {
+            ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
+            anyhow::anyhow!(
+                "stored signer for {hash_str} is not a valid Address ({e})"
+            )
+        })?;
 
         let result = match status {
             "success" => Some(Ok(())),

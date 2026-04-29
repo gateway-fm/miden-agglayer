@@ -66,4 +66,10 @@ pub fn init_metrics() {
          threshold (Cantina #7). Indicates batch-dedup censorship via a \
          metadata-distinct twin. Triggers retry; alerts after K retries."
     );
+    describe_counter!(
+        "store_envelope_decode_errors_total",
+        "PgStore TxEnvelope decode failures (S9). Each increment marks a \
+         corrupt or schema-drifted transactions row that surfaced as an \
+         error rather than masking as not-found. Investigate immediately."
+    );
 }
