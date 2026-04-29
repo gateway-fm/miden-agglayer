@@ -190,6 +190,14 @@ pub trait Store: Send + Sync + 'static {
         origin_address: &[u8; 20],
         origin_network: u32,
     ) -> anyhow::Result<Option<FaucetEntry>>;
+    /// Find every faucet registered under a given origin token address, regardless of network.
+    /// Used to detect cross-network token-address collisions before auto-creating a faucet
+    /// (the on-chain registry keys by token address only, so a same-address-different-network
+    /// auto-create would silently overwrite the existing on-chain registration — Cantina #1).
+    async fn find_faucets_by_origin_address(
+        &self,
+        origin_address: &[u8; 20],
+    ) -> anyhow::Result<Vec<FaucetEntry>>;
     /// Look up a faucet by its Miden account ID.
     async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>>;
     /// List all registered faucets.

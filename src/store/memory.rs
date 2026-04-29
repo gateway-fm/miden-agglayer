@@ -541,6 +541,18 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
+    async fn find_faucets_by_origin_address(
+        &self,
+        origin_address: &[u8; 20],
+    ) -> anyhow::Result<Vec<FaucetEntry>> {
+        let faucets = self.faucets.read();
+        Ok(faucets
+            .iter()
+            .filter(|f| f.origin_address == *origin_address)
+            .cloned()
+            .collect())
+    }
+
     async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>> {
         let faucets = self.faucets.read();
         Ok(faucets.iter().find(|f| f.faucet_id == faucet_id).cloned())
@@ -889,5 +901,66 @@ mod tests {
         let origin_amount =
             crate::bridge_out::reverse_scale_amount(1000, bridge_out_faucet.scale).unwrap();
         assert_eq!(origin_amount, 1000);
+    }
+
+    /// Cantina #1 — repro+regression. Two faucets registered for the same origin token
+    /// address under different `origin_network` values must both surface from the new
+    /// `find_faucets_by_origin_address` lookup so `find_or_create_faucet` can refuse a
+    /// colliding auto-create. Without this method, aggkit only had the
+    /// `(token, network)` pair lookup which always misses the existing entry under a
+    /// different network — letting auto-create silently overwrite the on-chain registry.
+    #[tokio::test]
+    async fn cantina_1_find_faucets_by_origin_address_surfaces_cross_network_collision() {
+        let store = InMemoryStore::new();
+        let token_addr = [0xA0u8; 20]; // shared origin token address (e.g. CREATE2-cloned)
+
+        let faucet_n0 = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let faucet_n1 = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_n0,
+                origin_address: token_addr,
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_n1,
+                origin_address: token_addr,
+                origin_network: 7,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+            })
+            .await
+            .unwrap();
+
+        // Per-pair lookup correctly returns each network's own entry.
+        let only_n0 = store.get_faucet_by_origin(&token_addr, 0).await.unwrap();
+        assert_eq!(only_n0.unwrap().origin_network, 0);
+
+        // The new method surfaces BOTH — this is what `find_or_create_faucet` uses to
+        // detect that a same-address-different-network entry already exists and refuse
+        // to auto-create a second one (which would silently overwrite the on-chain
+        // address-keyed registry, Cantina #1).
+        let all = store
+            .find_faucets_by_origin_address(&token_addr)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "should surface every faucet for this token");
+        let networks: std::collections::BTreeSet<u32> =
+            all.iter().map(|f| f.origin_network).collect();
+        assert_eq!(networks, [0u32, 7].iter().copied().collect());
+
+        // Other origin addresses are unaffected.
+        let other = store.find_faucets_by_origin_address(&[0u8; 20]).await.unwrap();
+        assert!(other.is_empty());
     }
 }

@@ -88,7 +88,26 @@ async fn find_or_create_faucet(
         });
     }
 
-    // 2. Auto-create: parse token metadata from claimAsset call
+    // 2. Cantina #1 — refuse colliding-network auto-create. The on-chain bridge registry
+    //    keys faucets by `hash(origin_token_address)` ALONE, so registering a second faucet
+    //    for the same token address under a different `origin_network` will silently
+    //    overwrite the first registration on-chain. Reject before we reach that path.
+    let same_address_faucets = store.find_faucets_by_origin_address(&token_address.0.0).await?;
+    if let Some(existing) = same_address_faucets
+        .iter()
+        .find(|f| f.origin_network != origin_network)
+    {
+        anyhow::bail!(
+            "refusing to auto-create faucet for token {token_address} on network {origin_network}: \
+             a faucet for the same token address is already registered under network {} \
+             (faucet_id {}). Cross-network token-address collision (Cantina #1) — auto-creating \
+             would overwrite the existing on-chain registration. Investigate and resolve manually.",
+            existing.origin_network,
+            existing.faucet_id,
+        );
+    }
+
+    // 3. Auto-create: parse token metadata from claimAsset call
     let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
     let miden_decimals: u8 = origin_decimals.min(8);
     let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
