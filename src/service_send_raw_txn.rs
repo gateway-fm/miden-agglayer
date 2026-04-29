@@ -223,13 +223,25 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
 
-    // Validate chain_id to prevent cross-chain replay attacks
+    // R4 — chain_id validation. Pre-fix the legacy branch used `unwrap_or(0)` and
+    // the test below `tx_chain_id != 0` skipped the comparison entirely for legacy
+    // tx without a chain_id. That allowed cross-chain replay: an envelope signed
+    // for chain X could be replayed against our service if its chain_id field was
+    // None. Require an explicit chain_id (rejects pre-EIP-155 legacy envelopes)
+    // and require it to equal the service's chain_id.
     let tx_chain_id = match &txn_envelope {
-        TxEnvelope::Eip1559(signed) => signed.tx().chain_id,
-        TxEnvelope::Legacy(signed) => signed.tx().chain_id.unwrap_or(0),
-        _ => 0,
+        TxEnvelope::Eip1559(signed) => Some(signed.tx().chain_id),
+        TxEnvelope::Eip2930(signed) => Some(signed.tx().chain_id),
+        TxEnvelope::Eip4844(signed) => Some(signed.tx().tx().chain_id),
+        TxEnvelope::Eip7702(signed) => Some(signed.tx().chain_id),
+        TxEnvelope::Legacy(signed) => signed.tx().chain_id,
     };
-    if tx_chain_id != 0 && tx_chain_id != service.chain_id {
+    let tx_chain_id = tx_chain_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "transaction is missing chain_id (pre-EIP-155 legacy envelopes are rejected to prevent cross-chain replay)"
+        )
+    })?;
+    if tx_chain_id != service.chain_id {
         anyhow::bail!(
             "chain_id mismatch: transaction has {tx_chain_id}, expected {}",
             service.chain_id
@@ -240,6 +252,31 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let txn_hash = txn.hash;
     let signer = txn_envelope.recover_signer()?;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
+
+    // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce only on
+    // success and never compared the incoming `tx.nonce` against the expected next
+    // value. That allowed:
+    //   1. Replay: a tx replayed with its original nonce would re-execute (the
+    //      claim path's try_claim dedupes by globalIndex, but other paths don't).
+    //   2. Skipped sequencing: an out-of-order tx with an inflated nonce would
+    //      still be processed, leaving "holes" in the apparent sequence.
+    // Validate `tx.nonce == store.nonce_get(signer)` BEFORE running any handler.
+    let signer_str = format!("{signer:#x}");
+    let expected_nonce = service.store.nonce_get(&signer_str).await?;
+    let tx_nonce = match &txn_envelope {
+        TxEnvelope::Eip1559(s) => s.tx().nonce,
+        TxEnvelope::Eip2930(s) => s.tx().nonce,
+        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
+        TxEnvelope::Eip7702(s) => s.tx().nonce,
+        TxEnvelope::Legacy(s) => s.tx().nonce,
+    };
+    if tx_nonce != expected_nonce {
+        ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+        anyhow::bail!(
+            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; \
+             this guards against replay and out-of-order submission (R4)"
+        );
+    }
 
     // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
     // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
@@ -364,9 +401,14 @@ mod tests {
 
     /// Encode a legacy transaction with the given calldata into a hex string
     /// suitable for `service_send_raw_txn`.
+    ///
+    /// Chain id is set to match `create_test_service`'s chain_id (1) — R4 rejects
+    /// pre-EIP-155 envelopes without a chain_id, which is the right production
+    /// posture but means tests must opt in explicitly.
     fn encode_legacy_tx(input: Vec<u8>) -> (String, Address) {
         let txn = TxLegacy {
             input: input.into(),
+            chain_id: Some(1),
             ..Default::default()
         };
         let signature = Signature::test_signature();
@@ -583,6 +625,92 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("only handles network")
+        );
+    }
+
+    /// Self-review R4 — repro+regression. Two failure modes:
+    /// (a) legacy envelope without an explicit chain_id is replay-vulnerable
+    ///     (cross-chain). Pre-fix, the unwrap_or(0) branch + `if tx_chain_id != 0`
+    ///     guard meant such envelopes were *accepted* with no chain check.
+    /// (b) replay with the same nonce, or out-of-order tx with a future nonce,
+    ///     was processed despite the proxy already tracking a sequence per signer.
+    /// Tests:
+    /// - `r4_legacy_tx_without_chain_id_rejected` — encode TxLegacy{chain_id:None}
+    ///   and assert the proxy refuses with the EIP-155 message.
+    /// - `r4_nonce_mismatch_rejected` — submit two valid txs with the same nonce;
+    ///   the second is refused.
+    /// - `r4_correct_nonce_accepted` — incrementing nonce flow works.
+    #[tokio::test]
+    async fn r4_legacy_tx_without_chain_id_rejected() {
+        let service = create_test_service();
+        // Construct a TxLegacy with chain_id = None.
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xAAu8; 32]),
+        }
+        .abi_encode();
+        let txn = TxLegacy {
+            input: calldata.into(),
+            chain_id: None,
+            ..Default::default()
+        };
+        let signature = Signature::test_signature();
+        let signed = Signed::new_unchecked(txn, signature, TxHash::default());
+        let envelope = TxEnvelope::Legacy(signed);
+        let mut buf = Vec::new();
+        envelope.encode_2718(&mut buf);
+        let input = format!("0x{}", ::hex::encode(buf));
+
+        let err = service_send_raw_txn(service, input)
+            .await
+            .expect_err("legacy without chain_id must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing chain_id") || msg.contains("EIP-155"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn r4_nonce_mismatch_rejected() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        // Force the store's tracked nonce up by 5; a tx with nonce 0 (default) is
+        // now stale-replay territory.
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xAAu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+        for _ in 0..5 {
+            store
+                .nonce_increment(&format!("{signer:#x}"))
+                .await
+                .unwrap();
+        }
+        let err = service_send_raw_txn(service, input_hex)
+            .await
+            .expect_err("stale nonce must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonce mismatch"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn r4_correct_nonce_accepted() {
+        let service = create_test_service();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xAAu8; 32]),
+        }
+        .abi_encode();
+        // Default TxLegacy nonce is 0 and create_test_service starts the store
+        // nonce at 0, so this should succeed.
+        let (input_hex, _) = encode_legacy_tx(calldata);
+        let result = service_send_raw_txn(service, input_hex).await;
+        assert!(
+            result.is_ok(),
+            "matching nonce must be accepted: {result:?}"
         );
     }
 
