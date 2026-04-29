@@ -97,6 +97,13 @@ struct Command {
     /// `Authorization: Bearer <token>`. Comparison is constant-time.
     #[arg(long, env = "ADMIN_API_KEY")]
     admin_api_key: Option<String>,
+
+    /// Allow-list of EVM signer addresses permitted to submit
+    /// `eth_sendRawTransaction` (R2). Comma-separated 0x-prefixed addresses
+    /// (case-insensitive). When unset, every well-formed signer is accepted
+    /// (legacy open mode — only safe behind a private network boundary).
+    #[arg(long, env = "ALLOWED_SIGNERS", value_delimiter = ',')]
+    allowed_signers: Option<Vec<alloy::primitives::Address>>,
 }
 
 impl std::fmt::Debug for Command {
@@ -127,6 +134,7 @@ impl std::fmt::Debug for Command {
                 &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("allowed_signers", &self.allowed_signers)
             .finish()
     }
 }
@@ -299,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
     state.ger_l1_address = command.ger_l1_address;
     state.cors_allowed_origins = command.cors_allowed_origins;
     state.admin_api_key = command.admin_api_key;
+    state.allowed_signers = command.allowed_signers;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
     // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.

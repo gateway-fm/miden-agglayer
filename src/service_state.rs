@@ -29,6 +29,12 @@ pub struct ServiceState {
     /// entirely (the safe production default — fail closed). `Some(token)` =
     /// admin requests must carry `Authorization: Bearer <token>`.
     pub admin_api_key: Option<String>,
+    /// Allow-list of EVM signer addresses (R2). `None` = `eth_sendRawTransaction`
+    /// is OPEN to any signer (legacy default; only safe behind a private
+    /// network-level boundary). `Some(list)` = inbound txs must be signed by an
+    /// address in the list. Production must always set this — aggsender,
+    /// aggoracle, and any operator-rescue tool are the only legitimate signers.
+    pub allowed_signers: Option<Vec<alloy::primitives::Address>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -56,6 +62,7 @@ impl ServiceState {
             miden_node_url: String::new(),
             cors_allowed_origins: None,
             admin_api_key: None,
+            allowed_signers: None,
         }
     }
 }

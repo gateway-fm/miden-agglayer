@@ -202,6 +202,22 @@ async fn publish_and_record_claim(
     Ok(())
 }
 
+/// Check whether the recovered signer is permitted to submit transactions.
+///
+/// `None` = open mode (legacy default). `Some(list)` = explicit allow-list — every
+/// signer outside the list is rejected. Comparison is checksum-insensitive (the
+/// allow-list and recovered address are both `alloy::primitives::Address` values).
+///
+/// Self-review R2 — pre-fix the proxy accepted any well-formed signed tx, even
+/// though only aggsender / aggoracle / operator-rescue signers have a legitimate
+/// reason to submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`.
+pub fn is_signer_allowed(allowed: Option<&[Address]>, signer: &Address) -> bool {
+    match allowed {
+        None => true,
+        Some(list) => list.iter().any(|a| a == signer),
+    }
+}
+
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
@@ -224,6 +240,19 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let txn_hash = txn.hash;
     let signer = txn_envelope.recover_signer()?;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
+
+    // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
+    // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
+    // calldata. The proxy then runs Miden tx work on the service account's behalf
+    // (auto-creates faucets, advances LET, marks GERs injected), letting an
+    // attacker burn fees, poison registries, or feed fabricated GERs to
+    // bridge-service. Reject any signer not in the configured allow-list.
+    if !is_signer_allowed(service.allowed_signers.as_deref(), &signer) {
+        ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
+        anyhow::bail!(
+            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or set ALLOWED_SIGNERS) to permit"
+        );
+    }
 
     let params_encoded = &txn.input;
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
@@ -555,5 +584,62 @@ mod tests {
                 .to_string()
                 .contains("only handles network")
         );
+    }
+
+    /// Self-review R2 — repro+regression. Pre-fix, every recovered signer was
+    /// accepted unconditionally. Post-fix the predicate must:
+    /// - return true when no allow-list is configured (legacy open mode)
+    /// - return true when the signer is in the allow-list
+    /// - return false when an allow-list is configured but the signer isn't in it
+    /// - return false for an empty allow-list (explicit refuse-all)
+    #[test]
+    fn r2_is_signer_allowed_pins_allow_list_semantics() {
+        let alice: Address = "0xAAaAaAaAaaaAaaAaAaAAAAAAAaaaAaAaAaaAaaAa".parse().unwrap();
+        let bob: Address = "0xbBbBbBbBbBbbbBbBbBBbbbbbBBBBbbbbBBbBbBbB".parse().unwrap();
+        let carol: Address = "0xCccCccCcCccCcCCCCccCCCcCcCCCCccCcCcCcCcC".parse().unwrap();
+
+        // None = open
+        assert!(is_signer_allowed(None, &alice));
+        assert!(is_signer_allowed(None, &bob));
+
+        // Empty list = explicit refuse-all
+        assert!(!is_signer_allowed(Some(&[]), &alice));
+
+        // Single-entry list
+        assert!(is_signer_allowed(Some(&[alice]), &alice));
+        assert!(!is_signer_allowed(Some(&[alice]), &bob));
+
+        // Multi-entry list
+        let list = [alice, bob];
+        assert!(is_signer_allowed(Some(&list), &alice));
+        assert!(is_signer_allowed(Some(&list), &bob));
+        assert!(!is_signer_allowed(Some(&list), &carol));
+    }
+
+    /// R2 integration repro — a signed tx whose signer is NOT on the allow-list
+    /// must be rejected, even if everything else is well-formed. Without the
+    /// fix, the same tx would be processed (and the proxy would attempt to run
+    /// the corresponding Miden tx on the service account's behalf).
+    #[tokio::test]
+    async fn r2_unauthorised_signer_rejected_with_descriptive_error() {
+        let mut service = create_test_service();
+        // Configure a non-empty allow-list that does NOT include the test signer.
+        let foreign: Address = "0xdeAddeaDdEadDeaDDEaDDeadDEADDeaDDEAdDEaD".parse().unwrap();
+        service.allowed_signers = Some(vec![foreign]);
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xAAu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+        // sanity: the tx's recovered signer is the test signer, not the foreign one.
+        assert_ne!(signer, foreign);
+
+        let err = service_send_raw_txn(service, input_hex)
+            .await
+            .expect_err("non-allowed signer must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not on the allow-list"), "unexpected: {msg}");
+        assert!(msg.contains(&format!("{signer:#x}")), "must name the signer: {msg}");
     }
 }
