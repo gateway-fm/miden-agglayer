@@ -348,6 +348,15 @@ impl SyncListener for BridgeOutScanner {
 // BRIDGE EVENT ABI ENCODING
 // ================================================================================================
 
+/// Maximum metadata payload size accepted by `encode_bridge_event_data`.
+///
+/// 64 KB matches the largest legitimate metadata block we expect (ABI-encoded
+/// `(string name, string symbol, uint8 decimals)` for normal ERC-20s sits well
+/// below 1 KB; 64 KB is generous for any future variant). Without an explicit
+/// cap, a misuse passing huge metadata would allocate `metadata.len() + 9*32`
+/// bytes per call and OOM the indexer on a single bad event.
+pub const MAX_BRIDGE_EVENT_METADATA_BYTES: usize = 64 * 1024;
+
 /// ABI-encode BridgeEvent data for synthetic log emission.
 ///
 /// BridgeEvent(uint8 leafType, uint32 originNetwork, address originAddress,
@@ -366,6 +375,64 @@ impl SyncListener for BridgeOutScanner {
 /// padding). Take metadata as an explicit parameter and encode canonically:
 /// write the length word, append the bytes, zero-pad to the next 32-byte
 /// boundary.
+///
+/// # Errors
+/// Returns `Err(BridgeEventEncodeError::MetadataTooLarge)` if `metadata.len()`
+/// exceeds `MAX_BRIDGE_EVENT_METADATA_BYTES`.
+pub fn encode_bridge_event_data_checked(
+    leaf_type: u8,
+    origin_network: u32,
+    origin_address: &[u8; 20],
+    destination_network: u32,
+    destination_address: &[u8; 20],
+    amount: u128,
+    metadata: &[u8],
+    deposit_count: u32,
+) -> Result<String, BridgeEventEncodeError> {
+    if metadata.len() > MAX_BRIDGE_EVENT_METADATA_BYTES {
+        return Err(BridgeEventEncodeError::MetadataTooLarge {
+            len: metadata.len(),
+            cap: MAX_BRIDGE_EVENT_METADATA_BYTES,
+        });
+    }
+    Ok(encode_bridge_event_data(
+        leaf_type,
+        origin_network,
+        origin_address,
+        destination_network,
+        destination_address,
+        amount,
+        metadata,
+        deposit_count,
+    ))
+}
+
+/// Errors returned by `encode_bridge_event_data_checked`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BridgeEventEncodeError {
+    MetadataTooLarge { len: usize, cap: usize },
+}
+
+impl std::fmt::Display for BridgeEventEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MetadataTooLarge { len, cap } => write!(
+                f,
+                "BridgeEvent metadata too large: {len} > {cap} bytes (cap configured for indexer DoS protection)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BridgeEventEncodeError {}
+
+/// Encode BridgeEvent data, panicking on metadata overflow. Use
+/// `encode_bridge_event_data_checked` for callers that handle errors.
+///
+/// Internal callers (`Store::add_bridge_event`, restore path) pass `&[]` so
+/// the cap is unreachable today; this `unwrap_or_else` form preserves the
+/// pre-fix infallible signature for those callers while keeping the cap
+/// enforced for any future caller via the `_checked` variant.
 pub fn encode_bridge_event_data(
     leaf_type: u8,
     origin_network: u32,
@@ -574,6 +641,35 @@ mod tests {
         let _ = assert_bool::<_, std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>>(
             || Box::pin(async { true }),
         );
+    }
+
+    /// Self-review of-the-fix follow-up — repro+regression. The original
+    /// `encode_bridge_event_data` had no cap on metadata size — a misuse passing
+    /// huge metadata would allocate proportionally and OOM the indexer on a
+    /// single bad event. The reviewer agents flagged this as a low-severity
+    /// gap in the Cantina #10 encoder commit. The new
+    /// `encode_bridge_event_data_checked` wrapper enforces
+    /// `MAX_BRIDGE_EVENT_METADATA_BYTES` and surfaces an explicit error.
+    #[test]
+    fn bridge_event_metadata_length_capped() {
+        let too_big = vec![0u8; MAX_BRIDGE_EVENT_METADATA_BYTES + 1];
+        let err = encode_bridge_event_data_checked(
+            0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, &too_big, 0,
+        )
+        .expect_err("oversized metadata must error");
+        match err {
+            BridgeEventEncodeError::MetadataTooLarge { len, cap } => {
+                assert_eq!(len, MAX_BRIDGE_EVENT_METADATA_BYTES + 1);
+                assert_eq!(cap, MAX_BRIDGE_EVENT_METADATA_BYTES);
+            }
+        }
+
+        // Exactly at the cap is accepted.
+        let at_cap = vec![0u8; MAX_BRIDGE_EVENT_METADATA_BYTES];
+        let ok = encode_bridge_event_data_checked(
+            0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, &at_cap, 0,
+        );
+        assert!(ok.is_ok(), "exactly cap must be accepted");
     }
 
     /// Cantina #13 — repro+regression. The on-chain `bridge_out` procedure does not
