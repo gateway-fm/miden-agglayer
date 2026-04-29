@@ -95,10 +95,24 @@ impl Store for PgStore {
     // ── Logs ─────────────────────────────────────────────────────
 
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
 
-        // Get and increment log_counter atomically
-        let row = client
+        // S3 — atomic counter UPDATE + INSERT.
+        //
+        // Pre-fix the counter was incremented in one connection roundtrip
+        // (UPDATE ... RETURNING log_counter - 1) and the INSERT happened in
+        // a SEPARATE roundtrip. If the INSERT failed (constraint violation,
+        // disk full, network hiccup), the counter had already advanced and
+        // no row existed at that index — leaving permanent gaps in
+        // log_index that downstream consumers (eth_getLogs callers
+        // iterating by index) would silently skip.
+        //
+        // Now both run inside a single tokio_postgres transaction; the
+        // commit/rollback boundary preserves the invariant that every
+        // bumped counter has a matching row.
+        let tx = client.transaction().await?;
+
+        let row = tx
             .query_one(
                 "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
                 &[],
@@ -107,23 +121,24 @@ impl Store for PgStore {
         let log_index: i64 = row.get(0);
 
         let topics: Vec<&str> = log.topics.iter().map(|s| s.as_str()).collect();
-        client
-            .execute(
-                "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-                &[
-                    &log_index,
-                    &log.address,
-                    &topics,
-                    &log.data,
-                    &(log.block_number as i64),
-                    &log.block_hash.as_slice(),
-                    &log.transaction_hash,
-                    &(log.transaction_index as i64),
-                    &log.removed,
-                ],
-            )
-            .await?;
+        tx.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &log.address,
+                &topics,
+                &log.data,
+                &(log.block_number as i64),
+                &log.block_hash.as_slice(),
+                &log.transaction_hash,
+                &(log.transaction_index as i64),
+                &log.removed,
+            ],
+        )
+        .await?;
+
+        tx.commit().await?;
 
         tracing::debug!(
             block_number = log.block_number,
