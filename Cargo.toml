@@ -60,6 +60,7 @@ tokio = { features = ["macros", "rt-multi-thread", "signal"], version = "1.48" }
 toml = { version = "0.9" }
 tower = { version = "0.5" }
 tower-http = { features = ["cors", "limit", "set-header", "trace"], version = "0.6" }
+tower_governor = { version = "0.8" }
 tracing = { version = "0.1" }
 tracing-subscriber = { features = [
   "env-filter",

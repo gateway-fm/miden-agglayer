@@ -77,6 +77,10 @@ pub struct ServiceState {
     /// nonce-check critical section so two concurrent same-nonce txs from one
     /// signer cannot both pass the equality check before either increments.
     pub per_signer_locks: PerSignerLocks,
+    /// Per-IP rate limit (R13) — sustained rate (per second).
+    pub rate_limit_per_second: u64,
+    /// Per-IP rate limit burst (R13).
+    pub rate_limit_burst: u32,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -106,6 +110,8 @@ impl ServiceState {
             admin_api_key: None,
             allowed_signers: None,
             per_signer_locks: PerSignerLocks::new(),
+            rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
+            rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
         }
     }
 }

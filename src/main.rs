@@ -104,6 +104,14 @@ struct Command {
     /// (legacy open mode — only safe behind a private network boundary).
     #[arg(long, env = "ALLOWED_SIGNERS", value_delimiter = ',')]
     allowed_signers: Option<Vec<alloy::primitives::Address>>,
+
+    /// Per-IP rate limit, sustained requests per second (R13). Default 60.
+    #[arg(long, env = "RATE_LIMIT_PER_SECOND", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND)]
+    rate_limit_per_second: u64,
+
+    /// Per-IP rate limit, burst capacity (R13). Default 60.
+    #[arg(long, env = "RATE_LIMIT_BURST", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST)]
+    rate_limit_burst: u32,
 }
 
 impl std::fmt::Debug for Command {
@@ -308,6 +316,8 @@ async fn main() -> anyhow::Result<()> {
     state.cors_allowed_origins = command.cors_allowed_origins;
     state.admin_api_key = command.admin_api_key;
     state.allowed_signers = command.allowed_signers;
+    state.rate_limit_per_second = command.rate_limit_per_second;
+    state.rate_limit_burst = command.rate_limit_burst;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
     // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.

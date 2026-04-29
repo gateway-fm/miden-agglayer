@@ -23,7 +23,17 @@ use std::str::FromStr;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::GovernorLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+
+/// Default per-IP rate limit (R13). 60 req/sec sustained with a 60-request burst.
+/// Aggsender / aggoracle / operator-rescue all signal at low frequency relative to
+/// this; the cap exists primarily to slow down brute-force probing of admin auth
+/// (R1) and signer-allow-list rejection paths (R2). Configurable via
+/// `--rate-limit-per-second` / `RATE_LIMIT_PER_SECOND`.
+pub const DEFAULT_RATE_LIMIT_PER_SECOND: u64 = 60;
+pub const DEFAULT_RATE_LIMIT_BURST: u32 = 60;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
@@ -578,6 +588,18 @@ pub async fn serve(
     state: ServiceState,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> anyhow::Result<()> {
+    // R13 — per-IP rate limit. The default config (60 req/sec, 60 burst) slows
+    // brute-force probing of admin auth (R1) and signer-allow-list rejection
+    // paths (R2) without affecting legitimate aggsender / aggoracle traffic.
+    let governor_conf = std::sync::Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(state.rate_limit_per_second)
+            .burst_size(state.rate_limit_burst)
+            .finish()
+            .expect("rate-limit config must produce a valid governor"),
+    );
+    let governor_layer = GovernorLayer::new(governor_conf);
+
     let app = Router::new()
         .route("/", post(json_rpc_endpoint))
         .route("/health", get(health_check))
@@ -592,6 +614,9 @@ pub async fn serve(
                 // than MAX_REQUEST_BODY_BYTES are rejected with HTTP 413 by tower-http
                 // without ever allocating the full payload.
                 .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+                // R13 — per-IP rate limiting. Applied before the JSON-RPC handler so
+                // an attacker cannot exhaust the worker pool via a flood.
+                .layer(governor_layer)
                 .layer(build_cors_layer(state.cors_allowed_origins.as_deref())),
         )
         .with_state(state)
@@ -609,9 +634,13 @@ pub async fn serve(
 
     tracing::info!(target: COMPONENT, address = %url, "Service started");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // PeerIpKeyExtractor needs ConnectInfo<SocketAddr> to identify the caller.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -705,6 +734,37 @@ fn validate_eth_address(addr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-review R13 — repro+regression. Default rate-limit constants
+    /// must produce a buildable governor config (not all GovernorConfigBuilder
+    /// inputs are valid; an invalid period or zero burst returns None).
+    /// This pins the contract: defaults DEFAULT_RATE_LIMIT_PER_SECOND and
+    /// DEFAULT_RATE_LIMIT_BURST always finalise.
+    #[test]
+    fn r13_default_rate_limit_config_is_valid() {
+        let cfg = GovernorConfigBuilder::default()
+            .per_second(DEFAULT_RATE_LIMIT_PER_SECOND)
+            .burst_size(DEFAULT_RATE_LIMIT_BURST)
+            .finish();
+        assert!(cfg.is_some(), "default rate-limit config must finalise");
+
+        // Tightening to 1 req/sec / 1 burst is also valid.
+        let tight = GovernorConfigBuilder::default()
+            .per_second(1)
+            .burst_size(1)
+            .finish();
+        assert!(tight.is_some(), "1/1 config must finalise");
+
+        // Zero per_second OR zero burst is rejected by the builder.
+        assert!(
+            GovernorConfigBuilder::default()
+                .per_second(0)
+                .burst_size(DEFAULT_RATE_LIMIT_BURST)
+                .finish()
+                .is_none(),
+            "zero per_second must be rejected"
+        );
+    }
 
     /// Self-review (review-of-fix follow-up) — repro+regression. Pre-fix,
     /// `rpc_requests_total{method=...}` used the raw attacker-supplied method
