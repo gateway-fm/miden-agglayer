@@ -44,6 +44,13 @@ async fn json_rpc_endpoint(
 ) -> JrpcResult {
     let start = std::time::Instant::now();
     let method_name = request.method.clone();
+    // Cardinality-safe label for metrics. A request.method comes from the
+    // attacker-controlled JSON body; using it verbatim creates one
+    // Prometheus series per distinct method, which an unauthenticated
+    // caller can grow without bound (DoS the metrics exporter / OOM the
+    // proxy). Bucket to a finite known set; everything else collapses to
+    // "other".
+    let method_label = bucket_method_label(&method_name);
 
     // R1 — gate admin_* methods on the configured API key BEFORE running any handler.
     // Without this, admin endpoints (`admin_registerFaucet`, `admin_listFaucets`) are
@@ -51,7 +58,7 @@ async fn json_rpc_endpoint(
     // poison the faucet registry with attacker-chosen `MetadataHash` for any token.
     if method_name.starts_with("admin_") {
         if let Err(reason) = check_admin_auth(service.admin_api_key.as_deref(), &headers) {
-            metrics::counter!("rpc_admin_auth_rejects_total", "method" => method_name.clone())
+            metrics::counter!("rpc_admin_auth_rejects_total", "method" => method_label)
                 .increment(1);
             return Ok(JsonRpcResponse::error(
                 request.get_answer_id(),
@@ -66,11 +73,51 @@ async fn json_rpc_endpoint(
 
     let result = json_rpc_handler(service, request).await;
 
-    metrics::counter!("rpc_requests_total", "method" => method_name.to_string()).increment(1);
-    metrics::histogram!("rpc_request_duration_seconds", "method" => method_name)
+    metrics::counter!("rpc_requests_total", "method" => method_label).increment(1);
+    metrics::histogram!("rpc_request_duration_seconds", "method" => method_label)
         .record(start.elapsed().as_secs_f64());
 
     result
+}
+
+/// Return a metric label for a JSON-RPC method name, restricted to a finite
+/// set of known buckets so an attacker-controlled method string cannot
+/// inflate Prometheus cardinality.
+///
+/// Self-review (review-of-fix follow-up): the original R1 commit and the
+/// pre-existing `rpc_requests_total` instrumentation used the raw
+/// `request.method` string as a label. An unauthenticated caller posting
+/// random method names (e.g. `"admin_<uuid>"`) created one series per
+/// guess, which OOMs the metrics exporter — a trivial DoS.
+fn bucket_method_label(method: &str) -> &'static str {
+    match method {
+        // Standard EVM-shaped methods we actually serve (success path).
+        "eth_blockNumber" => "eth_blockNumber",
+        "eth_chainId" => "eth_chainId",
+        "eth_getBlockByNumber" => "eth_getBlockByNumber",
+        "eth_getBlockByHash" => "eth_getBlockByHash",
+        "eth_getCode" => "eth_getCode",
+        "eth_getBalance" => "eth_getBalance",
+        "eth_getStorageAt" => "eth_getStorageAt",
+        "eth_getLogs" => "eth_getLogs",
+        "eth_getTransactionCount" => "eth_getTransactionCount",
+        "eth_getTransactionByHash" => "eth_getTransactionByHash",
+        "eth_getTransactionReceipt" => "eth_getTransactionReceipt",
+        "eth_getBlockTransactionCountByNumber" => "eth_getBlockTransactionCountByNumber",
+        "eth_call" => "eth_call",
+        "eth_estimateGas" => "eth_estimateGas",
+        "eth_gasPrice" => "eth_gasPrice",
+        "eth_sendRawTransaction" => "eth_sendRawTransaction",
+        "net_version" => "net_version",
+        "debug_traceTransaction" => "debug_traceTransaction",
+        "zkevm_getLatestGlobalExitRoot" => "zkevm_getLatestGlobalExitRoot",
+        "zkevm_getExitRootsByGER" => "zkevm_getExitRootsByGER",
+        "admin_registerFaucet" => "admin_registerFaucet",
+        "admin_listFaucets" => "admin_listFaucets",
+        // Anything else → "other". Includes typos and method-name-fuzzing
+        // attacks. We still log the actual method via tracing for debugging.
+        _ => "other",
+    }
 }
 
 /// Outcome of an admin auth check; private detail for documentation.
@@ -597,6 +644,33 @@ fn validate_eth_address(addr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-review (review-of-fix follow-up) — repro+regression. Pre-fix,
+    /// `rpc_requests_total{method=...}` used the raw attacker-supplied method
+    /// string. An unauthenticated caller posting `{"method":"admin_<uuid>"}`
+    /// for distinct uuids would create one Prometheus series per call,
+    /// inflating the metrics exporter without bound (OOM DoS). Test pins the
+    /// bucketing function: known methods map to themselves; anything else
+    /// (including typos and obvious attacker probes) collapses to "other".
+    #[test]
+    fn metric_label_cardinality_capped_to_known_set() {
+        // Known methods preserved.
+        assert_eq!(bucket_method_label("eth_getLogs"), "eth_getLogs");
+        assert_eq!(bucket_method_label("admin_registerFaucet"), "admin_registerFaucet");
+        assert_eq!(bucket_method_label("eth_sendRawTransaction"), "eth_sendRawTransaction");
+
+        // Attacker-shaped admin probe: one series, not a million.
+        assert_eq!(bucket_method_label("admin_DEADBEEF"), "other");
+        assert_eq!(bucket_method_label("admin_8d4f2c3e-…-uuid"), "other");
+
+        // Typos collapse to "other".
+        assert_eq!(bucket_method_label("eth_getlogs"), "other"); // wrong case
+        assert_eq!(bucket_method_label("eth_blockNumberX"), "other");
+
+        // Empty / odd inputs handled.
+        assert_eq!(bucket_method_label(""), "other");
+        assert_eq!(bucket_method_label(&"a".repeat(10_000)), "other");
+    }
 
     /// Self-review R1 — repro+regression. Pre-fix, every `admin_*` JSON-RPC method
     /// was reachable by anyone who could hit the listening port. There was no
