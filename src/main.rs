@@ -83,6 +83,13 @@ struct Command {
     /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
     #[arg(long, env = "MIDEN_DEBUG")]
     miden_debug: bool,
+
+    /// CORS-allowed origins for the JSON-RPC route (R11). Comma-separated list of
+    /// scheme://host[:port] entries. The single value `*` enables a permissive
+    /// wildcard (DEV ONLY — do not deploy to mainnet). Omit to disable CORS entirely
+    /// (the safe production default).
+    #[arg(long, env = "CORS_ALLOWED_ORIGINS", value_delimiter = ',')]
+    cors_allowed_origins: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for Command {
@@ -278,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
     );
     state.l1_rpc_url = command.l1_rpc_url;
     state.ger_l1_address = command.ger_l1_address;
+    state.cors_allowed_origins = command.cors_allowed_origins;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
     // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.

@@ -21,6 +21,10 @@ pub struct ServiceState {
     pub miden_store_dir: PathBuf,
     /// Miden node URL (for building fresh clients)
     pub miden_node_url: String,
+    /// CORS-allowed origins (R11). `None` = no cross-origin requests permitted (the
+    /// safe default in production); `Some(list)` = explicit allowlist; the special
+    /// single-entry `vec!["*"]` is reserved for dev-only wildcards.
+    pub cors_allowed_origins: Option<Vec<String>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -46,6 +50,7 @@ impl ServiceState {
             ger_l1_address: None,
             miden_store_dir: PathBuf::new(),
             miden_node_url: String::new(),
+            cors_allowed_origins: None,
         }
     }
 }

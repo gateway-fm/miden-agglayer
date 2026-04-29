@@ -23,7 +23,6 @@ use std::str::FromStr;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
-use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
@@ -426,12 +425,7 @@ pub async fn serve(
                 // than MAX_REQUEST_BODY_BYTES are rejected with HTTP 413 by tower-http
                 // without ever allocating the full payload.
                 .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
-                .layer(
-                    CorsLayer::new()
-                        .allow_origin(tower_http::cors::Any)
-                        .allow_methods(tower_http::cors::Any)
-                        .allow_headers([http::header::CONTENT_TYPE]),
-                ),
+                .layer(build_cors_layer(state.cors_allowed_origins.as_deref())),
         )
         .with_state(state)
         .route(
@@ -452,6 +446,49 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Build the CORS layer for the JSON-RPC route.
+///
+/// Self-review R11 — pre-fix, the CORS layer used `allow_origin(Any)` and
+/// `allow_methods(Any)`. Combined with the unauthenticated admin endpoints (R1) and
+/// `eth_sendRawTransaction` (R2), a victim's browser visiting attacker.example could
+/// POST to a private agglayer endpoint via fetch, including state-mutating methods
+/// like `admin_registerFaucet` and `eth_sendRawTransaction`.
+///
+/// Now driven by `ServiceState::cors_allowed_origins` (CLI flag
+/// `--cors-allowed-origins` / env `CORS_ALLOWED_ORIGINS`):
+/// - `None` → no `Access-Control-Allow-Origin` header is emitted; cross-origin
+///   browser requests are blocked by the browser. Safest production default.
+/// - `Some(["*"])` → wildcard, dev-only convenience.
+/// - `Some([..])` → explicit allowlist.
+fn build_cors_layer(allowed_origins: Option<&[String]>) -> tower_http::cors::CorsLayer {
+    let layer = tower_http::cors::CorsLayer::new()
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers([http::header::CONTENT_TYPE]);
+    match allowed_origins {
+        None => layer, // no allow-origin → effectively no CORS
+        Some(origins) if origins.iter().any(|o| o == "*") => {
+            tracing::warn!(
+                target: COMPONENT,
+                "R11: CORS configured with wildcard origin — DEV ONLY; do not deploy to mainnet"
+            );
+            layer.allow_origin(tower_http::cors::Any)
+        }
+        Some(origins) => {
+            let parsed: Vec<HeaderValue> = origins
+                .iter()
+                .filter_map(|s| s.parse::<HeaderValue>().ok())
+                .collect();
+            tracing::info!(
+                target: COMPONENT,
+                origins = ?origins,
+                "R11: CORS allow-list configured ({} origin(s))",
+                parsed.len()
+            );
+            layer.allow_origin(parsed)
+        }
+    }
 }
 
 /// Validate that an `address` parameter from a JSON-RPC stub method is a well-formed
@@ -477,6 +514,38 @@ fn validate_eth_address(addr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-review R11 — repro+regression. Pre-fix, `CorsLayer::new().allow_origin(Any)`
+    /// allowed any origin to invoke any JSON-RPC method, including admin endpoints and
+    /// `eth_sendRawTransaction`. Combined with the unauthenticated admin surface (R1)
+    /// this meant a victim's browser visiting attacker.example could POST state-mutating
+    /// requests to a private agglayer endpoint via fetch.
+    ///
+    /// The fix is `build_cors_layer` driven by an explicit allow-list. We can't directly
+    /// inspect `CorsLayer` configuration after build, but we can pin the input contract:
+    /// None → no allow-origin emitted; ["*"] → wildcard with a warning; ["a", "b"] →
+    /// explicit allow-list; junk values are filtered to avoid panics on a misconfigured
+    /// env var.
+    #[test]
+    fn r11_cors_layer_inputs_dont_panic_and_filter_junk() {
+        // None — should construct successfully.
+        let _ = build_cors_layer(None);
+
+        // Wildcard — should construct successfully (warning logged at runtime).
+        let _ = build_cors_layer(Some(&["*".to_string()]));
+
+        // Explicit allow-list — should construct successfully.
+        let _ = build_cors_layer(Some(&[
+            "https://app.example.com".to_string(),
+            "https://staging.example.com".to_string(),
+        ]));
+
+        // Junk values must be filtered (HeaderValue parse fails) instead of panicking.
+        let _ = build_cors_layer(Some(&[
+            "https://valid.example.com".to_string(),
+            "\nnot a valid header value\r".to_string(),
+        ]));
+    }
 
     /// Self-review R10 — repro+regression. Pre-fix, `eth_getCode` / `eth_getBalance` /
     /// `eth_getStorageAt` accepted arbitrary garbage and returned constant stubs
