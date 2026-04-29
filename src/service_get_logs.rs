@@ -13,13 +13,18 @@ use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
 /// 12s blocks; well-behaved consumers paginate.
 pub const MAX_GETLOGS_BLOCK_RANGE: u64 = 10_000;
 
-/// Maximum length of a `topics` filter array in an `eth_getLogs` request. Prevents an
-/// attacker from forcing the store to compare each candidate log against an unbounded
-/// number of topic filters per row.
-pub const MAX_GETLOGS_TOPICS_LEN: usize = 256;
+/// Maximum length of a `topics` filter array in an `eth_getLogs` request.
+///
+/// Per Ethereum spec, an event log carries at most 4 topics (topic0 = signature
+/// hash + up to 3 indexed args). A filter with more than 4 entries cannot match
+/// any real log, so accepting larger arrays is purely DoS surface. Initial
+/// implementation set this to 256 — the security review flagged it as a 64×
+/// over-allocation. Aligned to the spec.
+pub const MAX_GETLOGS_TOPICS_LEN: usize = 4;
 
-/// Maximum number of address-filter entries.
-pub const MAX_GETLOGS_ADDRESSES_LEN: usize = 256;
+/// Maximum number of address-filter entries. Most consumers query 1-2 addresses
+/// at a time; 32 is comfortable headroom for batched indexers.
+pub const MAX_GETLOGS_ADDRESSES_LEN: usize = 32;
 
 pub(crate) async fn service_get_logs(
     service: ServiceState,
