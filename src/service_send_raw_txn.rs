@@ -152,19 +152,102 @@ async fn handle_claim_asset(
 
     // Lock the claim index. All error paths after this MUST unclaim.
     service.store.try_claim(params.globalIndex).await?;
+
+    // R9 — install a RAII drop guard so that even if the request future is
+    // dropped (client disconnect mid-publish, panic, task cancellation), the
+    // claim lock is released. Without the guard, a malicious caller can
+    // permanently lock arbitrary globalIndex values by repeatedly disconnecting
+    // mid-flight during the 15s GER-propagation wait inside `publish_claim`.
+    let guard = ClaimGuard::new(service.store.clone(), params.globalIndex);
+
     let result =
         publish_and_record_claim(service, params.clone(), txn_hash, txn_envelope, signer).await;
     if let Err(err) = result {
-        let _ = service.store.unclaim(&params.globalIndex).await;
+        // Explicit release: the guard would also fire on drop, but doing it
+        // here avoids the tokio::spawn round-trip on the error path.
+        guard.release_explicitly().await;
         tracing::error!("claim failed after lock: {err:#?}");
         return Err(err);
     }
+
+    // On success the lock should NOT be released (the claim is committed). Tell
+    // the guard to forget so its Drop is a no-op.
+    guard.commit();
 
     service
         .store
         .nonce_increment(&format!("{signer:#x}"))
         .await?;
     Ok(txn_hash)
+}
+
+/// RAII guard that releases a `try_claim` lock if the holding future is dropped
+/// before either `commit()` (claim succeeded — keep the lock) or
+/// `release_explicitly()` (claim failed — release synchronously) is called.
+///
+/// On drop with neither call made, schedules a background `unclaim` via
+/// `tokio::spawn`. Guarantees that a cancelled / panicked / disconnected request
+/// future cannot leave a globalIndex permanently locked. Self-review R9.
+pub(crate) struct ClaimGuard {
+    store: Option<std::sync::Arc<dyn crate::store::Store>>,
+    global_index: alloy::primitives::U256,
+}
+
+impl ClaimGuard {
+    fn new(
+        store: std::sync::Arc<dyn crate::store::Store>,
+        global_index: alloy::primitives::U256,
+    ) -> Self {
+        Self {
+            store: Some(store),
+            global_index,
+        }
+    }
+
+    /// Mark the lock as committed — the claim succeeded. Drop becomes a no-op.
+    fn commit(mut self) {
+        self.store = None;
+    }
+
+    /// Synchronously release the lock (caller awaits the unclaim).
+    async fn release_explicitly(mut self) {
+        if let Some(store) = self.store.take() {
+            let _ = store.unclaim(&self.global_index).await;
+        }
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            let global_index = self.global_index;
+            // tokio::spawn requires a current runtime; in normal handler contexts
+            // it always exists. If we're somehow being dropped outside any
+            // runtime (e.g. a unit test that constructed the guard but never
+            // entered tokio), the spawn will panic — guard against that with
+            // try_handle.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = store.unclaim(&global_index).await {
+                        tracing::error!(
+                            target: "claim::guard",
+                            "R9 drop-guard failed to unclaim {global_index}: {e:#}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "claim::guard",
+                            "R9 drop-guard released claim {global_index} after future was cancelled"
+                        );
+                    }
+                });
+            } else {
+                tracing::error!(
+                    target: "claim::guard",
+                    "R9 drop-guard ran outside tokio runtime; claim {global_index} may be leaked"
+                );
+            }
+        }
+    }
 }
 
 /// Publish a CLAIM note and record the transaction in the store.
