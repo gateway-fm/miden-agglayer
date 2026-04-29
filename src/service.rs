@@ -160,8 +160,10 @@ fn check_admin_auth(
     let header_str = header
         .to_str()
         .map_err(|_| AdminAuthError::MalformedHeader)?;
-    let token = header_str
-        .strip_prefix("Bearer ")
+    // RFC 6750 §2.1: the auth-scheme is case-insensitive (`Bearer` == `bearer`).
+    // The previous implementation accepted only `Bearer ` exactly, which would
+    // reject standards-compliant clients that lower-case the scheme.
+    let token = strip_bearer_prefix_case_insensitive(header_str)
         .ok_or(AdminAuthError::MalformedHeader)?;
     if constant_time_eq(token.as_bytes(), configured.as_bytes()) {
         Ok(())
@@ -170,15 +172,41 @@ fn check_admin_auth(
     }
 }
 
-/// Constant-time byte equality — prevents an attacker from learning prefix-match
-/// length from response timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Strip a case-insensitive `Bearer ` (or `bearer `, `BEARER `, etc.) prefix.
+fn strip_bearer_prefix_case_insensitive(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 7 {
+        return None;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let scheme = &bytes[..6];
+    let sep = bytes[6];
+    if scheme.eq_ignore_ascii_case(b"Bearer") && sep == b' ' {
+        // SAFETY: we sliced at byte 7 of an ASCII prefix, so the remaining
+        // bytes form a valid str slice from the same underlying string.
+        Some(&s[7..])
+    } else {
+        None
+    }
+}
+
+/// Constant-time byte equality — prevents an attacker from learning prefix-match
+/// length OR length-mismatch from response timing.
+///
+/// Self-review of-the-fix follow-up: the previous implementation early-returned
+/// `false` on `a.len() != b.len()`, which leaks the configured token length via
+/// timing. Now we walk the longer slice in full, treating any out-of-bounds
+/// byte from the shorter slice as zero. Constant work irrespective of input
+/// shape; the only timing channel is "input length", which is already
+/// observable in the request's wire size.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff: u32 = 0;
+    // Length difference contributes to `diff` so unequal lengths reject.
+    diff |= (a.len() as u32) ^ (b.len() as u32);
+    for i in 0..max_len {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        diff |= u32::from(x ^ y);
     }
     diff == 0
 }
@@ -746,10 +774,59 @@ mod tests {
     fn r1_constant_time_eq_pins_behaviour() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
-        // length mismatch must short-circuit to false (not a panic).
+        // length mismatch must reject (and not panic).
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Self-review of-the-fix follow-up — repro+regression. The previous
+    /// `constant_time_eq` early-returned `false` on `a.len() != b.len()`,
+    /// leaking the configured token length via timing. Test asserts the
+    /// no-early-return contract: the function must walk `max(a.len(),
+    /// b.len())` bytes regardless of where the difference is.
+    ///
+    /// We can't measure timing in a unit test, but we can pin the
+    /// observable contract: same length + same content → true; same length
+    /// + different content (anywhere) → false; different length → false;
+    /// either empty → false unless both empty.
+    #[test]
+    fn r1_constant_time_eq_contract_pinned() {
+        // Same length, every byte position can disagree independently.
+        for i in 0..8 {
+            let mut a = [0u8; 8];
+            let mut b = [0u8; 8];
+            b[i] = 1; // single-byte differ at position i
+            assert!(
+                !constant_time_eq(&a, &b),
+                "single-byte differ at pos {i} must reject"
+            );
+            a[i] = 1;
+            assert!(constant_time_eq(&a, &b), "matching byte at pos {i} must accept");
+        }
+        // Length mismatch from any side.
+        assert!(!constant_time_eq(b"longer-token", b"short"));
+        assert!(!constant_time_eq(b"short", b"longer-token"));
+    }
+
+    /// Self-review of-the-fix follow-up — repro+regression. RFC 6750 §2.1
+    /// makes the bearer auth scheme case-insensitive. The previous
+    /// implementation only accepted `Bearer ` exactly; tests pin the
+    /// case-insensitive prefix while still rejecting non-matching prefixes
+    /// (Basic, garbage, missing space).
+    #[test]
+    fn r1_bearer_prefix_case_insensitive() {
+        assert_eq!(strip_bearer_prefix_case_insensitive("Bearer abc"), Some("abc"));
+        assert_eq!(strip_bearer_prefix_case_insensitive("bearer abc"), Some("abc"));
+        assert_eq!(strip_bearer_prefix_case_insensitive("BEARER abc"), Some("abc"));
+        assert_eq!(strip_bearer_prefix_case_insensitive("BeArEr abc"), Some("abc"));
+
+        // Non-Bearer schemes rejected.
+        assert_eq!(strip_bearer_prefix_case_insensitive("Basic dXNlcg=="), None);
+        assert_eq!(strip_bearer_prefix_case_insensitive("Bearerabc"), None); // missing space
+        assert_eq!(strip_bearer_prefix_case_insensitive("Bear abc"), None); // truncated
+        assert_eq!(strip_bearer_prefix_case_insensitive(""), None);
+        assert_eq!(strip_bearer_prefix_case_insensitive("Bearer "), Some(""));
     }
 
     /// Self-review R11 — repro+regression. Pre-fix, `CorsLayer::new().allow_origin(Any)`
