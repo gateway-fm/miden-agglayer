@@ -10,6 +10,7 @@ pub mod ger;
 pub mod hex;
 pub mod init;
 pub mod log_synthesis;
+pub mod burn_serial_tracker;
 pub mod let_divergence;
 pub mod logging;
 pub mod metrics;

@@ -27,4 +27,11 @@ pub fn init_metrics() {
          kind=on_chain_ahead (private B2AGG was consumed) or \
          kind=aggkit_ahead (local state corruption)."
     );
+    describe_counter!(
+        "bridge_burn_serial_collision_total",
+        "BURN note serial collisions (Cantina #5). Each increment marks \
+         a BURN note whose serial number was already observed for a \
+         different leaf — the bridge's `mint_and_send` token_supply is at \
+         risk of exhaustion. Page critical."
+    );
 }
