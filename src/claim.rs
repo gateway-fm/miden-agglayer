@@ -699,6 +699,47 @@ mod tests {
             );
         }
 
+        /// Cantina #12 — repro+regression. The on-chain MASM
+        /// `verify_u256_to_native_amount_conversion` advertises a 2^128 outer gate
+        /// but the inner verifier algebra only succeeds for x < ~2^123; values in
+        /// [2^123, 2^128) panic later with `ERR_UNDERFLOW`. Aggkit's scaling path
+        /// goes through `EthAmount::scale_to_token_amount` which enforces the
+        /// real protocol cap (`FungibleAsset::MAX_AMOUNT = 2^63 - 2^31`), so any
+        /// amount that falls in the upstream gap is rejected here BEFORE we
+        /// build a CLAIM note that would panic on Miden. This test pins that
+        /// boundary so a future regression that loosens the cap (e.g. switches
+        /// to a tighter or looser `try_from` path) is caught immediately.
+        #[test]
+        fn cantina_12_amount_cap_pins_fungible_asset_max() {
+            use miden_client::asset::FungibleAsset;
+
+            // Boundary: an amount that scales to exactly MAX_AMOUNT must succeed.
+            let max_native = FungibleAsset::MAX_AMOUNT; // 2^63 - 2^31
+            // For an 18→8 decimal layout, scale = 10. Pre-image wei = max_native * 10^10.
+            let wei_at_max = U256::from(max_native).mul(U256::from(10u64).pow(U256::from(10u64)));
+            let amount = scale_claim_amount(&eth_amount(wei_at_max), faucet(18, 8))
+                .expect("exact MAX_AMOUNT must be accepted");
+            assert_eq!(amount, Felt::try_from(max_native).unwrap());
+
+            // Off-by-one above MAX_AMOUNT must be rejected.
+            let wei_just_over = U256::from(max_native + 1)
+                .mul(U256::from(10u64).pow(U256::from(10u64)));
+            assert!(
+                scale_claim_amount(&eth_amount(wei_just_over), faucet(18, 8)).is_err(),
+                "MAX_AMOUNT + 1 must be rejected"
+            );
+
+            // An amount that would fall in the upstream MASM's [2^123, 2^128) gap
+            // must also be rejected here. With scale=10, even 2^123 wei scales to
+            // 2^123 / 10^10 ≈ 2^90, well above MAX_AMOUNT (2^63 - 2^31), so we
+            // catch it before any MASM path could panic.
+            let wei_in_gap = U256::from(1u64) << 123;
+            assert!(
+                scale_claim_amount(&eth_amount(wei_in_gap), faucet(18, 8)).is_err(),
+                "2^123 wei must be rejected client-side (Cantina #12 gap)"
+            );
+        }
+
         #[test]
         fn passes_through_when_decimals_match() {
             let wei = U256::from(1_234_567u64);
