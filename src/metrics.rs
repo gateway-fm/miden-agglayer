@@ -34,4 +34,11 @@ pub fn init_metrics() {
          different leaf — the bridge's `mint_and_send` token_supply is at \
          risk of exhaustion. Page critical."
     );
+    describe_counter!(
+        "bridge_twin_note_detected_total",
+        "Twin-NoteId detections (Cantina #6). Each increment marks a \
+         second on-chain note sharing a previously-observed NoteId but \
+         differing in metadata — the B2AGG reclaim attack signature. \
+         Page critical."
+    );
 }

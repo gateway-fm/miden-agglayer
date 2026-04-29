@@ -13,6 +13,7 @@ pub mod log_synthesis;
 pub mod burn_serial_tracker;
 pub mod let_divergence;
 pub mod logging;
+pub mod twin_note_detector;
 pub mod metrics;
 pub mod miden_client;
 pub mod recovery;
