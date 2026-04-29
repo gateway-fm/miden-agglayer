@@ -78,7 +78,23 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
     match method {
         "eth_getCode" => {
-            let _params: (String, String) = request.parse_params()?;
+            // R10 — validate the address before returning the constant stub. Pre-fix,
+            // any garbage was accepted and a non-empty single-byte was returned, which
+            // some EVM-compat consumers interpret as "this address has code". Reject
+            // malformed addresses with InvalidParams; well-formed addresses still get
+            // the stub `0xFE` response (this is a JSON-RPC stub for compat — there is
+            // no L2 EVM bytecode store, the response is documented as a sentinel).
+            let params: (String, String) = request.parse_params()?;
+            validate_eth_address(&params.0).map_err(|msg| {
+                JsonRpcResponse::error(
+                    answer_id.clone(),
+                    JsonRpcError::new(
+                        JsonRpcErrorReason::InvalidParams,
+                        format!("eth_getCode: {msg}"),
+                        serde_json::Value::Null,
+                    ),
+                )
+            })?;
             Ok(JsonRpcResponse::success(answer_id, "0xFE"))
         }
 
@@ -263,7 +279,17 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         "eth_getLogs" => service_get_logs(service, request).await,
 
         "eth_getBalance" => {
-            let _params: (String, String) = request.parse_params()?;
+            let params: (String, String) = request.parse_params()?;
+            validate_eth_address(&params.0).map_err(|msg| {
+                JsonRpcResponse::error(
+                    answer_id.clone(),
+                    JsonRpcError::new(
+                        JsonRpcErrorReason::InvalidParams,
+                        format!("eth_getBalance: {msg}"),
+                        serde_json::Value::Null,
+                    ),
+                )
+            })?;
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         }
 
@@ -278,7 +304,17 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         "eth_getStorageAt" => {
-            let _params: (String, String, String) = request.parse_params()?;
+            let params: (String, String, String) = request.parse_params()?;
+            validate_eth_address(&params.0).map_err(|msg| {
+                JsonRpcResponse::error(
+                    answer_id.clone(),
+                    JsonRpcError::new(
+                        JsonRpcErrorReason::InvalidParams,
+                        format!("eth_getStorageAt: {msg}"),
+                        serde_json::Value::Null,
+                    ),
+                )
+            })?;
             Ok(JsonRpcResponse::success(
                 answer_id,
                 "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -409,9 +445,60 @@ pub async fn serve(
     Ok(())
 }
 
+/// Validate that an `address` parameter from a JSON-RPC stub method is a well-formed
+/// 20-byte hex address (`0x` prefix + 40 hex chars). Returns an error message suitable
+/// for an `InvalidParams` JSON-RPC response.
+///
+/// Self-review R10 — pre-fix, methods like `eth_getCode` accepted arbitrary garbage
+/// and still returned a constant stub. Some downstream EVM-compat tools interpret
+/// `0xFE` (the `eth_getCode` stub) as "address has code", so accepting a malformed
+/// input could mislead consistency checks. Reject malformed values rather than
+/// fabricate compatibility.
+fn validate_eth_address(addr: &str) -> Result<(), String> {
+    let s = addr.strip_prefix("0x").ok_or("address must start with 0x")?;
+    if s.len() != 40 {
+        return Err(format!("address must be 40 hex chars, got {}", s.len()));
+    }
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("address contains non-hex characters".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-review R10 — repro+regression. Pre-fix, `eth_getCode` / `eth_getBalance` /
+    /// `eth_getStorageAt` accepted arbitrary garbage and returned constant stubs
+    /// regardless. Test that the validator rejects (a) the empty string,
+    /// (b) addresses missing the `0x` prefix, (c) wrong length, (d) non-hex
+    /// characters, and accepts (e) a well-formed lowercase address and (f) the
+    /// upper/mixed-case checksum form.
+    #[test]
+    fn r10_validate_eth_address_rejects_garbage() {
+        assert!(validate_eth_address("").is_err());
+        assert!(validate_eth_address("nope").is_err());
+        assert!(
+            validate_eth_address("0000000000000000000000000000000000000000").is_err(),
+            "missing 0x prefix"
+        );
+        assert!(
+            validate_eth_address("0x000000000000000000000000000000000000000").is_err(),
+            "39 chars (one short)"
+        );
+        assert!(
+            validate_eth_address("0x00000000000000000000000000000000000000000").is_err(),
+            "41 chars (one long)"
+        );
+        assert!(
+            validate_eth_address("0xZZZZ000000000000000000000000000000000000").is_err(),
+            "non-hex chars"
+        );
+        // Accepted forms.
+        assert!(validate_eth_address("0x0000000000000000000000000000000000000000").is_ok());
+        assert!(validate_eth_address("0xAbCDeF1234567890aBcdEf1234567890ABcDef12").is_ok());
+    }
 
     /// Self-review R6 — repro+regression. The limit constant must be (a) at least as
     /// big as the largest legitimate payload (worst case: an `eth_sendRawTransaction`
