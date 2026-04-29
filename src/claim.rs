@@ -167,6 +167,57 @@ fn bytes32_array_to_smt_nodes(values: [FixedBytes<32>; 32]) -> [SmtNode; 32] {
     values.map(|v| SmtNode::new(v.0))
 }
 
+/// Decode the agglayer mainnet flag from a `globalIndex` U256.
+///
+/// GlobalIndex layout (per miden-agglayer's `eth_types::global_index`):
+///   - bytes 0..20  : zero (top 160 bits of the U256)
+///   - bytes 20..24 : mainnet flag (limb 5; value = 1 for mainnet, 0 for rollup)
+///   - bytes 24..28 : rollup index (limb 6; must be 0 for mainnet deposits)
+///   - bytes 28..32 : leaf index (limb 7)
+///
+/// `GlobalIndexExt::is_mainnet()` is gated behind upstream's `testing` feature so we
+/// decode the flag inline.
+fn is_mainnet_global_index(global_index_bytes: &[u8; 32]) -> bool {
+    let flag = u32::from_be_bytes([
+        global_index_bytes[20],
+        global_index_bytes[21],
+        global_index_bytes[22],
+        global_index_bytes[23],
+    ]);
+    flag == 1
+}
+
+/// Build the CLAIM note's `ProofData`, canonicalising the rollup-side fields when the
+/// claim is for a mainnet deposit (Cantina #11).
+///
+/// The on-chain CLAIM verifier's mainnet branch in `bridge_in.masm` does not read
+/// `smt_proof_rollup_exit_root` (256 felts) or `rollup_exit_root` (8 felts) and does not
+/// constrain them to any value. Whatever the caller supplies still gets folded into the
+/// CLAIM note's RECIPIENT digest and into PROOF_DATA_KEY (the future MINT note's serial —
+/// see Cantina #7), making each note's NoteId non-deterministic across equivalent mainnet
+/// claims. Zero those fields here so re-submissions of the same mainnet claim hash to
+/// the same NoteId and the produced commitment is canonical even before the upstream
+/// MASM-side gate lands.
+fn build_canonical_proof_data(params: &claimAssetCall) -> ProofData {
+    let global_index_bytes = params.globalIndex.to_be_bytes::<32>();
+    let is_mainnet = is_mainnet_global_index(&global_index_bytes);
+    ProofData {
+        smt_proof_local_exit_root: bytes32_array_to_smt_nodes(params.smtProofLocalExitRoot),
+        smt_proof_rollup_exit_root: if is_mainnet {
+            [SmtNode::new([0u8; 32]); 32]
+        } else {
+            bytes32_array_to_smt_nodes(params.smtProofRollupExitRoot)
+        },
+        global_index: GlobalIndex::new(global_index_bytes),
+        mainnet_exit_root: ExitRoot::new(params.mainnetExitRoot.0),
+        rollup_exit_root: if is_mainnet {
+            ExitRoot::new([0u8; 32])
+        } else {
+            ExitRoot::new(params.rollupExitRoot.0)
+        },
+    }
+}
+
 /// Scales an L1 deposit amount into a Miden fungible-token amount using the faucet's
 /// decimal layout. Sub-unit wei are truncated (the full value is still preserved in
 /// `leaf_data.amount`); the only hard failure is exceeding `FungibleAsset::MAX_AMOUNT`.
@@ -204,13 +255,7 @@ async fn create_claim(
     let _dest_account =
         crate::address_mapper::resolve_address(store, params.destinationAddress, accounts).await?;
 
-    let proof_data = ProofData {
-        smt_proof_local_exit_root: bytes32_array_to_smt_nodes(params.smtProofLocalExitRoot),
-        smt_proof_rollup_exit_root: bytes32_array_to_smt_nodes(params.smtProofRollupExitRoot),
-        global_index: GlobalIndex::new(params.globalIndex.to_be_bytes::<32>()),
-        mainnet_exit_root: ExitRoot::new(params.mainnetExitRoot.0),
-        rollup_exit_root: ExitRoot::new(params.rollupExitRoot.0),
-    };
+    let proof_data = build_canonical_proof_data(&params);
 
     let leaf_data = LeafData {
         origin_network: params.originNetwork,
@@ -669,6 +714,114 @@ mod tests {
                 msg.contains("invariant violated"),
                 "unexpected error: {msg}"
             );
+        }
+    }
+
+    /// Cantina #11 — repro+regression. The on-chain CLAIM verifier's mainnet branch
+    /// does not constrain `smt_proof_rollup_exit_root` (256 felts) or `rollup_exit_root`
+    /// (8 felts) — any garbage prover supplies still folds into the note's RECIPIENT
+    /// digest and PROOF_DATA_KEY, so equivalent mainnet claims with different rollup-side
+    /// bytes produce different NoteIds. Aggkit canonicalises by zeroing those fields
+    /// when the globalIndex's mainnet flag is set.
+    mod cantina_11_canonical_mainnet_proof_data {
+        use super::*;
+        use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+
+        /// Build a claimAssetCall with a chosen mainnet flag and rollup-side garbage.
+        fn make_call(mainnet: bool, rollup_garbage_byte: u8) -> claimAssetCall {
+            // GlobalIndex layout: bytes 0..20 zero, bytes 20..24 mainnet flag (BE),
+            // bytes 24..28 rollup index, bytes 28..32 leaf index.
+            let mut gi = [0u8; 32];
+            if mainnet {
+                gi[23] = 1; // BE-low byte of the flag word
+            } // else flag stays 0 = rollup
+            gi[31] = 42; // leaf index = 42
+
+            let smt_local: [FixedBytes<32>; 32] =
+                std::array::from_fn(|i| FixedBytes([i as u8; 32]));
+            let smt_rollup: [FixedBytes<32>; 32] =
+                std::array::from_fn(|_| FixedBytes([rollup_garbage_byte; 32]));
+
+            claimAssetCall {
+                smtProofLocalExitRoot: smt_local,
+                smtProofRollupExitRoot: smt_rollup,
+                globalIndex: U256::from_be_bytes(gi),
+                mainnetExitRoot: FixedBytes([0xAAu8; 32]),
+                rollupExitRoot: FixedBytes([rollup_garbage_byte; 32]),
+                originNetwork: 0,
+                originTokenAddress: Address::ZERO,
+                destinationNetwork: 1,
+                destinationAddress: Address::ZERO,
+                amount: U256::from(0u64),
+                metadata: Bytes::new(),
+            }
+        }
+
+        #[test]
+        fn mainnet_claim_zeroes_rollup_proof_and_rollup_exit_root() {
+            let call = make_call(true, 0xCC);
+            let proof = build_canonical_proof_data(&call);
+
+            let zero_node = SmtNode::new([0u8; 32]);
+            for n in proof.smt_proof_rollup_exit_root.iter() {
+                assert_eq!(*n, zero_node, "mainnet smt_proof_rollup must be zeroed");
+            }
+            assert_eq!(
+                proof.rollup_exit_root,
+                ExitRoot::new([0u8; 32]),
+                "mainnet rollup_exit_root must be zeroed"
+            );
+            // Mainnet exit root is preserved.
+            assert_eq!(proof.mainnet_exit_root, ExitRoot::new([0xAAu8; 32]));
+        }
+
+        #[test]
+        fn mainnet_claim_note_id_invariant_to_rollup_garbage() {
+            // Two mainnet claims for the same leaf, but different rollup-side garbage.
+            // Post-fix the canonicalised ProofData must be byte-identical, proving the
+            // resulting CLAIM note RECIPIENT (and therefore NoteId) is deterministic.
+            let a = build_canonical_proof_data(&make_call(true, 0x00));
+            let b = build_canonical_proof_data(&make_call(true, 0xFF));
+            assert_eq!(
+                a.smt_proof_rollup_exit_root, b.smt_proof_rollup_exit_root,
+                "rollup proof must be canonical for mainnet"
+            );
+            assert_eq!(
+                a.rollup_exit_root, b.rollup_exit_root,
+                "rollup_exit_root must be canonical for mainnet"
+            );
+        }
+
+        #[test]
+        fn rollup_claim_preserves_rollup_proof() {
+            // Non-mainnet claims must NOT be canonicalised — those fields are load-bearing
+            // for rollup-leaf verification.
+            let call = make_call(false, 0xCC);
+            let proof = build_canonical_proof_data(&call);
+
+            let cc_node = SmtNode::new([0xCCu8; 32]);
+            for n in proof.smt_proof_rollup_exit_root.iter() {
+                assert_eq!(*n, cc_node, "rollup smt_proof must be preserved verbatim");
+            }
+            assert_eq!(proof.rollup_exit_root, ExitRoot::new([0xCCu8; 32]));
+        }
+
+        #[test]
+        fn is_mainnet_global_index_decodes_layout() {
+            let mut gi = [0u8; 32];
+            assert!(!is_mainnet_global_index(&gi), "all-zero is rollup");
+            gi[23] = 1;
+            assert!(is_mainnet_global_index(&gi), "flag at byte 23 → mainnet");
+            // Garbage outside the flag bytes must not flip the result.
+            gi[20] = 0;
+            gi[21] = 0;
+            gi[22] = 0;
+            gi[24] = 0xFF; // rollup index garbage
+            gi[31] = 0xFF; // leaf index garbage
+            assert!(is_mainnet_global_index(&gi));
+            // Flag = 2 is technically out of spec but our decoder must only treat 1 as mainnet.
+            gi[23] = 2;
+            assert!(!is_mainnet_global_index(&gi), "flag must be exactly 1");
         }
     }
 }
