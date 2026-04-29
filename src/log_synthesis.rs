@@ -101,7 +101,22 @@ impl LogFilter {
             .unwrap_or(current_block)
     }
 
-    /// Check if the query's topic filter explicitly includes the given topic.
+    /// Check if the query's topic0 filter explicitly includes the given topic.
+    ///
+    /// Self-review B11 — pre-fix the docstring said "the query's topic filter"
+    /// generally; in fact this only inspects topic0 (the event signature hash),
+    /// matching go-ethereum's behaviour for synthetic-log passthrough where the
+    /// caller asks "is this event family interesting?" Topics 1..3 (indexed
+    /// args) are matched separately via `LogFilter::matches`. Document the
+    /// contract explicitly so a future refactor that adds topics 1..3 doesn't
+    /// silently break.
+    ///
+    /// Returns false if:
+    /// - `topic` is `None`
+    /// - the filter has no topics array
+    /// - the filter has a topics array but no topic0 entry
+    /// - the topic0 entry is `None` (= "any topic0" wildcard)
+    /// - the topic0 entry is `Some(filter)` and `topic` doesn't match
     fn query_includes_topic(&self, topic: Option<&str>) -> bool {
         let Some(topic) = topic else {
             return false;
@@ -109,7 +124,8 @@ impl LogFilter {
         let Some(ref topic_filters) = self.topics else {
             return false;
         };
-        // Check if topic0 filter includes this topic
+        // Check ONLY topic0 — synthetic logs are passthrough-filtered by event
+        // family at this layer. Indexed-arg matching happens later.
         if let Some(Some(filter)) = topic_filters.first() {
             let topic_lower = topic.to_lowercase();
             return match filter {
