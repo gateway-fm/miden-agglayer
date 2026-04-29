@@ -205,13 +205,73 @@ pub fn parse_token_metadata(
 
     // Read symbol offset (second word) and decode the string
     let symbol_offset = u256_from_be_slice(&data[32..64]);
-    let symbol = abi_decode_string(data, symbol_offset)?;
+    let raw_symbol = abi_decode_string(data, symbol_offset)?;
 
-    if symbol.is_empty() {
+    if raw_symbol.is_empty() {
         anyhow::bail!("parsed empty symbol from metadata for token {token_address}");
     }
 
+    // X5 — sanitise the L1 symbol for Miden's TokenSymbol constraints.
+    // Miden requires uppercase A-Z, max 6 chars, no digits or punctuation.
+    // L1 ERC-20s routinely use lowercase ("usdt"), digits ("1INCH"), or
+    // mixed case ("USDC.e"). Pre-fix the raw symbol flowed straight to
+    // `create_agglayer_faucet`, which panics on invalid TokenSymbol —
+    // failing the auto-create and (combined with RD-860 swallow)
+    // permanently dropping every claim of that token. Sanitise to a
+    // deterministic Miden-compatible value while preserving the raw
+    // symbol via tracing for operator visibility.
+    let symbol = sanitise_token_symbol(&raw_symbol, token_address);
+
     Ok((symbol, decimals))
+}
+
+/// Maximum length of a Miden TokenSymbol. The upstream type accepts ≤ 6
+/// uppercase ASCII letters.
+pub const MIDEN_TOKEN_SYMBOL_MAX: usize = 6;
+
+/// Sanitise a raw L1 token symbol into a Miden-compatible TokenSymbol.
+///
+/// Maps any character that is NOT an uppercase A-Z to nothing (drop), keeps
+/// at most `MIDEN_TOKEN_SYMBOL_MAX` characters, and uppercases the rest.
+/// If the result is empty, falls back to a deterministic identifier
+/// derived from the first 4 hex chars of the token address (so
+/// non-letterful symbols like "🪙" or "$$$" still produce a stable
+/// non-clashing fallback).
+pub fn sanitise_token_symbol(raw: &str, token_address: &Address) -> String {
+    let upper: String = raw
+        .chars()
+        .filter_map(|c| {
+            let u = c.to_ascii_uppercase();
+            if u.is_ascii_uppercase() {
+                Some(u)
+            } else {
+                None
+            }
+        })
+        .take(MIDEN_TOKEN_SYMBOL_MAX)
+        .collect();
+    if upper.is_empty() {
+        // Fallback: T + first 4 hex chars of the token address.
+        let addr_hex = format!("{token_address:x}");
+        // Address is hex32 (lowercase, no 0x). Take first 4 chars and uppercase.
+        let suffix: String = addr_hex
+            .chars()
+            .take(4)
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        format!("T{suffix}")
+    } else {
+        if upper != raw {
+            tracing::warn!(
+                target: "faucet",
+                raw_symbol = %raw,
+                sanitised = %upper,
+                token_address = %token_address,
+                "X5: L1 token symbol sanitised to fit Miden's TokenSymbol constraints"
+            );
+        }
+        upper
+    }
 }
 
 /// Read a big-endian u256 as a usize offset.
@@ -428,6 +488,79 @@ mod tests {
         let metadata = Bytes::from(data);
         let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
         assert!(parse_token_metadata(&metadata, &addr).is_err());
+    }
+
+    /// Self-review X5 — repro+regression. Pre-fix, the raw L1 symbol was
+    /// passed straight to `create_agglayer_faucet`, which calls Miden's
+    /// `TokenSymbol::new(&str)` — that helper panics or returns Err on
+    /// any non-uppercase / non-A-Z / >6-char input. Real-world tokens
+    /// like "usdt", "1INCH", "USDC.e", "stETH" therefore failed
+    /// auto-create. Combined with RD-860 swallow, those claims would
+    /// silently drop forever.
+    ///
+    /// Tests pin the sanitiser's behaviour over a representative set:
+    /// - lowercase preserved letters → uppercased
+    /// - digits/punctuation dropped
+    /// - multi-letter prefixes capped at MIDEN_TOKEN_SYMBOL_MAX
+    /// - empty after stripping → fallback to T + first 4 hex of address
+    /// - already-canonical symbols pass through unchanged (no warning
+    ///   trigger)
+    #[test]
+    fn x5_sanitise_token_symbol() {
+        let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+
+        // Lowercase preserved letters.
+        assert_eq!(sanitise_token_symbol("usdt", &addr), "USDT");
+
+        // Digits dropped.
+        assert_eq!(sanitise_token_symbol("1INCH", &addr), "INCH");
+
+        // Punctuation dropped.
+        assert_eq!(sanitise_token_symbol("USDC.e", &addr), "USDCE");
+
+        // Mixed case — uppercased.
+        assert_eq!(sanitise_token_symbol("stETH", &addr), "STETH");
+
+        // Already canonical — passes through.
+        assert_eq!(sanitise_token_symbol("ETH", &addr), "ETH");
+
+        // Truncated to MIDEN_TOKEN_SYMBOL_MAX.
+        assert_eq!(sanitise_token_symbol("VERYLONG", &addr), "VERYLO");
+
+        // All-letter cap exact.
+        assert_eq!(sanitise_token_symbol("ABCDEF", &addr), "ABCDEF");
+        assert_eq!(sanitise_token_symbol("ABCDEFG", &addr), "ABCDEF");
+
+        // Empty after stripping → fallback.
+        let result = sanitise_token_symbol("$$$", &addr);
+        assert!(result.starts_with('T'));
+        assert_eq!(result.len(), 5); // T + 4 hex chars
+        assert!(result.chars().skip(1).all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+
+        // Non-ASCII Unicode dropped, falls back.
+        let result = sanitise_token_symbol("🪙", &addr);
+        assert!(result.starts_with('T'));
+    }
+
+    /// Self-review X5 — when invoked through `parse_token_metadata`, the
+    /// returned symbol must be Miden-compatible regardless of L1 input.
+    #[test]
+    fn x5_parse_token_metadata_returns_sanitised_symbol() {
+        // Build metadata with a lowercase symbol "usdt".
+        let mut data = vec![0u8; 224];
+        data[31] = 0x60; // name offset
+        data[63] = 0xa0; // symbol offset
+        data[95] = 6; // decimals
+        // name = "X" at 0x60
+        data[127] = 1;
+        data[128] = b'X';
+        // symbol = "usdt" at 0xa0
+        data[191] = 4;
+        data[192..196].copy_from_slice(b"usdt");
+        let metadata = Bytes::from(data);
+        let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let (symbol, _decimals) = parse_token_metadata(&metadata, &addr).unwrap();
+        assert_eq!(symbol, "USDT");
     }
 
     /// Helper for X3 tests: build a minimal valid ABI metadata with a
