@@ -126,6 +126,87 @@ struct Command {
     require_hardening: bool,
 }
 
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    /// Test fixture: build a Command with all the boring fields set to
+    /// minimum-valid defaults, then mutate the hardening fields per test.
+    fn cmd(
+        require: bool,
+        admin: Option<String>,
+        signers: Option<Vec<alloy::primitives::Address>>,
+        cors: Option<Vec<String>>,
+    ) -> Command {
+        Command {
+            port: 8546,
+            miden_store_dir: None,
+            miden_node: None,
+            chain_id: 1,
+            network_id: 1,
+            init: false,
+            database_url: None,
+            restore: false,
+            reset_miden_store: false,
+            unlock_miden_accounts: false,
+            bridge_address:
+                miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS.to_string(),
+            l1_rpc_url: None,
+            ger_l1_address: None,
+            miden_debug: false,
+            cors_allowed_origins: cors,
+            admin_api_key: admin,
+            allowed_signers: signers,
+            rate_limit_per_second: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND,
+            rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
+            require_hardening: require,
+        }
+    }
+
+    /// When --require-hardening is false, no invariant is enforced.
+    #[test]
+    fn hardening_disabled_passes_with_open_defaults() {
+        let c = cmd(false, None, None, None);
+        assert!(check_hardening_invariants(&c).is_ok());
+    }
+
+    /// All three flags missing → all three reasons reported.
+    #[test]
+    fn hardening_enabled_lists_every_unsatisfied_invariant() {
+        let c = cmd(true, None, None, None);
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(reasons.len(), 2, "admin + signers missing; cors absent OK");
+        assert!(reasons[0].contains("--admin-api-key"));
+        assert!(reasons[1].contains("--allowed-signers"));
+    }
+
+    /// Wildcard CORS triggers the third reason.
+    #[test]
+    fn hardening_flags_wildcard_cors() {
+        let c = cmd(
+            true,
+            Some("k".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["*".into()]),
+        );
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("wildcard `*`"));
+    }
+
+    /// All flags set correctly → pass even with hardening enabled.
+    #[test]
+    fn hardening_all_set_passes() {
+        let c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        assert!(check_hardening_invariants(&c).is_ok());
+    }
+}
+
 /// Validate the `--require-hardening` invariants. Returns a list of
 /// reason strings naming each unsatisfied flag. Empty list = pass.
 fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
