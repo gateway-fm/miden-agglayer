@@ -334,7 +334,16 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         "admin_listFaucets" => {
-            let faucets = service.store.list_faucets().await.unwrap_or_default();
+            // R12 — propagate store errors to the caller. Pre-fix this used
+            // `unwrap_or_default()`, returning an empty list on transient DB failure.
+            // An operator monitoring "do we have faucets?" via this endpoint would
+            // think the registry was empty during a Postgres blip and might
+            // double-register.
+            let faucets = service
+                .store
+                .list_faucets()
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?;
             let list: Vec<serde_json::Value> = faucets
                 .iter()
                 .map(|f| {
