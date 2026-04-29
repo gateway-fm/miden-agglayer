@@ -60,4 +60,10 @@ pub fn init_metrics() {
          aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge \
          note authorship. Page critical, freeze claim processing."
     );
+    describe_counter!(
+        "bridge_expected_mint_stale_total",
+        "Expected MINT NoteId did not land within the configured retry \
+         threshold (Cantina #7). Indicates batch-dedup censorship via a \
+         metadata-distinct twin. Triggers retry; alerts after K retries."
+    );
 }

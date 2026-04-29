@@ -11,6 +11,7 @@ pub mod hex;
 pub mod init;
 pub mod log_synthesis;
 pub mod burn_serial_tracker;
+pub mod expected_mint_tracker;
 pub mod faucet_ownership_monitor;
 pub mod forged_mint_detector;
 pub mod let_divergence;
