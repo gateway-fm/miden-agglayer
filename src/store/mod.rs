@@ -220,7 +220,7 @@ pub trait Store: Send + Sync + 'static {
         let log = SyntheticLog {
             address: bridge_address.to_string(),
             topics: vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
-            data: crate::log_synthesis::encode_claim_event_data(
+            data: crate::log_synthesis::encode_claim_event_data_u64(
                 global_index,
                 origin_network,
                 origin_address,
