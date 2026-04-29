@@ -41,4 +41,10 @@ pub fn init_metrics() {
          differing in metadata — the B2AGG reclaim attack signature. \
          Page critical."
     );
+    describe_counter!(
+        "bridge_mint_target_mismatch_total",
+        "MINT note consumed by a faucet other than its NetworkAccountTarget \
+         attachment (Cantina #2). The claimant is about to receive the \
+         wrong wrapped asset. Page critical."
+    );
 }
