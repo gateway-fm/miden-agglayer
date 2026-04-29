@@ -47,4 +47,11 @@ pub fn init_metrics() {
          attachment (Cantina #2). The claimant is about to receive the \
          wrong wrapped asset. Page critical."
     );
+    describe_counter!(
+        "bridge_faucet_ownership_drift_total",
+        "Faucet owner storage slot has changed away from the configured \
+         bridge AccountId (Cantina #4). Labels: kind=drift (transferred to \
+         another account) or kind=renounced (owner cleared, faucet wedged). \
+         Page critical."
+    );
 }
