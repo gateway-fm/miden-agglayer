@@ -150,6 +150,37 @@ async fn handle_claim_asset(
         return Ok(txn_hash);
     }
 
+    // C6 — gate on `has_seen_ger` BEFORE acquiring the claim lock.
+    //
+    // The CLAIM note's leaf proof is internally consistent (built from L1
+    // calldata), but on-chain the bridge MASM verifies it against the GER
+    // currently stored in the bridge account. If aggkit hasn't yet observed
+    // (and propagated) the relevant GER, the on-chain `assert_valid_ger`
+    // rejects the claim — but only AFTER:
+    //   1. try_claim locks the globalIndex
+    //   2. publish_claim sleeps 15s waiting for GER propagation
+    //   3. Miden tx is submitted
+    //   4. on-chain MASM panics with ERR_GER_NOT_FOUND
+    //   5. unclaim runs
+    //
+    // That entire round-trip is wasted work (and burns a Miden gas budget).
+    // Pre-check `has_seen_ger(combined_ger(mainnet_exit_root, rollup_exit_root))`
+    // — if false, return a retryable error immediately so aggkit-driven
+    // clients re-submit cleanly without burning the lock or the 15s wait.
+    let combined = crate::ger::combined_ger(
+        &params.mainnetExitRoot.0,
+        &params.rollupExitRoot.0,
+    );
+    if !service.store.has_seen_ger(&combined).await? {
+        ::metrics::counter!("rpc_claim_ger_not_seen_total").increment(1);
+        anyhow::bail!(
+            "claim references a GER that aggkit has not observed yet \
+             (mainnet={}, rollup={}); retry after the GER is injected. C6.",
+            ::hex::encode(params.mainnetExitRoot.0),
+            ::hex::encode(params.rollupExitRoot.0)
+        );
+    }
+
     // Lock the claim index. All error paths after this MUST unclaim.
     service.store.try_claim(params.globalIndex).await?;
 
@@ -633,6 +664,47 @@ mod tests {
         );
     }
 
+    /// Self-review C6 — repro+regression. A claim referencing a GER that
+    /// aggkit has not observed must be rejected BEFORE the lock is
+    /// acquired. Pre-fix the proxy locked the globalIndex, ran the 15s
+    /// GER-propagation wait, submitted to Miden, and only then saw the
+    /// on-chain `ERR_GER_NOT_FOUND` panic — wasted work + held lock for
+    /// the full round-trip.
+    #[tokio::test]
+    async fn c6_claim_with_unseen_ger_rejected_before_lock() {
+        let service = create_test_service();
+        let store = service.store.clone();
+
+        let global_index = U256::from(99u64);
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: global_index,
+            mainnetExitRoot: FixedBytes::from([0xAAu8; 32]),
+            rollupExitRoot: FixedBytes::from([0xBBu8; 32]),
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 1,
+            destinationAddress: Address::from([0x42; 20]),
+            amount: U256::from(1_000u64),
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let (input_hex, _) = encode_legacy_tx(calldata);
+
+        // GER is NOT pre-seeded — this is the test's whole point.
+        let result = service_send_raw_txn(service, input_hex).await;
+        let err = result.expect_err("claim with unseen GER must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("not observed yet"), "unexpected: {msg}");
+
+        // The lock must NOT have been acquired (cheap retry surface).
+        assert!(
+            !store.is_claimed(&global_index).await.unwrap(),
+            "C6 must reject before acquiring the claim lock"
+        );
+    }
+
     #[tokio::test]
     async fn test_claim_asset_no_event_on_failure() {
         let service = create_test_service();
@@ -655,6 +727,23 @@ mod tests {
         }
         .abi_encode();
         let (input_hex, _) = encode_legacy_tx(calldata);
+
+        // C6 — pre-seed the GER as seen so the new pre-check passes; the
+        // test's intent is to exercise the publish-failure path, not the
+        // GER-not-yet-seen path.
+        let ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
+        store
+            .mark_ger_seen(
+                &ger,
+                crate::log_synthesis::GerEntry {
+                    mainnet_exit_root: Some([0u8; 32]),
+                    rollup_exit_root: Some([0u8; 32]),
+                    block_number: 1,
+                    timestamp: 0,
+                },
+            )
+            .await
+            .unwrap();
 
         let result = service_send_raw_txn(service, input_hex).await;
         assert!(result.is_err(), "publish_claim should fail with test stub");

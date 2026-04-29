@@ -90,4 +90,10 @@ pub fn init_metrics() {
         "B2AGG note referenced a faucet not in the registry (B8). \
          Quarantined to prevent silent re-loop on every sync tick."
     );
+    describe_counter!(
+        "rpc_claim_ger_not_seen_total",
+        "Claim submission rejected because the referenced GER was not \
+         yet in `has_seen_ger` (C6). Caller should retry after the GER \
+         is injected; the lock is NOT acquired so retries are cheap."
+    );
 }
