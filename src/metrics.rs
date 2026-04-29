@@ -78,4 +78,11 @@ pub fn init_metrics() {
          zero address or in the EVM precompile range (B7). Forwarding such \
          events to bridge-service would waste cert-build work."
     );
+    describe_counter!(
+        "address_mapper_zero_padding_fallback_total",
+        "Address-mapper zero-padding fallback was taken (C5). The EVM \
+         destination had no explicit store mapping; a Miden AccountId was \
+         reconstructed from the trailing 16 bytes. Account existence on \
+         Miden is NOT verified — alert on unusual rates."
+    );
 }
