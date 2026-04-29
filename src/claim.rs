@@ -198,9 +198,23 @@ fn is_mainnet_global_index(global_index_bytes: &[u8; 32]) -> bool {
 /// claims. Zero those fields here so re-submissions of the same mainnet claim hash to
 /// the same NoteId and the produced commitment is canonical even before the upstream
 /// MASM-side gate lands.
+///
+/// In addition: the GlobalIndex layout reserves limb 6 (bytes 24..28) for the rollup
+/// index, which "must be 0 for mainnet deposits" per upstream's
+/// `eth_types::global_index` doc-comment. The original Cantina #11 fix preserved
+/// the full `globalIndex` u256, so an attacker setting non-zero rollup-index bytes
+/// in a mainnet leaf could still produce a non-canonical NoteId. The security
+/// review of-the-fix flagged this gap: also zero bytes 24..28 of the globalIndex
+/// when the mainnet flag is set.
 fn build_canonical_proof_data(params: &claimAssetCall) -> ProofData {
-    let global_index_bytes = params.globalIndex.to_be_bytes::<32>();
+    let mut global_index_bytes = params.globalIndex.to_be_bytes::<32>();
     let is_mainnet = is_mainnet_global_index(&global_index_bytes);
+    if is_mainnet {
+        // Rollup index (limb 6 = bytes 24..28) must be 0 for mainnet deposits.
+        // Zero it explicitly so attacker-supplied garbage in those bytes can't
+        // change the resulting NoteId.
+        global_index_bytes[24..28].fill(0);
+    }
     ProofData {
         smt_proof_local_exit_root: bytes32_array_to_smt_nodes(params.smtProofLocalExitRoot),
         smt_proof_rollup_exit_root: if is_mainnet {
@@ -830,6 +844,41 @@ mod tests {
             assert_eq!(
                 a.rollup_exit_root, b.rollup_exit_root,
                 "rollup_exit_root must be canonical for mainnet"
+            );
+        }
+
+        /// Self-review of-the-fix follow-up — the original Cantina #11 fix
+        /// preserved the full `globalIndex` u256, including bytes 24..28 (limb
+        /// 6 = rollup index). A malicious caller setting *both* the mainnet
+        /// flag AND non-zero rollup-index bytes could still produce different
+        /// NoteIds for the same mainnet leaf. This test pins the tightening:
+        /// the rollup-index bytes are zeroed when the mainnet flag is set.
+        #[test]
+        fn mainnet_claim_zeroes_rollup_index_bytes_in_global_index() {
+            // Build two mainnet claims where the rollup-index bytes (24..28)
+            // differ, everything else identical.
+            let mut gi_a = [0u8; 32];
+            gi_a[23] = 1; // mainnet flag
+            gi_a[24] = 0xAA; // attacker-supplied rollup-index garbage
+            gi_a[31] = 42;
+
+            let mut gi_b = gi_a;
+            gi_b[24] = 0xBB;
+            gi_b[25] = 0xCC;
+
+            let mut call_a = make_call(true, 0);
+            call_a.globalIndex = U256::from_be_bytes(gi_a);
+            let mut call_b = make_call(true, 0);
+            call_b.globalIndex = U256::from_be_bytes(gi_b);
+
+            let a = build_canonical_proof_data(&call_a);
+            let b = build_canonical_proof_data(&call_b);
+
+            // After canonicalisation the GlobalIndex bytes must match — the
+            // rollup-index garbage was zeroed for both.
+            assert_eq!(
+                a.global_index, b.global_index,
+                "globalIndex rollup-index bytes must be zeroed for mainnet"
             );
         }
 
