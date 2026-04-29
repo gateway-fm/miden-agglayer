@@ -287,9 +287,30 @@ async fn restore_gers(
                     }
 
                     let mut ger_bytes = [0u8; 32];
+                    let mut overflow = false;
                     for (i, felt) in items.iter().take(8).enumerate() {
-                        let v: u32 = felt.as_canonical_u64() as u32;
-                        ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+                        // X6 — Felt values can be anywhere in [0, GOLDILOCKS).
+                        // The previous `as u32` silently truncated values
+                        // exceeding u32::MAX, producing a corrupted GER that
+                        // wouldn't match the L1-side keccak. Use try_from so
+                        // a malformed UpdateGerNote is rejected instead of
+                        // silently restoring the wrong root.
+                        match u32::try_from(felt.as_canonical_u64()) {
+                            Ok(v) => ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes()),
+                            Err(_) => {
+                                tracing::error!(
+                                    note_id = %note.id(),
+                                    limb_index = i,
+                                    felt_value = felt.as_canonical_u64(),
+                                    "restore: UpdateGerNote limb exceeds u32::MAX, skipping (X6)"
+                                );
+                                overflow = true;
+                                break;
+                            }
+                        }
+                    }
+                    if overflow {
+                        continue;
                     }
 
                     if store_clone.has_seen_ger(&ger_bytes).await? {
