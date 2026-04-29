@@ -486,7 +486,7 @@ impl Store for PgStore {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
         let hash_str = format!("{tx_hash:#x}");
 
         let (status, error_msg) = match &result {
@@ -494,23 +494,40 @@ impl Store for PgStore {
             Err(msg) => ("failed", Some(msg.as_str())),
         };
 
-        client
-            .execute(
-                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
-                &[
-                    &status,
-                    &error_msg as &(dyn ToSql + Sync),
-                    &(block_num as i64),
-                    &hash_str,
-                ],
-            )
-            .await?;
+        // S4 — atomic status update + log materialisation.
+        //
+        // Pre-fix the status `UPDATE transactions ... WHERE tx_hash = $`
+        // committed first; only afterwards did we loop over
+        // `transaction_logs` and call `self.add_log(log)` for each.
+        // Each `add_log` opened its OWN transaction. If any of them
+        // failed (e.g. log_index unique-constraint violation, network
+        // hiccup), the `transactions` row already said 'success' with
+        // zero or partial synthetic logs. `eth_getTransactionReceipt`
+        // would then return a confirmed tx whose log set is incomplete
+        // — exactly the kind of silent corruption indexer consumers
+        // can't recover from.
+        //
+        // Now both run inside a single tokio_postgres transaction. On
+        // any failure the rollback restores the 'pending' status AND
+        // any partial log inserts.
+        let tx = client.transaction().await?;
+
+        tx.execute(
+            "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
+            &[
+                &status,
+                &error_msg as &(dyn ToSql + Sync),
+                &(block_num as i64),
+                &hash_str,
+            ],
+        )
+        .await?;
 
         if result.is_ok() {
-            tracing::info!("PgStore: committed txn {tx_hash}");
-
-            // Fetch attached logs and add them to synthetic_logs
-            let log_rows = client
+            // Fetch attached logs (within the same txn so we see a consistent
+            // snapshot — no race with a concurrent txn_begin updating the
+            // attached log set).
+            let log_rows = tx
                 .query(
                     "SELECT topics, data FROM transaction_logs WHERE tx_hash = $1",
                     &[&hash_str],
@@ -527,19 +544,40 @@ impl Store for PgStore {
                     .collect();
                 let data_str = format!("0x{}", hex::encode(data_bytes));
 
-                let log = SyntheticLog {
-                    address: bridge_address.clone(),
-                    topics,
-                    data: data_str,
-                    block_number: block_num,
-                    block_hash,
-                    transaction_hash: format!("{tx_hash:#x}"),
-                    transaction_index: 0,
-                    log_index: 0,
-                    removed: false,
-                };
-                self.add_log(log).await?;
+                // Inline the add_log logic so the counter UPDATE + INSERT
+                // run inside the SAME outer txn. Pre-fix `self.add_log`
+                // opened a nested txn that committed independently.
+                let counter_row = tx
+                    .query_one(
+                        "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
+                        &[],
+                    )
+                    .await?;
+                let log_index: i64 = counter_row.get(0);
+                let topic_strs: Vec<&str> = topics.iter().map(|s| s.as_str()).collect();
+                tx.execute(
+                    "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &log_index,
+                        &bridge_address,
+                        &topic_strs,
+                        &data_str,
+                        &(block_num as i64),
+                        &block_hash.as_slice(),
+                        &hash_str,
+                        &0i64,
+                        &false,
+                    ],
+                )
+                .await?;
             }
+        }
+
+        tx.commit().await?;
+
+        if result.is_ok() {
+            tracing::info!("PgStore: committed txn {tx_hash}");
         } else if let Err(ref err) = result {
             tracing::error!("PgStore: failed txn {tx_hash}: {err}");
         }
