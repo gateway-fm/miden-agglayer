@@ -228,15 +228,15 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
                 .to_string(),
         );
     }
-    if let Some(origins) = command.cors_allowed_origins.as_ref() {
-        if origins.iter().any(|o| o == "*") {
-            reasons.push(
-                "  - --cors-allowed-origins contains a wildcard `*` (browsers from \
-                 any origin can hit state-mutating endpoints). Use an explicit \
-                 origin list."
-                    .to_string(),
-            );
-        }
+    if let Some(origins) = command.cors_allowed_origins.as_ref()
+        && origins.iter().any(|o| o == "*")
+    {
+        reasons.push(
+            "  - --cors-allowed-origins contains a wildcard `*` (browsers from \
+             any origin can hit state-mutating endpoints). Use an explicit \
+             origin list."
+                .to_string(),
+        );
     }
     if reasons.is_empty() {
         Ok(())
