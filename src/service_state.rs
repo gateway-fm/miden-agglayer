@@ -1,8 +1,46 @@
 use crate::block_state::BlockState;
 use crate::store::Store;
 use crate::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Per-signer async mutex registry that serialises the
+/// `nonce_get → handler → nonce_increment` critical section in
+/// `eth_sendRawTransaction`.
+///
+/// Self-review of-the-fix follow-up — the original R4 commit checked the
+/// nonce against `nonce_get` and incremented later, but the two operations
+/// weren't atomic. Two concurrent valid txs at the same nonce both passed
+/// the equality check before either incremented; for `claimAsset`, `try_claim`
+/// dedupes by `globalIndex`, but the GER injection path could double-inject.
+/// This mutex ensures the entire request-handling lifecycle for one signer
+/// runs serially.
+#[derive(Clone, Default)]
+pub struct PerSignerLocks {
+    inner: Arc<std::sync::Mutex<HashMap<alloy::primitives::Address, Arc<Mutex<()>>>>>,
+}
+
+impl PerSignerLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Acquire the mutex for `signer`, creating it if needed. Returns an
+    /// owned guard the caller must hold for the duration of the critical
+    /// section.
+    pub async fn lock(&self, signer: alloy::primitives::Address) -> tokio::sync::OwnedMutexGuard<()> {
+        // Fetch (or create) the per-signer mutex under a quick std-mutex
+        // (no `await`-points held). The actual critical section uses the
+        // returned tokio mutex.
+        let mu = {
+            let mut map = self.inner.lock().expect("PerSignerLocks std-mutex poisoned");
+            map.entry(signer).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        };
+        mu.lock_owned().await
+    }
+}
 
 #[derive(Clone)]
 pub struct ServiceState {
@@ -35,6 +73,10 @@ pub struct ServiceState {
     /// address in the list. Production must always set this — aggsender,
     /// aggoracle, and any operator-rescue tool are the only legitimate signers.
     pub allowed_signers: Option<Vec<alloy::primitives::Address>>,
+    /// Per-signer async mutex registry (R4 follow-up) — serialises the
+    /// nonce-check critical section so two concurrent same-nonce txs from one
+    /// signer cannot both pass the equality check before either increments.
+    pub per_signer_locks: PerSignerLocks,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -63,6 +105,7 @@ impl ServiceState {
             cors_allowed_origins: None,
             admin_api_key: None,
             allowed_signers: None,
+            per_signer_locks: PerSignerLocks::new(),
         }
     }
 }

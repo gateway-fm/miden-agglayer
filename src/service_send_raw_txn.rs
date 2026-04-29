@@ -336,6 +336,13 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let signer = txn_envelope.recover_signer()?;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
+    // R4 follow-up — serialise the entire nonce-check + handler critical section
+    // for this signer. Without the mutex, two concurrent same-nonce txs both
+    // pass the equality check before either calls `nonce_increment`. This guard
+    // is cheap (per-signer, no contention across distinct signers), is held
+    // until the function returns, and is dropped automatically on panic.
+    let _lock = service.per_signer_locks.lock(signer).await;
+
     // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce only on
     // success and never compared the incoming `tx.nonce` against the expected next
     // value. That allowed:
@@ -708,6 +715,56 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("only handles network")
+        );
+    }
+
+    /// Self-review of-the-fix follow-up — TOCTOU between `nonce_get` and
+    /// `nonce_increment`. Two concurrent valid txs at the same nonce both
+    /// passed the equality check before either called `nonce_increment`. For
+    /// `claimAsset`, `try_claim` dedupes by `globalIndex`; for the GER injection
+    /// path, no dedup existed, so both could double-process.
+    ///
+    /// This test concurrently launches two `service_send_raw_txn` calls from
+    /// the same signer at the same nonce and asserts that exactly ONE
+    /// succeeds (the second receives a "nonce mismatch" error). Pre-fix both
+    /// would have succeeded.
+    #[tokio::test]
+    async fn r4_followup_concurrent_same_nonce_serialised() {
+        // Build two identical legacy txs; encode_legacy_tx signs with the same
+        // private key + same nonce by construction, so both yield the same
+        // signer + nonce.
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xAAu8; 32]),
+        }
+        .abi_encode();
+        let (input_a, _) = encode_legacy_tx(calldata.clone());
+        let (input_b, _) = encode_legacy_tx(calldata);
+
+        let service = create_test_service();
+        // Run both concurrently.
+        let svc_a = service.clone();
+        let svc_b = service.clone();
+        let h_a = tokio::spawn(async move { service_send_raw_txn(svc_a, input_a).await });
+        let h_b = tokio::spawn(async move { service_send_raw_txn(svc_b, input_b).await });
+        let res_a = h_a.await.unwrap();
+        let res_b = h_b.await.unwrap();
+
+        let (oks, errs): (Vec<_>, Vec<_>) =
+            [res_a, res_b].into_iter().partition(|r| r.is_ok());
+        assert_eq!(
+            oks.len(),
+            1,
+            "exactly one of the two same-nonce concurrent txs must succeed"
+        );
+        assert_eq!(
+            errs.len(),
+            1,
+            "the other must be rejected by the nonce check"
+        );
+        let err_msg = format!("{}", errs[0].as_ref().unwrap_err());
+        assert!(
+            err_msg.contains("nonce mismatch"),
+            "rejected tx must fail with nonce mismatch: {err_msg}"
         );
     }
 
