@@ -54,4 +54,10 @@ pub fn init_metrics() {
          another account) or kind=renounced (owner cleared, faucet wedged). \
          Page critical."
     );
+    describe_counter!(
+        "bridge_forged_mint_total",
+        "MINT note observed on-chain that does not correspond to any \
+         aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge \
+         note authorship. Page critical, freeze claim processing."
+    );
 }
