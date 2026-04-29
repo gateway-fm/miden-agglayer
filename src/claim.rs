@@ -68,6 +68,16 @@ struct Faucet {
 ///
 /// On the first bridge of a new ERC-20 token, the faucet is created on Miden,
 /// registered in the bridge, and saved to the Store — all automatically.
+///
+/// Concurrency: this function is always called inside a
+/// `MidenClient::with(|client| ...)` closure, which holds the global Miden
+/// client mutex for its duration. Two concurrent first-bridge claims for the
+/// same token therefore serialise on that lock — the second call sees the
+/// faucet already registered by the first and takes the fast `get_faucet_by_origin`
+/// path. The Cantina #1 colliding-network refusal predicate (added in `e6a33ae`)
+/// is consequently TOCTOU-safe by virtue of the surrounding lock; a future
+/// refactor that moves auto-create outside the client mutex must add an
+/// explicit per-token-address mutex (analogous to `PerSignerLocks` for R4).
 async fn find_or_create_faucet(
     token_address: alloy::primitives::Address,
     origin_network: u32,
