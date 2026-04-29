@@ -141,6 +141,19 @@ pub async fn register_faucet_in_bridge(
     Ok(())
 }
 
+/// Maximum decimals an ERC-20 may legitimately declare. Real-world tokens use
+/// 0..30; values above 30 are pathological and would cause `10u256.pow(decimals)`
+/// to overflow during scaling. Self-review X3 — without this bound the
+/// `parse_token_metadata` happy path accepts `decimals = 255` from a malicious
+/// or buggy ERC-20, which then overflows U256 arithmetic in the claim path.
+pub const MAX_TOKEN_DECIMALS: u8 = 30;
+
+/// Maximum byte length for an ABI-decoded token symbol/name. Token symbols are
+/// always short (1-12 chars in practice). Cap at 64 bytes so a malicious
+/// metadata claiming `length = 1 GB` cannot trigger a huge allocation before
+/// failing TokenSymbol validation. Self-review X4.
+pub const MAX_DECODED_STRING_BYTES: usize = 64;
+
 /// Parse token metadata from a `claimAsset` call's metadata field.
 ///
 /// The bridge contract sends `abi.encode(string name, string symbol, uint8 decimals)`
@@ -172,6 +185,23 @@ pub fn parse_token_metadata(
 
     // Read decimals from the third 32-byte word
     let decimals = data[95]; // last byte of third word
+    // X3 — reject pathological decimals that would overflow `10^decimals` in
+    // U256 amount scaling. The bridge contract's own metadata typically caps
+    // at 18 (ETH); 30 is generous headroom for any future variant.
+    if decimals > MAX_TOKEN_DECIMALS {
+        anyhow::bail!(
+            "token decimals out of range: {decimals} > {MAX_TOKEN_DECIMALS} (would overflow U256 scaling)"
+        );
+    }
+    // The decimals field is u8 in the ABI; the high 31 bytes of the word must be
+    // zero. A non-zero value there indicates a malformed metadata that misbeds
+    // the decimals into a wider integer slot — refuse rather than silently
+    // truncating.
+    if data[64..95].iter().any(|b| *b != 0) {
+        anyhow::bail!(
+            "token decimals word non-canonical: high bytes are non-zero (malformed ABI)"
+        );
+    }
 
     // Read symbol offset (second word) and decode the string
     let symbol_offset = u256_from_be_slice(&data[32..64]);
@@ -194,16 +224,32 @@ fn u256_from_be_slice(slice: &[u8]) -> usize {
 }
 
 /// ABI-decode a dynamic string at the given byte offset in `data`.
+///
+/// X4 hardening: bound everything with `checked_add` so a malicious metadata
+/// that reports `len = u64::MAX - 31` cannot wrap into a small size that
+/// passes the bounds check, and cap the maximum decoded length at
+/// `MAX_DECODED_STRING_BYTES` so a 1 GB declared length doesn't trigger a
+/// huge allocation before TokenSymbol validation rejects it.
 fn abi_decode_string(data: &[u8], offset: usize) -> anyhow::Result<String> {
-    if offset + 32 > data.len() {
+    let header_end = offset
+        .checked_add(32)
+        .ok_or_else(|| anyhow::anyhow!("string offset {offset} overflows usize"))?;
+    if header_end > data.len() {
         anyhow::bail!(
             "string offset {offset} out of bounds (data len {})",
             data.len()
         );
     }
-    let len = u256_from_be_slice(&data[offset..offset + 32]);
-    let str_start = offset + 32;
-    let str_end = str_start + len;
+    let len = u256_from_be_slice(&data[offset..header_end]);
+    if len > MAX_DECODED_STRING_BYTES {
+        anyhow::bail!(
+            "decoded string length {len} exceeds cap {MAX_DECODED_STRING_BYTES} bytes"
+        );
+    }
+    let str_start = header_end;
+    let str_end = str_start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("string end overflow: start {str_start} + len {len}"))?;
     if str_end > data.len() {
         anyhow::bail!(
             "string data [{str_start}..{str_end}) out of bounds (data len {})",
@@ -275,5 +321,128 @@ mod tests {
         let (symbol, decimals) = parse_token_metadata(&metadata, &addr).unwrap();
         assert_eq!(symbol, "USDT");
         assert_eq!(decimals, 6);
+    }
+
+    /// Self-review X3 — repro+regression. Pre-fix `parse_token_metadata`
+    /// accepted any u8 value for `decimals`, including `255`. The downstream
+    /// claim path then computes `10u256.pow(decimals)` for amount scaling,
+    /// which overflows for `decimals > ~77`. Cap at MAX_TOKEN_DECIMALS = 30
+    /// (well above any real-world token).
+    #[test]
+    fn x3_decimals_above_30_rejected() {
+        let metadata = bytes_with_decimals(255);
+        let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let err = parse_token_metadata(&metadata, &addr).unwrap_err();
+        assert!(
+            err.to_string().contains("decimals out of range"),
+            "unexpected: {err}"
+        );
+
+        // Boundary: exactly MAX is accepted.
+        let metadata = bytes_with_decimals(MAX_TOKEN_DECIMALS);
+        assert!(parse_token_metadata(&metadata, &addr).is_ok());
+
+        // Off-by-one above MAX is rejected.
+        let metadata = bytes_with_decimals(MAX_TOKEN_DECIMALS + 1);
+        assert!(parse_token_metadata(&metadata, &addr).is_err());
+    }
+
+    /// Self-review X3 — non-canonical decimals word (high bytes non-zero)
+    /// must be refused. The ABI declares `uint8 decimals` so the high 31
+    /// bytes of the 32-byte slot must be zero. A misformed sender that
+    /// embeds a wider integer would silently truncate to its low byte
+    /// without this check.
+    #[test]
+    fn x3_non_canonical_decimals_word_rejected() {
+        // Build metadata with decimals=6 in the low byte but non-zero
+        // garbage in the high bytes of the third word.
+        let mut data = vec![0u8; 224];
+        data[31] = 0x60; // name offset = 0x60
+        data[63] = 0xa0; // symbol offset = 0xa0
+        data[64] = 0xff; // GARBAGE in high byte of decimals word
+        data[95] = 6; // legitimate-looking decimals
+        // name = "X" at offset 0x60
+        data[127] = 1; // name length = 1
+        data[128] = b'X';
+        // symbol = "USDT" at offset 0xa0
+        data[191] = 4;
+        data[192..196].copy_from_slice(b"USDT");
+        let metadata = Bytes::from(data);
+        let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let err = parse_token_metadata(&metadata, &addr).unwrap_err();
+        assert!(
+            err.to_string().contains("non-canonical"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// Self-review X4 — repro+regression. Pre-fix `abi_decode_string`
+    /// accepted any u64 length without bounds. A malicious metadata
+    /// declaring `length = 1 GB` would either allocate 1 GB (DoS) or
+    /// fail bounds check after the allocation. Cap at
+    /// MAX_DECODED_STRING_BYTES = 64 so the allocation refuses BEFORE
+    /// the slice is copied.
+    #[test]
+    fn x4_oversized_string_length_rejected() {
+        // Build metadata where the symbol's declared length is 1024
+        // (above MAX_DECODED_STRING_BYTES = 64).
+        let mut data = vec![0u8; 256];
+        data[31] = 0x60; // name offset
+        data[63] = 0xa0; // symbol offset = 0xa0
+        data[95] = 6; // decimals
+        // name = "X" at 0x60
+        data[127] = 1;
+        data[128] = b'X';
+        // symbol length = 1024 at 0xa0
+        data[160 + 30] = 0x04;
+        data[160 + 31] = 0x00; // 1024 = 0x0400
+        let metadata = Bytes::from(data);
+        let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let err = parse_token_metadata(&metadata, &addr).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds cap"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// Self-review X4 — overflow in `offset + len` arithmetic. Pre-fix
+    /// `offset + len` could wrap to a small value if `len = u64::MAX - 31`,
+    /// passing the bounds check. Post-fix `checked_add` short-circuits.
+    #[test]
+    fn x4_overflow_in_offset_plus_len_rejected() {
+        // Test the helper directly because crafting a 32-byte length word
+        // that lands at usize::MAX is awkward via the parse_token_metadata
+        // entry. The function is private so we round-trip through the
+        // public surface: a length word of max (u64) immediately fails
+        // the cap check before any arithmetic.
+        let mut data = vec![0u8; 256];
+        data[31] = 0x60;
+        data[63] = 0xa0;
+        data[95] = 6;
+        data[127] = 1;
+        data[128] = b'X';
+        // symbol length = u64::MAX
+        for b in data[160 + 24..160 + 32].iter_mut() {
+            *b = 0xff;
+        }
+        let metadata = Bytes::from(data);
+        let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        assert!(parse_token_metadata(&metadata, &addr).is_err());
+    }
+
+    /// Helper for X3 tests: build a minimal valid ABI metadata with a
+    /// chosen decimals byte. Other fields are kept canonical.
+    fn bytes_with_decimals(decimals: u8) -> Bytes {
+        let mut data = vec![0u8; 224];
+        data[31] = 0x60; // name offset
+        data[63] = 0xa0; // symbol offset
+        data[95] = decimals;
+        // name = "T"
+        data[127] = 1;
+        data[128] = b'T';
+        // symbol = "TKN"
+        data[191] = 3;
+        data[192..195].copy_from_slice(b"TKN");
+        Bytes::from(data)
     }
 }
