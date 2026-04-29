@@ -24,8 +24,18 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
+
+/// Maximum size in bytes for an inbound JSON-RPC request body.
+///
+/// Self-review R6 — without an explicit cap, axum's default body limit (2 MB) is the
+/// only protection. JSON-RPC requests are typically tiny; an unauthenticated caller
+/// posting megabytes of garbage is purely DoS. 256 KB is comfortable headroom for
+/// legitimate payloads (a typical `eth_sendRawTransaction` carrying a CLAIM proof is
+/// ~17 KB; an `eth_getLogs` with the maximum allowed filter arrays is well below 200 KB).
+pub const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 use url::Url;
 
 async fn json_rpc_endpoint(
@@ -367,6 +377,10 @@ pub async fn serve(
                     HeaderValue::from_static("no-cache"),
                 ))
                 .layer(TraceLayer::new_for_http())
+                // R6 — cap inbound bodies before any handler reads them. Bodies bigger
+                // than MAX_REQUEST_BODY_BYTES are rejected with HTTP 413 by tower-http
+                // without ever allocating the full payload.
+                .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
                 .layer(
                     CorsLayer::new()
                         .allow_origin(tower_http::cors::Any)
@@ -393,4 +407,31 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Self-review R6 — repro+regression. The limit constant must be (a) at least as
+    /// big as the largest legitimate payload (worst case: an `eth_sendRawTransaction`
+    /// carrying a CLAIM proof — ~17 KB — plus headroom for an upper-bounded
+    /// `eth_getLogs` filter), and (b) much smaller than axum's default 2 MB so the
+    /// tower-http layer actually does the rejecting.
+    ///
+    /// Pre-fix (no `RequestBodyLimitLayer`), the only protection was axum's default
+    /// (2 MB). Post-fix the limit is explicit and pinned by this test.
+    #[test]
+    fn r6_request_body_limit_is_explicit_and_in_band() {
+        // Must be >= 17 KB (largest legitimate aggkit payload observed in fixtures).
+        assert!(
+            MAX_REQUEST_BODY_BYTES >= 17 * 1024,
+            "limit too small: {MAX_REQUEST_BODY_BYTES}"
+        );
+        // Must be much smaller than axum default 2 MB (otherwise the new layer is a no-op).
+        assert!(
+            MAX_REQUEST_BODY_BYTES < 1024 * 1024,
+            "limit too generous: {MAX_REQUEST_BODY_BYTES}"
+        );
+    }
 }
