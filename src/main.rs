@@ -225,7 +225,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let bridge_out_scanner = Arc::new(BridgeOutScanner::new(store.clone(), block_state.clone()));
+    // Cantina #13 — BridgeOutScanner needs to know our local network id so it can
+    // refuse to emit synthetic BridgeEvents for self-targeted poison leaves.
+    let bridge_out_local_network_id = u32::try_from(command.network_id).map_err(|_| {
+        anyhow::anyhow!(
+            "--network-id ({}) does not fit in u32; B2AGG destination_network is u32-sized",
+            command.network_id
+        )
+    })?;
+    let bridge_out_scanner = Arc::new(BridgeOutScanner::new(
+        store.clone(),
+        block_state.clone(),
+        bridge_out_local_network_id,
+    ));
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
     let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =

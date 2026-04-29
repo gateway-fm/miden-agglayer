@@ -116,11 +116,33 @@ pub(crate) fn reverse_scale_amount(miden_amount: u64, scale: u8) -> anyhow::Resu
 pub struct BridgeOutScanner {
     store: Arc<dyn crate::store::Store>,
     block_state: Arc<BlockState>,
+    /// Local network id, used to detect self-targeted bridge-outs (Cantina #13). A B2AGG
+    /// note whose `destination_network` equals this value is a poison leaf — the on-chain
+    /// bridge accepts and processes it (LET frontier advances, BURN emitted), but the next
+    /// agglayer certificate covering it is rejected by pessimistic-proof-core, halting the
+    /// bridge for every legitimate B2AGG since the last successful certificate.
+    local_network_id: u32,
 }
 
 impl BridgeOutScanner {
-    pub fn new(store: Arc<dyn crate::store::Store>, block_state: Arc<BlockState>) -> Self {
-        Self { store, block_state }
+    pub fn new(
+        store: Arc<dyn crate::store::Store>,
+        block_state: Arc<BlockState>,
+        local_network_id: u32,
+    ) -> Self {
+        Self {
+            store,
+            block_state,
+            local_network_id,
+        }
+    }
+
+    /// Returns true if a parsed B2AGG `destination_network` is the bridge's own network,
+    /// i.e. a poison leaf that wedges every subsequent bridge-out until manual recovery.
+    /// Public for unit tests in this module and for any external observers that want to
+    /// pre-validate a B2AGG before submission.
+    pub fn is_self_targeted(&self, destination_network: u32) -> bool {
+        destination_network == self.local_network_id
     }
 
     async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) {
@@ -151,6 +173,33 @@ impl BridgeOutScanner {
                     return;
                 }
             };
+
+        // Cantina #13 — circuit-break self-targeted bridge-outs. The on-chain bridge_out
+        // procedure has no `dest_network != local_network` assertion, so a B2AGG note with
+        // `destination_network == this rollup's network_id` is consumed successfully (LET
+        // frontier advances, BURN emitted), but the next agglayer certificate covering it
+        // is rejected with `InvalidExit` and every legitimate B2AGG since the last good
+        // certificate is stranded. We can't prevent the on-chain leaf from being appended —
+        // it's already there by the time we observe the consumed note — but we MUST refuse
+        // to emit the synthetic BridgeEvent: forwarding it would have the bridge-service
+        // mint an aggsender certificate it can't settle, compounding the wedge. Skip the
+        // mark_note_processed step too so the note re-surfaces on each sync tick (and the
+        // metric keeps incrementing) until an operator quarantines it manually.
+        if self.is_self_targeted(destination_network) {
+            metrics::counter!("bridge_out_self_targeted_total").increment(1);
+            tracing::error!(
+                target: "bridge_out",
+                note_id = %note_id_str,
+                destination_network,
+                local_network_id = self.local_network_id,
+                "POISON LEAF: B2AGG bridge-out targets the local network. The on-chain LET \
+                 has been advanced; aggsender certificate covering this leaf will be rejected \
+                 with InvalidExit. Refusing to emit synthetic BridgeEvent to avoid compounding \
+                 the wedge. Operator action required: identify the depositor, decide whether \
+                 to drop the cert or fork the LET, and quarantine this note. Cantina #13."
+            );
+            return;
+        }
 
         // Get the fungible asset
         let Some(fungible_asset) = details.assets().iter_fungible().next() else {
@@ -411,6 +460,56 @@ mod tests {
         );
         // Overflow: scale too large
         assert!(reverse_scale_amount(1, 39).is_err());
+    }
+
+    /// Cantina #13 — repro+regression. The on-chain `bridge_out` procedure does not
+    /// assert `destination_network != local_network_id`, so a B2AGG note targeting the
+    /// local network is processed successfully on-chain (LET frontier advances) but the
+    /// next agglayer certificate covering it is rejected by pessimistic-proof-core,
+    /// stranding every legitimate B2AGG in the same window. We can't prevent the leaf
+    /// from being appended on-chain — by the time aggkit observes the consumed note,
+    /// the LET already advanced — but we MUST refuse to emit the synthetic BridgeEvent
+    /// for that leaf so the bridge-service doesn't try to settle a doomed certificate.
+    ///
+    /// This test asserts the load-bearing predicate `is_self_targeted` correctly
+    /// distinguishes self-target (poison) from cross-network (legitimate) and from the
+    /// edge case `network_id = 0` (mainnet, where any B2AGG is by definition cross-net).
+    /// The actual emit-skip happens in `process_consumed_note` and is exercised by the
+    /// e2e test suite under `scripts/security-repro/cantina-13-self-target.sh` once the
+    /// docker stack is up — see CANTINA_FIXES.md.
+    #[test]
+    fn cantina_13_is_self_targeted_distinguishes_poison_from_legitimate() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+
+        // Local network = 7 (typical rollup id assigned by RollupManager).
+        let scanner = BridgeOutScanner::new(store.clone(), block_state.clone(), 7);
+        assert!(
+            scanner.is_self_targeted(7),
+            "destination_network == local must be flagged as poison"
+        );
+        assert!(
+            !scanner.is_self_targeted(0),
+            "mainnet (0) destination is legitimate"
+        );
+        assert!(
+            !scanner.is_self_targeted(1),
+            "other rollup destination is legitimate"
+        );
+        assert!(
+            !scanner.is_self_targeted(u32::MAX),
+            "off-by-one: u32::MAX is not the local network 7"
+        );
+
+        // Edge: a service deployed with network_id = 0 (mainnet bridge) flags
+        // destination 0 as self-target.
+        let mainnet_scanner = BridgeOutScanner::new(store, block_state, 0);
+        assert!(mainnet_scanner.is_self_targeted(0));
+        assert!(!mainnet_scanner.is_self_targeted(1));
     }
 
     /// Self-review B6 — repro+regression. A B2AGG note with fewer than 6 storage felts

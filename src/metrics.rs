@@ -16,4 +16,9 @@ pub fn init_metrics() {
         "Background thread restarts after crash"
     );
     describe_counter!("miden_sync_errors_total", "Sync errors by kind");
+    describe_counter!(
+        "bridge_out_self_targeted_total",
+        "B2AGG bridge-outs whose destination_network equals our local network_id; \
+         each one is a poison leaf that wedges the bridge (Cantina #13)"
+    );
 }
