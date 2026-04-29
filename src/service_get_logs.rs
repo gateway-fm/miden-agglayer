@@ -93,6 +93,7 @@ pub fn validate_getlogs_filter(filter: &LogFilter, current_block: u64) -> Result
             "eth_getLogs block range too large: {span} > {MAX_GETLOGS_BLOCK_RANGE} (paginate)"
         ));
     }
+    #[allow(clippy::collapsible_if)]
     if let Some(topics) = filter.topics.as_ref() {
         if topics.len() > MAX_GETLOGS_TOPICS_LEN {
             return Err(format!(

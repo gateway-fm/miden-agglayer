@@ -75,6 +75,7 @@ async fn json_rpc_endpoint(
     // Without this, admin endpoints (`admin_registerFaucet`, `admin_listFaucets`) are
     // reachable by anyone who can hit the JSON-RPC port — letting a malicious caller
     // poison the faucet registry with attacker-chosen `MetadataHash` for any token.
+    #[allow(clippy::collapsible_if)]
     if method_name.starts_with("admin_") {
         if let Err(reason) = check_admin_auth(service.admin_api_key.as_deref(), &headers) {
             metrics::counter!("rpc_admin_auth_rejects_total", "method" => method_label)

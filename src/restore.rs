@@ -156,7 +156,7 @@ async fn restore_bridge_outs(
                 // breaking any consumer that joins on (note_id,
                 // deposit_count). Sort by note_id (stable across re-syncs).
                 let mut sorted: Vec<&_> = consumed_notes.iter().collect();
-                sorted.sort_by(|a, b| a.id().to_string().cmp(&b.id().to_string()));
+                sorted.sort_by_key(|n| n.id().to_string());
 
                 for note in sorted {
                     let details = note.details();
@@ -286,7 +286,7 @@ async fn restore_gers(
                 // different chain values without sorting. Lex-sort by
                 // NoteId for stability.
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sorted_notes.sort_by(|a, b| a.id().to_string().cmp(&b.id().to_string()));
+                sorted_notes.sort_by_key(|n| n.id().to_string());
 
                 for note in sorted_notes {
                     let details = note.details();

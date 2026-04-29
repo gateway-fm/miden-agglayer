@@ -467,6 +467,7 @@ pub const MAX_BRIDGE_EVENT_METADATA_BYTES: usize = 64 * 1024;
 /// # Errors
 /// Returns `Err(BridgeEventEncodeError::MetadataTooLarge)` if `metadata.len()`
 /// exceeds `MAX_BRIDGE_EVENT_METADATA_BYTES`.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_bridge_event_data_checked(
     leaf_type: u8,
     origin_network: u32,
@@ -521,6 +522,7 @@ impl std::error::Error for BridgeEventEncodeError {}
 /// the cap is unreachable today; this `unwrap_or_else` form preserves the
 /// pre-fix infallible signature for those callers while keeping the cap
 /// enforced for any future caller via the `_checked` variant.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_bridge_event_data(
     leaf_type: u8,
     origin_network: u32,
