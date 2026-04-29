@@ -251,6 +251,7 @@ pub trait Store: Send + Sync + 'static {
         destination_network: u32,
         destination_address: &[u8; 20],
         amount: u128,
+        metadata: &[u8],
         deposit_count: u32,
     ) -> anyhow::Result<()> {
         let log = SyntheticLog {
@@ -263,6 +264,7 @@ pub trait Store: Send + Sync + 'static {
                 destination_network,
                 destination_address,
                 amount,
+                metadata,
                 deposit_count,
             ),
             block_number,

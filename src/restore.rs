@@ -213,6 +213,7 @@ async fn restore_bridge_outs(
                             destination_network,
                             &destination_address,
                             origin_amount,
+                            &[],
                             deposit_count,
                         )
                         .await

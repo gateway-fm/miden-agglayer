@@ -257,6 +257,7 @@ impl BridgeOutScanner {
                 destination_network,
                 &destination_address,
                 origin_amount,
+                &[],
                 deposit_count,
             )
             .await
@@ -336,7 +337,17 @@ impl SyncListener for BridgeOutScanner {
 ///             uint256 amount, bytes metadata, uint32 depositCount)
 ///
 /// Per Solidity ABI encoding, all static types are padded to 32 bytes,
-/// and `bytes metadata` is encoded as an offset + length + data.
+/// and `bytes metadata` is encoded as an offset + length + zero-padded data.
+///
+/// Cantina #10 surfaced non-canonical leaf encoding upstream (`pack_leaf_data`
+/// does not enforce zero padding on bridge-in leaf data). The fix there is in
+/// MASM, but our event encoder is in the same canonical-encoding family:
+/// previously the metadata length was hardcoded to 0 with no provision for
+/// non-empty metadata, so any future caller passing real bytes would have
+/// produced non-canonical output (missing length, missing 32-byte alignment
+/// padding). Take metadata as an explicit parameter and encode canonically:
+/// write the length word, append the bytes, zero-pad to the next 32-byte
+/// boundary.
 pub fn encode_bridge_event_data(
     leaf_type: u8,
     origin_network: u32,
@@ -344,10 +355,13 @@ pub fn encode_bridge_event_data(
     destination_network: u32,
     destination_address: &[u8; 20],
     amount: u128,
+    metadata: &[u8],
     deposit_count: u32,
 ) -> String {
-    // 8 words of 32 bytes each for the static parts + dynamic metadata
-    let mut data = Vec::with_capacity(9 * 32);
+    // Compute the canonical 32-byte-aligned padded length of the metadata data section.
+    let metadata_padded_len = metadata.len().div_ceil(32) * 32;
+    // 8 static words (each 32 bytes) + 1 length word + padded data
+    let mut data = Vec::with_capacity(8 * 32 + 32 + metadata_padded_len);
 
     // leafType (uint8 padded to 32 bytes)
     data.extend_from_slice(&[0u8; 31]);
@@ -369,28 +383,27 @@ pub fn encode_bridge_event_data(
     data.extend_from_slice(&[0u8; 12]);
     data.extend_from_slice(destination_address);
 
-    // amount (uint256 — u128 in high bytes of 32-byte slot)
+    // amount (uint256 — u128 in low 16 bytes of 32-byte slot, big-endian)
     data.extend_from_slice(&[0u8; 16]);
     data.extend_from_slice(&amount.to_be_bytes());
 
-    // metadata (bytes) — offset pointer (points to word 8 = 0x100 = 256)
-    data.extend_from_slice(&[0u8; 31]);
-    data.push(0); // offset = 8 * 32 = 256
-    // Fix: offset is after all 8 params. Params: leafType, originNetwork, originAddress,
-    // destinationNetwork, destinationAddress, amount, metadata_offset, depositCount = 8 words
-    // So metadata starts at byte 8*32 = 256 = 0x100
-    // Overwrite the metadata offset
-    let offset_pos = 6 * 32; // 7th parameter (0-indexed: 6)
-    data[offset_pos..offset_pos + 32].fill(0);
-    let offset: u32 = 8 * 32; // 256
-    data[offset_pos + 28..offset_pos + 32].copy_from_slice(&offset.to_be_bytes());
+    // metadata offset (uint256). Static head is 8 params × 32 bytes = 256, so the dynamic
+    // region begins at byte 256 = 0x100. The metadata length sits at that offset, the data
+    // starts at offset+32.
+    data.extend_from_slice(&[0u8; 28]);
+    let metadata_offset: u32 = 8 * 32;
+    data.extend_from_slice(&metadata_offset.to_be_bytes());
 
     // depositCount (uint32 padded to 32 bytes)
     data.extend_from_slice(&[0u8; 28]);
     data.extend_from_slice(&deposit_count.to_be_bytes());
 
-    // metadata dynamic part: length (0) + no data (empty metadata)
-    data.extend_from_slice(&[0u8; 32]); // length = 0
+    // metadata dynamic part: length (uint256, big-endian) + data + zero padding to 32-byte boundary
+    data.extend_from_slice(&[0u8; 24]);
+    data.extend_from_slice(&(metadata.len() as u64).to_be_bytes());
+    data.extend_from_slice(metadata);
+    let pad = metadata_padded_len - metadata.len();
+    data.extend(std::iter::repeat_n(0u8, pad));
 
     format!("0x{}", hex::encode(data))
 }
@@ -408,10 +421,57 @@ mod tests {
             1,           // destination_network
             &[0xaa; 20], // destination_address
             1000,        // amount
+            &[],         // metadata
             0,           // deposit_count
         );
         // 9 words (8 params + 1 metadata length) = 288 bytes = 576 hex chars + "0x" prefix
         assert_eq!(data.len(), 2 + 9 * 32 * 2);
+    }
+
+    /// Cantina #10 — repro+regression. Pre-fix `encode_bridge_event_data` hardcoded
+    /// `metadata length = 0` and had no parameter for non-empty metadata. Any future
+    /// caller passing real bytes would have produced non-canonical Solidity ABI:
+    /// no length word and no 32-byte alignment padding on the data section. Post-fix
+    /// the length word reflects `metadata.len()` and trailing bytes are zero-padded
+    /// to the next 32-byte boundary so consumers (alloy, ethers, web3.py) decode it
+    /// identically to a real on-chain BridgeEvent.
+    #[test]
+    fn cantina_10_bridge_event_metadata_canonical_encoding() {
+        let metadata = b"USDC-erc20-decimals-6";
+        let data = encode_bridge_event_data(
+            0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, metadata, 0,
+        );
+        let bytes = hex::decode(&data[2..]).unwrap();
+        // 32-byte aligned overall.
+        assert_eq!(bytes.len() % 32, 0, "encoding must be 32-byte aligned");
+        // Static head occupies the first 8 * 32 = 256 bytes.
+        // Length word at offset 256 (BE u256, length goes in the low 8 bytes).
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&bytes[256 + 24..256 + 32]);
+        assert_eq!(u64::from_be_bytes(len_bytes), metadata.len() as u64);
+        // Data starts at 288, must contain the metadata bytes verbatim.
+        let padded_len = metadata.len().div_ceil(32) * 32;
+        assert_eq!(&bytes[288..288 + metadata.len()], metadata);
+        // Trailing pad must be exactly zero (canonical Solidity ABI).
+        assert_eq!(
+            &bytes[288 + metadata.len()..288 + padded_len],
+            &vec![0u8; padded_len - metadata.len()][..]
+        );
+
+        // Empty metadata: length = 0, no data bytes after the length word.
+        let empty = encode_bridge_event_data(0, 0, &[0u8; 20], 1, &[0xaa; 20], 0, &[], 0);
+        let empty_bytes = hex::decode(&empty[2..]).unwrap();
+        assert_eq!(empty_bytes.len(), 9 * 32);
+        assert_eq!(&empty_bytes[256..288], &[0u8; 32]);
+
+        // Exactly 32-byte-aligned metadata: must NOT add a second pad word.
+        let aligned = vec![0xAB; 32];
+        let aligned_enc = encode_bridge_event_data(
+            0, 0, &[0u8; 20], 1, &[0xaa; 20], 0, &aligned, 0,
+        );
+        let aligned_bytes = hex::decode(&aligned_enc[2..]).unwrap();
+        // 8 head + 1 length + 1 data = 10 words.
+        assert_eq!(aligned_bytes.len(), 10 * 32);
     }
 
     #[test]
@@ -426,6 +486,7 @@ mod tests {
             1,          // destination_network
             &dest_addr, // destination_address
             1000,       // amount
+            &[],        // metadata
             5,          // deposit_count
         );
 
