@@ -39,10 +39,30 @@ use url::Url;
 
 async fn json_rpc_endpoint(
     State(service): State<ServiceState>,
+    headers: axum::http::HeaderMap,
     request: JsonRpcExtractor,
 ) -> JrpcResult {
     let start = std::time::Instant::now();
     let method_name = request.method.clone();
+
+    // R1 — gate admin_* methods on the configured API key BEFORE running any handler.
+    // Without this, admin endpoints (`admin_registerFaucet`, `admin_listFaucets`) are
+    // reachable by anyone who can hit the JSON-RPC port — letting a malicious caller
+    // poison the faucet registry with attacker-chosen `MetadataHash` for any token.
+    if method_name.starts_with("admin_") {
+        if let Err(reason) = check_admin_auth(service.admin_api_key.as_deref(), &headers) {
+            metrics::counter!("rpc_admin_auth_rejects_total", "method" => method_name.clone())
+                .increment(1);
+            return Ok(JsonRpcResponse::error(
+                request.get_answer_id(),
+                JsonRpcError::new(
+                    JsonRpcErrorReason::ServerError(-32001),
+                    format!("admin auth: {reason}"),
+                    serde_json::Value::Null,
+                ),
+            ));
+        }
+    }
 
     let result = json_rpc_handler(service, request).await;
 
@@ -51,6 +71,69 @@ async fn json_rpc_endpoint(
         .record(start.elapsed().as_secs_f64());
 
     result
+}
+
+/// Outcome of an admin auth check; private detail for documentation.
+#[derive(Debug, PartialEq)]
+enum AdminAuthError {
+    NotConfigured,
+    MissingHeader,
+    MalformedHeader,
+    BadToken,
+}
+
+impl std::fmt::Display for AdminAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("admin endpoints disabled (no admin API key configured)"),
+            Self::MissingHeader => f.write_str("missing Authorization header"),
+            Self::MalformedHeader => f.write_str("malformed Authorization header (expected `Bearer <token>`)"),
+            Self::BadToken => f.write_str("invalid bearer token"),
+        }
+    }
+}
+
+/// Verify the `Authorization: Bearer <token>` header against the configured admin
+/// API key. Returns `Ok(())` if the request is authorised; otherwise an
+/// `AdminAuthError` whose `Display` is safe to surface to the caller.
+///
+/// Self-review R1 — pre-fix, every admin method was reachable by any caller who
+/// could hit the JSON-RPC port. We didn't even check `Authorization`. The fix
+/// requires a configured `admin_api_key` (CLI/env); when none is set, every
+/// `admin_*` request is rejected with `NotConfigured`. Constant-time comparison
+/// guards against timing oracles.
+fn check_admin_auth(
+    configured: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), AdminAuthError> {
+    let configured = configured.ok_or(AdminAuthError::NotConfigured)?;
+    let header = headers
+        .get(http::header::AUTHORIZATION)
+        .ok_or(AdminAuthError::MissingHeader)?;
+    let header_str = header
+        .to_str()
+        .map_err(|_| AdminAuthError::MalformedHeader)?;
+    let token = header_str
+        .strip_prefix("Bearer ")
+        .ok_or(AdminAuthError::MalformedHeader)?;
+    if constant_time_eq(token.as_bytes(), configured.as_bytes()) {
+        Ok(())
+    } else {
+        Err(AdminAuthError::BadToken)
+    }
+}
+
+/// Constant-time byte equality — prevents an attacker from learning prefix-match
+/// length from response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> JrpcResult {
@@ -514,6 +597,86 @@ fn validate_eth_address(addr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-review R1 — repro+regression. Pre-fix, every `admin_*` JSON-RPC method
+    /// was reachable by anyone who could hit the listening port. There was no
+    /// `Authorization` header check, no API key, no IP allow-list. A malicious
+    /// caller could `admin_registerFaucet` with attacker-chosen `MetadataHash` to
+    /// poison the registry for any token (so that the legitimate first claim of
+    /// that token's metadata would fail FPI validation).
+    ///
+    /// Tests cover:
+    /// - `not_configured` — when no admin key is set, every admin request is
+    ///   rejected with `NotConfigured`. This is the safe production default
+    ///   (fail closed, not open).
+    /// - `missing_header` — admin key configured, no Authorization header.
+    /// - `wrong_scheme` — Authorization present but not `Bearer ...`.
+    /// - `wrong_token` — `Bearer x` where x != configured key.
+    /// - `correct_token` — accepted.
+    /// - `constant_time_eq` — basic equality + length-mismatch coverage.
+    #[test]
+    fn r1_admin_auth_rejects_when_unconfigured() {
+        let headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            check_admin_auth(None, &headers).unwrap_err(),
+            AdminAuthError::NotConfigured
+        );
+    }
+
+    #[test]
+    fn r1_admin_auth_rejects_missing_header() {
+        let headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            check_admin_auth(Some("s3cret"), &headers).unwrap_err(),
+            AdminAuthError::MissingHeader
+        );
+    }
+
+    #[test]
+    fn r1_admin_auth_rejects_wrong_scheme() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(
+            check_admin_auth(Some("s3cret"), &headers).unwrap_err(),
+            AdminAuthError::MalformedHeader
+        );
+    }
+
+    #[test]
+    fn r1_admin_auth_rejects_wrong_token() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        assert_eq!(
+            check_admin_auth(Some("s3cret"), &headers).unwrap_err(),
+            AdminAuthError::BadToken
+        );
+    }
+
+    #[test]
+    fn r1_admin_auth_accepts_correct_token() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer s3cret"),
+        );
+        assert!(check_admin_auth(Some("s3cret"), &headers).is_ok());
+    }
+
+    #[test]
+    fn r1_constant_time_eq_pins_behaviour() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        // length mismatch must short-circuit to false (not a panic).
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     /// Self-review R11 — repro+regression. Pre-fix, `CorsLayer::new().allow_origin(Any)`
     /// allowed any origin to invoke any JSON-RPC method, including admin endpoints and

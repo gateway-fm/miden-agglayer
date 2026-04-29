@@ -90,6 +90,13 @@ struct Command {
     /// (the safe production default).
     #[arg(long, env = "CORS_ALLOWED_ORIGINS", value_delimiter = ',')]
     cors_allowed_origins: Option<Vec<String>>,
+
+    /// Admin API key gating the `admin_*` JSON-RPC methods (R1). When unset,
+    /// `admin_*` requests are rejected with "admin endpoints disabled". Set this to
+    /// a long random token in production (rotate via deploy). Callers must send
+    /// `Authorization: Bearer <token>`. Comparison is constant-time.
+    #[arg(long, env = "ADMIN_API_KEY")]
+    admin_api_key: Option<String>,
 }
 
 impl std::fmt::Debug for Command {
@@ -115,6 +122,11 @@ impl std::fmt::Debug for Command {
             )
             .field("ger_l1_address", &self.ger_l1_address)
             .field("miden_debug", &self.miden_debug)
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
             .finish()
     }
 }
@@ -286,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
     state.l1_rpc_url = command.l1_rpc_url;
     state.ger_l1_address = command.ger_l1_address;
     state.cors_allowed_origins = command.cors_allowed_origins;
+    state.admin_api_key = command.admin_api_key;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
     // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.

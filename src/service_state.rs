@@ -25,6 +25,10 @@ pub struct ServiceState {
     /// safe default in production); `Some(list)` = explicit allowlist; the special
     /// single-entry `vec!["*"]` is reserved for dev-only wildcards.
     pub cors_allowed_origins: Option<Vec<String>>,
+    /// Admin API key (R1). `None` = `admin_*` JSON-RPC methods are disabled
+    /// entirely (the safe production default — fail closed). `Some(token)` =
+    /// admin requests must carry `Authorization: Bearer <token>`.
+    pub admin_api_key: Option<String>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -51,6 +55,7 @@ impl ServiceState {
             miden_store_dir: PathBuf::new(),
             miden_node_url: String::new(),
             cors_allowed_origins: None,
+            admin_api_key: None,
         }
     }
 }
