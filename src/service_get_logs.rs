@@ -27,13 +27,22 @@ pub(crate) async fn service_get_logs(
 ) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let raw_params: (serde_json::Value,) = request.parse_params()?;
-    let log_filter: LogFilter = match serde_json::from_value(raw_params.0.clone()) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("eth_getLogs: failed to parse filter params, using default: {e}");
-            LogFilter::default()
-        }
-    };
+    // R7 — surface a malformed filter as InvalidParams instead of silently degrading
+    // to "logs at the tip block". The previous fallback masked typos (e.g. an
+    // unrecognised hex string) by returning an empty result for the wrong reason,
+    // which downstream consumers would misinterpret as "no claims yet" and fail to
+    // retry. JSON-RPC contract is to fail loud on bad input.
+    let log_filter: LogFilter = serde_json::from_value(raw_params.0.clone()).map_err(|e| {
+        tracing::warn!("eth_getLogs: rejecting malformed filter params: {e}");
+        JsonRpcResponse::error(
+            answer_id.clone(),
+            JsonRpcError::new(
+                JsonRpcErrorReason::InvalidParams,
+                format!("invalid eth_getLogs filter: {e}"),
+                serde_json::Value::Null,
+            ),
+        )
+    })?;
     let current_block = service
         .store
         .get_latest_block_number()
@@ -158,6 +167,36 @@ mod tests {
         };
         let err = validate_getlogs_filter(&f, 100).unwrap_err();
         assert!(err.contains("topics array too long"), "unexpected: {err}");
+    }
+
+    /// Self-review R7 — repro+regression. Pre-fix, malformed filter JSON (e.g. a
+    /// non-string `from_block` value, or an entirely invalid type) was silently
+    /// degraded into `LogFilter::default()` which resolves to "logs at the tip
+    /// block". Downstream consumers got an empty result for the wrong reason and
+    /// would conclude "no claims" instead of retrying with a corrected filter.
+    /// Post-fix the parse failure surfaces as JSON-RPC InvalidParams.
+    ///
+    /// We test the underlying serde behaviour because the actual handler requires
+    /// a `JsonRpcExtractor` which is constructed from full HTTP request parts;
+    /// a `from_value` round-trip is sufficient to pin the parse contract.
+    #[test]
+    fn r7_malformed_eth_get_logs_filter_is_rejected() {
+        // `from_block` is declared as Option<String>; a numeric literal must NOT
+        // be silently coerced into a default-tip filter.
+        let bad = serde_json::json!({ "fromBlock": 12345 });
+        assert!(
+            serde_json::from_value::<LogFilter>(bad).is_err(),
+            "numeric fromBlock must be rejected"
+        );
+        // Wholly invalid shape.
+        let bad2 = serde_json::json!("not-an-object");
+        assert!(serde_json::from_value::<LogFilter>(bad2).is_err());
+        // Sane shape still parses.
+        let good = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock": "0x10",
+        });
+        assert!(serde_json::from_value::<LogFilter>(good).is_ok());
     }
 
     #[test]
