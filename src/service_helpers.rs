@@ -67,12 +67,64 @@ pub(crate) fn validate_hex_hash_param(
     Ok(arr)
 }
 
+/// Scrub an error chain for public consumption (R8).
+///
+/// `anyhow::Error` `Display` (and even more so `Debug` / chain) routinely contains
+/// internal-only detail: filesystem paths from `Context::with_context`, hostnames
+/// from network errors, sqlx schema names, miden-client store paths, etc.
+/// Returning the raw chain to a JSON-RPC caller leaks those details to anyone
+/// who can hit the port.
+///
+/// This helper:
+/// 1. Logs the FULL error chain at `error` level so server-side observability
+///    keeps everything (operators see the real cause in logs).
+/// 2. Returns a redacted summary string suitable to send back to the caller —
+///    keeps the high-level shape (e.g. "store error" / "claim error") but strips
+///    paths, URLs, and bare punctuation that hints at internal layouts.
+pub(crate) fn scrub_error(prefix: &str, e: &anyhow::Error) -> String {
+    tracing::error!(target: "rpc::error", "{prefix}: {e:#}");
+    redact_internal_details(&format!("{prefix}: {e}"))
+}
+
+/// Redact substrings that look like filesystem paths, file:line citations, or
+/// URL prefixes from a public error message. Conservative — keeps the
+/// human-readable summary but removes the load-bearing internal-leakage parts.
+fn redact_internal_details(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for word in s.split_whitespace() {
+        // Filesystem path heuristic: starts with `/` and contains another `/`.
+        let looks_like_path = word.starts_with('/') && word[1..].contains('/');
+        // URL heuristic.
+        let looks_like_url = word.starts_with("http://")
+            || word.starts_with("https://")
+            || word.starts_with("postgres://")
+            || word.starts_with("postgresql://");
+        // Env-var-y: ALL_CAPS_WITH_UNDERSCORES of length >= 4.
+        let looks_like_env =
+            word.len() >= 4 && word.chars().all(|c| c.is_ascii_uppercase() || c == '_');
+
+        if looks_like_path || looks_like_url || looks_like_env {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("<redacted>");
+        } else {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
+    }
+    out
+}
+
 pub(crate) fn store_error(answer_id: axum_jrpc::Id, e: anyhow::Error) -> JsonRpcResponse {
+    let message = scrub_error("store error", &e);
     JsonRpcResponse::error(
         answer_id,
         JsonRpcError::new(
             JsonRpcErrorReason::InternalError,
-            format!("store error: {e}"),
+            message,
             serde_json::Value::Null,
         ),
     )
@@ -86,11 +138,8 @@ pub(crate) fn json_rpc_response_from_result<T: serde::Serialize>(
     match result {
         Ok(value) => Ok(JsonRpcResponse::success(answer_id, value)),
         Err(error) => {
-            let error = JsonRpcError::new(
-                error_code.into(),
-                error.to_string(),
-                serde_json::Value::Null,
-            );
+            let message = scrub_error("rpc error", &error);
+            let error = JsonRpcError::new(error_code.into(), message, serde_json::Value::Null);
             Err(JsonRpcResponse::error(answer_id, error))
         }
     }
@@ -165,6 +214,57 @@ pub(crate) fn encode_bridge_asset_from_log(log: &crate::log_synthesis::Synthetic
 mod tests {
     use super::*;
     use crate::log_synthesis::SyntheticLog;
+
+    /// Self-review R8 — repro+regression. Pre-fix, error chains from
+    /// `anyhow::Error` Display flowed through `format!("store error: {e}")` and
+    /// `error.to_string()` straight into JSON-RPC responses. Filesystem paths,
+    /// URLs, and env var names embedded in `Context::with_context` chains
+    /// landed in caller-visible payloads.
+    ///
+    /// Tests pin the redactor's behaviour:
+    /// - filesystem paths replaced with `<redacted>`
+    /// - URLs replaced with `<redacted>`
+    /// - env-var-style ALL_CAPS strings replaced with `<redacted>`
+    /// - normal English error text passes through unchanged
+    #[test]
+    fn r8_redact_internal_details_strips_paths_urls_envvars() {
+        // Filesystem path
+        let s = "failed to read /var/lib/miden-agglayer-service/keystore/key.bin";
+        assert_eq!(
+            redact_internal_details(s),
+            "failed to read <redacted>",
+            "filesystem path must be redacted"
+        );
+
+        // Multiple paths in one message
+        let s = "io: src/store/db.rs:42 — cannot open /etc/foo /tmp/bar";
+        let redacted = redact_internal_details(s);
+        assert!(redacted.contains("io:"));
+        assert!(!redacted.contains("/etc/foo"));
+        assert!(!redacted.contains("/tmp/bar"));
+
+        // Postgres URL
+        let s = "connection refused to postgres://user:pass@host:5432/db";
+        let redacted = redact_internal_details(s);
+        assert!(!redacted.contains("postgres://"));
+        assert!(!redacted.contains("user:pass"));
+        assert!(redacted.contains("connection refused"));
+
+        // Env var name
+        let s = "missing DATABASE_URL env var";
+        let redacted = redact_internal_details(s);
+        assert!(!redacted.contains("DATABASE_URL"));
+        assert!(redacted.contains("missing"));
+
+        // Normal text passes through (no leak)
+        let s = "claim amount must be positive";
+        assert_eq!(redact_internal_details(s), "claim amount must be positive");
+
+        // Single-letter words (e.g. variables) are kept; no over-redaction.
+        let s = "value x is too small";
+        assert_eq!(redact_internal_details(s), "value x is too small");
+    }
+
 
     #[test]
     fn test_build_synthetic_tx_json_format() {
