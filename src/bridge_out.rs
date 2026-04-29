@@ -70,6 +70,27 @@ pub fn parse_b2agg_storage(storage: &NoteStorage) -> anyhow::Result<(u32, [u8; 2
     Ok((destination_network, address))
 }
 
+/// Reject destination addresses that are obviously invalid for a bridge-out.
+///
+/// Self-review B7 — pre-fix, aggkit forwarded any 20-byte destination address
+/// to bridge-service, even the zero address (no recipient) or the EVM
+/// precompile range (0x00..0x09 reserved for ecrecover, sha256, ripemd, etc.).
+/// The L1 contract has its own checks but pre-filtering here saves
+/// bridge-service work and keeps the synthetic log stream tidy.
+pub fn is_invalid_destination_address(address: &[u8; 20]) -> bool {
+    // All-zero — no recipient.
+    if address.iter().all(|b| *b == 0) {
+        return true;
+    }
+    // Precompile range: address bytes are zero except possibly the very last
+    // byte being 0x01..0x09. The ABI encodes addresses BE so the precompile
+    // is at the *low* end of the 20 bytes (byte 19).
+    if address[..19].iter().all(|b| *b == 0) && address[19] >= 0x01 && address[19] <= 0x09 {
+        return true;
+    }
+    false
+}
+
 // FAUCET ORIGIN RESOLUTION
 // ================================================================================================
 
@@ -184,6 +205,25 @@ impl BridgeOutScanner {
                     return false;
                 }
             };
+
+        // B7 — reject obviously-invalid destination addresses before they
+        // reach the EVM-side bridge-service. The L1 PolygonZkEVMBridgeV2
+        // contract does its own validation, but emitting a synthetic
+        // BridgeEvent for an address aggkit knows is invalid wastes
+        // bridge-service work and pollutes its log stream. Catch:
+        // - the zero address (claim recipient that nobody controls)
+        // - the EVM precompile range 0x00..0x09 (low addresses
+        //   reserved for ecrecover/sha256/etc.)
+        if is_invalid_destination_address(&destination_address) {
+            ::metrics::counter!("bridge_out_invalid_destination_total").increment(1);
+            tracing::warn!(
+                target: "bridge_out",
+                note_id = %note_id_str,
+                destination = ?destination_address,
+                "B2AGG bridge-out targets the zero or precompile address; refusing to emit synthetic event"
+            );
+            return false;
+        }
 
         // Cantina #13 — circuit-break self-targeted bridge-outs. The on-chain bridge_out
         // procedure has no `dest_network != local_network` assertion, so a B2AGG note with
@@ -720,6 +760,47 @@ mod tests {
         let mainnet_scanner = BridgeOutScanner::new(store, block_state, 0);
         assert!(mainnet_scanner.is_self_targeted(0));
         assert!(!mainnet_scanner.is_self_targeted(1));
+    }
+
+    /// Self-review B7 — repro+regression. The destination address validator
+    /// must reject:
+    /// - zero address (no recipient)
+    /// - precompile range (bytes 0..18 zero, byte 19 in 0x01..0x09)
+    /// AND accept legitimate addresses:
+    /// - real EOA (random hex)
+    /// - real contract (random hex)
+    /// - byte 19 = 0x0A onwards (precompiles stop at 0x09)
+    #[test]
+    fn b7_destination_address_validator() {
+        // Zero address rejected.
+        assert!(is_invalid_destination_address(&[0u8; 20]));
+
+        // Precompile range rejected (0x01..0x09).
+        for byte in 0x01u8..=0x09 {
+            let mut addr = [0u8; 20];
+            addr[19] = byte;
+            assert!(
+                is_invalid_destination_address(&addr),
+                "precompile {byte:#04x} must be rejected"
+            );
+        }
+
+        // 0x0A is just past the precompile range — accepted.
+        let mut addr = [0u8; 20];
+        addr[19] = 0x0A;
+        assert!(!is_invalid_destination_address(&addr));
+
+        // Legitimate-looking address.
+        let mut addr = [0xAAu8; 20];
+        addr[19] = 0x42;
+        assert!(!is_invalid_destination_address(&addr));
+
+        // Address with high byte set (precompiles only have low byte set,
+        // so this should NOT be flagged).
+        let mut addr = [0u8; 20];
+        addr[0] = 0x01;
+        addr[19] = 0x05; // looks like precompile in low byte but high byte set
+        assert!(!is_invalid_destination_address(&addr));
     }
 
     /// Self-review B6 — repro+regression. A B2AGG note with fewer than 6 storage felts

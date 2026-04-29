@@ -72,4 +72,10 @@ pub fn init_metrics() {
          corrupt or schema-drifted transactions row that surfaced as an \
          error rather than masking as not-found. Investigate immediately."
     );
+    describe_counter!(
+        "bridge_out_invalid_destination_total",
+        "B2AGG bridge-out rejected because the destination address is the \
+         zero address or in the EVM precompile range (B7). Forwarding such \
+         events to bridge-service would waste cert-build work."
+    );
 }
