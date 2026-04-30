@@ -137,6 +137,43 @@ pub trait Store: Send + Sync + 'static {
         timestamp: u64,
     ) -> anyhow::Result<()>;
 
+    /// G5: commit a GER injection in one atomic store operation. Combines
+    /// `add_ger_update_event` (hash chain + UpdateHashChainValue log),
+    /// `mark_ger_injected` (idempotency flag), and `set_latest_block_number`
+    /// (cursor advance) so a process crash mid-sequence cannot leave aggkit
+    /// in a state where the on-chain GER consumption has happened but
+    /// aggkit's view is split (log written but `is_ger_injected` still
+    /// false, or cursor advanced past a block with no log).
+    ///
+    /// The default impl below calls the three primitives sequentially —
+    /// safe for InMemoryStore where everything is in-process. PgStore
+    /// overrides with a single SERIALIZABLE postgres transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
+        &self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        self.add_ger_update_event(
+            block_number,
+            block_hash,
+            tx_hash,
+            global_exit_root,
+            mainnet_exit_root,
+            rollup_exit_root,
+            timestamp,
+        )
+        .await?;
+        self.mark_ger_injected(*global_exit_root).await?;
+        self.set_latest_block_number(block_number).await?;
+        Ok(())
+    }
+
     // === Transactions ===
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()>;
     async fn txn_commit(

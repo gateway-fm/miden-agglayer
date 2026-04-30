@@ -435,6 +435,117 @@ impl Store for PgStore {
         Ok(())
     }
 
+    /// G5: atomic GER commit. The default Store-trait impl runs three
+    /// separate calls; this override folds all four writes (ger_entries
+    /// upsert, hash chain update, synthetic_logs insert, is_injected
+    /// flag, latest_block_number bump) into ONE postgres transaction so
+    /// a process crash anywhere mid-sequence either leaves nothing or
+    /// leaves the full GER commit visible.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
+        &self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // Pre-existing add_ger_update_event sequence — duplicated here
+        // so the whole bundle is one transaction.
+        let mainnet: Option<Vec<u8>> = mainnet_exit_root.map(|root| root.to_vec());
+        let rollup: Option<Vec<u8>> = rollup_exit_root.map(|root| root.to_vec());
+        txn.execute(
+            "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (ger_hash) DO NOTHING",
+            &[
+                &global_exit_root.as_slice(),
+                &mainnet as &(dyn ToSql + Sync),
+                &rollup as &(dyn ToSql + Sync),
+                &(block_number as i64),
+                &(timestamp as i64),
+            ],
+        )
+        .await?;
+
+        let row = txn
+            .query_one(
+                "SELECT hash_chain_value FROM service_state WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await?;
+        let old_chain = bytes_to_array_32(row.get(0));
+
+        let mut hasher = Keccak256::new();
+        hasher.update(old_chain);
+        hasher.update(global_exit_root);
+        let new_chain: [u8; 32] = hasher.finalize().into();
+
+        txn.execute(
+            "UPDATE service_state SET hash_chain_value = $1, updated_at = now() WHERE id = 1",
+            &[&new_chain.as_slice()],
+        )
+        .await?;
+
+        let row = txn
+            .query_one(
+                "UPDATE service_state
+                 SET log_counter = log_counter + 1, updated_at = now()
+                 WHERE id = 1
+                 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+        let topics = [
+            UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+            format!("0x{}", hex::encode(global_exit_root)),
+            format!("0x{}", hex::encode(new_chain)),
+        ];
+        let topic_refs: Vec<&str> = topics.iter().map(|topic| topic.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &L2_GLOBAL_EXIT_ROOT_ADDRESS,
+                &topic_refs,
+                &"0x",
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
+            ],
+        )
+        .await?;
+
+        // mark_ger_injected, fused into the same transaction. The original
+        // out-of-band call did `INSERT … ON CONFLICT … DO UPDATE`. Here the
+        // row from the ger_entries insert above MUST exist, so we just flip
+        // the flag.
+        txn.execute(
+            "UPDATE ger_entries SET is_injected = TRUE WHERE ger_hash = $1",
+            &[&global_exit_root.as_slice()],
+        )
+        .await?;
+
+        // set_latest_block_number, fused.
+        txn.execute(
+            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
+            &[&(block_number as i64)],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(())
+    }
+
     // ── Transactions ─────────────────────────────────────────────
 
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()> {
