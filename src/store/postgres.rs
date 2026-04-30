@@ -1024,7 +1024,9 @@ impl Store for PgStore {
         let row = client
             .query_one("SELECT deposit_counter FROM service_state WHERE id = 1", &[])
             .await?;
-        let val: i64 = row.get(0);
+        // service_state.deposit_counter is `INT NOT NULL` (postgres int4 / Rust i32),
+        // not BIGINT. Reading as i64 panics with "error deserializing column 0".
+        let val: i32 = row.get(0);
         Ok(val as u64)
     }
 
