@@ -5,7 +5,7 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - |
-        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 --no-rate-limit &
+        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 &
         ANVIL_PID=$$!
         sleep 2
         # Fund deployment accounts and replay contract deployment transactions
@@ -120,6 +120,10 @@ services:
       - "--miden-store-dir=/var/lib/miden-agglayer-service"
       - "--l1-rpc-url=http://anvil:8545"
       - "--ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+      # R1 — admin-auth key for e2e test access to admin_listFaucets etc.
+      # In production this MUST be a strong random secret; for the e2e
+      # stack we use a fixed dev-only token so scripts can authenticate.
+      - "--admin-api-key=<redacted-test-secret>"
     depends_on:
       miden-node:
         condition: service_healthy

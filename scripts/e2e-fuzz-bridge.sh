@@ -165,8 +165,10 @@ wait_faucet_auto_create() {
 }
 
 # Helper: count faucets
+# R1 — admin_* methods require Bearer auth.
+ADMIN_BEARER="Authorization: Bearer <redacted-test-secret>"
 faucet_count() {
-    curl -sf "$L2_RPC" -H "Content-Type: application/json" \
+    curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" \
         -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' \
         | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))" 2>/dev/null || echo "0"
 }
@@ -505,7 +507,7 @@ echo ""
 step "Round 7: Faucet Registry Integrity"
 echo ""
 
-FAUCETS_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" \
+FAUCETS_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" \
     -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' 2>/dev/null)
 FINAL_FAUCET_COUNT=$(echo "$FAUCETS_JSON" | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))" 2>/dev/null || echo "0")
 
