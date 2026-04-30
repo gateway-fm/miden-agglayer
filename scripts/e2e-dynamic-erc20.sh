@@ -128,9 +128,12 @@ TOKEN_SYMBOL=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "symbol()(string)")
 TOKEN_DEC=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "decimals()(uint8)")
 log "Token: name=$TOKEN_NAME, symbol=$TOKEN_SYMBOL, decimals=$TOKEN_DEC"
 
-# R1 — admin_* methods require Bearer auth. The e2e stack provisions
-# `<redacted-test-secret>` via docker-compose.e2e.yml.
-ADMIN_BEARER="Authorization: Bearer <redacted-test-secret>"
+# R1 — admin_* methods require Bearer auth. ADMIN_API_KEY is generated
+# fresh per setup by scripts/setup-fixtures.sh (or
+# scripts/ensure-e2e-secrets.sh on quick-up paths) and exported here
+# from fixtures/.env, which the calling test runner already sources.
+: "${ADMIN_API_KEY:?fixtures/.env must define ADMIN_API_KEY — run scripts/ensure-e2e-secrets.sh}"
+ADMIN_BEARER="Authorization: Bearer ${ADMIN_API_KEY}"
 
 # Check admin_listFaucets before bridging
 FAUCETS_BEFORE=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' \

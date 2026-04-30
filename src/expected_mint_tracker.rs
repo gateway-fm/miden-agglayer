@@ -68,7 +68,10 @@ impl ExpectedMintTracker {
     /// Register a claim's expected MINT NoteId. Called immediately after
     /// a successful CLAIM submission.
     pub fn record_expected(&self, global_index: GlobalIndex, expected_mint: MintNoteId) {
-        let mut map = self.inner.write().expect("ExpectedMintTracker lock poisoned");
+        let mut map = self
+            .inner
+            .write()
+            .expect("ExpectedMintTracker lock poisoned");
         map.insert(
             global_index,
             Entry {
@@ -92,7 +95,10 @@ impl ExpectedMintTracker {
         landed_mint_ids: &std::collections::HashSet<MintNoteId>,
         stale_threshold_ticks: u32,
     ) -> Vec<(GlobalIndex, MintStatus)> {
-        let mut map = self.inner.write().expect("ExpectedMintTracker lock poisoned");
+        let mut map = self
+            .inner
+            .write()
+            .expect("ExpectedMintTracker lock poisoned");
         let mut results = Vec::with_capacity(map.len());
         let mut to_remove = Vec::new();
 
@@ -103,13 +109,19 @@ impl ExpectedMintTracker {
             } else {
                 entry.ticks_pending = entry.ticks_pending.saturating_add(1);
                 if entry.ticks_pending >= stale_threshold_ticks {
-                    results.push((*gi, MintStatus::StaleAlert {
-                        ticks_pending: entry.ticks_pending,
-                    }));
+                    results.push((
+                        *gi,
+                        MintStatus::StaleAlert {
+                            ticks_pending: entry.ticks_pending,
+                        },
+                    ));
                 } else {
-                    results.push((*gi, MintStatus::Pending {
-                        ticks_pending: entry.ticks_pending,
-                    }));
+                    results.push((
+                        *gi,
+                        MintStatus::Pending {
+                            ticks_pending: entry.ticks_pending,
+                        },
+                    ));
                 }
             }
         }
@@ -135,7 +147,10 @@ impl ExpectedMintTracker {
     /// account), so the tick-based "did the bridge consume our CLAIM"
     /// signal would always alert spuriously without this hook.
     pub fn mark_landed(&self, global_index: GlobalIndex) {
-        let mut map = self.inner.write().expect("ExpectedMintTracker lock poisoned");
+        let mut map = self
+            .inner
+            .write()
+            .expect("ExpectedMintTracker lock poisoned");
         map.remove(&global_index);
     }
 }
@@ -222,7 +237,9 @@ mod tests {
 
         for i in 1..10 {
             let r = t.tick(&HashSet::new(), u32::MAX);
-            assert!(matches!(r[0], (g, MintStatus::Pending { ticks_pending }) if g == gi && ticks_pending == i));
+            assert!(
+                matches!(r[0], (g, MintStatus::Pending { ticks_pending }) if g == gi && ticks_pending == i)
+            );
         }
     }
 }

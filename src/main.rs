@@ -157,8 +157,8 @@ mod hardening_tests {
             restore: false,
             reset_miden_store: false,
             unlock_miden_accounts: false,
-            bridge_address:
-                miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS.to_string(),
+            bridge_address: miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS
+                .to_string(),
             l1_rpc_url: None,
             ger_l1_address: None,
             miden_debug: false,
@@ -230,7 +230,11 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
                 .to_string(),
         );
     }
-    if command.allowed_signers.as_ref().is_none_or(|v| v.is_empty()) {
+    if command
+        .allowed_signers
+        .as_ref()
+        .is_none_or(|v| v.is_empty())
+    {
         reasons.push(
             "  - --allowed-signers is unset (eth_sendRawTransaction would accept \
              any signer). Set ALLOWED_SIGNERS to a comma-separated allow-list."

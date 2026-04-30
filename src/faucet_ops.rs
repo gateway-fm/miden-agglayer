@@ -198,9 +198,7 @@ pub fn parse_token_metadata(
     // the decimals into a wider integer slot — refuse rather than silently
     // truncating.
     if data[64..95].iter().any(|b| *b != 0) {
-        anyhow::bail!(
-            "token decimals word non-canonical: high bytes are non-zero (malformed ABI)"
-        );
+        anyhow::bail!("token decimals word non-canonical: high bytes are non-zero (malformed ABI)");
     }
 
     // Read symbol offset (second word) and decode the string
@@ -302,9 +300,7 @@ fn abi_decode_string(data: &[u8], offset: usize) -> anyhow::Result<String> {
     }
     let len = u256_from_be_slice(&data[offset..header_end]);
     if len > MAX_DECODED_STRING_BYTES {
-        anyhow::bail!(
-            "decoded string length {len} exceeds cap {MAX_DECODED_STRING_BYTES} bytes"
-        );
+        anyhow::bail!("decoded string length {len} exceeds cap {MAX_DECODED_STRING_BYTES} bytes");
     }
     let str_start = header_end;
     let str_end = str_start
@@ -459,10 +455,7 @@ mod tests {
         let metadata = Bytes::from(data);
         let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
         let err = parse_token_metadata(&metadata, &addr).unwrap_err();
-        assert!(
-            err.to_string().contains("exceeds cap"),
-            "unexpected: {err}"
-        );
+        assert!(err.to_string().contains("exceeds cap"), "unexpected: {err}");
     }
 
     /// Self-review X4 — overflow in `offset + len` arithmetic. Pre-fix
@@ -535,7 +528,12 @@ mod tests {
         let result = sanitise_token_symbol("$$$", &addr);
         assert!(result.starts_with('T'));
         assert_eq!(result.len(), 5); // T + 4 hex chars
-        assert!(result.chars().skip(1).all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+        assert!(
+            result
+                .chars()
+                .skip(1)
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        );
 
         // Non-ASCII Unicode dropped, falls back.
         let result = sanitise_token_symbol("🪙", &addr);

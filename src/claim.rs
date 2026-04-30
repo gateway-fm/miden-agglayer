@@ -102,7 +102,9 @@ async fn find_or_create_faucet(
     //    keys faucets by `hash(origin_token_address)` ALONE, so registering a second faucet
     //    for the same token address under a different `origin_network` will silently
     //    overwrite the first registration on-chain. Reject before we reach that path.
-    let same_address_faucets = store.find_faucets_by_origin_address(&token_address.0.0).await?;
+    let same_address_faucets = store
+        .find_faucets_by_origin_address(&token_address.0.0)
+        .await?;
     if let Some(existing) = same_address_faucets
         .iter()
         .find(|f| f.origin_network != origin_network)
@@ -397,10 +399,7 @@ async fn publish_claim_internal(
     // process's lifetime, the bridge has already consumed it (or will within
     // milliseconds). We still sync_state once to refresh, but skip the
     // 4×3s = 12s of additional waiting in the common case.
-    let claim_ger = crate::ger::combined_ger(
-        &params.mainnetExitRoot.0,
-        &params.rollupExitRoot.0,
-    );
+    let claim_ger = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
     tracing::info!("waiting for GER to propagate to bridge account before submitting CLAIM...");
     for i in 0..5 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -467,7 +466,9 @@ async fn publish_claim_internal(
             .output_notes()
             .iter()
             .find_map(|n| match n {
-                miden_protocol::transaction::RawOutputNote::Full(full) => Some(full.id().as_bytes()),
+                miden_protocol::transaction::RawOutputNote::Full(full) => {
+                    Some(full.id().as_bytes())
+                }
                 miden_protocol::transaction::RawOutputNote::Partial(partial) => {
                     Some(partial.id().as_bytes())
                 }
@@ -853,8 +854,8 @@ mod tests {
             assert_eq!(amount, Felt::try_from(max_native).unwrap());
 
             // Off-by-one above MAX_AMOUNT must be rejected.
-            let wei_just_over = U256::from(max_native + 1)
-                .mul(U256::from(10u64).pow(U256::from(10u64)));
+            let wei_just_over =
+                U256::from(max_native + 1).mul(U256::from(10u64).pow(U256::from(10u64)));
             assert!(
                 scale_claim_amount(&eth_amount(wei_just_over), faucet(18, 8)).is_err(),
                 "MAX_AMOUNT + 1 must be rejected"

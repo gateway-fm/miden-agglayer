@@ -790,9 +790,7 @@ impl Store for PgStore {
         })?;
         let signer = signer_str.parse::<Address>().map_err(|e| {
             ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
-            anyhow::anyhow!(
-                "stored signer for {hash_str} is not a valid Address ({e})"
-            )
+            anyhow::anyhow!("stored signer for {hash_str} is not a valid Address ({e})")
         })?;
 
         let result = match status {
@@ -1022,7 +1020,10 @@ impl Store for PgStore {
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let row = client
-            .query_one("SELECT deposit_counter FROM service_state WHERE id = 1", &[])
+            .query_one(
+                "SELECT deposit_counter FROM service_state WHERE id = 1",
+                &[],
+            )
             .await?;
         // service_state.deposit_counter is `INT NOT NULL` (postgres int4 / Rust i32),
         // not BIGINT. Reading as i64 panics with "error deserializing column 0".

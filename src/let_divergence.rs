@@ -122,7 +122,11 @@ mod tests {
     /// the whole bridge. Pin that the gap matches `on_chain - aggkit`.
     #[test]
     fn cantina_9_gap_arithmetic_correct() {
-        for (chain, agg, expected_gap) in [(5u64, 3, 2), (100, 1, 99), (u32::MAX as u64, 0, u32::MAX as u64)] {
+        for (chain, agg, expected_gap) in [
+            (5u64, 3, 2),
+            (100, 1, 99),
+            (u32::MAX as u64, 0, u32::MAX as u64),
+        ] {
             assert_eq!(
                 compare_let_state(chain, agg),
                 LetDivergence::OnChainAhead { gap: expected_gap }

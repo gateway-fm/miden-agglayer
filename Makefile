@@ -75,6 +75,7 @@ test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-containe
 	@echo "║  Starting E2E stack (Anvil, Miden node, PG, bridge, aggkit) ║"
 	@echo "╚══════════════════════════════════════════════════════════════╝"
 	@$(MAKE) --no-print-directory e2e-clean-data
+	@./scripts/ensure-e2e-secrets.sh
 	$(E2E_COMPOSE) up -d --build --wait
 	@echo ""
 	@echo "Stack is up — running E2E tests..."

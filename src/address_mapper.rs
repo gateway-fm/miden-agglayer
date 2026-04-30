@@ -144,13 +144,11 @@ mod tests {
         let zero_padded = address!("0x000000003d7c9747558851900f8206226dfbea00");
 
         // Default policy (reject = false): fallback succeeds.
-        let r =
-            resolve_address_with_policy(&store, zero_padded, &cfg, false).await;
+        let r = resolve_address_with_policy(&store, zero_padded, &cfg, false).await;
         assert!(r.is_ok());
 
         // Strict policy (reject = true): fallback refused with clear error.
-        let r =
-            resolve_address_with_policy(&store, zero_padded, &cfg, true).await;
+        let r = resolve_address_with_policy(&store, zero_padded, &cfg, true).await;
         let err = r.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("fallback disabled"));
@@ -161,17 +159,19 @@ mod tests {
     /// an address must not be blocked by the strict policy).
     #[tokio::test]
     async fn c5_explicit_store_mapping_always_wins() {
-        use crate::store::memory::InMemoryStore;
         use crate::Store;
+        use crate::store::memory::InMemoryStore;
         let store = InMemoryStore::new();
         let cfg = test_accounts_config();
         let mapped_addr = address!("0xabcdef1234567890abcdef1234567890abcdef12");
         let target = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        store.set_address_mapping(mapped_addr, target).await.unwrap();
+        store
+            .set_address_mapping(mapped_addr, target)
+            .await
+            .unwrap();
 
         // With strict policy, the mapping still resolves.
-        let r =
-            resolve_address_with_policy(&store, mapped_addr, &cfg, true).await;
+        let r = resolve_address_with_policy(&store, mapped_addr, &cfg, true).await;
         assert_eq!(r.unwrap(), target);
     }
 

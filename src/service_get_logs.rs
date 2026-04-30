@@ -1,8 +1,8 @@
 use crate::log_synthesis::LogFilter;
 use crate::service_helpers::store_error;
 use crate::service_state::ServiceState;
-use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
+use axum_jrpc::{JrpcResult, JsonRpcExtractor, JsonRpcResponse};
 
 /// Maximum number of blocks an `eth_getLogs` request is allowed to span.
 ///
@@ -217,6 +217,9 @@ mod tests {
             ..Default::default()
         };
         let err = validate_getlogs_filter(&f, 100).unwrap_err();
-        assert!(err.contains("addresses array too long"), "unexpected: {err}");
+        assert!(
+            err.contains("addresses array too long"),
+            "unexpected: {err}"
+        );
     }
 }

@@ -23,8 +23,8 @@ use std::str::FromStr;
 use tokio::net::TcpListener;
 use tokio::signal::unix::SignalKind;
 use tower::ServiceBuilder;
-use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::GovernorLayer;
+use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 
 /// Default per-IP rate limit (R13). 500 req/sec sustained with a 500-request
@@ -161,9 +161,13 @@ enum AdminAuthError {
 impl std::fmt::Display for AdminAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotConfigured => f.write_str("admin endpoints disabled (no admin API key configured)"),
+            Self::NotConfigured => {
+                f.write_str("admin endpoints disabled (no admin API key configured)")
+            }
             Self::MissingHeader => f.write_str("missing Authorization header"),
-            Self::MalformedHeader => f.write_str("malformed Authorization header (expected `Bearer <token>`)"),
+            Self::MalformedHeader => {
+                f.write_str("malformed Authorization header (expected `Bearer <token>`)")
+            }
             Self::BadToken => f.write_str("invalid bearer token"),
         }
     }
@@ -192,8 +196,8 @@ fn check_admin_auth(
     // RFC 6750 §2.1: the auth-scheme is case-insensitive (`Bearer` == `bearer`).
     // The previous implementation accepted only `Bearer ` exactly, which would
     // reject standards-compliant clients that lower-case the scheme.
-    let token = strip_bearer_prefix_case_insensitive(header_str)
-        .ok_or(AdminAuthError::MalformedHeader)?;
+    let token =
+        strip_bearer_prefix_case_insensitive(header_str).ok_or(AdminAuthError::MalformedHeader)?;
     if constant_time_eq(token.as_bytes(), configured.as_bytes()) {
         Ok(())
     } else {
@@ -617,7 +621,10 @@ pub async fn serve(
     // when N >= 1000 — at N=1000 we get one token per ms i.e. 1000 req/sec
     // exactly; at higher rates the millisecond floor caps us at 1000/sec
     // sustained, which is comfortably above any legitimate use case.
-    let replenish_period_ms = 1000_u64.checked_div(state.rate_limit_per_second).unwrap_or(1).max(1);
+    let replenish_period_ms = 1000_u64
+        .checked_div(state.rate_limit_per_second)
+        .unwrap_or(1)
+        .max(1);
     let governor_conf = std::sync::Arc::new(
         GovernorConfigBuilder::default()
             .per_millisecond(replenish_period_ms)
@@ -748,7 +755,9 @@ fn build_cors_layer(allowed_origins: Option<&[String]>) -> tower_http::cors::Cor
 /// input could mislead consistency checks. Reject malformed values rather than
 /// fabricate compatibility.
 fn validate_eth_address(addr: &str) -> Result<(), String> {
-    let s = addr.strip_prefix("0x").ok_or("address must start with 0x")?;
+    let s = addr
+        .strip_prefix("0x")
+        .ok_or("address must start with 0x")?;
     if s.len() != 40 {
         return Err(format!("address must be 40 hex chars, got {}", s.len()));
     }
@@ -794,7 +803,10 @@ mod tests {
             .per_millisecond(1000)
             .burst_size(1)
             .finish();
-        assert!(tight.is_some(), "1/1 (1 token per 1000ms) config must finalise");
+        assert!(
+            tight.is_some(),
+            "1/1 (1 token per 1000ms) config must finalise"
+        );
 
         assert!(
             GovernorConfigBuilder::default()
@@ -817,8 +829,14 @@ mod tests {
     fn metric_label_cardinality_capped_to_known_set() {
         // Known methods preserved.
         assert_eq!(bucket_method_label("eth_getLogs"), "eth_getLogs");
-        assert_eq!(bucket_method_label("admin_registerFaucet"), "admin_registerFaucet");
-        assert_eq!(bucket_method_label("eth_sendRawTransaction"), "eth_sendRawTransaction");
+        assert_eq!(
+            bucket_method_label("admin_registerFaucet"),
+            "admin_registerFaucet"
+        );
+        assert_eq!(
+            bucket_method_label("eth_sendRawTransaction"),
+            "eth_sendRawTransaction"
+        );
 
         // Attacker-shaped admin probe: one series, not a million.
         assert_eq!(bucket_method_label("admin_DEADBEEF"), "other");
@@ -935,7 +953,10 @@ mod tests {
                 "single-byte differ at pos {i} must reject"
             );
             a[i] = 1;
-            assert!(constant_time_eq(&a, &b), "matching byte at pos {i} must accept");
+            assert!(
+                constant_time_eq(&a, &b),
+                "matching byte at pos {i} must accept"
+            );
         }
         // Length mismatch from any side.
         assert!(!constant_time_eq(b"longer-token", b"short"));
@@ -949,10 +970,22 @@ mod tests {
     /// (Basic, garbage, missing space).
     #[test]
     fn r1_bearer_prefix_case_insensitive() {
-        assert_eq!(strip_bearer_prefix_case_insensitive("Bearer abc"), Some("abc"));
-        assert_eq!(strip_bearer_prefix_case_insensitive("bearer abc"), Some("abc"));
-        assert_eq!(strip_bearer_prefix_case_insensitive("BEARER abc"), Some("abc"));
-        assert_eq!(strip_bearer_prefix_case_insensitive("BeArEr abc"), Some("abc"));
+        assert_eq!(
+            strip_bearer_prefix_case_insensitive("Bearer abc"),
+            Some("abc")
+        );
+        assert_eq!(
+            strip_bearer_prefix_case_insensitive("bearer abc"),
+            Some("abc")
+        );
+        assert_eq!(
+            strip_bearer_prefix_case_insensitive("BEARER abc"),
+            Some("abc")
+        );
+        assert_eq!(
+            strip_bearer_prefix_case_insensitive("BeArEr abc"),
+            Some("abc")
+        );
 
         // Non-Bearer schemes rejected.
         assert_eq!(strip_bearer_prefix_case_insensitive("Basic dXNlcg=="), None);

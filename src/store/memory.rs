@@ -964,7 +964,10 @@ mod tests {
         assert_eq!(networks, [0u32, 7].iter().copied().collect());
 
         // Other origin addresses are unaffected.
-        let other = store.find_faucets_by_origin_address(&[0u8; 20]).await.unwrap();
+        let other = store
+            .find_faucets_by_origin_address(&[0u8; 20])
+            .await
+            .unwrap();
         assert!(other.is_empty());
     }
 }

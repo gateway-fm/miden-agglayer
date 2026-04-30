@@ -139,9 +139,16 @@ mod tests {
         let outcomes: Vec<Outcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         let new_count = outcomes.iter().filter(|o| **o == Outcome::New).count();
-        let dup_count = outcomes.iter().filter(|o| **o == Outcome::Duplicate).count();
+        let dup_count = outcomes
+            .iter()
+            .filter(|o| **o == Outcome::Duplicate)
+            .count();
         assert_eq!(new_count, 1, "exactly one thread must record New");
-        assert_eq!(dup_count, n_threads - 1, "all others must observe Duplicate");
+        assert_eq!(
+            dup_count,
+            n_threads - 1,
+            "all others must observe Duplicate"
+        );
         assert_eq!(t.distinct_count(), 1);
     }
 }

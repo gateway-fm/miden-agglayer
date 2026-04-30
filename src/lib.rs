@@ -3,23 +3,22 @@ pub mod address_mapper;
 pub mod block_state;
 pub mod bridge_address;
 pub mod bridge_out;
+pub mod burn_serial_tracker;
 pub mod claim;
 pub mod exit;
+pub mod expected_mint_tracker;
 pub mod faucet_ops;
+pub mod faucet_ownership_monitor;
+pub mod forged_mint_detector;
 pub mod ger;
 pub mod hex;
 pub mod init;
-pub mod log_synthesis;
-pub mod burn_serial_tracker;
-pub mod expected_mint_tracker;
-pub mod faucet_ownership_monitor;
-pub mod forged_mint_detector;
 pub mod let_divergence;
+pub mod log_synthesis;
 pub mod logging;
-pub mod mint_target_monitor;
-pub mod twin_note_detector;
 pub mod metrics;
 pub mod miden_client;
+pub mod mint_target_monitor;
 pub mod recovery;
 pub mod restore;
 pub mod service;
@@ -35,6 +34,7 @@ pub(crate) mod service_zkevm;
 pub mod store;
 #[cfg(test)]
 pub mod test_helpers;
+pub mod twin_note_detector;
 
 pub const COMPONENT: &str = "miden-agglayer";
 

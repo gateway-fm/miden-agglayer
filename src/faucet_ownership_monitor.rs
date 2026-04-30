@@ -83,10 +83,7 @@ mod tests {
         }
 
         // Renounced — DoS variant.
-        assert_eq!(
-            check_faucet_owner(bridge, None),
-            OwnershipState::Renounced
-        );
+        assert_eq!(check_faucet_owner(bridge, None), OwnershipState::Renounced);
     }
 
     /// The expected bridge is opaque — even if it equals the attacker's

@@ -315,7 +315,9 @@ async fn restore_gers(
                         // a malformed UpdateGerNote is rejected instead of
                         // silently restoring the wrong root.
                         match u32::try_from(felt.as_canonical_u64()) {
-                            Ok(v) => ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes()),
+                            Ok(v) => {
+                                ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes())
+                            }
                             Err(_) => {
                                 tracing::error!(
                                     note_id = %note.id(),

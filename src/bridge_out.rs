@@ -328,9 +328,7 @@ impl BridgeOutScanner {
                     error = ?e,
                     "B8: B2AGG note references an unregistered faucet — quarantining"
                 );
-                if let Err(mark_err) =
-                    self.store.mark_note_processed(note_id_str.clone()).await
-                {
+                if let Err(mark_err) = self.store.mark_note_processed(note_id_str.clone()).await {
                     tracing::error!(
                         target: "bridge_out",
                         note_id = %note_id_str,
@@ -515,8 +513,7 @@ impl SyncListener for BridgeOutScanner {
                     // cross-faucet exploit (Cantina #2) or a misregistered
                     // faucet (operator error).
                     if !registered_faucets.contains(&intended) {
-                        metrics::counter!("bridge_mint_target_mismatch_total")
-                            .increment(1);
+                        metrics::counter!("bridge_mint_target_mismatch_total").increment(1);
                         tracing::error!(
                             target: "bridge_out::mint_attach",
                             note_id = %note.id(),
@@ -612,10 +609,7 @@ impl SyncListener for BridgeOutScanner {
         // critical metric and log so on-call can investigate.
         let tracker_results = self.expected_mints.tick(&landed_claim_ids, 60);
         for (gi, status) in tracker_results {
-            if let crate::expected_mint_tracker::MintStatus::StaleAlert {
-                ticks_pending,
-            } = status
-            {
+            if let crate::expected_mint_tracker::MintStatus::StaleAlert { ticks_pending } = status {
                 metrics::counter!("bridge_expected_mint_stale_total").increment(1);
                 tracing::error!(
                     target: "bridge_out::expected_mint",
@@ -635,10 +629,7 @@ impl BridgeOutScanner {
     /// `let_num_leaves` storage slot via FPI, compares to aggkit's local
     /// `deposit_counter`, emits `bridge_let_divergence_total{kind=...}`
     /// on mismatch.
-    async fn run_let_divergence_check(
-        &self,
-        client: &mut MidenClientLib,
-    ) -> anyhow::Result<()> {
+    async fn run_let_divergence_check(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
         let bridge_account = client
             .get_account(self.bridge_account_id)
             .await
@@ -688,10 +679,7 @@ impl BridgeOutScanner {
     /// Cantina #4 ownership monitor. Iterates the registered faucet list,
     /// FPI-fetches each one's `owner` storage slot, compares against the
     /// configured bridge account id.
-    async fn run_faucet_ownership_check(
-        &self,
-        client: &mut MidenClientLib,
-    ) -> anyhow::Result<()> {
+    async fn run_faucet_ownership_check(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
         let faucets = self.store.list_faucets().await?;
         for entry in faucets {
             let acct = match client.get_account(entry.faucet_id).await {
@@ -729,10 +717,7 @@ impl BridgeOutScanner {
                 observed,
             ) {
                 crate::faucet_ownership_monitor::OwnershipState::Expected => {}
-                crate::faucet_ownership_monitor::OwnershipState::Drift {
-                    observed,
-                    expected,
-                } => {
+                crate::faucet_ownership_monitor::OwnershipState::Drift { observed, expected } => {
                     metrics::counter!(
                         "bridge_faucet_ownership_drift_total",
                         "kind" => "drift"
@@ -944,9 +929,7 @@ mod tests {
     #[test]
     fn cantina_10_bridge_event_metadata_canonical_encoding() {
         let metadata = b"USDC-erc20-decimals-6";
-        let data = encode_bridge_event_data(
-            0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, metadata, 0,
-        );
+        let data = encode_bridge_event_data(0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, metadata, 0);
         let bytes = hex::decode(&data[2..]).unwrap();
         // 32-byte aligned overall.
         assert_eq!(bytes.len() % 32, 0, "encoding must be 32-byte aligned");
@@ -972,9 +955,8 @@ mod tests {
 
         // Exactly 32-byte-aligned metadata: must NOT add a second pad word.
         let aligned = vec![0xAB; 32];
-        let aligned_enc = encode_bridge_event_data(
-            0, 0, &[0u8; 20], 1, &[0xaa; 20], 0, &aligned, 0,
-        );
+        let aligned_enc =
+            encode_bridge_event_data(0, 0, &[0u8; 20], 1, &[0xaa; 20], 0, &aligned, 0);
         let aligned_bytes = hex::decode(&aligned_enc[2..]).unwrap();
         // 8 head + 1 length + 1 data = 10 words.
         assert_eq!(aligned_bytes.len(), 10 * 32);
@@ -1059,9 +1041,10 @@ mod tests {
         // because it takes a `&InputNoteRecord` which is hard to mock. The signature
         // check below is a placeholder; the real proof is the type signature at the
         // function definition (`async fn process_consumed_note(...) -> bool`).
-        let _ = assert_bool::<_, std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>>(
-            || Box::pin(async { true }),
-        );
+        let _ =
+            assert_bool::<_, std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>>(|| {
+                Box::pin(async { true })
+            });
     }
 
     /// Self-review of-the-fix follow-up — repro+regression. The original
@@ -1074,10 +1057,9 @@ mod tests {
     #[test]
     fn bridge_event_metadata_length_capped() {
         let too_big = vec![0u8; MAX_BRIDGE_EVENT_METADATA_BYTES + 1];
-        let err = encode_bridge_event_data_checked(
-            0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, &too_big, 0,
-        )
-        .expect_err("oversized metadata must error");
+        let err =
+            encode_bridge_event_data_checked(0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, &too_big, 0)
+                .expect_err("oversized metadata must error");
         match err {
             BridgeEventEncodeError::MetadataTooLarge { len, cap } => {
                 assert_eq!(len, MAX_BRIDGE_EVENT_METADATA_BYTES + 1);
@@ -1087,9 +1069,8 @@ mod tests {
 
         // Exactly at the cap is accepted.
         let at_cap = vec![0u8; MAX_BRIDGE_EVENT_METADATA_BYTES];
-        let ok = encode_bridge_event_data_checked(
-            0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, &at_cap, 0,
-        );
+        let ok =
+            encode_bridge_event_data_checked(0, 0, &[0u8; 20], 1, &[0xaa; 20], 1000, &at_cap, 0);
         assert!(ok.is_ok(), "exactly cap must be accepted");
     }
 
@@ -1118,8 +1099,7 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
 
         // Local network = 7 (typical rollup id assigned by RollupManager).
-        let bridge_id =
-            AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
         let scanner = BridgeOutScanner::new(store.clone(), block_state.clone(), 7, bridge_id);
         assert!(
             scanner.is_self_targeted(7),

@@ -265,7 +265,6 @@ mod tests {
         assert_eq!(redact_internal_details(s), "value x is too small");
     }
 
-
     #[test]
     fn test_build_synthetic_tx_json_format() {
         let txn_hash = TxHash::from([5u8; 32]);

@@ -30,13 +30,21 @@ impl PerSignerLocks {
     /// Acquire the mutex for `signer`, creating it if needed. Returns an
     /// owned guard the caller must hold for the duration of the critical
     /// section.
-    pub async fn lock(&self, signer: alloy::primitives::Address) -> tokio::sync::OwnedMutexGuard<()> {
+    pub async fn lock(
+        &self,
+        signer: alloy::primitives::Address,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         // Fetch (or create) the per-signer mutex under a quick std-mutex
         // (no `await`-points held). The actual critical section uses the
         // returned tokio mutex.
         let mu = {
-            let mut map = self.inner.lock().expect("PerSignerLocks std-mutex poisoned");
-            map.entry(signer).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+            let mut map = self
+                .inner
+                .lock()
+                .expect("PerSignerLocks std-mutex poisoned");
+            map.entry(signer)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
         };
         mu.lock_owned().await
     }

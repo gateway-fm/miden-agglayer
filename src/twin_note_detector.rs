@@ -183,7 +183,10 @@ mod tests {
             .collect();
         let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-        let new_count = outcomes.iter().filter(|o| matches!(o, Outcome::New)).count();
+        let new_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::New))
+            .count();
         assert_eq!(new_count, 1, "exactly one thread must record New");
         assert_eq!(d.distinct_note_ids(), 1);
     }

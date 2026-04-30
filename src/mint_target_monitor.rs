@@ -75,7 +75,10 @@ mod tests {
 
         // Cantina #2 signature: A's MINT consumed by B.
         match check_mint_attachment(faucet_a, faucet_b) {
-            MintTargetMatch::Mismatch { intended, consuming } => {
+            MintTargetMatch::Mismatch {
+                intended,
+                consuming,
+            } => {
                 assert_eq!(intended, faucet_a);
                 assert_eq!(consuming, faucet_b);
             }
@@ -84,7 +87,10 @@ mod tests {
 
         // The reverse mismatch is also flagged.
         match check_mint_attachment(faucet_b, faucet_a) {
-            MintTargetMatch::Mismatch { intended, consuming } => {
+            MintTargetMatch::Mismatch {
+                intended,
+                consuming,
+            } => {
                 assert_eq!(intended, faucet_b);
                 assert_eq!(consuming, faucet_a);
             }

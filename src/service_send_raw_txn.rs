@@ -172,10 +172,7 @@ async fn handle_claim_asset(
     // Pre-check `has_seen_ger(combined_ger(mainnet_exit_root, rollup_exit_root))`
     // — if false, return a retryable error immediately so aggkit-driven
     // clients re-submit cleanly without burning the lock or the 15s wait.
-    let combined = crate::ger::combined_ger(
-        &params.mainnetExitRoot.0,
-        &params.rollupExitRoot.0,
-    );
+    let combined = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
     if !service.store.has_seen_ger(&combined).await? {
         ::metrics::counter!("rpc_claim_ger_not_seen_total").increment(1);
         anyhow::bail!(
@@ -845,8 +842,7 @@ mod tests {
         let res_a = h_a.await.unwrap();
         let res_b = h_b.await.unwrap();
 
-        let (oks, errs): (Vec<_>, Vec<_>) =
-            [res_a, res_b].into_iter().partition(|r| r.is_ok());
+        let (oks, errs): (Vec<_>, Vec<_>) = [res_a, res_b].into_iter().partition(|r| r.is_ok());
         assert_eq!(
             oks.len(),
             1,
@@ -958,9 +954,15 @@ mod tests {
     /// - return false for an empty allow-list (explicit refuse-all)
     #[test]
     fn r2_is_signer_allowed_pins_allow_list_semantics() {
-        let alice: Address = "0xAAaAaAaAaaaAaaAaAaAAAAAAAaaaAaAaAaaAaaAa".parse().unwrap();
-        let bob: Address = "0xbBbBbBbBbBbbbBbBbBBbbbbbBBBBbbbbBBbBbBbB".parse().unwrap();
-        let carol: Address = "0xCccCccCcCccCcCCCCccCCCcCcCCCCccCcCcCcCcC".parse().unwrap();
+        let alice: Address = "0xAAaAaAaAaaaAaaAaAaAAAAAAAaaaAaAaAaaAaaAa"
+            .parse()
+            .unwrap();
+        let bob: Address = "0xbBbBbBbBbBbbbBbBbBBbbbbbBBBBbbbbBBbBbBbB"
+            .parse()
+            .unwrap();
+        let carol: Address = "0xCccCccCcCccCcCCCCccCCCcCcCCCCccCcCcCcCcC"
+            .parse()
+            .unwrap();
 
         // None = open
         assert!(is_signer_allowed(None, &alice));
@@ -988,7 +990,9 @@ mod tests {
     async fn r2_unauthorised_signer_rejected_with_descriptive_error() {
         let mut service = create_test_service();
         // Configure a non-empty allow-list that does NOT include the test signer.
-        let foreign: Address = "0xdeAddeaDdEadDeaDDEaDDeadDEADDeaDDEAdDEaD".parse().unwrap();
+        let foreign: Address = "0xdeAddeaDdEadDeaDDEaDDeadDEADDeaDDEAdDEaD"
+            .parse()
+            .unwrap();
         service.allowed_signers = Some(vec![foreign]);
 
         let calldata = insertGlobalExitRootCall {
@@ -1004,6 +1008,9 @@ mod tests {
             .expect_err("non-allowed signer must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("not on the allow-list"), "unexpected: {msg}");
-        assert!(msg.contains(&format!("{signer:#x}")), "must name the signer: {msg}");
+        assert!(
+            msg.contains(&format!("{signer:#x}")),
+            "must name the signer: {msg}"
+        );
     }
 }
