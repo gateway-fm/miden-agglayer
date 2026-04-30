@@ -327,6 +327,7 @@ async fn publish_claim_internal(
     store: &dyn Store,
     latest_block_num: BlockNumber,
     reject_zero_padding: bool,
+    expected_mints: Option<&Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_or_create_faucet(
         params.originTokenAddress,
@@ -445,6 +446,38 @@ async fn publish_claim_internal(
         anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
 
+    // Cantina #7: record this CLAIM's NoteId in the expected-MINT tracker.
+    // The bridge_out scanner ticks the tracker each sync; entries land when
+    // the bridge consumes the CLAIM (proxy for "MINT was emitted"). Stale
+    // entries fire `bridge_expected_mint_stale_total` and a critical log.
+    //
+    // We key by `globalIndex` (32-byte L1 leaf identifier) so an operator
+    // chasing a stale alert can resolve it back to the original deposit.
+    // The tracked value is the CLAIM NoteId we just submitted: the bridge's
+    // MINT NoteId is computable from public claim data per Cantina #7, but
+    // re-deriving it here would brittle-couple aggkit to upstream MASM
+    // internals. The CLAIM NoteId is a sufficient proxy because the bridge
+    // ALWAYS consumes the CLAIM as a precondition to emitting the MINT —
+    // a stale CLAIM means a stalled / censored claim, regardless of which
+    // MINT NoteId would have been emitted.
+    if let Some(tracker) = expected_mints {
+        let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
+        let claim_id_bytes: [u8; 32] = tx_result
+            .executed_transaction()
+            .output_notes()
+            .iter()
+            .find_map(|n| match n {
+                miden_protocol::transaction::RawOutputNote::Full(full) => Some(full.id().as_bytes()),
+                miden_protocol::transaction::RawOutputNote::Partial(partial) => {
+                    Some(partial.id().as_bytes())
+                }
+            })
+            .unwrap_or_default();
+        if claim_id_bytes != [0u8; 32] {
+            tracker.record_expected(global_index_bytes, claim_id_bytes);
+        }
+    }
+
     let event = ClaimEvent::from(params);
     let log = event.encode_log_data();
 
@@ -465,6 +498,7 @@ async fn publish_claim_internal(
 /// of the ClaimEvent happens before the result is sent back so the event
 /// is in the store even if the HTTP caller disconnects.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
@@ -478,6 +512,7 @@ pub async fn publish_claim(
     store_dir: std::path::PathBuf,
     node_url: String,
     reject_zero_padding: bool,
+    expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
@@ -501,6 +536,7 @@ pub async fn publish_claim(
                         &*store,
                         latest_block_num,
                         reject_zero_padding,
+                        expected_mints.as_ref(),
                     )
                     .await?;
                     let block_num = store.get_latest_block_number().await? + 1;
@@ -543,6 +579,7 @@ pub async fn publish_claim(
     // Production path: fresh client per call (Igor's approach).
     let store_clone = store.clone();
     let accounts_inner = accounts.0.clone();
+    let expected_mints_clone = expected_mints.clone();
     let join_result = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
@@ -582,6 +619,7 @@ pub async fn publish_claim(
                 &*store_clone,
                 latest_block_num,
                 reject_zero_padding,
+                expected_mints_clone.as_ref(),
             )
             .await?;
 

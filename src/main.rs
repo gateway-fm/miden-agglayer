@@ -428,6 +428,10 @@ async fn main() -> anyhow::Result<()> {
         bridge_out_local_network_id,
         accounts.0.bridge.0,
     ));
+    // Cantina #7: clone the tracker handle now so we can plumb it into
+    // ServiceState below — `bridge_out_scanner` is moved into the listener
+    // vec a few lines down.
+    let expected_mints_handle = bridge_out_scanner.expected_mints.clone();
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
     let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
@@ -474,6 +478,10 @@ async fn main() -> anyhow::Result<()> {
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
     state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
+    // Cantina #7: share the BridgeOutScanner's expected-MINT tracker so
+    // `publish_claim_internal` can record the CLAIM NoteId and the scanner
+    // can mark it Landed once it sees the bridge consume it.
+    state.expected_mints = expected_mints_handle;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
     // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.

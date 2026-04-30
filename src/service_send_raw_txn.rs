@@ -312,6 +312,7 @@ async fn publish_and_record_claim(
         service.miden_store_dir.clone(),
         service.miden_node_url.clone(),
         service.reject_zero_padding_addresses,
+        Some(service.expected_mints.clone()),
     )
     .await?;
     tracing::info!(

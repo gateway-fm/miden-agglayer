@@ -87,6 +87,11 @@ pub struct ServiceState {
     /// reconstruction. Production posture; default false for backward
     /// compatibility with aggsender / aggoracle / hardhat dev flows.
     pub reject_zero_padding_addresses: bool,
+    /// Cantina #7 expected-MINT tracker, shared with the `BridgeOutScanner`.
+    /// `publish_claim_internal` records each submitted CLAIM's NoteId here;
+    /// the scanner ticks it each sync, marking entries Landed once it
+    /// observes the CLAIM consumed by the bridge. Stale entries page on-call.
+    pub expected_mints: Arc<crate::expected_mint_tracker::ExpectedMintTracker>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -119,6 +124,7 @@ impl ServiceState {
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
+            expected_mints: Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new()),
         }
     }
 }

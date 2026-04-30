@@ -424,6 +424,15 @@ impl SyncListener for BridgeOutScanner {
         // claim was recorded by aggkit (forged-MINT detection).
         let burn_root = miden_standards::note::BurnNote::script_root();
         let mint_root = miden_standards::note::MintNote::script_root();
+        // Cantina #7: claim script root, used to mark expected-MINT entries
+        // Landed when we observe the bridge consume the CLAIM. The script
+        // root is a constant (the script bytes are baked into the agglayer
+        // crate); compute once per sync instead of caching, since
+        // `claim_script()` returns by value and the cost is negligible
+        // versus the on-chain query that follows.
+        let claim_root = miden_base_agglayer::claim_script().root();
+        let mut landed_claim_ids: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
         let registered_faucets: std::collections::HashSet<AccountId> = self
             .store
             .list_faucets()
@@ -456,6 +465,13 @@ impl SyncListener for BridgeOutScanner {
             }
 
             let script_root = note.details().script().root();
+            // Cantina #7 — CLAIM consumption observation. The bridge ALWAYS
+            // consumes the CLAIM as a precondition to emitting the MINT, so
+            // a CLAIM in the consumed-set is the proxy "MINT landed" signal
+            // for this proxy's expected-MINT tracker.
+            if script_root == claim_root {
+                landed_claim_ids.insert(id_bytes);
+            }
             // Cantina #5 — BURN serial collision tracking.
             if script_root == burn_root {
                 let serial = note.details().recipient().serial_num();
@@ -586,12 +602,11 @@ impl SyncListener for BridgeOutScanner {
             }
         }
 
-        // Cantina #7 — tick the expected-MINT tracker. Currently passes empty
-        // landed-set because we don't observe MINT NoteIds yet (the wiring
-        // depends on output-note observation). Will graduate once that lands.
-        let tracker_results = self
-            .expected_mints
-            .tick(&std::collections::HashSet::new(), 60);
+        // Cantina #7 — tick the expected-MINT tracker with the CLAIM IDs we
+        // observed consumed this sync. Stale entries (CLAIM not consumed
+        // within 60 sync ticks ≈ 6 minutes at default cadence) fire a
+        // critical metric and log so on-call can investigate.
+        let tracker_results = self.expected_mints.tick(&landed_claim_ids, 60);
         for (gi, status) in tracker_results {
             if let crate::expected_mint_tracker::MintStatus::StaleAlert {
                 ticks_pending,
