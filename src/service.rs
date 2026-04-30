@@ -27,13 +27,22 @@ use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::GovernorLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
-/// Default per-IP rate limit (R13). 60 req/sec sustained with a 60-request burst.
-/// Aggsender / aggoracle / operator-rescue all signal at low frequency relative to
-/// this; the cap exists primarily to slow down brute-force probing of admin auth
-/// (R1) and signer-allow-list rejection paths (R2). Configurable via
+/// Default per-IP rate limit (R13). 500 req/sec sustained with a 500-request
+/// burst. Aggkit colocates ~6 sync loops (L1BridgeSyncer, L2BridgeSyncer,
+/// reorgdetector, ethtxmanager, aggoracle, aggsender) each polling at 1+ Hz
+/// against the proxy from a single container IP, plus eth_call probing on
+/// every cycle — observed bursts at startup hit 200+ req/sec from one IP.
+///
+/// The rate-limit's purpose is brute-force protection for admin auth (R1) and
+/// signer-allow-list probing (R2), both of which only fire from external IPs.
+/// 500 req/sec is far below what a brute-force attacker would mount and
+/// comfortably above legitimate aggkit traffic. Configurable via
 /// `--rate-limit-per-second` / `RATE_LIMIT_PER_SECOND`.
-pub const DEFAULT_RATE_LIMIT_PER_SECOND: u64 = 60;
-pub const DEFAULT_RATE_LIMIT_BURST: u32 = 60;
+///
+/// Self-review history: an earlier 60/60 default tripped aggkit during e2e —
+/// 429 cooldowns of 40s+ deadlocked the ready_for_claim wait.
+pub const DEFAULT_RATE_LIMIT_PER_SECOND: u64 = 500;
+pub const DEFAULT_RATE_LIMIT_BURST: u32 = 500;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
