@@ -405,7 +405,7 @@ mod tests {
 
     /// Self-review X3 — non-canonical decimals word (high bytes non-zero)
     /// must be refused. The ABI declares `uint8 decimals` so the high 31
-    /// bytes of the 32-byte slot must be zero. A misformed sender that
+    /// bytes of the 32-byte slot must be zero. A malformed sender that
     /// embeds a wider integer would silently truncate to its low byte
     /// without this check.
     #[test]
