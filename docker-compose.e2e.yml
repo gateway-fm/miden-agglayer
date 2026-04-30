@@ -5,7 +5,7 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - |
-        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 &
+        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 --no-rate-limit &
         ANVIL_PID=$$!
         sleep 2
         # Fund deployment accounts and replay contract deployment transactions
