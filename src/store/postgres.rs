@@ -635,6 +635,23 @@ impl Store for PgStore {
         .await?;
 
         if result.is_ok() {
+            // C11 — fold the latest_block_number advance into the same
+            // transaction. Monotonic guard: only bump if block_num is
+            // strictly greater than the current cursor, so sweep callers
+            // committing earlier txs (txn_commit_pending replaying a
+            // batch at the Miden block they were committed at) don't
+            // roll the synthetic-log cursor backwards. The synthetic-
+            // log virtual-block path (claim.rs, ger.rs) always passes
+            // current_latest+1, so this collapses two roundtrips into
+            // one and removes the gap where a crash between txn_commit
+            // and set_latest_block_number would leave a finalized log
+            // unreachable via eth_blockNumber.
+            tx.execute(
+                "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1 AND $1 > latest_block_number",
+                &[&(block_num as i64)],
+            )
+            .await?;
+
             // Fetch attached logs (within the same txn so we see a consistent
             // snapshot — no race with a concurrent txn_begin updating the
             // attached log set).
