@@ -504,6 +504,10 @@ impl Store for InMemoryStore {
         Ok(self.processed_notes.read().contains(note_id))
     }
 
+    async fn get_deposit_count(&self) -> anyhow::Result<u64> {
+        Ok(*self.deposit_counter.read() as u64)
+    }
+
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
         self.processed_notes.write().insert(note_id);
         let mut counter = self.deposit_counter.write();

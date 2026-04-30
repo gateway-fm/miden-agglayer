@@ -891,6 +891,15 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
+    async fn get_deposit_count(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one("SELECT deposit_counter FROM service_state WHERE id = 1", &[])
+            .await?;
+        let val: i64 = row.get(0);
+        Ok(val as u64)
+    }
+
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
         let client = self.pool.get().await?;
         let row = client

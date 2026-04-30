@@ -180,6 +180,10 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
     /// Roll back a processed-note marker when later persistence fails.
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;
+    /// Read the current deposit_counter (number of B2AGG-out notes aggkit has
+    /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
+    /// to compare against the bridge account's `let_num_leaves` storage slot.
+    async fn get_deposit_count(&self) -> anyhow::Result<u64>;
 
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).

@@ -426,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
         store.clone(),
         block_state.clone(),
         bridge_out_local_network_id,
+        accounts.0.bridge.0,
     ));
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));

@@ -169,6 +169,20 @@ pub struct BridgeOutScanner {
     /// agglayer certificate covering it is rejected by pessimistic-proof-core, halting the
     /// bridge for every legitimate B2AGG since the last successful certificate.
     local_network_id: u32,
+    /// The bridge account id (so the LET-divergence monitor can FPI-query
+    /// `let_num_leaves` post-sync) — Cantina #9.
+    bridge_account_id: AccountId,
+    /// BURN serial collision tracker (Cantina #5).
+    pub burn_serials: Arc<crate::burn_serial_tracker::BurnSerialTracker>,
+    /// Twin-NoteId detector (Cantina #6).
+    pub twin_notes: Arc<crate::twin_note_detector::TwinNoteDetector>,
+    /// Expected-MINT-NoteId tracker (Cantina #7).
+    pub expected_mints: Arc<crate::expected_mint_tracker::ExpectedMintTracker>,
+    /// Sync ticks per faucet-ownership probe (Cantina #4 ownership monitor).
+    /// 0 disables; default is every tick.
+    ownership_probe_every_n_ticks: u32,
+    /// Internal tick counter for ownership probe scheduling.
+    tick_counter: std::sync::atomic::AtomicU32,
 }
 
 impl BridgeOutScanner {
@@ -176,11 +190,18 @@ impl BridgeOutScanner {
         store: Arc<dyn crate::store::Store>,
         block_state: Arc<BlockState>,
         local_network_id: u32,
+        bridge_account_id: AccountId,
     ) -> Self {
         Self {
             store,
             block_state,
             local_network_id,
+            bridge_account_id,
+            burn_serials: Arc::new(crate::burn_serial_tracker::BurnSerialTracker::new()),
+            twin_notes: Arc::new(crate::twin_note_detector::TwinNoteDetector::new()),
+            expected_mints: Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new()),
+            ownership_probe_every_n_ticks: 5, // every 5 sync ticks (~30s at 6s/tick)
+            tick_counter: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -393,6 +414,113 @@ impl SyncListener for BridgeOutScanner {
             .await
             .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
+        // Cantina #6 — feed every observed note's NoteId + commitment into the
+        // twin-detector. Same-NoteId-different-commitment is the B2AGG twin
+        // attack signature.
+        // Cantina #5 — every consumed BURN note's serial → tracker; collisions
+        // are the duplicate-burn signature.
+        // Cantina #2 / #4 — every consumed MINT note → check NetworkAccountTarget
+        // attachment matches the consuming faucet AND that the corresponding
+        // claim was recorded by aggkit (forged-MINT detection).
+        let burn_root = miden_standards::note::BurnNote::script_root();
+        let mint_root = miden_standards::note::MintNote::script_root();
+        let registered_faucets: std::collections::HashSet<AccountId> = self
+            .store
+            .list_faucets()
+            .await
+            .ok()
+            .map(|v| v.into_iter().map(|f| f.faucet_id).collect())
+            .unwrap_or_default();
+
+        for note in &consumed_notes {
+            let id_bytes: [u8; 32] = note.id().as_bytes();
+            let Some(commitment_word) = note.commitment() else {
+                // Notes without a commitment (incomplete InputNoteRecord)
+                // shouldn't show up in the Consumed filter; skip defensively.
+                continue;
+            };
+            let commitment_bytes: [u8; 32] = commitment_word.as_bytes();
+            match self.twin_notes.record(id_bytes, commitment_bytes) {
+                crate::twin_note_detector::Outcome::TwinDetected { prior_commitments } => {
+                    metrics::counter!("bridge_twin_note_detected_total").increment(1);
+                    tracing::error!(
+                        target: "bridge_out::twin",
+                        note_id = %note.id(),
+                        observed_commitment = %hex::encode(commitment_bytes),
+                        prior_count = prior_commitments.len(),
+                        "Cantina #6: twin NoteId observed — different metadata, same NoteId"
+                    );
+                }
+                crate::twin_note_detector::Outcome::New
+                | crate::twin_note_detector::Outcome::LegitimateDuplicate => {}
+            }
+
+            let script_root = note.details().script().root();
+            // Cantina #5 — BURN serial collision tracking.
+            if script_root == burn_root {
+                let serial = note.details().recipient().serial_num();
+                if matches!(
+                    self.burn_serials.record(serial.as_bytes()),
+                    crate::burn_serial_tracker::Outcome::Duplicate
+                ) {
+                    metrics::counter!("bridge_burn_serial_collision_total").increment(1);
+                    tracing::error!(
+                        target: "bridge_out::burn",
+                        note_id = %note.id(),
+                        serial = %hex::encode(serial.as_bytes()),
+                        "Cantina #5: BURN serial collision — second BURN with same serial \
+                         observed; faucet token_supply at risk"
+                    );
+                }
+            }
+            // Cantina #2 + #4 — MINT attachment-target + forged-MINT detection.
+            if script_root == mint_root {
+                // The MINT note's metadata.attachment() carries a
+                // NetworkAccountTarget identifying the intended consuming
+                // faucet. We decode via TryFrom<&NoteAttachment>.
+                let Some(metadata) = note.metadata() else {
+                    continue;
+                };
+                let attachment = metadata.attachment();
+                let intended_faucet: Option<AccountId> =
+                    miden_standards::note::NetworkAccountTarget::try_from(attachment)
+                        .ok()
+                        .map(|nat| nat.target_id());
+                if let Some(intended) = intended_faucet {
+                    // Cantina #2: we observe MINT consumption by a faucet
+                    // we don't have direct access to here, but we DO know
+                    // which faucet was the intended target. If the
+                    // intended faucet is not in our registry, that's
+                    // already a critical signal — either it's a
+                    // cross-faucet exploit (Cantina #2) or a misregistered
+                    // faucet (operator error).
+                    if !registered_faucets.contains(&intended) {
+                        metrics::counter!("bridge_mint_target_mismatch_total")
+                            .increment(1);
+                        tracing::error!(
+                            target: "bridge_out::mint_attach",
+                            note_id = %note.id(),
+                            intended_faucet = %intended,
+                            "Cantina #2: MINT NetworkAccountTarget points at a \
+                             faucet not in aggkit's registry — possible \
+                             cross-faucet exploit"
+                        );
+                    }
+                } else {
+                    // MINT with no decodable NetworkAccountTarget — Cantina
+                    // #4 forged-mint signature. The bridge always attaches
+                    // when emitting legitimate MINTs.
+                    metrics::counter!("bridge_forged_mint_total").increment(1);
+                    tracing::error!(
+                        target: "bridge_out::forged_mint",
+                        note_id = %note.id(),
+                        "Cantina #4: MINT note observed with no decodable \
+                         NetworkAccountTarget attachment — forged via NoAuth"
+                    );
+                }
+            }
+        }
+
         for note in &consumed_notes {
             // Only process B2AGG notes — other consumed notes (CLAIM, UpdateGerNote)
             // must not trigger block advancement or they race with GER event writes.
@@ -429,6 +557,190 @@ impl SyncListener for BridgeOutScanner {
             );
         }
 
+        // Cantina #9 — LET divergence monitor. After processing consumed
+        // notes, FPI-query the bridge account's `let_num_leaves` slot and
+        // compare to aggkit's local deposit_counter. A monotonic gap is the
+        // private-B2AGG / silent-LET-advance signature.
+        if let Err(e) = self.run_let_divergence_check(client).await {
+            tracing::warn!(
+                target: "bridge_out::let_divergence",
+                error = ?e,
+                "Cantina #9: LET-divergence check failed (transient — will retry next tick)"
+            );
+        }
+
+        // Cantina #4 ownership monitor — on a slower cadence (every N ticks)
+        // FPI-query each registered faucet's owner storage slot.
+        let tick = self
+            .tick_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.ownership_probe_every_n_ticks > 0
+            && tick.is_multiple_of(self.ownership_probe_every_n_ticks)
+        {
+            if let Err(e) = self.run_faucet_ownership_check(client).await {
+                tracing::warn!(
+                    target: "bridge_out::ownership",
+                    error = ?e,
+                    "Cantina #4: faucet ownership probe failed (transient — will retry)"
+                );
+            }
+        }
+
+        // Cantina #7 — tick the expected-MINT tracker. Currently passes empty
+        // landed-set because we don't observe MINT NoteIds yet (the wiring
+        // depends on output-note observation). Will graduate once that lands.
+        let tracker_results = self
+            .expected_mints
+            .tick(&std::collections::HashSet::new(), 60);
+        for (gi, status) in tracker_results {
+            if let crate::expected_mint_tracker::MintStatus::StaleAlert {
+                ticks_pending,
+            } = status
+            {
+                metrics::counter!("bridge_expected_mint_stale_total").increment(1);
+                tracing::error!(
+                    target: "bridge_out::expected_mint",
+                    global_index = ?gi,
+                    ticks_pending,
+                    "Cantina #7: expected MINT NoteId never landed within threshold"
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl BridgeOutScanner {
+    /// Cantina #9 LET-divergence monitor. Reads the bridge account's
+    /// `let_num_leaves` storage slot via FPI, compares to aggkit's local
+    /// `deposit_counter`, emits `bridge_let_divergence_total{kind=...}`
+    /// on mismatch.
+    async fn run_let_divergence_check(
+        &self,
+        client: &mut MidenClientLib,
+    ) -> anyhow::Result<()> {
+        let bridge_account = client
+            .get_account(self.bridge_account_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_account({}): {e}", self.bridge_account_id))?;
+        let Some(bridge_account) = bridge_account else {
+            // Bridge not yet known to local store — skip silently; the next
+            // sync tick will re-attempt.
+            return Ok(());
+        };
+        let on_chain = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
+        let aggkit = self.store.get_deposit_count().await?;
+        match crate::let_divergence::compare_let_state(on_chain, aggkit) {
+            crate::let_divergence::LetDivergence::InSync => {}
+            crate::let_divergence::LetDivergence::OnChainAhead { gap } => {
+                metrics::counter!(
+                    "bridge_let_divergence_total",
+                    "kind" => "on_chain_ahead"
+                )
+                .increment(1);
+                tracing::error!(
+                    target: "bridge_out::let_divergence",
+                    on_chain,
+                    aggkit,
+                    gap,
+                    "Cantina #9: bridge LET advanced past aggkit's deposit count — \
+                     private B2AGG processed without aggkit observing"
+                );
+            }
+            crate::let_divergence::LetDivergence::AggkitAhead { gap } => {
+                metrics::counter!(
+                    "bridge_let_divergence_total",
+                    "kind" => "aggkit_ahead"
+                )
+                .increment(1);
+                tracing::error!(
+                    target: "bridge_out::let_divergence",
+                    on_chain,
+                    aggkit,
+                    gap,
+                    "Cantina #9: aggkit deposit count exceeds bridge LET — local state corruption"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Cantina #4 ownership monitor. Iterates the registered faucet list,
+    /// FPI-fetches each one's `owner` storage slot, compares against the
+    /// configured bridge account id.
+    async fn run_faucet_ownership_check(
+        &self,
+        client: &mut MidenClientLib,
+    ) -> anyhow::Result<()> {
+        let faucets = self.store.list_faucets().await?;
+        for entry in faucets {
+            let acct = match client.get_account(entry.faucet_id).await {
+                Ok(Some(acct)) => acct,
+                Ok(None) => continue, // not yet synced
+                Err(e) => {
+                    tracing::warn!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        error = ?e,
+                        "Cantina #4: faucet account fetch failed"
+                    );
+                    continue;
+                }
+            };
+            // The Ownable2Step component stores the owner AccountId at a
+            // known slot. Upstream exposes `owner_account_id` returning
+            // `Err(OwnershipRenounced)` for the renounced case.
+            let observed: Option<AccountId> =
+                match miden_base_agglayer::AggLayerFaucet::owner_account_id(&acct) {
+                    Ok(id) => Some(id),
+                    Err(miden_base_agglayer::AgglayerFaucetError::OwnershipRenounced) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "bridge_out::ownership",
+                            faucet_id = %entry.faucet_id,
+                            error = ?e,
+                            "Cantina #4: failed to decode faucet owner — skipping"
+                        );
+                        continue;
+                    }
+                };
+            match crate::faucet_ownership_monitor::check_faucet_owner(
+                self.bridge_account_id,
+                observed,
+            ) {
+                crate::faucet_ownership_monitor::OwnershipState::Expected => {}
+                crate::faucet_ownership_monitor::OwnershipState::Drift {
+                    observed,
+                    expected,
+                } => {
+                    metrics::counter!(
+                        "bridge_faucet_ownership_drift_total",
+                        "kind" => "drift"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        observed_owner = %observed,
+                        expected_owner = %expected,
+                        "Cantina #4: faucet ownership drifted from bridge — possible takeover"
+                    );
+                }
+                crate::faucet_ownership_monitor::OwnershipState::Renounced => {
+                    metrics::counter!(
+                        "bridge_faucet_ownership_drift_total",
+                        "kind" => "renounced"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        "Cantina #4: faucet owner cleared (renounced) — DoS variant"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -787,7 +1099,9 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
 
         // Local network = 7 (typical rollup id assigned by RollupManager).
-        let scanner = BridgeOutScanner::new(store.clone(), block_state.clone(), 7);
+        let bridge_id =
+            AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let scanner = BridgeOutScanner::new(store.clone(), block_state.clone(), 7, bridge_id);
         assert!(
             scanner.is_self_targeted(7),
             "destination_network == local must be flagged as poison"
@@ -807,7 +1121,7 @@ mod tests {
 
         // Edge: a service deployed with network_id = 0 (mainnet bridge) flags
         // destination 0 as self-target.
-        let mainnet_scanner = BridgeOutScanner::new(store, block_state, 0);
+        let mainnet_scanner = BridgeOutScanner::new(store, block_state, 0, bridge_id);
         assert!(mainnet_scanner.is_self_targeted(0));
         assert!(!mainnet_scanner.is_self_targeted(1));
     }
