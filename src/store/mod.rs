@@ -278,6 +278,53 @@ pub trait Store: Send + Sync + 'static {
         self.add_log(log).await
     }
 
+    /// B1: commit a B2AGG bridge-out synthetic event in one atomic store
+    /// operation. Combines `mark_note_processed` (allocate deposit_count),
+    /// `add_bridge_event` (encode + insert synthetic log), and
+    /// `set_latest_block_number` (cursor advance) so that a crash mid-
+    /// sequence cannot leave aggkit in a state where the deposit_count
+    /// has been allocated for a note but no log was emitted (which would
+    /// cause aggsender to skip the BridgeEvent permanently).
+    ///
+    /// Default impl below runs the three primitives sequentially —
+    /// suitable for InMemoryStore. PgStore overrides with a single
+    /// SERIALIZABLE postgres transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let deposit_count = self.mark_note_processed(note_id).await?;
+        self.add_bridge_event(
+            bridge_address,
+            block_number,
+            block_hash,
+            tx_hash,
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        )
+        .await?;
+        self.set_latest_block_number(block_number).await?;
+        Ok(deposit_count)
+    }
+
     // === Convenience: bridge event log ===
     #[allow(clippy::too_many_arguments)]
     async fn add_bridge_event(

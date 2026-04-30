@@ -355,18 +355,19 @@ impl BridgeOutScanner {
         let tx_hash = derive_bridge_out_tx_hash(&note_id_str);
 
         let block_hash = self.block_state.get_block_hash(block_number);
-        let deposit_count = match self.store.mark_note_processed(note_id_str.clone()).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("failed to mark note processed: {e}");
-                return false;
-            }
-        };
 
-        // Emit BridgeEvent log
-        if let Err(e) = self
+        // B1 — atomic commit. Replaces the previous three sequential
+        // calls (mark_note_processed → add_bridge_event →
+        // set_latest_block_number) which had a crash window: if the
+        // process died between mark_note_processed and add_bridge_event,
+        // the deposit_count was permanently allocated for a note with no
+        // emitted log, causing aggsender to skip the BridgeEvent and
+        // wedge that bridge-out forever. PgStore folds all five writes
+        // into one transaction; InMemoryStore uses the default impl.
+        match self
             .store
-            .add_bridge_event(
+            .commit_b2agg_event_atomic(
+                note_id_str.clone(),
                 get_bridge_address(),
                 block_number,
                 block_hash,
@@ -378,27 +379,30 @@ impl BridgeOutScanner {
                 &destination_address,
                 origin_amount,
                 &[],
-                deposit_count,
             )
             .await
         {
-            tracing::error!("failed to add bridge event: {e}");
-            if let Err(rollback_err) = self.store.unmark_note_processed(&note_id_str).await {
-                tracing::error!("failed to roll back processed note marker: {rollback_err}");
+            Ok(deposit_count) => {
+                tracing::info!(
+                    note_id = %note_id_str,
+                    synthetic_tx_hash = %tx_hash,
+                    deposit_count,
+                    destination_network,
+                    amount = origin_amount,
+                    block_number,
+                    "emitted BridgeEvent for consumed B2AGG note (atomic B1)"
+                );
+                true
             }
-            return false;
+            Err(e) => {
+                tracing::error!(
+                    note_id = %note_id_str,
+                    error = %e,
+                    "atomic B2AGG commit failed; transaction rolled back, no state advanced"
+                );
+                false
+            }
         }
-
-        tracing::info!(
-            note_id = %note_id_str,
-            synthetic_tx_hash = %tx_hash,
-            deposit_count,
-            destination_network,
-            amount = origin_amount,
-            block_number,
-            "emitted BridgeEvent for consumed B2AGG note"
-        );
-        true
     }
 }
 

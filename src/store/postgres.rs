@@ -1028,6 +1028,102 @@ impl Store for PgStore {
         Ok(row.get::<_, i32>(0) as u32)
     }
 
+    /// B1: atomic B2AGG bridge-out commit. Folds five writes into one txn:
+    ///   1. service_state.deposit_counter UPDATE → new count
+    ///   2. bridge_out_processed INSERT (with the count)
+    ///   3. service_state.log_counter UPDATE → new log_index
+    ///   4. synthetic_logs INSERT (BridgeEvent)
+    ///   5. service_state.latest_block_number UPDATE
+    /// Either all visible or none — closes the gap where a crash between
+    /// mark_note_processed and add_bridge_event would consume a deposit_count
+    /// without ever emitting the synthetic log, causing aggsender to skip
+    /// the BridgeEvent permanently.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // 1+2: allocate deposit_count, INSERT processed-note row.
+        let row = txn
+            .query_one(
+                "WITH counter AS (
+                    UPDATE service_state SET deposit_counter = deposit_counter + 1, updated_at = now() WHERE id = 1
+                    RETURNING deposit_counter - 1 AS val
+                 )
+                 INSERT INTO bridge_out_processed (note_id, deposit_count)
+                 SELECT $1, val FROM counter
+                 RETURNING deposit_count",
+                &[&note_id],
+            )
+            .await?;
+        let deposit_count: u32 = row.get::<_, i32>(0) as u32;
+
+        // 3: allocate log_index.
+        let row = txn
+            .query_one(
+                "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+
+        // 4: encode + insert the synthetic log. Encoding is identical to
+        // `add_bridge_event`'s default impl — keeping it inline here keeps
+        // the whole bundle in one connection / transaction.
+        let data = crate::bridge_out::encode_bridge_event_data(
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        );
+        let topics_owned: [String; 1] = [crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()];
+        let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &bridge_address,
+                &topics,
+                &data,
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
+            ],
+        )
+        .await?;
+
+        // 5: advance the cursor.
+        txn.execute(
+            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
+            &[&(block_number as i64)],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(deposit_count)
+    }
+
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
