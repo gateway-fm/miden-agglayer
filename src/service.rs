@@ -938,9 +938,11 @@ mod tests {
     /// b.len())` bytes regardless of where the difference is.
     ///
     /// We can't measure timing in a unit test, but we can pin the
-    /// observable contract: same length + same content → true; same length
-    /// + different content (anywhere) → false; different length → false;
-    /// either empty → false unless both empty.
+    /// observable contract:
+    ///   - same length + same content → true
+    ///   - same length + different content (anywhere) → false
+    ///   - different length → false
+    ///   - either empty → false unless both empty
     #[test]
     fn r1_constant_time_eq_contract_pinned() {
         // Same length, every byte position can disagree independently.
@@ -1069,14 +1071,14 @@ mod tests {
     #[test]
     fn r6_request_body_limit_is_explicit_and_in_band() {
         // Must be >= 17 KB (largest legitimate aggkit payload observed in fixtures).
-        assert!(
+        const _: () = assert!(
             MAX_REQUEST_BODY_BYTES >= 17 * 1024,
-            "limit too small: {MAX_REQUEST_BODY_BYTES}"
+            "limit too small for legitimate aggkit payloads"
         );
         // Must be much smaller than axum default 2 MB (otherwise the new layer is a no-op).
-        assert!(
+        const _: () = assert!(
             MAX_REQUEST_BODY_BYTES < 1024 * 1024,
-            "limit too generous: {MAX_REQUEST_BODY_BYTES}"
+            "limit too generous — must stay below axum default 2 MB"
         );
     }
 }

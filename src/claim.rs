@@ -465,14 +465,13 @@ async fn publish_claim_internal(
             .executed_transaction()
             .output_notes()
             .iter()
-            .find_map(|n| match n {
-                miden_protocol::transaction::RawOutputNote::Full(full) => {
-                    Some(full.id().as_bytes())
-                }
+            .map(|n| match n {
+                miden_protocol::transaction::RawOutputNote::Full(full) => full.id().as_bytes(),
                 miden_protocol::transaction::RawOutputNote::Partial(partial) => {
-                    Some(partial.id().as_bytes())
+                    partial.id().as_bytes()
                 }
             })
+            .next()
             .unwrap_or_default();
         if claim_id_bytes != [0u8; 32] {
             tracker.record_expected(global_index_bytes, claim_id_bytes);
@@ -530,7 +529,6 @@ async fn publish_claim_internal(
 /// client, causing `IncorrectAccountInitialCommitment` errors. Recording
 /// of the ClaimEvent happens before the result is sent back so the event
 /// is in the store even if the HTTP caller disconnects.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_claim(
     params: claimAssetCall,

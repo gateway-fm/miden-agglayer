@@ -593,14 +593,13 @@ impl SyncListener for BridgeOutScanner {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.ownership_probe_every_n_ticks > 0
             && tick.is_multiple_of(self.ownership_probe_every_n_ticks)
+            && let Err(e) = self.run_faucet_ownership_check(client).await
         {
-            if let Err(e) = self.run_faucet_ownership_check(client).await {
-                tracing::warn!(
-                    target: "bridge_out::ownership",
-                    error = ?e,
-                    "Cantina #4: faucet ownership probe failed (transient — will retry)"
-                );
-            }
+            tracing::warn!(
+                target: "bridge_out::ownership",
+                error = ?e,
+                "Cantina #4: faucet ownership probe failed (transient — will retry)"
+            );
         }
 
         // Cantina #7 — tick the expected-MINT tracker with the CLAIM IDs we
@@ -1041,10 +1040,9 @@ mod tests {
         // because it takes a `&InputNoteRecord` which is hard to mock. The signature
         // check below is a placeholder; the real proof is the type signature at the
         // function definition (`async fn process_consumed_note(...) -> bool`).
-        let _ =
-            assert_bool::<_, std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>>(|| {
-                Box::pin(async { true })
-            });
+        assert_bool::<_, std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>>(|| {
+            Box::pin(async { true })
+        });
     }
 
     /// Self-review of-the-fix follow-up — repro+regression. The original
@@ -1155,12 +1153,13 @@ mod tests {
 
     /// Self-review B7 — repro+regression. The destination address validator
     /// must reject:
-    /// - zero address (no recipient)
-    /// - precompile range (bytes 0..18 zero, byte 19 in 0x01..0x09)
+    ///   - zero address (no recipient)
+    ///   - precompile range (bytes 0..18 zero, byte 19 in 0x01..0x09)
+    ///
     /// AND accept legitimate addresses:
-    /// - real EOA (random hex)
-    /// - real contract (random hex)
-    /// - byte 19 = 0x0A onwards (precompiles stop at 0x09)
+    ///   - real EOA (random hex)
+    ///   - real contract (random hex)
+    ///   - byte 19 = 0x0A onwards (precompiles stop at 0x09)
     #[test]
     fn b7_destination_address_validator() {
         // Zero address rejected.
