@@ -197,25 +197,46 @@ fn is_mainnet_global_index(global_index_bytes: &[u8; 32]) -> bool {
     flag == 1
 }
 
-/// Build the CLAIM note's `ProofData`, canonicalising the rollup-side fields when the
-/// claim is for a mainnet deposit (Cantina #11).
+/// Build the CLAIM note's `ProofData`, canonicalising the rollup-side fields that the
+/// upstream MASM mainnet branch genuinely doesn't read (Cantina #11).
 ///
-/// The on-chain CLAIM verifier's mainnet branch in `bridge_in.masm` does not read
-/// `smt_proof_rollup_exit_root` (256 felts) or `rollup_exit_root` (8 felts) and does not
-/// constrain them to any value. Whatever the caller supplies still gets folded into the
-/// CLAIM note's RECIPIENT digest and into PROOF_DATA_KEY (the future MINT note's serial —
-/// see Cantina #7), making each note's NoteId non-deterministic across equivalent mainnet
-/// claims. Zero those fields here so re-submissions of the same mainnet claim hash to
-/// the same NoteId and the produced commitment is canonical even before the upstream
-/// MASM-side gate lands.
+/// Self-review of-the-fix history
+/// ------------------------------
+/// The original Cantina #11 commit zeroed *both* `smt_proof_rollup_exit_root` (256
+/// felts) AND `rollup_exit_root` (8 felts) for mainnet claims, on the assumption
+/// that neither was read by `bridge_in.masm`'s mainnet branch. That assumption
+/// matched the SMT proof but was wrong about the exit root: the dynamic-ERC20
+/// e2e (and any second-and-later mainnet claim against a non-zero on-chain
+/// `PolygonZkEVMGlobalExitRootV2.rollupExitRoot`) failed with
+/// `ERR_GER_NOT_FOUND` (assertion code `0xDF0E804B375D0B3B`).
 ///
-/// In addition: the GlobalIndex layout reserves limb 6 (bytes 24..28) for the rollup
-/// index, which "must be 0 for mainnet deposits" per upstream's
-/// `eth_types::global_index` doc-comment. The original Cantina #11 fix preserved
-/// the full `globalIndex` u256, so an attacker setting non-zero rollup-index bytes
-/// in a mainnet leaf could still produce a non-canonical NoteId. The security
-/// review of-the-fix flagged this gap: also zero bytes 24..28 of the globalIndex
-/// when the mainnet flag is set.
+/// Trace: `bridge_in.masm::verify_leaf` (line 532-553) calls `compute_ger`
+/// (line 385-391) BEFORE the mainnet/rollup branch split. `compute_ger` is
+/// `keccak256(mainnet_exit_root || rollup_exit_root)` and the result is looked
+/// up in `GER_MAP_STORAGE_SLOT` by `assert_valid_ger`
+/// (`bridge_config.masm::101`). The map is populated by `update_ger`
+/// (`bridge_config.masm::48`) when an `UpdateGerNote` is consumed; aggkit
+/// `ger.rs::141` injects the *real* L1 GER digest verbatim. Zeroing
+/// `rollup_exit_root` on the CLAIM side made the recomputed key
+/// `keccak256(mainnet_real || 0)` instead of `keccak256(mainnet_real ||
+/// rollup_real)` whenever the L1 contract had advanced
+/// `rollupExitRoot` past zero — the lookup then missed and the assertion
+/// fired.
+///
+/// The original Cantina #11 NoteId-determinism property is preserved without
+/// the over-zero: for a given mainnet leaf at a given GER, both
+/// `mainnet_exit_root` and `rollup_exit_root` are fixed by the L1 contract
+/// state, so they are NOT attacker-tunable in the way the SMT rollup proof
+/// path bytes (256 felts of merkle siblings — only the SMT *path*-derived
+/// root needs to match anything; the rest is attacker-supplied padding) and
+/// the rollup-index bytes of `globalIndex` (must be 0 per the upstream layout
+/// spec, but unread/unasserted) genuinely were.
+///
+/// Current canonicalisation (mainnet only):
+/// - `smt_proof_rollup_exit_root` → all-zero (256 felts); unread by mainnet branch
+/// - `globalIndex` bytes 24..28 (rollup index) → zero per layout spec
+///
+/// `rollup_exit_root` is left as-is — it IS read by `compute_ger`.
 fn build_canonical_proof_data(params: &claimAssetCall) -> ProofData {
     let mut global_index_bytes = params.globalIndex.to_be_bytes::<32>();
     let is_mainnet = is_mainnet_global_index(&global_index_bytes);
@@ -234,11 +255,11 @@ fn build_canonical_proof_data(params: &claimAssetCall) -> ProofData {
         },
         global_index: GlobalIndex::new(global_index_bytes),
         mainnet_exit_root: ExitRoot::new(params.mainnetExitRoot.0),
-        rollup_exit_root: if is_mainnet {
-            ExitRoot::new([0u8; 32])
-        } else {
-            ExitRoot::new(params.rollupExitRoot.0)
-        },
+        // rollup_exit_root MUST NOT be zeroed: bridge_in's compute_ger feeds
+        // it through keccak256 to derive the GER lookup key, which must match
+        // the digest the GER manager injected (the *real* L1 root pair).
+        // See the docstring above for the diagnosis trail.
+        rollup_exit_root: ExitRoot::new(params.rollupExitRoot.0),
     }
 }
 
@@ -909,7 +930,7 @@ mod tests {
         }
 
         #[test]
-        fn mainnet_claim_zeroes_rollup_proof_and_rollup_exit_root() {
+        fn mainnet_claim_zeroes_rollup_proof_path_only() {
             let call = make_call(true, 0xCC);
             let proof = build_canonical_proof_data(&call);
 
@@ -917,29 +938,64 @@ mod tests {
             for n in proof.smt_proof_rollup_exit_root.iter() {
                 assert_eq!(*n, zero_node, "mainnet smt_proof_rollup must be zeroed");
             }
+            // rollup_exit_root MUST be preserved — it's read by `compute_ger` in
+            // bridge_in.masm to derive the GER lookup key. Zeroing it broke the
+            // dynamic-ERC20 e2e with ERR_GER_NOT_FOUND. See claim.rs docstring.
             assert_eq!(
                 proof.rollup_exit_root,
-                ExitRoot::new([0u8; 32]),
-                "mainnet rollup_exit_root must be zeroed"
+                ExitRoot::new([0xCCu8; 32]),
+                "mainnet rollup_exit_root must NOT be zeroed (load-bearing for compute_ger)"
             );
             // Mainnet exit root is preserved.
             assert_eq!(proof.mainnet_exit_root, ExitRoot::new([0xAAu8; 32]));
         }
 
         #[test]
-        fn mainnet_claim_note_id_invariant_to_rollup_garbage() {
-            // Two mainnet claims for the same leaf, but different rollup-side garbage.
-            // Post-fix the canonicalised ProofData must be byte-identical, proving the
-            // resulting CLAIM note RECIPIENT (and therefore NoteId) is deterministic.
-            let a = build_canonical_proof_data(&make_call(true, 0x00));
-            let b = build_canonical_proof_data(&make_call(true, 0xFF));
+        fn mainnet_claim_note_id_invariant_to_smt_proof_garbage() {
+            // Two mainnet claims for the same leaf, but different smt_proof_rollup
+            // garbage AND identical real (mainnet,rollup)-exit-root pair. Post-fix
+            // the canonicalised ProofData must be byte-identical wrt the SMT proof
+            // path (the only field genuinely unread by the bridge's mainnet branch
+            // and therefore safely zeroable for NoteId determinism).
+            //
+            // We CANNOT canonicalise rollup_exit_root because it's used in the GER
+            // keccak; the test pins the now-correct subset of the determinism
+            // property.
+            let mut call_a = make_call(true, 0x00);
+            let mut call_b = make_call(true, 0xFF);
+            // Force rollup_exit_root to match for both — this is what real claims
+            // look like (the L1 GER manager dictates the value).
+            call_a.rollupExitRoot = FixedBytes([0x33u8; 32]);
+            call_b.rollupExitRoot = FixedBytes([0x33u8; 32]);
+
+            let a = build_canonical_proof_data(&call_a);
+            let b = build_canonical_proof_data(&call_b);
             assert_eq!(
                 a.smt_proof_rollup_exit_root, b.smt_proof_rollup_exit_root,
-                "rollup proof must be canonical for mainnet"
+                "rollup smt_proof must be canonical for mainnet (zeroed)"
             );
             assert_eq!(
                 a.rollup_exit_root, b.rollup_exit_root,
-                "rollup_exit_root must be canonical for mainnet"
+                "rollup_exit_root must be preserved verbatim (=L1 GER manager value)"
+            );
+        }
+
+        /// Regression for the dynamic-ERC20 e2e fix. ERR_GER_NOT_FOUND fired
+        /// because the original canonicalisation zeroed `rollup_exit_root` for
+        /// mainnet claims, but `compute_ger` in `bridge_in.masm` keccaks
+        /// `mainnet_exit_root || rollup_exit_root` to derive the GER lookup key.
+        /// This test pins that the canonicalised proof_data preserves whatever
+        /// `rollup_exit_root` the caller supplied — including non-zero values
+        /// from a live L1 GER manager.
+        #[test]
+        fn mainnet_claim_preserves_nonzero_rollup_exit_root_for_ger_lookup() {
+            let mut call = make_call(true, 0);
+            call.rollupExitRoot = FixedBytes([0x77u8; 32]); // simulates live L1
+            let proof = build_canonical_proof_data(&call);
+            assert_eq!(
+                proof.rollup_exit_root,
+                ExitRoot::new([0x77u8; 32]),
+                "rollup_exit_root must reach the bridge unchanged (else ERR_GER_NOT_FOUND)"
             );
         }
 
@@ -981,7 +1037,7 @@ mod tests {
         #[test]
         fn rollup_claim_preserves_rollup_proof() {
             // Non-mainnet claims must NOT be canonicalised — those fields are load-bearing
-            // for rollup-leaf verification.
+            // for rollup-leaf verification AND the GER keccak.
             let call = make_call(false, 0xCC);
             let proof = build_canonical_proof_data(&call);
 
