@@ -433,33 +433,12 @@ async fn publish_claim_internal(
         .await?;
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
-    let committed = crate::miden_client::wait_for_transaction_commit(
-        client,
-        txn_id,
-        20,
-        std::time::Duration::from_secs(1),
-    )
-    .await?;
-    if committed {
-        tracing::info!("claim tx {txn_id} committed to block");
-    } else {
-        anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
-    }
-
-    // Cantina #7: record this CLAIM's NoteId in the expected-MINT tracker.
-    // The bridge_out scanner ticks the tracker each sync; entries land when
-    // the bridge consumes the CLAIM (proxy for "MINT was emitted"). Stale
-    // entries fire `bridge_expected_mint_stale_total` and a critical log.
-    //
-    // We key by `globalIndex` (32-byte L1 leaf identifier) so an operator
-    // chasing a stale alert can resolve it back to the original deposit.
-    // The tracked value is the CLAIM NoteId we just submitted: the bridge's
-    // MINT NoteId is computable from public claim data per Cantina #7, but
-    // re-deriving it here would brittle-couple aggkit to upstream MASM
-    // internals. The CLAIM NoteId is a sufficient proxy because the bridge
-    // ALWAYS consumes the CLAIM as a precondition to emitting the MINT —
-    // a stale CLAIM means a stalled / censored claim, regardless of which
-    // MINT NoteId would have been emitted.
+    // Cantina #7: record the submitted CLAIM in the expected-MINT tracker
+    // BEFORE awaiting commit. If wait_for_transaction_commit times out (20s)
+    // and we bail!, the entry remains in the tracker. The bridge_out
+    // scanner's tick path then escalates to StaleAlert per global_index,
+    // giving on-call a list of stuck CLAIMs by L1 leaf. On successful
+    // commit (the next code block) we mark_landed to drop the entry.
     if let Some(tracker) = expected_mints {
         let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
         let claim_id_bytes: [u8; 32] = tx_result
@@ -476,6 +455,38 @@ async fn publish_claim_internal(
         if claim_id_bytes != [0u8; 32] {
             tracker.record_expected(global_index_bytes, claim_id_bytes);
         }
+    }
+
+    let committed = crate::miden_client::wait_for_transaction_commit(
+        client,
+        txn_id,
+        20,
+        std::time::Duration::from_secs(1),
+    )
+    .await?;
+    if committed {
+        tracing::info!("claim tx {txn_id} committed to block");
+        // Cantina #7: mark Landed once `wait_for_transaction_commit`
+        // confirms the CLAIM tx was committed. Aggkit's miden-client
+        // operates on the proxy's service account — it CANNOT observe
+        // the bridge account's consumption of our CLAIM via
+        // NoteFilter::Consumed (the consumed-set returned by miden-client
+        // is restricted to our tracked accounts, not the bridge's). The
+        // commit confirmation is the right closure point: from there,
+        // the bridge's MINT emission is deterministic, and tracking
+        // longer would only fire spurious StaleAlerts.
+        //
+        // We still keep the record_expected → tick path useful: any
+        // CLAIM that fails to commit (tx not in block within 20s) does
+        // NOT reach this branch, so the tracker entry remains and the
+        // tick eventually escalates to StaleAlert with the global_index
+        // for operator triage.
+        if let Some(tracker) = expected_mints {
+            let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
+            tracker.mark_landed(global_index_bytes);
+        }
+    } else {
+        anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
 
     let event = ClaimEvent::from(params);

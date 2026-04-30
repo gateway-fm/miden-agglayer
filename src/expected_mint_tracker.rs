@@ -126,6 +126,18 @@ impl ExpectedMintTracker {
     pub fn pending_count(&self) -> usize {
         self.inner.read().map(|m| m.len()).unwrap_or(0)
     }
+
+    /// Mark a tracked global_index as Landed without going through the tick
+    /// path. Used by the claim path once `wait_for_transaction_commit`
+    /// confirms the CLAIM tx was committed: from there the bridge's MINT
+    /// emission is deterministic. Aggkit's own miden-client cannot observe
+    /// the bridge's consumption of CLAIM notes (they belong to a different
+    /// account), so the tick-based "did the bridge consume our CLAIM"
+    /// signal would always alert spuriously without this hook.
+    pub fn mark_landed(&self, global_index: GlobalIndex) {
+        let mut map = self.inner.write().expect("ExpectedMintTracker lock poisoned");
+        map.remove(&global_index);
+    }
 }
 
 #[cfg(test)]
