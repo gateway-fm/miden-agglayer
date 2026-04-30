@@ -598,12 +598,29 @@ pub async fn serve(
     state: ServiceState,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> anyhow::Result<()> {
-    // R13 — per-IP rate limit. The default config (60 req/sec, 60 burst) slows
-    // brute-force probing of admin auth (R1) and signer-allow-list rejection
-    // paths (R2) without affecting legitimate aggsender / aggoracle traffic.
+    // R13 — per-IP rate limit. The default config (500 req/sec sustained,
+    // 500-token burst) slows brute-force probing of admin auth (R1) and
+    // signer-allow-list rejection paths (R2) without affecting legitimate
+    // aggkit traffic.
+    //
+    // Self-review of the original R13 wiring: the builder's `.per_second(N)`
+    // method is named MISLEADINGLY — it sets the REPLENISH PERIOD in seconds,
+    // i.e. "one token every N seconds", which is the *inverse* of what the
+    // const name `DEFAULT_RATE_LIMIT_PER_SECOND` implied. The original
+    // shipped wiring at `.per_second(60)` therefore yielded one token every
+    // 60 seconds (~0.0167 req/sec sustained), not 60 req/sec. Once the
+    // 60-token burst was exhausted aggkit was throttled for hours, with
+    // 429 cooldowns of 90s+ visible in its sync logs.
+    //
+    // Use `.per_millisecond(1000 / N)` so the const name maps to the actual
+    // sustained rate. `1000 / N` clamps to ≥1 ms to avoid divide-by-zero
+    // when N >= 1000 — at N=1000 we get one token per ms i.e. 1000 req/sec
+    // exactly; at higher rates the millisecond floor caps us at 1000/sec
+    // sustained, which is comfortably above any legitimate use case.
+    let replenish_period_ms = 1000_u64.checked_div(state.rate_limit_per_second).unwrap_or(1).max(1);
     let governor_conf = std::sync::Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(state.rate_limit_per_second)
+            .per_millisecond(replenish_period_ms)
             .burst_size(state.rate_limit_burst)
             .finish()
             .expect("rate-limit config must produce a valid governor"),
@@ -746,33 +763,46 @@ mod tests {
     use super::*;
 
     /// Self-review R13 — repro+regression. Default rate-limit constants
-    /// must produce a buildable governor config (not all GovernorConfigBuilder
-    /// inputs are valid; an invalid period or zero burst returns None).
-    /// This pins the contract: defaults DEFAULT_RATE_LIMIT_PER_SECOND and
-    /// DEFAULT_RATE_LIMIT_BURST always finalise.
+    /// must produce a buildable governor config that delivers the expected
+    /// SUSTAINED RATE (not the prior `.per_second(N)` mistake which turned
+    /// 60-cells-burst-then-1-token-per-60-seconds into the proxy's effective
+    /// throttle and made aggkit 429 itself out of the e2e).
+    ///
+    /// Pins the contract:
+    /// - default 500/500 finalises
+    /// - 1/1 finalises
+    /// - rate_limit_per_second=0 is treated as "1 token per 1 ms" (1000/sec)
+    ///   via the saturating divide in `serve()` — this matches "open" intent
+    ///   when an operator nukes the limit by setting 0
+    /// - burst=0 always invalid regardless of period
     #[test]
     fn r13_default_rate_limit_config_is_valid() {
+        let replenish_default = 1000_u64
+            .checked_div(DEFAULT_RATE_LIMIT_PER_SECOND)
+            .unwrap_or(1)
+            .max(1);
         let cfg = GovernorConfigBuilder::default()
-            .per_second(DEFAULT_RATE_LIMIT_PER_SECOND)
+            .per_millisecond(replenish_default)
             .burst_size(DEFAULT_RATE_LIMIT_BURST)
             .finish();
-        assert!(cfg.is_some(), "default rate-limit config must finalise");
+        assert!(
+            cfg.is_some(),
+            "default 500/500 rate-limit config must finalise"
+        );
 
-        // Tightening to 1 req/sec / 1 burst is also valid.
         let tight = GovernorConfigBuilder::default()
-            .per_second(1)
+            .per_millisecond(1000)
             .burst_size(1)
             .finish();
-        assert!(tight.is_some(), "1/1 config must finalise");
+        assert!(tight.is_some(), "1/1 (1 token per 1000ms) config must finalise");
 
-        // Zero per_second OR zero burst is rejected by the builder.
         assert!(
             GovernorConfigBuilder::default()
-                .per_second(0)
-                .burst_size(DEFAULT_RATE_LIMIT_BURST)
+                .per_millisecond(1)
+                .burst_size(0)
                 .finish()
                 .is_none(),
-            "zero per_second must be rejected"
+            "zero burst must be rejected regardless of period"
         );
     }
 

@@ -105,11 +105,11 @@ struct Command {
     #[arg(long, env = "ALLOWED_SIGNERS", value_delimiter = ',')]
     allowed_signers: Option<Vec<alloy::primitives::Address>>,
 
-    /// Per-IP rate limit, sustained requests per second (R13). Default 60.
+    /// Per-IP rate limit, sustained requests per second (R13). Default 500.
     #[arg(long, env = "RATE_LIMIT_PER_SECOND", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND)]
     rate_limit_per_second: u64,
 
-    /// Per-IP rate limit, burst capacity (R13). Default 60.
+    /// Per-IP rate limit, burst capacity (R13). Default 500.
     #[arg(long, env = "RATE_LIMIT_BURST", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST)]
     rate_limit_burst: u32,
 
