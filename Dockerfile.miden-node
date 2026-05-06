@@ -1,7 +1,11 @@
-# Build testing-node-builder from ajl-agglayer-integration-tests-v0.14.0 branch.
-# This is the first stable-0.14.x-compatible integration test branch; the CLAIM note
-# now targets the bridge (not the faucet), and the bridge gains an on-chain
-# token_registry_map alongside the faucet_registry_map.
+# Build testing-node-builder from miden-client v0.14.4.
+#
+# MUST stay in lockstep with the miden-client git tag pinned in Cargo.toml —
+# the gRPC proto between server (this image) and client (miden-agglayer-service)
+# is schema-locked per tag. v0.14.4 matches miden-node-proto-build 0.14.9
+# (`TransactionHeader.output_notes = repeated NoteHeader`). Any client bump
+# that changes the proto schema MUST bump this tag too, or sync_transactions
+# fails with "invalid wire type" and every GER injection hangs on commit wait.
 FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -16,18 +20,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# ajl-agglayer-integration-tests-v0.14.0 branch has:
-# - miden-node + miden-protocol + miden-agglayer deps at 0.14 (stable, non-alpha)
-# - CLAIM notes targeting the bridge (not the faucet); bridge produces MINT note
-#   that the faucet consumes to create the final P2ID for the destination wallet
-# - Dual on-chain registration (faucet_registry_map + token_registry_map)
-# - EthAddress / EthEmbeddedAccountId type split
-# Pinned to specific commit for reproducible builds.
-RUN git clone https://github.com/0xMiden/miden-client.git . && \
-    git checkout f7cdf263781999e8f81ba608f9c5a91218747d98
+# Pinned to the same tagged release as Cargo.toml's miden-client dep
+# (search for `tag = "v0.14.4"` over there). Bumping one without the other
+# produces a wire-type mismatch on sync_transactions.
+ARG MIDEN_CLIENT_TAG=v0.14.4
+RUN git clone --depth 1 --branch ${MIDEN_CLIENT_TAG} https://github.com/0xMiden/miden-client.git .
 
 RUN git rev-parse HEAD > /tmp/miden-client-commit.txt && \
-    echo "Branch: ajl-agglayer-integration-tests-v0.14.0" >> /tmp/miden-client-commit.txt
+    echo "Tag: ${MIDEN_CLIENT_TAG}" >> /tmp/miden-client-commit.txt
 
 # Patch: bind RPC to 0.0.0.0 for Docker port forwarding
 RUN sed -i 's|format!("127.0.0.1:{}", self.rpc_port)|format!("0.0.0.0:{}", self.rpc_port)|' \
@@ -60,7 +60,7 @@ RUN mkdir -p /app/data
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -e' \
-    'echo "=== Miden Testing Node (ajl-agglayer-integration-tests-v0.14.0) ==="' \
+    'echo "=== Miden Testing Node ==="' \
     'cat /app/miden-client-commit.txt' \
     'export AGGLAYER_GENESIS="${AGGLAYER_GENESIS:-0}"' \
     'echo "AGGLAYER_GENESIS=$AGGLAYER_GENESIS"' \
