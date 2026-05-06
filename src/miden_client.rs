@@ -75,7 +75,7 @@ pub fn build_rpc_client(
 ) -> Arc<dyn NodeRpcClient> {
     let mut client = GrpcClient::new(endpoint, timeout_ms);
     if let Some(key) = api_key {
-        client = client.with_header("authorization", format!("Bearer {key}"));
+        client = client.with_bearer_auth(key.to_string());
     }
     Arc::new(client)
 }
