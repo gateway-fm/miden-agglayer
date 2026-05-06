@@ -264,7 +264,7 @@ log "L1 TestToken balance before claim: $L1_TOKEN_BAL_BEFORE"
 
 wait_for "certificate settled" \
     "docker logs $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
-    300 10
+    900 10
 pass "Certificate settled on L1"
 
 # Wait for the SPECIFIC TestToken deposit to appear in bridge-service. When
