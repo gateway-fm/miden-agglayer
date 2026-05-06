@@ -137,6 +137,43 @@ pub trait Store: Send + Sync + 'static {
         timestamp: u64,
     ) -> anyhow::Result<()>;
 
+    /// G5: commit a GER injection in one atomic store operation. Combines
+    /// `add_ger_update_event` (hash chain + UpdateHashChainValue log),
+    /// `mark_ger_injected` (idempotency flag), and `set_latest_block_number`
+    /// (cursor advance) so a process crash mid-sequence cannot leave aggkit
+    /// in a state where the on-chain GER consumption has happened but
+    /// aggkit's view is split (log written but `is_ger_injected` still
+    /// false, or cursor advanced past a block with no log).
+    ///
+    /// The default impl below calls the three primitives sequentially —
+    /// safe for InMemoryStore where everything is in-process. PgStore
+    /// overrides with a single SERIALIZABLE postgres transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
+        &self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        self.add_ger_update_event(
+            block_number,
+            block_hash,
+            tx_hash,
+            global_exit_root,
+            mainnet_exit_root,
+            rollup_exit_root,
+            timestamp,
+        )
+        .await?;
+        self.mark_ger_injected(*global_exit_root).await?;
+        self.set_latest_block_number(block_number).await?;
+        Ok(())
+    }
+
     // === Transactions ===
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()>;
     async fn txn_commit(
@@ -180,6 +217,10 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
     /// Roll back a processed-note marker when later persistence fails.
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;
+    /// Read the current deposit_counter (number of B2AGG-out notes aggkit has
+    /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
+    /// to compare against the bridge account's `let_num_leaves` storage slot.
+    async fn get_deposit_count(&self) -> anyhow::Result<u64>;
 
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).
@@ -190,6 +231,14 @@ pub trait Store: Send + Sync + 'static {
         origin_address: &[u8; 20],
         origin_network: u32,
     ) -> anyhow::Result<Option<FaucetEntry>>;
+    /// Find every faucet registered under a given origin token address, regardless of network.
+    /// Used to detect cross-network token-address collisions before auto-creating a faucet
+    /// (the on-chain registry keys by token address only, so a same-address-different-network
+    /// auto-create would silently overwrite the existing on-chain registration — Cantina #1).
+    async fn find_faucets_by_origin_address(
+        &self,
+        origin_address: &[u8; 20],
+    ) -> anyhow::Result<Vec<FaucetEntry>>;
     /// Look up a faucet by its Miden account ID.
     async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>>;
     /// List all registered faucets.
@@ -212,7 +261,7 @@ pub trait Store: Send + Sync + 'static {
         let log = SyntheticLog {
             address: bridge_address.to_string(),
             topics: vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
-            data: crate::log_synthesis::encode_claim_event_data(
+            data: crate::log_synthesis::encode_claim_event_data_u64(
                 global_index,
                 origin_network,
                 origin_address,
@@ -229,6 +278,53 @@ pub trait Store: Send + Sync + 'static {
         self.add_log(log).await
     }
 
+    /// B1: commit a B2AGG bridge-out synthetic event in one atomic store
+    /// operation. Combines `mark_note_processed` (allocate deposit_count),
+    /// `add_bridge_event` (encode + insert synthetic log), and
+    /// `set_latest_block_number` (cursor advance) so that a crash mid-
+    /// sequence cannot leave aggkit in a state where the deposit_count
+    /// has been allocated for a note but no log was emitted (which would
+    /// cause aggsender to skip the BridgeEvent permanently).
+    ///
+    /// Default impl below runs the three primitives sequentially —
+    /// suitable for InMemoryStore. PgStore overrides with a single
+    /// SERIALIZABLE postgres transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let deposit_count = self.mark_note_processed(note_id).await?;
+        self.add_bridge_event(
+            bridge_address,
+            block_number,
+            block_hash,
+            tx_hash,
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        )
+        .await?;
+        self.set_latest_block_number(block_number).await?;
+        Ok(deposit_count)
+    }
+
     // === Convenience: bridge event log ===
     #[allow(clippy::too_many_arguments)]
     async fn add_bridge_event(
@@ -243,6 +339,7 @@ pub trait Store: Send + Sync + 'static {
         destination_network: u32,
         destination_address: &[u8; 20],
         amount: u128,
+        metadata: &[u8],
         deposit_count: u32,
     ) -> anyhow::Result<()> {
         let log = SyntheticLog {
@@ -255,6 +352,7 @@ pub trait Store: Send + Sync + 'static {
                 destination_network,
                 destination_address,
                 amount,
+                metadata,
                 deposit_count,
             ),
             block_number,

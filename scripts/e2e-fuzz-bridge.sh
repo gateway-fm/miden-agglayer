@@ -165,8 +165,13 @@ wait_faucet_auto_create() {
 }
 
 # Helper: count faucets
+# R1 — admin_* methods require Bearer auth. ADMIN_API_KEY is generated
+# fresh per setup (scripts/ensure-e2e-secrets.sh) and exported from
+# fixtures/.env, which the test runner sources before invoking us.
+: "${ADMIN_API_KEY:?fixtures/.env must define ADMIN_API_KEY — run scripts/ensure-e2e-secrets.sh}"
+ADMIN_BEARER="Authorization: Bearer ${ADMIN_API_KEY}"
 faucet_count() {
-    curl -sf "$L2_RPC" -H "Content-Type: application/json" \
+    curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" \
         -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' \
         | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))" 2>/dev/null || echo "0"
 }
@@ -505,7 +510,7 @@ echo ""
 step "Round 7: Faucet Registry Integrity"
 echo ""
 
-FAUCETS_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" \
+FAUCETS_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" \
     -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' 2>/dev/null)
 FINAL_FAUCET_COUNT=$(echo "$FAUCETS_JSON" | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))" 2>/dev/null || echo "0")
 

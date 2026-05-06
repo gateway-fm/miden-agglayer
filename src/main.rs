@@ -83,6 +83,97 @@ struct Command {
     /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
     #[arg(long, env = "MIDEN_DEBUG")]
     miden_debug: bool,
+
+    /// CORS-allowed origins for the JSON-RPC route (R11). Comma-separated list of
+    /// scheme://host[:port] entries. The single value `*` enables a permissive
+    /// wildcard (DEV ONLY — do not deploy to mainnet). Omit to disable CORS entirely
+    /// (the safe production default).
+    #[arg(long, env = "CORS_ALLOWED_ORIGINS", value_delimiter = ',')]
+    cors_allowed_origins: Option<Vec<String>>,
+
+    /// Admin API key gating the `admin_*` JSON-RPC methods (R1). When unset,
+    /// `admin_*` requests are rejected with "admin endpoints disabled". Set this to
+    /// a long random token in production (rotate via deploy). Callers must send
+    /// `Authorization: Bearer <token>`. Comparison is constant-time.
+    #[arg(long, env = "ADMIN_API_KEY")]
+    admin_api_key: Option<String>,
+
+    /// Allow-list of EVM signer addresses permitted to submit
+    /// `eth_sendRawTransaction` (R2). Comma-separated 0x-prefixed addresses
+    /// (case-insensitive). When unset, every well-formed signer is accepted
+    /// (legacy open mode — only safe behind a private network boundary).
+    #[arg(long, env = "ALLOWED_SIGNERS", value_delimiter = ',')]
+    allowed_signers: Option<Vec<alloy::primitives::Address>>,
+
+    /// Per-IP rate limit, sustained requests per second (R13). Default 500.
+    #[arg(long, env = "RATE_LIMIT_PER_SECOND", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND)]
+    rate_limit_per_second: u64,
+
+    /// Per-IP rate limit, burst capacity (R13). Default 500.
+    #[arg(long, env = "RATE_LIMIT_BURST", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST)]
+    rate_limit_burst: u32,
+
+    /// Reject the address-mapper zero-padding fallback (C5). When set,
+    /// claims targeting an EVM address with no explicit store mapping are
+    /// rejected immediately instead of falling through to the structural
+    /// reconstruction. Production posture; default false for backward
+    /// compat with aggsender / aggoracle / hardhat dev flows.
+    #[arg(long, env = "REJECT_ZERO_PADDING_ADDRESSES", default_value_t = false)]
+    reject_zero_padding_addresses: bool,
+
+    /// Production hardening invariant. When set, refuse to start if any of
+    /// the following hardening flags are at their fail-open defaults:
+    /// - `--admin-api-key` unset (admin endpoints accept any caller)
+    /// - `--allowed-signers` unset (any signer can submit txs)
+    /// - `--cors-allowed-origins` set to a wildcard `*`
+    ///
+    /// Operators deploying to mainnet should set `--require-hardening`
+    /// (env `REQUIRE_HARDENING`) to make these mistakes startup failures
+    /// rather than silent runtime exposures.
+    #[arg(long, env = "REQUIRE_HARDENING", default_value_t = false)]
+    require_hardening: bool,
+}
+
+/// Validate the `--require-hardening` invariants. Returns a list of
+/// reason strings naming each unsatisfied flag. Empty list = pass.
+fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
+    if !command.require_hardening {
+        return Ok(());
+    }
+    let mut reasons = Vec::new();
+    if command.admin_api_key.is_none() {
+        reasons.push(
+            "  - --admin-api-key is unset (admin_* methods would be open). \
+             Set ADMIN_API_KEY to a long random token."
+                .to_string(),
+        );
+    }
+    if command
+        .allowed_signers
+        .as_ref()
+        .is_none_or(|v| v.is_empty())
+    {
+        reasons.push(
+            "  - --allowed-signers is unset (eth_sendRawTransaction would accept \
+             any signer). Set ALLOWED_SIGNERS to a comma-separated allow-list."
+                .to_string(),
+        );
+    }
+    if let Some(origins) = command.cors_allowed_origins.as_ref()
+        && origins.iter().any(|o| o == "*")
+    {
+        reasons.push(
+            "  - --cors-allowed-origins contains a wildcard `*` (browsers from \
+             any origin can hit state-mutating endpoints). Use an explicit \
+             origin list."
+                .to_string(),
+        );
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
 }
 
 impl std::fmt::Debug for Command {
@@ -108,6 +199,13 @@ impl std::fmt::Debug for Command {
             )
             .field("ger_l1_address", &self.ger_l1_address)
             .field("miden_debug", &self.miden_debug)
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("allowed_signers", &self.allowed_signers)
+            .field("require_hardening", &self.require_hardening)
             .finish()
     }
 }
@@ -118,6 +216,19 @@ async fn main() -> anyhow::Result<()> {
     logging::setup_tracing()?;
     miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
     tracing::info!("{command:?}");
+
+    // Hardening startup invariants — fail loud on fail-open production
+    // configurations. Reviewer-flagged (R1+R2+R11). Without this, an
+    // operator can launch the proxy with all three hardening flags at
+    // their fail-open defaults and the only signal is a faint info-level
+    // log line. Loud startup failure is the right escalation.
+    if let Err(reasons) = check_hardening_invariants(&command) {
+        anyhow::bail!(
+            "--require-hardening is set but the following invariants are not satisfied:\n{}\n\
+             Either set the listed flags or drop --require-hardening for dev mode.",
+            reasons.join("\n")
+        );
+    }
 
     let miden_store_dir = command.miden_store_dir;
 
@@ -225,7 +336,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let bridge_out_scanner = Arc::new(BridgeOutScanner::new(store.clone(), block_state.clone()));
+    // Cantina #13 — BridgeOutScanner needs to know our local network id so it can
+    // refuse to emit synthetic BridgeEvents for self-targeted poison leaves.
+    let bridge_out_local_network_id = u32::try_from(command.network_id).map_err(|_| {
+        anyhow::anyhow!(
+            "--network-id ({}) does not fit in u32; B2AGG destination_network is u32-sized",
+            command.network_id
+        )
+    })?;
+    let bridge_out_scanner = Arc::new(BridgeOutScanner::new(
+        store.clone(),
+        block_state.clone(),
+        bridge_out_local_network_id,
+        accounts.0.bridge.0,
+    ));
+    // Cantina #7: clone the tracker handle now so we can plumb it into
+    // ServiceState below — `bridge_out_scanner` is moved into the listener
+    // vec a few lines down.
+    let expected_mints_handle = bridge_out_scanner.expected_mints.clone();
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
     let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
@@ -266,6 +394,16 @@ async fn main() -> anyhow::Result<()> {
     );
     state.l1_rpc_url = command.l1_rpc_url;
     state.ger_l1_address = command.ger_l1_address;
+    state.cors_allowed_origins = command.cors_allowed_origins;
+    state.admin_api_key = command.admin_api_key;
+    state.allowed_signers = command.allowed_signers;
+    state.rate_limit_per_second = command.rate_limit_per_second;
+    state.rate_limit_burst = command.rate_limit_burst;
+    state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
+    // Cantina #7: share the BridgeOutScanner's expected-MINT tracker so
+    // `publish_claim_internal` can record the CLAIM NoteId and the scanner
+    // can mark it Landed once it sees the bridge consume it.
+    state.expected_mints = expected_mints_handle;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
     // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.
@@ -379,4 +517,86 @@ async fn main() -> anyhow::Result<()> {
     state.miden_client.shutdown()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    /// Test fixture: build a Command with all the boring fields set to
+    /// minimum-valid defaults, then mutate the hardening fields per test.
+    fn cmd(
+        require: bool,
+        admin: Option<String>,
+        signers: Option<Vec<alloy::primitives::Address>>,
+        cors: Option<Vec<String>>,
+    ) -> Command {
+        Command {
+            port: 8546,
+            miden_store_dir: None,
+            miden_node: None,
+            chain_id: 1,
+            network_id: 1,
+            init: false,
+            database_url: None,
+            restore: false,
+            reset_miden_store: false,
+            unlock_miden_accounts: false,
+            bridge_address: miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS
+                .to_string(),
+            l1_rpc_url: None,
+            ger_l1_address: None,
+            miden_debug: false,
+            cors_allowed_origins: cors,
+            admin_api_key: admin,
+            allowed_signers: signers,
+            rate_limit_per_second: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND,
+            rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
+            reject_zero_padding_addresses: false,
+            require_hardening: require,
+        }
+    }
+
+    /// When --require-hardening is false, no invariant is enforced.
+    #[test]
+    fn hardening_disabled_passes_with_open_defaults() {
+        let c = cmd(false, None, None, None);
+        assert!(check_hardening_invariants(&c).is_ok());
+    }
+
+    /// All three flags missing → all three reasons reported.
+    #[test]
+    fn hardening_enabled_lists_every_unsatisfied_invariant() {
+        let c = cmd(true, None, None, None);
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(reasons.len(), 2, "admin + signers missing; cors absent OK");
+        assert!(reasons[0].contains("--admin-api-key"));
+        assert!(reasons[1].contains("--allowed-signers"));
+    }
+
+    /// Wildcard CORS triggers the third reason.
+    #[test]
+    fn hardening_flags_wildcard_cors() {
+        let c = cmd(
+            true,
+            Some("k".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["*".into()]),
+        );
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("wildcard `*`"));
+    }
+
+    /// All flags set correctly → pass even with hardening enabled.
+    #[test]
+    fn hardening_all_set_passes() {
+        let c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        assert!(check_hardening_invariants(&c).is_ok());
+    }
 }

@@ -182,10 +182,23 @@ pub async fn insert_ger(
         let block_hash = block_state.get_block_hash(block_number);
         let timestamp = block_state.get_block_timestamp(block_number);
 
-        // Miden submission succeeded — now record the event
+        // Miden submission succeeded — now record the event.
+        //
+        // G5 — single atomic store transaction. Replaces the previous
+        // three sequential calls (add_ger_update_event,
+        // mark_ger_injected, set_latest_block_number) which were not
+        // atomic: a process crash between any two left aggkit in a
+        // split state. The PgStore override folds all five writes
+        // (ger_entries upsert, hash_chain UPDATE, synthetic_logs
+        // INSERT, is_injected UPDATE, latest_block_number UPDATE) into
+        // one SERIALIZABLE postgres transaction. InMemoryStore uses the
+        // default trait impl that just calls the primitives in sequence
+        // (safe in-process; no crash window for tests).
+        //
+        // Supersedes G4's narrowing of the gap.
         let tx_hash_str = format!("{txn_hash:#x}");
         store
-            .add_ger_update_event(
+            .commit_ger_event_atomic(
                 block_number,
                 block_hash,
                 &tx_hash_str,
@@ -195,7 +208,6 @@ pub async fn insert_ger(
                 timestamp,
             )
             .await?;
-        store.set_latest_block_number(block_number).await?;
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),

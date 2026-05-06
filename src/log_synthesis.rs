@@ -101,7 +101,22 @@ impl LogFilter {
             .unwrap_or(current_block)
     }
 
-    /// Check if the query's topic filter explicitly includes the given topic.
+    /// Check if the query's topic0 filter explicitly includes the given topic.
+    ///
+    /// Self-review B11 — pre-fix the docstring said "the query's topic filter"
+    /// generally; in fact this only inspects topic0 (the event signature hash),
+    /// matching go-ethereum's behaviour for synthetic-log passthrough where the
+    /// caller asks "is this event family interesting?" Topics 1..3 (indexed
+    /// args) are matched separately via `LogFilter::matches`. Document the
+    /// contract explicitly so a future refactor that adds topics 1..3 doesn't
+    /// silently break.
+    ///
+    /// Returns false if:
+    /// - `topic` is `None`
+    /// - the filter has no topics array
+    /// - the filter has a topics array but no topic0 entry
+    /// - the topic0 entry is `None` (= "any topic0" wildcard)
+    /// - the topic0 entry is `Some(filter)` and `topic` doesn't match
     fn query_includes_topic(&self, topic: Option<&str>) -> bool {
         let Some(topic) = topic else {
             return false;
@@ -109,7 +124,8 @@ impl LogFilter {
         let Some(ref topic_filters) = self.topics else {
             return false;
         };
-        // Check if topic0 filter includes this topic
+        // Check ONLY topic0 — synthetic logs are passthrough-filtered by event
+        // family at this layer. Indexed-arg matching happens later.
         if let Some(Some(filter)) = topic_filters.first() {
             let topic_lower = topic.to_lowercase();
             return match filter {
@@ -212,12 +228,26 @@ pub struct GerEntry {
 
 // LogStore has been replaced by the Store trait — see src/store/mod.rs
 
+/// Encode a synthetic ClaimEvent log's data section.
+///
+/// On-chain ClaimEvent ABI declares `uint256 amount` — the full 32-byte
+/// slot. The previous signature accepted `amount: u64`, BE-encoded into
+/// the low 8 bytes, with zero padding for the rest. That works for any
+/// amount ≤ u64::MAX but silently truncates anything above (Cantina #12
+/// notes the protocol can technically hold ~2^123-bit values via the
+/// Miden Felt path; aggkit caps at 2^63 - 2^31, but the wire ABI must
+/// stay U256-shaped to align byte-for-byte with the on-chain emission).
+///
+/// X8 — take a 32-byte big-endian U256 directly. Callers that have a
+/// u64 (as today's claim path does) can call
+/// `encode_claim_event_data_u64` for ergonomic compatibility, which
+/// zero-extends the u64 into the U256 slot.
 pub fn encode_claim_event_data(
     global_index: &[u8; 32],
     origin_network: u32,
     origin_address: &[u8; 20],
     destination_address: &[u8; 20],
-    amount: u64,
+    amount_u256_be: &[u8; 32],
 ) -> String {
     let mut data = Vec::with_capacity(160);
 
@@ -236,16 +266,64 @@ pub fn encode_claim_event_data(
     data.extend_from_slice(&[0u8; 12]);
     data.extend_from_slice(destination_address);
 
-    // amount (uint256)
-    data.extend_from_slice(&[0u8; 24]);
-    data.extend_from_slice(&amount.to_be_bytes());
+    // amount (uint256, full 32-byte BE)
+    data.extend_from_slice(amount_u256_be);
 
     format!("0x{}", hex::encode(data))
+}
+
+/// Convenience wrapper for u64-shaped amounts (today's claim path).
+/// Zero-extends `amount` into a U256 slot.
+pub fn encode_claim_event_data_u64(
+    global_index: &[u8; 32],
+    origin_network: u32,
+    origin_address: &[u8; 20],
+    destination_address: &[u8; 20],
+    amount: u64,
+) -> String {
+    let mut amount_be = [0u8; 32];
+    amount_be[24..].copy_from_slice(&amount.to_be_bytes());
+    encode_claim_event_data(
+        global_index,
+        origin_network,
+        origin_address,
+        destination_address,
+        &amount_be,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-review X8 — repro+regression. Pre-fix the encoder accepted
+    /// `amount: u64` and BE-encoded it into the low 8 bytes of a 32-byte
+    /// slot, with the high 24 bytes zero. That works for any value
+    /// ≤ u64::MAX but the on-chain ABI declares `uint256 amount` — a
+    /// future amount > u64::MAX would silently truncate. The fix takes
+    /// a 32-byte BE slice directly. The convenience wrapper still accepts
+    /// a u64 for the present claim path.
+    #[test]
+    fn x8_claim_event_amount_u256_aligned() {
+        let gi = [0xAAu8; 32];
+        let origin_addr = [0x11u8; 20];
+        let dest_addr = [0x22u8; 20];
+
+        // u64 path: amount = 1000 → low 8 bytes carry the value, rest zero.
+        let s = encode_claim_event_data_u64(&gi, 0, &origin_addr, &dest_addr, 1000);
+        let bytes = hex::decode(&s[2..]).unwrap();
+        // amount slot is at bytes 128..160.
+        assert_eq!(&bytes[128..152], &[0u8; 24]);
+        assert_eq!(&bytes[152..160], &1000u64.to_be_bytes());
+
+        // U256 path: amount > u64::MAX is preserved across the full 32 bytes.
+        let mut amount_u256 = [0u8; 32];
+        amount_u256[0] = 0x01; // top byte set → value ≈ 2^248
+        amount_u256[31] = 0x42;
+        let s = encode_claim_event_data(&gi, 0, &origin_addr, &dest_addr, &amount_u256);
+        let bytes = hex::decode(&s[2..]).unwrap();
+        assert_eq!(&bytes[128..160], &amount_u256[..]);
+    }
 
     #[test]
     fn test_log_filter_block_range() {

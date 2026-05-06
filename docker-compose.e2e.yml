@@ -120,6 +120,12 @@ services:
       - "--miden-store-dir=/var/lib/miden-agglayer-service"
       - "--l1-rpc-url=http://anvil:8545"
       - "--ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+      # R1 admin-auth key is supplied via the `ADMIN_API_KEY` env var
+      # from `fixtures/.env`, generated fresh per setup by
+      # scripts/setup-fixtures.sh (or scripts/ensure-e2e-secrets.sh on
+      # quick-up paths). NEVER hardcode a key here — GitHub secret
+      # scanning rightly flags it, and a fixed dev key drifts into
+      # production deploys via copy-paste.
     depends_on:
       miden-node:
         condition: service_healthy

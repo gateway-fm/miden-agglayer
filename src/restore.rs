@@ -146,7 +146,19 @@ async fn restore_bridge_outs(
                 let mut count = 0usize;
                 let mut logs = 0usize;
 
-                for note in &consumed_notes {
+                // G7 — sort B2AGG notes deterministically before assigning
+                // deposit_count. The Miden client returns consumed notes in
+                // store-arrival order, which can differ between runs (e.g.
+                // sync re-orderings, partial restores). Without sorting, the
+                // (note_id → deposit_count) mapping is non-deterministic
+                // across restore runs — two restores from the same on-chain
+                // state could produce different deposit_count assignments,
+                // breaking any consumer that joins on (note_id,
+                // deposit_count). Sort by note_id (stable across re-syncs).
+                let mut sorted: Vec<&_> = consumed_notes.iter().collect();
+                sorted.sort_by_key(|n| n.id().to_string());
+
+                for note in sorted {
                     let details = note.details();
                     if !is_b2agg_note(details) {
                         continue;
@@ -190,13 +202,10 @@ async fn restore_bridge_outs(
                         }
                     };
 
-                    let tx_hash = {
-                        let mut hasher = Keccak256::new();
-                        hasher.update(b"miden-bridge-out-");
-                        hasher.update(note_id_str.as_bytes());
-                        let hash: [u8; 32] = hasher.finalize().into();
-                        format!("0x{}", hex::encode(hash))
-                    };
+                    // B5 — share the versioned domain-separated helper with
+                    // bridge_out so the tx_hash is byte-identical across
+                    // first-observation and restore paths (dedup-stable).
+                    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
 
                     let deposit_count =
                         store_clone.mark_note_processed(note_id_str.clone()).await?;
@@ -213,6 +222,7 @@ async fn restore_bridge_outs(
                             destination_network,
                             &destination_address,
                             origin_amount,
+                            &[],
                             deposit_count,
                         )
                         .await
@@ -268,7 +278,17 @@ async fn restore_gers(
                 let mut ger_count = 0usize;
                 let mut log_count = 0usize;
 
-                for note in &consumed_notes {
+                // G7 — sort GER notes deterministically before reconstructing
+                // the hash chain. Iteration order from the miden client is
+                // insertion-order, but the GER hash chain is order-sensitive
+                // (each new value mixes into a rolling Keccak), so two
+                // restore runs over the same on-chain state could produce
+                // different chain values without sorting. Lex-sort by
+                // NoteId for stability.
+                let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
+                sorted_notes.sort_by_key(|n| n.id().to_string());
+
+                for note in sorted_notes {
                     let details = note.details();
                     if details.script().root() != ger_script_root {
                         continue;
@@ -286,9 +306,32 @@ async fn restore_gers(
                     }
 
                     let mut ger_bytes = [0u8; 32];
+                    let mut overflow = false;
                     for (i, felt) in items.iter().take(8).enumerate() {
-                        let v: u32 = felt.as_canonical_u64() as u32;
-                        ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+                        // X6 — Felt values can be anywhere in [0, GOLDILOCKS).
+                        // The previous `as u32` silently truncated values
+                        // exceeding u32::MAX, producing a corrupted GER that
+                        // wouldn't match the L1-side keccak. Use try_from so
+                        // a malformed UpdateGerNote is rejected instead of
+                        // silently restoring the wrong root.
+                        match u32::try_from(felt.as_canonical_u64()) {
+                            Ok(v) => {
+                                ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes())
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    note_id = %note.id(),
+                                    limb_index = i,
+                                    felt_value = felt.as_canonical_u64(),
+                                    "restore: UpdateGerNote limb exceeds u32::MAX, skipping (X6)"
+                                );
+                                overflow = true;
+                                break;
+                            }
+                        }
+                    }
+                    if overflow {
+                        continue;
                     }
 
                     if store_clone.has_seen_ger(&ger_bytes).await? {

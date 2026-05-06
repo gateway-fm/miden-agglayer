@@ -128,8 +128,15 @@ TOKEN_SYMBOL=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "symbol()(string)")
 TOKEN_DEC=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "decimals()(uint8)")
 log "Token: name=$TOKEN_NAME, symbol=$TOKEN_SYMBOL, decimals=$TOKEN_DEC"
 
+# R1 — admin_* methods require Bearer auth. ADMIN_API_KEY is generated
+# fresh per setup by scripts/setup-fixtures.sh (or
+# scripts/ensure-e2e-secrets.sh on quick-up paths) and exported here
+# from fixtures/.env, which the calling test runner already sources.
+: "${ADMIN_API_KEY:?fixtures/.env must define ADMIN_API_KEY — run scripts/ensure-e2e-secrets.sh}"
+ADMIN_BEARER="Authorization: Bearer ${ADMIN_API_KEY}"
+
 # Check admin_listFaucets before bridging
-FAUCETS_BEFORE=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' \
+FAUCETS_BEFORE=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}' \
     | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))")
 log "Faucets registered before bridge: $FAUCETS_BEFORE"
 
@@ -179,7 +186,7 @@ pass "CLAIM committed to Miden block"
 
 # ── Step 4: Verify faucet was auto-created ────────────────────────────────────
 log "Step 4/7: Verifying faucet auto-creation..."
-FAUCETS_AFTER=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}')
+FAUCETS_AFTER=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d '{"jsonrpc":"2.0","method":"admin_listFaucets","params":[],"id":1}')
 FAUCET_COUNT=$(echo "$FAUCETS_AFTER" | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('result',[])))")
 log "Faucets registered after bridge: $FAUCET_COUNT (was $FAUCETS_BEFORE)"
 

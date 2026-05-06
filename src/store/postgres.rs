@@ -95,10 +95,24 @@ impl Store for PgStore {
     // ── Logs ─────────────────────────────────────────────────────
 
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
 
-        // Get and increment log_counter atomically
-        let row = client
+        // S3 — atomic counter UPDATE + INSERT.
+        //
+        // Pre-fix the counter was incremented in one connection roundtrip
+        // (UPDATE ... RETURNING log_counter - 1) and the INSERT happened in
+        // a SEPARATE roundtrip. If the INSERT failed (constraint violation,
+        // disk full, network hiccup), the counter had already advanced and
+        // no row existed at that index — leaving permanent gaps in
+        // log_index that downstream consumers (eth_getLogs callers
+        // iterating by index) would silently skip.
+        //
+        // Now both run inside a single tokio_postgres transaction; the
+        // commit/rollback boundary preserves the invariant that every
+        // bumped counter has a matching row.
+        let tx = client.transaction().await?;
+
+        let row = tx
             .query_one(
                 "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
                 &[],
@@ -107,23 +121,24 @@ impl Store for PgStore {
         let log_index: i64 = row.get(0);
 
         let topics: Vec<&str> = log.topics.iter().map(|s| s.as_str()).collect();
-        client
-            .execute(
-                "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-                &[
-                    &log_index,
-                    &log.address,
-                    &topics,
-                    &log.data,
-                    &(log.block_number as i64),
-                    &log.block_hash.as_slice(),
-                    &log.transaction_hash,
-                    &(log.transaction_index as i64),
-                    &log.removed,
-                ],
-            )
-            .await?;
+        tx.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &log.address,
+                &topics,
+                &log.data,
+                &(log.block_number as i64),
+                &log.block_hash.as_slice(),
+                &log.transaction_hash,
+                &(log.transaction_index as i64),
+                &log.removed,
+            ],
+        )
+        .await?;
+
+        tx.commit().await?;
 
         tracing::debug!(
             block_number = log.block_number,
@@ -420,6 +435,117 @@ impl Store for PgStore {
         Ok(())
     }
 
+    /// G5: atomic GER commit. The default Store-trait impl runs three
+    /// separate calls; this override folds all four writes (ger_entries
+    /// upsert, hash chain update, synthetic_logs insert, is_injected
+    /// flag, latest_block_number bump) into ONE postgres transaction so
+    /// a process crash anywhere mid-sequence either leaves nothing or
+    /// leaves the full GER commit visible.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
+        &self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // Pre-existing add_ger_update_event sequence — duplicated here
+        // so the whole bundle is one transaction.
+        let mainnet: Option<Vec<u8>> = mainnet_exit_root.map(|root| root.to_vec());
+        let rollup: Option<Vec<u8>> = rollup_exit_root.map(|root| root.to_vec());
+        txn.execute(
+            "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (ger_hash) DO NOTHING",
+            &[
+                &global_exit_root.as_slice(),
+                &mainnet as &(dyn ToSql + Sync),
+                &rollup as &(dyn ToSql + Sync),
+                &(block_number as i64),
+                &(timestamp as i64),
+            ],
+        )
+        .await?;
+
+        let row = txn
+            .query_one(
+                "SELECT hash_chain_value FROM service_state WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await?;
+        let old_chain = bytes_to_array_32(row.get(0));
+
+        let mut hasher = Keccak256::new();
+        hasher.update(old_chain);
+        hasher.update(global_exit_root);
+        let new_chain: [u8; 32] = hasher.finalize().into();
+
+        txn.execute(
+            "UPDATE service_state SET hash_chain_value = $1, updated_at = now() WHERE id = 1",
+            &[&new_chain.as_slice()],
+        )
+        .await?;
+
+        let row = txn
+            .query_one(
+                "UPDATE service_state
+                 SET log_counter = log_counter + 1, updated_at = now()
+                 WHERE id = 1
+                 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+        let topics = [
+            UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+            format!("0x{}", hex::encode(global_exit_root)),
+            format!("0x{}", hex::encode(new_chain)),
+        ];
+        let topic_refs: Vec<&str> = topics.iter().map(|topic| topic.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &L2_GLOBAL_EXIT_ROOT_ADDRESS,
+                &topic_refs,
+                &"0x",
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
+            ],
+        )
+        .await?;
+
+        // mark_ger_injected, fused into the same transaction. The original
+        // out-of-band call did `INSERT … ON CONFLICT … DO UPDATE`. Here the
+        // row from the ger_entries insert above MUST exist, so we just flip
+        // the flag.
+        txn.execute(
+            "UPDATE ger_entries SET is_injected = TRUE WHERE ger_hash = $1",
+            &[&global_exit_root.as_slice()],
+        )
+        .await?;
+
+        // set_latest_block_number, fused.
+        txn.execute(
+            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
+            &[&(block_number as i64)],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(())
+    }
+
     // ── Transactions ─────────────────────────────────────────────
 
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()> {
@@ -471,7 +597,7 @@ impl Store for PgStore {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
         let hash_str = format!("{tx_hash:#x}");
 
         let (status, error_msg) = match &result {
@@ -479,23 +605,57 @@ impl Store for PgStore {
             Err(msg) => ("failed", Some(msg.as_str())),
         };
 
-        client
-            .execute(
-                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
-                &[
-                    &status,
-                    &error_msg as &(dyn ToSql + Sync),
-                    &(block_num as i64),
-                    &hash_str,
-                ],
+        // S4 — atomic status update + log materialisation.
+        //
+        // Pre-fix the status `UPDATE transactions ... WHERE tx_hash = $`
+        // committed first; only afterwards did we loop over
+        // `transaction_logs` and call `self.add_log(log)` for each.
+        // Each `add_log` opened its OWN transaction. If any of them
+        // failed (e.g. log_index unique-constraint violation, network
+        // hiccup), the `transactions` row already said 'success' with
+        // zero or partial synthetic logs. `eth_getTransactionReceipt`
+        // would then return a confirmed tx whose log set is incomplete
+        // — exactly the kind of silent corruption indexer consumers
+        // can't recover from.
+        //
+        // Now both run inside a single tokio_postgres transaction. On
+        // any failure the rollback restores the 'pending' status AND
+        // any partial log inserts.
+        let tx = client.transaction().await?;
+
+        tx.execute(
+            "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
+            &[
+                &status,
+                &error_msg as &(dyn ToSql + Sync),
+                &(block_num as i64),
+                &hash_str,
+            ],
+        )
+        .await?;
+
+        if result.is_ok() {
+            // C11 — fold the latest_block_number advance into the same
+            // transaction. Monotonic guard: only bump if block_num is
+            // strictly greater than the current cursor, so sweep callers
+            // committing earlier txs (txn_commit_pending replaying a
+            // batch at the Miden block they were committed at) don't
+            // roll the synthetic-log cursor backwards. The synthetic-
+            // log virtual-block path (claim.rs, ger.rs) always passes
+            // current_latest+1, so this collapses two roundtrips into
+            // one and removes the gap where a crash between txn_commit
+            // and set_latest_block_number would leave a finalized log
+            // unreachable via eth_blockNumber.
+            tx.execute(
+                "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1 AND $1 > latest_block_number",
+                &[&(block_num as i64)],
             )
             .await?;
 
-        if result.is_ok() {
-            tracing::info!("PgStore: committed txn {tx_hash}");
-
-            // Fetch attached logs and add them to synthetic_logs
-            let log_rows = client
+            // Fetch attached logs (within the same txn so we see a consistent
+            // snapshot — no race with a concurrent txn_begin updating the
+            // attached log set).
+            let log_rows = tx
                 .query(
                     "SELECT topics, data FROM transaction_logs WHERE tx_hash = $1",
                     &[&hash_str],
@@ -512,19 +672,40 @@ impl Store for PgStore {
                     .collect();
                 let data_str = format!("0x{}", hex::encode(data_bytes));
 
-                let log = SyntheticLog {
-                    address: bridge_address.clone(),
-                    topics,
-                    data: data_str,
-                    block_number: block_num,
-                    block_hash,
-                    transaction_hash: format!("{tx_hash:#x}"),
-                    transaction_index: 0,
-                    log_index: 0,
-                    removed: false,
-                };
-                self.add_log(log).await?;
+                // Inline the add_log logic so the counter UPDATE + INSERT
+                // run inside the SAME outer txn. Pre-fix `self.add_log`
+                // opened a nested txn that committed independently.
+                let counter_row = tx
+                    .query_one(
+                        "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
+                        &[],
+                    )
+                    .await?;
+                let log_index: i64 = counter_row.get(0);
+                let topic_strs: Vec<&str> = topics.iter().map(|s| s.as_str()).collect();
+                tx.execute(
+                    "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &log_index,
+                        &bridge_address,
+                        &topic_strs,
+                        &data_str,
+                        &(block_num as i64),
+                        &block_hash.as_slice(),
+                        &hash_str,
+                        &0i64,
+                        &false,
+                    ],
+                )
+                .await?;
             }
+        }
+
+        tx.commit().await?;
+
+        if result.is_ok() {
+            tracing::info!("PgStore: committed txn {tx_hash}");
         } else if let Err(ref err) = result {
             tracing::error!("PgStore: failed txn {tx_hash}: {err}");
         }
@@ -586,14 +767,31 @@ impl Store for PgStore {
         let error_msg: Option<&str> = row.get(5);
         let block_num: i64 = row.get(6);
 
-        // Deserialize envelope
+        // Deserialize envelope.
+        //
+        // S9 — return Err on decode failure rather than None. Pre-fix a
+        // corrupt or schema-drift envelope row was indistinguishable from
+        // "tx not found" — `eth_getTransactionByHash` would lie to clients.
+        // Surface the failure as a real error so operators see the
+        // corruption (and the metric counter increments).
         use alloy::eips::Decodable2718;
-        let Some(envelope) = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).ok() else {
-            return Ok(None);
-        };
-        let Some(signer) = signer_str.parse::<Address>().ok() else {
-            return Ok(None);
-        };
+        let envelope = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).map_err(|e| {
+            ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
+            tracing::error!(
+                target: "store::postgres",
+                tx_hash = %hash_str,
+                error = ?e,
+                "S9: TxEnvelope decode failed; returning error rather than masking as not-found"
+            );
+            anyhow::anyhow!(
+                "stored TxEnvelope for {hash_str} cannot be decoded ({e}); \
+                 row is corrupt or schema drifted"
+            )
+        })?;
+        let signer = signer_str.parse::<Address>().map_err(|e| {
+            ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
+            anyhow::anyhow!("stored signer for {hash_str} is not a valid Address ({e})")
+        })?;
 
         let result = match status {
             "success" => Some(Ok(())),
@@ -819,6 +1017,20 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
+    async fn get_deposit_count(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT deposit_counter FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        // service_state.deposit_counter is `INT NOT NULL` (postgres int4 / Rust i32),
+        // not BIGINT. Reading as i64 panics with "error deserializing column 0".
+        let val: i32 = row.get(0);
+        Ok(val as u64)
+    }
+
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
         let client = self.pool.get().await?;
         let row = client
@@ -834,6 +1046,102 @@ impl Store for PgStore {
             )
             .await?;
         Ok(row.get::<_, i32>(0) as u32)
+    }
+
+    /// B1: atomic B2AGG bridge-out commit. Folds five writes into one txn:
+    ///   1. service_state.deposit_counter UPDATE → new count
+    ///   2. bridge_out_processed INSERT (with the count)
+    ///   3. service_state.log_counter UPDATE → new log_index
+    ///   4. synthetic_logs INSERT (BridgeEvent)
+    ///   5. service_state.latest_block_number UPDATE
+    /// Either all visible or none — closes the gap where a crash between
+    /// mark_note_processed and add_bridge_event would consume a deposit_count
+    /// without ever emitting the synthetic log, causing aggsender to skip
+    /// the BridgeEvent permanently.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // 1+2: allocate deposit_count, INSERT processed-note row.
+        let row = txn
+            .query_one(
+                "WITH counter AS (
+                    UPDATE service_state SET deposit_counter = deposit_counter + 1, updated_at = now() WHERE id = 1
+                    RETURNING deposit_counter - 1 AS val
+                 )
+                 INSERT INTO bridge_out_processed (note_id, deposit_count)
+                 SELECT $1, val FROM counter
+                 RETURNING deposit_count",
+                &[&note_id],
+            )
+            .await?;
+        let deposit_count: u32 = row.get::<_, i32>(0) as u32;
+
+        // 3: allocate log_index.
+        let row = txn
+            .query_one(
+                "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+
+        // 4: encode + insert the synthetic log. Encoding is identical to
+        // `add_bridge_event`'s default impl — keeping it inline here keeps
+        // the whole bundle in one connection / transaction.
+        let data = crate::bridge_out::encode_bridge_event_data(
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        );
+        let topics_owned: [String; 1] = [crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()];
+        let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &bridge_address,
+                &topics,
+                &data,
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
+            ],
+        )
+        .await?;
+
+        // 5: advance the cursor.
+        txn.execute(
+            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
+            &[&(block_number as i64)],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(deposit_count)
     }
 
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
@@ -894,6 +1202,23 @@ impl Store for PgStore {
             .await?;
 
         Ok(rows.first().and_then(pg_row_to_faucet_entry))
+    }
+
+    async fn find_faucets_by_origin_address(
+        &self,
+        origin_address: &[u8; 20],
+    ) -> anyhow::Result<Vec<FaucetEntry>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
+                 FROM faucet_registry
+                 WHERE origin_address = $1",
+                &[&origin_address.as_slice()],
+            )
+            .await?;
+
+        Ok(rows.iter().filter_map(pg_row_to_faucet_entry).collect())
     }
 
     async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>> {
