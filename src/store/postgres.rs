@@ -3,7 +3,7 @@
 //! Requires the `postgres` feature flag and a running PostgreSQL instance
 //! with the schema from `migrations/001_initial.sql` applied.
 
-use super::{FaucetEntry, Store, TxnData, TxnEntry};
+use super::{FaucetEntry, Store, TxnData, TxnEntry, UnclaimableClaim, UnclaimableReason};
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
@@ -970,6 +970,80 @@ impl Store for PgStore {
             )
             .await?;
         Ok(!rows.is_empty())
+    }
+
+    async fn record_unclaimable_claim(&self, entry: UnclaimableClaim) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let global_index_hex = format!("{:#x}", entry.global_index);
+        let destination_hex = format!("{:#x}", entry.destination_address);
+        let origin_hex = format!("{:#x}", entry.origin_address);
+        let amount_hex = format!("{:#x}", entry.amount);
+        let eth_tx_hex = format!("{:#x}", entry.eth_tx_hash);
+        let reason = entry.reason.as_str();
+        let origin_network = entry.origin_network as i32;
+
+        // First-write wins: ON CONFLICT DO NOTHING so aggkit retries don't error.
+        // `INSERT … RETURNING` tells us whether a row was actually added.
+        let rows = client
+            .query(
+                "INSERT INTO unclaimable_claims \
+                 (global_index, destination_address, origin_network, origin_address, amount, reason, eth_tx_hash) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (global_index) DO NOTHING \
+                 RETURNING global_index",
+                &[
+                    &global_index_hex,
+                    &destination_hex,
+                    &origin_network,
+                    &origin_hex,
+                    &amount_hex,
+                    &reason,
+                    &eth_tx_hex,
+                ],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn get_unclaimable_claim(
+        &self,
+        global_index: &U256,
+    ) -> anyhow::Result<Option<UnclaimableClaim>> {
+        let client = self.pool.get().await?;
+        let key = format!("{global_index:#x}");
+        let rows = client
+            .query(
+                "SELECT global_index, destination_address, origin_network, origin_address, \
+                        amount, reason, eth_tx_hash \
+                 FROM unclaimable_claims WHERE global_index = $1",
+                &[&key],
+            )
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let global_index_hex: String = row.get(0);
+        let destination_hex: String = row.get(1);
+        let origin_network: i32 = row.get(2);
+        let origin_hex: String = row.get(3);
+        let amount_hex: String = row.get(4);
+        let reason_str: String = row.get(5);
+        let eth_tx_hex: String = row.get(6);
+
+        let reason = match reason_str.as_str() {
+            "unresolvable_destination" => UnclaimableReason::UnresolvableDestination,
+            other => anyhow::bail!("unknown unclaimable_claims.reason value: {other}"),
+        };
+
+        Ok(Some(UnclaimableClaim {
+            global_index: U256::from_str_radix(global_index_hex.trim_start_matches("0x"), 16)?,
+            destination_address: destination_hex.parse()?,
+            origin_network: u32::try_from(origin_network)?,
+            origin_address: origin_hex.parse()?,
+            amount: U256::from_str_radix(amount_hex.trim_start_matches("0x"), 16)?,
+            reason,
+            eth_tx_hash: eth_tx_hex.parse()?,
+        }))
     }
 
     // ── Address mappings ─────────────────────────────────────────

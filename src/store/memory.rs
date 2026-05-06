@@ -1,6 +1,6 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
-use super::{FaucetEntry, Store, TxnData, TxnEntry};
+use super::{FaucetEntry, Store, TxnData, TxnEntry, UnclaimableClaim};
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
@@ -48,6 +48,9 @@ pub struct InMemoryStore {
     // Claims
     claimed: RwLock<HashSet<U256>>,
 
+    // Unclaimable claims — first-write wins per global_index (RD-860).
+    unclaimable: RwLock<HashMap<U256, UnclaimableClaim>>,
+
     // Address mappings
     address_mappings: RwLock<HashMap<Address, AccountId>>,
 
@@ -77,6 +80,7 @@ impl InMemoryStore {
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
             claimed: RwLock::new(HashSet::new()),
+            unclaimable: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashSet::new()),
             deposit_counter: RwLock::new(0),
@@ -487,6 +491,25 @@ impl Store for InMemoryStore {
         Ok(self.claimed.read().contains(global_index))
     }
 
+    async fn record_unclaimable_claim(&self, entry: UnclaimableClaim) -> anyhow::Result<bool> {
+        use std::collections::hash_map::Entry;
+        let mut map = self.unclaimable.write();
+        match map.entry(entry.global_index) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+                Ok(true)
+            }
+        }
+    }
+
+    async fn get_unclaimable_claim(
+        &self,
+        global_index: &U256,
+    ) -> anyhow::Result<Option<UnclaimableClaim>> {
+        Ok(self.unclaimable.read().get(global_index).cloned())
+    }
+
     // ── Address mappings ─────────────────────────────────────────
 
     async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>> {
@@ -602,6 +625,46 @@ mod tests {
         store.unclaim(&idx).await.unwrap();
         assert!(!store.is_claimed(&idx).await.unwrap());
         store.try_claim(idx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unclaimable_claims_first_write_wins() {
+        use crate::store::{UnclaimableClaim, UnclaimableReason};
+        let store = InMemoryStore::new();
+        let idx = U256::from(999u64);
+        let first = UnclaimableClaim {
+            global_index: idx,
+            destination_address: Address::from([0x42; 20]),
+            origin_network: 0,
+            origin_address: Address::ZERO,
+            amount: U256::from(100u64),
+            reason: UnclaimableReason::UnresolvableDestination,
+            eth_tx_hash: TxHash::default(),
+        };
+        let second = UnclaimableClaim {
+            // Same global_index, different everything else — mimics aggkit retrying
+            // the same claim with a new outer tx envelope.
+            global_index: idx,
+            destination_address: Address::from([0x77; 20]),
+            origin_network: 9,
+            origin_address: Address::from([0xaa; 20]),
+            amount: U256::from(200u64),
+            reason: UnclaimableReason::UnresolvableDestination,
+            eth_tx_hash: TxHash::from([0xff; 32]),
+        };
+
+        assert!(store.get_unclaimable_claim(&idx).await.unwrap().is_none());
+        assert!(
+            store.record_unclaimable_claim(first.clone()).await.unwrap(),
+            "first insert returns true"
+        );
+        assert!(
+            !store.record_unclaimable_claim(second).await.unwrap(),
+            "duplicate global_index returns false (first-write wins)"
+        );
+        let got = store.get_unclaimable_claim(&idx).await.unwrap().unwrap();
+        assert_eq!(got.destination_address, first.destination_address);
+        assert_eq!(got.amount, first.amount);
     }
 
     #[tokio::test]
