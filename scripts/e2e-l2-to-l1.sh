@@ -105,9 +105,13 @@ L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
 log "L1 balance before settlement: $L1_BAL_BEFORE"
 
 log "Step 3/5: Waiting for certificate settlement on AggLayer..."
+# 900s, not 300s: cold-start agglayer prover can blow past 5 min on the first
+# proof of a fresh `make test-e2e` run (circuit compile + load). Warm reruns
+# settle in ~20s, well inside the original window. Keep the timeout wide so
+# cold first-runs don't trip a regression false alarm.
 wait_for "certificate settled" \
     "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
-    300 10
+    900 10
 pass "Certificate settled on L1!"
 
 # ── Step 4: Wait for deposit to appear in bridge-service ──────────────────────
