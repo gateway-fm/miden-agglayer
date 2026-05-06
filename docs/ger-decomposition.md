@@ -81,13 +81,6 @@ if exitRoots == nil {
 }
 ```
 
-### Lazy resolution on query
-
-When `zkevm_getExitRootsByGER` is called for a GER with missing roots, we
-attempt to resolve them from L1 on-the-fly. If L1's current roots match the
-GER, we persist them and return the resolved data. This handles the common case
-where the roots were unresolved at injection time but L1 hasn't moved on yet.
-
 ### Removed L1 backward log scanning (commit `531252f`)
 
 Previously, `find_l1_exit_roots_by_ger()` scanned backward through L1 in
@@ -117,23 +110,30 @@ For the zero-root poisoning path that we eliminated:
    NEW: Next cycle resolves (same GER still current) or superseded (newer GER)
 ```
 
-## Long-Term Improvement: Aggoracle ChainSender
+## Resolution: Aggoracle two-root mode (RD-862)
 
 The decomposition problem exists because the aggoracle sends only the combined
-hash. The permanent solution is to modify the Miden `ChainSender` in
-[agglayer/aggkit](https://github.com/agglayer/aggkit) to send both roots:
+hash. The permanent fix, landed as an aggkit patch (branch
+`rd-862/update-exit-root-mode`, pending upstream PR to
+[agglayer/aggkit](https://github.com/agglayer/aggkit)):
 
-- **Current**: `insertGlobalExitRoot(bytes32 combinedGER)` — one-way hash,
-  roots lost
-- **Target**: `updateExitRoot(bytes32 mainnet, bytes32 rollup)` — both roots
-  preserved
+- Add `UseUpdateExitRoot` config flag to `AggOracle.EVMSender`.
+- When enabled, aggoracle forwards the full `L1InfoTreeLeaf` — calling
+  `updateExitRoot(bytes32 rollup, bytes32 mainnet)` instead of
+  `insertGlobalExitRoot(bytes32 combined)`.
 
-The aggoracle already has both roots in its `L1InfoTreeLeaf` struct
-(`aggoracle/chaingersender/evm.go`). Our service already handles the two-root
-form via `updateExitRoot()` in `service_send_raw_txn.rs`.
+Gateway's `fixtures/aggkit-config.toml` sets `UseUpdateExitRoot = true`. With
+the flag on, our proxy's `updateExitRoot` selector handler
+(`service_send_raw_txn.rs`) receives both roots in calldata — no L1 fetch, no
+race, no orphans. Measured orphan rate in the RD-862 repro drops from ~85% at
+N=30 back-to-back deposits to 0%.
 
-This would eliminate the decomposition problem entirely — no L1 fetch, no race
-condition, no null responses.
+Observed at inject time on the legacy `insertGlobalExitRoot` path (kept
+compiled for backward compat but no longer the Gateway-preferred mode):
+two separate `eth_call`s to `lastMainnetExitRoot()` and `lastRollupExitRoot()`
+against live L1 state, then verifies `keccak(m, r) == combined`. Under rapid
+bursts the pair frequently advances past the injected GER between mint and
+arrival at the proxy, which is the entire RD-862 failure mode.
 
 ## Test Coverage
 
@@ -144,8 +144,6 @@ condition, no null responses.
 | `test_exit_roots_returns_null_when_roots_unresolved` | GER exists, roots None → null |
 | `test_exit_roots_returns_roots_when_resolved` | GER exists, roots present → data |
 | `test_exit_roots_returns_null_for_unknown_ger` | GER not in store → null |
-| `test_exit_roots_lazy_resolves_from_l1` | Roots None, L1 matches → resolved + persisted |
-| `test_exit_roots_returns_null_when_l1_stale` | Roots None, L1 moved on → null |
 
 ### E2E test (`scripts/e2e-ger-decomposition.sh`)
 

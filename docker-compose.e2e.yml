@@ -71,8 +71,15 @@ services:
         condition: service_healthy
 
   # ── L2 Chain (Miden node in devnet mode) ────────────────────────────────────
+  # Built from Dockerfile.miden-node pinned to the SAME miden-client tag as
+  # Cargo.toml. Do not switch back to a pre-built `miden-infra/miden-node:*`
+  # tag without verifying the server proto matches the client — partial
+  # alignment breaks sync_transactions and makes GER injection hang silently.
   miden-node:
-    image: miden-infra/miden-node:agglayer-v0.1
+    build:
+      context: .
+      dockerfile: Dockerfile.miden-node
+    image: miden-agglayer/miden-node:v0.14.4
     restart: on-failure
     ports:
       - "57291:57291"
