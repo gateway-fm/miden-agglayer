@@ -100,6 +100,10 @@ pub struct ServiceState {
     /// the scanner ticks it each sync, marking entries Landed once it
     /// observes the CLAIM consumed by the bridge. Stale entries page on-call.
     pub expected_mints: Arc<crate::expected_mint_tracker::ExpectedMintTracker>,
+    /// Optional `authorization: Bearer <key>` header value forwarded to every Miden gRPC
+    /// call. `None` when talking to the node directly; `Some(...)` when fronted by a
+    /// gateway that rate-limits unauthenticated traffic. Redact if you ever log this.
+    pub miden_api_key: Option<String>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -133,6 +137,7 @@ impl ServiceState {
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
             expected_mints: Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new()),
+            miden_api_key: None,
         }
     }
 }

@@ -544,6 +544,7 @@ pub async fn publish_claim(
     node_url: String,
     reject_zero_padding: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
+    api_key: Option<String>,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
@@ -629,8 +630,13 @@ pub async fn publish_claim(
                 resolved = %ep,
                 "publish_claim: building fresh Miden client to dial node"
             );
+            // Build the gRPC client through the shared helper so the optional
+            // bearer-auth `api_key` (RD-856) is applied identically to the
+            // long-lived MidenClient path. Without the helper this fresh-per-call
+            // builder would silently skip the auth header.
+            let rpc = crate::miden_client::build_rpc_client(&ep, 10_000, api_key.as_deref());
             let mut client = ClientBuilder::new()
-                .grpc_client(&ep, Some(10_000))
+                .rpc(rpc)
                 .sqlite_store(store_path)
                 .authenticator(keystore)
                 .in_debug_mode(DebugMode::Enabled)
