@@ -436,6 +436,55 @@ async fn main() -> anyhow::Result<()> {
     );
     state.miden_api_key = command.miden_api_key;
 
+    // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
+    // proactively indexing every (mainnet, rollup) pair as L1 emits it,
+    // instead of trying to recover the pair from a racing view call after the
+    // GER lands on L2. Idempotent UPSERT: no-op if both code paths populate
+    // the same ger_entries row. See `l1_info_tree_indexer.rs` for the full
+    // race analysis and store-ordering guarantees.
+    if let (Some(l1_rpc_url), Some(ger_addr_str)) =
+        (state.l1_rpc_url.clone(), state.ger_l1_address.clone())
+    {
+        match ger_addr_str.parse::<alloy::primitives::Address>() {
+            Ok(ger_addr) => {
+                let indexer = miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
+                    l1_rpc_url,
+                    ger_addr,
+                    state.store.clone(),
+                );
+                match indexer.spawn() {
+                    Ok(shutdown_tx) => {
+                        // The indexer runs for the lifetime of the tokio
+                        // runtime; when `main` returns, the runtime tears
+                        // down and the task stops with it. Leak the shutdown
+                        // sender deliberately rather than store it on the
+                        // (Clone) ServiceState — Sender is not Clone, and
+                        // there is no graceful-shutdown path here that would
+                        // benefit from holding it.
+                        std::mem::forget(shutdown_tx);
+                        tracing::info!("L1InfoTreeIndexer spawned");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to spawn L1InfoTreeIndexer");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    address = %ger_addr_str,
+                    error = %e,
+                    "invalid --ger-l1-address; L1InfoTreeIndexer not started"
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            "L1 RPC URL or GER contract address missing; L1InfoTreeIndexer disabled. \
+             Without it, GER orphan resolution falls back to the racing view-call path \
+             in service_send_raw_txn.rs and may produce orphan GERs under deposit load."
+        );
+    }
+
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()

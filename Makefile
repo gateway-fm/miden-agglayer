@@ -216,6 +216,11 @@ e2e-security: e2e-up ## Spin up stack + run security E2E tests
 e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
 	./scripts/e2e-fuzz-bridge.sh
 
+.PHONY: repro-rd862
+repro-rd862: ## Run RD-862 GER-injection race repro (assumes stack is up); prints orphan rate
+	N_DEPOSITS=$${N_DEPOSITS:-30} INTER_DELAY_MS=$${INTER_DELAY_MS:-0} POLL_TIMEOUT=$${POLL_TIMEOUT:-300} \
+		./scripts/e2e-rd862-repro.sh
+
 .PHONY: e2e
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 

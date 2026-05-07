@@ -334,7 +334,13 @@ async fn restore_gers(
                         continue;
                     }
 
-                    if store_clone.has_seen_ger(&ger_bytes).await? {
+                    // `is_ger_injected` (not `has_seen_ger`): with the
+                    // L1InfoTreeIndexer running, ger_entries rows can exist
+                    // for pairs the indexer observed on L1 but for which the
+                    // proxy never submitted a Miden inject (typical when
+                    // restore is replaying after a crash that lost the in-
+                    // memory injection state). Replay should re-emit those.
+                    if store_clone.is_ger_injected(&ger_bytes).await? {
                         continue;
                     }
 

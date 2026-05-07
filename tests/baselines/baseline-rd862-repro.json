@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-05-07T11:08:00Z",
+  "purpose": "Phase -1 baseline for RD-862 GER-injection race. Locks the orphan rate before the miden-monitor refactor. Phase 7 verification must drive this metric to 0.",
+  "topology": {
+    "miden_agglayer_repo_sha": "57febd9a514b2a08ba66038db3812e4f61e88e11",
+    "miden_agglayer_branch": "origin/main (detached)",
+    "aggkit_image": "ghcr.io/agglayer/aggkit:0.8.3-rc1",
+    "aggkit_mode": "stock (no UseUpdateExitRoot)",
+    "miden_node_image_tag": "miden-agglayer/miden-node:v0.14.4",
+    "miden_client_version": "v0.14.7",
+    "stack": "docker-compose.e2e.yml (anvil L1, miden-node, miden-agglayer, bridge-service v0.6.4-RC2, agglayer 0.4.4, aggkit 0.8.3-rc1)",
+    "host": "darwin-25.3.0 / docker desktop"
+  },
+  "harness": {
+    "script": "scripts/e2e-rd862-repro.sh",
+    "params": {
+      "N_DEPOSITS": 30,
+      "INTER_DELAY_MS": 0,
+      "POLL_TIMEOUT_S": 300,
+      "DEPOSIT_WEI_BASE": 10000000000
+    },
+    "regression_fixed_in_run_2_and_3": "scripts/e2e-rd862-repro.sh: replaced [^\\n]* with .* in committed_gers_since() — macOS BSD grep treats [^\\n] as not-(backslash-or-n), truncating lines at any 'n' character (e.g. 'Miden') and silently zeroing the orphan count. .* portably means 'rest of line' on both BSD and GNU grep."
+  },
+  "runs": [
+    {
+      "run": 1,
+      "deposits_submitted": 30,
+      "deposits_ready_for_claim": 30,
+      "conversion_rate_pct": 100.0,
+      "gers_committed": 5,
+      "gers_orphaned": 4,
+      "gers_resolved": 1,
+      "orphan_rate_pct": 80.0,
+      "orphan_count_method": "manual zkevm_getExitRootsByGER per-GER query (script regex was broken on macOS for this run)",
+      "orphan_gers": [
+        "0x4ad87ae55e5fe60ada0f44d3c60317fdfe85f7bf97c211d7680c566476e7fd12",
+        "0x64bf5fea7b6c66905bfff6775e45d3d93d766c2e0573d73d889400d0c794a083",
+        "0x79d0a0db2b59a94046ae18287e5de2fcf5b10db01476a5aa70caa776f5acb71c",
+        "0x7c181dc13a362eb7aacabd32b713ef69f1b42e5f065a78537974122f88e6516a"
+      ],
+      "log_file": "tests/baselines/run-1.log",
+      "note": "ready_for_claim hit 30/30 because aggoracle injects the LATEST InfoTree leaf which subsumes earlier deposits — and the single resolved GER happened to be the latest. Orphan rate is the canonical race metric, not conversion."
+    },
+    {
+      "run": 2,
+      "deposits_submitted": 30,
+      "deposits_ready_for_claim": 19,
+      "conversion_rate_pct": 63.3,
+      "gers_committed": 4,
+      "gers_orphaned": 4,
+      "gers_resolved": 0,
+      "orphan_rate_pct": 100.0,
+      "log_file": "tests/baselines/run-2.log"
+    },
+    {
+      "run": 3,
+      "deposits_submitted": 30,
+      "deposits_ready_for_claim": 32,
+      "conversion_rate_pct": 106.7,
+      "gers_committed": 5,
+      "gers_orphaned": 5,
+      "gers_resolved": 0,
+      "orphan_rate_pct": 100.0,
+      "log_file": "tests/baselines/run-3.log",
+      "note": "ready_for_claim count >30 because cumulative across prior runs (same DEST_ADDR), but Δ-over-baseline within this run reflects the new burst."
+    }
+  ],
+  "aggregate": {
+    "total_gers": 14,
+    "total_orphans": 13,
+    "orphan_rate_pct": 92.9,
+    "verdict": "RD-862 race confirmed reproduced on origin/main + stock aggkit 0.8.3-rc1.",
+    "metric_to_drive_to_zero": "orphan_rate_pct"
+  },
+  "phase_7_pass_criterion": {
+    "description": "After miden-monitor lands and is enabled, three consecutive runs of this harness with N_DEPOSITS=30 must each produce orphan_rate_pct = 0 (gers_orphaned = 0 over gers_committed >= 1). Conversion rate is informational; orphan rate is canonical.",
+    "if_pass": "Close aggkit#1597, retire UseUpdateExitRoot mode."
+  }
+}

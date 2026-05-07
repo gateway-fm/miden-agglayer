@@ -13,6 +13,7 @@ pub mod forged_mint_detector;
 pub mod ger;
 pub mod hex;
 pub mod init;
+pub mod l1_info_tree_indexer;
 pub mod let_divergence;
 pub mod log_synthesis;
 pub mod logging;

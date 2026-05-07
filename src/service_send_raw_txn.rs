@@ -239,7 +239,11 @@ async fn handle_claim_asset(
     // — if false, return a retryable error immediately so aggkit-driven
     // clients re-submit cleanly without burning the lock or the 15s wait.
     let combined = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
-    if !service.store.has_seen_ger(&combined).await? {
+    // `is_ger_injected` rather than `has_seen_ger`: the L1InfoTreeIndexer
+    // pre-populates ger_entries rows for L1 pairs it has indexed but that
+    // haven't yet been injected to L2. C6 requires the GER to be on L2, not
+    // merely indexed; checking the `is_injected` flag captures that intent.
+    if !service.store.is_ger_injected(&combined).await? {
         ::metrics::counter!("rpc_claim_ger_not_seen_total").increment(1);
         anyhow::bail!(
             "claim references a GER that aggkit has not observed yet \
