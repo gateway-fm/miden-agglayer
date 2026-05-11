@@ -1,11 +1,14 @@
-# Build testing-node-builder from miden-client v0.14.4.
+# Build testing-node-builder from miden-client v0.14.7.
 #
 # MUST stay in lockstep with the miden-client git tag pinned in Cargo.toml —
 # the gRPC proto between server (this image) and client (miden-agglayer-service)
-# is schema-locked per tag. v0.14.4 matches miden-node-proto-build 0.14.9
-# (`TransactionHeader.output_notes = repeated NoteHeader`). Any client bump
-# that changes the proto schema MUST bump this tag too, or sync_transactions
-# fails with "invalid wire type" and every GER injection hangs on commit wait.
+# is schema-locked per tag. Any client bump that changes the proto schema MUST
+# bump this tag too, or sync_transactions fails with "invalid wire type" and
+# every GER injection hangs on commit wait. The standards library's BURN note
+# script root is *also* schema-coupled: if the proxy is built from a different
+# tag than this miden-node, the bridge_out MASM produces a BURN script root
+# the node doesn't recognise and the L2→L1 NTX consumption fails with
+# "note script with root <X> not found in data store for public note".
 FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -21,9 +24,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 
 # Pinned to the same tagged release as Cargo.toml's miden-client dep
-# (search for `tag = "v0.14.4"` over there). Bumping one without the other
+# (search for `tag = "v0.14.7"` over there). Bumping one without the other
 # produces a wire-type mismatch on sync_transactions.
-ARG MIDEN_CLIENT_TAG=v0.14.4
+ARG MIDEN_CLIENT_TAG=v0.14.7
 RUN git clone --depth 1 --branch ${MIDEN_CLIENT_TAG} https://github.com/0xMiden/miden-client.git .
 
 RUN git rev-parse HEAD > /tmp/miden-client-commit.txt && \
