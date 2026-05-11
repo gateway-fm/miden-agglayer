@@ -209,14 +209,21 @@ impl L1InfoTreeIndexer {
             }
         }
 
-        if indexed > 0 || log_count > 0 {
-            tracing::debug!(
+        // INFO-level activity log: bumped from debug per Igor's review on PR #41.
+        // Quiet ticks (no events in the polled range) are kept at debug so we
+        // don't flood the log file at the 1s poll cadence, but any range that
+        // either contains events or indexes new pairs is surfaced.
+        if log_count > 0 || indexed > 0 {
+            tracing::info!(
                 from,
                 to,
+                head,
                 log_count,
                 indexed,
                 "L1InfoTreeIndexer batch processed"
             );
+        } else {
+            tracing::debug!(from, to, head, "L1InfoTreeIndexer polled (no events)");
         }
         metrics::counter!("l1_info_tree_indexer_pairs_indexed_total").increment(indexed as u64);
 
@@ -232,6 +239,19 @@ impl L1InfoTreeIndexer {
             return Ok(false);
         }
 
+        // Decode which event signature so the log line is unambiguous in
+        // testing — `UpdateL1InfoTree` and `UpdateGlobalExitRoot` carry the
+        // same (mainnet, rollup) payload but represent different stages of
+        // the L1 GER lifecycle. Easier to debug a stuck deposit if the log
+        // tells you which one fired.
+        let event_kind = if topics[0].0 == UpdateL1InfoTree::SIGNATURE_HASH.0 {
+            "UpdateL1InfoTree"
+        } else if topics[0].0 == UpdateGlobalExitRoot::SIGNATURE_HASH.0 {
+            "UpdateGlobalExitRoot"
+        } else {
+            "unknown"
+        };
+
         let mainnet: [u8; 32] = topics[1].0;
         let rollup: [u8; 32] = topics[2].0;
         let combined = combined_ger(&mainnet, &rollup);
@@ -240,7 +260,12 @@ impl L1InfoTreeIndexer {
             .set_ger_exit_roots(&combined, mainnet, rollup)
             .await?;
 
-        tracing::debug!(
+        // INFO-level so test runs show every pair indexed in real time
+        // (Igor's review on PR #41). One pair == one L1 deposit's worth of
+        // GER state arriving — exactly what an operator wants to see during
+        // a stuck-deposit triage.
+        tracing::info!(
+            event = event_kind,
             mainnet = %hex::encode(mainnet),
             rollup = %hex::encode(rollup),
             combined = %hex::encode(combined),
