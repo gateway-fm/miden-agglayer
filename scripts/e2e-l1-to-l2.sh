@@ -48,6 +48,48 @@ wait_for() {
     echo ""
 }
 
+# Progress-based wait. Polls $cmd like wait_for, but doesn't have a hard
+# wall-clock timeout — instead it fails only when $progress_cmd's output has
+# been *unchanged* for $stall_timeout consecutive seconds. The idea: bridge-
+# service / aggkit / miden-node sync can legitimately take many minutes on a
+# cold stack, but if NOTHING is changing for a minute then something is stuck.
+#
+#   wait_for_progress "desc" "<condition cmd>" "<progress probe>" stall_timeout interval max_total
+#
+# Args:
+#   desc          : human-readable description
+#   cmd           : the actual condition to wait for (exit 0 = pass)
+#   progress_cmd  : command whose stdout we hash; a change = "stack made progress"
+#   stall_timeout : seconds since the last progress change before we fail (default 90)
+#   interval      : poll interval in seconds (default 5)
+#   max_total     : absolute backstop in seconds (default 1800 = 30min) so a runaway
+#                   doesn't run forever even if the progress probe keeps flapping
+wait_for_progress() {
+    local desc="$1" cmd="$2" progress_cmd="$3"
+    local stall_timeout="${4:-90}" interval="${5:-5}" max_total="${6:-1800}"
+    local elapsed=0 stalled=0
+    local last_progress="" current_progress=""
+    log "Waiting: $desc (stall_timeout=${stall_timeout}s, max_total=${max_total}s)..."
+    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+        current_progress=$( ( set +o pipefail; eval "$progress_cmd" ) 2>/dev/null || echo "")
+        if [[ "$current_progress" != "$last_progress" ]]; then
+            # State changed — reset the stall counter, print the new snapshot.
+            stalled=0
+            last_progress="$current_progress"
+            echo ""
+            log "  progress: ${current_progress:-<empty>}"
+        else
+            stalled=$((stalled + interval))
+            echo -n "."
+        fi
+        [[ "$stalled" -ge "$stall_timeout" ]] && fail "Stalled: $desc (no progress for ${stall_timeout}s; last seen: ${last_progress:-<empty>})"
+        [[ "$elapsed" -ge "$max_total" ]] && fail "Hard timeout: $desc (${max_total}s, last progress: ${last_progress:-<empty>})"
+    done
+    echo ""
+}
+
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 command -v cast >/dev/null || fail "cast (foundry) not found"
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 (Anvil) not reachable"
@@ -99,10 +141,18 @@ STATUS=$(printf '%s\n' "$TX" | awk '$1=="status"{print $2; exit}')
 pass "L1 deposit succeeded"
 
 # ── Step 2: Wait for deposit to be ready_for_claim ────────────────────────────
+# Progress-based: bridge-service / aggkit / miden-node cold-start sync can
+# legitimately take 30+s; only fail when nothing is changing. The progress
+# probe is "(L1 head, proxy_synthetic_block_number, deposit_count_visible_to_bridge)"
+# — any change resets the stall counter.
 log "Step 2/5: Waiting for bridge-service sync + GER injection..."
-wait_for "deposit ready_for_claim" \
+wait_for_progress "deposit ready_for_claim" \
     "curl -sf '$BRIDGE_SERVICE_URL/bridges/$DEST_ADDR' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if any(dep['ready_for_claim'] and dep['amount']!='0' for dep in d['deposits']) else 1)\"" \
-    180 5
+    "L1=\$(cast block-number --rpc-url '$L1_RPC' 2>/dev/null || echo ?); \
+     L2=\$(curl -sf -X POST '$L2_RPC' -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin)[\"result\"],16))' 2>/dev/null || echo ?); \
+     N=\$(curl -sf '$BRIDGE_SERVICE_URL/bridges/$DEST_ADDR' 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)[\"deposits\"]))' 2>/dev/null || echo ?); \
+     echo \"L1=\$L1 L2_synth=\$L2 deposits_seen=\$N\"" \
+    90 5 600
 pass "Deposit is ready_for_claim"
 
 # ── Step 3: Wait for CLAIM note submission ────────────────────────────────────
