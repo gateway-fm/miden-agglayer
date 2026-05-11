@@ -76,14 +76,23 @@ services:
 
   # ── L2 Chain (Miden node in devnet mode) ────────────────────────────────────
   # Built from Dockerfile.miden-node pinned to the SAME miden-client tag as
-  # Cargo.toml. Do not switch back to a pre-built `miden-infra/miden-node:*`
+  # Cargo.toml. `MIDEN_CLIENT_TAG` is auto-derived from Cargo.toml by the
+  # Makefile (`make miden-client-tag`) and exported into the compose env so
+  # bumping miden-client in one place updates BOTH the Cargo dep and this
+  # image build. Do not switch back to a pre-built `miden-infra/miden-node:*`
   # tag without verifying the server proto matches the client — partial
   # alignment breaks sync_transactions and makes GER injection hang silently.
+  # The standards library's BURN note script root is *also* schema-coupled:
+  # a v0.14.4 node will not recognise a v0.14.7-bridge's BURN output, and
+  # every L2→L1 bridge-out NTX consumption fails with
+  #   "note script with root 0x… not found in data store for public note"
   miden-node:
     build:
       context: .
       dockerfile: Dockerfile.miden-node
-    image: miden-agglayer/miden-node:v0.14.4
+      args:
+        MIDEN_CLIENT_TAG: ${MIDEN_CLIENT_TAG:?MIDEN_CLIENT_TAG must be set (run via 'make e2e-up')}
+    image: miden-agglayer/miden-node:${MIDEN_CLIENT_TAG:?MIDEN_CLIENT_TAG must be set (run via 'make e2e-up')}
     restart: on-failure
     ports:
       - "57291:57291"

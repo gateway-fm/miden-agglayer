@@ -167,7 +167,18 @@ install-tools: ## Install development tools
 
 # --- E2E Testing (docker-compose, no Kurtosis) -------------------------------------------
 
-E2E_COMPOSE := docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+# miden-client tag is derived from Cargo.toml so the miden-node Docker image
+# can never drift from the proxy's miden-client. Single source of truth → if
+# `miden-client = { ... tag = "v0.14.7" }` in Cargo.toml, the e2e miden-node
+# is rebuilt from the same tag. See docker-compose.e2e.yml::miden-node for
+# the matching consumer side.
+MIDEN_CLIENT_TAG := $(shell awk '/^miden-client = /{flag=1} flag && /tag = "/{ sub(/.*tag = "/,""); sub(/".*$$/,""); print; exit }' Cargo.toml)
+
+E2E_COMPOSE := MIDEN_CLIENT_TAG=$(MIDEN_CLIENT_TAG) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+
+.PHONY: miden-client-tag
+miden-client-tag: ## Print the miden-client tag derived from Cargo.toml
+	@echo "$(MIDEN_CLIENT_TAG)"
 
 .PHONY: e2e-setup
 e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
