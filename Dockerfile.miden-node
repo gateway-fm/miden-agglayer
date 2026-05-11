@@ -1,26 +1,14 @@
-# Build testing-node-builder from revitteth/miden-client's agglayer-integration
-# branch (rev f7cdf263, the tip of `ajl-agglayer-integration-tests-v0.14.0`).
+# Build testing-node-builder from miden-client v0.14.7.
 #
-# Why a fork branch and not an upstream tag:
-#
-#   Upstream v0.14.7 dropped the `AGGLAYER_GENESIS` env hook + the
-#   `NodeBuilder::with_agglayer_accounts()` method that bootstrap the bridge,
-#   faucet, GER manager, and bridge_admin accounts in the testing-node-builder
-#   binary at genesis. Without those preloaded accounts, the bridge's NTX
-#   consumption of a B2AGG note fails with
-#       "note script with root 0x… not found in data store for public note"
-#   because the miden-node has never been told the BURN note's script. Every
-#   L2→L1 e2e Step 2 (BridgeEvent emission) then times out.
-#
-#   The fork branch carries the agglayer-genesis path (last touched 2026-04-10)
-#   on top of a v0.14.0 base. Its server-side proto for `TransactionHeader`
-#   is `repeated NoteHeader` — IDENTICAL to v0.14.7's reverted schema (see
-#   PR #30 body) — so the client (`miden-client = v0.14.7` in our Cargo.toml)
-#   and this miden-node stay wire-compatible.
-#
-# MIDEN_NODE_GIT_REF + MIDEN_NODE_GIT_URL are passed in via docker-compose
-# `build.args`. The Makefile holds the canonical defaults so future bumps are
-# a single-file edit; see `make miden-node-image-coords` to print them.
+# MUST stay in lockstep with the miden-client git tag pinned in Cargo.toml —
+# the gRPC proto between server (this image) and client (miden-agglayer-service)
+# is schema-locked per tag. Any client bump that changes the proto schema MUST
+# bump this tag too, or sync_transactions fails with "invalid wire type" and
+# every GER injection hangs on commit wait. The standards library's BURN note
+# script root is *also* schema-coupled: if the proxy is built from a different
+# tag than this miden-node, the bridge_out MASM produces a BURN script root
+# the node doesn't recognise and the L2→L1 NTX consumption fails with
+# "note script with root <X> not found in data store for public note".
 FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -35,24 +23,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# MIDEN_NODE_GIT_URL + MIDEN_NODE_GIT_REF passed via docker-compose's
-# `build.args`. No defaults — building outside `make e2e-up` must set them
-# explicitly so the version is impossible to forget. See Makefile for the
-# canonical values.
-ARG MIDEN_NODE_GIT_URL
-ARG MIDEN_NODE_GIT_REF
-RUN test -n "${MIDEN_NODE_GIT_URL}" -a -n "${MIDEN_NODE_GIT_REF}" \
-    || (echo "MIDEN_NODE_GIT_URL and MIDEN_NODE_GIT_REF build-args are required" >&2 && exit 1)
-
-# Shallow clone of the ref's branch isn't possible if the ref is a raw commit
-# sha, so fetch the full tip of the matching ref and check out the requested
-# commit/branch/tag explicitly.
-RUN git clone "${MIDEN_NODE_GIT_URL}" . && \
-    git checkout "${MIDEN_NODE_GIT_REF}"
+# MIDEN_CLIENT_TAG is auto-derived from Cargo.toml by the Makefile and
+# passed through docker-compose's `build.args`. No default — building this
+# image outside of `make e2e-up` (or its descendants) must explicitly set
+# `--build-arg MIDEN_CLIENT_TAG=…` so the tag is impossible to forget.
+ARG MIDEN_CLIENT_TAG
+RUN test -n "${MIDEN_CLIENT_TAG}" || (echo "MIDEN_CLIENT_TAG build-arg is required" >&2 && exit 1)
+RUN git clone --depth 1 --branch ${MIDEN_CLIENT_TAG} https://github.com/0xMiden/miden-client.git .
 
 RUN git rev-parse HEAD > /tmp/miden-client-commit.txt && \
-    echo "Ref: ${MIDEN_NODE_GIT_REF}" >> /tmp/miden-client-commit.txt && \
-    echo "Url: ${MIDEN_NODE_GIT_URL}" >> /tmp/miden-client-commit.txt
+    echo "Tag: ${MIDEN_CLIENT_TAG}" >> /tmp/miden-client-commit.txt
 
 # Patch: bind RPC to 0.0.0.0 for Docker port forwarding
 RUN sed -i 's|format!("127.0.0.1:{}", self.rpc_port)|format!("0.0.0.0:{}", self.rpc_port)|' \

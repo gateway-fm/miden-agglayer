@@ -167,27 +167,18 @@ install-tools: ## Install development tools
 
 # --- E2E Testing (docker-compose, no Kurtosis) -------------------------------------------
 
-# The local miden-node container is built from the revitteth fork's
-# agglayer-integration branch (NOT upstream v0.14.7). Upstream stripped the
-# `AGGLAYER_GENESIS` + `with_agglayer_accounts()` preload our bridge needs;
-# without it L2→L1 fails on every B2AGG with
-#   "note script with root 0x… not found in data store for public note".
-# The fork's proto (`TransactionHeader.output_notes = repeated NoteHeader`) is
-# IDENTICAL to upstream v0.14.7's reverted schema (PR #30 body), so our
-# Cargo.toml-pinned upstream miden-client v0.14.7 and this fork-built node
-# stay wire-compatible.
-#
-# Bumping: change MIDEN_NODE_GIT_REF here. The arg is passed through
-# `build.args` in docker-compose so the Dockerfile picks it up at build time.
-MIDEN_NODE_GIT_URL := https://github.com/revitteth/miden-client.git
-MIDEN_NODE_GIT_REF := f7cdf263781999e8f81ba608f9c5a91218747d98
+# miden-client tag is derived from Cargo.toml so the miden-node Docker image
+# can never drift from the proxy's miden-client. Single source of truth → if
+# `miden-client = { ... tag = "v0.14.7" }` in Cargo.toml, the e2e miden-node
+# is rebuilt from the same tag. See docker-compose.e2e.yml::miden-node for
+# the matching consumer side.
+MIDEN_CLIENT_TAG := $(shell awk '/^miden-client = /{flag=1} flag && /tag = "/{ sub(/.*tag = "/,""); sub(/".*$$/,""); print; exit }' Cargo.toml)
 
-E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+E2E_COMPOSE := MIDEN_CLIENT_TAG=$(MIDEN_CLIENT_TAG) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
-.PHONY: miden-node-image-coords
-miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
-	@echo "url: $(MIDEN_NODE_GIT_URL)"
-	@echo "ref: $(MIDEN_NODE_GIT_REF)"
+.PHONY: miden-client-tag
+miden-client-tag: ## Print the miden-client tag derived from Cargo.toml
+	@echo "$(MIDEN_CLIENT_TAG)"
 
 .PHONY: e2e-setup
 e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
