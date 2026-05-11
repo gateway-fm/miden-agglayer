@@ -196,6 +196,10 @@ e2e-test: ## Run E2E tests (assumes stack is already up)
 e2e-l1-to-l2: e2e-up ## Spin up stack + run L1→L2 deposit + claim test
 	./scripts/e2e-l1-to-l2.sh
 
+.PHONY: e2e-claim-watcher
+e2e-claim-watcher: e2e-l1-to-l2 ## After L1→L2, assert the chain-tail CLAIM watcher fired
+	./scripts/e2e-claim-watcher.sh
+
 .PHONY: e2e-l2-to-l1
 e2e-l2-to-l1: e2e-up ## Spin up stack + run L2→L1 bridge-out test
 	./scripts/e2e-l2-to-l1.sh

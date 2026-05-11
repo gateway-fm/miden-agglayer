@@ -5,6 +5,7 @@ pub mod bridge_address;
 pub mod bridge_out;
 pub mod burn_serial_tracker;
 pub mod claim;
+pub mod claim_watcher;
 pub mod exit;
 pub mod expected_mint_tracker;
 pub mod faucet_ops;

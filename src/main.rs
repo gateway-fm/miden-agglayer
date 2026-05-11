@@ -368,9 +368,24 @@ async fn main() -> anyhow::Result<()> {
     // vec a few lines down.
     let expected_mints_handle = bridge_out_scanner.expected_mints.clone();
 
+    // CLAIM-side chain-tail watcher: synthesises missing ClaimEvent logs for
+    // CLAIMs the normal eth_sendRawTransaction path didn't fully record
+    // (crash recovery + foreign CLAIM observations). Must run AFTER
+    // BridgeOutScanner so the two listeners don't both try to claim the same
+    // (latest + 1) slot in the same sync tick — BridgeOutScanner consumes
+    // the slot for any B2AGG it processes; ClaimWatcher takes the next slot.
+    let claim_watcher = Arc::new(miden_agglayer_service::claim_watcher::ClaimWatcher::new(
+        store.clone(),
+        block_state.clone(),
+    ));
+
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
-    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
-        vec![sync_listener, block_state.clone(), bridge_out_scanner];
+    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
+        sync_listener,
+        block_state.clone(),
+        bridge_out_scanner,
+        claim_watcher,
+    ];
 
     let client = MidenClient::new(
         miden_store_dir.clone(),

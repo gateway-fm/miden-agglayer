@@ -84,11 +84,7 @@ pub struct L1InfoTreeIndexer {
 }
 
 impl L1InfoTreeIndexer {
-    pub fn new(
-        rpc_url: String,
-        contract_address: Address,
-        store: Arc<dyn Store>,
-    ) -> Self {
+    pub fn new(rpc_url: String, contract_address: Address, store: Arc<dyn Store>) -> Self {
         Self {
             rpc_url,
             contract_address,
@@ -107,10 +103,11 @@ impl L1InfoTreeIndexer {
     pub fn spawn(self) -> anyhow::Result<oneshot::Sender<()>> {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
-        let provider = ProviderBuilder::new()
-            .connect_http(self.rpc_url.parse().map_err(|e| {
-                anyhow::anyhow!("invalid L1 RPC URL '{}': {}", self.rpc_url, e)
-            })?);
+        let provider = ProviderBuilder::new().connect_http(
+            self.rpc_url
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid L1 RPC URL '{}': {}", self.rpc_url, e))?,
+        );
 
         tokio::spawn(async move {
             tracing::info!(
@@ -135,7 +132,10 @@ impl L1InfoTreeIndexer {
                     0
                 }
             };
-            tracing::info!(start_block = last_processed, "L1InfoTreeIndexer cursor initialized");
+            tracing::info!(
+                start_block = last_processed,
+                "L1InfoTreeIndexer cursor initialized"
+            );
 
             let mut ticker = tokio::time::interval(self.poll_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

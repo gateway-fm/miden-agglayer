@@ -348,3 +348,150 @@ async fn test_pgstore_bridge_out() {
     store.unmark_note_processed(&note_id).await.unwrap();
     assert!(!store.is_note_processed(&note_id).await.unwrap());
 }
+
+// ── Claim watcher ────────────────────────────────────────────
+
+/// `is_claim_note_processed` + `mark_claim_note_processed` round-trip,
+/// and ON CONFLICT DO NOTHING semantics for the idempotency mark.
+#[tokio::test]
+async fn test_pgstore_claim_watcher_processed_lifecycle() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let note_id = format!(
+        "claim_test_note_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let gi = {
+        let mut g = [0u8; 32];
+        g[31] = 0x42;
+        g
+    };
+
+    assert!(!store.is_claim_note_processed(&note_id).await.unwrap());
+    store
+        .mark_claim_note_processed(note_id.clone(), gi, 7)
+        .await
+        .unwrap();
+    assert!(store.is_claim_note_processed(&note_id).await.unwrap());
+
+    // Second mark must be a no-op (ON CONFLICT DO NOTHING).
+    store
+        .mark_claim_note_processed(note_id.clone(), gi, 99)
+        .await
+        .unwrap();
+    assert!(store.is_claim_note_processed(&note_id).await.unwrap());
+}
+
+/// `has_claim_event_for_global_index` finds a watcher-emitted ClaimEvent
+/// AND an `add_claim_event`-emitted one (data-prefix scan path).
+#[tokio::test]
+async fn test_pgstore_has_claim_event_for_global_index_finds_both_sources() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    // Source A: watcher-emitted via commit_manual_claim_event_atomic.
+    let gi_a = {
+        let mut g = [0u8; 32];
+        g[..16].copy_from_slice(&now_ns.to_be_bytes());
+        g
+    };
+    let note_id_a = format!("claim_test_note_a_{now_ns}");
+    assert!(!store.has_claim_event_for_global_index(&gi_a).await.unwrap());
+    store
+        .commit_manual_claim_event_atomic(
+            note_id_a,
+            "0xbridge",
+            (now_ns % 1_000_000) as u64,
+            [0u8; 32],
+            "0xwatchertx",
+            gi_a,
+            0,
+            &[0u8; 20],
+            &[0u8; 20],
+            1234,
+        )
+        .await
+        .unwrap();
+    assert!(store.has_claim_event_for_global_index(&gi_a).await.unwrap());
+
+    // Source B: normal-RPC-path emission via add_claim_event.
+    let gi_b = {
+        let mut g = [0u8; 32];
+        g[..16].copy_from_slice(&(now_ns + 1).to_be_bytes());
+        g
+    };
+    assert!(!store.has_claim_event_for_global_index(&gi_b).await.unwrap());
+    store
+        .add_claim_event(
+            "0xbridge",
+            (now_ns % 1_000_000) as u64 + 1,
+            [0u8; 32],
+            &format!("0xrpctx_{now_ns}"),
+            &gi_b,
+            0,
+            &[0u8; 20],
+            &[0u8; 20],
+            5678,
+        )
+        .await
+        .unwrap();
+    assert!(store.has_claim_event_for_global_index(&gi_b).await.unwrap());
+}
+
+/// `commit_manual_claim_event_atomic`: a single PG txn folds mark +
+/// log insert + cursor advance. Verify cursor lands at the expected
+/// block and a fresh ClaimEvent log appears.
+#[tokio::test]
+async fn test_pgstore_commit_manual_claim_event_atomic() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let gi = {
+        let mut g = [0u8; 32];
+        g[..16].copy_from_slice(&now_ns.to_be_bytes());
+        g
+    };
+    let note_id = format!("claim_atomic_test_{now_ns}");
+    // Use a high block_number namespaced by timestamp so tests don't fight.
+    let block = (now_ns % 1_000_000) as u64 + 10_000;
+    let tx_hash = format!("0xclaim_atomic_{now_ns}");
+
+    store
+        .commit_manual_claim_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            gi,
+            0,
+            &[0u8; 20],
+            &[0u8; 20],
+            42,
+        )
+        .await
+        .unwrap();
+
+    // Cursor advanced.
+    assert!(store.get_latest_block_number().await.unwrap() >= block);
+    // Note processed.
+    assert!(store.is_claim_note_processed(&note_id).await.unwrap());
+    // ClaimEvent dedup query finds the row.
+    assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+}
