@@ -167,18 +167,32 @@ install-tools: ## Install development tools
 
 # --- E2E Testing (docker-compose, no Kurtosis) -------------------------------------------
 
-# miden-client tag is derived from Cargo.toml so the miden-node Docker image
-# can never drift from the proxy's miden-client. Single source of truth → if
-# `miden-client = { ... tag = "v0.14.7" }` in Cargo.toml, the e2e miden-node
-# is rebuilt from the same tag. See docker-compose.e2e.yml::miden-node for
-# the matching consumer side.
-MIDEN_CLIENT_TAG := $(shell awk '/^miden-client = /{flag=1} flag && /tag = "/{ sub(/.*tag = "/,""); sub(/".*$$/,""); print; exit }' Cargo.toml)
+# The local miden-node container is built from the production
+# `0xMiden/miden-node` repo (NOT the miden-client testing-node-builder).
+# Agglayer support moved out of the testing harness in v0.14.7+; the
+# production miden-node binary now uses a `--genesis-config-file` TOML to
+# load pre-built bridge / faucet `.mac` account files into genesis.
+# miden-node-store's build.rs auto-generates those files deterministically
+# from miden-agglayer's account builders, so the e2e image is fully
+# reproducible.
+#
+# Wire-compat: both miden-node v0.14.10 and our miden-client v0.14.7 pin
+# miden-node-proto-build v0.14.10 — protos align. Hash function identical
+# (miden-crypto 0.23.0 on both). BURN script root identical between
+# miden-standards 0.14.4 (miden-node) and 0.14.5 (us) — empirically
+# verified.
+#
+# Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
+# docker-compose so the Dockerfile picks it up at build time.
+MIDEN_NODE_GIT_URL := https://github.com/0xMiden/miden-node.git
+MIDEN_NODE_GIT_REF := v0.14.10
 
-E2E_COMPOSE := MIDEN_CLIENT_TAG=$(MIDEN_CLIENT_TAG) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
-.PHONY: miden-client-tag
-miden-client-tag: ## Print the miden-client tag derived from Cargo.toml
-	@echo "$(MIDEN_CLIENT_TAG)"
+.PHONY: miden-node-image-coords
+miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
+	@echo "url: $(MIDEN_NODE_GIT_URL)"
+	@echo "ref: $(MIDEN_NODE_GIT_REF)"
 
 .PHONY: e2e-setup
 e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis

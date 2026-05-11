@@ -1,14 +1,31 @@
-# Build testing-node-builder from miden-client v0.14.7.
+# Build the production `miden-node` binary from the 0xMiden/miden-node repo,
+# NOT the testing-node-builder from the miden-client repo.
 #
-# MUST stay in lockstep with the miden-client git tag pinned in Cargo.toml —
-# the gRPC proto between server (this image) and client (miden-agglayer-service)
-# is schema-locked per tag. Any client bump that changes the proto schema MUST
-# bump this tag too, or sync_transactions fails with "invalid wire type" and
-# every GER injection hangs on commit wait. The standards library's BURN note
-# script root is *also* schema-coupled: if the proxy is built from a different
-# tag than this miden-node, the bridge_out MASM produces a BURN script root
-# the node doesn't recognise and the L2→L1 NTX consumption fails with
-# "note script with root <X> not found in data store for public note".
+# Why: the agglayer integration moved between v0.14.0 and v0.14.10.
+#   - Old path (revitteth fork + AGGLAYER_GENESIS env): testing-node-builder
+#     in miden-client hardcoded the agglayer accounts into its GenesisState.
+#     Upstream dropped this — testing-node-builder in upstream v0.14.7 has
+#     no agglayer code.
+#   - New path (v0.14.10+): the production miden-node binary's
+#     `bundled bootstrap --genesis-config-file <toml>` loads pre-built
+#     `.mac` account files into the genesis block. miden-node-store's
+#     build.rs generates the sample agglayer .mac files (bridge,
+#     agglayer_faucet_eth, agglayer_faucet_usdc) deterministically.
+#
+# We use the sample `02-with-account-files.toml` config that ships in
+# miden-node-store. The proxy's own init.rs still creates a separate
+# runtime bridge — that's fine; the genesis bridge's MAST tree registers
+# the BURN/MINT note scripts in the miden-node store so the runtime
+# bridge's emissions resolve through `StandardNote::from_script_root`.
+#
+# Proto schemas align: both this miden-node v0.14.10 and our proxy
+# (Cargo.toml miden-client = v0.14.7) pin miden-node-proto-build v0.14.10.
+# Hash function identical (miden-crypto 0.23.0 on both). BURN script root
+# identical between miden-standards 0.14.4 and 0.14.5 (empirically verified).
+
+ARG MIDEN_NODE_GIT_URL
+ARG MIDEN_NODE_GIT_REF
+
 FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -23,28 +40,33 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# MIDEN_CLIENT_TAG is auto-derived from Cargo.toml by the Makefile and
-# passed through docker-compose's `build.args`. No default — building this
-# image outside of `make e2e-up` (or its descendants) must explicitly set
-# `--build-arg MIDEN_CLIENT_TAG=…` so the tag is impossible to forget.
-ARG MIDEN_CLIENT_TAG
-RUN test -n "${MIDEN_CLIENT_TAG}" || (echo "MIDEN_CLIENT_TAG build-arg is required" >&2 && exit 1)
-RUN git clone --depth 1 --branch ${MIDEN_CLIENT_TAG} https://github.com/0xMiden/miden-client.git .
+# Build coords passed via docker-compose build.args; no defaults so a forgotten
+# value fails fast with an explicit error.
+ARG MIDEN_NODE_GIT_URL
+ARG MIDEN_NODE_GIT_REF
+RUN test -n "${MIDEN_NODE_GIT_URL}" -a -n "${MIDEN_NODE_GIT_REF}" \
+    || (echo "MIDEN_NODE_GIT_URL and MIDEN_NODE_GIT_REF build-args are required" >&2 && exit 1)
 
-RUN git rev-parse HEAD > /tmp/miden-client-commit.txt && \
-    echo "Tag: ${MIDEN_CLIENT_TAG}" >> /tmp/miden-client-commit.txt
+RUN git clone "${MIDEN_NODE_GIT_URL}" . && \
+    git checkout "${MIDEN_NODE_GIT_REF}"
 
-# Patch: bind RPC to 0.0.0.0 for Docker port forwarding
-RUN sed -i 's|format!("127.0.0.1:{}", self.rpc_port)|format!("0.0.0.0:{}", self.rpc_port)|' \
-    crates/testing/node-builder/src/lib.rs
+RUN git rev-parse HEAD > /tmp/miden-node-commit.txt && \
+    echo "Ref: ${MIDEN_NODE_GIT_REF}" >> /tmp/miden-node-commit.txt && \
+    echo "Url: ${MIDEN_NODE_GIT_URL}" >> /tmp/miden-node-commit.txt
 
-# Build the testing-node-builder binary
-RUN cargo build --release --package node-builder
+# Build the miden-node binary. The build.rs in crates/store generates the
+# agglayer sample .mac files deterministically; they end up in
+# crates/store/src/genesis/config/samples/02-with-account-files/.
+RUN cargo build --release --bin miden-node
+
+# Capture the genesis config + .mac files for the runtime stage.
+RUN cp -r crates/store/src/genesis/config/samples /tmp/genesis-samples
 
 # Runtime
 FROM debian:bookworm-slim
 
-COPY --from=builder /tmp/miden-client-commit.txt /app/miden-client-commit.txt
+COPY --from=builder /tmp/miden-node-commit.txt /app/miden-node-commit.txt
+COPY --from=builder /tmp/genesis-samples /app/genesis-samples
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -56,22 +78,34 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/testing-node-builder /usr/local/bin/
+COPY --from=builder /build/target/release/miden-node /usr/local/bin/
 
 EXPOSE 57291
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/accounts
 
-RUN printf '%s\n' \
-    '#!/bin/bash' \
-    'set -e' \
-    'echo "=== Miden Testing Node ==="' \
-    'cat /app/miden-client-commit.txt' \
-    'export AGGLAYER_GENESIS="${AGGLAYER_GENESIS:-0}"' \
-    'echo "AGGLAYER_GENESIS=$AGGLAYER_GENESIS"' \
-    'exec testing-node-builder "$@"' \
-    > /usr/local/bin/entrypoint.sh && \
-    chmod +x /usr/local/bin/entrypoint.sh
+COPY <<'EOF' /usr/local/bin/entrypoint.sh
+#!/bin/bash
+set -e
+echo "=== Miden Node (production binary, bundled mode) ==="
+cat /app/miden-node-commit.txt
+
+GENESIS_CONFIG=/app/genesis-samples/02-with-account-files.toml
+DATA_DIR=/app/data
+ACCOUNTS_DIR=/app/accounts
+
+if [ ! -f "$DATA_DIR/.bootstrapped" ]; then
+  echo "Bootstrapping genesis with agglayer accounts from $GENESIS_CONFIG"
+  rm -rf "$DATA_DIR"
+  mkdir -p "$DATA_DIR" "$ACCOUNTS_DIR"
+  miden-node bundled bootstrap --data-directory "$DATA_DIR" --accounts-directory "$ACCOUNTS_DIR" --genesis-config-file "$GENESIS_CONFIG"
+  touch "$DATA_DIR/.bootstrapped"
+fi
+
+echo "Starting miden-node bundled..."
+exec miden-node bundled start --rpc.url "http://0.0.0.0:57291" --data-directory "$DATA_DIR"
+EOF
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD []

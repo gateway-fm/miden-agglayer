@@ -74,37 +74,29 @@ services:
       agglayer-postgres:
         condition: service_healthy
 
-  # ── L2 Chain (Miden node in devnet mode) ────────────────────────────────────
-  # Built from Dockerfile.miden-node pinned to the SAME miden-client tag as
-  # Cargo.toml. `MIDEN_CLIENT_TAG` is auto-derived from Cargo.toml by the
-  # Makefile (`make miden-client-tag`) and exported into the compose env so
-  # bumping miden-client in one place updates BOTH the Cargo dep and this
-  # image build. Do not switch back to a pre-built `miden-infra/miden-node:*`
-  # tag without verifying the server proto matches the client — partial
-  # alignment breaks sync_transactions and makes GER injection hang silently.
-  # The standards library's BURN note script root is *also* schema-coupled:
-  # a v0.14.4 node will not recognise a v0.14.7-bridge's BURN output, and
-  # every L2→L1 bridge-out NTX consumption fails with
-  #   "note script with root 0x… not found in data store for public note"
+  # ── L2 Chain (Miden node in bundled mode) ──────────────────────────────────
+  # Built from `0xMiden/miden-node` (production binary), NOT the testing
+  # harness in miden-client. See Dockerfile.miden-node + Makefile's
+  # MIDEN_NODE_GIT_{URL,REF} for the agglayer-genesis rationale.
   miden-node:
     build:
       context: .
       dockerfile: Dockerfile.miden-node
       args:
-        MIDEN_CLIENT_TAG: ${MIDEN_CLIENT_TAG:?MIDEN_CLIENT_TAG must be set (run via 'make e2e-up')}
-    image: miden-agglayer/miden-node:${MIDEN_CLIENT_TAG:?MIDEN_CLIENT_TAG must be set (run via 'make e2e-up')}
+        MIDEN_NODE_GIT_URL: ${MIDEN_NODE_GIT_URL:?MIDEN_NODE_GIT_URL must be set (run via 'make e2e-up')}
+        MIDEN_NODE_GIT_REF: ${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
+    image: miden-agglayer/miden-node:${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
     restart: on-failure
     ports:
       - "57291:57291"
     environment:
       RUST_LOG: "info,miden_node_ntx_builder=debug,miden_tx=debug"
-      AGGLAYER_GENESIS: "0"
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 57291 || exit 1"]
       interval: 3s
       timeout: 2s
-      retries: 20
-      start_period: 15s
+      retries: 30
+      start_period: 30s
 
     # ── L2 EVM Proxy (service under test) ──────────────────────────────────────
   miden-agglayer:
