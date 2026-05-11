@@ -53,7 +53,7 @@ services:
       timeout: 2s
       retries: 5
 
-  # ── Migration (runs 001_initial.sql then exits) ───────────────────────────
+  # ── Migration (applies every migrations/*.sql then exits) ─────────────────
   agglayer-migrate:
     image: postgres:16-alpine
     entrypoint: ["sh", "-c"]
@@ -62,10 +62,14 @@ services:
         echo "Running miden-agglayer migrations..."
         PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/001_initial.sql
         PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/002_faucet_registry.sql
+        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/003_unclaimable_claims.sql
+        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/004_claim_watcher.sql
         echo "Migrations complete."
     volumes:
       - ./migrations/001_initial.sql:/migrations/001_initial.sql:ro
       - ./migrations/002_faucet_registry.sql:/migrations/002_faucet_registry.sql:ro
+      - ./migrations/003_unclaimable_claims.sql:/migrations/003_unclaimable_claims.sql:ro
+      - ./migrations/004_claim_watcher.sql:/migrations/004_claim_watcher.sql:ro
     depends_on:
       agglayer-postgres:
         condition: service_healthy
