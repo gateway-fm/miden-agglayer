@@ -816,7 +816,10 @@ mod tests {
 
         // C6 — pre-seed the GER as seen so the new pre-check passes; the
         // test's intent is to exercise the publish-failure path, not the
-        // GER-not-yet-seen path.
+        // GER-not-yet-seen path. RD-862 follow-up: `handle_claim_asset` now
+        // gates on `is_ger_injected` (not `has_seen_ger`) since the
+        // L1InfoTreeIndexer pre-populates ger_entries rows before the GER is
+        // injected to L2. Mark BOTH so the gate passes.
         let ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
         store
             .mark_ger_seen(
@@ -830,6 +833,7 @@ mod tests {
             )
             .await
             .unwrap();
+        store.mark_ger_injected(ger).await.unwrap();
 
         let result = service_send_raw_txn(service, input_hex).await;
         assert!(result.is_err(), "publish_claim should fail with test stub");
