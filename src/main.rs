@@ -302,8 +302,7 @@ async fn main() -> anyhow::Result<()> {
             command.miden_node.as_deref(),
         )?;
 
-        let config_path =
-            init::init(&init_client, init_net_id, miden_store_dir.clone()).await?;
+        let config_path = init::init(&init_client, init_net_id, miden_store_dir.clone()).await?;
         tracing::info!("new config created at {config_path:?}");
 
         init_client.shutdown()?;

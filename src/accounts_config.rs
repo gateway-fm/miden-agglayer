@@ -263,6 +263,9 @@ mod tests {
         };
         save_config(cfg, &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
         let loaded = load_config(Some(dir.path().to_path_buf())).unwrap();
-        assert_eq!(loaded.bridge.0, AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap());
+        assert_eq!(
+            loaded.bridge.0,
+            AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap()
+        );
     }
 }
