@@ -63,6 +63,21 @@ pub fn parse_node_url(node_url: &str) -> anyhow::Result<Endpoint> {
     }
 }
 
+/// Resolves the `NetworkId` for the configured `--miden-node` value, applying
+/// the same `None` → localhost default as `MidenClient::new`. Use this so
+/// bech32 strings written by the service (notably `bridge_accounts.toml`) use
+/// the active node's HRP — e.g. `mtst` on testnet rather than the local
+/// network's `mlcl`.
+pub fn resolve_network_id(
+    node_url: Option<&str>,
+) -> anyhow::Result<miden_protocol::address::NetworkId> {
+    let endpoint = match node_url {
+        Some(url) => parse_node_url(url)?,
+        None => Endpoint::localhost(),
+    };
+    Ok(endpoint.to_network_id())
+}
+
 /// Builds an RPC client for the Miden node, optionally authenticating via a bearer token.
 ///
 /// When `api_key` is `Some`, the returned client sends `authorization: Bearer <api_key>` on
