@@ -93,11 +93,16 @@ docker exec $AGGLAYER_CONTAINER bridge-out-tool \
 pass "B2AGG note created"
 
 # ── Step 2: Wait for BridgeEvent log ──────────────────────────────────────────
+# Under load the bridge's B2AGG consumption hits miden-node block-producer
+# crash-loops (v0.14.10 desync bug); each recovery takes 30-40s. Default 120s
+# isn't enough for a single clean run on a constrained host. Override via
+# BRIDGE_EVENT_TIMEOUT_S — the best-effort wrapper sets this to 600s.
 BRIDGE_EVENT_TOPIC="0x501781209a1f8899323b96b4ef08b168df93e0a90c673d1e4cce39366cb62f9b"
-log "Step 2/4: Waiting for BridgeEvent in L2 proxy..."
+BRIDGE_EVENT_TIMEOUT_S="${BRIDGE_EVENT_TIMEOUT_S:-120}"
+log "Step 2/4: Waiting for BridgeEvent in L2 proxy (timeout ${BRIDGE_EVENT_TIMEOUT_S}s)..."
 wait_for "BridgeEvent in eth_getLogs" \
     "cast logs --rpc-url $L2_RPC --from-block 0 $BRIDGE_EVENT_TOPIC 2>/dev/null | grep -q 'data'" \
-    120 5
+    "$BRIDGE_EVENT_TIMEOUT_S" 5
 pass "BridgeEvent detected in L2"
 
 # ── Step 3: Wait for certificate settlement on L1 ────────────────────────────

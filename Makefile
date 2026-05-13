@@ -5,7 +5,7 @@ CARGO_RELEASE_ARG := $(if $(filter release,$(CARGO_PROFILE)),--release,)
 
 .PHONY: help
 help: ## Show description of all commands
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 # --- Linting -------------------------------------------------------------------------------------
 
@@ -229,12 +229,20 @@ e2e-l1-to-l2: e2e-up ## Spin up stack + run L1→L2 deposit + claim test
 	$(COMPOSE_ENV) ./scripts/e2e-l1-to-l2.sh
 
 .PHONY: e2e-claim-watcher
-e2e-claim-watcher: e2e-l1-to-l2 ## After L1→L2, assert the chain-tail CLAIM watcher fired
+e2e-claim-watcher: e2e-l1-to-l2 ## After L1→L2, assert the chain-tail CLAIM watcher fired (happy path: already_recorded)
 	$(COMPOSE_ENV) ./scripts/e2e-claim-watcher.sh
 
+.PHONY: e2e-claim-watcher-synthesis
+e2e-claim-watcher-synthesis: e2e-claim-watcher ## After watcher happy path, simulate desync and assert synthesis fires (RD-860/EFAD repro)
+	$(COMPOSE_ENV) ./scripts/e2e-claim-watcher-synthesis.sh
+
 .PHONY: e2e-l2-to-l1
-e2e-l2-to-l1: e2e-up ## Spin up stack + run L2→L1 bridge-out test
+e2e-l2-to-l1: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund wallet + run L2→L1 bridge-out test (strict)
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1.sh
+
+.PHONY: e2e-l2-to-l1-best-effort
+e2e-l2-to-l1-best-effort: e2e-l1-to-l2 ## L2→L1 with extended timeout + miden-node crash detection (exits 2 on upstream miden-node v0.14.10 crash-loop, 1 on real regression)
+	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-best-effort.sh
 
 .PHONY: e2e-restore
 e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test
@@ -256,6 +264,40 @@ e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
 repro-rd862: ## Run RD-862 GER-injection race repro (assumes stack is up); prints orphan rate
 	N_DEPOSITS=$${N_DEPOSITS:-30} INTER_DELAY_MS=$${INTER_DELAY_MS:-0} POLL_TIMEOUT=$${POLL_TIMEOUT:-300} \
 		./scripts/e2e-rd862-repro.sh
+
+.PHONY: test-e2e-coverage
+test-e2e-coverage: SHELL := /bin/bash
+test-e2e-coverage: ## Regression-protect all three production fixes (RD-862 GER race + claim_watcher synthesis + L2→L1) on a single fresh stack
+	@echo "╔══════════════════════════════════════════════════════════════════════════╗"
+	@echo "║  test-e2e-coverage: locks production fixes in CI                           ║"
+	@echo "║    1) e2e-l1-to-l2                  baseline L1→L2 flow                    ║"
+	@echo "║    2) e2e-claim-watcher             watcher happy path (already_recorded)  ║"
+	@echo "║    3) e2e-claim-watcher-synthesis   watcher synthesis path (EFAD repro)    ║"
+	@echo "║    4) repro-rd862                   orphan-rate canonical metric           ║"
+	@echo "║    5) e2e-l2-to-l1-best-effort      L2→L1 round-trip (env-skip aware)      ║"
+	@echo "╚══════════════════════════════════════════════════════════════════════════╝"
+	@$(MAKE) e2e-down >/dev/null 2>&1 || true
+	@set -o pipefail; \
+		$(MAKE) e2e-claim-watcher-synthesis; EXIT_CODE=$$?; \
+		if [ $$EXIT_CODE -eq 0 ]; then \
+			echo ""; \
+			echo "Running RD-862 repro on the live stack..."; \
+			$(MAKE) repro-rd862; EXIT_CODE=$$?; \
+		fi; \
+		if [ $$EXIT_CODE -eq 0 ]; then \
+			echo ""; \
+			echo "Running L2→L1 best-effort (extended timeout + miden-node crash detection)..."; \
+			$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-best-effort.sh; L2L1_EXIT=$$?; \
+			case $$L2L1_EXIT in \
+				0) echo "  L2→L1: PASS" ;; \
+				2) echo "  L2→L1: SKIP (upstream miden-node v0.14.10 instability) — not a regression" ;; \
+				*) echo "  L2→L1: FAIL (real regression candidate)"; EXIT_CODE=$$L2L1_EXIT ;; \
+			esac; \
+		fi; \
+		echo ""; \
+		echo "Tearing down..."; \
+		$(MAKE) e2e-down >/dev/null 2>&1 || true; \
+		exit $$EXIT_CODE
 
 .PHONY: e2e
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)

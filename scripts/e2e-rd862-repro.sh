@@ -251,16 +251,23 @@ echo ""
 ALL_READY=0
 [[ "$DELTA_READY" -ge "$SUBMITTED_OK" ]] && ALL_READY=1
 
-if [[ "$ALL_READY" -eq 1 && ${#ORPHANS[@]} -eq 0 ]]; then
-    pass "All deposits ready_for_claim AND zero orphan GERs — race did NOT manifest."
-    exit 0
-else
-    REASONS=()
-    [[ "$ALL_READY" -ne 1 ]] && REASONS+=("$((SUBMITTED_OK - DELTA_READY))/$SUBMITTED_OK deposits stuck")
-    [[ ${#ORPHANS[@]} -gt 0 ]] && REASONS+=("${#ORPHANS[@]}/${#GERS[@]} GERs orphaned")
-    fail "RD-862 race MANIFESTED: $(IFS=', '; echo "${REASONS[*]}")"
-    # Note: deposits can reach ready_for_claim even with orphan GERs, because
-    # aggoracle injects the *latest* InfoTree leaf which subsumes earlier
-    # deposits. Orphan rate is the canonical race metric.
+# Pass criterion per tests/baselines/baseline-rd862-repro.json:
+#   "metric_to_drive_to_zero": "orphan_rate_pct"
+#   "Conversion rate is informational; orphan rate is canonical."
+#
+# Orphan rate > 0 = the GER decomposition race manifested → HARD FAIL (CI gate).
+# Conversion rate < 100% under burst load is normal: aggoracle injects ~one GER
+# per ~30-60s and only the LATEST L1InfoTree leaf at inject time is committed,
+# so a 30-deposit burst takes multiple aggoracle cycles to fully cover. The
+# conversion-rate warning is preserved as a perf signal but no longer fails CI.
+if [[ ${#ORPHANS[@]} -gt 0 ]]; then
+    fail "RD-862 race MANIFESTED: ${#ORPHANS[@]}/${#GERS[@]} GERs orphaned"
     exit 1
 fi
+
+if [[ "$ALL_READY" -ne 1 ]]; then
+    warn "conversion rate < 100% ($((SUBMITTED_OK - DELTA_READY))/$SUBMITTED_OK deposits not yet ready_for_claim) — informational, not a fail. aggoracle cadence is the bottleneck under burst load. Bump POLL_TIMEOUT or reduce N_DEPOSITS to drive conversion to 100% for perf-tracking runs."
+fi
+
+pass "Zero orphan GERs — RD-862 race did NOT manifest (canonical metric)."
+exit 0
