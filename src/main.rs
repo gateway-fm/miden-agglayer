@@ -293,7 +293,16 @@ async fn main() -> anyhow::Result<()> {
             command.miden_debug,
         )?;
 
-        let config_path = init::init(&init_client, miden_store_dir.clone()).await?;
+        // Resolve the NetworkId from the same `--miden-node` flag MidenClient uses,
+        // so the bech32 strings written to bridge_accounts.toml use the active
+        // node's HRP (e.g. `mtst` on testnet). Without this, every saved id
+        // would be encoded with the local-network HRP (`mlcl`) regardless of
+        // which network the agglayer is actually deployed against.
+        let init_net_id = miden_agglayer_service::miden_client::resolve_network_id(
+            command.miden_node.as_deref(),
+        )?;
+
+        let config_path = init::init(&init_client, init_net_id, miden_store_dir.clone()).await?;
         tracing::info!("new config created at {config_path:?}");
 
         init_client.shutdown()?;

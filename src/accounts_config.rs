@@ -1,11 +1,11 @@
-use miden_client::rpc::Endpoint;
 use miden_protocol::account::AccountId;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use miden_protocol::address::NetworkId;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::{Display, Formatter};
 use std::path::{Component, PathBuf};
 use std::{env, fs};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AccountsConfig {
     pub service: AccountIdBech32,
     pub bridge: AccountIdBech32,
@@ -27,21 +27,25 @@ pub struct AccountsConfig {
 #[derive(Debug, Clone)]
 pub struct AccountIdBech32(pub AccountId);
 
-impl Display for AccountIdBech32 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let net_id = Endpoint::localhost().to_network_id();
-        let str = self.0.to_bech32(net_id);
-        write!(f, "{str}")
+impl AccountIdBech32 {
+    /// Render the account id as a bech32 string for the given network.
+    ///
+    /// Bech32 encodes the network in its HRP. Using the wrong HRP makes the
+    /// address unfindable on the network's block explorer even though the
+    /// underlying account is valid on-chain — see PR introducing this method.
+    /// Any code that emits the bech32 form across a system boundary (on-disk
+    /// config, logs, API responses, support tickets) MUST pass the
+    /// `NetworkId` of the active node.
+    pub fn to_bech32(&self, net_id: NetworkId) -> String {
+        self.0.to_bech32(net_id)
     }
 }
 
-impl Serialize for AccountIdBech32 {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let str = self.to_string();
-        serializer.serialize_str(&str)
+impl Display for AccountIdBech32 {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Network-agnostic hex form. For the bech32 form (which encodes the
+        // network HRP) call `to_bech32(net_id)` with an explicit NetworkId.
+        write!(f, "{}", self.0.to_hex())
     }
 }
 
@@ -50,9 +54,50 @@ impl<'de> Deserialize<'de> for AccountIdBech32 {
     where
         D: Deserializer<'de>,
     {
-        let str = String::deserialize(deserializer)?;
-        let (_, id) = AccountId::from_bech32(&str).map_err(serde::de::Error::custom)?;
+        let s = String::deserialize(deserializer)?;
+        let id = if s.starts_with("0x") || s.starts_with("0X") {
+            AccountId::from_hex(&s).map_err(serde::de::Error::custom)?
+        } else {
+            // `from_bech32` validates the bech32 checksum but doesn't constrain the HRP;
+            // older configs written before the network-id fix used the `mlcl` (local) HRP
+            // even on testnet. Both forms decode to the same on-chain account.
+            AccountId::from_bech32(&s)
+                .map(|(_, id)| id)
+                .map_err(serde::de::Error::custom)?
+        };
         Ok(Self(id))
+    }
+}
+
+/// On-disk representation. Holds the bech32 strings ready-encoded with the
+/// network id supplied at save time, so the bech32 HRP matches the active
+/// node. Constructing this from `AccountsConfig` is the only sanctioned way
+/// to serialize the config — there is intentionally no derived `Serialize`
+/// impl on `AccountsConfig` itself.
+#[derive(Serialize)]
+struct AccountsConfigOnDisk {
+    service: String,
+    bridge: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    faucet_eth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    faucet_agg: Option<String>,
+    wallet_hardhat: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ger_manager: Option<String>,
+}
+
+impl AccountsConfigOnDisk {
+    fn from_config(config: &AccountsConfig, net_id: &NetworkId) -> Self {
+        let enc = |id: &AccountIdBech32| id.to_bech32(net_id.clone());
+        Self {
+            service: enc(&config.service),
+            bridge: enc(&config.bridge),
+            faucet_eth: config.faucet_eth.as_ref().map(&enc),
+            faucet_agg: config.faucet_agg.as_ref().map(&enc),
+            wallet_hardhat: enc(&config.wallet_hardhat),
+            ger_manager: config.ger_manager.as_ref().map(&enc),
+        }
     }
 }
 
@@ -100,9 +145,11 @@ pub fn config_path_exists(miden_store_dir: Option<PathBuf>) -> anyhow::Result<bo
 
 pub fn save_config(
     config: AccountsConfig,
+    net_id: &NetworkId,
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
-    let config_toml = toml::to_string(&config)?;
+    let on_disk = AccountsConfigOnDisk::from_config(&config, net_id);
+    let config_toml = toml::to_string(&on_disk)?;
     let config_path = config_path(miden_store_dir)?;
     fs::write(config_path.clone(), config_toml)?;
     Ok(config_path)
@@ -118,6 +165,13 @@ pub fn load_config(miden_store_dir: Option<PathBuf>) -> anyhow::Result<AccountsC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    const TEST_ACCOUNT_HEX: &str = "0x27525024cc2047507cb35ee9ed00d4";
+
+    fn dummy() -> AccountIdBech32 {
+        AccountIdBech32(AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap())
+    }
 
     #[test]
     fn rejects_parent_dir_traversal() {
@@ -153,5 +207,65 @@ mod tests {
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.ends_with("bridge_accounts.toml"));
+    }
+
+    #[test]
+    fn save_writes_bech32_with_configured_network_hrp() {
+        let dir = tempdir().unwrap();
+        let cfg = AccountsConfig {
+            service: dummy(),
+            bridge: dummy(),
+            faucet_eth: Some(dummy()),
+            faucet_agg: None,
+            wallet_hardhat: dummy(),
+            ger_manager: Some(dummy()),
+        };
+        save_config(cfg, &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
+        let body = fs::read_to_string(dir.path().join("bridge_accounts.toml")).unwrap();
+        // Every emitted id must use the `mtst` testnet HRP — never `mlcl`.
+        assert!(
+            body.contains("\"mtst1"),
+            "expected testnet (`mtst`) HRP in saved bech32; got:\n{body}"
+        );
+        assert!(
+            !body.contains("\"mlcl1"),
+            "saved bech32 must not use the local-network (`mlcl`) HRP; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_legacy_local_hrp_bech32() {
+        // Files written by previous versions used the local-network HRP
+        // unconditionally. They must still load — `from_bech32` ignores the HRP.
+        let dir = tempdir().unwrap();
+        let id = AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap();
+        let local_hrp = NetworkId::new("mlcl").unwrap();
+        let legacy_bech32 = id.to_bech32(local_hrp);
+        let toml_body = format!(
+            "service = \"{b}\"\nbridge = \"{b}\"\nwallet_hardhat = \"{b}\"\n",
+            b = legacy_bech32
+        );
+        fs::write(dir.path().join("bridge_accounts.toml"), toml_body).unwrap();
+        let loaded = load_config(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(loaded.bridge.0, id);
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let dir = tempdir().unwrap();
+        let cfg = AccountsConfig {
+            service: dummy(),
+            bridge: dummy(),
+            faucet_eth: None,
+            faucet_agg: None,
+            wallet_hardhat: dummy(),
+            ger_manager: None,
+        };
+        save_config(cfg, &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
+        let loaded = load_config(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(
+            loaded.bridge.0,
+            AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap()
+        );
     }
 }

@@ -9,6 +9,7 @@ use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
 use miden_protocol::account::{Account, AccountId};
+use miden_protocol::address::NetworkId;
 use miden_protocol::note::NoteType;
 use miden_standards::account::auth::AuthSingleSig;
 use miden_standards::account::wallets::BasicWallet;
@@ -195,6 +196,7 @@ async fn register_p2id_script(
 async fn init_internal(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
+    net_id: NetworkId,
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
@@ -232,12 +234,13 @@ async fn init_internal(
     register_p2id_script(client, accounts.service.id()).await?;
 
     let config = AccountsConfig::from(accounts);
-    let config_path = accounts_config::save_config(config, miden_store_dir)?;
+    let config_path = accounts_config::save_config(config, &net_id, miden_store_dir)?;
     Ok(config_path)
 }
 
 pub async fn init(
     client: &MidenClient,
+    net_id: NetworkId,
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     let result = Arc::new(OnceLock::<PathBuf>::new());
@@ -246,7 +249,7 @@ pub async fn init(
 
     let future = client.with(|client| {
         Box::new(async move {
-            let result = init_internal(client, keystore, miden_store_dir).await?;
+            let result = init_internal(client, keystore, net_id, miden_store_dir).await?;
             result_internal.set(result).unwrap();
             Ok(())
         })
