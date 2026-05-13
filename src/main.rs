@@ -368,9 +368,24 @@ async fn main() -> anyhow::Result<()> {
     // vec a few lines down.
     let expected_mints_handle = bridge_out_scanner.expected_mints.clone();
 
+    // CLAIM-side chain-tail watcher: synthesises missing ClaimEvent logs for
+    // CLAIMs the normal eth_sendRawTransaction path didn't fully record
+    // (crash recovery + foreign CLAIM observations). Must run AFTER
+    // BridgeOutScanner so the two listeners don't both try to claim the same
+    // (latest + 1) slot in the same sync tick — BridgeOutScanner consumes
+    // the slot for any B2AGG it processes; ClaimWatcher takes the next slot.
+    let claim_watcher = Arc::new(miden_agglayer_service::claim_watcher::ClaimWatcher::new(
+        store.clone(),
+        block_state.clone(),
+    ));
+
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
-    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
-        vec![sync_listener, block_state.clone(), bridge_out_scanner];
+    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
+        sync_listener,
+        block_state.clone(),
+        bridge_out_scanner,
+        claim_watcher,
+    ];
 
     let client = MidenClient::new(
         miden_store_dir.clone(),
@@ -435,6 +450,55 @@ async fn main() -> anyhow::Result<()> {
         "fresh-client `publish_claim` path will dial this Miden node URL"
     );
     state.miden_api_key = command.miden_api_key;
+
+    // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
+    // proactively indexing every (mainnet, rollup) pair as L1 emits it,
+    // instead of trying to recover the pair from a racing view call after the
+    // GER lands on L2. Idempotent UPSERT: no-op if both code paths populate
+    // the same ger_entries row. See `l1_info_tree_indexer.rs` for the full
+    // race analysis and store-ordering guarantees.
+    if let (Some(l1_rpc_url), Some(ger_addr_str)) =
+        (state.l1_rpc_url.clone(), state.ger_l1_address.clone())
+    {
+        match ger_addr_str.parse::<alloy::primitives::Address>() {
+            Ok(ger_addr) => {
+                let indexer = miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
+                    l1_rpc_url,
+                    ger_addr,
+                    state.store.clone(),
+                );
+                match indexer.spawn() {
+                    Ok(shutdown_tx) => {
+                        // The indexer runs for the lifetime of the tokio
+                        // runtime; when `main` returns, the runtime tears
+                        // down and the task stops with it. Leak the shutdown
+                        // sender deliberately rather than store it on the
+                        // (Clone) ServiceState — Sender is not Clone, and
+                        // there is no graceful-shutdown path here that would
+                        // benefit from holding it.
+                        std::mem::forget(shutdown_tx);
+                        tracing::info!("L1InfoTreeIndexer spawned");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to spawn L1InfoTreeIndexer");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    address = %ger_addr_str,
+                    error = %e,
+                    "invalid --ger-l1-address; L1InfoTreeIndexer not started"
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            "L1 RPC URL or GER contract address missing; L1InfoTreeIndexer disabled. \
+             Without it, GER orphan resolution falls back to the racing view-call path \
+             in service_send_raw_txn.rs and may produce orphan GERs under deposit load."
+        );
+    }
 
     // Initialize metrics
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()

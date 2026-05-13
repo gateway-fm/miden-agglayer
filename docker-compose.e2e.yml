@@ -53,7 +53,7 @@ services:
       timeout: 2s
       retries: 5
 
-  # ── Migration (runs 001_initial.sql then exits) ───────────────────────────
+  # ── Migration (applies every migrations/*.sql then exits) ─────────────────
   agglayer-migrate:
     image: postgres:16-alpine
     entrypoint: ["sh", "-c"]
@@ -62,36 +62,41 @@ services:
         echo "Running miden-agglayer migrations..."
         PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/001_initial.sql
         PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/002_faucet_registry.sql
+        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/003_unclaimable_claims.sql
+        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/004_claim_watcher.sql
         echo "Migrations complete."
     volumes:
       - ./migrations/001_initial.sql:/migrations/001_initial.sql:ro
       - ./migrations/002_faucet_registry.sql:/migrations/002_faucet_registry.sql:ro
+      - ./migrations/003_unclaimable_claims.sql:/migrations/003_unclaimable_claims.sql:ro
+      - ./migrations/004_claim_watcher.sql:/migrations/004_claim_watcher.sql:ro
     depends_on:
       agglayer-postgres:
         condition: service_healthy
 
-  # ── L2 Chain (Miden node in devnet mode) ────────────────────────────────────
-  # Built from Dockerfile.miden-node pinned to the SAME miden-client tag as
-  # Cargo.toml. Do not switch back to a pre-built `miden-infra/miden-node:*`
-  # tag without verifying the server proto matches the client — partial
-  # alignment breaks sync_transactions and makes GER injection hang silently.
+  # ── L2 Chain (Miden node in bundled mode) ──────────────────────────────────
+  # Built from `0xMiden/miden-node` (production binary), NOT the testing
+  # harness in miden-client. See Dockerfile.miden-node + Makefile's
+  # MIDEN_NODE_GIT_{URL,REF} for the agglayer-genesis rationale.
   miden-node:
     build:
       context: .
       dockerfile: Dockerfile.miden-node
-    image: miden-agglayer/miden-node:v0.14.4
+      args:
+        MIDEN_NODE_GIT_URL: ${MIDEN_NODE_GIT_URL:?MIDEN_NODE_GIT_URL must be set (run via 'make e2e-up')}
+        MIDEN_NODE_GIT_REF: ${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
+    image: miden-agglayer/miden-node:${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
     restart: on-failure
     ports:
       - "57291:57291"
     environment:
       RUST_LOG: "info,miden_node_ntx_builder=debug,miden_tx=debug"
-      AGGLAYER_GENESIS: "0"
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 57291 || exit 1"]
       interval: 3s
       timeout: 2s
-      retries: 20
-      start_period: 15s
+      retries: 30
+      start_period: 30s
 
     # ── L2 EVM Proxy (service under test) ──────────────────────────────────────
   miden-agglayer:

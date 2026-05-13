@@ -102,4 +102,30 @@ pub fn init_metrics() {
          the GER was already recorded as injected by the proxy (G6). \
          Saves up to 12s per claim in the common case."
     );
+    describe_counter!(
+        "claim_watcher_synthesised_total",
+        "ClaimWatcher synthesised a ClaimEvent from a consumed CLAIM note \
+         that the normal eth_sendRawTransaction path had not recorded \
+         (crash recovery or foreign-CLAIM observation)."
+    );
+    describe_counter!(
+        "claim_watcher_already_recorded_total",
+        "ClaimWatcher observed a consumed CLAIM whose ClaimEvent was \
+         already in the store (either prior watcher emission or \
+         eth_sendRawTransaction emission). Note marked processed and \
+         skipped — counted to monitor the dedup-rate."
+    );
+    describe_counter!(
+        "claim_watcher_storage_decode_total",
+        "ClaimWatcher could not decode the on-chain storage of a \
+         consumed CLAIM note (truncated felts, oversize amount, etc.). \
+         Quarantined to prevent re-loop. Investigate any non-zero rate."
+    );
+    describe_counter!(
+        "claim_watcher_unrecoverable_total",
+        "Consumed CLAIM note where the watcher cannot synthesise a \
+         ClaimEvent at all — currently fires alongside \
+         claim_watcher_storage_decode_total when quarantining a \
+         malformed note. Page if rate spikes."
+    );
 }

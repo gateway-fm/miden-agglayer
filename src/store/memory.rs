@@ -58,6 +58,10 @@ pub struct InMemoryStore {
     processed_notes: RwLock<HashSet<String>>,
     deposit_counter: RwLock<u32>,
 
+    // Claim watcher (independent from bridge-out so CLAIM observations do not
+    // consume B2AGG `deposit_counter` slots — see commit_manual_claim_event_atomic).
+    claim_watcher_processed: RwLock<HashMap<String, [u8; 32]>>,
+
     // Faucet registry
     faucets: RwLock<Vec<FaucetEntry>>,
 }
@@ -84,6 +88,7 @@ impl InMemoryStore {
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashSet::new()),
             deposit_counter: RwLock::new(0),
+            claim_watcher_processed: RwLock::new(HashMap::new()),
             faucets: RwLock::new(Vec::new()),
         }
     }
@@ -542,6 +547,57 @@ impl Store for InMemoryStore {
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
         self.processed_notes.write().remove(note_id);
         Ok(())
+    }
+
+    // ── Claim watcher ────────────────────────────────────────────
+
+    async fn is_claim_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
+        Ok(self.claim_watcher_processed.read().contains_key(note_id))
+    }
+
+    async fn mark_claim_note_processed(
+        &self,
+        note_id: String,
+        global_index: [u8; 32],
+        _block_number: u64,
+    ) -> anyhow::Result<()> {
+        self.claim_watcher_processed
+            .write()
+            .insert(note_id, global_index);
+        Ok(())
+    }
+
+    async fn has_claim_event_for_global_index(
+        &self,
+        global_index: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        // 1. Any prior watcher-emission for this leaf.
+        if self
+            .claim_watcher_processed
+            .read()
+            .values()
+            .any(|gi| gi == global_index)
+        {
+            return Ok(true);
+        }
+        // 2. Normal-RPC path: scan synthetic_logs for a ClaimEvent whose 32-byte
+        //    data prefix matches the global_index. Encoding lives in
+        //    `log_synthesis::encode_claim_event_data*`; the global_index is the
+        //    first 32 bytes of the ABI-encoded data, so a prefix match is sound.
+        let topic = crate::log_synthesis::CLAIM_EVENT_TOPIC;
+        let prefix = format!("0x{}", hex::encode(global_index));
+        let logs = self.logs_by_block.read();
+        for v in logs.values() {
+            for log in v {
+                if log.topics.first().is_some_and(|t| t == topic)
+                    && log.data.len() >= prefix.len()
+                    && log.data[..prefix.len()].eq_ignore_ascii_case(&prefix)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     // ── Faucet registry ──────────────────────────────────────────

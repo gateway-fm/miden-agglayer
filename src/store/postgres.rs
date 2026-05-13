@@ -1229,6 +1229,150 @@ impl Store for PgStore {
         Ok(())
     }
 
+    // ── Claim watcher ────────────────────────────────────────────
+
+    async fn is_claim_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT 1 FROM claim_watcher_processed WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn mark_claim_note_processed(
+        &self,
+        note_id: String,
+        global_index: [u8; 32],
+        block_number: u64,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO claim_watcher_processed (note_id, global_index, block_number)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (note_id) DO NOTHING",
+                &[&note_id, &global_index.as_slice(), &(block_number as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn has_claim_event_for_global_index(
+        &self,
+        global_index: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        // 1. Any prior watcher-emission for this leaf.
+        let watcher_rows = client
+            .query(
+                "SELECT 1 FROM claim_watcher_processed WHERE global_index = $1 LIMIT 1",
+                &[&global_index.as_slice()],
+            )
+            .await?;
+        if !watcher_rows.is_empty() {
+            return Ok(true);
+        }
+        // 2. Normal-RPC path emission: scan synthetic_logs for a ClaimEvent
+        //    whose ABI-encoded data starts with this 32-byte global_index.
+        //    `data` is stored as `0x` + lowercase hex, so a prefix string match
+        //    against `0x{global_index_hex}` is sound. Bounded by the
+        //    ClaimEvent topic to keep the scan narrow.
+        let topic = crate::log_synthesis::CLAIM_EVENT_TOPIC;
+        let prefix = format!("0x{}", hex::encode(global_index));
+        let pattern = format!("{prefix}%");
+        let rpc_rows = client
+            .query(
+                "SELECT 1 FROM synthetic_logs \
+                 WHERE topics[1] = $1 AND lower(data) LIKE $2 LIMIT 1",
+                &[&topic, &pattern.to_lowercase()],
+            )
+            .await?;
+        Ok(!rpc_rows.is_empty())
+    }
+
+    /// Atomic commit for a watcher-synthesised ClaimEvent. Single PG txn folding
+    /// the three writes the default impl chains separately. Mirrors the design
+    /// of `commit_b2agg_event_atomic` and `commit_ger_event_atomic`.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_manual_claim_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_index: [u8; 32],
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_address: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // 1. Mark the CLAIM note processed (idempotent — second observation no-ops).
+        txn.execute(
+            "INSERT INTO claim_watcher_processed (note_id, global_index, block_number)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (note_id) DO NOTHING",
+            &[&note_id, &global_index.as_slice(), &(block_number as i64)],
+        )
+        .await?;
+
+        // 2. Allocate a log_index.
+        let row = txn
+            .query_one(
+                "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+
+        // 3. Encode + insert the synthetic ClaimEvent log. Encoding is the
+        //    same path `add_claim_event` would take — keep it inline to keep
+        //    the bundle in one connection / one transaction.
+        let data = crate::log_synthesis::encode_claim_event_data_u64(
+            &global_index,
+            origin_network,
+            origin_address,
+            destination_address,
+            amount,
+        );
+        let topics_owned: [String; 1] = [crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()];
+        let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &bridge_address,
+                &topics,
+                &data,
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
+            ],
+        )
+        .await?;
+
+        // 4. Advance the cursor — write log THEN advance, so any reader who
+        //    sees latest >= N also sees the log at N. The same invariant
+        //    `bridge_out.rs::on_post_sync` documents at line 555.
+        txn.execute(
+            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
+            &[&(block_number as i64)],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(())
+    }
+
     // ── Faucet registry ──────────────────────────────────────────
 
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {

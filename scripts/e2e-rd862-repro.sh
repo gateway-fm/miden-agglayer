@@ -141,11 +141,17 @@ query_ger() {
 # Extract committed GERs from the agglayer container logs since $1 (ISO-8601).
 # tracing-subscriber emits `ger: HEX` (ANSI-bold label, then space + value).
 # We strip ANSI and match ger followed by `:` or `=` then optional whitespace.
+#
+# IMPORTANT: use `.*` not `[^\n]*` to match "rest of line". macOS BSD grep
+# treats `[^\n]` as "not the literal characters \ or n", so any line containing
+# an `n` (e.g. "Miden") gets truncated before reaching the `ger: HEX` tag and
+# the inner grep silently returns nothing. `.` already excludes newlines in
+# basic/extended regex, so `.*` is the portable form.
 committed_gers_since() {
     local since="$1"
     docker logs --since "$since" "$AGGLAYER_CONTAINER" 2>&1 \
         | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
-        | grep -oE '(GER injection: submitting|UpdateGerNote (submitted|created|transaction committed))[^\n]*' \
+        | grep -oE '(GER injection: submitting|UpdateGerNote (submitted|created|transaction committed)).*' \
         | grep -oE 'ger[:=][[:space:]]*[0-9a-f]{64}' \
         | sed -E 's/^ger[:=][[:space:]]*/0x/' | sort -u || true
 }
@@ -242,11 +248,19 @@ if [[ ${#ORPHANS[@]} -gt 0 ]]; then
 fi
 echo ""
 
-if [[ "$DELTA_READY" -ge "$SUBMITTED_OK" ]]; then
-    pass "All submitted deposits reached ready_for_claim — race did NOT manifest."
+ALL_READY=0
+[[ "$DELTA_READY" -ge "$SUBMITTED_OK" ]] && ALL_READY=1
+
+if [[ "$ALL_READY" -eq 1 && ${#ORPHANS[@]} -eq 0 ]]; then
+    pass "All deposits ready_for_claim AND zero orphan GERs — race did NOT manifest."
     exit 0
 else
-    STUCK=$((SUBMITTED_OK - DELTA_READY))
-    fail "$STUCK / $SUBMITTED_OK deposits stuck — RD-862 race MANIFESTED."
+    REASONS=()
+    [[ "$ALL_READY" -ne 1 ]] && REASONS+=("$((SUBMITTED_OK - DELTA_READY))/$SUBMITTED_OK deposits stuck")
+    [[ ${#ORPHANS[@]} -gt 0 ]] && REASONS+=("${#ORPHANS[@]}/${#GERS[@]} GERs orphaned")
+    fail "RD-862 race MANIFESTED: $(IFS=', '; echo "${REASONS[*]}")"
+    # Note: deposits can reach ready_for_claim even with orphan GERs, because
+    # aggoracle injects the *latest* InfoTree leaf which subsumes earlier
+    # deposits. Orphan rate is the canonical race metric.
     exit 1
 fi

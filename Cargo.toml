@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "bridge-out-tool"
 path = "src/bin/bridge_out_tool.rs"
 
+[[bin]]
+name = "check-burn-root"
+path = "src/bin/check_burn_root.rs"
+
 [dev-dependencies]
 tempfile = "3.10"
 
@@ -78,17 +82,34 @@ url = { features = ["serde"], version = "2.5" }
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 
-# miden-base — loose caret pins. Pinning to `=0.14.4` exactly caused a runtime
-# STARK verification regression in the miden-node NTX builder; the 0.14.6
-# transitive node deps that cargo picks when left alone are what actually work
-# with miden-client @ f7cdf26 in practice (confirmed by our first e2e-l1-to-l2
-# pass). Keep the caret; rely on the git rev pin below for reproducibility.
-miden-base-agglayer = { package = "miden-agglayer", version = "0.14" }
+# miden-base — exact pin to 0.14.4 to match the miden-node binary's
+# transitive miden-assembly version (0.22.1). Different miden-assembly
+# patch versions compute DIFFERENT MAST roots for the same MASM source:
+#   miden-assembly 0.22.1 → BurnNote::script_root() = 0xdad2…
+#   miden-assembly 0.22.3 → BurnNote::script_root() = 0x2777…
+# When the two sides disagreed on the BURN root, every L2→L1 bridge-out
+# failed inside the miden-node's NTX `before_created` event handler with
+# "note script with root <X> not found in data store for public note"
+# because StandardNote::from_script_root(0x2777) returns None when the
+# node's BurnNote::script_root() is 0xdad2. Pinning miden-base to 0.14.4
+# (instead of caret-0.14) forces cargo to resolve miden-assembly 0.22.1
+# on this side too. Bump in lockstep with miden-node releases.
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.14.4" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "0.14" }
-miden-standards = { default-features = false, version = "0.14" }
-miden-tx = { default-features = false, version = "0.14" }
+], version = "=0.14.4" }
+miden-standards = { default-features = false, version = "=0.14.4" }
+miden-tx = { default-features = false, version = "=0.14.4" }
+
+# miden-assembly/core MUST be pinned to 0.22.1 to match miden-node v0.14.10's
+# transitive resolution. Empirically `BurnNote::script_root()` differs:
+#   0.22.1 → 0xdad2020d27b388008dedb2dfa1952a1be7d45c9f8b8366ca734de06a07247f9e
+#   0.22.3 → 0x277784547e6a93bbd3a6811dc3ed6bd29141011ae3066dc4319cbf10bb8ab89b
+# Without these explicit pins cargo picks the latest 0.22.x, the proxy emits
+# BURN at the 0.22.3 root, and the node's lookup misses. Bump in lockstep
+# with miden-node releases.
+miden-assembly = { default-features = false, version = "=0.22.1" }
+miden-core = { default-features = false, version = "=0.22.1" }
 
 # miden-client v0.14.7 (tagged release). Upstream backport of #2101 ships
 # `GrpcClient::with_bearer_auth(token)` — the bearer-header API we need for

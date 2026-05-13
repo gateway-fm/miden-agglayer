@@ -269,6 +269,80 @@ pub trait Store: Send + Sync + 'static {
     /// to compare against the bridge account's `let_num_leaves` storage slot.
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;
 
+    // === Claim watcher ===
+    //
+    // Tracks consumed CLAIM notes the `claim_watcher` SyncListener has already
+    // turned into a synthetic ClaimEvent. Separate from the B2AGG idempotency
+    // tracker (`*_note_processed` above) so CLAIM observations cannot bump the
+    // `deposit_counter` sequence that aggsender reads for bridge-outs.
+    //
+    // The watcher itself lives in `src/claim_watcher.rs`; the use case is
+    // crash-recovery (proxy submitted a CLAIM but died before writing the log)
+    // and foreign CLAIMs (operator-issued via another miden-client).
+
+    /// Has the watcher already processed this CLAIM note?
+    async fn is_claim_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
+    /// Mark the CLAIM note as processed, recording the global_index it carried
+    /// and the synthetic block number the ClaimEvent landed at.
+    async fn mark_claim_note_processed(
+        &self,
+        note_id: String,
+        global_index: [u8; 32],
+        block_number: u64,
+    ) -> anyhow::Result<()>;
+    /// Has a ClaimEvent already been written for this L1 leaf (`global_index`)?
+    /// Both the normal `eth_sendRawTransaction` path and the watcher path
+    /// write ClaimEvent logs; this guards against double-emission when the
+    /// watcher observes a CLAIM whose corresponding ClaimEvent was already
+    /// recorded via the normal path.
+    async fn has_claim_event_for_global_index(
+        &self,
+        global_index: &[u8; 32],
+    ) -> anyhow::Result<bool>;
+
+    /// Atomic commit for a watcher-synthesised ClaimEvent. Combines:
+    ///   1. `mark_claim_note_processed`
+    ///   2. `add_claim_event` (synthetic log emission)
+    ///   3. `set_latest_block_number` (cursor advance)
+    ///
+    /// PgStore overrides with a single SERIALIZABLE postgres txn; the default
+    /// impl below chains the three primitives sequentially, which is fine for
+    /// `InMemoryStore` where every primitive is an in-process lock. The
+    /// race-safe ordering (log THEN cursor) is the same invariant
+    /// `commit_b2agg_event_atomic` and `commit_ger_event_atomic` enforce — see
+    /// the canonical comment at `src/bridge_out.rs::on_post_sync`.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_manual_claim_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_index: [u8; 32],
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_address: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<()> {
+        self.mark_claim_note_processed(note_id, global_index, block_number)
+            .await?;
+        self.add_claim_event(
+            bridge_address,
+            block_number,
+            block_hash,
+            tx_hash,
+            &global_index,
+            origin_network,
+            origin_address,
+            destination_address,
+            amount,
+        )
+        .await?;
+        self.set_latest_block_number(block_number).await?;
+        Ok(())
+    }
+
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()>;

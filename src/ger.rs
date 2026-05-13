@@ -105,8 +105,17 @@ pub async fn insert_ger(
     block_state: &Arc<crate::block_state::BlockState>,
     txn_hash: TxHash,
 ) -> anyhow::Result<GerInsertResult> {
-    // Check dedup before doing any work
-    let is_new = !store.has_seen_ger(&ger_bytes).await?;
+    // Check dedup before doing any work.
+    //
+    // Use `is_ger_injected` (not `has_seen_ger`) because the L1InfoTreeIndexer
+    // pre-creates ger_entries rows for every L1 InfoTree pair as it observes
+    // them, even before the corresponding Miden inject happens. With
+    // `has_seen_ger` we'd skip the actual Miden tx submission as a "duplicate"
+    // and the synthetic L2 event would never be emitted, leaving deposits
+    // stuck `ready_for_claim=false`. Gating on `is_injected = TRUE` correctly
+    // reflects "have we already submitted the Miden tx and committed the
+    // synthetic event for this GER?".
+    let is_new = !store.is_ger_injected(&ger_bytes).await?;
 
     let mut block_number = 0u64; // assigned by store.advance_block_number() after Miden commit
 
