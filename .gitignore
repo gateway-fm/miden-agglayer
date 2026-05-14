@@ -21,3 +21,16 @@ fixtures/l1-transactions.json
 fixtures/l1-raw-txs.txt
 fixtures/.env
 .miden-agglayer-data/
+
+# Local working notes / scratchpads
+BRIDGING_TESTNET.md
+CANTINA_FIXES.md
+CANTINA_REPORT.md
+LOCAL_FIXES.md
+SECURITY_REVIEW_PLAN.md
+
+# Local docker-compose overrides (e.g. LXC apparmor workaround)
+docker-compose.override.yml
+
+# Per-host run evidence (reference baselines are *.json)
+tests/baselines/*.log
