@@ -117,23 +117,46 @@ impl L1InfoTreeIndexer {
                 "L1InfoTreeIndexer starting"
             );
 
-            // Start at L1 head — we don't backfill historic events. The race
-            // we're closing only matters for GERs injected from now on; older
-            // injections in the store either already have roots populated
-            // (resolved at the time) or are already orphaned and not
-            // recoverable cheaply. Backfill is a separate concern.
-            let mut last_processed: u64 = match provider.get_block_number().await {
+            // Resume from the persisted cursor if we have one, else start at
+            // current L1 head. The persisted cursor closes the gap that
+            // stranded GERs every time the proxy restarted (OOMKills,
+            // planned deploys): historic `UpdateL1InfoTree` events emitted
+            // during downtime are now indexed on the next boot and the
+            // orphan ger_entries rows from that window get their (M, R)
+            // filled in by the indexer's `set_ger_exit_roots` UPSERT.
+            //
+            // Fresh deployments (cursor = 0) start at head — same behaviour
+            // as before persistence. Pre-existing deployments inherit a 0
+            // cursor on first boot after the migration; treat 0 as "no
+            // cursor recorded yet" and fall back to head to avoid a
+            // multi-million-block backfill on the first boot.
+            let head = provider.get_block_number().await.unwrap_or_else(|e| {
+                tracing::error!(error = %e, "L1InfoTreeIndexer: failed to fetch initial L1 block; starting at 0");
+                0
+            });
+            let stored = match self.store.get_l1_indexer_cursor().await {
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(
                         error = %e,
-                        "L1InfoTreeIndexer: failed to fetch initial L1 block, starting at 0"
+                        "L1InfoTreeIndexer: failed to load persisted cursor; falling back to L1 head"
                     );
                     0
                 }
             };
+            let mut last_processed: u64 = if stored == 0 {
+                head
+            } else {
+                // Re-process a small reorg window so we don't miss reorg'd
+                // events. Sepolia 64 blocks ≈ 12 minutes, well inside what
+                // `get_logs` can chunk through quickly via max_range.
+                const REORG_MARGIN: u64 = 64;
+                stored.saturating_sub(REORG_MARGIN)
+            };
             tracing::info!(
                 start_block = last_processed,
+                stored_cursor = stored,
+                l1_head = head,
                 "L1InfoTreeIndexer cursor initialized"
             );
 
@@ -228,6 +251,20 @@ impl L1InfoTreeIndexer {
         metrics::counter!("l1_info_tree_indexer_pairs_indexed_total").increment(indexed as u64);
 
         *last_processed = to;
+
+        // Persist the cursor so a restart resumes from here instead of
+        // jumping back to L1 head. Failure to persist is logged but does
+        // not abort the loop — we'd rather keep indexing on a transient
+        // DB blip than wedge the service.
+        if let Err(e) = self.store.set_l1_indexer_cursor(to).await {
+            tracing::warn!(
+                error = %e,
+                cursor = to,
+                "L1InfoTreeIndexer: failed to persist cursor; continuing in-memory"
+            );
+            metrics::counter!("l1_info_tree_indexer_cursor_persist_errors_total").increment(1);
+        }
+
         Ok(())
     }
 
