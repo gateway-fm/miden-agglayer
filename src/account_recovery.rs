@@ -241,9 +241,8 @@ mod tests {
     #[test]
     fn typed_downcast_catches_incorrect_initial_commitment() {
         use miden_client::rpc::{GrpcError, RpcEndpoint};
-        let endpoint_err = EndpointError::AddTransaction(
-            AddTransactionError::IncorrectAccountInitialCommitment,
-        );
+        let endpoint_err =
+            EndpointError::AddTransaction(AddTransactionError::IncorrectAccountInitialCommitment);
         let rpc_err = RpcError::RequestError {
             endpoint: RpcEndpoint::SubmitProvenTx,
             error_kind: GrpcError::InvalidArgument,

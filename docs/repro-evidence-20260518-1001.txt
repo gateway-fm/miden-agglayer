@@ -1,0 +1,88 @@
+
+[10:00:41] Part A — reproduce the bali bug locally
+[10:00:41] A1. Stopping aggkit so deposits stack up without GER updates from aggoracle
+ Container miden-agglayer-aggkit-1 Stopping 
+ Container miden-agglayer-aggkit-1 Stopped 
+[10:00:41] A2. Reading current bridge depositCount to pick fresh slots for our 3 deposits
+[10:00:41]     current depositCount = 4
+[10:00:41]     bridgeAsset → deposit_cnt=4  (dest=0x0000000000000000000000006a0ad53900000000  amount=10000000000000 wei)
+[10:00:41]     bridgeAsset → deposit_cnt=5  (dest=0x0000000000000000000000006a0ad53900000001  amount=10000000000000 wei)
+[10:00:42]     bridgeAsset → deposit_cnt=6  (dest=0x0000000000000000000000006a0ad53900000002  amount=10000000000000 wei)
+[10:00:43] A2. Waiting up to 30s for bridge-service to index all 3 deposits
+[10:00:44] A2. Verifying all 3 deposits are STUCK (ready_for_claim=false)
+    cnt=4 blk=223 ready=false claimed=false
+    cnt=5 blk=224 ready=false claimed=false
+    cnt=6 blk=225 ready=false claimed=false
+[10:00:44] PASS: all 3 deposits in expected stuck state
+
+[10:00:44] A3. Poison a GER by submitting insertGlobalExitRoot(GARBAGE)
+[10:00:44]     GARBAGE = 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef6a0ad539
+[10:00:44]     (proxy will refetch (M, R) from L1, compute real combined, see mismatch,
+[10:00:44]      store row with NULL roots and is_injected=TRUE — this IS the bali bug)
+[10:00:55] A3. Verifying the poisoned row in agglayer_store.ger_entries
+[10:00:55]     mainnet_exit_root = <NULL>
+[10:00:55]     rollup_exit_root  = <NULL>
+[10:00:55]     is_injected       = t
+[10:00:55] PASS: BUG REPRODUCED: poisoned row has NULL roots AND is_injected=TRUE
+
+[10:00:55] A4. Verifying dedup poison: re-submitting same GARBAGE is a no-op
+[10:00:57] WARN: did not observe 'GER already seen' in proxy logs after re-submit
+[10:00:57] WARN: (may be filtered by log level; checking ger_entries.block_number stayed put instead)
+
+[10:00:57] A5. Verifying the 3 deposits are STILL stuck after the poisoned GER
+    cnt=4 ready=false (correctly still stuck)
+    cnt=5 ready=false (correctly still stuck)
+    cnt=6 ready=false (correctly still stuck)
+[10:00:57] PASS: BUG CONFIRMED: synthetic log fired but bridge-service can't resolve unmatched (M, R)
+
+[10:00:57] Part B — apply the fix via one-shot-ger-inject.sh (updateExitRoot)
+[10:00:57] B1. Running scripts/one-shot-ger-inject.sh with current L1 (M, R)
+    → Reading current (mainnet, rollup) pair from L1 GER at 0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674...
+       mainnet     0x1d394d7a0cc1b01abbf18113b7a1f4605c40925b2c67a913f448f8cf626762a5
+       rollup      0x0000000000000000000000000000000000000000000000000000000000000000
+       combined    0xbc800748b996e9f387458bd97395fd54d649ce7cf1807531c4c65bc0e819e7e3  (informational; not sent)
+    → Proxy state:
+       signer   0xE34aaF64b29273B7D567FCFc40544c014EEe9970
+       nonce    0x5 (= 5)
+       chainId  0x2 (= 2)
+    → Submitting updateExitRoot(rollup=0x0000000000000000000000000000000000000000000000000000000000000000, mainnet=0x1d394d7a0cc1b01abbf18113b7a1f4605c40925b2c67a913f448f8cf626762a5) to 0xa40D5f56745a118D0906a34E69aeC8C0Db1cB8fA via http://localhost:8546...
+    
+    blockHash            0x42828ed066d06b5a49dbd7a55284d84fe72570f5446c9f1b707b4770473358c8
+    blockNumber          62
+    contractAddress      
+    cumulativeGasUsed    0
+    effectiveGasPrice    0
+    from                 0x0000000000000000000000000000000000000000
+    gasUsed              0
+    logs                 []
+    logsBloom            0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+    root                 
+    status               1 (success)
+    transactionHash      0x552e9a545a7d5755d59855201ef621bfcbf0a40a4937440ad48d636b21be8b6c
+    transactionIndex     0
+    type                 2
+    blobGasPrice         
+    blobGasUsed          
+    → Done. bridge-service should flip ready_for_claim for all pending deposits within ~2-3s (its L2 SyncInterval).
+       If 'GER already seen, skipping duplicate' appears in proxy logs, this exact (M, R) pair was
+       previously injected (likely from a poisoned insertGlobalExitRoot run). Wait ~30s for Sepolia
+       to advance its exit roots, then re-run — the new pair will produce a fresh combined hash.
+[10:01:05]     real mainnet  = 0x1d394d7a0cc1b01abbf18113b7a1f4605c40925b2c67a913f448f8cf626762a5
+[10:01:05]     real rollup   = 0x0000000000000000000000000000000000000000000000000000000000000000
+[10:01:05]     real combined = 0xbc800748b996e9f387458bd97395fd54d649ce7cf1807531c4c65bc0e819e7e3
+
+[10:01:05] B2. Verifying ger_entries row for the freshly-injected GER
+[10:01:07]     mainnet_exit_root = 0x1d394d7a0cc1b01abbf18113b7a1f4605c40925b2c67a913f448f8cf626762a5
+[10:01:07]     rollup_exit_root  = 0x0000000000000000000000000000000000000000000000000000000000000000
+[10:01:07]     is_injected       = t
+[10:01:07] PASS: FIX VERIFIED at proxy level: (M, R) stored from call params, no race
+
+[10:01:07] B3. Verifying all 3 deposits flipped to ready_for_claim=TRUE
+    cnt=4 blk=223 ready=true claimed=false
+    cnt=5 blk=224 ready=true claimed=false
+    cnt=6 blk=225 ready=true claimed=false
+[10:01:07] PASS: FIX VERIFIED end-to-end: all 3 deposits now ready_for_claim
+
+[10:01:07] Done. Backlog cleared via updateExitRoot — same shape as bali recovery.
+[10:01:07] NOTE: aggkit is still stopped — restart it with:
+[10:01:07]     docker compose -f docker-compose.e2e.yml --env-file fixtures/.env start aggkit

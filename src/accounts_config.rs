@@ -182,9 +182,8 @@ fn write_config_atomic(config_path: &std::path::Path, config_toml: &str) -> anyh
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return Err(e).with_context(|| {
-                format!("failed to clear stale temp file {}", tmp.display())
-            });
+            return Err(e)
+                .with_context(|| format!("failed to clear stale temp file {}", tmp.display()));
         }
     }
 
@@ -197,7 +196,12 @@ fn write_config_atomic(config_path: &std::path::Path, config_toml: &str) -> anyh
     let file = fs::OpenOptions::new()
         .write(true)
         .open(&tmp)
-        .with_context(|| format!("failed to reopen temp config file {} for fsync", tmp.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to reopen temp config file {} for fsync",
+                tmp.display()
+            )
+        })?;
     file.sync_all()
         .with_context(|| format!("failed to fsync temp config file {}", tmp.display()))?;
     drop(file);
@@ -347,7 +351,12 @@ mod tests {
     #[test]
     fn load_rejects_truncated_file_then_atomic_save_heals_it() {
         let dir = tempdir().unwrap();
-        save_config(full_cfg(), &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
+        save_config(
+            full_cfg(),
+            &NetworkId::Testnet,
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
 
         let path = dir.path().join("bridge_accounts.toml");
         let body = fs::read_to_string(&path).unwrap();
@@ -365,7 +374,12 @@ mod tests {
 
         // Re-save via the atomic path and confirm it loads cleanly with all
         // optional fields intact (i.e. not silently defaulted to None).
-        save_config(full_cfg(), &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
+        save_config(
+            full_cfg(),
+            &NetworkId::Testnet,
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
         let healed = load_config(Some(dir.path().to_path_buf())).unwrap();
         assert!(
             healed.ger_manager.is_some(),
@@ -383,10 +397,19 @@ mod tests {
     fn atomic_save_overwrites_stale_tmp_file_from_prior_crash() {
         let dir = tempdir().unwrap();
         let stale_tmp = dir.path().join("bridge_accounts.toml.new");
-        fs::write(&stale_tmp, b"this is garbage left over from a crashed run\n").unwrap();
+        fs::write(
+            &stale_tmp,
+            b"this is garbage left over from a crashed run\n",
+        )
+        .unwrap();
         assert!(stale_tmp.exists());
 
-        save_config(full_cfg(), &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
+        save_config(
+            full_cfg(),
+            &NetworkId::Testnet,
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
 
         // Temp file must be gone (consumed by the rename) and the real config
         // must load successfully.

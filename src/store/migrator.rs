@@ -103,7 +103,10 @@ async fn run_migrations_with_client(client: &Client) -> Result<MigrationReport> 
     // Take the advisory lock; held for the rest of this connection's
     // lifetime (released on drop).
     client
-        .execute(&format!("SELECT pg_advisory_lock({ADVISORY_LOCK_KEY})"), &[])
+        .execute(
+            &format!("SELECT pg_advisory_lock({ADVISORY_LOCK_KEY})"),
+            &[],
+        )
         .await
         .context("acquiring advisory lock")?;
 
@@ -156,7 +159,10 @@ async fn run_migrations_with_client(client: &Client) -> Result<MigrationReport> 
     // Release the advisory lock explicitly (it'd release on disconnect
     // anyway, but being explicit makes the intent obvious).
     client
-        .execute(&format!("SELECT pg_advisory_unlock({ADVISORY_LOCK_KEY})"), &[])
+        .execute(
+            &format!("SELECT pg_advisory_unlock({ADVISORY_LOCK_KEY})"),
+            &[],
+        )
         .await
         .context("releasing advisory lock")?;
 
@@ -228,12 +234,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn live_run_migrations_is_idempotent() {
-        let db_url = std::env::var("DATABASE_URL")
-            .expect("set DATABASE_URL to run this test");
+        let db_url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to run this test");
         let r1 = run_migrations(&db_url).await.expect("first run");
         let r2 = run_migrations(&db_url).await.expect("second run");
         // Second run must apply nothing.
-        assert!(r2.applied.is_empty(), "second run applied: {:?}", r2.applied);
+        assert!(
+            r2.applied.is_empty(),
+            "second run applied: {:?}",
+            r2.applied
+        );
         assert_eq!(
             r2.already_present.len(),
             MIGRATIONS.len(),
