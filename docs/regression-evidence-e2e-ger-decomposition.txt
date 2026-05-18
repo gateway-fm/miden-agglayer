@@ -1,0 +1,50 @@
+[0;32m[20:14:17][0m ======================================================================
+[0;32m[20:14:17][0m   GER Decomposition Bug — E2E Regression Test
+[0;32m[20:14:17][0m   See: docs/ger-decomposition.md
+[0;32m[20:14:17][0m ======================================================================
+
+[0;36m[20:14:17] STEP:[0m Test 1: Verify normal GER with resolved roots returns exit root data
+[0;32m[20:14:17][0m Waiting for aggoracle to inject at least one GER...
+
+[0;32m[20:14:17][0m   Found 3 GER(s) in store
+[0;32m[20:14:17][0m   Testing resolved GER: 0x133e6a88627cda3e7df19f63db3be8dbaa691e860ee1ccec52eeaf54be5381cd
+[0;32m[20:14:17] PASS:[0m Resolved GER returns exit roots: mainnet=0x87b3e82db67d821f... rollup=0x0000000000000000... block=0x1b
+
+[0;36m[20:14:17] STEP:[0m Test 2: GER with unresolved roots (the L1 race condition)
+[0;32m[20:14:17][0m 
+[0;32m[20:14:17][0m   Scenario: insertGlobalExitRoot(GER) arrived, but L1 had already
+[0;32m[20:14:17][0m   advanced to a newer root pair. fetch_exit_roots() didn't match.
+[0;32m[20:14:17][0m   The GER is in our store but mainnet/rollup roots are NULL.
+[0;32m[20:14:17][0m 
+[0;32m[20:14:17][0m   BUG (before fix): returns {mainnetExitRoot: 0x000..., rollupExitRoot: 0x000...}
+[0;32m[20:14:17][0m     → bridge-service stores zero roots permanently via ON CONFLICT DO NOTHING
+[0;32m[20:14:17][0m     → claims against this GER fail forever (Merkle root mismatch)
+[0;32m[20:14:17][0m 
+[0;32m[20:14:17][0m   FIX: returns null
+[0;32m[20:14:17][0m     → bridge-service treats null as 'retry later', does not poison its DB
+[0;32m[20:14:17][0m 
+INSERT 0 1
+[0;32m[20:14:17][0m   Inserted fake GER with NULL roots: 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+[0;32m[20:14:17][0m   zkevm_getExitRootsByGER response: null
+[0;32m[20:14:17] PASS:[0m Unresolved GER returns null — bridge-service will retry, no DB poisoning
+DELETE 1
+
+[0;36m[20:14:17] STEP:[0m Test 3: Completely unknown GER returns null
+[0;32m[20:14:17] PASS:[0m Unknown GER returns null
+
+[0;36m[20:14:17] STEP:[0m Test 4: Partially resolved GER (one root missing) returns null
+INSERT 0 1
+[0;32m[20:14:17] PASS:[0m Partially resolved GER returns null — both roots required
+DELETE 1
+
+[0;32m[20:14:17][0m ======================================================================
+[0;32m[20:14:17][0m   GER DECOMPOSITION TEST COMPLETE
+[0;32m[20:14:17][0m 
+[0;32m[20:14:17][0m   Test 1: Resolved GER returns real roots          ✓
+[0;32m[20:14:17][0m   Test 2: Unresolved GER returns null (not zeros)  ✓  ← the fix
+[0;32m[20:14:17][0m   Test 3: Unknown GER returns null                  ✓
+[0;32m[20:14:17][0m   Test 4: Partially resolved GER returns null       ✓
+[0;32m[20:14:17][0m 
+[0;32m[20:14:17][0m   The bridge-service will retry on null instead of
+[0;32m[20:14:17][0m   permanently storing fabricated zero roots.
+[0;32m[20:14:17][0m ======================================================================

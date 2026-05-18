@@ -1,0 +1,74 @@
+[0;32m[20:17:40][0m ======================================================================
+[0;32m[20:17:40][0m   Security E2E Test Suite
+[0;32m[20:17:40][0m ======================================================================
+
+[0;36m[20:17:40] STEP:[0m Section 1: Malformed Input Fuzzing
+[0;32m[20:17:40] PASS:[0m 1.1 Empty POST body returns error
+[0;32m[20:17:40] PASS:[0m 1.2 Missing 'method' field returns error
+[0;32m[20:17:40] PASS:[0m 1.3 params:null on eth_blockNumber succeeds
+[0;32m[20:17:40] PASS:[0m 1.4 Truncated JSON returns error (no crash)
+[0;32m[20:17:40] PASS:[0m 1.5 Extra closing brackets: server responded (no crash)
+[0;32m[20:17:40] PASS:[0m 1.6 1MB payload: timed out gracefully (no OOM)
+[0;32m[20:17:40] PASS:[0m 1.7 Null bytes in method name: method not found or error
+[0;32m[20:17:40] PASS:[0m 1.8 Overflow block number: error or null
+
+[0;36m[20:17:40] STEP:[0m Section 2: RPC Method Boundary Testing
+[0;32m[20:17:40] PASS:[0m 2.1 Unknown method returns -32601
+[0;32m[20:17:40] PASS:[0m 2.2 Uppercase method returns -32601
+[0;32m[20:17:40] PASS:[0m 2.3 Batch request returns error (single-object parser)
+[0;32m[20:17:40] PASS:[0m 2.4 String ID 'abc' echoed back
+[0;32m[20:17:40] PASS:[0m 2.5 Null ID echoed back as null
+
+[0;36m[20:17:40] STEP:[0m Section 3: eth_sendRawTransaction Security
+[0;32m[20:17:40] PASS:[0m 3.1 Invalid hex '0xZZZZ' returns error
+[0;32m[20:17:40] PASS:[0m 3.2 Valid hex / invalid RLP returns error
+[0;32m[20:17:40] PASS:[0m 3.3 Empty calldata returns error
+[0;32m[20:17:40] PASS:[0m 3.4 Wrong chain_id returns error
+[0;32m[20:17:40] PASS:[0m 3.5 Truncated claimAsset calldata returns error
+
+[0;36m[20:17:40] STEP:[0m Section 4: GER Manipulation
+INSERT 0 1
+INSERT 0 0
+[0;32m[20:17:40] PASS:[0m 4.1 Duplicate GER insert: idempotent, no crash
+[0;32m[20:17:40] PASS:[0m 4.2 All-zero GER hash: null result (no crash)
+[0;32m[20:17:40] PASS:[0m 4.3 Wrong-length GER hash: error or null (no crash)
+
+[0;36m[20:17:40] STEP:[0m Section 5: eth_getLogs Abuse
+[0;32m[20:17:40] PASS:[0m 5.1 Huge block range: server responded
+[0;32m[20:17:40] PASS:[0m 5.2 Inverted block range: valid response
+[0;32m[20:17:40] PASS:[0m 5.3 Invalid topic strings: valid response (no crash)
+[0;32m[20:17:40] PASS:[0m 5.4 Non-existent address filter: returns empty array
+
+[0;36m[20:17:40] STEP:[0m Section 6: Block Number Edge Cases
+[0;32m[20:17:40] PASS:[0m 6.1 'earliest' tag: valid response
+[0;32m[20:17:40] PASS:[0m 6.2 Far future block: returns null
+[0;32m[20:17:40] PASS:[0m 6.3 Invalid tag 'newest': returns 'bad block number' error
+[0;32m[20:17:40] PASS:[0m 6.4 Empty string block tag: valid response (no crash)
+[0;32m[20:17:41] PASS:[0m 6.5 All 5 standard tags return valid responses
+
+[0;36m[20:17:41] STEP:[0m Section 7: Transaction Receipt Probing
+[0;32m[20:17:41] PASS:[0m 7.1 Random non-existent hash: returns null
+[0;32m[20:17:41] PASS:[0m 7.2 Zero hash: returns null
+[0;32m[20:17:41] PASS:[0m 7.3 Wrong-length hash: returns error
+
+[0;36m[20:17:41] STEP:[0m Section 8: Timing/State Consistency
+[0;32m[20:17:41] PASS:[0m 8.1 10 concurrent eth_blockNumber: all returned valid responses
+[0;32m[20:17:41] PASS:[0m 8.2 Nonce stability: two reads return same value (0x0)
+[0;32m[20:17:41] PASS:[0m 8.3 Block number monotonicity: 153 <= 153
+
+[0;36m[20:17:41] STEP:[0m Section 9: Error Information Leakage
+[0;32m[20:17:41] PASS:[0m 9.1 No stack traces, panics, or .rs: paths in error responses
+[0;32m[20:17:41] PASS:[0m 9.2 No sensitive keywords in error responses
+
+[0;36m[20:17:41] STEP:[0m Section 10: Health/Metrics Endpoint Security
+[0;32m[20:17:41] PASS:[0m 10.1 GET /health returns {"status":"ok"}
+[0;32m[20:17:41] PASS:[0m 10.2 /metrics contains no sensitive data
+[0;32m[20:17:41] PASS:[0m 10.3 Expected metrics counters present
+
+[0;32m[20:17:41][0m ======================================================================
+[0;32m[20:17:41][0m   SECURITY E2E TEST SUITE COMPLETE
+[0;32m[20:17:41][0m 
+[0;32m[20:17:41][0m   Passed: 41 / 41
+[0;32m[20:17:41][0m   Failed: 0 / 41
+[0;32m[20:17:41][0m ======================================================================
+DELETE 1

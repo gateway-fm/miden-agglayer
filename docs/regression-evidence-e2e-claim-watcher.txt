@@ -1,0 +1,8 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+[0;32m[20:12:53][0m Waiting 15s for at least one Miden sync tick so the watcher can observe consumed CLAIMs...
+[0;32m[20:13:08][0m Sampling /metrics from http://localhost:8546 ...
+[0;32m[20:13:08][0m   claim_watcher_already_recorded_total = 1
+[0;32m[20:13:08][0m   claim_watcher_synthesised_total      = 0
+[0;32m[20:13:08][0m   claim_watcher_storage_decode_total   = 0
+[0;32m[20:13:08][0m   claim_watcher_unrecoverable_total    = 0
+[0;32m[20:13:08][0m claim_watcher smoke OK.

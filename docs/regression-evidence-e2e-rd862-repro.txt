@@ -1,0 +1,87 @@
+[0;32m[20:14:23][0m ════════════════════════════════════════════════════════════════════
+[0;32m[20:14:23][0m   RD-862 rapid-deposit GER-injection race repro
+[0;32m[20:14:23][0m ════════════════════════════════════════════════════════════════════
+[0;32m[20:14:23][0m   N_DEPOSITS=10  INTER_DELAY_MS=0
+[0;32m[20:14:23][0m   POLL_TIMEOUT=180s  DEPOSIT_WEI=10000000000
+[0;32m[20:14:23][0m   DEST_ADDR=0x00000000d3a89187743c53101e432571ed475300
+
+[0;32m[20:14:23][0m Baseline: 1 deposits seen, 1 ready_for_claim
+[0;36m[20:14:23] RD-862:[0m Firing 10 deposits back-to-back...
+[0;32m[20:14:33] PASS:[0m Submitted: 10 / 10 L1 bridgeAsset txs
+[0;36m[20:14:33] RD-862:[0m Polling bridge-service (timeout 180s, interval 3s)...
+[0;32m[20:14:33][0m   t+0s  seen=9/11  ready=1/11
+[0;32m[20:14:36][0m   t+3s  seen=11/11  ready=1/11
+[0;32m[20:14:39][0m   t+6s  seen=11/11  ready=1/11
+[0;32m[20:14:42][0m   t+9s  seen=11/11  ready=1/11
+[0;32m[20:14:45][0m   t+12s  seen=11/11  ready=1/11
+[0;32m[20:14:48][0m   t+15s  seen=11/11  ready=1/11
+[0;32m[20:14:51][0m   t+18s  seen=11/11  ready=1/11
+[0;32m[20:14:54][0m   t+21s  seen=11/11  ready=1/11
+[0;32m[20:14:57][0m   t+24s  seen=11/11  ready=1/11
+[0;32m[20:15:00][0m   t+27s  seen=11/11  ready=1/11
+[0;32m[20:15:03][0m   t+30s  seen=11/11  ready=1/11
+[0;32m[20:15:06][0m   t+33s  seen=11/11  ready=1/11
+[0;32m[20:15:09][0m   t+36s  seen=11/11  ready=1/11
+[0;32m[20:15:12][0m   t+39s  seen=11/11  ready=1/11
+[0;32m[20:15:15][0m   t+42s  seen=11/11  ready=1/11
+[0;32m[20:15:18][0m   t+45s  seen=11/11  ready=1/11
+[0;32m[20:15:21][0m   t+48s  seen=11/11  ready=1/11
+[0;32m[20:15:24][0m   t+51s  seen=11/11  ready=1/11
+[0;32m[20:15:27][0m   t+54s  seen=11/11  ready=1/11
+[0;32m[20:15:30][0m   t+57s  seen=11/11  ready=1/11
+[0;32m[20:15:33][0m   t+60s  seen=11/11  ready=1/11
+[0;32m[20:15:36][0m   t+63s  seen=11/11  ready=1/11
+[0;32m[20:15:39][0m   t+66s  seen=11/11  ready=1/11
+[0;32m[20:15:42][0m   t+69s  seen=11/11  ready=1/11
+[0;32m[20:15:45][0m   t+72s  seen=11/11  ready=1/11
+[0;32m[20:15:48][0m   t+75s  seen=11/11  ready=1/11
+[0;32m[20:15:51][0m   t+78s  seen=11/11  ready=1/11
+[0;32m[20:15:54][0m   t+81s  seen=11/11  ready=1/11
+[0;32m[20:15:57][0m   t+84s  seen=11/11  ready=1/11
+[0;32m[20:16:00][0m   t+87s  seen=11/11  ready=1/11
+[0;32m[20:16:03][0m   t+90s  seen=11/11  ready=1/11
+[0;32m[20:16:06][0m   t+93s  seen=11/11  ready=1/11
+[0;32m[20:16:09][0m   t+96s  seen=11/11  ready=1/11
+[0;32m[20:16:12][0m   t+99s  seen=11/11  ready=1/11
+[0;32m[20:16:15][0m   t+102s  seen=11/11  ready=1/11
+[0;32m[20:16:18][0m   t+105s  seen=11/11  ready=1/11
+[0;32m[20:16:21][0m   t+108s  seen=11/11  ready=1/11
+[0;32m[20:16:24][0m   t+111s  seen=11/11  ready=1/11
+[0;32m[20:16:27][0m   t+114s  seen=11/11  ready=1/11
+[0;32m[20:16:30][0m   t+117s  seen=11/11  ready=1/11
+[0;32m[20:16:33][0m   t+120s  seen=11/11  ready=1/11
+[0;32m[20:16:36][0m   t+123s  seen=11/11  ready=1/11
+[0;32m[20:16:39][0m   t+126s  seen=11/11  ready=1/11
+[0;32m[20:16:42][0m   t+129s  seen=11/11  ready=1/11
+[0;32m[20:16:45][0m   t+132s  seen=11/11  ready=1/11
+[0;32m[20:16:48][0m   t+135s  seen=11/11  ready=1/11
+[0;32m[20:16:51][0m   t+138s  seen=11/11  ready=1/11
+[0;32m[20:16:54][0m   t+141s  seen=11/11  ready=1/11
+[0;32m[20:16:57][0m   t+144s  seen=11/11  ready=1/11
+[0;32m[20:17:00][0m   t+147s  seen=11/11  ready=1/11
+[0;32m[20:17:03][0m   t+150s  seen=11/11  ready=1/11
+[0;32m[20:17:06][0m   t+153s  seen=11/11  ready=1/11
+[0;32m[20:17:09][0m   t+156s  seen=11/11  ready=1/11
+[0;32m[20:17:12][0m   t+159s  seen=11/11  ready=1/11
+[0;32m[20:17:15][0m   t+162s  seen=11/11  ready=1/11
+[0;32m[20:17:18][0m   t+165s  seen=11/11  ready=1/11
+[0;32m[20:17:21][0m   t+168s  seen=11/11  ready=1/11
+[0;32m[20:17:24][0m   t+171s  seen=11/11  ready=1/11
+[0;32m[20:17:27][0m   t+174s  seen=11/11  ready=1/11
+[0;32m[20:17:30][0m   t+177s  seen=11/11  ready=1/11
+
+[0;36m[20:17:33] RD-862:[0m Enumerating GERs committed by the proxy since 2026-05-18T20:14:23Z...
+
+[0;32m[20:17:33][0m ════════════════════════════════════════════════════════════════════
+[0;32m[20:17:33][0m   RD-862 Repro Report
+[0;32m[20:17:33][0m ════════════════════════════════════════════════════════════════════
+[0;32m[20:17:33][0m   Deposits submitted:            10 / 10
+[0;32m[20:17:33][0m   Deposits seen by bridge-svc:   10  (Δ over baseline)
+[0;32m[20:17:33][0m   Deposits ready_for_claim:      0 / 10
+[0;32m[20:17:33][0m   Conversion rate:               0.0%
+[0;32m[20:17:33][0m   GERs committed by proxy:       3
+[0;32m[20:17:33][0m   GERs resolved (both roots):    3
+[0;32m[20:17:33][0m   GERs orphaned (roots = null):  0
+
+[0;33m[20:17:33] WARN:[0m conversion rate < 100% (10/10 deposits not yet ready_for_claim) — informational, not a fail. aggoracle cadence is the bottleneck under burst load. Bump POLL_TIMEOUT or reduce N_DEPOSITS to drive conversion to 100% for perf-tracking runs.
+[0;32m[20:17:33] PASS:[0m Zero orphan GERs — RD-862 race did NOT manifest (canonical metric).

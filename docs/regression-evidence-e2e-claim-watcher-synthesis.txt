@@ -1,0 +1,25 @@
+[0;36m[20:13:37] STEP:[0m Snapshotting baseline /metrics + DB state
+[0;32m[20:13:37][0m   baseline /metrics: synthesised=0 already=1 decode_err=0 unrecov=0
+[0;32m[20:13:37][0m   baseline synthesised log lines: 0
+[0;36m[20:13:37] STEP:[0m Locating ClaimEvent row in synthetic_logs
+[0;32m[20:13:37][0m   global_index = 0x0000000000000000000000000000000000000000000000010000000000000001
+[0;36m[20:13:37] STEP:[0m Locating claim_watcher_processed row for this global_index
+[0;32m[20:13:37][0m   note_id = 0x3ada7d9790f6e651e75fd45efebc0b7cbf67baf19cb6af01bbd6f8f3b2efd473
+[0;36m[20:13:37] STEP:[0m Deleting synthetic_logs ClaimEvent row to simulate crash-recovery desync
+[0;32m[20:13:37][0m   deleted synthetic_logs rows: 2
+[0;36m[20:13:37] STEP:[0m Deleting claim_watcher_processed row so the watcher re-evaluates this CLAIM
+[0;32m[20:13:37][0m   deleted claim_watcher_processed rows: 2
+[0;32m[20:13:37][0m   has_claim_event_for_global_index simulated → false ✓
+[0;36m[20:13:37] STEP:[0m Waiting 20s for watcher's on_post_sync to scan consumed notes and synthesise
+[0;36m[20:13:57] STEP:[0m Sampling /metrics + DB + proxy logs after synthesis window
+[0;32m[20:13:57][0m   after    /metrics: synthesised=1 already=1 decode_err=0 unrecov=0
+[0;32m[20:13:57][0m   after    synthesised log lines: 1 (was 0)
+[0;32m[20:13:57][0m ════════════════════════════════════════════════════════════════════
+[0;32m[20:13:57][0m   claim_watcher SYNTHESIS-PATH PASS
+[0;32m[20:13:57][0m     Δsynthesised_log     = 1
+[0;32m[20:13:57][0m     Δsynthesised_metric  = 1  (known broken — see warning)
+[0;32m[20:13:57][0m     Δdecode_errors       = 0
+[0;32m[20:13:57][0m     Δunrecoverable       = 0
+[0;32m[20:13:57][0m     fresh watcher rows   = 1
+[0;32m[20:13:57][0m     ClaimEvent for 0x0000000000000000... recovered via watcher
+[0;32m[20:13:57][0m ════════════════════════════════════════════════════════════════════
