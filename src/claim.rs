@@ -521,14 +521,44 @@ async fn publish_claim_internal(
     })
 }
 
-/// Publish a claim using a fresh miden-client instance (Igor's approach).
+/// Publish a claim through the long-lived `MidenClient` event loop.
 ///
-/// Creates a new client per call to avoid stale account state from the
-/// long-lived MidenClient's background sync loop. After faucet creation
-/// or prior CLAIMs, the service account's state drifts in the long-lived
-/// client, causing `IncorrectAccountInitialCommitment` errors. Recording
-/// of the ClaimEvent happens before the result is sent back so the event
-/// is in the store even if the HTTP caller disconnects.
+/// All Miden submissions — claim publishes and aggoracle `insert_ger` pushes
+/// alike — funnel through `MidenClient::with(...)`, which serialises every
+/// request through a `mpsc::channel::<Request>(1)` (see `miden_client.rs:126`).
+/// That FIFO serialisation is what makes this design correct on bali:
+///
+///   - **No concurrent submissions for the same account.** The Miden node
+///     rejects a second tx that builds atop the same `init_commitment` as a
+///     pending mempool tx with `AddTransactionError::IncorrectAccountInitialCommitment`
+///     (`code: 'Client specified an invalid argument', message: "transaction
+///     conflicts with current mempool state"`). The bali production incident
+///     fired this 189 times over 2026-05-11 → 2026-05-14 because the previous
+///     fresh-per-call code path raced aggoracle's `insert_ger` against
+///     claim publishes on the same `bridge`/`service` account. The channel-of-1
+///     makes that race structurally impossible.
+///
+///   - **Single in-memory account cache.** Building a fresh `Client` against
+///     the same `store.sqlite3` produced a divergent in-memory commitment
+///     cache between the two clients (the long-lived one's cache stayed at
+///     the pre-claim commitment until its next `sync_state()` tick, ~5s
+///     later). Routing through the long-lived client eliminates the second
+///     cache entirely.
+///
+///   - **TOCTOU safety for first-bridge faucet creation** (Cantina #1
+///     colliding-network refusal, `e6a33ae`) and any future per-resource
+///     check inside `publish_claim_internal` rely on the surrounding
+///     `with()` mutex, as documented at `find_or_create_faucet`.
+///
+/// Recording of the `ClaimEvent` happens inside the same closure, before the
+/// caller receives a response, so the event is durable in the store even if
+/// the HTTP client disconnects (cancellation-safe).
+///
+/// Race-safe ordering: write the txn+log at `latest_block + 1` BEFORE bumping
+/// `latest_block_number`. See the matching comment in `bridge_out.rs::on_post_sync`:
+/// advancing the counter first leaves a window where `eth_blockNumber` returns
+/// N but no log exists at block N yet, so aggsender / bridge-service skip the
+/// event entirely.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_claim(
     params: claimAssetCall,
@@ -540,163 +570,52 @@ pub async fn publish_claim(
     txn_hash: alloy::primitives::TxHash,
     txn_envelope: alloy::consensus::TxEnvelope,
     signer: alloy::primitives::Address,
-    store_dir: std::path::PathBuf,
-    node_url: String,
     reject_zero_padding: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
-    api_key: Option<String>,
 ) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
-
-    if node_url.is_empty() {
-        // Test path: use the existing MidenClient.
-        //
-        // Race-safe ordering: write the txn+log at (current_latest + 1) BEFORE
-        // bumping `latest_block_number`. See the matching comment in
-        // `bridge_out.rs::on_post_sync`: advancing the counter first leaves a
-        // window where `eth_blockNumber` returns N but no log exists at block N
-        // yet, so aggsender / bridge-service skip the event entirely.
-        let result_test = result.clone();
-        client
-            .with(move |client| {
-                Box::new(async move {
-                    let value = publish_claim_internal(
-                        params,
-                        client,
-                        &accounts.0,
-                        &*store,
-                        latest_block_num,
-                        reject_zero_padding,
-                        expected_mints.as_ref(),
-                    )
-                    .await?;
-                    let block_num = store.get_latest_block_number().await? + 1;
-                    let block_hash = block_state.get_block_hash(block_num);
-                    store
-                        .txn_begin(
-                            txn_hash,
-                            crate::store::TxnEntry {
-                                id: Some(value.txn_id),
-                                envelope: txn_envelope,
-                                signer,
-                                expires_at: Some(value.expires_at),
-                                logs: vec![value.log.clone()],
-                            },
-                        )
-                        .await?;
-                    store
-                        .txn_commit(txn_hash, Ok(()), block_num, block_hash)
-                        .await?;
-                    store.set_latest_block_number(block_num).await?;
-                    tracing::info!(
-                        eth_tx = %txn_hash,
-                        block_num,
-                        "ClaimEvent recorded (cancellation-safe)"
-                    );
-                    let _ = result_test.set(value);
-                    Ok(())
-                })
-            })
-            .await?;
-        return result
-            .get()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("publish_claim: result not set"));
-    }
-
-    let keystore = client.get_keystore();
-    let store_path = store_dir.join("store.sqlite3");
-
-    // Production path: fresh client per call (Igor's approach).
-    let store_clone = store.clone();
-    let accounts_inner = accounts.0.clone();
-    let expected_mints_clone = expected_mints.clone();
-    let join_result = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            use ::miden_client::DebugMode;
-            use ::miden_client::builder::ClientBuilder;
-            use ::miden_client_sqlite_store::ClientBuilderSqliteExt;
-
-            // Resolve via the same helper `MidenClient::new` uses, so shortcut
-            // strings ("devnet" / "testnet") map to the same Endpoint across both
-            // code paths. See RD-856 — an asymmetric URL parse was how the fresh
-            // client ended up dialing the wrong hostname in the first place.
-            let ep = crate::miden_client::parse_node_url(&node_url)
-                .map_err(|e| anyhow::anyhow!("invalid node URL {node_url}: {e}"))?;
-            tracing::info!(
-                node_url = %node_url,
-                resolved = %ep,
-                "publish_claim: building fresh Miden client to dial node"
-            );
-            // Build the gRPC client through the shared helper so the optional
-            // bearer-auth `api_key` (RD-856) is applied identically to the
-            // long-lived MidenClient path. Without the helper this fresh-per-call
-            // builder would silently skip the auth header.
-            let rpc = crate::miden_client::build_rpc_client(&ep, 10_000, api_key.as_deref());
-            let mut client = ClientBuilder::new()
-                .rpc(rpc)
-                .sqlite_store(store_path)
-                .authenticator(keystore)
-                .in_debug_mode(DebugMode::Enabled)
-                .build()
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "publish_claim: failed to build Miden client for {node_url}: {e}"
-                    )
-                })?;
-            client.sync_state().await?;
-
-            let value = publish_claim_internal(
-                params,
-                &mut client,
-                &accounts_inner,
-                &*store_clone,
-                latest_block_num,
-                reject_zero_padding,
-                expected_mints_clone.as_ref(),
-            )
-            .await?;
-
-            // Record the ClaimEvent — cancellation-safe.
-            // Race-safe ordering: write the txn+log at (current_latest + 1)
-            // BEFORE bumping `latest_block_number`. See `bridge_out.rs::on_post_sync`
-            // for the SIGPIPE/cursor-advance rationale.
-            let block_num = store_clone.get_latest_block_number().await? + 1;
-            let block_hash = block_state.get_block_hash(block_num);
-            store_clone
-                .txn_begin(
-                    txn_hash,
-                    crate::store::TxnEntry {
-                        id: Some(value.txn_id),
-                        envelope: txn_envelope,
-                        signer,
-                        expires_at: Some(value.expires_at),
-                        logs: vec![value.log.clone()],
-                    },
+    client
+        .with(move |client| {
+            Box::new(async move {
+                let value = publish_claim_internal(
+                    params,
+                    client,
+                    &accounts.0,
+                    &*store,
+                    latest_block_num,
+                    reject_zero_padding,
+                    expected_mints.as_ref(),
                 )
                 .await?;
-            store_clone
-                .txn_commit(txn_hash, Ok(()), block_num, block_hash)
-                .await?;
-            store_clone.set_latest_block_number(block_num).await?;
-            tracing::info!(
-                eth_tx = %txn_hash,
-                block_num,
-                "ClaimEvent recorded (cancellation-safe)"
-            );
-
-            let _ = result_inner.set(value);
-            Ok::<_, anyhow::Error>(())
+                let block_num = store.get_latest_block_number().await? + 1;
+                let block_hash = block_state.get_block_hash(block_num);
+                store
+                    .txn_begin(
+                        txn_hash,
+                        crate::store::TxnEntry {
+                            id: Some(value.txn_id),
+                            envelope: txn_envelope,
+                            signer,
+                            expires_at: Some(value.expires_at),
+                            logs: vec![value.log.clone()],
+                        },
+                    )
+                    .await?;
+                store
+                    .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+                    .await?;
+                store.set_latest_block_number(block_num).await?;
+                tracing::info!(
+                    eth_tx = %txn_hash,
+                    block_num,
+                    "ClaimEvent recorded (cancellation-safe)"
+                );
+                let _ = result_inner.set(value);
+                Ok(())
+            })
         })
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("claim spawn_blocking: {e}"))?;
-
-    join_result?;
-
+        .await?;
     result
         .get()
         .cloned()
