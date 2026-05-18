@@ -657,6 +657,7 @@ mod hardening_tests {
                 .to_string(),
             l1_rpc_url: None,
             ger_l1_address: None,
+            l1_indexer_from_block: None,
             miden_debug: false,
             cors_allowed_origins: cors,
             admin_api_key: admin,

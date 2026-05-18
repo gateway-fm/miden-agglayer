@@ -73,17 +73,17 @@ pub fn is_recoverable_account_error(err: &anyhow::Error) -> bool {
             }
             // RpcError chain: ClientError::RpcError(RpcError) wrapping the
             // node-side IncorrectAccountInitialCommitment.
-            if let ClientError::RpcError(rpc_err) = client_err {
-                if rpc_error_is_incorrect_initial_commitment(rpc_err) {
-                    return true;
-                }
+            if let ClientError::RpcError(rpc_err) = client_err
+                && rpc_error_is_incorrect_initial_commitment(rpc_err)
+            {
+                return true;
             }
         }
         // Bare RpcError in the chain (some call sites unwrap ClientError).
-        if let Some(rpc_err) = e.downcast_ref::<RpcError>() {
-            if rpc_error_is_incorrect_initial_commitment(rpc_err) {
-                return true;
-            }
+        if let Some(rpc_err) = e.downcast_ref::<RpcError>()
+            && rpc_error_is_incorrect_initial_commitment(rpc_err)
+        {
+            return true;
         }
         // Last-resort string match — kept as a belt-and-braces fallback for
         // any error path we miss. Matches both the original PascalCase token
