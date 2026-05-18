@@ -1,0 +1,34 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+[0;32m[19:48:31][0m ======================================================================
+[0;32m[19:48:31][0m   L1→L2 Deposit + Claim
+[0;32m[19:48:31][0m ======================================================================
+[0;32m[19:48:31][0m Wallet:  mcst1azaxnrn2xk7puyzvm0sdr647vywwgxev (0xba698e6a35bc1e104cdbe0d1eabe61)
+[0;32m[19:48:31][0m Dest:    0x00000000ba698e6a35bc1e104cdbe0d1eabe6100 (zero-padded, network 1)
+[0;32m[19:48:31][0m Amount:  10000000000000 wei (expect 1000 Miden units)
+[0;32m[19:48:31][0m Step 1/5: Depositing on L1...
+[0;32m[19:48:32] PASS:[0m L1 deposit succeeded
+[0;32m[19:48:32][0m Step 2/5: Waiting for bridge-service sync + GER injection...
+[0;32m[19:48:32][0m Waiting: deposit ready_for_claim (stall_timeout=90s, max_total=600s)...
+
+[0;32m[19:48:37][0m   progress: L1=135 L2_synth=28 deposits_seen=1
+
+[0;32m[19:48:42][0m   progress: L1=140 L2_synth=28 deposits_seen=1
+
+[0;32m[19:48:47][0m   progress: L1=145 L2_synth=31 deposits_seen=1
+
+[0;32m[19:48:47] PASS:[0m Deposit is ready_for_claim
+[0;32m[19:48:47][0m Step 3/5: Waiting for ClaimTxManager auto-claim...
+[0;32m[19:48:47][0m Waiting: claim tx submitted (timeout: 120s)...
+..
+[0;32m[19:48:57] PASS:[0m CLAIM note submitted to Miden
+[0;32m[19:48:57][0m Step 4/5: Waiting for CLAIM commit + NTX builder processing...
+[0;32m[19:48:57][0m Waiting: claim tx committed (timeout: 60s)...
+
+[0;32m[19:48:57] PASS:[0m CLAIM committed — waiting for NTX builder to create P2ID...
+[0;32m[19:48:57][0m Step 5/5: Checking wallet balance (sync + consume P2ID notes)...
+[0;32m[19:49:41][0m Attempt 1/15: balance = 1000
+[0;32m[19:49:41] PASS:[0m L1→L2 COMPLETE! Wallet balance: 1000 (expected 1000)
+
+[0;32m[19:49:41][0m ======================================================================
+[0;32m[19:49:41][0m   L1→L2 TEST DONE
+[0;32m[19:49:41][0m ======================================================================

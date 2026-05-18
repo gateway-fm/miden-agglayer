@@ -1,0 +1,54 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+[0;32m[19:57:05][0m ======================================================================
+[0;32m[19:57:05][0m   L2→L1 Bridge-Out
+[0;32m[19:57:05][0m ======================================================================
+[0;32m[19:57:05][0m Wallet:  mcst1azaxnrn2xk7puyzvm0sdr647vywwgxev
+[0;32m[19:57:05][0m Bridge:  mcst1aqyhf57cxshmu5zf2flq7ppgny06kzgh
+[0;32m[19:57:05][0m Faucet:  mcst1arqdnd32t7lrxcru6cgcmg7z4u299plv
+[0;32m[19:57:05][0m L1 dest: 0xE34aaF64b29273B7D567FCFc40544c014EEe9970
+[0;32m[19:57:05][0m Checking wallet balance...
+[0;32m[19:57:55][0m Wallet balance: 1000
+[0;32m[19:57:55][0m Bridge-out amount: 500 Miden units (expect +5000000000000 wei on L1)
+[0;32m[19:57:55][0m Step 1/4: Creating B2AGG bridge-out note...
+[bridge-out] wallet:  0xba698e6a35bc1e104cdbe0d1eabe61
+[bridge-out] bridge:  0x0974d3d8342fbe5049527e0f042899
+[bridge-out] faucet:  0xc0d9b62a5fbe33607cd6118da3c2af
+[bridge-out] amount:  500
+[bridge-out] dest:    0xE34aaF64b29273B7D567FCFc40544c014EEe9970 (network 0)
+[bridge-out] syncing state...
+[bridge-out] sync complete
+[bridge-out] notes: 0 expected, 1 committed
+[bridge-out] wallet balance: 1000
+[bridge-out] B2AGG note created
+[bridge-out] submitting transaction...
+[bridge-out] transaction submitted: 0x26d9008a977ab44acacdd5ddf34256e7b055ffa37e1681dbf7158ce608fe51e1
+[bridge-out] waiting for confirmation...
+[bridge-out] sync cycle 1/5
+[bridge-out] sync cycle 2/5
+[bridge-out] sync cycle 3/5
+[bridge-out] sync cycle 4/5
+[bridge-out] sync cycle 5/5
+[bridge-out] wallet balance after: 500
+[bridge-out] done
+[0;32m[19:58:35] PASS:[0m B2AGG note created
+[0;32m[19:58:35][0m Step 2/4: Waiting for BridgeEvent in L2 proxy (timeout 120s)...
+[0;32m[19:58:35][0m Waiting: BridgeEvent in eth_getLogs (timeout: 120s)...
+
+[0;32m[19:58:35] PASS:[0m BridgeEvent detected in L2
+[0;32m[19:58:35][0m L1 balance before settlement: 10999999899989999945419827
+[0;32m[19:58:35][0m Step 3/5: Waiting for certificate settlement on AggLayer...
+[0;32m[19:58:35][0m Waiting: certificate settled (timeout: 900s)...
+
+[0;32m[19:58:35] PASS:[0m Certificate settled on L1!
+[0;32m[19:58:35][0m Step 4/5: Waiting for bridge-service to sync L2→L1 deposit...
+[0;32m[19:58:35][0m Waiting: L2 deposit in bridge-service (timeout: 120s)...
+
+[0;32m[19:58:35] PASS:[0m L2→L1 deposit synced and ready_for_claim
+[0;32m[19:58:35][0m Step 5/5: Claiming deposit on L1...
+[0;32m[19:58:36][0m Deposit #0: amount=5000000000000, globalIndex=0
+[0;32m[19:58:37] PASS:[0m L1 claim transaction succeeded!
+[0;32m[19:58:37] PASS:[0m L2→L1 COMPLETE! L1 balance: 10999999899989999945419827 → 10999999899994999945026230 (+4999999606403 wei, gas: 393597 wei)
+
+[0;32m[19:58:37][0m ======================================================================
+[0;32m[19:58:37][0m   L2→L1 TEST DONE
+[0;32m[19:58:37][0m ======================================================================
