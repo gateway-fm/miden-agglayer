@@ -8,7 +8,7 @@ use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
-use miden_protocol::account::{Account, AccountId};
+use miden_protocol::account::{Account, AccountId, AccountStorageMode};
 use miden_protocol::address::NetworkId;
 use miden_protocol::note::NoteType;
 use miden_standards::account::auth::AuthSingleSig;
@@ -126,8 +126,29 @@ async fn add_wallet(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
 ) -> anyhow::Result<Account> {
+    // Public storage mode is REQUIRED for the proxy's infrastructure accounts
+    // (service, ger_manager, wallet_hardhat) so a missing local sqlite row can
+    // be recovered via `Client::import_account_by_id` from the live Miden
+    // node. Private accounts (the AccountBuilder default) cannot be
+    // recovered — their full state lives ONLY in the proxy's sqlite. The
+    // regression that put bali in this state was commit dbe5c2d (Apr 2026),
+    // which folded `add_public_wallet` into `add_wallet` during the 0.14.x
+    // migration and dropped the explicit storage_mode call. Bali ran with
+    // Private accounts for ~20 days until the proxy's sqlite lost the
+    // ger_manager row, after which every aggoracle GER push rejected with
+    // `AccountDataNotFound` and `--reset-miden-store --restore` could not
+    // bring it back.
+    //
+    // We use `Public` rather than `Network` because the latter is
+    // testnet/devnet-only on current upstream — local miden-node builds
+    // (and any production node not running with network-tx enabled) reject
+    // Network deployments with `Network transactions may not be submitted
+    // by users yet`. Public gives us the recovery property (state on-chain,
+    // import-by-id works) without the network-tx-builder semantics, which
+    // the proxy doesn't use anyway.
     let (auth_component, key_pair) = create_auth_component(client)?;
     let account = Account::builder(client.rng().draw_word().into())
+        .storage_mode(AccountStorageMode::Public)
         .with_component(BasicWallet)
         .with_auth_component(auth_component)
         .build()?;
