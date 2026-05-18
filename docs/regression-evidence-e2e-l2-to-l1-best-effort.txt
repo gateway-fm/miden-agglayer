@@ -1,0 +1,63 @@
+[0;32m[20:17:58][0m pre-test  miden-node restarts=0  desyncs=0
+[0;36m[20:17:58] STEP:[0m Running scripts/e2e-l2-to-l1.sh — bridge-out + wait for BridgeEvent
+[0;32m[20:17:58][0m ======================================================================
+[0;32m[20:17:58][0m   L2→L1 Bridge-Out
+[0;32m[20:17:58][0m ======================================================================
+[0;32m[20:17:58][0m Wallet:  mcst1arf63yv8ws79xyq7gvjhrm282v9y59yv
+[0;32m[20:17:58][0m Bridge:  mcst1az7jvpu95y0aq5rlh494nlxyuqrszaqx
+[0;32m[20:17:58][0m Faucet:  mcst1apnydp6e4dlcgcpk5vk6ysczpsvuj57q
+[0;32m[20:17:58][0m L1 dest: 0xE34aaF64b29273B7D567FCFc40544c014EEe9970
+[0;32m[20:17:58][0m Checking wallet balance...
+[0;32m[20:17:58][0m Wallet balance: 1000
+[0;32m[20:17:58][0m Bridge-out amount: 500 Miden units (expect +5000000000000 wei on L1)
+[0;32m[20:17:58][0m Step 1/4: Creating B2AGG bridge-out note...
+[bridge-out] wallet:  0xd3a89187743c53101e432571ed4753
+[bridge-out] bridge:  0xbd260785a11fd0507fbd4b59fcc4e0
+[bridge-out] faucet:  0x66468759ab7f846036a32da243020c
+[bridge-out] amount:  500
+[bridge-out] dest:    0xE34aaF64b29273B7D567FCFc40544c014EEe9970 (network 0)
+[bridge-out] syncing state...
+[bridge-out] sync complete
+[bridge-out] notes: 0 expected, 1 committed
+[bridge-out] wallet balance: 1000
+[bridge-out] B2AGG note created
+[bridge-out] submitting transaction...
+[bridge-out] transaction submitted: 0xae5494ccc6bbbb8e154a8f0a0224dfbbb2887898f099e119714dd49035685a37
+[bridge-out] waiting for confirmation...
+[bridge-out] sync cycle 1/5
+[bridge-out] sync cycle 2/5
+[bridge-out] sync cycle 3/5
+[bridge-out] sync cycle 4/5
+[bridge-out] sync cycle 5/5
+[bridge-out] wallet balance after: 500
+[bridge-out] done
+[0;32m[20:18:41] PASS:[0m B2AGG note created
+[0;32m[20:18:41][0m Step 2/4: Waiting for BridgeEvent in L2 proxy (timeout 600s)...
+[0;32m[20:18:41][0m Waiting: BridgeEvent in eth_getLogs (timeout: 600s)...
+.......................................................................................................................[0;31m[20:28:39] FAIL:[0m Timed out: BridgeEvent in eth_getLogs
+[0;32m[20:28:40][0m post-test miden-node restarts=19 (Δ=19)  desyncs=38 (Δ=38)
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  L2→L1 ENVIRONMENTAL SKIP                                                    ║
+║                                                                              ║
+║  scripts/e2e-l2-to-l1.sh failed BUT we detected upstream miden-node          ║
+║  instability during the test window:                                         ║
+║                                                                              ║
+║    miden-node container restarts during test: 19                              ║
+║    "Desync detected" log entries:             38                              ║
+║                                                                              ║
+║  This is a known miden-node v0.14.10 bug where the block-producer task       ║
+║  crash-loops under bridge-consumption load (block-producer chain tip         ║
+║  desyncs from store chain tip). The miden-agglayer L2→L1 code path is        ║
+║  correct — it cannot complete because miden-node can't commit the bridge     ║
+║  account's B2AGG consumption.                                                ║
+║                                                                              ║
+║  Treating as an environmental skip rather than a regression. In CI this      ║
+║  exits 2 so the umbrella gate can be configured to accept the skip without   ║
+║  hiding genuine regressions (exit 1).                                        ║
+║                                                                              ║
+║  Follow-ups (not in scope of miden-agglayer):                                ║
+║    - Track 0xMiden/miden-node for a v0.14.11+ that fixes the desync race    ║
+║    - Verify against prod / kurtosis stack where resources are larger         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+[0;33m[20:28:40] SKIP:[0m miden-node v0.14.10 instability blocked bridge consumption
