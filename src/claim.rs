@@ -573,6 +573,77 @@ pub async fn publish_claim(
     reject_zero_padding: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
 ) -> anyhow::Result<PublishClaimTxn> {
+    // Submit with runtime self-heal, mirroring the pattern in
+    // `src/ger.rs::insert_ger`. If the inner Miden submission rejects with
+    // `AccountDataNotFound` (local sqlite row missing — typically after a
+    // `--reset-miden-store`) or `IncorrectAccountInitialCommitment` (local
+    // commitment stale vs. the node), reimport every account from
+    // `bridge_accounts.toml` and retry the publish once. Defense in depth
+    // alongside the structural fix in `e3e3e2a` that routes through
+    // `MidenClient::with(...)` and eliminates mempool-conflict IAIC.
+    //
+    // The claim flow touches several accounts (`bridge` for the CLAIM note,
+    // `service` and dynamically-created faucets for first-bridge token
+    // registration), so we reimport the whole bridge_accounts set rather
+    // than guess which account was the culprit from the error message.
+    // `reimport_known_accounts` is best-effort and idempotent — accounts
+    // not on chain (e.g. `wallet_hardhat`) fail benignly.
+    match attempt_publish_claim(
+        params.clone(),
+        client,
+        accounts.clone(),
+        store.clone(),
+        block_state.clone(),
+        latest_block_num,
+        txn_hash,
+        txn_envelope.clone(),
+        signer,
+        reject_zero_padding,
+        expected_mints.clone(),
+    )
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(err) if crate::account_recovery::is_recoverable_account_error(&err) => {
+            tracing::warn!(
+                err = %err,
+                eth_tx = %txn_hash,
+                "publish_claim: recoverable account error, reimporting known accounts and retrying"
+            );
+            crate::account_recovery::reimport_known_accounts(client, &accounts.0).await;
+            attempt_publish_claim(
+                params,
+                client,
+                accounts,
+                store,
+                block_state,
+                latest_block_num,
+                txn_hash,
+                txn_envelope,
+                signer,
+                reject_zero_padding,
+                expected_mints,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attempt_publish_claim(
+    params: claimAssetCall,
+    client: &MidenClient,
+    accounts: crate::AccountsConfig,
+    store: Arc<dyn Store>,
+    block_state: std::sync::Arc<crate::block_state::BlockState>,
+    latest_block_num: BlockNumber,
+    txn_hash: alloy::primitives::TxHash,
+    txn_envelope: alloy::consensus::TxEnvelope,
+    signer: alloy::primitives::Address,
+    reject_zero_padding: bool,
+    expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
+) -> anyhow::Result<PublishClaimTxn> {
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
     client
