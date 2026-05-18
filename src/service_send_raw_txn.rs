@@ -376,11 +376,8 @@ async fn publish_and_record_claim(
         txn_hash,
         txn_envelope,
         signer,
-        service.miden_store_dir.clone(),
-        service.miden_node_url.clone(),
         service.reject_zero_padding_addresses,
         Some(service.expected_mints.clone()),
-        service.miden_api_key.clone(),
     )
     .await?;
     tracing::info!(
