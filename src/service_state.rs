@@ -63,10 +63,10 @@ pub struct ServiceState {
     pub l1_rpc_url: Option<String>,
     /// L1 GER contract address
     pub ger_l1_address: Option<String>,
-    /// Miden client store directory (for building fresh clients)
+    /// Miden client store directory (used by recovery commands; the long-lived
+    /// `MidenClient` owns the sqlite handle so production submission paths do
+    /// not need to re-derive this).
     pub miden_store_dir: PathBuf,
-    /// Miden node URL (for building fresh clients)
-    pub miden_node_url: String,
     /// CORS-allowed origins (R11). `None` = no cross-origin requests permitted (the
     /// safe default in production); `Some(list)` = explicit allowlist; the special
     /// single-entry `vec!["*"]` is reserved for dev-only wildcards.
@@ -128,7 +128,6 @@ impl ServiceState {
             l1_rpc_url: None,
             ger_l1_address: None,
             miden_store_dir: PathBuf::new(),
-            miden_node_url: String::new(),
             cors_allowed_origins: None,
             admin_api_key: None,
             allowed_signers: None,
