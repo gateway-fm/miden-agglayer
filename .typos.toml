@@ -6,3 +6,10 @@ extend-exclude = ["*.lock", "dist", "target", "fixtures"]
 # Test fixture for constant_time_eq() — `abd` is intentionally a one-byte
 # variant of `abc`, not a typo of `and`/`bad`.
 abd = "abd"
+# Commit SHA `dbe5c2d` is referenced throughout the v0.3.0 docs + code as
+# the regression-of-record. The `dbe` prefix trips typos which thinks it's
+# a misspelling of "be" / "due".
+dbe5c2d = "dbe5c2d"
+# `mis` is intentional as in "mis-report" — `typos` mis-detects it as a
+# misspelling of `miss` / `mist`.
+mis = "mis"
