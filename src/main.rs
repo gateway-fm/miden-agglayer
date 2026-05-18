@@ -316,6 +316,22 @@ async fn main() -> anyhow::Result<()> {
     let store: Arc<dyn Store> = if let Some(_db_url) = &command.database_url {
         #[cfg(feature = "postgres")]
         {
+            // Run embedded SQL migrations BEFORE the connection pool opens.
+            // This replaces the `agglayer-migrate` one-shot service that
+            // hardcoded the migration list in docker-compose.e2e.yml — new
+            // migrations are now part of the deploy artifact (compiled into
+            // the binary via `include_str!`) so the proxy and its schema
+            // can't drift out of sync.
+            let report =
+                miden_agglayer_service::store::migrator::run_migrations(_db_url)
+                    .await
+                    .context("running embedded DB migrations on startup")?;
+            tracing::info!(
+                applied = report.applied.len(),
+                already_present = report.already_present.len(),
+                "DB migrations complete"
+            );
+
             let pg = miden_agglayer_service::store::postgres::PgStore::new(_db_url).await?;
             Arc::new(pg)
         }
