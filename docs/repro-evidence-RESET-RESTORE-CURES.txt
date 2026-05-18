@@ -1,0 +1,48 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+[17:46:49] MODE = expect_recovery
+[17:46:49]   expect_failure  → bug fires, AccountDataNotFound observed, deposit stays stuck
+[17:46:49]   expect_recovery → cure works, Phase 0 reimport logs, deposit becomes ready
+[17:46:49] log line count before run: 255
+
+[17:46:49] Phase 1 — STATE A: baseline L1→L2 deposit must land clean
+[17:46:49]     sending baseline bridgeAsset cnt=1 dest=0x00000000000000000000000079126409deadbeef
+[17:47:02] PASS: STATE A baseline deposit cnt=1 ready_for_claim=true
+[17:47:02]     latest_account_headers rows BEFORE reset = 5
+
+[17:47:02] Phase 2 — invoke the documented operator recovery: --reset-miden-store --restore
+[17:47:02]     stopping proxy
+ Container miden-agglayer-miden-agglayer-1 Stopping 
+ Container miden-agglayer-miden-agglayer-1 Stopped 
+[17:47:02]     running one-shot: docker compose run --rm --no-deps miden-agglayer --reset-miden-store --restore
+[17:47:03]     restore one-shot exit code = 0
+[17:47:03]     restore log markers:
+[17:47:03]       reset_miden_store deleted   = 1  (expected: ≥1)
+[17:47:03]       Phase 0 reimport pass start = 1  expect_recovery → expect_recoveryexpected ≥1
+[17:47:03]       'reimported from node'      = 4  (post-55fa17a: ≥1 per network-tracked account)
+[17:47:03]       RESTORE: complete           = 1  (expected: 1)
+[17:47:03]     latest_account_headers rows AFTER reset+restore = 4
+[17:47:03]     cure confirmed: latest_account_headers has 4 rows after restore (down from 5 but non-empty)
+
+[17:47:03] Phase 3 — restart proxy normally and trigger a follow-up deposit
+ Container miden-agglayer-agglayer-postgres-1 Waiting 
+ Container miden-agglayer-miden-node-1 Waiting 
+ Container miden-agglayer-miden-node-1 Healthy 
+ Container miden-agglayer-agglayer-postgres-1 Healthy 
+ Container miden-agglayer-miden-agglayer-1 Starting 
+ Container miden-agglayer-miden-agglayer-1 Started 
+[17:47:10] PASS: proxy healthy after restart
+[17:47:10]     sending follow-up bridgeAsset cnt=2
+
+[17:47:11] Phase 4 — observe AccountDataNotFound vs. clean recovery
+[17:47:20]     final deposit cnt=2 ready_for_claim=true
+[17:47:20]     AccountDataNotFound log lines since restart = 0
+[17:47:20] PASS: CURE VERIFIED: zero AccountDataNotFound; deposit cnt=2 ready_for_claim=true
+
+[17:47:20] Done. Evidence captured to /tmp/repro-evidence-reset-restore-expect_recovery-1779126409.txt
+[17:47:20] summary:
+[17:47:20]   MODE                       = expect_recovery
+[17:47:20]   rows BEFORE reset          = 5
+[17:47:20]   rows AFTER reset+restore   = 4
+[17:47:20]   Phase 0 reimport marker    = 1 (expected expect_recovery≥1)
+[17:47:20]   AccountDataNotFound count  = 0 (expected expect_recovery0)
+[17:47:20]   STATE B deposit ready      = true (expected expect_recoverytrue)

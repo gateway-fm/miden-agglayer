@@ -1,92 +1,92 @@
 bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
 
-[17:37:36] Phase 0 — resolving ger_manager hex id from init logs
-[17:37:36]     ger_manager hex id = 0x390714eeab9eca107e9697b8f1674c
+[17:43:18] Phase 0 — resolving ger_manager hex id from init logs
+[17:43:18]     ger_manager hex id = 0x1dcfa3823c824b1018193a30d62381
 
-[17:37:36] Phase 1 — STATE A setup (prior-successful: real deposit, real GER, is_injected=TRUE)
-[17:37:36]     baseline bridgeAsset cnt=1 dest=0x00000000000000000000000079125856deadbeef
-[17:37:48]     STATE A GER = 0xb34c522d1ffef5f0de524a31f0e3f7f996837a697da8dec79010ab931cf2989b
-[17:37:48]     STATE A state = set|set|t  (expected: set|set|t)
-[17:37:49] PASS: STATE A established: baseline deposit ready, healthy GER preserved as canary
+[17:43:18] Phase 1 — STATE A setup (prior-successful: real deposit, real GER, is_injected=TRUE)
+[17:43:18]     baseline bridgeAsset cnt=1 dest=0x00000000000000000000000079126198deadbeef
+[17:43:34]     STATE A GER = 0x133e6a88627cda3e7df19f63db3be8dbaa691e860ee1ccec52eeaf54be5381cd
+[17:43:34]     STATE A state = set|set|t  (expected: set|set|t)
+[17:43:34] PASS: STATE A established: baseline deposit ready, healthy GER preserved as canary
 
-[17:37:49] Phase 2 — STATE C setup (historic orphan: NULL,NULL roots, is_injected=TRUE)
-[17:37:49]     synthetic orphan ger = 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef6a0b4e60
-[17:37:49]     STATE C state = NULL|NULL|t  (expected: NULL|NULL|t)
-[17:37:49] PASS: STATE C established: synthetic orphan inserted directly into agglayer_store
+[17:43:34] Phase 2 — STATE C setup (historic orphan: NULL,NULL roots, is_injected=TRUE)
+[17:43:34]     synthetic orphan ger = 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef6a0b4fb6
+[17:43:34]     STATE C state = NULL|NULL|t  (expected: NULL|NULL|t)
+[17:43:34] PASS: STATE C established: synthetic orphan inserted directly into agglayer_store
 
-[17:37:49] Phase 3 — STATE B setup (delete ger_manager from sqlite, trigger AccountDataNotFound)
-[17:37:49]     stopping proxy
+[17:43:34] Phase 3 — STATE B setup (delete ger_manager from sqlite, trigger AccountDataNotFound)
+[17:43:34]     stopping proxy
  Container miden-agglayer-miden-agglayer-1 Stopping 
  Container miden-agglayer-miden-agglayer-1 Stopped 
-[17:37:49]     ger_manager row deleted (latest_account_headers count=0)
-[17:37:49]     starting proxy WITHOUT the self-heal fix — this is the broken state
- Container miden-agglayer-miden-node-1 Waiting 
+[17:43:34]     ger_manager row deleted (latest_account_headers count=0)
+[17:43:34]     starting proxy WITHOUT the self-heal fix — this is the broken state
  Container miden-agglayer-agglayer-postgres-1 Waiting 
- Container miden-agglayer-agglayer-postgres-1 Healthy 
+ Container miden-agglayer-miden-node-1 Waiting 
  Container miden-agglayer-miden-node-1 Healthy 
+ Container miden-agglayer-agglayer-postgres-1 Healthy 
  Container miden-agglayer-miden-agglayer-1 Starting 
  Container miden-agglayer-miden-agglayer-1 Started 
-[17:37:56] PASS: proxy healthy after restart
-[17:37:56]     triggering STATE B deposit at cnt=2
-[17:38:11]     STATE B GER = 0x<none>
+[17:43:41] PASS: proxy healthy after restart
+[17:43:41]     triggering STATE B deposit at cnt=2
+[17:43:57]     STATE B GER = 0x<none>
 
-[17:38:11] Phase 4 — observe state at first use (self-heal may already have fired inline)
-[17:38:11]     STATE A canary = set|set|t
-[17:38:11]     STATE B canary = <missing>
-[17:38:11]     STATE C canary = NULL|NULL|t
-[17:38:11]     STATE B deposit cnt=2 ready_for_claim=true
-[17:38:11]     → runtime self-heal fired inline on first submission and cured the deposit immediately.
-[17:38:11]     → this is the v0.3.0 SUCCESS path.
-[17:38:11] PASS: ALL THREE STATES present (STATE A preserved, STATE C orphan inserted, STATE B may be pre-cured)
+[17:43:57] Phase 4 — observe state at first use (self-heal may already have fired inline)
+[17:43:57]     STATE A canary = set|set|t
+[17:43:57]     STATE B canary = <missing>
+[17:43:57]     STATE C canary = NULL|NULL|t
+[17:43:57]     STATE B deposit cnt=2 ready_for_claim=true
+[17:43:57]     → runtime self-heal fired inline on first submission and cured the deposit immediately.
+[17:43:57]     → this is the v0.3.0 SUCCESS path.
+[17:43:57] PASS: ALL THREE STATES present (STATE A preserved, STATE C orphan inserted, STATE B may be pre-cured)
 
-NULL|NULL|t[17:38:11] <missing>Phase 5a — STATE D: NOTE on IAIC reproducibility (local stack limitation)
-[17:38:11]     IAIC ('incorrect account initial commitment') in production on bali was
-[17:38:11]     caused by MEMPOOL CONFLICT — two submissions for the same account in
-[17:38:11]     flight at once, both built atop the same initial commitment, node rejects
-[17:38:11]     the second with code 4. Loki evidence: 189 hits 2026-05-11→05-14.
-[17:38:11] 
-[17:38:11]     This is structurally hard to reproduce on a local stack because the local
-[17:38:11]     Miden node v0.14.10 doesn't have the concurrent claim+GER load that bali
-[17:38:11]     sees, AND ger.rs:142 calls sync_state() before every submit which
-[17:38:11]     pre-emptively repairs the cache-lag variant.
-[17:38:11] 
-[17:38:11]     The architectural cure is in branch `feat/v0.3.0-unify-claim-client`
-[17:38:11]     (unifies publish_claim onto the long-lived MidenClient's capacity-1
-[17:38:11]     channel — structurally serialises all submissions per account).
-[17:38:11] 
-[17:38:11]     The v0.3.0 runtime self-heal (commit c491eca) cures AccountDataNotFound
-[17:38:11]     and CACHE-LAG IAIC (where sync_state hasn't caught up yet); this script's
-[17:38:11]     Phase 3 demonstrates that end-to-end. The MEMPOOL-CONFLICT IAIC variant
-[17:38:11]     is cured by the unify, not by retry-after-import (retry would hit the
-[17:38:11]     same mempool conflict). Unit test coverage at
-[17:38:11]     `account_recovery::tests::typed_downcast_catches_incorrect_initial_commitment`
-[17:38:11]     confirms is_recoverable_account_error() correctly matches the typed
-[17:38:11]     IAIC variant in case the cure path needs to handle it.
-[17:38:11] 
-[17:38:11]     Skipping the sqlite-tamper IAIC injection — it was misleading (sync_state
-[17:38:11]     immediately repaired the staleness, the apparent 'IAIC cure' was actually
-[17:38:11]     the AccountDataNotFound path firing on a different submission).
+NULL|NULL|t[17:43:57] <missing>Phase 5a — STATE D: NOTE on IAIC reproducibility (local stack limitation)
+[17:43:57]     IAIC ('incorrect account initial commitment') in production on bali was
+[17:43:57]     caused by MEMPOOL CONFLICT — two submissions for the same account in
+[17:43:57]     flight at once, both built atop the same initial commitment, node rejects
+[17:43:57]     the second with code 4. Loki evidence: 189 hits 2026-05-11→05-14.
+[17:43:57] 
+[17:43:57]     This is structurally hard to reproduce on a local stack because the local
+[17:43:57]     Miden node v0.14.10 doesn't have the concurrent claim+GER load that bali
+[17:43:57]     sees, AND ger.rs:142 calls sync_state() before every submit which
+[17:43:57]     pre-emptively repairs the cache-lag variant.
+[17:43:57] 
+[17:43:57]     The architectural cure is in branch `feat/v0.3.0-unify-claim-client`
+[17:43:57]     (unifies publish_claim onto the long-lived MidenClient's capacity-1
+[17:43:57]     channel — structurally serialises all submissions per account).
+[17:43:57] 
+[17:43:57]     The v0.3.0 runtime self-heal (commit c491eca) cures AccountDataNotFound
+[17:43:57]     and CACHE-LAG IAIC (where sync_state hasn't caught up yet); this script's
+[17:43:57]     Phase 3 demonstrates that end-to-end. The MEMPOOL-CONFLICT IAIC variant
+[17:43:57]     is cured by the unify, not by retry-after-import (retry would hit the
+[17:43:57]     same mempool conflict). Unit test coverage at
+[17:43:57]     `account_recovery::tests::typed_downcast_catches_incorrect_initial_commitment`
+[17:43:57]     confirms is_recoverable_account_error() correctly matches the typed
+[17:43:57]     IAIC variant in case the cure path needs to handle it.
+[17:43:57] 
+[17:43:57]     Skipping the sqlite-tamper IAIC injection — it was misleading (sync_state
+[17:43:57]     immediately repaired the staleness, the apparent 'IAIC cure' was actually
+[17:43:57]     the AccountDataNotFound path firing on a different submission).
 
-NULL|NULL|t[17:38:11] <missing>Phase 5 — final restart to confirm clean steady state
+NULL|NULL|t[17:43:57] <missing>Phase 5 — final restart to confirm clean steady state
  Container miden-agglayer-miden-agglayer-1 Restarting 
  Container miden-agglayer-miden-agglayer-1 Started 
-[17:38:18] WARN: no explicit reimport log line observed
+[17:44:03] WARN: no explicit reimport log line observed
 
-NULL|NULL|t[17:38:18] <missing>Phase 6 — post-cure verification (each state's expected resolution)
-[17:38:18]     STATE A after = set|set|t  (expected: set|set|t, unchanged)
-[17:38:18] PASS: STATE A preserved
-[17:38:18]     waiting up to 60s for STATE B deposit cnt=2 to reach ready_for_claim=true
-[17:38:18]     STATE B deposit cnt=2 ready_for_claim=true  (expected: true)
-[17:38:18]     runtime self-heal log:
-      2026-05-18T17:37:58.924194Z  WARN miden_agglayer_service::ger: src/ger.rs:204: GER injection: recoverable account error, reimporting ger_manager and retrying, err: account data wasn't found for account id 0x390714eeab9eca107e9697b8f1674c, ger: 2da5a3582281f9bd75f3b0514086cf81e72bb5c5c5fa93cdc5d7d8904288b305
-[17:38:18]     runtime reimport log:
-      2026-05-18T17:37:58.975022Z  INFO miden_agglayer_service::account_recovery: src/account_recovery.rs:141: reimported from node, account: "ger_manager", account_id: 0x390714eeab9eca107e9697b8f1674c
-[17:38:18] PASS: STATE B cured: deposit ready_for_claim=true; runtime self-heal fired on first AccountDataNotFound
-[17:38:18]     waiting up to 30s for indexer to back-fill the orphan's (M, R)
-[17:38:49]     STATE C after = NULL|NULL|t  (expected: set|set|t, indexer back-filled)
-[17:38:49] WARN: STATE C did not cure in this run: NULL|NULL|t
-[17:38:49] WARN:   → indexer back-fill of EXISTING orphans needs a follow-up commit
-[17:38:49] WARN:   → going-forward behaviour (new orphans don't accumulate) is verified by Phase 5
+NULL|NULL|t[17:44:03] <missing>Phase 6 — post-cure verification (each state's expected resolution)
+[17:44:03]     STATE A after = set|set|t  (expected: set|set|t, unchanged)
+[17:44:03] PASS: STATE A preserved
+[17:44:03]     waiting up to 60s for STATE B deposit cnt=2 to reach ready_for_claim=true
+[17:44:03]     STATE B deposit cnt=2 ready_for_claim=true  (expected: true)
+[17:44:03]     runtime self-heal log:
+      2026-05-18T17:43:43.382480Z  WARN miden_agglayer_service::ger: src/ger.rs:204: GER injection: recoverable account error, reimporting ger_manager and retrying, err: account data wasn't found for account id 0x1dcfa3823c824b1018193a30d62381, ger: 318c143aa7865fb3c35ae3834f06d752ba3857d35f1a40db82402eb4f2fa8ef3
+[17:44:03]     runtime reimport log:
+      2026-05-18T17:43:43.474759Z  INFO miden_agglayer_service::account_recovery: src/account_recovery.rs:141: reimported from node, account: "ger_manager", account_id: 0x1dcfa3823c824b1018193a30d62381
+[17:44:03] PASS: STATE B cured: deposit ready_for_claim=true; runtime self-heal fired on first AccountDataNotFound
+[17:44:03]     waiting up to 30s for indexer to back-fill the orphan's (M, R)
+[17:44:34]     STATE C after = NULL|NULL|t  (expected: set|set|t, indexer back-filled)
+[17:44:34] WARN: STATE C did not cure in this run: NULL|NULL|t
+[17:44:34] WARN:   → indexer back-fill of EXISTING orphans needs a follow-up commit
+[17:44:34] WARN:   → going-forward behaviour (new orphans don't accumulate) is verified by Phase 5
 
-NULL|NULL|t[17:38:49] <missing>Done. Evidence captured to /tmp/repro-evidence-self-heal-1779125856.txt
-[17:38:49] summary: STATE A=set|set|t  STATE B deposit ready=true  STATE C=NULL|NULL|t
+NULL|NULL|t[17:44:34] <missing>Done. Evidence captured to /tmp/repro-evidence-self-heal-1779126198.txt
+[17:44:34] summary: STATE A=set|set|t  STATE B deposit ready=true  STATE C=NULL|NULL|t
