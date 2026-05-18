@@ -404,6 +404,14 @@ async fn main() -> anyhow::Result<()> {
         command.miden_debug,
     )?;
 
+    // Self-heal is RUNTIME-only, not startup-only. See `src/account_recovery.rs`
+    // — when a Miden submission inside `insert_ger` or `publish_claim` returns
+    // an `AccountDataNotFound` or `IncorrectAccountInitialCommitment` error,
+    // the caller reimports the affected account from the live Miden node and
+    // retries once. We deliberately do NOT brick the proxy at startup over
+    // locally-deployed-but-not-yet-network-tracked accounts (e.g. service,
+    // wallet_hardhat) — those are healthy until first use, at which point
+    // their initial `submit_new_transaction` deploys them on-chain.
     // Run restore if requested
     if command.restore {
         let result =

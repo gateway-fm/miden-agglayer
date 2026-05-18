@@ -1,3 +1,4 @@
+pub mod account_recovery;
 pub mod accounts_config;
 pub mod address_mapper;
 pub mod block_state;
