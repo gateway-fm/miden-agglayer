@@ -7,6 +7,8 @@
 
 pub mod memory;
 #[cfg(feature = "postgres")]
+pub mod migrator;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_tests;
