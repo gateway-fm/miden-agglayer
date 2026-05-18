@@ -81,6 +81,15 @@ pub struct L1InfoTreeIndexer {
     store: Arc<dyn Store>,
     poll_interval: Duration,
     max_range: u64,
+    /// Optional operator override: force the indexer to start polling from
+    /// this L1 block on the next boot, ignoring any persisted cursor.
+    /// Used to backfill historic orphan GERs whose `UpdateL1InfoTree` events
+    /// predate the persisted cursor (e.g. bali's 27 NULL-roots rows from
+    /// blocks 95k-130k). Operator passes via `--l1-indexer-from-block <N>`
+    /// or env `L1_INDEXER_FROM_BLOCK`. After the backfill completes the
+    /// cursor advances forward normally; remove the flag for subsequent
+    /// boots.
+    from_block_override: Option<u64>,
 }
 
 impl L1InfoTreeIndexer {
@@ -91,7 +100,17 @@ impl L1InfoTreeIndexer {
             store,
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_range: DEFAULT_MAX_RANGE,
+            from_block_override: None,
         }
+    }
+
+    /// Operator override for the indexer start block. Overrides both the
+    /// persisted cursor and the L1-head fallback for one boot. After that
+    /// boot's first persisted cursor write, the override stops mattering
+    /// and the normal resume-from-cursor path takes over.
+    pub fn with_from_block_override(mut self, from_block: u64) -> Self {
+        self.from_block_override = Some(from_block);
+        self
     }
 
     /// Spawn the indexer as a tokio task. Returns a oneshot sender for graceful
@@ -144,7 +163,22 @@ impl L1InfoTreeIndexer {
                     0
                 }
             };
-            let mut last_processed: u64 = if stored == 0 {
+            // Resolve start block:
+            //   1. Operator override (`--l1-indexer-from-block <N>`) wins
+            //      unconditionally — used to backfill historic orphan GERs
+            //      whose events predate the persisted cursor.
+            //   2. Else persisted cursor minus reorg margin, if non-zero.
+            //   3. Else current L1 head (fresh deployment).
+            let mut last_processed: u64 = if let Some(forced) = self.from_block_override {
+                tracing::warn!(
+                    from_block = forced,
+                    stored_cursor = stored,
+                    l1_head = head,
+                    "L1InfoTreeIndexer: operator override active — starting from forced block. \
+                     Remove --l1-indexer-from-block after this boot's backfill completes."
+                );
+                forced.saturating_sub(1)
+            } else if stored == 0 {
                 head
             } else {
                 // Re-process a small reorg window so we don't miss reorg'd
@@ -157,6 +191,7 @@ impl L1InfoTreeIndexer {
                 start_block = last_processed,
                 stored_cursor = stored,
                 l1_head = head,
+                from_block_override = ?self.from_block_override,
                 "L1InfoTreeIndexer cursor initialized"
             );
 

@@ -80,6 +80,17 @@ struct Command {
     #[arg(long, env = "GER_L1_ADDRESS")]
     ger_l1_address: Option<String>,
 
+    /// Operator override for the L1 InfoTree indexer's start block. When
+    /// set, the indexer ignores the persisted cursor and forces a forward
+    /// walk from this L1 block on the next boot — used to back-fill
+    /// historic `UpdateL1InfoTree` events whose `ger_entries` rows landed
+    /// with NULL `(M, R)` (the STATE C orphans pattern seen on bali, 27
+    /// rows from proxy blocks 95k-130k). After the back-fill completes
+    /// and the cursor advances forward, remove the flag for subsequent
+    /// boots — it serves no purpose once the cursor has moved past it.
+    #[arg(long, env = "L1_INDEXER_FROM_BLOCK")]
+    l1_indexer_from_block: Option<u64>,
+
     /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
     #[arg(long, env = "MIDEN_DEBUG")]
     miden_debug: bool,
@@ -495,11 +506,15 @@ async fn main() -> anyhow::Result<()> {
     {
         match ger_addr_str.parse::<alloy::primitives::Address>() {
             Ok(ger_addr) => {
-                let indexer = miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
-                    l1_rpc_url,
-                    ger_addr,
-                    state.store.clone(),
-                );
+                let mut indexer =
+                    miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
+                        l1_rpc_url,
+                        ger_addr,
+                        state.store.clone(),
+                    );
+                if let Some(from_block) = command.l1_indexer_from_block {
+                    indexer = indexer.with_from_block_override(from_block);
+                }
                 match indexer.spawn() {
                     Ok(shutdown_tx) => {
                         // The indexer runs for the lifetime of the tokio
