@@ -5,6 +5,7 @@ WORKDIR /usr/src/app
 # copy sources
 COPY src src
 COPY axum-jrpc axum-jrpc
+COPY migrations migrations
 COPY Cargo.* .
 
 # build
