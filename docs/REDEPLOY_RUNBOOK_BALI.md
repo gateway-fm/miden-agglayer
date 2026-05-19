@@ -1,14 +1,14 @@
-# Bali v0.3.0 deploy + recovery runbook
+# Bali v0.4.0 deploy + recovery runbook
 
 Author: max.revitt@gateway.fm
 Audience: SRE on call for the bali Miden agglayer testnet
-Last-validated: 2026-05-18 against branch `feat/v0.3.0-self-heal`
-                (commit `55fa17a`).
+Last-validated: 2026-05-19 against branch `feat/v0.4.0-self-heal`
+                (HEAD `d241b0b`).
 
 ## What this runbook is for
 
-Deploying `v0.3.0` of `gatewayfm/miden-agglayer` to the bali production
-proxy (`outpost-testnet-miden-testnet/miden-agglayer-0`). v0.3.0 fixes
+Deploying `v0.4.0` of `gatewayfm/miden-agglayer` to the bali production
+proxy (`outpost-testnet-miden-testnet/miden-agglayer-0`). v0.4.0 fixes
 the regression chain that has held bali's L1→L2 bridge in
 `AccountDataNotFound` failure for ~20 wall-days, plus the underlying
 race that triggered it. Two stuck deposits (marti's `cnt=1130654` and
@@ -16,7 +16,7 @@ race that triggered it. Two stuck deposits (marti's `cnt=1130654` and
 
 ## Pre-flight: confirm the state you're about to operate on
 
-The investigation that produced v0.3.0 was done against this snapshot.
+The investigation that produced this release was done against this snapshot.
 Re-verify these still hold before deploying — if any of them have
 changed, stop and re-investigate.
 
@@ -26,7 +26,7 @@ kubectl -n outpost-testnet-miden-testnet describe pod miden-agglayer-0 \
 ```
 
 Expect: `Image: docker.io/gatewayfm/miden-agglayer:0.2.1`. If it's
-already v0.3.0 something is out of band and you should ask Max.
+already v0.4.0 something is out of band and you should ask Max.
 
 ```sql
 -- agglayer-store (kubectl port-forward svc/miden-agglayer-db 15434:5432)
@@ -50,21 +50,25 @@ WHERE network_id = 0 AND dest_net = 73 ORDER BY deposit_cnt;
 Expect `1127628..1127650 ready=true` (3 rows), `1130654 + 1131034
 ready=false` (2 rows). marti's `1130654` is one of the stuck.
 
-## Step 1 — build + push v0.3.0 image
+## Step 1 — build + push v0.4.0 image
+
+The `release.yml` GitHub Actions workflow auto-builds and pushes
+`gatewayfm/miden-agglayer:0.4.0` to Docker Hub on tag push. Local
+fallback (if CI is unavailable):
 
 ```bash
 cd ~/github/gateway/miden/miden-agglayer
-git checkout feat/v0.3.0-self-heal
+git checkout main  # after PR #45 merge
 docker buildx build --platform linux/amd64 \
-  -t gatewayfm/miden-agglayer:0.3.0 \
+  -t gatewayfm/miden-agglayer:0.4.0 \
   --push .
 ```
 
 Tag the commit:
 
 ```bash
-git tag -a v0.3.0 -m "v0.3.0 runtime self-heal + atomic config + in-process migrator + persistent indexer cursor"
-git push origin v0.3.0
+git tag -a v0.4.0 -m "v0.4.0 runtime self-heal + Public storage_mode + unified claim client + remote tx-prover + atomic config + in-process migrator + persistent indexer cursor"
+git push origin v0.4.0
 ```
 
 Image digest from the push output — paste it into the StatefulSet
@@ -75,7 +79,7 @@ patch below.
 ```bash
 kubectl -n outpost-testnet-miden-testnet patch statefulset miden-agglayer \
   --type='json' \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/gatewayfm/miden-agglayer:0.3.0"}]'
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/gatewayfm/miden-agglayer:0.4.0"}]'
 ```
 
 Watch the rollout:
@@ -177,15 +181,15 @@ DB downgrade.
 
 The new code path in `init.rs` (`storage_mode = Public`) only affects
 **new** account deployments. v0.2.1 will keep working against the
-accounts deployed by v0.3.0 (they have a stricter storage mode but the
+accounts deployed by v0.4.0 (they have a stricter storage mode but the
 proxy uses them identically).
 
-## Known scope limits of v0.3.0
+## Known scope limits of v0.4.0
 
 These are NOT fixed by this release; they're acknowledged trade-offs
 or out-of-scope follow-ups:
 
-1. **Existing bali accounts remain Private.** v0.3.0's
+1. **Existing bali accounts remain Private.** v0.4.0's
    `storage_mode = Public` only applies to fresh deployments. The
    account IDs already in `bridge_accounts.toml` on bali were created
    pre-`dbe5c2d` and are unrecoverable from a fresh sqlite loss. The
@@ -195,21 +199,13 @@ or out-of-scope follow-ups:
    no other restore path is available, the only recourse is a
    full re-init with new account IDs + an aggkit config rewrite
    pointing at the new IDs. Plan a future maintenance window for
-   that swap; until then v0.3.0's heal is your safety net.
+   that swap; until then v0.4.0's heal is your safety net.
 
 2. **STATE-C orphans aren't auto-cured.** The 27 historic
    `(NULL, NULL)` rows need the operator backfill flag in Step 4.
 
-3. **Dual-miden-client cache race still present.** `claim.rs::publish_claim`
-   builds a fresh `miden_client` on the same sqlite as the long-lived
-   one (claim.rs:611-650). The runtime self-heal catches the resulting
-   `IncorrectAccountInitialCommitment` and retries — that's the safety
-   net. The cleaner fix is to unify `publish_claim` onto the long-lived
-   client; tracked separately as `feat/v0.3.0-unify-claim-client`
-   follow-up.
-
-4. **Sepolia archival apiKey rotation.** `RUST_LOG=debug` was leaking
-   this key for the lifetime of the deployment. v0.3.0 stops the leak
+3. **Sepolia archival apiKey rotation.** `RUST_LOG=debug` was leaking
+   this key for the lifetime of the deployment. v0.4.0 stops the leak
    going forward, but the already-leaked key should be rotated via the
    secret store (AWS Secrets Manager) as a separate ticket. The new
    value flows in through `miden-agglayer-secret.l1_rpc_url` — no proxy
