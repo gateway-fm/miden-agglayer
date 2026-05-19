@@ -1,14 +1,20 @@
-# Bali v0.4.0 deploy + recovery runbook
+# Bali v0.4.1 deploy + recovery runbook
 
 Author: max.revitt@gateway.fm
 Audience: SRE on call for the bali Miden agglayer testnet
 Last-validated: 2026-05-19 against branch `feat/v0.4.0-self-heal`
                 (HEAD `d241b0b`).
 
+> **v0.4.1 vs v0.4.0:** code is identical. v0.4.1 is a re-tag that
+> drops the moving `:{major}.{minor}` (`:0.4`) tag from the release
+> workflow — both v0.4.0 release attempts failed at the Docker Hub
+> push because of tag immutability (`:latest` on attempt 1, `:0.4` on
+> attempt 2). The published image is `gatewayfm/miden-agglayer:0.4.1`.
+
 ## What this runbook is for
 
-Deploying `v0.4.0` of `gatewayfm/miden-agglayer` to the bali production
-proxy (`outpost-testnet-miden-testnet/miden-agglayer-0`). v0.4.0 fixes
+Deploying `v0.4.1` of `gatewayfm/miden-agglayer` to the bali production
+proxy (`outpost-testnet-miden-testnet/miden-agglayer-0`). v0.4.1 fixes
 the regression chain that has held bali's L1→L2 bridge in
 `AccountDataNotFound` failure for ~20 wall-days, plus the underlying
 race that triggered it. Two stuck deposits (marti's `cnt=1130654` and
@@ -26,7 +32,7 @@ kubectl -n outpost-testnet-miden-testnet describe pod miden-agglayer-0 \
 ```
 
 Expect: `Image: docker.io/gatewayfm/miden-agglayer:0.2.1`. If it's
-already v0.4.0 something is out of band and you should ask Max.
+already v0.4.1 something is out of band and you should ask Max.
 
 ```sql
 -- agglayer-store (kubectl port-forward svc/miden-agglayer-db 15434:5432)
@@ -50,25 +56,25 @@ WHERE network_id = 0 AND dest_net = 73 ORDER BY deposit_cnt;
 Expect `1127628..1127650 ready=true` (3 rows), `1130654 + 1131034
 ready=false` (2 rows). marti's `1130654` is one of the stuck.
 
-## Step 1 — build + push v0.4.0 image
+## Step 1 — build + push v0.4.1 image
 
 The `release.yml` GitHub Actions workflow auto-builds and pushes
-`gatewayfm/miden-agglayer:0.4.0` to Docker Hub on tag push. Local
+`gatewayfm/miden-agglayer:0.4.1` to Docker Hub on tag push. Local
 fallback (if CI is unavailable):
 
 ```bash
 cd ~/github/gateway/miden/miden-agglayer
 git checkout main  # after PR #45 merge
 docker buildx build --platform linux/amd64 \
-  -t gatewayfm/miden-agglayer:0.4.0 \
+  -t gatewayfm/miden-agglayer:0.4.1 \
   --push .
 ```
 
 Tag the commit:
 
 ```bash
-git tag -a v0.4.0 -m "v0.4.0 runtime self-heal + Public storage_mode + unified claim client + remote tx-prover + atomic config + in-process migrator + persistent indexer cursor"
-git push origin v0.4.0
+git tag -a v0.4.1 -m "v0.4.1 — same code as v0.4.0, re-tagged after dropping moving :major.minor tag from release workflow"
+git push origin v0.4.1
 ```
 
 Image digest from the push output — paste it into the StatefulSet
@@ -79,7 +85,7 @@ patch below.
 ```bash
 kubectl -n outpost-testnet-miden-testnet patch statefulset miden-agglayer \
   --type='json' \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/gatewayfm/miden-agglayer:0.4.0"}]'
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/gatewayfm/miden-agglayer:0.4.1"}]'
 ```
 
 Watch the rollout:
