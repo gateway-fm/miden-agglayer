@@ -29,15 +29,16 @@ jobs:
           images: gatewayfm/miden-agglayer
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-          # NOTE: `:latest` is intentionally NOT pushed. The Docker Hub
-          # repository has tag-immutability enabled on `:latest`, so every
-          # release-workflow run that tried to push it failed (v0.2.0,
-          # v0.2.1, v0.3.0, v0.4.0 first attempt) and the multi-tag buildx
-          # push rolled back the version-specific manifests with it,
-          # leaving Docker Hub without the released image. If a moving
-          # `:latest` pointer is ever wanted, remove the immutability rule
-          # on Docker Hub first, then re-add `type=raw,value=latest` here.
+          # NOTE: Only the exact `:{version}` tag is pushed. The Docker Hub
+          # repository has tag-immutability enabled across the board, so
+          # any *moving* tag fails on the second release that tries to
+          # update it. `:latest` killed v0.2.0, v0.2.1, v0.3.0, and v0.4.0
+          # first attempt; `:{major}.{minor}` (e.g. `:0.4`) killed v0.4.0
+          # second attempt because the first attempt had already written
+          # it before failing on `:latest`. Both moving patterns are now
+          # removed. If a moving pointer is ever wanted, remove the
+          # immutability rule on Docker Hub first, then re-add the
+          # corresponding `type=raw` / `type=semver` entry here.
 
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
