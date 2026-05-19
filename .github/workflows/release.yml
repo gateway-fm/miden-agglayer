@@ -30,7 +30,14 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+          # NOTE: `:latest` is intentionally NOT pushed. The Docker Hub
+          # repository has tag-immutability enabled on `:latest`, so every
+          # release-workflow run that tried to push it failed (v0.2.0,
+          # v0.2.1, v0.3.0, v0.4.0 first attempt) and the multi-tag buildx
+          # push rolled back the version-specific manifests with it,
+          # leaving Docker Hub without the released image. If a moving
+          # `:latest` pointer is ever wanted, remove the immutability rule
+          # on Docker Hub first, then re-add `type=raw,value=latest` here.
 
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
