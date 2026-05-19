@@ -94,6 +94,15 @@ GENESIS_CONFIG=/app/genesis-samples/02-with-account-files.toml
 DATA_DIR=/app/data
 ACCOUNTS_DIR=/app/accounts
 
+# HARD-PIN the remote tx-prover. The in-process tx-prover OOM-kills miden-node
+# during bridge-consumption proof generation under any non-trivial load.
+# `tx-prover.devnet.miden.io` is the publicly-exposed devnet endpoint.
+# Override via MIDEN_NODE_NTX_PROVER_URL env var only if explicitly set;
+# otherwise default to the remote so no test path accidentally exercises
+# the OOM-prone in-process prover.
+TX_PROVER_URL="${MIDEN_NODE_NTX_PROVER_URL:-https://tx-prover.devnet.miden.io}"
+echo "tx-prover (remote): ${TX_PROVER_URL}"
+
 if [ ! -f "$DATA_DIR/.bootstrapped" ]; then
   echo "Bootstrapping genesis with agglayer accounts from $GENESIS_CONFIG"
   rm -rf "$DATA_DIR"
@@ -103,7 +112,10 @@ if [ ! -f "$DATA_DIR/.bootstrapped" ]; then
 fi
 
 echo "Starting miden-node bundled..."
-exec miden-node bundled start --rpc.url "http://0.0.0.0:57291" --data-directory "$DATA_DIR"
+exec miden-node bundled start \
+  --rpc.url "http://0.0.0.0:57291" \
+  --data-directory "$DATA_DIR" \
+  --tx-prover.url "${TX_PROVER_URL}"
 EOF
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
