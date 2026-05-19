@@ -1,3 +1,4 @@
+use anyhow::Context;
 use miden_protocol::account::AccountId;
 use miden_protocol::address::NetworkId;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -151,8 +152,69 @@ pub fn save_config(
     let on_disk = AccountsConfigOnDisk::from_config(&config, net_id);
     let config_toml = toml::to_string(&on_disk)?;
     let config_path = config_path(miden_store_dir)?;
-    fs::write(config_path.clone(), config_toml)?;
+    write_config_atomic(&config_path, &config_toml)?;
     Ok(config_path)
+}
+
+/// Atomically replace `config_path` with `config_toml`.
+///
+/// Writes to a sibling temp file in the same directory, fsync's it, then
+/// renames it into place. The rename is atomic on POSIX when source and
+/// destination are on the same filesystem — which is guaranteed here by
+/// constructing the temp path with `with_extension` on the target path.
+///
+/// Motivation: a non-atomic `fs::write` can leave `bridge_accounts.toml`
+/// truncated if the process is OOMKilled (or the host loses power) mid-write.
+/// On the next start, `load_config` would silently deserialize the partial
+/// file: fields like `ger_manager` are `#[serde(default)]` and would become
+/// `None`, causing GER injection to fall back to the wrong account and fail
+/// with `AccountDataNotFound`. Bali hit this failure mode after two OOMKills
+/// in four days.
+fn write_config_atomic(config_path: &std::path::Path, config_toml: &str) -> anyhow::Result<()> {
+    // Sibling temp file on the same mount as the target — required for the
+    // rename below to be atomic rather than degenerate to copy-then-unlink.
+    let tmp = config_path.with_extension("toml.new");
+
+    // Best-effort cleanup of any stragglers from a previously crashed run.
+    // We don't care if it doesn't exist; only surface errors that aren't
+    // NotFound so we don't mask the real failure below.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to clear stale temp file {}", tmp.display()));
+        }
+    }
+
+    fs::write(&tmp, config_toml)
+        .with_context(|| format!("failed to write temp config file {}", tmp.display()))?;
+
+    // fsync the file contents before renaming so that a crash between the
+    // write and the rename can't expose pre-fsync (zero-filled) contents
+    // after the rename completes.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .with_context(|| {
+            format!(
+                "failed to reopen temp config file {} for fsync",
+                tmp.display()
+            )
+        })?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync temp config file {}", tmp.display()))?;
+    drop(file);
+
+    fs::rename(&tmp, config_path).with_context(|| {
+        format!(
+            "failed to rename temp config {} -> {}",
+            tmp.display(),
+            config_path.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 pub fn load_config(miden_store_dir: Option<PathBuf>) -> anyhow::Result<AccountsConfig> {
@@ -267,5 +329,112 @@ mod tests {
             loaded.bridge.0,
             AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap()
         );
+    }
+
+    fn full_cfg() -> AccountsConfig {
+        AccountsConfig {
+            service: dummy(),
+            bridge: dummy(),
+            faucet_eth: Some(dummy()),
+            faucet_agg: Some(dummy()),
+            wallet_hardhat: dummy(),
+            ger_manager: Some(dummy()),
+        }
+    }
+
+    /// Simulates a mid-write OOMKill by truncating the on-disk file to half
+    /// its length. `load_config` must surface the corruption as an error
+    /// rather than deserialising a partial TOML — otherwise `#[serde(default)]`
+    /// fields like `ger_manager` would silently fall back to `None`, which is
+    /// the exact failure path that hurt Bali after two OOMKills in four days.
+    /// After the corruption, a fresh `save_config` must heal the file.
+    #[test]
+    fn load_rejects_truncated_file_then_atomic_save_heals_it() {
+        let dir = tempdir().unwrap();
+        save_config(
+            full_cfg(),
+            &NetworkId::Testnet,
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        let path = dir.path().join("bridge_accounts.toml");
+        let body = fs::read_to_string(&path).unwrap();
+        // Truncate to half length — guaranteed to slice mid-key or mid-value
+        // because every field name + bech32 value is longer than a few bytes.
+        let half = body.len() / 2;
+        fs::write(&path, &body[..half]).unwrap();
+
+        let truncated_load = load_config(Some(dir.path().to_path_buf()));
+        assert!(
+            truncated_load.is_err(),
+            "expected truncated TOML to fail to load; got Ok({:?})",
+            truncated_load.ok()
+        );
+
+        // Re-save via the atomic path and confirm it loads cleanly with all
+        // optional fields intact (i.e. not silently defaulted to None).
+        save_config(
+            full_cfg(),
+            &NetworkId::Testnet,
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        let healed = load_config(Some(dir.path().to_path_buf())).unwrap();
+        assert!(
+            healed.ger_manager.is_some(),
+            "atomic save must round-trip ger_manager; got None which would silently \
+             trigger the AccountDataNotFound regression"
+        );
+        assert!(healed.faucet_eth.is_some());
+        assert!(healed.faucet_agg.is_some());
+    }
+
+    /// A stale `bridge_accounts.toml.new` left over from a crashed prior run
+    /// must not block the next save. `write_config_atomic` should clean it up
+    /// and rewrite cleanly.
+    #[test]
+    fn atomic_save_overwrites_stale_tmp_file_from_prior_crash() {
+        let dir = tempdir().unwrap();
+        let stale_tmp = dir.path().join("bridge_accounts.toml.new");
+        fs::write(
+            &stale_tmp,
+            b"this is garbage left over from a crashed run\n",
+        )
+        .unwrap();
+        assert!(stale_tmp.exists());
+
+        save_config(
+            full_cfg(),
+            &NetworkId::Testnet,
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        // Temp file must be gone (consumed by the rename) and the real config
+        // must load successfully.
+        assert!(
+            !stale_tmp.exists(),
+            "stale temp file should have been removed or renamed away"
+        );
+        let loaded = load_config(Some(dir.path().to_path_buf())).unwrap();
+        assert!(loaded.ger_manager.is_some());
+    }
+
+    /// Belt-and-braces: confirm the atomic save never leaves the target file
+    /// in a partial state. After a successful save, the target's contents must
+    /// exactly match what `toml::to_string` produced for the on-disk config.
+    #[test]
+    fn atomic_save_produces_complete_file_contents() {
+        let dir = tempdir().unwrap();
+        let cfg = full_cfg();
+        let expected = toml::to_string(&AccountsConfigOnDisk::from_config(
+            &cfg,
+            &NetworkId::Testnet,
+        ))
+        .unwrap();
+        save_config(cfg, &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
+        let actual = fs::read_to_string(dir.path().join("bridge_accounts.toml")).unwrap();
+        assert_eq!(actual, expected);
     }
 }

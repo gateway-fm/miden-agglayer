@@ -7,6 +7,8 @@
 
 pub mod memory;
 #[cfg(feature = "postgres")]
+pub mod migrator;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_tests;
@@ -132,6 +134,18 @@ pub trait Store: Send + Sync + 'static {
     async fn set_latest_block_number(&self, n: u64) -> anyhow::Result<()>;
     /// Increment block number by 1 and return the new value.
     async fn advance_block_number(&self) -> anyhow::Result<u64>;
+
+    // === L1 indexer cursor (RD-862 follow-up) ===
+    /// Last successfully-polled L1 block. Returns 0 if the indexer has
+    /// never persisted a cursor on this deployment.
+    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    /// Persist the last-processed L1 block. Called after each successful
+    /// batch so a restart resumes from here instead of jumping to L1 head.
+    async fn set_l1_indexer_cursor(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     // === Synthetic logs ===
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;

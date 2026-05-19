@@ -92,6 +92,34 @@ impl Store for PgStore {
         Ok(val as u64)
     }
 
+    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT last_processed FROM l1_indexer_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        match row {
+            Some(r) => {
+                let val: i64 = r.get(0);
+                Ok(val as u64)
+            }
+            None => Ok(0),
+        }
+    }
+
+    async fn set_l1_indexer_cursor(&self, block: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE l1_indexer_state SET last_processed = $1, updated_at = now() WHERE id = 1",
+                &[&(block as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── Logs ─────────────────────────────────────────────────────
 
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {

@@ -53,26 +53,10 @@ services:
       timeout: 2s
       retries: 5
 
-  # ── Migration (applies every migrations/*.sql then exits) ─────────────────
-  agglayer-migrate:
-    image: postgres:16-alpine
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        echo "Running miden-agglayer migrations..."
-        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/001_initial.sql
-        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/002_faucet_registry.sql
-        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/003_unclaimable_claims.sql
-        PGPASSWORD=agglayer psql -h agglayer-postgres -U agglayer -d agglayer_store -f /migrations/004_claim_watcher.sql
-        echo "Migrations complete."
-    volumes:
-      - ./migrations/001_initial.sql:/migrations/001_initial.sql:ro
-      - ./migrations/002_faucet_registry.sql:/migrations/002_faucet_registry.sql:ro
-      - ./migrations/003_unclaimable_claims.sql:/migrations/003_unclaimable_claims.sql:ro
-      - ./migrations/004_claim_watcher.sql:/migrations/004_claim_watcher.sql:ro
-    depends_on:
-      agglayer-postgres:
-        condition: service_healthy
+  # Migrations are run IN-PROCESS by the miden-agglayer proxy on startup
+  # (see `src/store/migrator.rs`). The old `agglayer-migrate` one-shot
+  # service is intentionally removed — its replacement embeds the SQL via
+  # `include_str!` into the binary so the proxy and its schema cannot drift.
 
   # ── L2 Chain (Miden node in bundled mode) ──────────────────────────────────
   # Built from `0xMiden/miden-node` (production binary), NOT the testing
@@ -91,6 +75,12 @@ services:
       - "57291:57291"
     environment:
       RUST_LOG: "info,miden_node_ntx_builder=debug,miden_tx=debug"
+      # Offload tx proving to Miden's devnet prover so local miden-node doesn't
+      # OOM-kill itself during bridge-consumption proof generation. Only
+      # `tx-prover.devnet.miden.io` is publicly exposed by Miden devnet; block
+      # proving stays in-process (no remote endpoint available). This env var
+      # maps to the `--tx-prover.url` flag of `miden-node bundled start`.
+      MIDEN_NODE_NTX_PROVER_URL: "${MIDEN_NODE_NTX_PROVER_URL:-https://tx-prover.devnet.miden.io}"
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 57291 || exit 1"]
       interval: 3s
@@ -141,8 +131,8 @@ services:
     depends_on:
       miden-node:
         condition: service_healthy
-      agglayer-migrate:
-        condition: service_completed_successfully
+      agglayer-postgres:
+        condition: service_healthy
     healthcheck:
       test: >-
         curl -sf -X POST http://localhost:8546

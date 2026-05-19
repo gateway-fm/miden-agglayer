@@ -80,6 +80,17 @@ struct Command {
     #[arg(long, env = "GER_L1_ADDRESS")]
     ger_l1_address: Option<String>,
 
+    /// Operator override for the L1 InfoTree indexer's start block. When
+    /// set, the indexer ignores the persisted cursor and forces a forward
+    /// walk from this L1 block on the next boot — used to back-fill
+    /// historic `UpdateL1InfoTree` events whose `ger_entries` rows landed
+    /// with NULL `(M, R)` (the STATE C orphans pattern seen on bali, 27
+    /// rows from proxy blocks 95k-130k). After the back-fill completes
+    /// and the cursor advances forward, remove the flag for subsequent
+    /// boots — it serves no purpose once the cursor has moved past it.
+    #[arg(long, env = "L1_INDEXER_FROM_BLOCK")]
+    l1_indexer_from_block: Option<u64>,
+
     /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
     #[arg(long, env = "MIDEN_DEBUG")]
     miden_debug: bool,
@@ -316,6 +327,21 @@ async fn main() -> anyhow::Result<()> {
     let store: Arc<dyn Store> = if let Some(_db_url) = &command.database_url {
         #[cfg(feature = "postgres")]
         {
+            // Run embedded SQL migrations BEFORE the connection pool opens.
+            // This replaces the `agglayer-migrate` one-shot service that
+            // hardcoded the migration list in docker-compose.e2e.yml — new
+            // migrations are now part of the deploy artifact (compiled into
+            // the binary via `include_str!`) so the proxy and its schema
+            // can't drift out of sync.
+            let report = miden_agglayer_service::store::migrator::run_migrations(_db_url)
+                .await
+                .context("running embedded DB migrations on startup")?;
+            tracing::info!(
+                applied = report.applied.len(),
+                already_present = report.already_present.len(),
+                "DB migrations complete"
+            );
+
             let pg = miden_agglayer_service::store::postgres::PgStore::new(_db_url).await?;
             Arc::new(pg)
         }
@@ -404,6 +430,14 @@ async fn main() -> anyhow::Result<()> {
         command.miden_debug,
     )?;
 
+    // Self-heal is RUNTIME-only, not startup-only. See `src/account_recovery.rs`
+    // — when a Miden submission inside `insert_ger` or `publish_claim` returns
+    // an `AccountDataNotFound` or `IncorrectAccountInitialCommitment` error,
+    // the caller reimports the affected account from the live Miden node and
+    // retries once. We deliberately do NOT brick the proxy at startup over
+    // locally-deployed-but-not-yet-network-tracked accounts (e.g. service,
+    // wallet_hardhat) — those are healthy until first use, at which point
+    // their initial `submit_new_transaction` deploys them on-chain.
     // Run restore if requested
     if command.restore {
         let result =
@@ -443,21 +477,6 @@ async fn main() -> anyhow::Result<()> {
     // can mark it Landed once it sees the bridge consume it.
     state.expected_mints = expected_mints_handle;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
-    // The fresh `MidenClient` built per `publish_claim` in `src/claim.rs` must connect to
-    // the SAME node URL as `MidenClient::new` — that's what `command.miden_node` feeds.
-    // This used to read an independent `MIDEN_NODE_URL` env var with a `http://miden-node:57291`
-    // fallback; when the env var wasn't set by the deployment, fresh-client builds
-    // unconditionally failed with `dns error: Name or service not known` on the fallback
-    // hostname, while the persistent sync loop (which reads `command.miden_node`) kept
-    // working fine. Claims silently never landed. See RD-856.
-    state.miden_node_url = command
-        .miden_node
-        .clone()
-        .unwrap_or_else(|| "http://localhost:57291".to_string());
-    tracing::info!(
-        miden_node_url = %state.miden_node_url,
-        "fresh-client `publish_claim` path will dial this Miden node URL"
-    );
     state.miden_api_key = command.miden_api_key;
 
     // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
@@ -471,11 +490,15 @@ async fn main() -> anyhow::Result<()> {
     {
         match ger_addr_str.parse::<alloy::primitives::Address>() {
             Ok(ger_addr) => {
-                let indexer = miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
-                    l1_rpc_url,
-                    ger_addr,
-                    state.store.clone(),
-                );
+                let mut indexer =
+                    miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
+                        l1_rpc_url,
+                        ger_addr,
+                        state.store.clone(),
+                    );
+                if let Some(from_block) = command.l1_indexer_from_block {
+                    indexer = indexer.with_from_block_override(from_block);
+                }
                 match indexer.spawn() {
                     Ok(shutdown_tx) => {
                         // The indexer runs for the lifetime of the tokio
@@ -634,6 +657,7 @@ mod hardening_tests {
                 .to_string(),
             l1_rpc_url: None,
             ger_l1_address: None,
+            l1_indexer_from_block: None,
             miden_debug: false,
             cors_allowed_origins: cors,
             admin_api_key: admin,

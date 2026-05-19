@@ -59,6 +59,24 @@ pub async fn restore(
 ) -> anyhow::Result<RestoreResult> {
     tracing::info!("=== RESTORE: starting state reconstruction ===");
 
+    // Phase 0: Re-import every bridge_accounts.toml account from the live
+    // Miden node into the local sqlite. Without this, `--reset-miden-store
+    // --restore` is a footgun: reset wipes the sqlite, restore's Phase 1
+    // calls `sync_state()` which only syncs deltas for already-tracked
+    // accounts (not new imports), and the proxy comes back with zero
+    // local rows for any account → every subsequent submission fails
+    // with `AccountDataNotFound`. This is the regression chain that
+    // locked bali into 20 days of stuck deposits after an operator ran
+    // the recovery flags.
+    //
+    // Best-effort: per-account failures are logged + counted but do not
+    // abort restore. Locally-deployed-but-not-network-tracked accounts
+    // (`service`, `wallet_hardhat`) will return `AccountNotFoundOnChain`
+    // here and that's fine — they're healthy until first use.
+    tracing::info!("Phase 0: re-importing bridge accounts from Miden node...");
+    crate::account_recovery::reimport_known_accounts(miden_client, accounts).await;
+    tracing::info!("Phase 0 complete: bridge account reimport pass done");
+
     // Phase 1: Sync miden state
     tracing::info!("Phase 1: syncing miden state...");
     let block_num = sync_miden_block(miden_client, store).await?;
