@@ -147,8 +147,8 @@ mod tests {
 
         let filter = super::log_filter().expect("log_filter must build");
         let capture = CaptureLayer::default();
-        let subscriber = tracing_subscriber::Registry::default()
-            .with(capture.clone().with_filter(filter));
+        let subscriber =
+            tracing_subscriber::Registry::default().with(capture.clone().with_filter(filter));
 
         tracing::subscriber::with_default(subscriber, || f(&capture));
 
@@ -205,7 +205,10 @@ mod tests {
 
             let seen = capture.seen.lock().unwrap();
             for (target, level) in seen.iter() {
-                if matches!(target.as_str(), "alloy_transport" | "alloy_rpc_client" | "reqwest") {
+                if matches!(
+                    target.as_str(),
+                    "alloy_transport" | "alloy_rpc_client" | "reqwest"
+                ) {
                     assert!(
                         *level <= tracing::Level::INFO,
                         "{target} event at {level:?} leaked through filter",
@@ -227,8 +230,9 @@ mod tests {
 
             let seen = capture.seen.lock().unwrap();
             assert!(
-                seen.iter().any(|(t, l)| t == "miden_agglayer_service::claim_watcher"
-                    && *l == tracing::Level::DEBUG),
+                seen.iter()
+                    .any(|(t, l)| t == "miden_agglayer_service::claim_watcher"
+                        && *l == tracing::Level::DEBUG),
                 "own-crate debug event was suppressed by clamp — directive too broad. seen={seen:?}",
             );
         });
