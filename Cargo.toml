@@ -22,6 +22,9 @@ path = "src/bin/check_burn_root.rs"
 
 [dev-dependencies]
 tempfile = "3.10"
+# Used only by `r5_oversize_error_matches_aggsender_parser` to mirror aggkit's
+# `ParseMaxRangeFromError` regex verbatim and pin the error-format contract.
+regex = "1.10"
 
 [profile.dev.package."*"]
 opt-level = 1
