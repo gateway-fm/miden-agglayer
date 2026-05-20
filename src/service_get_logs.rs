@@ -89,8 +89,14 @@ pub fn validate_getlogs_filter(filter: &LogFilter, current_block: u64) -> Result
     // Saturate so a `from` that exceeds `to` doesn't underflow into a giant span.
     let span = to.saturating_sub(from).saturating_add(1);
     if span > MAX_GETLOGS_BLOCK_RANGE {
+        // Format chosen to match aggkit's `ParseMaxRangeFromError` reMaxRange regex
+        // `block range too large, max range:\s*(\d+)` so aggsender's reactive-chunking
+        // fallback can extract the limit and split the request automatically. See
+        // `aggkit/common/errors.go` and `aggkit/claimsync/agglayer_bridge_l2_reader.go`.
+        // The regression test `r5_oversize_error_matches_aggsender_parser` below pins
+        // this contract — do not change the format without updating that test.
         return Err(format!(
-            "eth_getLogs block range too large: {span} > {MAX_GETLOGS_BLOCK_RANGE} (paginate)"
+            "eth_getLogs block range too large, max range: {MAX_GETLOGS_BLOCK_RANGE} (got {span}, paginate)"
         ));
     }
     #[allow(clippy::collapsible_if)]
@@ -158,6 +164,61 @@ mod tests {
         // Accepts: tip-only query (default `latest`/`latest` resolves to current_block).
         let tip = LogFilter::default();
         assert!(validate_getlogs_filter(&tip, 100).is_ok());
+    }
+
+    /// Regression test for an interop bug we hit on the post-relaunch Bali rollup
+    /// 2026-05-20: aggsender's `ParseMaxRangeFromError` parser couldn't extract the
+    /// limit from the agglayer's "X > Y (paginate)" error format, so its reactive
+    /// chunked-fallback never fired and the bridge-out cert build was stuck retrying
+    /// forever. The fix was to rewrite the error string to the canonical
+    /// "max range: N" shape that aggsender's `reMaxRange` regex matches.
+    ///
+    /// This test locks the contract: a regex copy-pasted from
+    /// `aggkit/common/errors.go:12` (and verified in `aggkit/common/errors_test.go`)
+    /// MUST find a numeric capture in the over-range error string. If anyone ever
+    /// reverts the format, this test fails before the change ships.
+    #[test]
+    fn r5_oversize_error_matches_aggsender_parser() {
+        use regex::Regex;
+        // Copied verbatim from `aggkit/common/errors.go:12` — the regex aggsender
+        // uses to detect "split this into chunks of N blocks" hints. If this regex
+        // ever changes upstream we want a test failure; do not "fix" it by relaxing
+        // here. See [[agglayer-getlogs-error-format-mismatch]] in the gateway memory.
+        let re_max_range = Regex::new(r"block range too large, max range:\s*(\d+)").unwrap();
+
+        // Trigger the over-range path with a realistic ratio (matches what aggsender
+        // sends on a fresh-deployment cold-start scan: from=0, to=cluster's L2 head).
+        let oversize = LogFilter {
+            from_block: Some("0x0".into()),
+            to_block: Some("0xd2a7d".into()), // 862_653 — typical cold-start ceiling
+            ..Default::default()
+        };
+        let err = validate_getlogs_filter(&oversize, 1_000_000)
+            .expect_err("oversize range must be rejected");
+
+        // 1. Bare error string must match the parser regex.
+        let caps_bare = re_max_range
+            .captures(&err)
+            .unwrap_or_else(|| panic!("agglayer error format diverged from aggsender parser; aggsender's reactive chunking will silently fail. err={err}"));
+        let parsed_max: u64 = caps_bare[1].parse().unwrap();
+        assert_eq!(
+            parsed_max, MAX_GETLOGS_BLOCK_RANGE,
+            "parsed max range ({parsed_max}) must equal the agglayer cap ({MAX_GETLOGS_BLOCK_RANGE})"
+        );
+
+        // 2. Wrapped error (the actual shape aggsender sees: an err chain wrapped
+        // multiple levels deep by gRPC/Go wrappers) must ALSO match. This is the
+        // string aggsender actually parses — its parser does `.error()` on the
+        // root err, getting the fully unwrapped concatenation. Confirm our format
+        // is parseable even when prefixed with the wrapping aggsender adds.
+        let wrapped = format!(
+            "error getting certificate build params: error generating build params: \
+             error getting unset claims for block range: {err}"
+        );
+        let caps_wrapped = re_max_range.captures(&wrapped).unwrap_or_else(|| {
+            panic!("wrapped error did not match parser regex (caller wrapping broke contract): {wrapped}")
+        });
+        assert_eq!(&caps_wrapped[1], &caps_bare[1]);
     }
 
     #[test]
