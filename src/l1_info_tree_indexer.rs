@@ -37,11 +37,13 @@
 //!
 //! Either ordering converges to a resolved entry. No race window.
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use sha3::{Digest, Keccak256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -247,9 +249,21 @@ impl L1InfoTreeIndexer {
         let logs: Vec<Log> = provider.get_logs(&filter).await?;
         let log_count = logs.len();
 
+        // Per-poll cache: one `eth_getBlockByNumber` per *unique* L1 block in
+        // the batch, used to populate the L1 timestamp written to
+        // `ger_entries.timestamp`. Events from the same block share an RPC
+        // roundtrip, so a steady-state poll that sees 0–1 unique blocks per
+        // tick costs nothing extra in the common case.
+        let mut block_timestamps: HashMap<u64, u64> = HashMap::new();
+
         let mut indexed = 0usize;
         for log in logs {
-            match self.process_log(&log).await {
+            let block_number = log.block_number.unwrap_or(0);
+            let timestamp = self
+                .resolve_block_timestamp(provider, block_number, &mut block_timestamps)
+                .await;
+
+            match self.process_log(&log, block_number, timestamp).await {
                 Ok(true) => indexed += 1,
                 Ok(false) => {}
                 Err(e) => {
@@ -258,7 +272,7 @@ impl L1InfoTreeIndexer {
                     // poison log forever.
                     tracing::warn!(
                         error = %e,
-                        block = log.block_number.unwrap_or(0),
+                        block = block_number,
                         tx = ?log.transaction_hash,
                         "L1InfoTreeIndexer: failed to index log"
                     );
@@ -303,7 +317,12 @@ impl L1InfoTreeIndexer {
         Ok(())
     }
 
-    async fn process_log(&self, log: &Log) -> anyhow::Result<bool> {
+    async fn process_log(
+        &self,
+        log: &Log,
+        block_number: u64,
+        timestamp: u64,
+    ) -> anyhow::Result<bool> {
         // Both event signatures have the same shape: two indexed bytes32.
         // Topic 0 = event sig hash, topic 1 = mainnetExitRoot, topic 2 = rollupExitRoot.
         let topics = log.topics();
@@ -329,7 +348,7 @@ impl L1InfoTreeIndexer {
         let combined = combined_ger(&mainnet, &rollup);
 
         self.store
-            .set_ger_exit_roots(&combined, mainnet, rollup)
+            .set_ger_exit_roots(&combined, mainnet, rollup, block_number, timestamp)
             .await?;
 
         // INFO-level so test runs show every pair indexed in real time
@@ -341,10 +360,55 @@ impl L1InfoTreeIndexer {
             mainnet = %hex::encode(mainnet),
             rollup = %hex::encode(rollup),
             combined = %hex::encode(combined),
-            block = log.block_number.unwrap_or(0),
+            block = block_number,
+            timestamp,
             "L1InfoTreeIndexer: indexed exit-root pair"
         );
         Ok(true)
+    }
+
+    /// Resolve the L1 block timestamp for a given block number, using and
+    /// updating the per-poll cache. Returns 0 if the block is unknown
+    /// (block_number == 0) or if the RPC lookup fails — the indexer's
+    /// upsert path keeps the row writable in that case, and the next
+    /// successful poll will overwrite with the real timestamp.
+    async fn resolve_block_timestamp<P: Provider>(
+        &self,
+        provider: &P,
+        block_number: u64,
+        cache: &mut HashMap<u64, u64>,
+    ) -> u64 {
+        if block_number == 0 {
+            return 0;
+        }
+        if let Some(&ts) = cache.get(&block_number) {
+            return ts;
+        }
+        match provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .await
+        {
+            Ok(Some(block)) => {
+                let ts = block.header.timestamp;
+                cache.insert(block_number, ts);
+                ts
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    block = block_number,
+                    "L1InfoTreeIndexer: get_block_by_number returned None; timestamp left as 0 (will be overwritten on next observation)"
+                );
+                0
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    block = block_number,
+                    "L1InfoTreeIndexer: get_block_by_number failed; timestamp left as 0 (will be overwritten on next observation)"
+                );
+                0
+            }
+        }
     }
 }
 

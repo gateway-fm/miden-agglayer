@@ -162,11 +162,21 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool>;
     async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>>;
     async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>>;
+    /// Set the `(mainnet, rollup)` decomposition and L1 origin metadata for a
+    /// GER. Called by `L1InfoTreeIndexer` after observing the source
+    /// `UpdateL1InfoTree` / `UpdateGlobalExitRoot` event on L1, so the
+    /// `l1_block_number` / `l1_timestamp` here are the L1 block where the
+    /// event was emitted (the authoritative source for `zkevm_getExitRootsByGER`).
+    /// UPSERTs: on conflict, all four columns are overwritten — the indexer's
+    /// L1-sourced view supersedes any earlier hardcoded-0 row that may have
+    /// been left by an L2-side write path that didn't know the L1 origin yet.
     async fn set_ger_exit_roots(
         &self,
         ger: &[u8; 32],
         mainnet_exit_root: [u8; 32],
         rollup_exit_root: [u8; 32],
+        l1_block_number: u64,
+        l1_timestamp: u64,
     ) -> anyhow::Result<()>;
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
     async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()>;
