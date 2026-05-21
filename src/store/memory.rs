@@ -236,6 +236,8 @@ impl Store for InMemoryStore {
         ger: &[u8; 32],
         mainnet_exit_root: [u8; 32],
         rollup_exit_root: [u8; 32],
+        l1_block_number: u64,
+        l1_timestamp: u64,
     ) -> anyhow::Result<()> {
         let mut seen = self.seen_gers.write();
         let entry = seen.entry(*ger).or_insert(GerEntry {
@@ -246,6 +248,10 @@ impl Store for InMemoryStore {
         });
         entry.mainnet_exit_root = Some(mainnet_exit_root);
         entry.rollup_exit_root = Some(rollup_exit_root);
+        // Mirror the PgStore semantics: indexer is authoritative for L1
+        // origin metadata, so overwrite unconditionally on every call.
+        entry.block_number = l1_block_number;
+        entry.timestamp = l1_timestamp;
         Ok(())
     }
 
@@ -650,6 +656,41 @@ impl Store for InMemoryStore {
 mod tests {
     use super::*;
     use crate::log_synthesis::{CLAIM_EVENT_TOPIC, TopicFilter};
+
+    #[tokio::test]
+    async fn set_ger_exit_roots_persists_l1_block_and_timestamp() {
+        // Before this change, both columns were hardcoded to 0 in PgStore and
+        // ignored in InMemoryStore. The indexer is the authoritative writer
+        // for L1 origin metadata, so the InMemoryStore — which mirrors
+        // PgStore semantics for tests — must round-trip them.
+        let store = InMemoryStore::new();
+        let ger = [0x11u8; 32];
+        let mainnet = [0x22u8; 32];
+        let rollup = [0x33u8; 32];
+
+        // First write: fresh entry — block + ts land as given.
+        store
+            .set_ger_exit_roots(&ger, mainnet, rollup, 10_900_000, 1_779_300_000)
+            .await
+            .unwrap();
+        let entry = store.get_ger_entry(&ger).await.unwrap().unwrap();
+        assert_eq!(entry.mainnet_exit_root, Some(mainnet));
+        assert_eq!(entry.rollup_exit_root, Some(rollup));
+        assert_eq!(entry.block_number, 10_900_000);
+        assert_eq!(entry.timestamp, 1_779_300_000);
+
+        // Second write at a later L1 block (same GER hash): indexer is
+        // authoritative, so the new L1 origin metadata overwrites the old.
+        // This is the "L2 path wrote the row first with stale values; later
+        // indexer poll corrects it" convergence the docstring describes.
+        store
+            .set_ger_exit_roots(&ger, mainnet, rollup, 10_900_005, 1_779_300_060)
+            .await
+            .unwrap();
+        let entry = store.get_ger_entry(&ger).await.unwrap().unwrap();
+        assert_eq!(entry.block_number, 10_900_005);
+        assert_eq!(entry.timestamp, 1_779_300_060);
+    }
 
     #[tokio::test]
     async fn test_block_number() {

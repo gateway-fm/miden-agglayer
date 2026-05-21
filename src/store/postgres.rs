@@ -337,6 +337,8 @@ impl Store for PgStore {
         ger: &[u8; 32],
         mainnet_exit_root: [u8; 32],
         rollup_exit_root: [u8; 32],
+        l1_block_number: u64,
+        l1_timestamp: u64,
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         let mainnet = mainnet_exit_root.to_vec();
@@ -344,11 +346,19 @@ impl Store for PgStore {
         client
             .execute(
                 "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
-                 VALUES ($1, $2, $3, 0, 0)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (ger_hash) DO UPDATE
                  SET mainnet_exit_root = EXCLUDED.mainnet_exit_root,
-                     rollup_exit_root = EXCLUDED.rollup_exit_root",
-                &[&ger.as_slice(), &mainnet, &rollup],
+                     rollup_exit_root  = EXCLUDED.rollup_exit_root,
+                     block_number      = EXCLUDED.block_number,
+                     timestamp         = EXCLUDED.timestamp",
+                &[
+                    &ger.as_slice(),
+                    &mainnet,
+                    &rollup,
+                    &(l1_block_number as i64),
+                    &(l1_timestamp as i64),
+                ],
             )
             .await?;
         Ok(())
