@@ -58,8 +58,42 @@ fail() { echo -e "${RED}[$(date +%H:%M:%S)] FAIL:${NC} $*" >&2; exit 1; }
 command -v psql >/dev/null || fail "psql not found (apt-get install postgresql-client)"
 command -v curl >/dev/null || fail "curl not found"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 export PGPASSWORD="$PG_PASS"
 PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAX)
+
+# Run a psql query and emit ONLY the result on stdout. We deliberately drop
+# stderr because `psql` on systems where the locale isn't generated (common
+# on minimal LXCs / CI runners) emits multi-line perl warnings on stderr,
+# and the prior `2>&1` capture pattern was concatenating them into the
+# query result, breaking downstream regex extraction. Real psql errors
+# manifest as empty output, which every caller already checks via `[[ -z ]]`
+# or by validating the result shape.
+pgq() {
+    "${PSQL[@]}" -c "$1" 2>/dev/null
+}
+
+# Bootstrap: if the script is run on a fresh stack with no prior L1→L2
+# deposit, the ClaimEvent row this test relies on doesn't exist yet.
+# Auto-run the prerequisites unless the caller disables it.
+AUTO_BOOTSTRAP="${AUTO_BOOTSTRAP:-1}"
+
+ensure_prereq_state() {
+    local existing
+    existing=$(pgq "SELECT 1 FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' LIMIT 1;")
+    if [[ -n "$existing" ]]; then
+        log "ClaimEvent row already present in synthetic_logs — skipping bootstrap"
+        return 0
+    fi
+    if [[ "$AUTO_BOOTSTRAP" != "1" ]]; then
+        fail "no ClaimEvent in synthetic_logs and AUTO_BOOTSTRAP=0 — run 'make e2e-l1-to-l2 && make e2e-claim-watcher' first"
+    fi
+    step "Bootstrap: no ClaimEvent yet — running e2e-l1-to-l2 + e2e-claim-watcher"
+    "$SCRIPT_DIR/e2e-l1-to-l2.sh" >/dev/null
+    "$SCRIPT_DIR/e2e-claim-watcher.sh" >/dev/null
+    log "Bootstrap complete"
+}
 
 # Pull a Prometheus counter value (single un-labeled sample). Returns 0 if absent.
 counter() {
@@ -71,6 +105,9 @@ counter() {
     ')
     echo "${value%.*}"
 }
+
+# ── Step 0: Ensure prereq state exists (bootstrap on fresh stack) ─────────────
+ensure_prereq_state
 
 # ── Step 1: Snapshot baseline counters + log offset ───────────────────────────
 # We assert against DB state and proxy log emissions, not /metrics counters.
@@ -90,7 +127,7 @@ log "  baseline synthesised log lines: ${LOG_OFFSET}"
 
 # ── Step 2: Locate the ClaimEvent in synthetic_logs ───────────────────────────
 step "Locating ClaimEvent row in synthetic_logs"
-LOG_ROW=$("${PSQL[@]}" -c "SELECT data FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' ORDER BY block_number DESC LIMIT 1;" 2>&1)
+LOG_ROW=$(pgq "SELECT data FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' ORDER BY block_number DESC LIMIT 1;")
 [[ -z "$LOG_ROW" ]] && fail "no ClaimEvent in synthetic_logs — run 'make e2e-l1-to-l2' first"
 # ABI data layout: 0x + 32-byte global_index + ... (the rest is origin_network, etc.)
 GI_HEX=$(echo "$LOG_ROW" | sed -E 's/^0x([0-9a-f]{64}).*/\1/')
@@ -99,7 +136,7 @@ log "  global_index = 0x${GI_HEX}"
 
 # ── Step 3: Locate the matching row in claim_watcher_processed ────────────────
 step "Locating claim_watcher_processed row for this global_index"
-NOTE_ID=$("${PSQL[@]}" -c "SELECT note_id FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex') LIMIT 1;" 2>&1 || true)
+NOTE_ID=$(pgq "SELECT note_id FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex') LIMIT 1;" || true)
 if [[ -n "$NOTE_ID" ]]; then
     log "  note_id = ${NOTE_ID}"
 else
@@ -108,17 +145,17 @@ fi
 
 # ── Step 4: Simulate the desync — delete both rows ────────────────────────────
 step "Deleting synthetic_logs ClaimEvent row to simulate crash-recovery desync"
-DEL_LOGS=$("${PSQL[@]}" -c "DELETE FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND data LIKE '0x${GI_HEX}%' RETURNING block_number;" 2>&1)
+DEL_LOGS=$(pgq "DELETE FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND data LIKE '0x${GI_HEX}%' RETURNING block_number;")
 log "  deleted synthetic_logs rows: $(echo "$DEL_LOGS" | wc -l)"
 
 if [[ -n "${NOTE_ID:-}" ]]; then
     step "Deleting claim_watcher_processed row so the watcher re-evaluates this CLAIM"
-    DEL_WATCHER=$("${PSQL[@]}" -c "DELETE FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex') RETURNING note_id;" 2>&1)
+    DEL_WATCHER=$(pgq "DELETE FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex') RETURNING note_id;")
     log "  deleted claim_watcher_processed rows: $(echo "$DEL_WATCHER" | wc -l)"
 fi
 
 # Sanity-check: the predicate the watcher uses MUST now return false.
-HAS_AFTER_DELETE=$("${PSQL[@]}" -c "SELECT EXISTS(SELECT 1 FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex')) OR EXISTS(SELECT 1 FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${GI_HEX}%');" 2>&1)
+HAS_AFTER_DELETE=$(pgq "SELECT EXISTS(SELECT 1 FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex')) OR EXISTS(SELECT 1 FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${GI_HEX}%');")
 [[ "$HAS_AFTER_DELETE" != "f" ]] && fail "ClaimEvent state still recoverable after delete (got '$HAS_AFTER_DELETE') — test setup broken; check schema"
 log "  has_claim_event_for_global_index simulated → false ✓"
 
@@ -161,11 +198,11 @@ fi
 
 # Confirm the ClaimEvent is recoverable again via the same predicate the
 # watcher uses to dedup. Either watcher-emitted row OR synthetic_logs match.
-HAS_RECOVERED=$("${PSQL[@]}" -c "SELECT EXISTS(SELECT 1 FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex')) OR EXISTS(SELECT 1 FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${GI_HEX}%');" 2>&1)
+HAS_RECOVERED=$(pgq "SELECT EXISTS(SELECT 1 FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex')) OR EXISTS(SELECT 1 FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${GI_HEX}%');")
 [[ "$HAS_RECOVERED" != "t" ]] && fail "synthesis log fired but ClaimEvent still not recoverable (got '$HAS_RECOVERED') — atomic commit may be broken"
 
 # Sanity: at least one fresh row in claim_watcher_processed for this gi.
-FRESH_WATCHER_ROW=$("${PSQL[@]}" -c "SELECT COUNT(*) FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex');" 2>&1)
+FRESH_WATCHER_ROW=$(pgq "SELECT COUNT(*) FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex');")
 [[ "$FRESH_WATCHER_ROW" -lt 1 ]] && fail "no fresh claim_watcher_processed row after synthesis (got $FRESH_WATCHER_ROW)"
 
 # Note the metrics-bug warning so reviewers don't chase a phantom regression.

@@ -66,6 +66,14 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$PROJECT_DIR/docker-compose.e2e.yml"
 ENV_FILE="$PROJECT_DIR/fixtures/.env"
 
+# Required by docker-compose.e2e.yml's miden-node build args (`${VAR:?...}`).
+# Without these, even `docker compose run --no-deps miden-agglayer ...` fails at
+# compose-file parse time because the whole file is interpolated regardless of
+# which service the run targets. Defaults match the Makefile's MIDEN_NODE_GIT_*
+# (the source of truth — bump both together).
+export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/miden-node.git}"
+export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.14.10}"
+
 L1_RPC="${L1_RPC:-http://localhost:8545}"
 L2_RPC="${L2_RPC:-http://localhost:8546}"
 BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"
