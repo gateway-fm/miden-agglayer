@@ -124,7 +124,7 @@ ger_state() {
 
 depo() {
   # jq's `//` operator treats boolean `false` as null-equivalent, which
-  # would mis-report a deposit that's genuinely NOT ready as "<missing>".
+  # would incorrectly report a deposit that's genuinely NOT ready as "<missing>".
   # Use an explicit existence check + tostring so we distinguish:
   #   "true"      → deposit ready_for_claim is true
   #   "false"     → deposit indexed but not ready (the bug-state we want to see)
