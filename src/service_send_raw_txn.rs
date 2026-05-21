@@ -498,9 +498,17 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
         let ger_bytes: [u8; 32] = params.root.0;
 
-        // Resolve exit root components from L1, since insertGlobalExitRoot
-        // only carries the combined hash. Without these, bridge-service
-        // cannot mark deposits as ready_for_claim.
+        // Best-effort resolve `(mainnet, rollup)` from L1 via view calls on
+        // the GER contract. This is the RD-862 race path: under deposit load
+        // L1 has usually advanced past the pair that produced the combined
+        // hash before we get here, so the keccak check fails. That's fine —
+        // the `L1InfoTreeIndexer` (see `l1_info_tree_indexer.rs`) reads
+        // `UpdateL1InfoTree` events directly and backfills the components
+        // via `set_ger_exit_roots` UPSERT. Bridge-service's subsequent
+        // `zkevm_getExitRootsByGER` poll picks up the resolved entry, so
+        // an `(None, None)` outcome here is non-fatal. Logged at debug
+        // because the indexer guarantees convergence — a stuck deposit
+        // would surface elsewhere (indexer cursor stalled, store error).
         let (mainnet_root, rollup_root) = match (&service.l1_rpc_url, &service.ger_l1_address) {
             (Some(l1_rpc), Some(ger_addr)) => {
                 match ger::fetch_l1_exit_roots(l1_rpc, ger_addr).await {
@@ -509,14 +517,17 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                         if computed == ger_bytes {
                             (Some(m), Some(r))
                         } else {
-                            tracing::warn!(
-                                "L1 exit roots don't match injected GER (L1 may have advanced), storing without roots"
+                            tracing::debug!(
+                                "L1 exit roots don't match injected GER (L1 may have advanced); \
+                                 indexer will backfill via set_ger_exit_roots"
                             );
                             (None, None)
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("failed to fetch L1 exit roots: {e:#}");
+                        tracing::debug!(
+                            "failed to fetch L1 exit roots ({e:#}); indexer will backfill"
+                        );
                         (None, None)
                     }
                 }
