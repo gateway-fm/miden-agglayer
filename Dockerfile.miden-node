@@ -68,7 +68,7 @@ FROM debian:bookworm-slim
 COPY --from=builder /tmp/miden-node-commit.txt /app/miden-node-commit.txt
 COPY --from=builder /tmp/genesis-samples /app/genesis-samples
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     ca-certificates \
     libssl3 \
     libsqlite3-0 \
