@@ -135,7 +135,14 @@ async fn handle_claim_asset(
     signer: Address,
 ) -> anyhow::Result<TxHash> {
     // Only claims where destinationNetwork matches our network_id are processed.
-    if params.destinationNetwork != service.network_id as u32 {
+    //
+    // RD-703 — `service.network_id` is `u32` (validated at startup in
+    // `main.rs` via `u32::try_from(command.network_id)`), matching the
+    // Solidity bridge's `uint32 destinationNetwork`. No silent `as u32` cast
+    // here: any operator value that does not fit `u32` is rejected loudly
+    // at startup rather than truncating into a comparison that would
+    // spuriously accept the wrong network.
+    if params.destinationNetwork != service.network_id {
         anyhow::bail!(
             "claim targets destinationNetwork {} but this proxy only handles network {}",
             params.destinationNetwork,

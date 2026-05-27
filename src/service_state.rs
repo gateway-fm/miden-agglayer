@@ -55,8 +55,16 @@ pub struct ServiceState {
     pub miden_client: Arc<MidenClient>,
     pub accounts: AccountsConfig,
     pub chain_id: u64,
-    /// Rollup network ID from RollupManager (used for bridge's networkID() call)
-    pub network_id: u64,
+    /// Rollup network ID from RollupManager (used for bridge's `networkID()` call).
+    ///
+    /// Stored as `u32` because the Solidity bridge contract types
+    /// `originNetwork` / `destinationNetwork` as `uint32` (see
+    /// `claimAssetCall` in `src/claim.rs`) and the on-chain `networkID()`
+    /// return is `uint32`. The CLI flag is parsed as `u64` for backward
+    /// compat but validated and narrowed at startup in `main.rs` via
+    /// `u32::try_from`; reaching this struct with anything beyond `u32::MAX`
+    /// is therefore impossible (RD-703).
+    pub network_id: u32,
     pub store: Arc<dyn Store>,
     pub block_state: Arc<BlockState>,
     /// L1 RPC URL for resolving exit roots from the L1 GER contract
@@ -114,7 +122,7 @@ impl ServiceState {
         miden_client: MidenClient,
         accounts: AccountsConfig,
         chain_id: u64,
-        network_id: u64,
+        network_id: u32,
         store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
     ) -> Self {
