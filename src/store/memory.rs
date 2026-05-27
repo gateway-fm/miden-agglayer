@@ -67,6 +67,21 @@ pub struct InMemoryStore {
 
     // Faucet registry
     faucets: RwLock<Vec<FaucetEntry>>,
+
+    // Monitor trackers (RD-913) — in-memory mirror of monitor_burn_serials,
+    // monitor_twin_notes, monitor_expected_mints. With InMemoryStore the
+    // mirror IS the source of truth; with PgStore the DB is and these
+    // structures live inside the tracker's LRU cache instead.
+    monitor_burn_serials: RwLock<HashSet<[u8; 32]>>,
+    monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
+    monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
+}
+
+#[derive(Clone, Copy)]
+struct MonitorExpectedMintRow {
+    expected_mint: [u8; 32],
+    ticks_pending: u32,
+    alerted: bool,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -94,6 +109,9 @@ impl InMemoryStore {
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             faucets: RwLock::new(Vec::new()),
+            monitor_burn_serials: RwLock::new(HashSet::new()),
+            monitor_twin_notes: RwLock::new(HashMap::new()),
+            monitor_expected_mints: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -677,6 +695,85 @@ impl Store for InMemoryStore {
 
     async fn list_faucets(&self) -> anyhow::Result<Vec<FaucetEntry>> {
         Ok(self.faucets.read().clone())
+    }
+
+    // ── Monitor trackers (RD-913) ────────────────────────────────
+
+    async fn burn_serial_seen(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.monitor_burn_serials.read().contains(serial))
+    }
+
+    async fn burn_serial_observe(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
+        let mut set = self.monitor_burn_serials.write();
+        Ok(set.insert(*serial))
+    }
+
+    async fn twin_note_commitments(&self, note_id: &[u8; 32]) -> anyhow::Result<Vec<[u8; 32]>> {
+        Ok(self
+            .monitor_twin_notes
+            .read()
+            .get(note_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn twin_note_observe(
+        &self,
+        note_id: &[u8; 32],
+        commitment: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let mut map = self.monitor_twin_notes.write();
+        let entry = map.entry(*note_id).or_default();
+        if entry.contains(commitment) {
+            Ok(false)
+        } else {
+            entry.push(*commitment);
+            Ok(true)
+        }
+    }
+
+    async fn expected_mint_record(
+        &self,
+        global_index: &[u8; 32],
+        expected_mint: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        let mut map = self.monitor_expected_mints.write();
+        map.insert(
+            *global_index,
+            MonitorExpectedMintRow {
+                expected_mint: *expected_mint,
+                ticks_pending: 0,
+                alerted: false,
+            },
+        );
+        Ok(())
+    }
+
+    async fn expected_mint_remove(&self, global_index: &[u8; 32]) -> anyhow::Result<()> {
+        self.monitor_expected_mints.write().remove(global_index);
+        Ok(())
+    }
+
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+        let map = self.monitor_expected_mints.read();
+        Ok(map
+            .iter()
+            .map(|(gi, row)| (*gi, row.expected_mint, row.ticks_pending, row.alerted))
+            .collect())
+    }
+
+    async fn expected_mint_update_tick(
+        &self,
+        global_index: &[u8; 32],
+        ticks_pending: u32,
+        alerted: bool,
+    ) -> anyhow::Result<()> {
+        let mut map = self.monitor_expected_mints.write();
+        if let Some(row) = map.get_mut(global_index) {
+            row.ticks_pending = ticks_pending;
+            row.alerted = alerted;
+        }
+        Ok(())
     }
 }
 

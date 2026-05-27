@@ -538,8 +538,23 @@ async fn publish_claim_internal(
             })
             .next()
             .unwrap_or_default();
-        if claim_id_bytes != [0u8; 32] {
-            tracker.record_expected(global_index_bytes, claim_id_bytes);
+        if claim_id_bytes != [0u8; 32]
+            && let Err(e) = tracker
+                .record_expected(global_index_bytes, claim_id_bytes)
+                .await
+        {
+            // RD-913: tracker is now store-backed. A store hiccup here
+            // means we won't get a StaleAlert later if the MINT is
+            // censored — log it loudly, but don't fail the CLAIM
+            // submission itself (the claim has been submitted at this
+            // point; refusing to return would just mean the user can't
+            // get a receipt for a tx that already went on-chain).
+            tracing::warn!(
+                target: "claim",
+                global_index = ?global_index_bytes,
+                error = ?e,
+                "RD-913: expected-MINT record store failure; no staleness alert will fire"
+            );
         }
     }
 
@@ -569,7 +584,15 @@ async fn publish_claim_internal(
         // for operator triage.
         if let Some(tracker) = expected_mints {
             let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
-            tracker.mark_landed(global_index_bytes);
+            if let Err(e) = tracker.mark_landed(global_index_bytes).await {
+                tracing::warn!(
+                    target: "claim",
+                    global_index = ?global_index_bytes,
+                    error = ?e,
+                    "RD-913: mark_landed store failure; staleness tick will eventually \
+                     time the entry out (one-shot StaleAlert)"
+                );
+            }
         }
     } else {
         anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");

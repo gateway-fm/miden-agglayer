@@ -134,6 +134,15 @@ impl ServiceState {
         store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
     ) -> Self {
+        // RD-913: ExpectedMintTracker is now store-backed. This placeholder
+        // is overwritten in `main.rs` with the BridgeOutScanner's handle
+        // (so the CLAIM submission path and the scanner's tick path share
+        // a single, store-backed tracker). The placeholder still uses the
+        // same store so test paths that hit it directly don't lose
+        // persistence semantics.
+        let expected_mints = Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new(
+            store.clone(),
+        ));
         Self {
             miden_client: Arc::new(miden_client),
             accounts,
@@ -152,7 +161,7 @@ impl ServiceState {
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
             reject_hardhat_alias: false,
-            expected_mints: Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new()),
+            expected_mints,
             miden_api_key: None,
         }
     }
