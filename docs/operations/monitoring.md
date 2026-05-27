@@ -233,3 +233,63 @@ to assemble are:
 | Loki rate of `incorrect account initial commitment` | Zero | Any non-zero rate — see postmortem |
 | Pod restart count over 24h | 0-1 (deploys only) | Multiple — check `Last State.Reason` for `OOMKilled` |
 | `miden_locked_accounts_detected_total` on latest startup | 0 | > 0 — surgical unlock required |
+
+---
+
+# RD-940 writer worker
+
+This section codifies the alert thresholds for the eight Prometheus
+metrics introduced by the RD-940 async writer worker
+(`docs/design/RD-940-async-writer.md` Spec F §4). All series are
+registered unconditionally in `src/metrics.rs::init_metrics`; they are
+silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
+
+## Metric reference
+
+| Metric | Type | Source | Description |
+|---|---|---|---|
+| `agglayer_writer_queue_depth` | gauge | `try_enqueue` | Current fill level of the mpsc channel (cap minus available). |
+| `agglayer_writer_inflight_jobs` | gauge | `try_enqueue`, worker, TTL sweeper | Size of the inflight DashMap — Queued + Submitting + pre-eviction terminal. |
+| `agglayer_writer_job_duration_seconds{kind,outcome}` | histogram | worker `process` | Time from dequeue to terminal. `kind=claim\|ger_insert`, `outcome=committed\|failed`. |
+| `agglayer_writer_queue_full_rejections_total{kind}` | counter | `try_enqueue` | Backpressure events (returns JSON-RPC `-32005`). |
+| `agglayer_writer_job_failures_total{kind,reason}` | counter | worker fail path + TTL sweeper | Terminal Failed transitions. `reason=miden\|ttl\|panic\|store`. |
+| `agglayer_writer_dropped_on_restart_total` | counter | main.rs at boot | Residual jobs read from `/tmp/agglayer-writer-queue-snapshot`. |
+| `agglayer_writer_drain_outcome_total{outcome}` | counter | main.rs after `service::serve` | `outcome=clean\|partial`. |
+
+## Alerts
+
+| Alert | Query (PromQL) | Severity | Reason |
+|---|---|---|---|
+| **WriterQueueWarn** | `agglayer_writer_queue_depth > 0.8 * AGGLAYER_WRITER_QUEUE_DEPTH` for 10 m | warn | Sustained backpressure; queue is filling faster than the single worker can drain. Capacity-plan or bump `AGGLAYER_WRITER_QUEUE_DEPTH`. |
+| **WriterQueueCritical** | `agglayer_writer_queue_depth > 0.95 * AGGLAYER_WRITER_QUEUE_DEPTH` for 2 m | page | One step from `-32005` rejections; aggkit ethtxmanager retry budgets will start tripping. |
+| **WriterJobDurationP99** | `histogram_quantile(0.99, rate(agglayer_writer_job_duration_seconds_bucket[10m])) > 60` | page | p99 > 60 s breaks aggkit's `WaitTxToBeMined = 2 m` envelope (Spec E). Miden submission is degraded. |
+| **WriterJobFailures** | `rate(agglayer_writer_job_failures_total[5m]) > 0.5` for 5 m | page | Burst of dispatch failures. Drill down by `kind` + `reason` to distinguish Miden errors from TTL expiries. |
+| **WriterDroppedOnRestart** | `increase(agglayer_writer_dropped_on_restart_total[1h]) > 0` | **hard page** | v1 tripwire: real unrecovered work. See `docs/operations/runbook.md` Failure mode I. |
+| **WriterQueueFullRejections** | `rate(agglayer_writer_queue_full_rejections_total[5m]) > 0.1` for 5 m | page | aggkit retries `-32005` transparently up to its budget; sustained backpressure exhausts the budget and surfaces as a stuck tx. |
+| **WriterDrainOutcomePartial** | none — dashboard only | n/a | Counts non-clean shutdowns over time; correlate with restart events when investigating `dropped_on_restart` increments. |
+| **WriterInflightSize** | none — dashboard only | n/a | Informational; size of the DashMap. Should track `queue_depth + jobs in flight at Miden`. |
+
+## Useful dashboard panels
+
+- **Throughput.** `rate(agglayer_writer_job_duration_seconds_count[1m])`
+  split by `outcome`. Stack committed + failed; the gap to your request
+  rate is queue-full rejections.
+- **Latency heatmap.**
+  `agglayer_writer_job_duration_seconds_bucket` split by `kind`. Watch
+  the right tail of `claim` — `publish_claim` includes a 15 s
+  GER-propagation wait (`src/claim.rs:557`), so claim p50 will sit
+  noticeably higher than ger_insert.
+- **Per-signer fairness.** Currently no per-signer label on the metrics
+  (cardinality concern), but the structured-logs path emits `signer`
+  on every `writer_worker::job` span. Grep / Loki the span events to
+  detect a runaway signer monopolising the worker.
+
+## Self-heal correlation
+
+The pre-existing `claim_watcher_synthesised_total` metric remains the
+floor signal for `MidenSubmitted × worker-panic`: a CLAIM that was
+submitted to Miden but whose `ClaimEvent` was never written by
+`service_send_raw_txn` is back-filled by the watcher on its next sync.
+A correlated jump in `claim_watcher_synthesised_total` and
+`agglayer_writer_job_failures_total{reason=panic}` is the expected
+shape under a worker-panic incident.

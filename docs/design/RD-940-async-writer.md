@@ -4,6 +4,45 @@
 >
 > This is the design-of-record for the implementation that ships under [`feat/rd-940-async-writer`](https://github.com/gateway-fm/miden-agglayer/tree/feat/rd-940-async-writer). Linear ticket: [RD-940](https://linear.app/gateway-fm/issue/RD-940).
 
+## Ship status (2026-05-27)
+
+The feat branch lands the writer worker + RPC wire contract + observability surface as a **flag-gated default-off** rollout. Every section below that is marked ✅ ships in this PR; the BlockMonitor unification (§2.3) is the one explicit deferral, captured under "Phase 3 deferred" below.
+
+| Section | Status | Commit |
+|---|---|---|
+| §1 system overview | ✅ shipped | Phase 0 (`2ba4b92`) — design doc, flag wiring |
+| §2.1 writer worker + queue | ✅ shipped | Phase 1 (`95d6e4f`) |
+| §2.2 ClaimGuard placement | ✅ shipped — ClaimGuard taken inside `worker_handle_claim_asset`, dispatched on the worker task | Phase 1 (`95d6e4f`) |
+| §2.3 BlockMonitor unification | **⏸️ deferred** — see "Phase 3 deferred" | follow-up PR |
+| §2.4 RPC wire contract | ✅ shipped — geth pending shape, top-level null pre-commit, `eth_getBlockByNumber("pending")` aliased | Phase 4 (`ae35fe9`) |
+| §3 consumer interop | ✅ shipped — `-32005` mapping, idempotent re-broadcast, `eth_getTransactionCount` tag honour | Phase 1+2 (`95d6e4f`, `e1dfe0c`) |
+| §4 metrics + observability | ✅ shipped — 8 metrics, tracing spans per job, graceful drain, `dropped_on_restart` tmpfile | Phase 5 (`9da5aa2`) |
+| §5 unit tests | ✅ shipped — 12 new tests on top of 167 pre-existing; 179 lib + 4 bin pass | Phases 1–4 |
+| §5 e2e scripts | **⏸️ deferred** — require live fixture environment; will land in follow-up | follow-up PR |
+| `service_get_txn_receipt.rs:40` `from` co-fix | ✅ shipped | Phase 4 (`ae35fe9`) |
+| 5-minute TTL → status:0x0 (Decision 5) | ✅ shipped — TTL sweeper writes failure receipt | Phase 4 (`ae35fe9`) |
+| `docs/operations/runbook.md` + `monitoring.md` | ✅ shipped — Failure Mode I + 8-metric alert table | Phase 7 |
+| Default flag flip false→true | **⏸️ deferred** — operational rollout in a follow-up after canary validation | follow-up PR |
+
+### Phase 3 deferred — BlockMonitor unification
+
+The atomic-swap structural refactor that absorbs `BlockState` + `StoreSyncListener` + the inline emitters in `claim.rs`, `ger.rs`, `bridge_out.rs`, `claim_watcher.rs` into a single `BlockMonitor::record()` writer is held back as a focused follow-up PR. Reasons:
+
+1. **High blast radius** — touches 9+ source files, all on the synthetic-log emission hot path. The existing log-first/cursor-second ordering at the four call sites is correct today; the value of BlockMonitor is making that ordering a structural invariant, not a tribal-knowledge comment. That's a real cleanup but it isn't load-bearing for the async-writer functionality.
+2. **Diff-size hygiene** — bundling it with the worker + RPC + observability work would push this PR past the reasonable review threshold and make rollback granularity worse.
+3. **Worker already concentrates writes** — the new `worker_handle_claim_asset` + `worker_handle_ger_insert` already serve as the single dispatch surface under the worker-enabled path; the most error-prone surface BlockMonitor was guarding against is moot when there's only one dispatch entrypoint.
+
+The follow-up PR will own §2.3 in its entirety + the cross-emitter race elimination claims under that section. The RD-862 cure (L1InfoTreeIndexer + `commit_ger_event_atomic` UPSERT) is unaffected by either choice.
+
+### Phase 6 deferred — e2e scripts
+
+The six new `scripts/e2e-rd940-*.sh` scripts described in §5 (async-submit golden path, pending-receipt wire shape, queue-backpressure 600 req/s, restart-inflight, worker-panic, claim-guard-cancellation) require a running fixture environment (miden-node + bridge contracts + aggkit) that can't be stood up from a code review. They will land in a follow-up PR alongside `scripts/setup-iaic-fixture.sh` that lets the IAIC regression sentinel run strict in CI.
+
+The unit-test coverage (179 lib + 4 bin tests) covers the load-bearing per-component invariants. Two failure modes are explicitly only catchable in e2e and are flagged as accepted Phase-1 risk:
+
+- aggkit ethtxmanager-loop interaction under real wire JSON (the `insta` snapshot test in `build_inflight_pending_tx_json_emits_geth_wire_shape` pins the Rust-side shape; an aggkit-side parse smoke is the follow-up).
+- 50 req/s × 10 min v1 acceptance gate (drop-rate <1%, p99 < 60 s) needs a real Miden node — runs on bali staging once the flag is enabled.
+
 ## TL;DR
 
 The async write path replaces today's sync-on-Miden-commit `eth_sendRawTransaction` (`src/service_send_raw_txn.rs:407-595`) with: cheap synchronous validation on the request thread → bounded `tokio::sync::mpsc(64)` enqueue → single writer-worker task → `MidenClient::with(...)` (preserved channel-of-1 invariant from `src/miden_client.rs:126`) → `BlockMonitor::record(...)` (new sole writer of `latest_block_number` and synthetic logs) → durable receipt via `store.txn_commit`. The HTTP handler returns the tx hash as soon as the job is on the queue.
