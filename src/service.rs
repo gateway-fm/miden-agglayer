@@ -491,6 +491,30 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 return Ok(JsonRpcResponse::success(answer_id, txn));
             }
 
+            // RD-940 Spec D — in-flight (writer-worker accepted but not yet
+            // committed). Returns the geth pending-tx shape: `blockHash`,
+            // `blockNumber`, `transactionIndex` JSON null, every other
+            // numeric field hex-encoded so aggkit's Go-side
+            // hexutil.Uint{,64}/Big unmarshallers don't panic. See
+            // service_helpers::build_inflight_pending_tx_json for the
+            // full contract.
+            if let Some(handle) = service.writer_handle.as_ref()
+                && let Some(entry) = handle.get_inflight(&txn_hash)
+            {
+                tracing::debug!(
+                    tx_hash = %txn_hash,
+                    state = ?entry.state,
+                    "eth_getTransactionByHash: returning in-flight pending shape"
+                );
+                return Ok(JsonRpcResponse::success(
+                    answer_id,
+                    crate::service_helpers::build_inflight_pending_tx_json(
+                        &entry,
+                        service.chain_id,
+                    ),
+                ));
+            }
+
             // Fallback: synthetic transactions (bridge-out events)
             let tx_hash_str = format!("{txn_hash:#x}");
             let logs = service

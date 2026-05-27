@@ -499,7 +499,7 @@ impl WriterWorker {
         let worker = WriterWorker {
             receiver: rx,
             inflight: inflight.clone(),
-            service,
+            service: service.clone(),
             tx_ttl,
         };
 
@@ -511,8 +511,26 @@ impl WriterWorker {
         // garbage-collected even if the main worker is busy. Mirrors the
         // pattern in `L1InfoTreeIndexer::spawn` (a separate ticker loop on
         // the same Arc handle).
+        //
+        // RD-940 Decision 5: every accepted hash MUST reach a terminal
+        // state. Two responsibilities:
+        //   1. Non-terminal entries (Queued / Submitting) older than tx_ttl
+        //      since `created_at` are forcibly transitioned to `Failed` and
+        //      a failure receipt is written so `eth_getTransactionReceipt`
+        //      transitions `null → status:0x0`. Bounds the contract — no
+        //      more forever-pending traps like the IAIC postmortem
+        //      (`docs/POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md`).
+        //   2. Terminal entries older than tx_ttl since `terminal_at` are
+        //      evicted from the DashMap so it doesn't grow unbounded.
+        //
+        // Iteration pattern: collect the hash+entry snapshots into a Vec
+        // first (no `.await` while holding DashMap iter guards), then
+        // process outside the iteration. This avoids the deadlock risk
+        // where an in-flight reader on the same shard would block waiting
+        // for our (suspended) iterator to release.
         let sweeper_inflight = inflight.clone();
         let sweeper_ttl = tx_ttl;
+        let sweeper_service = service.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(SWEEPER_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -521,21 +539,80 @@ impl WriterWorker {
             loop {
                 ticker.tick().await;
                 let now = Instant::now();
-                let mut to_remove: Vec<TxHash> = Vec::new();
+
+                // Snapshot two cohorts in a single pass.
+                let mut to_expire: Vec<(TxHash, Address)> = Vec::new();
+                let mut to_evict: Vec<TxHash> = Vec::new();
                 for entry in sweeper_inflight.iter() {
-                    if let Some(t) = entry.terminal_at
-                        && now.duration_since(t) > sweeper_ttl
-                    {
-                        to_remove.push(*entry.key());
+                    match entry.state {
+                        JobState::Queued | JobState::Submitting => {
+                            if now.duration_since(entry.created_at) > sweeper_ttl {
+                                to_expire.push((*entry.key(), entry.signer));
+                            }
+                        }
+                        JobState::Committed { .. } | JobState::Failed => {
+                            if let Some(t) = entry.terminal_at
+                                && now.duration_since(t) > sweeper_ttl
+                            {
+                                to_evict.push(*entry.key());
+                            }
+                        }
                     }
                 }
-                if !to_remove.is_empty() {
-                    for hash in &to_remove {
+
+                for (hash, _signer) in &to_expire {
+                    // Mark Failed + record terminal_at. Errors are logged
+                    // but don't block — the next sweeper tick re-tries.
+                    if let Some(mut entry) = sweeper_inflight.get_mut(hash) {
+                        entry.state = JobState::Failed;
+                        entry.terminal_at = Some(now);
+                    }
+                    let block_num = sweeper_service
+                        .store
+                        .get_latest_block_number()
+                        .await
+                        .unwrap_or(0);
+                    let block_hash = sweeper_service.block_state.get_block_hash(block_num);
+                    let reason = format!(
+                        "writer_worker: TTL expired (>{}s in non-terminal state)",
+                        sweeper_ttl.as_secs()
+                    );
+                    if let Err(e) = sweeper_service
+                        .store
+                        .txn_commit(*hash, Err(reason), block_num, block_hash)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "writer_worker::ttl",
+                            %hash,
+                            err = format!("{e:#}"),
+                            "TTL expiry: store.txn_commit(Err) failed; \
+                             eth_getTransactionReceipt may still return null. \
+                             Next sweeper tick will retry."
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "writer_worker::ttl",
+                            %hash,
+                            "TTL expiry: wrote failure receipt (status:0x0). \
+                             Caller must re-submit with a fresh nonce."
+                        );
+                        ::metrics::counter!(
+                            "agglayer_writer_job_failures_total",
+                            "kind" => "unknown",
+                            "reason" => "ttl",
+                        )
+                        .increment(1);
+                    }
+                }
+
+                if !to_evict.is_empty() {
+                    for hash in &to_evict {
                         sweeper_inflight.remove(hash);
                     }
                     tracing::debug!(
                         target: "writer_worker::ttl",
-                        evicted = to_remove.len(),
+                        evicted = to_evict.len(),
                         inflight = sweeper_inflight.len(),
                         "writer_worker TTL sweeper evicted aged terminal entries"
                     );
@@ -1056,6 +1133,70 @@ mod tests {
         // JoinHandle (Phase 5 will). A short sleep gives tokio time to
         // process the dropped oneshot; the test passes if nothing panics.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// RD-940 Spec D — the in-flight pending-tx JSON must conform to
+    /// geth's wire shape: `blockHash`, `blockNumber`, `transactionIndex`
+    /// are the ONLY fields permitted to be JSON `null`. Every other
+    /// numeric field must be a hex string (Go's `hexutil.Uint{,64}` /
+    /// `hexutil.Big` value-type unmarshallers panic on `null`).
+    #[tokio::test]
+    async fn build_inflight_pending_tx_json_emits_geth_wire_shape() {
+        // Build an in-flight entry directly so the test doesn't need a
+        // full worker.
+        let (env, signer) = fake_envelope(5);
+        let hash = match &env {
+            TxEnvelope::Legacy(s) => *s.hash(),
+            _ => unreachable!(),
+        };
+        let entry = InFlightEntry {
+            state: JobState::Submitting,
+            eth_tx_hash: hash,
+            signer,
+            kind: WriteJobKind::Claim,
+            job_id: Ulid::new(),
+            envelope: env,
+            created_at: Instant::now(),
+            terminal_at: None,
+        };
+        let chain_id = 2u64;
+        let json = crate::service_helpers::build_inflight_pending_tx_json(&entry, chain_id);
+
+        // The three load-bearing nulls — pending shape requires these.
+        assert!(json.get("blockHash").unwrap().is_null());
+        assert!(json.get("blockNumber").unwrap().is_null());
+        assert!(json.get("transactionIndex").unwrap().is_null());
+
+        // Every other field that aggkit's monitor reads MUST be a string,
+        // never null. (Go's hexutil.* value types panic on null.)
+        for required_string_field in &[
+            "type", "nonce", "gasPrice", "gas", "value", "input", "v", "r", "s", "hash", "from",
+            "chainId",
+        ] {
+            assert!(
+                json.get(*required_string_field).unwrap().is_string(),
+                "field {required_string_field} MUST be a hex string, not null/absent"
+            );
+        }
+
+        // Hash + from + chainId must reflect the entry we built.
+        assert_eq!(
+            json["hash"].as_str().unwrap(),
+            format!("{:#x}", hash),
+            "hash must echo the tx_hash"
+        );
+        assert_eq!(
+            json["from"].as_str().unwrap(),
+            format!("{:#x}", signer),
+            "from must be the recovered signer captured at enqueue"
+        );
+        assert_eq!(
+            json["chainId"].as_str().unwrap(),
+            format!("0x{chain_id:x}"),
+            "chainId must echo the service chain_id"
+        );
+        // Nonce 5 from `fake_envelope(5)` round-trips.
+        assert_eq!(json["nonce"].as_str().unwrap(), "0x5");
     }
 
     /// RD-940 Decision 4 (Phase 2): `count_non_terminal_for_signer` must
