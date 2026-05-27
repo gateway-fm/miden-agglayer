@@ -758,6 +758,12 @@ impl WriterWorker {
                     .get_latest_block_number()
                     .await
                     .unwrap_or(0);
+                // RD-940 Phase 3 — keep the BlockMonitor tip mirror fresh
+                // so the next eth_blockNumber hot-read returns the right
+                // value without a store round-trip.
+                if block > 0 {
+                    self.service.block_monitor.record_tip(block);
+                }
                 if let Some(mut entry) = self.inflight.get_mut(&hash) {
                     entry.state = JobState::Committed {
                         block_number: block,

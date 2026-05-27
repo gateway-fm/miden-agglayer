@@ -289,11 +289,24 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         "eth_blockNumber" => {
-            let block_num = service
-                .store
-                .get_latest_block_number()
-                .await
-                .map_err(|e| store_error(answer_id.clone(), e))?;
+            // RD-940 Phase 3 — hot read via the BlockMonitor AtomicU64
+            // tip mirror. Falls back to the store on cold boot (mirror
+            // is 0 until the first writer reports). Cuts a stable-state
+            // per-request store round-trip down to a relaxed-atomic load.
+            let mirrored = service.block_monitor.current_tip();
+            let block_num = if mirrored > 0 {
+                mirrored
+            } else {
+                let n = service
+                    .store
+                    .get_latest_block_number()
+                    .await
+                    .map_err(|e| store_error(answer_id.clone(), e))?;
+                if n > 0 {
+                    service.block_monitor.record_tip(n);
+                }
+                n
+            };
             let block_num_str = format!("{:#x}", block_num);
             Ok(JsonRpcResponse::success(answer_id, block_num_str))
         }

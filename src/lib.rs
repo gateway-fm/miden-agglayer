@@ -1,6 +1,7 @@
 pub mod account_recovery;
 pub mod accounts_config;
 pub mod address_mapper;
+pub mod block_monitor;
 pub mod block_state;
 pub mod bridge_address;
 pub mod bridge_out;
