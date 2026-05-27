@@ -395,6 +395,24 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 Ok(hash) => tracing::info!("eth_sendRawTransaction: OK hash={hash}"),
                 Err(err) => tracing::info!("eth_sendRawTransaction: ERR {err:#}"),
             }
+            // RD-940 — promote writer-queue-saturation to JSON-RPC -32005
+            // (geth's `LimitExceeded`). aggkit's ethtxmanager retries
+            // `-32005` transparently; without this mapping the default
+            // `ApplicationError(1) = SendRawTransaction` would conflate
+            // queue backpressure with all other tx-submission failures,
+            // and ethtxmanager would not classify it as transient.
+            if let Err(err) = &result
+                && err
+                    .downcast_ref::<crate::writer_worker::WriterQueueSaturatedError>()
+                    .is_some()
+            {
+                let error = JsonRpcError::new(
+                    JsonRpcErrorReason::ServerError(-32005),
+                    "writer queue saturated; retry".to_string(),
+                    serde_json::Value::Null,
+                );
+                return Err(JsonRpcResponse::error(answer_id, error));
+            }
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::SendRawTransaction)
         }
 

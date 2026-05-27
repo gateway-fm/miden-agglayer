@@ -45,6 +45,10 @@ async-trait = "0.1"
 axum = { features = ["tokio"], version = "0.8" }
 axum-jrpc = { path = "axum-jrpc" }
 clap = { features = ["derive", "env"], version = "4.5" }
+# RD-940 — concurrent in-flight tx-hash map for the async writer worker
+# (DashMap chosen over RwLock<HashMap> for the hot eth_getTransactionByHash
+# read path that touches it on every aggkit poll).
+dashmap = { version = "6" }
 hex = { version = "0.4" }
 metrics = { version = "0.24" }
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
@@ -89,6 +93,9 @@ tracing-subscriber = { features = [
   "fmt",
   "json",
 ], version = "0.3" }
+# RD-940 — ULID for writer-worker job_id (sortable, no clock skew sensitivity
+# vs UUIDv7; we already pull `getrandom` transitively via `alloy`/`rand`).
+ulid = { version = "1" }
 url = { features = ["serde"], version = "2.5" }
 
 # postgres (optional)

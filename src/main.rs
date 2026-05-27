@@ -588,6 +588,39 @@ async fn main() -> anyhow::Result<()> {
     state.miden_api_key = command.miden_api_key;
     state.enable_writer_worker = command.enable_writer_worker;
 
+    // RD-940 — spawn the writer worker if the flag is set. The worker is a
+    // single tokio task with a bounded mpsc queue between it and
+    // `eth_sendRawTransaction`; see `docs/design/RD-940-async-writer.md`.
+    //
+    // The handle is plumbed into `ServiceState` (a `Clone` struct) BEFORE
+    // `service::serve` clones the state per request, so every dispatcher sees
+    // the same writer channel and inflight DashMap. The oneshot shutdown
+    // sender is `mem::forget`ged for parity with the L1InfoTreeIndexer below;
+    // graceful drain via SIGTERM lands in Phase 5.
+    if command.enable_writer_worker {
+        let queue_depth =
+            miden_agglayer_service::writer_worker::WriterWorker::parse_queue_depth_env();
+        let tx_ttl = miden_agglayer_service::writer_worker::WriterWorker::parse_tx_ttl_env();
+        let (handle, writer_shutdown_tx) =
+            miden_agglayer_service::writer_worker::WriterWorker::spawn(
+                state.clone(),
+                queue_depth,
+                tx_ttl,
+            );
+        std::mem::forget(writer_shutdown_tx);
+        tracing::info!(
+            queue_depth,
+            tx_ttl_secs = tx_ttl.as_secs(),
+            "RD-940 writer worker spawned"
+        );
+        state.writer_handle = Some(Arc::new(handle));
+    } else {
+        tracing::info!(
+            "RD-940 writer worker disabled (enable_writer_worker=false); \
+             eth_sendRawTransaction runs the legacy synchronous handler"
+        );
+    }
+
     // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
     // proactively indexing every (mainnet, rollup) pair as L1 emits it,
     // instead of trying to recover the pair from a racing view call after the

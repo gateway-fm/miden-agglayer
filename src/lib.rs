@@ -39,6 +39,7 @@ pub mod store;
 pub mod test_helpers;
 pub mod twin_note_detector;
 pub mod unknown_wrapper_detector;
+pub mod writer_worker;
 
 pub const COMPONENT: &str = "miden-agglayer";
 

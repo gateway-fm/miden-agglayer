@@ -127,6 +127,15 @@ pub struct ServiceState {
     /// enqueued to the single writer-worker task. See
     /// `docs/design/RD-940-async-writer.md` for the full design.
     pub enable_writer_worker: bool,
+    /// RD-940 writer-worker producer handle. `None` when
+    /// `enable_writer_worker = false` *or* when the flag is set but the
+    /// worker failed to spawn at startup (logged-but-non-fatal — the sync
+    /// path remains usable as the fallback). `Some(handle)` is the live
+    /// `try_enqueue` surface plumbed into `service_send_raw_txn` and the
+    /// upcoming Phase 4 `eth_getTransactionByHash` in-flight reader. The
+    /// `Arc` shares the underlying channel + in-flight DashMap across every
+    /// `ServiceState::clone()` the dispatcher hands out.
+    pub writer_handle: Option<Arc<crate::writer_worker::WriterWorkerHandle>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -171,6 +180,7 @@ impl ServiceState {
             expected_mints,
             miden_api_key: None,
             enable_writer_worker: false,
+            writer_handle: None,
         }
     }
 }

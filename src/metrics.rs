@@ -1,4 +1,4 @@
-use metrics::{describe_counter, describe_histogram};
+use metrics::{describe_counter, describe_gauge, describe_histogram};
 
 pub fn init_metrics() {
     describe_counter!("rpc_requests_total", "Total JSON-RPC requests by method");
@@ -160,6 +160,35 @@ pub fn init_metrics() {
          op=prove|submit (op=prove is pure prover latency on Claim; \
          op=submit is end-to-end submit latency dominated by proving on the \
          other call sites). Recorded on both success and error paths."
+    );
+
+    // RD-940 — async writer worker observability (Spec F §4). Registered
+    // unconditionally so the metric series exist even when
+    // `enable_writer_worker = false`; the sync path simply never emits.
+    describe_gauge!(
+        "agglayer_writer_queue_depth",
+        "RD-940: current number of WriteJobs sitting in the writer-worker \
+         mpsc channel (gauge). Alert: >0.8×cap for 10 min → warn; \
+         >0.95×cap for 2 min → page."
+    );
+    describe_gauge!(
+        "agglayer_writer_inflight_jobs",
+        "RD-940: WriteJobs in the in-flight DashMap (Queued + Submitting + \
+         not-yet-TTL'd terminal entries). Informational."
+    );
+    describe_histogram!(
+        "agglayer_writer_job_duration_seconds",
+        "RD-940: time from worker dequeue to terminal outcome (committed / \
+         failed). Labels: kind=claim|ger_insert, outcome=committed|failed. \
+         Alert: p99 >60s for 10 min → page (aggkit's WaitTxToBeMined=2m)."
+    );
+    describe_counter!(
+        "agglayer_writer_queue_full_rejections_total",
+        "RD-940: eth_sendRawTransaction requests rejected because the \
+         writer-worker mpsc channel was at capacity. Wire response is \
+         JSON-RPC -32005 'writer queue saturated; retry' (geth's \
+         LimitExceeded); aggkit's ethtxmanager retries transparently. \
+         Labels: kind=claim|ger_insert. Alert: rate >0.1/s for 5 min → page."
     );
 }
 
