@@ -350,6 +350,21 @@ impl WriterWorkerHandle {
         self.sender.capacity()
     }
 
+    /// RD-940 Decision 4 — count non-terminal in-flight jobs for `signer`.
+    ///
+    /// `eth_getTransactionCount(addr, "latest")` calls this to compute the
+    /// next-committed nonce as `next-accepted - non_terminal_count`. Without
+    /// the subtraction the RPC would leak queued/submitting txs into the
+    /// `latest` view, breaking claim-sponsor's `nonce_cache.go:35` LRU.
+    /// `pending` (geth default) keeps using `nonce_get` directly — that's
+    /// what the request thread bumped on accept.
+    pub fn count_non_terminal_for_signer(&self, signer: &Address) -> usize {
+        self.inflight
+            .iter()
+            .filter(|e| e.signer == *signer && !e.state.is_terminal())
+            .count()
+    }
+
     /// Try to push a job onto the writer-worker queue.
     ///
     /// **Non-blocking** — uses `mpsc::Sender::try_send`. On full, returns
@@ -1041,5 +1056,65 @@ mod tests {
         // JoinHandle (Phase 5 will). A short sleep gives tokio time to
         // process the dropped oneshot; the test passes if nothing panics.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// RD-940 Decision 4 (Phase 2): `count_non_terminal_for_signer` must
+    /// count Queued + Submitting entries for the matching signer, and
+    /// **not** count Committed / Failed entries (those are already
+    /// reflected in `store.nonce_get`).
+    #[tokio::test]
+    async fn count_non_terminal_for_signer_filters_correctly() {
+        // No real worker spawned; we just need a handle to mutate the
+        // inflight map directly.
+        let (sender, _receiver) = mpsc::channel::<WriteJob>(8);
+        let inflight = Arc::new(DashMap::new());
+        let handle = WriterWorkerHandle {
+            sender,
+            inflight: inflight.clone(),
+            queue_depth: 8,
+        };
+
+        let signer_a = Address::from([0x11u8; 20]);
+        let signer_b = Address::from([0x22u8; 20]);
+
+        // Helper to drop an entry directly into the map without going
+        // through try_enqueue (which also sends on the channel).
+        let insert = |hash: TxHash, signer: Address, state: JobState| {
+            inflight.insert(
+                hash,
+                InFlightEntry {
+                    state,
+                    eth_tx_hash: hash,
+                    signer,
+                    kind: WriteJobKind::Claim,
+                    job_id: Ulid::new(),
+                    envelope: fake_envelope(0).0,
+                    created_at: Instant::now(),
+                    terminal_at: None,
+                },
+            );
+        };
+
+        // Signer A: 2 Queued + 1 Submitting + 1 Committed + 1 Failed = 3 non-terminal.
+        insert(TxHash::from([0xA1u8; 32]), signer_a, JobState::Queued);
+        insert(TxHash::from([0xA2u8; 32]), signer_a, JobState::Queued);
+        insert(TxHash::from([0xA3u8; 32]), signer_a, JobState::Submitting);
+        insert(
+            TxHash::from([0xA4u8; 32]),
+            signer_a,
+            JobState::Committed { block_number: 1 },
+        );
+        insert(TxHash::from([0xA5u8; 32]), signer_a, JobState::Failed);
+
+        // Signer B: 1 Queued = 1 non-terminal. (Cross-signer noise.)
+        insert(TxHash::from([0xB1u8; 32]), signer_b, JobState::Queued);
+
+        assert_eq!(handle.count_non_terminal_for_signer(&signer_a), 3);
+        assert_eq!(handle.count_non_terminal_for_signer(&signer_b), 1);
+        assert_eq!(
+            handle.count_non_terminal_for_signer(&Address::from([0xFFu8; 20])),
+            0,
+            "unknown signer must return 0"
+        );
     }
 }

@@ -369,11 +369,41 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
         "eth_getTransactionCount" => {
             let params: (String, String) = request.parse_params()?;
-            let nonce = service
+            let addr = &params.0;
+            let tag = params.1.as_str();
+            let mut nonce = service
                 .store
-                .nonce_get(&params.0)
+                .nonce_get(addr)
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?;
+
+            // RD-940 Decision 4 — honour the block tag.
+            //
+            // `store.nonce_get` returns the **next-accepted** nonce because
+            // `eth_sendRawTransaction` advances it on accept (both legacy and
+            // worker paths). That value matches geth's `pending` semantics
+            // directly. For `latest` / `safe` / `finalized` / `earliest` the
+            // RPC must instead return the **next-committed** nonce, computed
+            // as `next-accepted - count(inflight non-terminal jobs from this
+            // signer)`.
+            //
+            // claim-sponsor's `nonce_cache.go:35` LRU reads `latest`; without
+            // this branch it sees queued/submitting txs leak into `latest`
+            // and races itself (Spec E). When the writer worker is disabled
+            // there are no inflight jobs so the two tags agree by
+            // construction.
+            //
+            // Empty / missing tag defaults to `latest` per the geth contract
+            // (`eth_getTransactionCount` second-param convention).
+            let treat_as_latest = matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest");
+            if treat_as_latest
+                && let Some(handle) = service.writer_handle.as_ref()
+                && let Ok(signer_addr) = addr.parse::<alloy::primitives::Address>()
+            {
+                let inflight = handle.count_non_terminal_for_signer(&signer_addr);
+                nonce = nonce.saturating_sub(inflight as u64);
+            }
+
             Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
         }
 

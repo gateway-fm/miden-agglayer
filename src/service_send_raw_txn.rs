@@ -524,6 +524,45 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let signer = txn_envelope.recover_signer()?;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
+    // RD-940 Decision 3 — tx-hash dedup early-return, BEFORE the R4 nonce check.
+    //
+    // aggkit's ethtxmanager re-broadcasts stuck txs within its
+    // `WaitTxToBeMined = 2m` envelope (`fixtures/aggkit-config.toml:43`).
+    // Without this short-circuit the re-broadcast races R4's `tx.nonce ==
+    // expected_nonce` check (the first accept already advanced the nonce),
+    // the duplicate gets a "nonce mismatch" error, and aggkit's state machine
+    // wedges. Returning `Ok(hash)` on a known hash matches geth's idempotent
+    // re-broadcast behaviour (Spec D / Spec E).
+    //
+    // Two lookups, OR'd:
+    //   1. Writer in-flight cache — present when the worker has accepted but
+    //      not yet committed. Set/cleared by `WriterWorkerHandle::try_enqueue`
+    //      and the worker's `process` loop.
+    //   2. Store `txn_get` — present once a receipt has been written (either
+    //      Committed or Failed via TTL/worker-failure). Covers the case where
+    //      a re-broadcast arrives after the worker has finished.
+    //
+    // Runs BEFORE `per_signer_lock` so contention from re-broadcast bursts
+    // doesn't pile up on the lock.
+    if let Some(handle) = service.writer_handle.as_ref()
+        && handle.is_inflight(&txn_hash)
+    {
+        tracing::debug!(
+            target: "rpc::dedup",
+            %txn_hash,
+            "tx-hash dedup (inflight): returning OK without re-enqueueing"
+        );
+        return Ok(txn_hash);
+    }
+    if matches!(service.store.txn_get(txn_hash).await, Ok(Some(_))) {
+        tracing::debug!(
+            target: "rpc::dedup",
+            %txn_hash,
+            "tx-hash dedup (committed): returning OK without re-running R4"
+        );
+        return Ok(txn_hash);
+    }
+
     // R4 follow-up — serialise the entire nonce-check + handler critical section
     // for this signer. Without the mutex, two concurrent same-nonce txs both
     // pass the equality check before either calls `nonce_increment`. This guard
@@ -1256,6 +1295,45 @@ mod tests {
         assert!(is_signer_allowed(Some(&list), &alice));
         assert!(is_signer_allowed(Some(&list), &bob));
         assert!(!is_signer_allowed(Some(&list), &carol));
+    }
+
+    /// RD-940 Decision 3 — tx-hash dedup early-return.
+    ///
+    /// aggkit's ethtxmanager re-broadcasts stuck txs within
+    /// `WaitTxToBeMined = 2m`. Without dedup, the re-broadcast races R4
+    /// nonce equality (the original accept already advanced the nonce) and
+    /// the duplicate gets "nonce mismatch", wedging aggkit's state machine.
+    ///
+    /// Submit a tx twice, assert: (1) both calls return the same `Ok(hash)`,
+    /// (2) the nonce advanced exactly once. The dedup branch fires because
+    /// `txn_get` returns Some after the first accept commits a receipt.
+    #[tokio::test]
+    async fn rd940_decision3_idempotent_rebroadcast_returns_same_hash() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xCCu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+
+        // First submission — runs the full pipeline.
+        let first = service_send_raw_txn(service.clone(), input_hex.clone())
+            .await
+            .expect("first submit must succeed");
+        // Second submission with the SAME wire bytes — should hit the dedup
+        // path and return the same hash without re-running anything.
+        let second = service_send_raw_txn(service.clone(), input_hex)
+            .await
+            .expect("re-broadcast must succeed via dedup");
+        assert_eq!(first, second, "dedup must return the original tx hash");
+
+        // Nonce must have advanced exactly once.
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            1,
+            "dedup must not double-advance the nonce"
+        );
     }
 
     /// R2 integration repro — a signed tx whose signer is NOT on the allow-list
