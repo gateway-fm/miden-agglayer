@@ -120,6 +120,13 @@ pub struct ServiceState {
     /// call. `None` when talking to the node directly; `Some(...)` when fronted by a
     /// gateway that rate-limits unauthenticated traffic. Redact if you ever log this.
     pub miden_api_key: Option<String>,
+    /// RD-940 async writer-worker dispatch toggle. When `false` (the default
+    /// until Phase 7 of the RD-940 rollout), `eth_sendRawTransaction` runs the
+    /// existing synchronous handler unchanged. When `true`, requests are
+    /// validated on the request thread and the actual Miden submission is
+    /// enqueued to the single writer-worker task. See
+    /// `docs/design/RD-940-async-writer.md` for the full design.
+    pub enable_writer_worker: bool,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -163,6 +170,7 @@ impl ServiceState {
             reject_hardhat_alias: false,
             expected_mints,
             miden_api_key: None,
+            enable_writer_worker: false,
         }
     }
 }

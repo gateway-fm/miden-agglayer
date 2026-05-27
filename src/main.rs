@@ -180,6 +180,16 @@ struct Command {
     /// Default OFF — preserves the bali OOM fix as the default behaviour.
     #[arg(long, env = "MIDEN_PROVER_FALLBACK_TO_LOCAL", default_value_t = false)]
     miden_prover_fallback_to_local: bool,
+
+    /// RD-940 async writer-worker dispatch toggle. When `false` (the default
+    /// during the RD-940 rollout up to Phase 7), `eth_sendRawTransaction` runs
+    /// the existing synchronous handler unchanged. When `true`, requests are
+    /// validated on the request thread and Miden submission is enqueued to the
+    /// single writer-worker task — see `docs/design/RD-940-async-writer.md`.
+    /// The flag is plumbed end-to-end starting at Phase 0; the actual fork on
+    /// it lands in Phase 1.
+    #[arg(long, env = "AGGLAYER_ENABLE_WRITER_WORKER", default_value_t = false)]
+    enable_writer_worker: bool,
 }
 
 /// Validate the `--require-hardening` invariants. Returns a list of
@@ -289,6 +299,7 @@ impl std::fmt::Debug for Command {
                 "miden_prover_fallback_to_local",
                 &self.miden_prover_fallback_to_local,
             )
+            .field("enable_writer_worker", &self.enable_writer_worker)
             .finish()
     }
 }
@@ -575,6 +586,7 @@ async fn main() -> anyhow::Result<()> {
     state.expected_mints = expected_mints_handle;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     state.miden_api_key = command.miden_api_key;
+    state.enable_writer_worker = command.enable_writer_worker;
 
     // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
     // proactively indexing every (mainnet, rollup) pair as L1 emits it,
@@ -818,6 +830,7 @@ mod hardening_tests {
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
+            enable_writer_worker: false,
         }
     }
 
