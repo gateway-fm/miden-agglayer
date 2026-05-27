@@ -34,8 +34,10 @@ warn() { echo -e "${YELLOW}[$(date +%H:%M:%S)] WARN:${NC} $*"; }
 fail() { echo -e "${RED}[$(date +%H:%M:%S)] FAIL:${NC} $*" >&2; exit 1; }
 pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
 
-# Phase 1: confirm worker is active
-if ! docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -q "RD-940 writer worker spawned"; then
+# Phase 1: confirm worker is active. Buffer logs before grep to avoid the
+# set -o pipefail × SIGPIPE false-failure when `grep -q` closes the pipe.
+LOGS=$(docker logs "$AGGLAYER_CONTAINER" 2>&1)
+if ! grep -q "RD-940 writer worker spawned" <<<"$LOGS"; then
     fail "writer worker not active — start with AGGLAYER_ENABLE_WRITER_WORKER=true make e2e-up"
 fi
 pass "worker is active on baseline boot"

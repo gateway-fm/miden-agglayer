@@ -27,11 +27,12 @@ log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
 fail() { echo -e "${RED}[$(date +%H:%M:%S)] FAIL:${NC} $*" >&2; exit 1; }
 pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
 
-# Verify queue depth env is low. We don't restart the stack here; the test
-# assumes the orchestrator (CI / make target) brought it up with the right
-# value. Skip with a clear message if not.
-if ! docker logs "${COMPOSE_PROJECT_NAME:-miden-agglayer}-miden-agglayer-1" 2>&1 \
-    | grep -q "RD-940 writer worker spawned"; then
+# Verify worker is active. Buffer logs before grep — pipefail × SIGPIPE
+# false-fails the simpler `docker logs ... | grep -q` form when grep -q
+# closes the pipe early.
+AGGLAYER_CONT="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME:-miden-agglayer}-miden-agglayer-1}"
+LOGS=$(docker logs "$AGGLAYER_CONT" 2>&1)
+if ! grep -q "RD-940 writer worker spawned" <<<"$LOGS"; then
     fail "writer worker not active — start stack with \
          AGGLAYER_ENABLE_WRITER_WORKER=true AGGLAYER_WRITER_QUEUE_DEPTH=1 make e2e-up"
 fi
