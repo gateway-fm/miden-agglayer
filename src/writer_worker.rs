@@ -90,7 +90,7 @@ pub const DROP_SNAPSHOT_PATH: &str = "/tmp/agglayer-writer-queue-snapshot";
 
 /// Read + remove the dropped-on-restart snapshot left by the previous
 /// shutdown. Returns the residual count (0 if the file is missing or
-/// unparseable). Call this **after** `metrics::init_metrics` so the
+/// unparsable). Call this **after** `metrics::init_metrics` so the
 /// counter increment lands in the registered recorder.
 pub fn read_and_clear_drop_snapshot() -> u64 {
     match std::fs::read_to_string(DROP_SNAPSHOT_PATH) {
@@ -472,7 +472,7 @@ pub struct WriterWorker {
 
 impl WriterWorker {
     /// Read `AGGLAYER_WRITER_QUEUE_DEPTH`, falling back to `DEFAULT_QUEUE_DEPTH`
-    /// when unset or unparseable. Logs a warning on parse failure so an
+    /// when unset or unparsable. Logs a warning on parse failure so an
     /// operator misconfiguration is loud.
     pub fn parse_queue_depth_env() -> usize {
         match std::env::var(QUEUE_DEPTH_ENV) {
