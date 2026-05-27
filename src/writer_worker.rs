@@ -75,6 +75,42 @@ pub const TX_TTL_ENV: &str = "AGGLAYER_WRITER_TX_TTL";
 /// How often the TTL sweeper task wakes up to evict aged-out terminal entries.
 const SWEEPER_INTERVAL: Duration = Duration::from_secs(30);
 
+/// RD-940 Phase 5 — graceful-shutdown queue-depth snapshot location.
+///
+/// Written by the writer-worker process on clean termination with the
+/// number of in-flight jobs still in non-terminal state. Read+reset on the
+/// next process boot to feed the `agglayer_writer_dropped_on_restart_total`
+/// counter. `/tmp` is appropriate for a k8s `emptyDir` (default behaviour on
+/// bali) — survives across container restarts within the same Pod, lost
+/// across Pod evictions, which matches the lossy semantics of the v1
+/// in-memory queue. SIGKILL leaves the tmpfile absent; combined with
+/// pre-kill `agglayer_writer_queue_depth` history this still pinpoints the
+/// loss window.
+pub const DROP_SNAPSHOT_PATH: &str = "/tmp/agglayer-writer-queue-snapshot";
+
+/// Read + remove the dropped-on-restart snapshot left by the previous
+/// shutdown. Returns the residual count (0 if the file is missing or
+/// unparseable). Call this **after** `metrics::init_metrics` so the
+/// counter increment lands in the registered recorder.
+pub fn read_and_clear_drop_snapshot() -> u64 {
+    match std::fs::read_to_string(DROP_SNAPSHOT_PATH) {
+        Ok(s) => {
+            let n: u64 = s.trim().parse().unwrap_or(0);
+            let _ = std::fs::remove_file(DROP_SNAPSHOT_PATH);
+            n
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Write the dropped-on-restart snapshot at graceful shutdown. Tolerates
+/// I/O failure — if the write fails, the next boot's read returns 0 and
+/// the operator sees "queue depth was high → restart → counter quiet",
+/// which the pre-kill queue-depth history covers as the fallback signal.
+pub fn write_drop_snapshot(count: u64) {
+    let _ = std::fs::write(DROP_SNAPSHOT_PATH, count.to_string());
+}
+
 // ─── DecodedWriteCall ───────────────────────────────────────────────────────
 
 /// Method-decoded `eth_sendRawTransaction` payload — the *output* of
@@ -348,6 +384,16 @@ impl WriterWorkerHandle {
     /// `agglayer_writer_queue_depth` gauge on each enqueue attempt.
     pub fn available_capacity(&self) -> usize {
         self.sender.capacity()
+    }
+
+    /// RD-940 Phase 5 — total non-terminal in-flight count (Queued +
+    /// Submitting across all signers). Used at graceful shutdown to size
+    /// the `dropped_on_restart` tmpfile snapshot.
+    pub fn inflight_non_terminal_count(&self) -> usize {
+        self.inflight
+            .iter()
+            .filter(|e| !e.state.is_terminal())
+            .count()
     }
 
     /// RD-940 Decision 4 — count non-terminal in-flight jobs for `signer`.
@@ -665,6 +711,27 @@ impl WriterWorker {
         let signer = job.signer();
         let started = Instant::now();
 
+        // RD-940 Phase 5 — one tracing span per job, fields per Spec F §4:
+        // tx_hash, job_id, kind, signer, queue_wait_ms, miden_submit_ms,
+        // commit_ms. `queue_wait_ms` is measured from the inflight entry's
+        // `created_at` (set in `try_enqueue`); the remaining elapsed
+        // measurements are recorded inline below.
+        let queue_wait_ms = self
+            .inflight
+            .get(&hash)
+            .map(|e| e.created_at.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let span = tracing::info_span!(
+            target: "writer_worker::job",
+            "writer_job",
+            %hash,
+            %job_id,
+            kind = kind.as_str(),
+            signer = %signer,
+            queue_wait_ms,
+        );
+        let _entered = span.enter();
+
         // Transition Queued → Submitting.
         if let Some(mut entry) = self.inflight.get_mut(&hash) {
             entry.state = JobState::Submitting;
@@ -734,6 +801,18 @@ impl WriterWorker {
                          eth_getTransactionReceipt will return null"
                     );
                 }
+                // Spec F: bucket failure reasons for the job_failures_total
+                // counter. Phase 1 doesn't distinguish miden errors from
+                // store errors at this layer — reason="miden" is the
+                // catch-all for now; the TTL sweeper increments
+                // reason="ttl" directly. Refine when miden_client emits
+                // typed errors.
+                ::metrics::counter!(
+                    "agglayer_writer_job_failures_total",
+                    "kind" => kind.as_str(),
+                    "reason" => "miden",
+                )
+                .increment(1);
             }
         }
 

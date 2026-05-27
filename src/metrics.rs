@@ -190,6 +190,32 @@ pub fn init_metrics() {
          LimitExceeded); aggkit's ethtxmanager retries transparently. \
          Labels: kind=claim|ger_insert. Alert: rate >0.1/s for 5 min → page."
     );
+
+    // RD-940 Phase 5 observability — the remaining 3 metrics from Spec F §4.
+    describe_counter!(
+        "agglayer_writer_job_failures_total",
+        "RD-940: writer-worker jobs that reached a terminal Failed state. \
+         Labels: kind=claim|ger_insert|unknown, reason=miden|ttl|panic|store. \
+         Alert: burst >0.5/s for 5 min → page."
+    );
+    describe_counter!(
+        "agglayer_writer_dropped_on_restart_total",
+        "RD-940: queue-depth snapshot read on boot from the previous \
+         process's graceful shutdown. A non-zero value means the previous \
+         restart dropped that many in-flight jobs whose hashes had already \
+         been returned to callers — those callers MUST re-submit. \
+         **Hard page on increase[1h]>0** — v1 tripwire (no on-disk queue). \
+         The metric is silent under SIGKILL because the tmpfile is only \
+         written on graceful drain; combined with pre-kill queue-depth \
+         history this still pinpoints the loss window."
+    );
+    describe_counter!(
+        "agglayer_writer_drain_outcome_total",
+        "RD-940: graceful-shutdown drain outcomes. Labels: outcome=clean \
+         (queue empty within budget) | partial (budget elapsed, residual \
+         jobs left for dropped_on_restart accounting). Dashboard only — \
+         not paging."
+    );
 }
 
 // =====================================================================

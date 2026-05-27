@@ -594,10 +594,11 @@ async fn main() -> anyhow::Result<()> {
     //
     // The handle is plumbed into `ServiceState` (a `Clone` struct) BEFORE
     // `service::serve` clones the state per request, so every dispatcher sees
-    // the same writer channel and inflight DashMap. The oneshot shutdown
-    // sender is `mem::forget`ged for parity with the L1InfoTreeIndexer below;
-    // graceful drain via SIGTERM lands in Phase 5.
-    if command.enable_writer_worker {
+    // the same writer channel and inflight DashMap. Phase 5: the oneshot
+    // shutdown sender is held in a local so we can fire it on graceful
+    // SIGTERM and drain the queue before the process exits.
+    let writer_shutdown: Option<tokio::sync::oneshot::Sender<()>> = if command.enable_writer_worker
+    {
         let queue_depth =
             miden_agglayer_service::writer_worker::WriterWorker::parse_queue_depth_env();
         let tx_ttl = miden_agglayer_service::writer_worker::WriterWorker::parse_tx_ttl_env();
@@ -607,19 +608,20 @@ async fn main() -> anyhow::Result<()> {
                 queue_depth,
                 tx_ttl,
             );
-        std::mem::forget(writer_shutdown_tx);
         tracing::info!(
             queue_depth,
             tx_ttl_secs = tx_ttl.as_secs(),
             "RD-940 writer worker spawned"
         );
         state.writer_handle = Some(Arc::new(handle));
+        Some(writer_shutdown_tx)
     } else {
         tracing::info!(
             "RD-940 writer worker disabled (enable_writer_worker=false); \
              eth_sendRawTransaction runs the legacy synchronous handler"
         );
-    }
+        None
+    };
 
     // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
     // proactively indexing every (mainnet, rollup) pair as L1 emits it,
@@ -708,6 +710,23 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to install metrics recorder")?;
     miden_agglayer_service::metrics::init_metrics();
 
+    // RD-940 Phase 5 — read the previous process's graceful-shutdown
+    // snapshot. A non-zero value means in-flight WriteJobs whose hashes
+    // had already been returned to callers were dropped on the last
+    // restart. Page hard on this counter: every increment is real
+    // unrecovered work and callers MUST re-submit. Must run AFTER
+    // `init_metrics` so the recorder is registered.
+    let dropped = miden_agglayer_service::writer_worker::read_and_clear_drop_snapshot();
+    if dropped > 0 {
+        tracing::error!(
+            count = dropped,
+            "RD-940 dropped_on_restart: previous shutdown left {dropped} in-flight job(s). \
+             Their tx hashes were returned to callers but the work is unrecoverable in v1. \
+             Callers MUST re-submit. Hard-page on this counter."
+        );
+        ::metrics::counter!("agglayer_writer_dropped_on_restart_total").increment(dropped);
+    }
+
     // Startup diagnostic: once the initial sync completes, check whether any
     // managed account is marked `locked` in miden-client's local state. A
     // stale lock is a symptom of a previous crash or commitment divergence and
@@ -794,6 +813,49 @@ async fn main() -> anyhow::Result<()> {
 
     let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
     service::serve(url, state.clone(), metrics_handle).await?;
+
+    // RD-940 Phase 5 — graceful drain. When `service::serve` returns
+    // (SIGTERM or upstream error), signal the writer worker to stop
+    // accepting new jobs, give it a short window to finish work that's
+    // already mid-Miden-roundtrip, then snapshot any residual non-terminal
+    // count to the dropped_on_restart tmpfile for the next boot. The
+    // budget (20 s) sits inside aggkit's `WaitTxToBeMined = 2 m` so even
+    // a partial drain doesn't leave aggkit wedged.
+    if let Some(shutdown_tx) = writer_shutdown {
+        let _ = shutdown_tx.send(());
+        tracing::info!("RD-940 writer worker: drain signal sent");
+        // Light wait — the worker exits its recv loop on the next
+        // iteration. We don't await a JoinHandle (Phase 1 didn't expose
+        // one). A short sleep gives the worker time to flip terminal_at
+        // on anything currently mid-dispatch.
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let residual = state
+            .writer_handle
+            .as_ref()
+            .map(|h| h.inflight_non_terminal_count())
+            .unwrap_or(0);
+        if residual > 0 {
+            tracing::warn!(
+                residual,
+                "RD-940 graceful drain: {residual} job(s) still in non-terminal state; \
+                 writing snapshot to {} for next-boot dropped_on_restart accounting",
+                miden_agglayer_service::writer_worker::DROP_SNAPSHOT_PATH
+            );
+            miden_agglayer_service::writer_worker::write_drop_snapshot(residual as u64);
+            ::metrics::counter!(
+                "agglayer_writer_drain_outcome_total",
+                "outcome" => "partial",
+            )
+            .increment(1);
+        } else {
+            tracing::info!("RD-940 graceful drain: queue empty, clean shutdown");
+            ::metrics::counter!(
+                "agglayer_writer_drain_outcome_total",
+                "outcome" => "clean",
+            )
+            .increment(1);
+        }
+    }
 
     state.miden_client.shutdown()?;
 
