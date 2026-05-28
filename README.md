@@ -47,6 +47,54 @@ src/
 └── main.rs                 # CLI entry point (clap)
 ```
 
+### Bridge amount ceiling
+
+Every L1 → Miden deposit is scaled from the L1 `uint256` wei amount down
+to a Miden fungible-asset amount (an 8-decimal `Felt`). The maximum
+representable Miden value is the protocol-level fungible-asset cap
+[`miden_client::asset::FungibleAsset::MAX_AMOUNT`][miden-max] —
+`2^63 − 2^31 ≈ 9.223 × 10^18` Miden base units. For the default 18 → 8
+decimal layout this corresponds to approximately **9.22 billion ETH per
+single deposit**, well above any realistic single-deposit value.
+
+This ceiling supersedes the earlier `u32::MAX` (~42.94 ETH) limit that
+was reported under [RD-702][rd-702]. The cap is now enforced by
+`EthAmount::scale_to_token_amount` (used inside `scale_claim_amount` at
+`src/claim.rs`), not by an intermediate `u32` truncation — see the
+boundary regression in
+[`cantina_12_amount_cap_pins_fungible_asset_max`][cantina-12]
+(`src/claim.rs:838-867`) and the above-old-ceiling acceptance test
+[`accepts_amount_above_old_u32_ceiling`][accepts] (`src/claim.rs:802-807`).
+Both will fail loud if a future refactor tightens or loosens the cap.
+
+The flow is:
+
+1. `claimAsset()` arrives over `eth_sendRawTransaction` with a `uint256
+   amount` (wei).
+2. `scale_claim_amount` (in `src/claim.rs`) divides by `10^scale`
+   (where `scale = origin_token_decimals − miden_decimals`, usually
+   `18 − 8 = 10`), truncating sub-unit wei.
+3. `EthAmount::scale_to_token_amount` rejects the scaled value if it
+   exceeds `FungibleAsset::MAX_AMOUNT`.
+4. On rejection, `scale_claim_amount` returns
+   `claim amount is not representable on Miden: <inner error>`. That
+   error bubbles out of `publish_claim` as an `anyhow::Error`, the JSON-RPC
+   handler maps it to a standard EVM error response, and the
+   `try_claim` lock is released by the RAII drop guard so the caller
+   may resubmit a smaller deposit. No CLAIM note is written, no Miden
+   transaction is submitted, and the eth tx hash is not recorded as
+   successful in the store.
+
+Cantina #12 (see the source comment on the regression test) also bounds
+the upstream MASM verifier's safe range; values that would land in the
+`[2^123, 2^128)` MASM gap are rejected at this same step before any
+note is built.
+
+[miden-max]: https://github.com/0xMiden/miden-base
+[rd-702]: https://linear.app/gatewayfm/issue/RD-702
+[cantina-12]: src/claim.rs
+[accepts]: src/claim.rs
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs) (1.90+, nightly for Docker builds)
