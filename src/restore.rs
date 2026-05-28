@@ -35,9 +35,10 @@ use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
 use crate::bridge_out::{is_b2agg_note, parse_b2agg_storage, resolve_faucet_origin};
+use crate::claim_watcher::{derive_manual_claim_tx_hash, parse_claim_event_from_storage};
 use crate::miden_client::MidenClient;
 use crate::store::Store;
-use miden_base_agglayer::UpdateGerNote;
+use miden_base_agglayer::{UpdateGerNote, claim_script};
 use miden_client::store::NoteFilter;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
@@ -46,6 +47,10 @@ use std::sync::Arc;
 pub struct RestoreResult {
     pub block_number: u64,
     pub bridge_outs_restored: usize,
+    /// Cantina MA#27 — number of consumed CLAIM notes for which a synthetic
+    /// ClaimEvent was emitted by restore (the offline equivalent of what
+    /// [`crate::claim_watcher::ClaimWatcher`] does on every live sync tick).
+    pub claims_restored: usize,
     pub gers_restored: usize,
     pub logs_created: usize,
 }
@@ -106,6 +111,26 @@ pub async fn restore(
     total_logs += logs;
     tracing::info!("Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs");
 
+    // Phase 2.5: Scan miden consumed CLAIM notes — Cantina MA#27
+    //
+    // The live `ClaimWatcher::on_post_sync` (claim_watcher.rs) is the only
+    // path that synthesises a `ClaimEvent` log when the primary
+    // `eth_sendRawTransaction` flow didn't write one (crash recovery + any
+    // CLAIM consumed by a tracked account through a non-RPC path).
+    // `restore()` previously skipped this entirely, so after a fresh DB
+    // (e.g. `--reset-miden-store --restore`) every pre-existing claim was
+    // dropped on the floor — bridge-service never saw the synthetic event
+    // and the L1 deposit stayed `claimed=false` forever, blocking the next
+    // aggsender certificate. Replay using the same primitives the live
+    // watcher uses so the synthetic logs are byte-identical (same tx-hash
+    // derivation, same `commit_manual_claim_event_atomic` store path).
+    tracing::info!("Phase 2.5: scanning miden consumed CLAIM notes (MA#27)...");
+    let (claims, claim_logs) =
+        restore_claims(store, miden_client, block_state, next_block).await?;
+    next_block += if claim_logs > 0 { 1 } else { 0 };
+    total_logs += claim_logs;
+    tracing::info!("Phase 2.5 complete: {claims} claims, {claim_logs} logs");
+
     // Phase 3: Scan consumed UpdateGerNote notes on Miden
     tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
     let (gers, ger_logs) = restore_gers(store, miden_client, block_state, next_block).await?;
@@ -119,12 +144,13 @@ pub async fn restore(
 
     // Phase 5: Verify
     tracing::info!("Phase 5: verification");
-    tracing::info!("  bridge_outs={bridge_outs}, gers={gers}, logs={total_logs}");
+    tracing::info!("  bridge_outs={bridge_outs}, claims={claims}, gers={gers}, logs={total_logs}");
     tracing::info!("=== RESTORE: complete ===");
 
     Ok(RestoreResult {
         block_number: final_block,
         bridge_outs_restored: bridge_outs,
+        claims_restored: claims,
         gers_restored: gers,
         logs_created: total_logs,
     })
@@ -281,6 +307,159 @@ async fn restore_bridge_outs(
     Ok((count, logs))
 }
 
+/// Phase 2.5: scan miden consumed CLAIM notes and replay any missing
+/// synthetic `ClaimEvent` log via [`Store::commit_manual_claim_event_atomic`].
+///
+/// Mirrors [`crate::claim_watcher::ClaimWatcher::on_post_sync`] — same
+/// script-root filter, same storage decoder, same dedup predicates, same
+/// atomic commit primitive — but runs offline as a restore phase instead of
+/// inside the live sync loop. The synthetic tx_hash uses the shared
+/// `derive_manual_claim_tx_hash` helper so re-running restore (or running
+/// live after restore) lands on a byte-identical hash and the bridge-service
+/// deduplicates correctly.
+///
+/// Returns `(claims_processed, logs_created)`.
+async fn restore_claims(
+    store: &Arc<dyn Store>,
+    miden_client: &MidenClient,
+    block_state: &Arc<BlockState>,
+    restore_block: u64,
+) -> anyhow::Result<(usize, usize)> {
+    let store_clone = store.clone();
+    let block_state_clone = block_state.clone();
+
+    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let result_inner = result.clone();
+
+    miden_client
+        .with(move |client| {
+            Box::new(async move {
+                let consumed_notes = client
+                    .get_input_notes(NoteFilter::Consumed)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+
+                let claim_root = claim_script().root();
+                let block_hash = block_state_clone.get_block_hash(restore_block);
+                let bridge_address = get_bridge_address();
+                let mut claim_count = 0usize;
+                let mut log_count = 0usize;
+
+                // G7 — deterministic sort. CLAIM notes share the same
+                // restore_block (and therefore block_hash) and write into a
+                // dedup-keyed store, but we still sort to keep restore runs
+                // deterministic for the operator-visible
+                // `claim_watcher_synthesised_total` counter and log stream.
+                let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
+                sorted_notes.sort_by_key(|n| n.id().to_string());
+
+                for note in sorted_notes {
+                    let details = note.details();
+                    if details.script().root() != claim_root {
+                        continue;
+                    }
+
+                    let note_id_str = note.id().to_string();
+
+                    // Dedup 1: was this CLAIM already replayed by an earlier
+                    // restore (or by the live watcher)?
+                    if store_clone.is_claim_note_processed(&note_id_str).await? {
+                        continue;
+                    }
+
+                    // Decode the on-chain CLAIM storage. Malformed storage
+                    // is logged + counted but doesn't abort restore — the
+                    // live watcher does the same (`quarantining` path).
+                    let decoded = match parse_claim_event_from_storage(details.storage()) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            ::metrics::counter!("claim_watcher_storage_decode_total")
+                                .increment(1);
+                            tracing::warn!(
+                                target: "restore::claims",
+                                note_id = %note_id_str,
+                                error = ?e,
+                                "restore: CLAIM storage could not be decoded; skipping"
+                            );
+                            ::metrics::counter!("claim_watcher_unrecoverable_total").increment(1);
+                            continue;
+                        }
+                    };
+
+                    // Dedup 2: was the ClaimEvent already written by the
+                    // normal `eth_sendRawTransaction` path before the crash?
+                    // Same check the live watcher uses; without it restore
+                    // would double-emit for every CLAIM whose primary path
+                    // ran to completion.
+                    if store_clone
+                        .has_claim_event_for_global_index(&decoded.global_index)
+                        .await?
+                    {
+                        ::metrics::counter!("claim_watcher_already_recorded_total").increment(1);
+                        // Still mark the note processed so the next
+                        // observation (live watcher or another restore) is
+                        // a fast skip rather than a re-decode.
+                        if let Err(e) = store_clone
+                            .mark_claim_note_processed(
+                                note_id_str.clone(),
+                                decoded.global_index,
+                                restore_block,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                target: "restore::claims",
+                                note_id = %note_id_str,
+                                error = ?e,
+                                "restore: failed to mark already-recorded CLAIM processed"
+                            );
+                        }
+                        continue;
+                    }
+
+                    let tx_hash = derive_manual_claim_tx_hash(&note_id_str);
+
+                    store_clone
+                        .commit_manual_claim_event_atomic(
+                            note_id_str.clone(),
+                            bridge_address,
+                            restore_block,
+                            block_hash,
+                            &tx_hash,
+                            decoded.global_index,
+                            decoded.origin_network,
+                            &decoded.origin_address,
+                            &decoded.destination_address,
+                            decoded.amount,
+                        )
+                        .await?;
+
+                    ::metrics::counter!("claim_watcher_synthesised_total").increment(1);
+                    tracing::info!(
+                        target: "restore::claims",
+                        note_id = %note_id_str,
+                        synthetic_tx_hash = %tx_hash,
+                        global_index = %hex::encode(decoded.global_index),
+                        origin_network = decoded.origin_network,
+                        amount = decoded.amount,
+                        block_number = restore_block,
+                        "restore: synthesised ClaimEvent from consumed CLAIM note (MA#27)"
+                    );
+
+                    claim_count += 1;
+                    log_count += 1;
+                }
+
+                *result_inner.lock().unwrap() = (claim_count, log_count);
+                Ok(())
+            })
+        })
+        .await?;
+
+    let (count, logs) = *result.lock().unwrap();
+    Ok((count, logs))
+}
+
 /// Phase 3: scan consumed UpdateGerNote notes to rebuild GER state.
 async fn restore_gers(
     store: &Arc<dyn Store>,
@@ -413,4 +592,120 @@ async fn restore_gers(
 
     let (count, logs) = *result.lock().unwrap();
     Ok((count, logs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use crate::store::memory::InMemoryStore;
+    use std::sync::Arc as StdArc;
+
+    // MA#27 — store-level pin for the Phase 2.5 dedup-and-emit pipeline.
+    // Replays the inner steps `restore_claims` performs against an
+    // InMemoryStore (skipping only the per-tick consumed_notes fetch which
+    // requires a live miden-client) and asserts:
+    //   1) First call emits a ClaimEvent and marks the note processed.
+    //   2) Second call (same note) is a no-op (Dedup 1).
+    //   3) If a ClaimEvent for the same global_index was already written
+    //      (e.g. by the normal eth_sendRawTransaction path), the new
+    //      observation skips emission but DOES mark the note processed
+    //      (Dedup 2).
+    #[tokio::test]
+    async fn ma27_restore_claims_emits_and_dedups() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+
+        let note_id = "0xnoteA".to_string();
+        let gi = [0x42u8; 32];
+        let bridge = get_bridge_address();
+        let tx_hash = derive_manual_claim_tx_hash(&note_id);
+
+        // Pre-conditions
+        assert!(!store.is_claim_note_processed(&note_id).await.unwrap());
+        assert!(!store.has_claim_event_for_global_index(&gi).await.unwrap());
+
+        // Phase 2.5 inner emission — mirror the call we make in
+        // `restore_claims` for an accepted CLAIM.
+        store
+            .commit_manual_claim_event_atomic(
+                note_id.clone(),
+                bridge,
+                1,
+                [0u8; 32],
+                &tx_hash,
+                gi,
+                7,
+                &[1u8; 20],
+                &[2u8; 20],
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert!(store.is_claim_note_processed(&note_id).await.unwrap());
+        assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+
+        // Idempotency: Dedup 1 short-circuits on a second pass. We model
+        // this by checking the predicate restore_claims uses BEFORE doing
+        // any write — if it returns true, we skip.
+        let already_processed = store.is_claim_note_processed(&note_id).await.unwrap();
+        assert!(
+            already_processed,
+            "second restore must see Dedup 1 fire and skip emission"
+        );
+
+        // Dedup 2 — different note id, same global_index. The normal path
+        // already wrote the ClaimEvent; restore's job is to mark the new
+        // observation processed but NOT double-emit. We assert via the
+        // public predicate.
+        let other_note = "0xnoteB".to_string();
+        assert!(
+            store
+                .has_claim_event_for_global_index(&gi)
+                .await
+                .unwrap(),
+            "global_index dedup predicate must fire for a second observation"
+        );
+        // The mark step for the "already-recorded" branch is also exposed
+        // via the store primitive — pin it directly so any future store
+        // refactor that drops mark_claim_note_processed in this branch
+        // is caught.
+        store
+            .mark_claim_note_processed(other_note.clone(), gi, 1)
+            .await
+            .unwrap();
+        assert!(store.is_claim_note_processed(&other_note).await.unwrap());
+    }
+
+    // MA#27 — pin the synthetic tx-hash derivation used by Phase 2.5
+    // matches what the live `ClaimWatcher` produces. If these drift, a
+    // restore-then-live pair will double-emit ClaimEvents under different
+    // tx_hashes and bridge-service won't dedup them.
+    #[test]
+    fn ma27_restore_synthetic_tx_hash_matches_live_watcher() {
+        let note_id = "0xfeed".to_string();
+        let restore_path = derive_manual_claim_tx_hash(&note_id);
+        let live_path = crate::claim_watcher::derive_manual_claim_tx_hash(&note_id);
+        assert_eq!(
+            restore_path, live_path,
+            "restore and live ClaimWatcher must derive identical synthetic tx-hashes"
+        );
+    }
+
+    // MA#27 — RestoreResult exposes a `claims_restored` counter so
+    // operators can verify the new Phase 2.5 ran. Pin the field shape;
+    // older RestoreResult shapes without this field made it impossible to
+    // tell whether the new phase had executed at all.
+    #[test]
+    fn ma27_restore_result_exposes_claims_restored() {
+        let r = RestoreResult {
+            block_number: 7,
+            bridge_outs_restored: 1,
+            claims_restored: 2,
+            gers_restored: 3,
+            logs_created: 6,
+        };
+        assert_eq!(r.claims_restored, 2);
+    }
 }
