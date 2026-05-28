@@ -59,6 +59,18 @@ pub async fn restore(
 ) -> anyhow::Result<RestoreResult> {
     tracing::info!("=== RESTORE: starting state reconstruction ===");
 
+    // Cantina MA#23 — suppress the live `BridgeOutScanner` / `ClaimWatcher`
+    // sync-listener callbacks for the entire restore window. The background
+    // sync thread inside `MidenClient` keeps pulling deltas (so the local
+    // sqlite store stays fresh, which restore phases below depend on), but
+    // `on_post_sync` is gated off. Without this guard, the initial sync's
+    // listener pass — fired inside `MidenClient::new` BEFORE `restore()`
+    // is reached — and every 5s interval tick interleave with restore's
+    // own `.with()` calls, causing the live path to also emit synthetic
+    // BridgeEvent / ClaimEvent logs and race the deposit-counter cursor.
+    // The guard auto-restores on any exit path (Ok / Err / panic).
+    let _pause = miden_client.pause_listeners();
+
     // Phase 0: Re-import every bridge_accounts.toml account from the live
     // Miden node into the local sqlite. Without this, `--reset-miden-store
     // --restore` is a footgun: reset wipes the sqlite, restore's Phase 1
