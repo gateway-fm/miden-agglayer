@@ -170,14 +170,25 @@ impl LogFilter {
             // Without the topic filter guard, queries by address only (like aggkit's
             // L2BridgeSyncer) would receive UpdateHashChainValue logs that they can't
             // decode, causing "input too short" errors.
+            //
+            // Cantina MA#26 — passthrough is intentionally NARROWED to
+            // `UpdateHashChainValue` only. Synthetic `BridgeEvent` logs are
+            // emitted at the bridge contract address (see
+            // `Store::record_bridge_event` and bridge_out.rs), so a caller
+            // querying by the bridge address sees them via the normal
+            // address-match path — no passthrough required. Previously
+            // `BRIDGE_EVENT_TOPIC` was lumped into the passthrough list,
+            // which leaked BridgeEvent logs to consumers querying a
+            // DIFFERENT address but with BridgeEvent in their topic filter
+            // (e.g. a misconfigured indexer pointed at the wrong rollup's
+            // bridge address). Address-aware filtering is the correct
+            // semantic for BridgeEvent: if the address doesn't match,
+            // the log is not for this caller.
             let is_passthrough = if !matches_addr {
                 let topic0 = log.topics.first().map(|t| t.to_lowercase());
                 let is_passthrough_topic = topic0
                     .as_ref()
-                    .map(|t| {
-                        t == &UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()
-                            || t == &BRIDGE_EVENT_TOPIC.to_lowercase()
-                    })
+                    .map(|t| t == &UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase())
                     .unwrap_or(false);
 
                 // Only passthrough if the query's topic filter explicitly includes
@@ -401,4 +412,90 @@ mod tests {
 
     // LogStore-based tests (ger dedup, hash chain, log add/query, bridge event roundtrip)
     // have been moved to src/store/memory.rs tests.
+
+    /// Cantina MA#26 regression — a BridgeEvent log emitted at the bridge
+    /// contract address MUST NOT be returned to a caller filtering by a
+    /// DIFFERENT address even when the caller's topic filter explicitly
+    /// includes BRIDGE_EVENT_TOPIC. Pre-fix the passthrough fall-through
+    /// would let the log slip out, exposing cross-rollup bridge state to
+    /// indexers that asked for a different address.
+    #[test]
+    fn ma26_bridge_event_address_aware_filter() {
+        let log = SyntheticLog {
+            address: "0x000000000000000000000000000000000000bee5".to_string(),
+            topics: vec![BRIDGE_EVENT_TOPIC.to_string()],
+            data: "0x".to_string(),
+            block_number: 100,
+            block_hash: [0u8; 32],
+            transaction_hash: "0xabc".to_string(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+
+        // Caller filters by a different address but explicitly asks for
+        // BridgeEvent in topic0. Must NOT match.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0x200".to_string()),
+            address: Some(AddressFilter::Single(
+                "0x000000000000000000000000000000000000dead".to_string(),
+            )),
+            topics: Some(vec![Some(TopicFilter::Single(
+                BRIDGE_EVENT_TOPIC.to_string(),
+            ))]),
+            ..Default::default()
+        };
+        assert!(
+            !filter.matches(&log, 500),
+            "BridgeEvent must be address-filtered; passthrough is GER-only"
+        );
+
+        // Same caller filtering by the actual bridge address still matches.
+        let filter_correct_addr = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0x200".to_string()),
+            address: Some(AddressFilter::Single(
+                "0x000000000000000000000000000000000000bee5".to_string(),
+            )),
+            topics: Some(vec![Some(TopicFilter::Single(
+                BRIDGE_EVENT_TOPIC.to_string(),
+            ))]),
+            ..Default::default()
+        };
+        assert!(filter_correct_addr.matches(&log, 500));
+    }
+
+    /// Cantina MA#26 — UpdateHashChainValue passthrough remains intact.
+    /// Aggkit's L2BridgeSyncer queries by bridge address but legitimately
+    /// needs GER updates emitted at L2_GLOBAL_EXIT_ROOT_ADDRESS; this is
+    /// the case the passthrough was added for, and the narrowed semantic
+    /// must preserve it.
+    #[test]
+    fn ma26_update_hash_chain_value_passthrough_preserved() {
+        let log = SyntheticLog {
+            address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
+            topics: vec![UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string()],
+            data: "0x".to_string(),
+            block_number: 100,
+            block_hash: [0u8; 32],
+            transaction_hash: "0xabc".to_string(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0x200".to_string()),
+            address: Some(AddressFilter::Single(
+                "0x000000000000000000000000000000000000bee5".to_string(),
+            )),
+            topics: Some(vec![Some(TopicFilter::Single(
+                UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+            ))]),
+            ..Default::default()
+        };
+        assert!(filter.matches(&log, 500));
+    }
 }
