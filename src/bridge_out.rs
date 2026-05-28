@@ -350,7 +350,22 @@ impl BridgeOutScanner {
             match parse_b2agg_storage(details.storage()) {
                 Ok(v) => v,
                 Err(e) => {
+                    // Cantina MA#18 — erased / malformed B2AGG storage. The
+                    // bridge consumed the note (LET frontier advanced on-chain),
+                    // but aggkit cannot reconstruct destination_network /
+                    // destination_address to form the BridgeEvent. Pre-fix the
+                    // failure surfaced only via the LET-divergence symptom
+                    // monitor (Cantina #9); a positive quarantine row gives
+                    // operators a concrete per-note handle for recovery.
                     tracing::error!("B2AGG note {note_id_str}: failed to parse storage: {e:#}");
+                    self.quarantine_unbridgeable_b2agg(
+                        &note_id_str,
+                        note,
+                        block_number,
+                        crate::store::UnbridgeableBridgeOutReason::StorageParseFailed,
+                        format!("parse_b2agg_storage failed: {e:#}"),
+                    )
+                    .await;
                     return false;
                 }
             };
@@ -404,6 +419,17 @@ impl BridgeOutScanner {
         // Get the fungible asset
         let Some(fungible_asset) = details.assets().iter_fungible().next() else {
             tracing::warn!("B2AGG note {note_id_str} has no fungible asset, skipping");
+            // Cantina MA#18 — bridge consumed an empty B2AGG. Quarantine so
+            // an operator can decide whether the LET advance was legitimate
+            // (zero-amount probe) or attacker-induced.
+            self.quarantine_unbridgeable_b2agg(
+                &note_id_str,
+                note,
+                block_number,
+                crate::store::UnbridgeableBridgeOutReason::NoFungibleAsset,
+                "iter_fungible returned None".to_string(),
+            )
+            .await;
             return false;
         };
         let faucet_id = fungible_asset.faucet_id();
@@ -439,6 +465,20 @@ impl BridgeOutScanner {
                          next tick will re-observe it"
                     );
                 }
+                // Cantina MA#18 — positive quarantine in addition to the
+                // mark_note_processed B8 already does. mark_note_processed
+                // prevents the infinite re-scan loop but leaves no
+                // forensic trail; the quarantine row gives operators a
+                // structured record of every B8 hit, including the faucet
+                // id that needs registering.
+                self.quarantine_unbridgeable_b2agg(
+                    &note_id_str,
+                    note,
+                    block_number,
+                    crate::store::UnbridgeableBridgeOutReason::UnknownFaucet,
+                    format!("resolve_faucet_origin(faucet_id={faucet_id}) failed: {e:#}"),
+                )
+                .await;
                 return false;
             }
         };
@@ -446,6 +486,17 @@ impl BridgeOutScanner {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("B2AGG note {note_id_str}: {e:#}");
+                // Cantina MA#18 — amount × 10^scale overflowed u128.
+                // Practically impossible for legitimate amounts, but a
+                // malicious B2AGG could trigger it.
+                self.quarantine_unbridgeable_b2agg(
+                    &note_id_str,
+                    note,
+                    block_number,
+                    crate::store::UnbridgeableBridgeOutReason::AmountOverflow,
+                    format!("reverse_scale_amount failed: {e:#}"),
+                )
+                .await;
                 return false;
             }
         };
@@ -500,10 +551,133 @@ impl BridgeOutScanner {
                     error = %e,
                     "atomic B2AGG commit failed; transaction rolled back, no state advanced"
                 );
+                // Cantina MA#18 — atomic commit failed mid-write. The store
+                // rolled back, so a retry on the next tick may succeed; the
+                // quarantine row gives operators visibility into commit-side
+                // flakiness without losing the leaf-recovery handle if the
+                // failure is persistent.
+                self.quarantine_unbridgeable_b2agg(
+                    &note_id_str,
+                    note,
+                    block_number,
+                    crate::store::UnbridgeableBridgeOutReason::AtomicCommitFailed,
+                    format!("commit_b2agg_event_atomic failed: {e}"),
+                )
+                .await;
                 false
             }
         }
     }
+
+    /// Cantina MA#18 — record a quarantine row for a B2AGG that was observed
+    /// consumed by the bridge but skipped by the indexer.
+    ///
+    /// The on-chain LET frontier has already advanced; without this row the
+    /// failure surfaces only as a `bridge_let_divergence_total` symptom and an
+    /// operator has no per-note handle to drive recovery. The quarantine row
+    /// captures `(note_id, reason, detail, note_dump)` so a future recovery
+    /// RPC can re-attempt synthesis once the underlying cause (parse bug,
+    /// missing faucet, etc) is fixed.
+    ///
+    /// Best-effort: a quarantine-write failure must not panic or surface
+    /// from `process_consumed_note` — the caller's contract is that
+    /// returning `false` is the only side effect a skip path produces.
+    /// Quarantine errors are logged and the metric still fires.
+    async fn quarantine_unbridgeable_b2agg(
+        &self,
+        note_id_str: &str,
+        note: &InputNoteRecord,
+        observed_block: u64,
+        reason: crate::store::UnbridgeableBridgeOutReason,
+        detail: String,
+    ) {
+        // Bound the detail field so a flood of malformed notes can't
+        // bloat individual rows. The Postgres column has no length cap;
+        // bound here so the bound is enforced regardless of backend.
+        const MAX_DETAIL: usize = 4096;
+        let detail = if detail.len() > MAX_DETAIL {
+            format!("{}…[truncated {} bytes]", &detail[..MAX_DETAIL], detail.len() - MAX_DETAIL)
+        } else {
+            detail
+        };
+
+        let note_dump = dump_note_for_quarantine(note);
+        metrics::counter!(
+            "bridge_out_quarantined_erased_b2agg_total",
+            "reason" => reason.as_str()
+        )
+        .increment(1);
+
+        let entry = crate::store::UnbridgeableBridgeOut {
+            note_id: note_id_str.to_string(),
+            bridge_account: self.bridge_account_id,
+            reason,
+            detail,
+            note_dump,
+            observed_block,
+        };
+
+        match self.store.record_unbridgeable_bridge_out(entry).await {
+            Ok(true) => {
+                tracing::warn!(
+                    target: "bridge_out::quarantine",
+                    note_id = %note_id_str,
+                    reason = reason.as_str(),
+                    "Cantina MA#18: B2AGG quarantined — operator handle persisted"
+                );
+            }
+            Ok(false) => {
+                // Already quarantined; idempotent — no spam.
+                tracing::debug!(
+                    target: "bridge_out::quarantine",
+                    note_id = %note_id_str,
+                    reason = reason.as_str(),
+                    "Cantina MA#18: B2AGG already quarantined (idempotent skip)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "bridge_out::quarantine",
+                    note_id = %note_id_str,
+                    reason = reason.as_str(),
+                    error = %e,
+                    "Cantina MA#18: failed to record quarantine row — \
+                     metric still fired but recovery handle is lost"
+                );
+            }
+        }
+    }
+}
+
+/// Render a note's key forensic fields as a JSON-like string suitable for
+/// the `note_dump` quarantine column. Captures: script root (so an operator
+/// can confirm this was a B2AGG, not some other wrapper), the storage felts
+/// (so a fixed parser can re-derive destination_network + destination_address),
+/// and the asset list (so the operator knows what's stranded).
+///
+/// Kept simple text rather than `serde_json::to_string` to avoid pulling
+/// serde into the bridge_out hot path and to keep the format human-readable
+/// in psql.
+fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
+    use std::fmt::Write as _;
+    let details = note.details();
+    let script_root_hex = hex::encode(details.script().root().as_bytes());
+    let storage_items: Vec<String> = details
+        .storage()
+        .items()
+        .iter()
+        .map(|f| format!("{}", f.as_canonical_u64()))
+        .collect();
+    let assets: Vec<String> = details
+        .assets()
+        .iter_fungible()
+        .map(|fa| format!("{{faucet={}, amount={}}}", fa.faucet_id(), fa.amount()))
+        .collect();
+    let mut out = String::with_capacity(256);
+    let _ = write!(out, "{{\"script_root\":\"0x{script_root_hex}\",");
+    let _ = write!(out, "\"storage_items\":[{}],", storage_items.join(","));
+    let _ = write!(out, "\"fungible_assets\":[{}]}}", assets.join(","));
+    out
 }
 
 #[async_trait::async_trait]
@@ -635,6 +809,45 @@ impl SyncListener for BridgeOutScanner {
                         note_id = %note.id(),
                         "Cantina #4: MINT note observed with no decodable \
                          NetworkAccountTarget attachment — forged via NoAuth"
+                    );
+                }
+            }
+
+            // Cantina MA#4 — unknown bridge-out wrapper detection. The bridge
+            // account has no on-chain assertion that the note consumed must
+            // be the canonical B2AGG script — any MASM body that calls
+            // `bridge_out::bridge_out` from a transaction the bridge consumes
+            // will advance the LET frontier and BURN funds. Pre-fix the
+            // indexer silently dropped every non-B2AGG script root in
+            // `is_b2agg_note`, so an alternate wrapper would create an
+            // invisible exit. Detect post-hoc: notes consumed by the bridge
+            // account whose script root is in neither the B2AGG-out set nor
+            // the CLAIM-in set are the MA#4 signature.
+            if note.consumer_account() == Some(self.bridge_account_id) {
+                let b2agg_root_bytes = B2AggNote::script_root().as_bytes();
+                let claim_root_bytes = claim_root.as_bytes();
+                let observed_bytes = script_root.as_bytes();
+                use crate::unknown_wrapper_detector::{
+                    BridgeConsumerScript, classify_bridge_consumer_script,
+                };
+                if matches!(
+                    classify_bridge_consumer_script(
+                        observed_bytes,
+                        b2agg_root_bytes,
+                        claim_root_bytes,
+                    ),
+                    BridgeConsumerScript::Unknown
+                ) {
+                    metrics::counter!("bridge_unknown_wrapper_consumed_total").increment(1);
+                    tracing::warn!(
+                        target: "bridge_out::unknown_wrapper",
+                        note_id = %note.id(),
+                        observed_script_root = %hex::encode(observed_bytes),
+                        bridge = %self.bridge_account_id,
+                        "Cantina MA#4: bridge account consumed a note whose script \
+                         root matches neither the canonical B2AGG bridge-out wrapper \
+                         nor the CLAIM script — alternate wrapper has produced an \
+                         on-chain LET advance that the indexer cannot translate"
                     );
                 }
             }
@@ -1510,5 +1723,205 @@ mod tests {
         // the gate. The pure-helper test pins the exact decision; this just
         // exercises the wiring end-to-end without a downstream panic.
         let _ = scanner.process_consumed_note(&note, 100).await;
+    }
+
+    // CANTINA MA#18 — UNBRIDGEABLE B2AGG QUARANTINE TESTS
+    // ============================================================================================
+
+    /// Build a B2AGG note with INVALID storage (only 1 felt) so
+    /// `parse_b2agg_storage` returns Err. Bridge-consumed so it passes the
+    /// MA#3 gate and reaches the storage-parse skip site in
+    /// `process_consumed_note`.
+    fn build_erased_b2agg_note(consumer_account: AccountId) -> miden_client::store::InputNoteRecord {
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::Felt;
+        use miden_protocol::Word;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{NoteAssets, NoteDetails, NoteRecipient, NoteStorage};
+
+        // 1 felt: too short for parse_b2agg_storage (which requires ≥6).
+        // This simulates an "erased" B2AGG — the bridge consumed it on-chain
+        // (LET advanced) but the indexer cannot reconstruct the destination.
+        let storage = NoteStorage::new(vec![Felt::new(0)]).unwrap();
+        let script = B2AggNote::script();
+        let recipient = NoteRecipient::new(Word::default(), script, storage);
+        let assets = NoteAssets::new(vec![]).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: Some(consumer_account),
+            consumed_tx_order: None,
+        });
+
+        miden_client::store::InputNoteRecord::new(details, None, state)
+    }
+
+    /// Cantina MA#18 — wiring repro. A B2AGG with un-parseable storage
+    /// (the "erased" case) that the bridge consumed MUST land a positive
+    /// quarantine row so an operator has a concrete handle to investigate /
+    /// rescue. Pre-MA#18 this skipped silently and only surfaced as a LET
+    /// divergence symptom (Cantina #9).
+    #[tokio::test]
+    async fn ma18_erased_b2agg_quarantined_on_storage_parse_failure() {
+        use crate::block_state::BlockState;
+        use crate::store::UnbridgeableBridgeOutReason;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_erased_b2agg_note(bridge_id);
+        let note_id_str = note.id().to_string();
+
+        let advanced = scanner.process_consumed_note(&note, 42).await;
+        assert!(!advanced, "erased note must NOT signal block advance");
+
+        let row = store
+            .get_unbridgeable_bridge_out(&note_id_str)
+            .await
+            .unwrap()
+            .expect("quarantine row must be present");
+        assert_eq!(row.note_id, note_id_str);
+        assert_eq!(row.bridge_account, bridge_id);
+        assert_eq!(row.reason, UnbridgeableBridgeOutReason::StorageParseFailed);
+        assert_eq!(row.observed_block, 42);
+        assert!(
+            row.note_dump.contains("script_root"),
+            "note_dump must capture script_root for forensic inspection, got: {}",
+            row.note_dump
+        );
+        assert!(
+            row.note_dump.contains("storage_items"),
+            "note_dump must capture storage_items so a fixed parser can re-derive fields"
+        );
+        assert!(
+            !row.detail.is_empty(),
+            "detail must capture the underlying parse error"
+        );
+    }
+
+    /// Cantina MA#18 — quarantine writes are idempotent by note_id. Multiple
+    /// sync ticks observing the same erased note must NOT duplicate rows.
+    /// Pre-fix duplicate inserts would either error or bloat the table on
+    /// every tick.
+    #[tokio::test]
+    async fn ma18_quarantine_is_idempotent_per_note_id() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_erased_b2agg_note(bridge_id);
+        let note_id_str = note.id().to_string();
+
+        // First observation — quarantine row written.
+        let _ = scanner.process_consumed_note(&note, 1).await;
+        let first = store
+            .get_unbridgeable_bridge_out(&note_id_str)
+            .await
+            .unwrap()
+            .expect("first quarantine row");
+        let first_block = first.observed_block;
+
+        // Second observation — quarantine row UNCHANGED.
+        let _ = scanner.process_consumed_note(&note, 2).await;
+        let second = store
+            .get_unbridgeable_bridge_out(&note_id_str)
+            .await
+            .unwrap()
+            .expect("quarantine row must persist");
+        assert_eq!(
+            second.observed_block, first_block,
+            "first-write-wins: observed_block must not be overwritten by later ticks"
+        );
+    }
+
+    /// Cantina MA#18 — a non-skip path (e.g. MA#3 reclaim by user) must NOT
+    /// generate a quarantine row. Quarantine fires only when the bridge
+    /// consumed the note (LET advanced) AND we couldn't translate it.
+    /// Reclaim by user is normal flow — no LET advance, no quarantine.
+    #[tokio::test]
+    async fn ma18_user_reclaim_does_not_quarantine() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let user_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_b2agg_note_with_consumer(Some(user_id));
+        let note_id_str = note.id().to_string();
+
+        let _ = scanner.process_consumed_note(&note, 1).await;
+
+        assert!(
+            store
+                .get_unbridgeable_bridge_out(&note_id_str)
+                .await
+                .unwrap()
+                .is_none(),
+            "user-reclaim must not produce a quarantine row — the LET did not advance"
+        );
+    }
+
+    /// Cantina MA#18 — pin the `as_str()` mapping. The textual `reason`
+    /// column is the load-bearing key for any future recovery RPC; the
+    /// strings MUST stay stable or operator queries will silently miss
+    /// rows.
+    #[test]
+    fn ma18_reason_str_mapping_stable() {
+        use crate::store::UnbridgeableBridgeOutReason as R;
+        assert_eq!(R::StorageParseFailed.as_str(), "storage_parse_failed");
+        assert_eq!(R::NoFungibleAsset.as_str(), "no_fungible_asset");
+        assert_eq!(R::UnknownFaucet.as_str(), "unknown_faucet");
+        assert_eq!(R::AmountOverflow.as_str(), "amount_overflow");
+        assert_eq!(R::AtomicCommitFailed.as_str(), "atomic_commit_failed");
+    }
+
+    /// Cantina MA#4 — wiring repro for the unknown-wrapper detector. Pins
+    /// that the predicate correctly distinguishes the canonical B2AGG and
+    /// CLAIM roots from any other 32-byte root. The wiring inside
+    /// `on_post_sync` is exercised by the e2e tests (full client+sync stack
+    /// required); this test pins the pure decision the wiring depends on.
+    #[test]
+    fn ma4_classify_bridge_consumer_script_pins_known_set() {
+        use crate::unknown_wrapper_detector::{
+            BridgeConsumerScript, classify_bridge_consumer_script,
+        };
+        // Use the real B2AGG + CLAIM roots so a future MASM regen that
+        // changes either is caught here.
+        let b2agg = B2AggNote::script_root().as_bytes();
+        let claim = miden_base_agglayer::claim_script().root().as_bytes();
+        assert_ne!(b2agg, claim, "B2AGG and CLAIM must have distinct roots");
+
+        // Known roots — the bridge legitimately consumes both.
+        assert_eq!(
+            classify_bridge_consumer_script(b2agg, b2agg, claim),
+            BridgeConsumerScript::KnownB2Agg
+        );
+        assert_eq!(
+            classify_bridge_consumer_script(claim, b2agg, claim),
+            BridgeConsumerScript::KnownClaim
+        );
+
+        // Arbitrary other root — the MA#4 signature. Pre-fix this slipped
+        // through silently.
+        let foreign = [0xCCu8; 32];
+        assert_eq!(
+            classify_bridge_consumer_script(foreign, b2agg, claim),
+            BridgeConsumerScript::Unknown
+        );
     }
 }

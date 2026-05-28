@@ -3,7 +3,10 @@
 //! Requires the `postgres` feature flag and a running PostgreSQL instance
 //! with the schema from `migrations/001_initial.sql` applied.
 
-use super::{FaucetEntry, Store, TxnData, TxnEntry, UnclaimableClaim, UnclaimableReason};
+use super::{
+    FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason,
+    UnclaimableClaim, UnclaimableReason,
+};
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
@@ -1081,6 +1084,81 @@ impl Store for PgStore {
             amount: U256::from_str_radix(amount_hex.trim_start_matches("0x"), 16)?,
             reason,
             eth_tx_hash: eth_tx_hex.parse()?,
+        }))
+    }
+
+    // ── Unbridgeable bridge-outs (Cantina MA#18) ─────────────────
+
+    async fn record_unbridgeable_bridge_out(
+        &self,
+        entry: UnbridgeableBridgeOut,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let bridge_account = entry.bridge_account.to_hex();
+        let reason = entry.reason.as_str();
+        let observed_block = entry.observed_block as i64;
+
+        // First-write wins: ON CONFLICT DO NOTHING so repeated sync ticks
+        // observing the same erased note don't error or duplicate rows.
+        let rows = client
+            .query(
+                "INSERT INTO unbridgeable_bridge_outs \
+                 (note_id, bridge_account, reason, detail, note_dump, observed_block) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (note_id) DO NOTHING \
+                 RETURNING note_id",
+                &[
+                    &entry.note_id,
+                    &bridge_account,
+                    &reason,
+                    &entry.detail,
+                    &entry.note_dump,
+                    &observed_block,
+                ],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn get_unbridgeable_bridge_out(
+        &self,
+        note_id: &str,
+    ) -> anyhow::Result<Option<UnbridgeableBridgeOut>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT note_id, bridge_account, reason, detail, note_dump, observed_block \
+                 FROM unbridgeable_bridge_outs WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let note_id_col: String = row.get(0);
+        let bridge_account_hex: String = row.get(1);
+        let reason_str: String = row.get(2);
+        let detail: String = row.get(3);
+        let note_dump: String = row.get(4);
+        let observed_block: i64 = row.get(5);
+
+        let reason = match reason_str.as_str() {
+            "storage_parse_failed" => UnbridgeableBridgeOutReason::StorageParseFailed,
+            "no_fungible_asset" => UnbridgeableBridgeOutReason::NoFungibleAsset,
+            "unknown_faucet" => UnbridgeableBridgeOutReason::UnknownFaucet,
+            "amount_overflow" => UnbridgeableBridgeOutReason::AmountOverflow,
+            "atomic_commit_failed" => UnbridgeableBridgeOutReason::AtomicCommitFailed,
+            other => anyhow::bail!("unknown unbridgeable_bridge_outs.reason value: {other}"),
+        };
+
+        Ok(Some(UnbridgeableBridgeOut {
+            note_id: note_id_col,
+            bridge_account: AccountId::from_hex(&bridge_account_hex)
+                .map_err(|e| anyhow::anyhow!("decoding bridge_account from db row: {e}"))?,
+            reason,
+            detail,
+            note_dump,
+            observed_block: u64::try_from(observed_block)?,
         }))
     }
 

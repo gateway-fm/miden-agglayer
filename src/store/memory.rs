@@ -1,6 +1,6 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
-use super::{FaucetEntry, Store, TxnData, TxnEntry, UnclaimableClaim};
+use super::{FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim};
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
@@ -51,6 +51,9 @@ pub struct InMemoryStore {
     // Unclaimable claims — first-write wins per global_index (RD-860).
     unclaimable: RwLock<HashMap<U256, UnclaimableClaim>>,
 
+    // Unbridgeable bridge-outs — first-write wins per note_id (Cantina MA#18).
+    unbridgeable_bridge_outs: RwLock<HashMap<String, UnbridgeableBridgeOut>>,
+
     // Address mappings
     address_mappings: RwLock<HashMap<Address, AccountId>>,
 
@@ -85,6 +88,7 @@ impl InMemoryStore {
             nonces: RwLock::new(HashMap::new()),
             claimed: RwLock::new(HashSet::new()),
             unclaimable: RwLock::new(HashMap::new()),
+            unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashSet::new()),
             deposit_counter: RwLock::new(0),
@@ -519,6 +523,30 @@ impl Store for InMemoryStore {
         global_index: &U256,
     ) -> anyhow::Result<Option<UnclaimableClaim>> {
         Ok(self.unclaimable.read().get(global_index).cloned())
+    }
+
+    // ── Unbridgeable bridge-outs (Cantina MA#18) ─────────────────
+
+    async fn record_unbridgeable_bridge_out(
+        &self,
+        entry: UnbridgeableBridgeOut,
+    ) -> anyhow::Result<bool> {
+        use std::collections::hash_map::Entry;
+        let mut map = self.unbridgeable_bridge_outs.write();
+        match map.entry(entry.note_id.clone()) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+                Ok(true)
+            }
+        }
+    }
+
+    async fn get_unbridgeable_bridge_out(
+        &self,
+        note_id: &str,
+    ) -> anyhow::Result<Option<UnbridgeableBridgeOut>> {
+        Ok(self.unbridgeable_bridge_outs.read().get(note_id).cloned())
     }
 
     // ── Address mappings ─────────────────────────────────────────

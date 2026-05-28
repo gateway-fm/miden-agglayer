@@ -66,6 +66,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "005_l1_indexer_cursor.sql",
         include_str!("../../migrations/005_l1_indexer_cursor.sql"),
     ),
+    (
+        "006_unbridgeable_bridge_outs.sql",
+        include_str!("../../migrations/006_unbridgeable_bridge_outs.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

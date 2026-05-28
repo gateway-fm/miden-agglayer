@@ -91,6 +91,22 @@ pub fn init_metrics() {
          Quarantined to prevent silent re-loop on every sync tick."
     );
     describe_counter!(
+        "bridge_unknown_wrapper_consumed_total",
+        "Bridge account consumed a note whose script root is neither the \
+         canonical B2AGG bridge-out wrapper nor the CLAIM script (Cantina \
+         MA#4). The on-chain LET frontier has advanced; aggkit cannot \
+         synthesise a BridgeEvent for an unrecognised wrapper. Operator \
+         must investigate before more funds are stranded."
+    );
+    describe_counter!(
+        "bridge_out_quarantined_erased_b2agg_total",
+        "B2AGG note observed consumed by the bridge but skipped by the \
+         indexer because the note contents were unparseable or referenced \
+         an unknown faucet (Cantina MA#18). A row was written to the \
+         quarantine table so operators have a concrete handle for a \
+         future recovery flow."
+    );
+    describe_counter!(
         "rpc_claim_ger_not_seen_total",
         "Claim submission rejected because the referenced GER was not \
          yet in `has_seen_ger` (C6). Caller should retry after the GER \
