@@ -656,8 +656,16 @@ pub async fn wait_for_transaction_commit(
             continue;
         }
 
+        // Cantina MA#22 — scope the store scan to the txn we're actually
+        // waiting on. Previously this used `TransactionFilter::All`, which
+        // forces the underlying sqlite query to return EVERY known
+        // transaction (committed, uncommitted, expired, foreign) on every
+        // 1s poll. On a hot path (claim publish, faucet ops, GER inject,
+        // init) this scales O(transactions_in_store) per poll, per call —
+        // wasted CPU, wasted memory, slower commit observation. The
+        // `Ids(...)` filter pushes the equality check into the SQL query.
         let txns = client
-            .get_transactions(miden_client::store::TransactionFilter::All)
+            .get_transactions(miden_client::store::TransactionFilter::Ids(vec![txn_id]))
             .await?;
         if txns.iter().any(|t| {
             t.id == txn_id

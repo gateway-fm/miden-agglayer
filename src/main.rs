@@ -132,6 +132,16 @@ struct Command {
     #[arg(long, env = "REJECT_ZERO_PADDING_ADDRESSES", default_value_t = false)]
     reject_zero_padding_addresses: bool,
 
+    /// Disable the built-in Hardhat default-account alias (Cantina MA#8).
+    /// When set, the special-case remap of the well-known Hardhat address
+    /// (`0xf39f...2266`) to `wallet_hardhat` is refused. Production
+    /// deployments MUST set this flag — otherwise an L1 deposit targeting
+    /// the Hardhat default-account address would be silently routed into
+    /// the operator's `wallet_hardhat` account. Enforced as a
+    /// `--require-hardening` invariant.
+    #[arg(long, env = "DISABLE_HARDHAT_ALIAS", default_value_t = false)]
+    disable_hardhat_alias: bool,
+
     /// Production hardening invariant. When set, refuse to start if any of
     /// the following hardening flags are at their fail-open defaults:
     /// - `--admin-api-key` unset (admin endpoints accept any caller)
@@ -216,6 +226,18 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
                 .to_string(),
         );
     }
+    // Cantina MA#8 — the Hardhat default-account alias is unsafe in
+    // production. With `--require-hardening` set, the operator MUST
+    // also pass `--disable-hardhat-alias` (env `DISABLE_HARDHAT_ALIAS`).
+    if !command.disable_hardhat_alias {
+        reasons.push(
+            "  - --disable-hardhat-alias is unset (Cantina MA#8: the well-known \
+             Hardhat default-account address `0xf39f...2266` would be silently \
+             remapped to `wallet_hardhat` on every claim). Set \
+             DISABLE_HARDHAT_ALIAS=true to refuse the remap in production."
+                .to_string(),
+        );
+    }
     if reasons.is_empty() {
         Ok(())
     } else {
@@ -253,6 +275,7 @@ impl std::fmt::Debug for Command {
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
             .field("require_hardening", &self.require_hardening)
+            .field("disable_hardhat_alias", &self.disable_hardhat_alias)
             .field(
                 "miden_api_key",
                 &self.miden_api_key.as_ref().map(|_| "[REDACTED]"),
@@ -545,6 +568,7 @@ async fn main() -> anyhow::Result<()> {
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
     state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
+    state.reject_hardhat_alias = command.disable_hardhat_alias;
     // Cantina #7: share the BridgeOutScanner's expected-MINT tracker so
     // `publish_claim_internal` can record the CLAIM NoteId and the scanner
     // can mark it Landed once it sees the bridge consume it.
@@ -783,6 +807,11 @@ mod hardening_tests {
             rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
             require_hardening: require,
+            // Cantina MA#8 — tests default the alias to disabled so the
+            // pre-existing hardening tests below only flex the flag they
+            // care about. The dedicated `hardening_flags_hardhat_alias`
+            // test below pins the new invariant in isolation.
+            disable_hardhat_alias: true,
             miden_api_key: None,
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
@@ -793,7 +822,8 @@ mod hardening_tests {
     /// When --require-hardening is false, no invariant is enforced.
     #[test]
     fn hardening_disabled_passes_with_open_defaults() {
-        let c = cmd(false, None, None, None);
+        let mut c = cmd(false, None, None, None);
+        c.disable_hardhat_alias = false;
         assert!(check_hardening_invariants(&c).is_ok());
     }
 
@@ -847,5 +877,38 @@ mod hardening_tests {
         let reasons = check_hardening_invariants(&c).unwrap_err();
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("--miden-prover-url"));
+    }
+
+    /// Cantina MA#8 — `--require-hardening` MUST require
+    /// `--disable-hardhat-alias` to be set. Otherwise an operator
+    /// thinks they're running a hardened build but the Hardhat default
+    /// address is still being remapped to `wallet_hardhat` on every
+    /// claim.
+    #[test]
+    fn hardening_flags_hardhat_alias_when_unset() {
+        let mut c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        c.disable_hardhat_alias = false;
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(reasons.len(), 1);
+        assert!(
+            reasons[0].contains("--disable-hardhat-alias"),
+            "expected MA#8 invariant, got: {}",
+            reasons[0]
+        );
+    }
+
+    /// Cantina MA#8 — when `--require-hardening` is OFF, the hardhat
+    /// invariant is not enforced. Operators can run dev-mode with the
+    /// alias on (current default) or off.
+    #[test]
+    fn hardening_disabled_does_not_enforce_hardhat_alias() {
+        let mut c = cmd(false, None, None, None);
+        c.disable_hardhat_alias = false;
+        assert!(check_hardening_invariants(&c).is_ok());
     }
 }
