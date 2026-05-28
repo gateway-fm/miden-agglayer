@@ -445,14 +445,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Cantina #13 — BridgeOutScanner needs to know our local network id so it can
-    // refuse to emit synthetic BridgeEvents for self-targeted poison leaves.
-    let bridge_out_local_network_id = u32::try_from(command.network_id).map_err(|_| {
+    // Cantina #13 / RD-703 — narrow the operator-supplied `--network-id`
+    // (parsed as `u64` for CLI backward compat) to `u32` exactly once, here
+    // at startup. The Solidity bridge contract types `originNetwork`,
+    // `destinationNetwork`, and the on-chain `networkID()` return as
+    // `uint32`, and BridgeOutScanner / ServiceState / claimAsset comparisons
+    // are all `u32`. A `u64` value that doesn't fit `u32` is operator
+    // misconfiguration — fail loudly here rather than silently truncate at
+    // a later use site (the prior `as u32` cast in `service_send_raw_txn.rs`
+    // would spuriously accept claims targeting `network_id & 0xFFFFFFFF`).
+    let local_network_id_u32 = u32::try_from(command.network_id).map_err(|_| {
         anyhow::anyhow!(
-            "--network-id ({}) does not fit in u32; B2AGG destination_network is u32-sized",
+            "--network-id ({}) does not fit in u32; bridge destinationNetwork / originNetwork are u32-sized",
             command.network_id
         )
     })?;
+    let bridge_out_local_network_id = local_network_id_u32;
     let bridge_out_scanner = Arc::new(BridgeOutScanner::new(
         store.clone(),
         block_state.clone(),
@@ -524,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
         client,
         accounts,
         command.chain_id,
-        command.network_id,
+        local_network_id_u32,
         store,
         block_state,
     );
