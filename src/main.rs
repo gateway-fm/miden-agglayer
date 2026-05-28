@@ -517,9 +517,10 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
 
         tracing::info!(
-            "Restore complete: block={}, bridge_outs={}, gers={}, logs={}",
+            "Restore complete: block={}, bridge_outs={}, claims={}, gers={}, logs={}",
             result.block_number,
             result.bridge_outs_restored,
+            result.claims_restored,
             result.gers_restored,
             result.logs_created,
         );

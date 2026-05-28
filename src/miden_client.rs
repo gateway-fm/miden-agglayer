@@ -109,8 +109,31 @@ pub struct MidenClient {
     /// proxy is already proving locally (no remote prover configured, so
     /// the active prover IS the local one and a "fallback" is meaningless).
     local_prover_fallback: Option<Arc<dyn TransactionProver + Send + Sync>>,
+    /// Cantina MA#23 — gates `on_post_sync` dispatch on the background sync
+    /// thread. While `true`, the initial sync + every 5s `sync_interval`
+    /// tick still runs `sync_state()` (so the local sqlite stays current),
+    /// but no `SyncListener::on_post_sync` calls fire. `restore()` toggles
+    /// this for the duration of its phases so the `BridgeOutScanner` /
+    /// `ClaimWatcher` cannot interleave with the consumed-note replay loop
+    /// (which would double-emit synthetic logs and race the deposit-count
+    /// counter). Released in a `Drop` guard so an error mid-restore still
+    /// re-enables listeners.
+    listeners_paused: Arc<AtomicBool>,
     #[cfg(test)]
     call_count: Arc<AtomicUsize>,
+}
+
+/// RAII guard returned by [`MidenClient::pause_listeners`]. While in scope,
+/// the background sync loop will skip `on_post_sync` dispatch on every
+/// listener. Drop (success or panic) restores the previous flag.
+pub struct ListenerPauseGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for ListenerPauseGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -154,6 +177,8 @@ impl MidenClient {
         let (done_sender, done_receiver) = oneshot::channel::<()>();
         let alive = Arc::new(AtomicBool::new(false));
         let alive_for_run = alive.clone();
+        let listeners_paused = Arc::new(AtomicBool::new(false));
+        let listeners_paused_for_run = listeners_paused.clone();
 
         let runtime = tokio::runtime::Runtime::new()?;
         let task = thread::spawn(move || -> anyhow::Result<()> {
@@ -174,6 +199,7 @@ impl MidenClient {
                     &sync_listeners,
                     debug_mode,
                     &alive_for_run,
+                    &listeners_paused_for_run,
                 )));
 
                 match result {
@@ -201,6 +227,7 @@ impl MidenClient {
             done_sender,
             alive,
             local_prover_fallback,
+            listeners_paused,
             #[cfg(test)]
             call_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -217,6 +244,29 @@ impl MidenClient {
     /// See `src/claim.rs::publish_claim_internal` for the canonical use.
     pub fn local_prover_fallback(&self) -> Option<Arc<dyn TransactionProver + Send + Sync>> {
         self.local_prover_fallback.clone()
+    }
+
+    /// Cantina MA#23 — suppress `SyncListener::on_post_sync` dispatch for the
+    /// lifetime of the returned guard. The background sync thread still
+    /// pulls deltas from the Miden node (so the local sqlite stays
+    /// current), but no listener side-effects fire. Used by `restore()` so
+    /// the live `BridgeOutScanner` / `ClaimWatcher` cannot interleave with
+    /// the consumed-note replay loop and double-emit synthetic logs.
+    ///
+    /// Calling this while already paused is safe: each guard restores the
+    /// flag to `false` on drop, but the wider `restore()` codepath holds the
+    /// outermost guard for its entire duration, so the inner reset is a
+    /// no-op in practice.
+    pub fn pause_listeners(&self) -> ListenerPauseGuard {
+        self.listeners_paused.store(true, Ordering::Release);
+        ListenerPauseGuard {
+            flag: self.listeners_paused.clone(),
+        }
+    }
+
+    /// Cantina MA#23 — true while `on_post_sync` dispatch is suppressed.
+    pub fn listeners_paused(&self) -> bool {
+        self.listeners_paused.load(Ordering::Acquire)
     }
 
     /// Returns true if the background thread is connected and syncing.
@@ -268,6 +318,7 @@ impl MidenClient {
             done_sender: std::sync::Mutex::new(Some(done_sender)),
             alive: Arc::new(AtomicBool::new(true)),
             local_prover_fallback: None,
+            listeners_paused: Arc::new(AtomicBool::new(false)),
             call_count,
         }
     }
@@ -393,10 +444,22 @@ impl MidenClient {
         result: anyhow::Result<SyncSummary>,
         client: &mut MidenClientLib,
         listeners: &[Arc<dyn SyncListener>],
+        listeners_paused: &AtomicBool,
     ) -> anyhow::Result<()> {
         let summary = result?;
+        // Cantina MA#23 — sample once per sync tick so the pause/unpause
+        // transitions don't interleave with this listener loop. Cheap and
+        // race-resilient: a tick that begins while paused completes paused.
+        let paused = listeners_paused.load(Ordering::Acquire);
         for listener in listeners {
+            // `on_sync` is the cheap summary hook — keep firing it so
+            // listeners can keep low-frequency tick-counter state in step
+            // even while the heavier `on_post_sync` is suppressed.
             listener.on_sync(&summary);
+            if paused {
+                ::metrics::counter!("miden_listener_skipped_paused_total").increment(1);
+                continue;
+            }
             listener.on_post_sync(client).await?;
         }
         Ok(())
@@ -415,6 +478,7 @@ impl MidenClient {
         sync_listeners: &[Arc<dyn SyncListener>],
         debug_mode: bool,
         alive: &AtomicBool,
+        listeners_paused: &AtomicBool,
     ) -> anyhow::Result<()> {
         // node client — retry build with exponential backoff
         let node_timeout_ms: u64 = 10_000;
@@ -489,7 +553,7 @@ impl MidenClient {
         // initial sync
         tokio::select! {
             result = Self::sync(&mut client) => {
-                if let Err(err) = Self::on_sync(result, &mut client, sync_listeners).await {
+                if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
                     tracing::error!("MidenClient initial sync listener error: {err:#}");
                 }
             },
@@ -512,7 +576,7 @@ impl MidenClient {
                 _ = sync_interval.tick() => {
                     tokio::select! {
                         result = Self::sync(&mut client) => {
-                            if let Err(err) = Self::on_sync(result, &mut client, sync_listeners).await {
+                            if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
                         },
@@ -641,5 +705,61 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("simulated failure"));
         assert_eq!(client.test_call_count(), 1);
+    }
+
+    /// Cantina MA#23 — the listener pause flag flips on while a guard is
+    /// held and back off when it drops. Without the guard, the background
+    /// sync thread fires `on_post_sync` on every listener including while
+    /// `restore()` is iterating consumed notes, producing duplicate
+    /// synthetic logs and a race on the deposit-count cursor.
+    #[test]
+    fn ma23_pause_listeners_guard_toggles_flag_on_drop() {
+        let client = MidenClient::new_test();
+        assert!(!client.listeners_paused(), "initially not paused");
+        {
+            let _guard = client.pause_listeners();
+            assert!(client.listeners_paused(), "guard pauses listeners");
+        }
+        assert!(!client.listeners_paused(), "drop releases the pause");
+    }
+
+    /// Cantina MA#23 — nesting two guards keeps the flag paused for the
+    /// entire outer scope. Inner-drop releases the flag prematurely, but
+    /// the outer guard runs `drop()` next and re-asserts the released
+    /// state — this test pins the documented "outer guard wins" behaviour
+    /// so future refactors don't silently turn pause into a counter.
+    #[test]
+    fn ma23_pause_listeners_guards_nest() {
+        let client = MidenClient::new_test();
+        let outer = client.pause_listeners();
+        assert!(client.listeners_paused());
+        {
+            let inner = client.pause_listeners();
+            assert!(client.listeners_paused());
+            drop(inner);
+            // Current contract: inner drop releases the flag. The outer
+            // guard's existence does NOT keep it paused on its own —
+            // restore() must hold a single guard for its entire window.
+            assert!(!client.listeners_paused());
+        }
+        drop(outer);
+        assert!(!client.listeners_paused());
+    }
+
+    /// Cantina MA#23 — `pause_listeners()` is callable before the
+    /// background sync loop reports `is_alive() == true`. This is the
+    /// timing-critical case: the original race is "sync_listeners are
+    /// constructed and the background thread is spinning up while
+    /// `restore()` runs Phase 0 of its replay." Restore must be able to
+    /// install the pause before is_alive flips on.
+    #[test]
+    fn ma23_pause_listeners_works_before_alive() {
+        // `new_test()` returns a stub where alive is already true; the
+        // pause flag is independent of alive, which is exactly the
+        // invariant the restore call relies on. Pin both observations.
+        let client = MidenClient::new_test();
+        let _guard = client.pause_listeners();
+        assert!(client.listeners_paused(), "pause works regardless of alive state");
+        assert!(client.is_alive(), "test stub is alive");
     }
 }
