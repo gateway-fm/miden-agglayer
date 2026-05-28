@@ -40,8 +40,62 @@ use crate::miden_client::MidenClient;
 use crate::store::Store;
 use miden_base_agglayer::{UpdateGerNote, claim_script};
 use miden_client::store::NoteFilter;
+use miden_protocol::account::AccountId;
+use miden_protocol::note::{NoteAttachment, NoteMetadata};
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
+
+/// MA#28 — outcome of verifying an `UpdateGerNote`-shaped consumed note's
+/// authoritative provenance. Pulled out of `restore_gers` so the
+/// fast-path verification can be unit-tested without spinning up a Miden
+/// node + sqlite store.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GerNoteVerdict {
+    /// Note was minted by the expected sender and targets the expected bridge.
+    /// Safe to replay as a sanctioned GER injection.
+    Accept,
+    /// `note.metadata()` returned `None` — non-conforming consumed note.
+    MissingMetadata,
+    /// `metadata.sender() != expected_sender`. Either an attacker minted
+    /// a same-script note from a different account, or the proxy's config
+    /// drifted away from the historical ger_manager id.
+    SenderMismatch,
+    /// `metadata.attachment()` did not decode as `NetworkAccountTarget`.
+    /// Mirrors the Cantina #4 forged-MINT signal in `bridge_out.rs`.
+    UndecodableTarget,
+    /// Decoded target was a different account than the bridge id.
+    TargetMismatch,
+}
+
+/// MA#28 — pure verification of an `UpdateGerNote`-shaped note. Public so
+/// the unit tests in this file (and any future tooling that wants to
+/// validate consumed-note feeds) can exercise the predicate directly.
+pub fn classify_ger_note(
+    metadata: Option<&NoteMetadata>,
+    expected_sender: AccountId,
+    expected_target: AccountId,
+) -> GerNoteVerdict {
+    let Some(meta) = metadata else {
+        return GerNoteVerdict::MissingMetadata;
+    };
+    if meta.sender() != expected_sender {
+        return GerNoteVerdict::SenderMismatch;
+    }
+    match decode_network_target(meta.attachment()) {
+        None => GerNoteVerdict::UndecodableTarget,
+        Some(target) if target != expected_target => GerNoteVerdict::TargetMismatch,
+        Some(_) => GerNoteVerdict::Accept,
+    }
+}
+
+/// Small wrapper so `classify_ger_note` doesn't have to import
+/// `miden_standards` into the public signature. Mirrors the decoder used
+/// by `bridge_out.rs::on_post_sync` for MINT notes.
+fn decode_network_target(attachment: &NoteAttachment) -> Option<AccountId> {
+    miden_standards::note::NetworkAccountTarget::try_from(attachment)
+        .ok()
+        .map(|nat| nat.target_id())
+}
 
 /// Result of a restore operation.
 pub struct RestoreResult {
@@ -133,7 +187,8 @@ pub async fn restore(
 
     // Phase 3: Scan consumed UpdateGerNote notes on Miden
     tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
-    let (gers, ger_logs) = restore_gers(store, miden_client, block_state, next_block).await?;
+    let (gers, ger_logs) =
+        restore_gers(store, miden_client, accounts, block_state, next_block).await?;
     total_logs += ger_logs;
     tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
 
@@ -461,14 +516,35 @@ async fn restore_claims(
 }
 
 /// Phase 3: scan consumed UpdateGerNote notes to rebuild GER state.
+///
+/// Cantina MA#28 — also asserts that the consumed note was minted by the
+/// `ger_manager` (or, for legacy deployments without a dedicated manager,
+/// the `service` account) and targeted the bridge account. Without these
+/// checks a note that happens to share the `UpdateGerNote` script root —
+/// possibly minted by some other account, possibly targeting some other
+/// recipient — would have been replayed as an injected GER, mutating
+/// `ger_entries` / `hash_chain_value` based on data the proxy did not
+/// authorise.
 async fn restore_gers(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
+    accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
+    // MA#28 — same fallback as `submit_update_ger_note` in `src/ger.rs`:
+    // legacy deployments without a dedicated `ger_manager` mint
+    // UpdateGerNotes from the `service` account. Use the same resolution
+    // here so notes minted before the dedicated manager was introduced
+    // still verify against the active configuration.
+    let expected_sender = accounts
+        .ger_manager
+        .as_ref()
+        .map(|a| a.0)
+        .unwrap_or(accounts.service.0);
+    let expected_target = accounts.bridge.0;
 
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
@@ -501,6 +577,62 @@ async fn restore_gers(
                     let details = note.details();
                     if details.script().root() != ger_script_root {
                         continue;
+                    }
+
+                    // MA#28 — verify the note's authoritative provenance
+                    // BEFORE we read any storage from it. `UpdateGerNote::create`
+                    // (miden-agglayer-0.14.5/src/update_ger_note.rs:87-114) sets:
+                    //   - metadata.sender = ger_manager (or service in legacy)
+                    //   - metadata.attachment = NetworkAccountTarget(bridge_id)
+                    // A consumed note with the right script_root but the wrong
+                    // sender / attachment was not minted by aggkit and must
+                    // not influence the restored `ger_entries` /
+                    // `hash_chain_value` state. Without these checks an
+                    // attacker (or operator footgun) could craft an
+                    // independent UpdateGerNote pointing at the bridge and
+                    // have restore silently replay it as a sanctioned GER
+                    // injection. Pure-predicate classification is unit-tested
+                    // via `classify_ger_note` — keep this match in sync.
+                    match classify_ger_note(note.metadata(), expected_sender, expected_target) {
+                        GerNoteVerdict::Accept => {}
+                        GerNoteVerdict::MissingMetadata => {
+                            ::metrics::counter!("restore_ger_missing_metadata_total").increment(1);
+                            tracing::warn!(
+                                note_id = %note.id(),
+                                "MA#28: UpdateGerNote-shaped consumed note has no metadata; skipping"
+                            );
+                            continue;
+                        }
+                        GerNoteVerdict::SenderMismatch => {
+                            ::metrics::counter!("restore_ger_sender_mismatch_total").increment(1);
+                            tracing::error!(
+                                note_id = %note.id(),
+                                sender = ?note.metadata().map(|m| m.sender()),
+                                expected = %expected_sender,
+                                "MA#28: UpdateGerNote-shaped note has unexpected sender; \
+                                 refusing to replay as restored GER"
+                            );
+                            continue;
+                        }
+                        GerNoteVerdict::UndecodableTarget => {
+                            ::metrics::counter!("restore_ger_no_target_total").increment(1);
+                            tracing::error!(
+                                note_id = %note.id(),
+                                "MA#28: UpdateGerNote-shaped note has no decodable \
+                                 NetworkAccountTarget attachment; refusing to replay"
+                            );
+                            continue;
+                        }
+                        GerNoteVerdict::TargetMismatch => {
+                            ::metrics::counter!("restore_ger_target_mismatch_total").increment(1);
+                            tracing::error!(
+                                note_id = %note.id(),
+                                expected = %expected_target,
+                                "MA#28: UpdateGerNote-shaped note targets a different \
+                                 recipient than the configured bridge; refusing to replay"
+                            );
+                            continue;
+                        }
                     }
 
                     let storage = details.storage();
@@ -599,7 +731,103 @@ mod tests {
     use super::*;
     use crate::store::Store;
     use crate::store::memory::InMemoryStore;
+    use miden_protocol::note::{NoteAttachment, NoteMetadata, NoteType};
+    use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
+
+    // Test AccountIds. The 7th byte of the prefix encodes
+    // `(storage_mode << 6) | (account_type << 4) | version`. Network mode
+    // (which is required for `NetworkAccountTarget::new` to accept a
+    // target_id) is `0b01 << 6 = 0x40`. The existing crate-wide test ID
+    // (`0x3d7c9747558851900f8206226dfbea`) encodes Private mode (0x90);
+    // we patch byte 7 to 0x40 here to satisfy the network-target check
+    // without depending on the `testing` feature of `miden-protocol`
+    // (which would pull in `rand_xoshiro` etc. for what is otherwise a
+    // pure-predicate test). See
+    // `miden-protocol-0.14.4/src/account/account_id/v0/mod.rs:121-129`.
+    //
+    // _SENDER_* IDs use the Private-mode encoding because `NoteMetadata`'s
+    // sender field has no storage-mode constraint.
+    const TEST_TARGET_BRIDGE: &str = "0x3d7c9747558851400f8206226dfbea";
+    const TEST_TARGET_OTHER: &str = "0x3d7c9747558851400f8206226dfbeb";
+    const TEST_SENDER_MANAGER: &str = "0x3d7c9747558851900f8206226dfbec";
+    const TEST_SENDER_ATTACKER: &str = "0x3d7c9747558851900f8206226dfbed";
+
+    fn id(hex: &str) -> AccountId {
+        AccountId::from_hex(hex).expect("hex must decode")
+    }
+
+    fn make_metadata(sender: AccountId, target: Option<AccountId>) -> NoteMetadata {
+        let base = NoteMetadata::new(sender, NoteType::Public);
+        match target {
+            Some(t) => {
+                let attachment = NoteAttachment::from(
+                    NetworkAccountTarget::new(t, NoteExecutionHint::Always).expect("ok"),
+                );
+                base.with_attachment(attachment)
+            }
+            None => base,
+        }
+    }
+
+    // MA#28 — classifier pins for the four reject branches + accept.
+    #[test]
+    fn ma28_classify_ger_note_accept() {
+        let sender = id(TEST_SENDER_MANAGER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        let meta = make_metadata(sender, Some(bridge));
+        assert_eq!(
+            classify_ger_note(Some(&meta), sender, bridge),
+            GerNoteVerdict::Accept,
+        );
+    }
+
+    #[test]
+    fn ma28_classify_ger_note_missing_metadata() {
+        let sender = id(TEST_SENDER_MANAGER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        assert_eq!(
+            classify_ger_note(None, sender, bridge),
+            GerNoteVerdict::MissingMetadata,
+        );
+    }
+
+    #[test]
+    fn ma28_classify_ger_note_sender_mismatch() {
+        let expected_sender = id(TEST_SENDER_MANAGER);
+        let attacker = id(TEST_SENDER_ATTACKER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        let meta = make_metadata(attacker, Some(bridge));
+        assert_eq!(
+            classify_ger_note(Some(&meta), expected_sender, bridge),
+            GerNoteVerdict::SenderMismatch,
+        );
+    }
+
+    #[test]
+    fn ma28_classify_ger_note_target_mismatch() {
+        let sender = id(TEST_SENDER_MANAGER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        let other = id(TEST_TARGET_OTHER);
+        let meta = make_metadata(sender, Some(other));
+        assert_eq!(
+            classify_ger_note(Some(&meta), sender, bridge),
+            GerNoteVerdict::TargetMismatch,
+        );
+    }
+
+    #[test]
+    fn ma28_classify_ger_note_undecodable_target() {
+        let sender = id(TEST_SENDER_MANAGER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        // Note metadata with no NetworkAccountTarget attachment at all —
+        // this is the "forged-via-NoAuth" signature analogous to Cantina #4.
+        let meta = make_metadata(sender, None);
+        assert_eq!(
+            classify_ger_note(Some(&meta), sender, bridge),
+            GerNoteVerdict::UndecodableTarget,
+        );
+    }
 
     // MA#27 — store-level pin for the Phase 2.5 dedup-and-emit pipeline.
     // Replays the inner steps `restore_claims` performs against an
