@@ -135,9 +135,11 @@ async fn submit_update_ger_note(
                 let tx_request = TransactionRequestBuilder::new()
                     .own_output_notes(vec![note])
                     .build()?;
-                let tx_id = client
-                    .submit_new_transaction(ger_manager_id, tx_request)
-                    .await?;
+                let tx_id = crate::metrics::meter_proof(
+                    crate::metrics::ProofKind::Ger,
+                    client.submit_new_transaction(ger_manager_id, tx_request),
+                )
+                .await?;
                 tracing::info!(
                     tx_id = %tx_id,
                     ger = %hex::encode(ger_bytes),

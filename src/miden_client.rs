@@ -1,8 +1,10 @@
 use anyhow::anyhow;
+use miden_client::RemoteTransactionProver;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::rpc::{Endpoint, GrpcClient, GrpcError, NodeRpcClient, RpcError};
 use miden_client::sync::SyncSummary;
+use miden_client::transaction::{LocalTransactionProver, TransactionProver};
 use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use std::env;
@@ -101,6 +103,12 @@ pub struct MidenClient {
     sender: mpsc::Sender<Request>,
     done_sender: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     alive: Arc<AtomicBool>,
+    /// Opt-in `LocalTransactionProver` used when the remote prover fails and
+    /// `--miden-prover-fallback-to-local` is set. `None` when fallback is
+    /// disabled (the default — preserves the bali OOM fix) OR when the
+    /// proxy is already proving locally (no remote prover configured, so
+    /// the active prover IS the local one and a "fallback" is meaningless).
+    local_prover_fallback: Option<Arc<dyn TransactionProver + Send + Sync>>,
     #[cfg(test)]
     call_count: Arc<AtomicUsize>,
 }
@@ -109,10 +117,14 @@ const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<MidenClient>();
 
 impl MidenClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store_dir: Option<PathBuf>,
         node_url: Option<String>,
         api_key: Option<String>,
+        prover_url: Option<String>,
+        prover_timeout_secs: u64,
+        fallback_to_local: bool,
         sync_listeners: Vec<Arc<dyn SyncListener>>,
         debug_mode: bool,
     ) -> anyhow::Result<Self> {
@@ -122,6 +134,21 @@ impl MidenClient {
             .unwrap_or(Ok(Endpoint::localhost()))?;
         let keystore = Self::create_keystore(store_dir.clone())?;
         let keystore_for_run = keystore.clone();
+        let prover_url_for_run = prover_url.clone();
+
+        // Pre-construct the local-prover Arc once at boot so the proof-call
+        // hot path can clone it without re-initialising. Only meaningful when
+        // a remote prover IS configured AND the operator has opted in via
+        // `--miden-prover-fallback-to-local`; otherwise the active prover
+        // is already local (no remote configured) or the operator has
+        // explicitly chosen "fail rather than fall back to the bali OOM
+        // path" (the default).
+        let local_prover_fallback: Option<Arc<dyn TransactionProver + Send + Sync>> =
+            if fallback_to_local && prover_url.is_some() {
+                Some(Arc::new(LocalTransactionProver::default()))
+            } else {
+                None
+            };
 
         let (sender, receiver) = mpsc::channel::<Request>(1);
         let (done_sender, done_receiver) = oneshot::channel::<()>();
@@ -139,6 +166,8 @@ impl MidenClient {
                     store_dir.clone(),
                     node_endpoint.clone(),
                     api_key.clone(),
+                    prover_url_for_run.clone(),
+                    prover_timeout_secs,
                     keystore_for_run.clone(),
                     &mut receiver,
                     &mut done_receiver,
@@ -171,9 +200,23 @@ impl MidenClient {
             sender,
             done_sender,
             alive,
+            local_prover_fallback,
             #[cfg(test)]
             call_count: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Returns the opt-in `LocalTransactionProver` fallback if the operator
+    /// set `--miden-prover-fallback-to-local` AND a remote prover is
+    /// configured. `None` when the active prover is already local (no
+    /// remote configured) or fallback was not opted into.
+    ///
+    /// Callers (currently `claim.rs`) should attempt `prove_transaction`
+    /// against the configured prover first, then retry against this
+    /// `Arc` when the result is a `ClientError::TransactionProvingError`.
+    /// See `src/claim.rs::publish_claim_internal` for the canonical use.
+    pub fn local_prover_fallback(&self) -> Option<Arc<dyn TransactionProver + Send + Sync>> {
+        self.local_prover_fallback.clone()
     }
 
     /// Returns true if the background thread is connected and syncing.
@@ -224,6 +267,7 @@ impl MidenClient {
             sender,
             done_sender: std::sync::Mutex::new(Some(done_sender)),
             alive: Arc::new(AtomicBool::new(true)),
+            local_prover_fallback: None,
             call_count,
         }
     }
@@ -363,6 +407,8 @@ impl MidenClient {
         store_dir: PathBuf,
         node_endpoint: Endpoint,
         api_key: Option<String>,
+        prover_url: Option<String>,
+        prover_timeout_secs: u64,
         keystore: Arc<FilesystemKeyStore>,
         receiver: &mut mpsc::Receiver<Request>,
         done_receiver: &mut oneshot::Receiver<()>,
@@ -378,10 +424,33 @@ impl MidenClient {
             DebugMode::Disabled
         };
 
+        let tx_prover: Option<Arc<dyn TransactionProver + Send + Sync>> =
+            prover_url.as_deref().map(|url| {
+                Arc::new(
+                    RemoteTransactionProver::new(url)
+                        .with_timeout(Duration::from_secs(prover_timeout_secs)),
+                ) as _
+            });
+        if prover_url.is_some() {
+            // Deliberately NOT logging the URL itself — operators can audit
+            // MIDEN_PROVER_URL from the environment, ops logs must not
+            // contain it (the URL may include an auth-bearing path or be
+            // routed through an internal-only hostname we do not want
+            // captured in long-lived log indices).
+            tracing::info!(
+                target: crate::COMPONENT,
+                prover_url = "configured",
+                prover_timeout_secs,
+                "MidenClient using remote transaction prover",
+            );
+        } else {
+            tracing::info!(target: crate::COMPONENT, "MidenClient using local transaction prover (default)");
+        }
+
         let mut client;
         let mut backoff = BACKOFF_MIN;
         loop {
-            let build_result = ClientBuilder::new()
+            let mut builder = ClientBuilder::new()
                 .rpc(build_rpc_client(
                     &node_endpoint,
                     node_timeout_ms,
@@ -389,9 +458,11 @@ impl MidenClient {
                 ))
                 .sqlite_store(store_dir.join("store.sqlite3"))
                 .authenticator(keystore.clone())
-                .in_debug_mode(mode)
-                .build()
-                .await;
+                .in_debug_mode(mode);
+            if let Some(p) = tx_prover.clone() {
+                builder = builder.prover(p);
+            }
+            let build_result = builder.build().await;
 
             match build_result {
                 Ok(c) => {
