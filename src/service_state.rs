@@ -103,6 +103,14 @@ pub struct ServiceState {
     /// reconstruction. Production posture; default false for backward
     /// compatibility with aggsender / aggoracle / hardhat dev flows.
     pub reject_zero_padding_addresses: bool,
+    /// Reject the Hardhat default-account alias remap (Cantina MA#8).
+    /// When `true`, the special-case remap of the well-known Hardhat
+    /// address (`0xf39f...2266`) to `wallet_hardhat` is disabled. Required
+    /// for production deployments — otherwise any L1 deposit targeting
+    /// the Hardhat address is silently routed into the operator-owned
+    /// wallet account. Enforced as a `--require-hardening` invariant in
+    /// `main.rs::check_hardening_invariants`.
+    pub reject_hardhat_alias: bool,
     /// Cantina #7 expected-MINT tracker, shared with the `BridgeOutScanner`.
     /// `publish_claim_internal` records each submitted CLAIM's NoteId here;
     /// the scanner ticks it each sync, marking entries Landed once it
@@ -143,6 +151,7 @@ impl ServiceState {
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
+            reject_hardhat_alias: false,
             expected_mints: Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new()),
             miden_api_key: None,
         }
