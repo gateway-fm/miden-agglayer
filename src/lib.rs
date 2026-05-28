@@ -38,6 +38,7 @@ pub mod store;
 #[cfg(test)]
 pub mod test_helpers;
 pub mod twin_note_detector;
+pub mod unknown_wrapper_detector;
 
 pub const COMPONENT: &str = "miden-agglayer";
 

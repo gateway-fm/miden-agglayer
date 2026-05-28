@@ -504,6 +504,7 @@ impl BridgeOutScanner {
             }
         }
     }
+
 }
 
 #[async_trait::async_trait]
@@ -635,6 +636,45 @@ impl SyncListener for BridgeOutScanner {
                         note_id = %note.id(),
                         "Cantina #4: MINT note observed with no decodable \
                          NetworkAccountTarget attachment — forged via NoAuth"
+                    );
+                }
+            }
+
+            // Cantina MA#4 — unknown bridge-out wrapper detection. The bridge
+            // account has no on-chain assertion that the note consumed must
+            // be the canonical B2AGG script — any MASM body that calls
+            // `bridge_out::bridge_out` from a transaction the bridge consumes
+            // will advance the LET frontier and BURN funds. Pre-fix the
+            // indexer silently dropped every non-B2AGG script root in
+            // `is_b2agg_note`, so an alternate wrapper would create an
+            // invisible exit. Detect post-hoc: notes consumed by the bridge
+            // account whose script root is in neither the B2AGG-out set nor
+            // the CLAIM-in set are the MA#4 signature.
+            if note.consumer_account() == Some(self.bridge_account_id) {
+                let b2agg_root_bytes = B2AggNote::script_root().as_bytes();
+                let claim_root_bytes = claim_root.as_bytes();
+                let observed_bytes = script_root.as_bytes();
+                use crate::unknown_wrapper_detector::{
+                    BridgeConsumerScript, classify_bridge_consumer_script,
+                };
+                if matches!(
+                    classify_bridge_consumer_script(
+                        observed_bytes,
+                        b2agg_root_bytes,
+                        claim_root_bytes,
+                    ),
+                    BridgeConsumerScript::Unknown
+                ) {
+                    metrics::counter!("bridge_unknown_wrapper_consumed_total").increment(1);
+                    tracing::warn!(
+                        target: "bridge_out::unknown_wrapper",
+                        note_id = %note.id(),
+                        observed_script_root = %hex::encode(observed_bytes),
+                        bridge = %self.bridge_account_id,
+                        "Cantina MA#4: bridge account consumed a note whose script \
+                         root matches neither the canonical B2AGG bridge-out wrapper \
+                         nor the CLAIM script — alternate wrapper has produced an \
+                         on-chain LET advance that the indexer cannot translate"
                     );
                 }
             }
@@ -1510,5 +1550,40 @@ mod tests {
         // the gate. The pure-helper test pins the exact decision; this just
         // exercises the wiring end-to-end without a downstream panic.
         let _ = scanner.process_consumed_note(&note, 100).await;
+    }
+
+    /// Cantina MA#4 — wiring repro for the unknown-wrapper detector. Pins
+    /// that the predicate correctly distinguishes the canonical B2AGG and
+    /// CLAIM roots from any other 32-byte root. The wiring inside
+    /// `on_post_sync` is exercised by the e2e tests (full client+sync stack
+    /// required); this test pins the pure decision the wiring depends on.
+    #[test]
+    fn ma4_classify_bridge_consumer_script_pins_known_set() {
+        use crate::unknown_wrapper_detector::{
+            BridgeConsumerScript, classify_bridge_consumer_script,
+        };
+        // Use the real B2AGG + CLAIM roots so a future MASM regen that
+        // changes either is caught here.
+        let b2agg = B2AggNote::script_root().as_bytes();
+        let claim = miden_base_agglayer::claim_script().root().as_bytes();
+        assert_ne!(b2agg, claim, "B2AGG and CLAIM must have distinct roots");
+
+        // Known roots — the bridge legitimately consumes both.
+        assert_eq!(
+            classify_bridge_consumer_script(b2agg, b2agg, claim),
+            BridgeConsumerScript::KnownB2Agg
+        );
+        assert_eq!(
+            classify_bridge_consumer_script(claim, b2agg, claim),
+            BridgeConsumerScript::KnownClaim
+        );
+
+        // Arbitrary other root — the MA#4 signature. Pre-fix this slipped
+        // through silently.
+        let foreign = [0xCCu8; 32];
+        assert_eq!(
+            classify_bridge_consumer_script(foreign, b2agg, claim),
+            BridgeConsumerScript::Unknown
+        );
     }
 }
