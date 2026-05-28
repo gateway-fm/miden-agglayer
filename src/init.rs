@@ -65,7 +65,11 @@ async fn deploy_account(
         AccountIdBech32(account_id)
     );
     let dummy_txn = TransactionRequestBuilder::new().build()?;
-    let txn_id = client.submit_new_transaction(account_id, dummy_txn).await?;
+    let txn_id = crate::metrics::meter_proof(
+        crate::metrics::ProofKind::Init,
+        client.submit_new_transaction(account_id, dummy_txn),
+    )
+    .await?;
     tracing::info!("deployed {name} account with txn_id {txn_id}");
 
     // Wait for the transaction to be committed (like ajl test's wait_for_tx)
@@ -209,7 +213,11 @@ async fn register_p2id_script(
         .own_output_notes(vec![note])
         .build()?;
 
-    let txn_id = client.submit_new_transaction(sender, txn).await?;
+    let txn_id = crate::metrics::meter_proof(
+        crate::metrics::ProofKind::Init,
+        client.submit_new_transaction(sender, txn),
+    )
+    .await?;
     tracing::info!("registered P2ID script with txn_id {txn_id}");
     Ok(())
 }

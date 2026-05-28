@@ -156,6 +156,48 @@ pub(crate) fn reverse_scale_amount(miden_amount: u64, scale: u8) -> anyhow::Resu
         .context("reverse_scale_amount: miden_amount * 10^scale overflows u128")
 }
 
+// CANTINA MA#3 — RECLAIM GATE
+// ================================================================================================
+
+/// Decision returned by [`classify_b2agg_consumer`].
+///
+/// The B2AGG MASM script (`asm/note_scripts/B2AGG.masm` lines 53-109) has TWO
+/// consumption paths — a reclaim branch that adds assets back to the sender,
+/// and a bridge branch that BURNs and advances the LET frontier. miden-client
+/// returns notes from both paths in `NoteFilter::Consumed`, so a pure gate on
+/// `consumer_account()` is required before emitting a synthetic BridgeEvent.
+///
+/// `Emit` is the only variant that should produce a BridgeEvent. The other two
+/// are skip paths with distinct metrics so operators can graph reclaim rate
+/// (expected, normal user flow) separately from the untracked-consumer anomaly
+/// (fail-closed, indicates miden-client did not record the consuming account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum B2AggConsumerClass {
+    /// Note was consumed by the bridge account — emit BridgeEvent.
+    Emit,
+    /// Note was consumed by a non-bridge account (reclaim path in MASM lines 65-71).
+    Reclaimed,
+    /// Note has no recorded consumer — fail-closed skip.
+    UntrackedConsumer,
+}
+
+/// Pure gate predicate for the B2AGG reclaim fix (Cantina MA#3).
+///
+/// Given the `consumer_account` field from miden-client's `InputNoteRecord`
+/// and this scanner's `bridge_account_id`, classify whether to emit a synthetic
+/// BridgeEvent. Pure (no I/O, no metrics) so it can be unit-tested directly.
+/// Metric emission and tracing live at the call site in `process_consumed_note`.
+pub fn classify_b2agg_consumer(
+    consumer_account: Option<AccountId>,
+    bridge_account_id: AccountId,
+) -> B2AggConsumerClass {
+    match consumer_account {
+        Some(consumer) if consumer == bridge_account_id => B2AggConsumerClass::Emit,
+        Some(_) => B2AggConsumerClass::Reclaimed,
+        None => B2AggConsumerClass::UntrackedConsumer,
+    }
+}
+
 // BRIDGE OUT SCANNER
 // ================================================================================================
 
@@ -241,6 +283,66 @@ impl BridgeOutScanner {
         let details = note.details();
         if !is_b2agg_note(details) {
             return false;
+        }
+
+        // Cantina MA#3 — reclaim gate. The B2AGG MASM script has TWO consumption
+        // paths (asm/note_scripts/B2AGG.masm lines 53-109):
+        //   1. Reclaim (lines 65-71, `if consuming_account == sender`) — assets
+        //      are added back to the sender via `basic_wallet::add_assets_to_account`.
+        //      NO `bridge_out::bridge_out` call, NO BURN, NO LET advance.
+        //   2. Bridge (lines 72-107) — calls `bridge_out::bridge_out` which BURNs
+        //      and advances the LET frontier.
+        //
+        // Both paths land the note in `NoteFilter::Consumed`, so without a gate
+        // here we emit a synthetic BridgeEvent for reclaims too. That synthetic
+        // event triggers an aggsender certificate covering a non-existent LET
+        // leaf, which `pessimistic-proof-core` rejects with `InvalidExit`, and
+        // the entire bridge-out window stalls.
+        //
+        // Gate: only emit when the note was consumed BY the bridge account.
+        // miden-client's `InputNoteRecord::consumer_account()` is set from sync
+        // data and is exactly what we need — it returns Some(consumer) for
+        // notes in any consumed state and None when the consumer isn't tracked
+        // by this client (which is unexpected for B2AGG and treated fail-closed).
+        // Pure classification lives in `classify_b2agg_consumer`; this match
+        // wires in the observability (metric + tracing) for each skip branch.
+        let consumer = note.consumer_account();
+        match classify_b2agg_consumer(consumer, self.bridge_account_id) {
+            B2AggConsumerClass::Emit => {
+                // Real bridge-out — proceed.
+            }
+            B2AggConsumerClass::Reclaimed => {
+                // Reclaim path: the user's wallet consumed the note via the
+                // `consuming_account == sender` branch in B2AGG.masm. Expected
+                // behaviour — record a metric so we can graph reclaim rate and
+                // log at info (not warn — reclaims are normal user flow).
+                metrics::counter!("bridge_out_reclaimed_b2agg_total").increment(1);
+                tracing::info!(
+                    target: "bridge_out",
+                    note_id = %note_id_str,
+                    consumer = ?consumer,
+                    bridge = %self.bridge_account_id,
+                    "B2AGG note was reclaimed by user (consumed by non-bridge account); \
+                     skipping synthetic BridgeEvent emission (Cantina MA#3)"
+                );
+                return false;
+            }
+            B2AggConsumerClass::UntrackedConsumer => {
+                // Fail-closed: a consumed B2AGG with no known consumer is an
+                // anomaly — miden-client should normally populate this field
+                // for any note we observe as Consumed. Skip rather than risk
+                // emitting an unverifiable BridgeEvent; an operator can probe
+                // the note manually if the metric trips.
+                metrics::counter!("bridge_out_b2agg_untracked_consumer_total").increment(1);
+                tracing::info!(
+                    target: "bridge_out",
+                    note_id = %note_id_str,
+                    bridge = %self.bridge_account_id,
+                    "B2AGG note consumed by untracked account (consumer_account = None); \
+                     fail-closed skip (Cantina MA#3)"
+                );
+                return false;
+            }
         }
 
         // Parse B2AGG storage
@@ -1235,5 +1337,178 @@ mod tests {
         ])
         .unwrap();
         assert!(parse_b2agg_storage(&storage).is_ok());
+    }
+
+    // CANTINA MA#3 — RECLAIM GATE TESTS
+    // ============================================================================================
+
+    /// Cantina MA#3 — pure-helper repro. `classify_b2agg_consumer` is the
+    /// load-bearing gate predicate. Test the three branches explicitly so any
+    /// future refactor that broadens or narrows the gate is caught here.
+    #[test]
+    fn ma3_classify_b2agg_consumer_branches() {
+        // Two distinct AccountIds (last hex char differs).
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let user_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+        assert_ne!(bridge_id, user_id, "test ids must be distinct");
+
+        // 1. Bridge-consumed → Emit (real bridge-out).
+        assert_eq!(
+            classify_b2agg_consumer(Some(bridge_id), bridge_id),
+            B2AggConsumerClass::Emit
+        );
+
+        // 2. Reclaim path — note was consumed by a different (user) account.
+        assert_eq!(
+            classify_b2agg_consumer(Some(user_id), bridge_id),
+            B2AggConsumerClass::Reclaimed
+        );
+
+        // 3. Untracked consumer — fail-closed.
+        assert_eq!(
+            classify_b2agg_consumer(None, bridge_id),
+            B2AggConsumerClass::UntrackedConsumer
+        );
+    }
+
+    /// Build a minimal B2AGG `InputNoteRecord` in a chosen consumed state for
+    /// gate-wiring tests. Empty asset set so we never need to construct a
+    /// FungibleAsset (which would require a faucet-typed AccountId) — the gate
+    /// runs strictly before asset extraction in `process_consumed_note`, so
+    /// the downstream code path that reads assets is unreachable for the
+    /// reclaim/untracked tests.
+    fn build_b2agg_note_with_consumer(
+        consumer_account: Option<AccountId>,
+    ) -> miden_client::store::InputNoteRecord {
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::Felt;
+        use miden_protocol::Word;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{NoteAssets, NoteDetails, NoteRecipient, NoteStorage};
+
+        // B2AGG storage: 6 felts (network + 5 address limbs). Values don't matter
+        // for the gate — only the script root distinguishes B2AGG.
+        let storage = NoteStorage::new(vec![
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+            Felt::new(0),
+        ])
+        .unwrap();
+        let script = B2AggNote::script();
+        let recipient = NoteRecipient::new(Word::default(), script, storage);
+        let assets = NoteAssets::new(vec![]).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account,
+            consumed_tx_order: None,
+        });
+
+        miden_client::store::InputNoteRecord::new(details, None, state)
+    }
+
+    /// Cantina MA#3 — wiring repro. A B2AGG note consumed by a user account
+    /// (reclaim branch in B2AGG.masm:65-71) must NOT trigger a synthetic
+    /// BridgeEvent or be marked processed.
+    #[tokio::test]
+    async fn ma3_process_consumed_note_skips_b2agg_reclaimed_by_user() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let user_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_b2agg_note_with_consumer(Some(user_id));
+        let note_id_str = note.id().to_string();
+
+        let advanced = scanner.process_consumed_note(&note, 100).await;
+        assert!(!advanced, "reclaim must NOT signal block advance");
+
+        // The note must NOT be marked processed — otherwise a future
+        // bridge-actual consumption of a different note with the same ID
+        // (twin) would silently skip.
+        assert!(
+            !store.is_note_processed(&note_id_str).await.unwrap(),
+            "reclaimed note must remain un-processed in the store"
+        );
+
+        // No BridgeEvent log emitted.
+        let filter = crate::log_synthesis::LogFilter::default();
+        let logs = store.get_logs(&filter, 1000).await.unwrap_or_default();
+        assert!(
+            logs.is_empty(),
+            "reclaim path must not emit any synthetic log, got {} log(s)",
+            logs.len()
+        );
+    }
+
+    /// Cantina MA#3 — wiring repro. A B2AGG note with no tracked consumer
+    /// account (miden-client gap or transient sync state) must be treated as
+    /// fail-closed: skip emission, no state mutation.
+    #[tokio::test]
+    async fn ma3_process_consumed_note_skips_b2agg_with_unknown_consumer() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_b2agg_note_with_consumer(None);
+        let note_id_str = note.id().to_string();
+
+        let advanced = scanner.process_consumed_note(&note, 100).await;
+        assert!(
+            !advanced,
+            "untracked-consumer must NOT signal block advance"
+        );
+        assert!(
+            !store.is_note_processed(&note_id_str).await.unwrap(),
+            "untracked-consumer note must remain un-processed"
+        );
+    }
+
+    /// Cantina MA#3 — positive wiring. A B2AGG note consumed by the bridge
+    /// account passes the gate and proceeds to downstream processing. In this
+    /// test the note carries no fungible asset so the subsequent
+    /// "no fungible asset" branch in `process_consumed_note` returns false —
+    /// what we're pinning here is that the gate did NOT short-circuit, i.e.
+    /// the reclaim metric path was NOT taken. We assert this indirectly: the
+    /// reclaim-skip path returns false WITHOUT ever calling
+    /// `iter_fungible().next()`, while the emit path returns false because
+    /// `iter_fungible().next()` is `None`. We pin the contract via the
+    /// pure-helper test (`ma3_classify_b2agg_consumer_branches`) and assert
+    /// here that the scanner doesn't panic / blow up when the bridge consumes
+    /// a B2AGG (i.e. it proceeds past the gate cleanly).
+    #[tokio::test]
+    async fn ma3_process_consumed_note_emits_for_bridge_consumed_b2agg() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_b2agg_note_with_consumer(Some(bridge_id));
+
+        // Must not panic — the gate accepts and we fall through to the
+        // "no fungible asset" branch (which also returns false). The key
+        // contract here is: bridge-consumed notes are NOT short-circuited by
+        // the gate. The pure-helper test pins the exact decision; this just
+        // exercises the wiring end-to-end without a downstream panic.
+        let _ = scanner.process_consumed_note(&note, 100).await;
     }
 }

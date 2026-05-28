@@ -64,6 +64,16 @@ serde_json = { version = "1.0" }
 sha3 = { version = "0.10" }
 thiserror = { default-features = false, version = "2.0" }
 tokio = { features = ["macros", "rt-multi-thread", "signal"], version = "1.48" }
+# Used by the startup-time remote-prover reachability probe in `main.rs`. The
+# miden-client crate already pulls tonic in via `features = ["tonic"]` so the
+# transitive build pulls server + tls; this direct dep narrows the explicit
+# surface to `channel` (client side, `Endpoint::from_shared(...).connect()`)
+# plus `tls-native-roots` so the same TLS material works for prover URLs
+# served via https://.
+tonic = { default-features = false, features = [
+  "channel",
+  "tls-native-roots",
+], version = "0.14" }
 toml = { version = "0.9" }
 tower = { version = "0.5" }
 tower-http = { features = [
