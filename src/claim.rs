@@ -8,7 +8,7 @@ use miden_base_agglayer::{
     ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
     ProofData, SmtNode,
 };
-use miden_client::transaction::TransactionRequestBuilder;
+use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::note::Note;
@@ -351,6 +351,14 @@ async fn publish_claim_internal(
     latest_block_num: BlockNumber,
     reject_zero_padding: bool,
     expected_mints: Option<&Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
+    // Opt-in local prover used as a fallback when the remote prover
+    // configured on the surrounding `MidenClient` fails. `None` when
+    // either (a) no remote prover is configured (the active prover IS
+    // already local) or (b) `--miden-prover-fallback-to-local` was not
+    // set. See `MidenClient::local_prover_fallback` for the full
+    // selection logic and `metrics::meter_proof_with_fallback` for how
+    // the two prove attempts are split across the outcome label.
+    local_prover_fallback: Option<Arc<dyn TransactionProver + Send + Sync>>,
 ) -> anyhow::Result<PublishClaimTxn> {
     let faucet = find_or_create_faucet(
         params.originTokenAddress,
@@ -435,7 +443,60 @@ async fn publish_claim_internal(
         tracing::info!(note_idx = i, variant = %variant, "executed tx output note");
     }
 
-    let proven_tx = client.prove_transaction(&tx_result).await?;
+    // The CLAIM hot path is the ONLY site that calls `prove_transaction`
+    // explicitly (every other site goes through `submit_new_transaction`,
+    // which performs execute+prove+submit+sync as one unit). That makes
+    // this the only site where we can wire the remote-prover →
+    // local-prover fallback cleanly: a failed `prove_transaction` doesn't
+    // mutate any node state, so we can safely retry against a different
+    // prover before calling `submit_proven_transaction`.
+    //
+    // When `--miden-prover-fallback-to-local` is set, the surrounding
+    // `MidenClient` builds and exposes a single shared
+    // `LocalTransactionProver` (`local_prover_fallback` parameter,
+    // plumbed in from `attempt_publish_claim`). When it's unset, the
+    // parameter is `None` and the retry block is skipped — matching the
+    // bali OOM-fix default (fail rather than silently double the prover
+    // workload).
+    //
+    // The fallback is wired inline (rather than through a combined
+    // `meter_proof_with_fallback` helper) because both attempts need
+    // `&mut client` and the borrow checker won't accept two closures
+    // capturing the same mutable reference, even though they execute
+    // sequentially. `record_primary_attempt` / `record_fallback_attempt`
+    // centralise the metric label set in `metrics.rs`.
+    let has_fallback = local_prover_fallback.is_some();
+    let primary_start = std::time::Instant::now();
+    let primary_res = client.prove_transaction(&tx_result).await;
+    let primary_elapsed = primary_start.elapsed().as_secs_f64();
+    let (primary_res, retry_outcome) = crate::metrics::record_primary_attempt(
+        crate::metrics::ProofKind::Claim,
+        primary_res,
+        primary_elapsed,
+        has_fallback,
+    );
+    let proven_tx = match primary_res {
+        Ok(p) => p,
+        Err(e) => {
+            if let (Some(prover), Some(failure)) = (local_prover_fallback, retry_outcome) {
+                tracing::warn!(
+                    error = %e,
+                    primary_outcome = failure.as_label(),
+                    "remote prover failed, retrying CLAIM proof against local fallback",
+                );
+                let fb_start = std::time::Instant::now();
+                let fb_res = client.prove_transaction_with(&tx_result, prover).await;
+                let fb_elapsed = fb_start.elapsed().as_secs_f64();
+                crate::metrics::record_fallback_attempt(
+                    crate::metrics::ProofKind::Claim,
+                    fb_res,
+                    fb_elapsed,
+                )?
+            } else {
+                return Err(e.into());
+            }
+        }
+    };
     for (i, note) in proven_tx.output_notes().iter().enumerate() {
         let variant = match note {
             miden_protocol::transaction::OutputNote::Public(_) => "Public",
@@ -644,6 +705,14 @@ async fn attempt_publish_claim(
     reject_zero_padding: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
 ) -> anyhow::Result<PublishClaimTxn> {
+    // Snapshot the opt-in local-prover fallback BEFORE entering the
+    // `client.with(...)` closure — the closure receives a
+    // `&mut MidenClientLib` (the inner client), not the outer
+    // `MidenClient` that owns the fallback Arc. Reading it here once and
+    // moving the `Option<Arc<_>>` into the closure keeps the proof-call
+    // site cancellation-safe and avoids any per-claim allocation of a new
+    // `LocalTransactionProver`.
+    let local_prover_fallback = client.local_prover_fallback();
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
     client
@@ -657,6 +726,7 @@ async fn attempt_publish_claim(
                     latest_block_num,
                     reject_zero_padding,
                     expected_mints.as_ref(),
+                    local_prover_fallback,
                 )
                 .await?;
                 let block_num = store.get_latest_block_number().await? + 1;

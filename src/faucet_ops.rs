@@ -54,9 +54,11 @@ pub async fn create_and_register_faucet(
         AccountIdBech32(account.id())
     );
     let dummy_txn = TransactionRequestBuilder::new().build()?;
-    let txn_id = client
-        .submit_new_transaction(account.id(), dummy_txn)
-        .await?;
+    let txn_id = crate::metrics::meter_proof(
+        crate::metrics::ProofKind::Faucet,
+        client.submit_new_transaction(account.id(), dummy_txn),
+    )
+    .await?;
     tracing::info!("deployed {symbol} faucet with txn_id {txn_id}");
 
     let committed = crate::miden_client::wait_for_transaction_commit(
@@ -117,7 +119,11 @@ pub async fn register_faucet_in_bridge(
         .own_output_notes(vec![note])
         .build()?;
 
-    let txn_id = client.submit_new_transaction(service_id, txn).await?;
+    let txn_id = crate::metrics::meter_proof(
+        crate::metrics::ProofKind::Faucet,
+        client.submit_new_transaction(service_id, txn),
+    )
+    .await?;
     tracing::info!(
         "registered {} faucet in bridge with txn_id {txn_id}",
         faucet_name,

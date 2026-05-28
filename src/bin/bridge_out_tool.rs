@@ -15,11 +15,12 @@ use anyhow::{Context, anyhow};
 use clap::Parser;
 use miden_base_agglayer::{B2AggNote, EthAddress};
 use miden_client::DebugMode;
+use miden_client::RemoteTransactionProver;
 use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;
-use miden_client::transaction::TransactionRequestBuilder;
+use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 
@@ -67,6 +68,18 @@ struct Args {
     /// traffic. Safe to omit for direct node access.
     #[arg(long, env = "MIDEN_API_KEY")]
     miden_api_key: Option<String>,
+
+    /// gRPC URL of a remote Miden transaction prover (e.g. `http://miden-prover:50051`).
+    /// When set, this binary offloads all proof generation to that endpoint instead
+    /// of running an in-process `LocalTransactionProver`. Mirrors the proxy flag of
+    /// the same name so the same `MIDEN_PROVER_URL` environment variable applies.
+    #[arg(long, env = "MIDEN_PROVER_URL")]
+    miden_prover_url: Option<String>,
+
+    /// Per-request timeout for the remote Miden prover, in seconds. Default 120s.
+    /// Has no effect when --miden-prover-url is unset.
+    #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
+    miden_prover_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for Args {
@@ -85,6 +98,11 @@ impl std::fmt::Debug for Args {
                 "miden_api_key",
                 &self.miden_api_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "miden_prover_url",
+                &self.miden_prover_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("miden_prover_timeout_secs", &self.miden_prover_timeout_secs)
             .finish()
     }
 }
@@ -154,11 +172,27 @@ async fn main() -> anyhow::Result<()> {
         10_000,
         args.miden_api_key.as_deref(),
     );
-    let mut client = ClientBuilder::new()
+    let mut builder = ClientBuilder::new()
         .rpc(rpc)
         .sqlite_store(store_path)
         .authenticator(Arc::new(keystore))
-        .in_debug_mode(mode)
+        .in_debug_mode(mode);
+    if let Some(prover_url) = args.miden_prover_url.as_deref() {
+        // Mirrors the main service wiring: when a remote prover URL is set,
+        // offload all proving to it (avoiding the bali OOM cause of in-process
+        // LocalTransactionProver). Without this the tool would silently still
+        // prove locally even with `MIDEN_PROVER_URL` exported.
+        let tx_prover: Arc<dyn TransactionProver + Send + Sync> = Arc::new(
+            RemoteTransactionProver::new(prover_url)
+                .with_timeout(std::time::Duration::from_secs(args.miden_prover_timeout_secs)),
+        );
+        builder = builder.prover(tx_prover);
+        println!(
+            "[bridge-out] using remote transaction prover (timeout {}s)",
+            args.miden_prover_timeout_secs,
+        );
+    }
+    let mut client = builder
         .build()
         .await
         .map_err(|e| anyhow!("failed to build miden client: {e}"))?;
@@ -210,17 +244,37 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             if !notes.is_empty() {
                 match TransactionRequestBuilder::new().build_consume_notes(notes) {
-                    Ok(req) => match client.submit_new_transaction(wallet_id, req).await {
-                        Ok(tx) => {
-                            println!("[bridge-out] consumed notes: {tx}");
-                            for _ in 0..10 {
-                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                client.sync_state().await.ok();
+                    Ok(req) => {
+                        match miden_agglayer_service::metrics::meter_proof(
+                            miden_agglayer_service::metrics::ProofKind::BridgeOut,
+                            client.submit_new_transaction(wallet_id, req),
+                        )
+                        .await
+                        {
+                            Ok(tx) => {
+                                println!("[bridge-out] consumed notes: {tx}");
+                                for _ in 0..10 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    client.sync_state().await.ok();
+                                }
+                            }
+                            Err(e) => {
+                                println!("[bridge-out] consume failed: {e}");
                             }
                         }
-                        Err(e) => println!("[bridge-out] consume failed: {e}"),
-                    },
-                    Err(e) => println!("[bridge-out] build consume req failed: {e}"),
+                    }
+                    Err(e) => {
+                        // Pre-prove build failure — no histogram (duration is
+                        // meaningless before any proving started). Record the
+                        // distinct `build_failed` outcome so dashboards can
+                        // split prover failures from request-construction
+                        // failures.
+                        miden_agglayer_service::metrics::record_proof_outcome(
+                            miden_agglayer_service::metrics::ProofKind::BridgeOut,
+                            miden_agglayer_service::metrics::ProofOutcome::BuildFailed,
+                        );
+                        println!("[bridge-out] build consume req failed: {e}");
+                    }
                 }
             }
         }
@@ -284,10 +338,12 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow!("tx request build failed: {e}"))?;
 
     println!("[bridge-out] submitting transaction...");
-    let tx_id = client
-        .submit_new_transaction(wallet_id, tx_request)
-        .await
-        .map_err(|e| anyhow!("submit failed: {e}"))?;
+    let tx_id = miden_agglayer_service::metrics::meter_proof(
+        miden_agglayer_service::metrics::ProofKind::BridgeOut,
+        client.submit_new_transaction(wallet_id, tx_request),
+    )
+    .await
+    .map_err(|e| anyhow!("submit failed: {e}"))?;
 
     println!("[bridge-out] transaction submitted: {tx_id}");
 

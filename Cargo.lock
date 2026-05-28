@@ -3381,6 +3381,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "toml 0.9.12+spec-1.1.0",
+ "tonic",
  "tower",
  "tower-http",
  "tower_governor",

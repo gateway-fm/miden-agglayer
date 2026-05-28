@@ -128,4 +128,414 @@ pub fn init_metrics() {
          claim_watcher_storage_decode_total when quarantining a \
          malformed note. Page if rate spikes."
     );
+    describe_counter!(
+        "miden_proof_generations_total",
+        "Miden zk-proof generations completed. Labels: \
+         kind=claim|ger|faucet|init|bridge_out (call-site category, bounded), \
+         op=prove|submit (prove = pure prover call; submit = end-to-end \
+         execute+prove+submit+sync, dominated by proving), \
+         outcome=ok|fallback_ok|timeout|connect_failure|prover_error|\
+         submit_failure|build_failed|fallback_error (bounded)."
+    );
+    describe_histogram!(
+        "miden_proof_duration_seconds",
+        "Wall-clock duration of a Miden zk-proof generation in seconds. \
+         Labels: kind=claim|ger|faucet|init|bridge_out (bounded), \
+         op=prove|submit (op=prove is pure prover latency on Claim; \
+         op=submit is end-to-end submit latency dominated by proving on the \
+         other call sites). Recorded on both success and error paths."
+    );
+}
+
+// =====================================================================
+// Proof-call instrumentation (Fix 11/7/12/6/14/5)
+// =====================================================================
+//
+// Every prove/submit call site in the proxy goes through `meter_proof`
+// (the 7 submit sites) or `meter_proof_with_fallback` (the single prove
+// site in `claim.rs` that also wires the local-prover retry from
+// `--miden-prover-fallback-to-local`). The wrappers centralise:
+//
+//   - histogram + counter naming and the (kind, op, outcome) label set
+//   - best-effort outcome classification (timeout/connect/prover/submit)
+//   - fallback bookkeeping so dashboards can split first-try success,
+//     second-try-via-local success, and total failure
+//
+// Adding a new call site = `meter_proof(ProofKind::X, future).await?;`
+// — the kind enum is what stops accidental free-text labels from leaking
+// unbounded cardinality into Prometheus.
+
+/// Compile-time–enforced "kind" label for Miden proof metrics.
+///
+/// Each variant tracks where the proof call originates so dashboards can
+/// split prover load by service path (claim hot path vs. boot init vs.
+/// admin tooling). Bounded enum → bounded cardinality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofKind {
+    /// `claim.rs::publish_claim_internal` — explicit `prove_transaction`
+    /// call on the CLAIM hot path.
+    Claim,
+    /// `ger.rs::insert_ger` — `submit_new_transaction` for UpdateGerNote.
+    Ger,
+    /// `faucet_ops::create_and_register_faucet` / `register_faucet_in_bridge`.
+    Faucet,
+    /// `init.rs::deploy_account` / `register_p2id_script` — boot path.
+    Init,
+    /// `bin/bridge_out_tool.rs` — both the consume-existing-notes path
+    /// and the final B2AGG submit.
+    BridgeOut,
+}
+
+impl ProofKind {
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            ProofKind::Claim => "claim",
+            ProofKind::Ger => "ger",
+            ProofKind::Faucet => "faucet",
+            ProofKind::Init => "init",
+            ProofKind::BridgeOut => "bridge_out",
+        }
+    }
+
+    /// Distinguishes pure prover latency from end-to-end submit latency.
+    ///
+    /// Only `ProofKind::Claim` wraps an explicit `client.prove_transaction`
+    /// — the rest wrap `client.submit_new_transaction` which is
+    /// execute+prove+submit+sync. The histogram dominates the same way
+    /// (proving is the heavy step) but the `op` label is required for
+    /// any alert that wants to bound true prover RTT (op=prove) vs.
+    /// total submit time including post-prove node calls (op=submit).
+    pub fn op_label(&self) -> &'static str {
+        match self {
+            ProofKind::Claim => "prove",
+            ProofKind::Ger
+            | ProofKind::Faucet
+            | ProofKind::Init
+            | ProofKind::BridgeOut => "submit",
+        }
+    }
+}
+
+/// Outcome classification for `miden_proof_generations_total`.
+///
+/// Finer-grained than ok/error so dashboards can tell a remote-prover
+/// outage (`ConnectFailure` / `Timeout`) from a real proof failure
+/// (`ProverError`) from a post-prove submission failure (`SubmitFailure`).
+/// `FallbackOk` / `FallbackError` only appear on `ProofKind::Claim` when
+/// `--miden-prover-fallback-to-local` is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofOutcome {
+    /// Proof succeeded against the configured prover (remote or local).
+    Ok,
+    /// Remote prover failed but the local-prover fallback succeeded.
+    /// Indicates the operator's `--miden-prover-fallback-to-local`
+    /// safety net actually fired — pair with `Timeout`/`ConnectFailure`
+    /// counts to see WHICH remote failure mode is being papered over.
+    FallbackOk,
+    /// gRPC DeadlineExceeded (per-request timeout fired). On the remote
+    /// prover this is the most common OOM-cascade symptom: the prover
+    /// process held the connection long enough to exhaust the timeout
+    /// but never returned a proof.
+    Timeout,
+    /// Failed to establish a gRPC channel to the prover. Distinct from
+    /// `Timeout` — connect-failure means the prover is gone or
+    /// unreachable; timeout means it took the call but never finished.
+    ConnectFailure,
+    /// The prover ran but returned a real proving error
+    /// (`TransactionProvingError`). Default classification for ambiguous
+    /// errors so a quiet metric drift doesn't hide a degraded prover.
+    ProverError,
+    /// Post-prove submission step failed (execute / submit_proven /
+    /// mempool admission). Only meaningful for op=submit — for
+    /// op=prove this variant is unreachable. Tracks "the proof
+    /// generated fine, but the node rejected the tx" separately from
+    /// proving issues.
+    SubmitFailure,
+    /// Pre-prove tx-request build failed — currently only
+    /// `bridge_out_tool.rs` outer error arm. No histogram recorded
+    /// (duration is meaningless before proving even starts).
+    BuildFailed,
+    /// Both the configured prover AND the local fallback failed.
+    /// Page critical: the fallback is the last line of defence.
+    FallbackError,
+}
+
+impl ProofOutcome {
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            ProofOutcome::Ok => "ok",
+            ProofOutcome::FallbackOk => "fallback_ok",
+            ProofOutcome::Timeout => "timeout",
+            ProofOutcome::ConnectFailure => "connect_failure",
+            ProofOutcome::ProverError => "prover_error",
+            ProofOutcome::SubmitFailure => "submit_failure",
+            ProofOutcome::BuildFailed => "build_failed",
+            ProofOutcome::FallbackError => "fallback_error",
+        }
+    }
+
+    /// Best-effort classification from an arbitrary error's `Display`.
+    ///
+    /// `ClientError` and `RemoteProverClientError` don't expose a stable
+    /// discriminator (the variants we care about — `Timeout`,
+    /// `ConnectionFailed`, `TransactionProvingError` — are buried inside
+    /// `#[from]` chains and `Box<dyn Error>` sources). Matching on the
+    /// `Display` rendering is the heuristic miden-client itself uses in
+    /// `unwrap_connection_error`-style call sites; it's good enough for
+    /// dashboard splits. Default is `ProverError` so any unclassified
+    /// error still falls into a "proof-side failure" bucket rather than
+    /// silently dropping off the dashboard.
+    pub fn from_error<E: std::fmt::Display>(err: &E) -> Self {
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("deadlineexceeded")
+            || lower.contains("deadline exceeded")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+        {
+            ProofOutcome::Timeout
+        } else if lower.contains("connectionfailed")
+            || lower.contains("connection error")
+            || lower.contains("failed to connect")
+            || lower.contains("unavailable")
+            || lower.contains("transport error")
+        {
+            ProofOutcome::ConnectFailure
+        } else if lower.contains("transactionprovingerror")
+            || lower.contains("transaction proving failed")
+            || lower.contains("proving failed")
+        {
+            ProofOutcome::ProverError
+        } else if lower.contains("submit")
+            || lower.contains("mempool")
+            || lower.contains("admission")
+            || lower.contains("incorrectaccountinitialcommitment")
+        {
+            ProofOutcome::SubmitFailure
+        } else {
+            ProofOutcome::ProverError
+        }
+    }
+}
+
+fn record_proof_metrics(kind: ProofKind, outcome: ProofOutcome, elapsed_secs: Option<f64>) {
+    if let Some(secs) = elapsed_secs {
+        metrics::histogram!(
+            "miden_proof_duration_seconds",
+            "kind" => kind.as_label(),
+            "op" => kind.op_label(),
+        )
+        .record(secs);
+    }
+    metrics::counter!(
+        "miden_proof_generations_total",
+        "kind" => kind.as_label(),
+        "op" => kind.op_label(),
+        "outcome" => outcome.as_label(),
+    )
+    .increment(1);
+}
+
+/// Record a proof-call metric inline for a known outcome (no duration,
+/// e.g. build-time failures before proving started). The 8th, 9th call
+/// sites can call this directly when `meter_proof` doesn't fit (e.g.
+/// `bridge_out_tool.rs` outer error arm for `build_consume_notes`).
+pub fn record_proof_outcome(kind: ProofKind, outcome: ProofOutcome) {
+    record_proof_metrics(kind, outcome, None);
+}
+
+/// Wraps a proof-producing future and records both the duration
+/// histogram and the per-outcome counter on completion. Replaces the
+/// inline `__proof_start`/`__res` pattern at every submit site.
+///
+/// Outcome is derived via `ProofOutcome::from_error` when the future
+/// returns `Err`. Call sites that need to override the classification
+/// (e.g. the bridge_out_tool consume-notes branch wants to split
+/// SubmitFailure from a real prover failure) should call
+/// `meter_proof_classified` or emit metrics inline.
+pub async fn meter_proof<F, T, E>(kind: ProofKind, fut: F) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let start = std::time::Instant::now();
+    let res = fut.await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let outcome = match &res {
+        Ok(_) => ProofOutcome::Ok,
+        Err(e) => ProofOutcome::from_error(e),
+    };
+    record_proof_metrics(kind, outcome, Some(elapsed));
+    res
+}
+
+/// Records primary-attempt metrics. Returns the result unchanged so the
+/// caller can decide whether to invoke a fallback (see
+/// `record_fallback_attempt`). This split-helper API exists because the
+/// CLAIM hot path retries against a `LocalTransactionProver` borrowed
+/// from the same `&mut MidenClientLib`, and a single combined helper
+/// can't construct both closures at once without tripping the borrow
+/// checker — primary and fallback both want `&mut client`. Splitting
+/// the metric emission keeps the call site readable while still
+/// centralising the label set.
+///
+/// Returns the result unchanged plus the elapsed seconds so the caller
+/// can attribute fallback retry time correctly.
+pub fn record_primary_attempt<T, E>(
+    kind: ProofKind,
+    result: Result<T, E>,
+    elapsed_secs: f64,
+    has_fallback: bool,
+) -> (Result<T, E>, Option<ProofOutcome>)
+where
+    E: std::fmt::Display,
+{
+    match &result {
+        Ok(_) => {
+            record_proof_metrics(kind, ProofOutcome::Ok, Some(elapsed_secs));
+            (result, None)
+        }
+        Err(e) => {
+            let outcome = ProofOutcome::from_error(e);
+            record_proof_metrics(kind, outcome, Some(elapsed_secs));
+            if has_fallback {
+                (result, Some(outcome))
+            } else {
+                (result, None)
+            }
+        }
+    }
+}
+
+/// Records the fallback-retry metric.
+///
+/// `outcome` is `FallbackOk` on success and `FallbackError` on a second
+/// failure. Histogram is recorded for the fallback alone (independent
+/// of the primary timing) so dashboards can see how much extra wall
+/// clock the safety net adds.
+pub fn record_fallback_attempt<T, E>(
+    kind: ProofKind,
+    result: Result<T, E>,
+    elapsed_secs: f64,
+) -> Result<T, E> {
+    let outcome = match &result {
+        Ok(_) => ProofOutcome::FallbackOk,
+        Err(_) => ProofOutcome::FallbackError,
+    };
+    record_proof_metrics(kind, outcome, Some(elapsed_secs));
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proof_kind_label_stable() {
+        assert_eq!(ProofKind::Claim.as_label(), "claim");
+        assert_eq!(ProofKind::Ger.as_label(), "ger");
+        assert_eq!(ProofKind::Faucet.as_label(), "faucet");
+        assert_eq!(ProofKind::Init.as_label(), "init");
+        assert_eq!(ProofKind::BridgeOut.as_label(), "bridge_out");
+    }
+
+    #[test]
+    fn proof_kind_op_label_distinguishes_prove_from_submit() {
+        assert_eq!(ProofKind::Claim.op_label(), "prove");
+        assert_eq!(ProofKind::Ger.op_label(), "submit");
+        assert_eq!(ProofKind::Faucet.op_label(), "submit");
+        assert_eq!(ProofKind::Init.op_label(), "submit");
+        assert_eq!(ProofKind::BridgeOut.op_label(), "submit");
+    }
+
+    #[test]
+    fn proof_outcome_label_stable() {
+        assert_eq!(ProofOutcome::Ok.as_label(), "ok");
+        assert_eq!(ProofOutcome::FallbackOk.as_label(), "fallback_ok");
+        assert_eq!(ProofOutcome::Timeout.as_label(), "timeout");
+        assert_eq!(ProofOutcome::ConnectFailure.as_label(), "connect_failure");
+        assert_eq!(ProofOutcome::ProverError.as_label(), "prover_error");
+        assert_eq!(ProofOutcome::SubmitFailure.as_label(), "submit_failure");
+        assert_eq!(ProofOutcome::BuildFailed.as_label(), "build_failed");
+        assert_eq!(ProofOutcome::FallbackError.as_label(), "fallback_error");
+    }
+
+    #[test]
+    fn from_error_classifies_timeout() {
+        let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "DeadlineExceeded");
+        assert_eq!(ProofOutcome::from_error(&e), ProofOutcome::Timeout);
+        let e2 = "request to Miden node timed out; the node may be under heavy load";
+        assert_eq!(ProofOutcome::from_error(&e2), ProofOutcome::Timeout);
+    }
+
+    #[test]
+    fn from_error_classifies_connect_failure() {
+        let e = "failed to connect to prover http://miden-prover:50051";
+        assert_eq!(ProofOutcome::from_error(&e), ProofOutcome::ConnectFailure);
+        let e2 = "Miden node is unavailable; check that the node is running and reachable";
+        assert_eq!(ProofOutcome::from_error(&e2), ProofOutcome::ConnectFailure);
+    }
+
+    #[test]
+    fn from_error_classifies_prover_error() {
+        let e = "TransactionProvingError(...)";
+        assert_eq!(ProofOutcome::from_error(&e), ProofOutcome::ProverError);
+        let e2 = "transaction proving failed";
+        assert_eq!(ProofOutcome::from_error(&e2), ProofOutcome::ProverError);
+    }
+
+    #[test]
+    fn from_error_defaults_to_prover_error() {
+        let e = "some weird error nobody's seen before";
+        assert_eq!(ProofOutcome::from_error(&e), ProofOutcome::ProverError);
+    }
+
+    #[tokio::test]
+    async fn meter_proof_ok_path_returns_value() {
+        let res: Result<i32, &str> =
+            meter_proof(ProofKind::Ger, async { Ok::<i32, &str>(42) }).await;
+        assert_eq!(res, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn meter_proof_err_path_returns_error() {
+        let res: Result<i32, &str> =
+            meter_proof(ProofKind::Ger, async { Err::<i32, &str>("boom") }).await;
+        assert_eq!(res, Err("boom"));
+    }
+
+    #[test]
+    fn record_primary_attempt_ok_returns_value_and_no_outcome() {
+        let res: Result<i32, &str> = Ok(7);
+        let (out, retry) = record_primary_attempt(ProofKind::Claim, res, 0.5, true);
+        assert_eq!(out, Ok(7));
+        assert_eq!(retry, None);
+    }
+
+    #[test]
+    fn record_primary_attempt_err_with_fallback_returns_outcome() {
+        let res: Result<i32, &str> = Err("DeadlineExceeded");
+        let (out, retry) = record_primary_attempt(ProofKind::Claim, res, 1.0, true);
+        assert_eq!(out, Err("DeadlineExceeded"));
+        assert_eq!(retry, Some(ProofOutcome::Timeout));
+    }
+
+    #[test]
+    fn record_primary_attempt_err_without_fallback_returns_none_retry() {
+        let res: Result<i32, &str> = Err("boom");
+        let (out, retry) = record_primary_attempt(ProofKind::Claim, res, 1.0, false);
+        assert_eq!(out, Err("boom"));
+        assert_eq!(retry, None);
+    }
+
+    #[test]
+    fn record_fallback_attempt_passes_result_through() {
+        let res: Result<i32, &str> = Ok(42);
+        assert_eq!(record_fallback_attempt(ProofKind::Claim, res, 0.3), Ok(42));
+        let res2: Result<i32, &str> = Err("nope");
+        assert_eq!(
+            record_fallback_attempt(ProofKind::Claim, res2, 0.3),
+            Err("nope")
+        );
+    }
 }

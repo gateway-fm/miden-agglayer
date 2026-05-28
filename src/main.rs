@@ -151,6 +151,25 @@ struct Command {
     /// targeting the node directly. Redacted in log output.
     #[arg(long, env = "MIDEN_API_KEY")]
     miden_api_key: Option<String>,
+
+    /// gRPC URL of a remote Miden transaction prover (e.g. `http://miden-prover:50051`).
+    /// When set, all transaction proving for the persistent MidenClient (CLAIM / GER
+    /// insert / faucet ops) is offloaded to this endpoint. When unset, proving stays
+    /// in-process via the default LocalTransactionProver — the historical behaviour
+    /// and the bali OOM cause.
+    #[arg(long, env = "MIDEN_PROVER_URL")]
+    miden_prover_url: Option<String>,
+
+    /// Per-request timeout for the remote Miden prover, in seconds. Default 120s.
+    /// Has no effect when --miden-prover-url is unset.
+    #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
+    miden_prover_timeout_secs: u64,
+
+    /// When the remote prover fails (timeout / connection error), retry the proof
+    /// against an in-process LocalTransactionProver. Trades OOM safety for availability.
+    /// Default OFF — preserves the bali OOM fix as the default behaviour.
+    #[arg(long, env = "MIDEN_PROVER_FALLBACK_TO_LOCAL", default_value_t = false)]
+    miden_prover_fallback_to_local: bool,
 }
 
 /// Validate the `--require-hardening` invariants. Returns a list of
@@ -185,6 +204,15 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
             "  - --cors-allowed-origins contains a wildcard `*` (browsers from \
              any origin can hit state-mutating endpoints). Use an explicit \
              origin list."
+                .to_string(),
+        );
+    }
+    if command.miden_prover_url.is_none() {
+        reasons.push(
+            "  - --require-hardening: --miden-prover-url must be set \
+             (local prover is the documented OOM cause). Set \
+             MIDEN_PROVER_URL to the gRPC URL of a remote Miden \
+             transaction prover."
                 .to_string(),
         );
     }
@@ -229,6 +257,15 @@ impl std::fmt::Debug for Command {
                 "miden_api_key",
                 &self.miden_api_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "miden_prover_url",
+                &self.miden_prover_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("miden_prover_timeout_secs", &self.miden_prover_timeout_secs)
+            .field(
+                "miden_prover_fallback_to_local",
+                &self.miden_prover_fallback_to_local,
+            )
             .finish()
     }
 }
@@ -251,6 +288,27 @@ async fn main() -> anyhow::Result<()> {
              Either set the listed flags or drop --require-hardening for dev mode.",
             reasons.join("\n")
         );
+    }
+
+    // Startup probe — when --require-hardening is set AND a remote prover is
+    // configured, dial the gRPC endpoint once at boot so a misconfigured
+    // prover URL fails loudly here instead of surfacing as a stalled CLAIM
+    // five minutes later. Read-only TCP/HTTP2 connect; NOT a prove() call.
+    //
+    // Skipped when --require-hardening is false so dev/local boots remain
+    // tolerant of an offline prover.
+    if command.require_hardening
+        && let Some(prover_url) = command.miden_prover_url.as_deref()
+    {
+        let endpoint = ::tonic::transport::Endpoint::from_shared(prover_url.to_string())
+            .context("invalid --miden-prover-url for startup probe")?
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(5));
+        endpoint
+            .connect()
+            .await
+            .context("remote prover unreachable (startup probe)")?;
+        tracing::info!("remote prover reachable");
     }
 
     let miden_store_dir = command.miden_store_dir;
@@ -300,6 +358,9 @@ async fn main() -> anyhow::Result<()> {
             miden_store_dir.clone(),
             command.miden_node.clone(),
             command.miden_api_key.clone(),
+            command.miden_prover_url.clone(),
+            command.miden_prover_timeout_secs,
+            command.miden_prover_fallback_to_local,
             sync_listeners,
             command.miden_debug,
         )?;
@@ -426,6 +487,9 @@ async fn main() -> anyhow::Result<()> {
         miden_store_dir.clone(),
         command.miden_node.clone(),
         command.miden_api_key.clone(),
+        command.miden_prover_url.clone(),
+        command.miden_prover_timeout_secs,
+        command.miden_prover_fallback_to_local,
         sync_listeners,
         command.miden_debug,
     )?;
@@ -532,8 +596,40 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Initialize metrics
+    // Initialize metrics.
+    //
+    // Histograms registered with `metrics-exporter-prometheus` default to the
+    // Prometheus *summary* representation (a fixed set of quantiles), which
+    // loses p95/p99 fidelity for low-volume metrics and — more importantly —
+    // can't be aggregated across replicas in PromQL. For the two latency
+    // metrics we actually care about (proof generation, JSON-RPC requests)
+    // we install explicit bucket sets so they're emitted as real
+    // `*_bucket{le="…"}` series. The proof buckets span 100ms (local prover
+    // warm) → 5min (remote prover under load) because bali has empirically
+    // seen 60–120s p99 proves; the RPC buckets are typical hot-path latencies
+    // (1ms → 5s). Both metric names match the `histogram!()` call-site
+    // strings in `metrics.rs` / `service.rs` exactly — using `Matcher::Full`
+    // means a typo here silently falls back to summary, so add a test if
+    // either name changes.
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "miden_proof_duration_seconds".to_string(),
+            ),
+            &[
+                0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
+            ],
+        )
+        .context("set_buckets_for_metric (miden_proof_duration_seconds) failed")?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "rpc_request_duration_seconds".to_string(),
+            ),
+            &[
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ],
+        )
+        .context("set_buckets_for_metric (rpc_request_duration_seconds) failed")?
         .install_recorder()
         .context("failed to install metrics recorder")?;
     miden_agglayer_service::metrics::init_metrics();
@@ -642,6 +738,18 @@ mod hardening_tests {
         signers: Option<Vec<alloy::primitives::Address>>,
         cors: Option<Vec<String>>,
     ) -> Command {
+        cmd_with_prover(require, admin, signers, cors, Some("http://prover:50051".into()))
+    }
+
+    /// Like [`cmd`] but leaves the prover-url tunable so the
+    /// `--miden-prover-url`-must-be-set hardening reason can be exercised.
+    fn cmd_with_prover(
+        require: bool,
+        admin: Option<String>,
+        signers: Option<Vec<alloy::primitives::Address>>,
+        cors: Option<Vec<String>>,
+        prover_url: Option<String>,
+    ) -> Command {
         Command {
             port: 8546,
             miden_store_dir: None,
@@ -667,6 +775,9 @@ mod hardening_tests {
             reject_zero_padding_addresses: false,
             require_hardening: require,
             miden_api_key: None,
+            miden_prover_url: prover_url,
+            miden_prover_timeout_secs: 120,
+            miden_prover_fallback_to_local: false,
         }
     }
 
@@ -711,5 +822,21 @@ mod hardening_tests {
             Some(vec!["https://app.example.com".into()]),
         );
         assert!(check_hardening_invariants(&c).is_ok());
+    }
+
+    /// When hardening is enabled and the remote prover is unset, the gate
+    /// must reject — local proving is the documented bali OOM cause.
+    #[test]
+    fn hardening_flags_missing_prover_url() {
+        let c = cmd_with_prover(
+            true,
+            Some("k".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            None,
+            None,
+        );
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("--miden-prover-url"));
     }
 }
