@@ -84,6 +84,86 @@ impl UnclaimableReason {
     }
 }
 
+/// Record of a B2AGG bridge-out that aggkit observed consumed by the bridge
+/// but could NOT translate into a synthetic `BridgeEvent` (Cantina MA#18).
+///
+/// The on-chain consumption already advanced the LET frontier — funds are
+/// effectively burned on L2 — but aggkit failed to parse or process the
+/// note. Without this quarantine row, the failure was only surfaced as a
+/// symptom by the LET-divergence monitor (Cantina #9); operators had no
+/// concrete handle for an individual stranded B2AGG.
+///
+/// `note_id` is the primary key because erased B2AGGs by definition never
+/// reached the deposit-counter stage that would assign a `global_index`.
+/// `note_dump` captures everything we knew about the note at quarantine
+/// time so a future recovery RPC can re-attempt the BridgeEvent
+/// synthesis once the underlying cause is fixed (faucet registered, parse
+/// bug patched, etc).
+#[derive(Debug, Clone)]
+pub struct UnbridgeableBridgeOut {
+    pub note_id: String,
+    pub bridge_account: AccountId,
+    pub reason: UnbridgeableBridgeOutReason,
+    /// Free-form diagnostic (the exact error message from the skip site).
+    /// Bounded by the caller; the column has no length cap in Postgres but
+    /// callers should keep it under 4 KiB so a flood of bad notes cannot
+    /// fill the table beyond bounded growth.
+    pub detail: String,
+    /// JSON-ish dump of the note for later forensic inspection. Today we
+    /// capture script root + storage felts + asset metadata — enough for an
+    /// operator to identify the depositor and decide on a recovery path.
+    pub note_dump: String,
+    /// The aggkit synthetic block number at which the consumption was
+    /// observed. Useful for cross-referencing with the LET-divergence
+    /// monitor that fires in the same on_post_sync tick.
+    pub observed_block: u64,
+}
+
+/// Why an observed-consumed B2AGG could not be translated into a
+/// synthetic BridgeEvent. Each variant maps 1:1 to a skip-return path in
+/// `process_consumed_note`.
+///
+/// Variant set is closed today; future skip paths must add their own
+/// variant + map back via `as_str()` so the Postgres column value remains
+/// machine-parseable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnbridgeableBridgeOutReason {
+    /// `parse_b2agg_storage` errored — the storage section was missing,
+    /// truncated, or contained limb values that overflowed u32. "Erased
+    /// note" in the Cantina MA#18 sense.
+    StorageParseFailed,
+    /// The B2AGG carried no fungible asset — the bridge consumed an empty
+    /// note. Pre-MA#18 this skipped silently; now quarantined so we have a
+    /// row to investigate.
+    NoFungibleAsset,
+    /// The B2AGG's faucet is not in aggkit's registry (B8). Already had a
+    /// metric (`bridge_out_unknown_faucet_total`) and a mark-processed
+    /// step, but no quarantine row — this adds one so the operator has a
+    /// concrete handle.
+    UnknownFaucet,
+    /// `reverse_scale_amount` overflowed u128 — the on-chain amount × 10^scale
+    /// can't fit. Practically impossible for legitimate ERC-20 amounts but
+    /// kept as a distinct skip path so a malicious B2AGG that triggers it
+    /// is auditable.
+    AmountOverflow,
+    /// The atomic store commit failed mid-write (transaction rolled back,
+    /// nothing persisted). Quarantine so a retry path or operator can
+    /// re-attempt without missing the leaf.
+    AtomicCommitFailed,
+}
+
+impl UnbridgeableBridgeOutReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StorageParseFailed => "storage_parse_failed",
+            Self::NoFungibleAsset => "no_fungible_asset",
+            Self::UnknownFaucet => "unknown_faucet",
+            Self::AmountOverflow => "amount_overflow",
+            Self::AtomicCommitFailed => "atomic_commit_failed",
+        }
+    }
+}
+
 /// Full transaction data returned from the store.
 #[derive(Debug, Clone)]
 pub struct TxnData {
@@ -292,6 +372,34 @@ pub trait Store: Send + Sync + 'static {
     /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
     /// to compare against the bridge account's `let_num_leaves` storage slot.
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;
+
+    /// Record a B2AGG bridge-out that was observed consumed by the bridge but
+    /// could NOT be translated into a synthetic BridgeEvent (Cantina MA#18).
+    ///
+    /// Idempotent by `note_id` — multiple sync ticks observing the same
+    /// erased note must not duplicate rows; the first record wins. Returns
+    /// `true` if this was a new insert (not a duplicate).
+    ///
+    /// Default impl is a no-op so InMemoryStore in tests that don't care
+    /// about quarantine state still compiles; the real impls (memory + pg)
+    /// override below.
+    async fn record_unbridgeable_bridge_out(
+        &self,
+        _entry: UnbridgeableBridgeOut,
+    ) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    /// Look up an unbridgeable B2AGG by `note_id`. `None` if not quarantined.
+    ///
+    /// Default impl returns `None` so stores without the quarantine table
+    /// (e.g. legacy deployments before migration 006) don't crash readers.
+    async fn get_unbridgeable_bridge_out(
+        &self,
+        _note_id: &str,
+    ) -> anyhow::Result<Option<UnbridgeableBridgeOut>> {
+        Ok(None)
+    }
 
     // === Claim watcher ===
     //
