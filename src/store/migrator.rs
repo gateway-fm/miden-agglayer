@@ -70,6 +70,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "006_unbridgeable_bridge_outs.sql",
         include_str!("../../migrations/006_unbridgeable_bridge_outs.sql"),
     ),
+    (
+        "007_monitor_state_persistence.sql",
+        include_str!("../../migrations/007_monitor_state_persistence.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

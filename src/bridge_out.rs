@@ -234,14 +234,25 @@ impl BridgeOutScanner {
         local_network_id: u32,
         bridge_account_id: AccountId,
     ) -> Self {
+        // RD-913: trackers now persist through `store` and bound their
+        // in-memory caches; default capacities live in each module.
+        let burn_serials = Arc::new(crate::burn_serial_tracker::BurnSerialTracker::new(
+            store.clone(),
+        ));
+        let twin_notes = Arc::new(crate::twin_note_detector::TwinNoteDetector::new(
+            store.clone(),
+        ));
+        let expected_mints = Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new(
+            store.clone(),
+        ));
         Self {
             store,
             block_state,
             local_network_id,
             bridge_account_id,
-            burn_serials: Arc::new(crate::burn_serial_tracker::BurnSerialTracker::new()),
-            twin_notes: Arc::new(crate::twin_note_detector::TwinNoteDetector::new()),
-            expected_mints: Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new()),
+            burn_serials,
+            twin_notes,
+            expected_mints,
             ownership_probe_every_n_ticks: 5, // every 5 sync ticks (~30s at 6s/tick)
             tick_counter: std::sync::atomic::AtomicU32::new(0),
         }
@@ -596,7 +607,11 @@ impl BridgeOutScanner {
         // bound here so the bound is enforced regardless of backend.
         const MAX_DETAIL: usize = 4096;
         let detail = if detail.len() > MAX_DETAIL {
-            format!("{}…[truncated {} bytes]", &detail[..MAX_DETAIL], detail.len() - MAX_DETAIL)
+            format!(
+                "{}…[truncated {} bytes]",
+                &detail[..MAX_DETAIL],
+                detail.len() - MAX_DETAIL
+            )
         } else {
             detail
         };
@@ -727,8 +742,11 @@ impl SyncListener for BridgeOutScanner {
                 continue;
             };
             let commitment_bytes: [u8; 32] = commitment_word.as_bytes();
-            match self.twin_notes.record(id_bytes, commitment_bytes) {
-                crate::twin_note_detector::Outcome::TwinDetected { prior_commitments } => {
+            // RD-913: tracker is now store-backed + async; a transient store
+            // failure must NOT panic the sync — log and continue so the rest
+            // of the post-sync work still runs.
+            match self.twin_notes.record(id_bytes, commitment_bytes).await {
+                Ok(crate::twin_note_detector::Outcome::TwinDetected { prior_commitments }) => {
                     metrics::counter!("bridge_twin_note_detected_total").increment(1);
                     tracing::error!(
                         target: "bridge_out::twin",
@@ -738,8 +756,17 @@ impl SyncListener for BridgeOutScanner {
                         "Cantina #6: twin NoteId observed — different metadata, same NoteId"
                     );
                 }
-                crate::twin_note_detector::Outcome::New
-                | crate::twin_note_detector::Outcome::LegitimateDuplicate => {}
+                Ok(crate::twin_note_detector::Outcome::New)
+                | Ok(crate::twin_note_detector::Outcome::LegitimateDuplicate) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "bridge_out::twin",
+                        note_id = %note.id(),
+                        error = ?e,
+                        "RD-913: twin-note tracker store failure; \
+                         continuing without classification"
+                    );
+                }
             }
 
             let script_root = note.details().script().root();
@@ -753,18 +780,26 @@ impl SyncListener for BridgeOutScanner {
             // Cantina #5 — BURN serial collision tracking.
             if script_root == burn_root {
                 let serial = note.details().recipient().serial_num();
-                if matches!(
-                    self.burn_serials.record(serial.as_bytes()),
-                    crate::burn_serial_tracker::Outcome::Duplicate
-                ) {
-                    metrics::counter!("bridge_burn_serial_collision_total").increment(1);
-                    tracing::error!(
-                        target: "bridge_out::burn",
-                        note_id = %note.id(),
-                        serial = %hex::encode(serial.as_bytes()),
-                        "Cantina #5: BURN serial collision — second BURN with same serial \
-                         observed; faucet token_supply at risk"
-                    );
+                match self.burn_serials.record(serial.as_bytes()).await {
+                    Ok(crate::burn_serial_tracker::Outcome::Duplicate) => {
+                        metrics::counter!("bridge_burn_serial_collision_total").increment(1);
+                        tracing::error!(
+                            target: "bridge_out::burn",
+                            note_id = %note.id(),
+                            serial = %hex::encode(serial.as_bytes()),
+                            "Cantina #5: BURN serial collision — second BURN with same serial \
+                             observed; faucet token_supply at risk"
+                        );
+                    }
+                    Ok(crate::burn_serial_tracker::Outcome::New) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "bridge_out::burn",
+                            note_id = %note.id(),
+                            error = ?e,
+                            "RD-913: burn-serial tracker store failure; continuing"
+                        );
+                    }
                 }
             }
             // Cantina #2 + #4 — MINT attachment-target + forged-MINT detection.
@@ -921,15 +956,32 @@ impl SyncListener for BridgeOutScanner {
         // observed consumed this sync. Stale entries (CLAIM not consumed
         // within 60 sync ticks ≈ 6 minutes at default cadence) fire a
         // critical metric and log so on-call can investigate.
-        let tracker_results = self.expected_mints.tick(&landed_claim_ids, 60);
-        for (gi, status) in tracker_results {
-            if let crate::expected_mint_tracker::MintStatus::StaleAlert { ticks_pending } = status {
-                metrics::counter!("bridge_expected_mint_stale_total").increment(1);
-                tracing::error!(
+        //
+        // RD-913 Bug B fix: `tick()` now fires StaleAlert **once** per
+        // record_expected, then removes the entry. The pre-fix forever-loop
+        // behaviour (re-firing every 6s until process death) is gone — see
+        // `expected_mint_tracker` module docs.
+        match self.expected_mints.tick(&landed_claim_ids, 60).await {
+            Ok(tracker_results) => {
+                for (gi, status) in tracker_results {
+                    if let crate::expected_mint_tracker::MintStatus::StaleAlert { ticks_pending } =
+                        status
+                    {
+                        metrics::counter!("bridge_expected_mint_stale_total").increment(1);
+                        tracing::error!(
+                            target: "bridge_out::expected_mint",
+                            global_index = ?gi,
+                            ticks_pending,
+                            "Cantina #7: expected MINT NoteId never landed within threshold"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
                     target: "bridge_out::expected_mint",
-                    global_index = ?gi,
-                    ticks_pending,
-                    "Cantina #7: expected MINT NoteId never landed within threshold"
+                    error = ?e,
+                    "RD-913: expected-MINT tracker tick store failure; will retry next sync"
                 );
             }
         }
@@ -1732,7 +1784,9 @@ mod tests {
     /// `parse_b2agg_storage` returns Err. Bridge-consumed so it passes the
     /// MA#3 gate and reaches the storage-parse skip site in
     /// `process_consumed_note`.
-    fn build_erased_b2agg_note(consumer_account: AccountId) -> miden_client::store::InputNoteRecord {
+    fn build_erased_b2agg_note(
+        consumer_account: AccountId,
+    ) -> miden_client::store::InputNoteRecord {
         use miden_client::store::InputNoteState;
         use miden_client::store::input_note_states::ConsumedExternalNoteState;
         use miden_protocol::Felt;

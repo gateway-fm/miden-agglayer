@@ -224,10 +224,7 @@ impl ProofKind {
     pub fn op_label(&self) -> &'static str {
         match self {
             ProofKind::Claim => "prove",
-            ProofKind::Ger
-            | ProofKind::Faucet
-            | ProofKind::Init
-            | ProofKind::BridgeOut => "submit",
+            ProofKind::Ger | ProofKind::Faucet | ProofKind::Init | ProofKind::BridgeOut => "submit",
         }
     }
 }

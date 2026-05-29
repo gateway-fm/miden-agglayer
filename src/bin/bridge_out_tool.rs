@@ -182,10 +182,10 @@ async fn main() -> anyhow::Result<()> {
         // offload all proving to it (avoiding the bali OOM cause of in-process
         // LocalTransactionProver). Without this the tool would silently still
         // prove locally even with `MIDEN_PROVER_URL` exported.
-        let tx_prover: Arc<dyn TransactionProver + Send + Sync> = Arc::new(
-            RemoteTransactionProver::new(prover_url)
-                .with_timeout(std::time::Duration::from_secs(args.miden_prover_timeout_secs)),
-        );
+        let tx_prover: Arc<dyn TransactionProver + Send + Sync> =
+            Arc::new(RemoteTransactionProver::new(prover_url).with_timeout(
+                std::time::Duration::from_secs(args.miden_prover_timeout_secs),
+            ));
         builder = builder.prover(tx_prover);
         println!(
             "[bridge-out] using remote transaction prover (timeout {}s)",

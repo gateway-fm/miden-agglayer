@@ -1583,6 +1583,156 @@ impl Store for PgStore {
 
         Ok(rows.iter().filter_map(pg_row_to_faucet_entry).collect())
     }
+
+    // ── Monitor trackers (RD-913) ────────────────────────────────
+
+    async fn burn_serial_seen(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT 1 FROM monitor_burn_serials WHERE serial = $1 LIMIT 1",
+                &[&serial.as_slice()],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn burn_serial_observe(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        // ON CONFLICT DO NOTHING with RETURNING tells us atomically whether
+        // we inserted a new row or hit an existing one. The serial primary
+        // key handles the race between two concurrent observations of the
+        // same serial — exactly one INSERT wins.
+        let rows = client
+            .query(
+                "INSERT INTO monitor_burn_serials (serial) VALUES ($1) \
+                 ON CONFLICT (serial) DO NOTHING RETURNING serial",
+                &[&serial.as_slice()],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn twin_note_commitments(&self, note_id: &[u8; 32]) -> anyhow::Result<Vec<[u8; 32]>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT commitment FROM monitor_twin_notes \
+                 WHERE note_id = $1 ORDER BY first_seen_at",
+                &[&note_id.as_slice()],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let bytes: &[u8] = r.get(0);
+                if bytes.len() == 32 {
+                    Some(bytes_to_array_32(bytes))
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    async fn twin_note_observe(
+        &self,
+        note_id: &[u8; 32],
+        commitment: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "INSERT INTO monitor_twin_notes (note_id, commitment) VALUES ($1, $2) \
+                 ON CONFLICT (note_id, commitment) DO NOTHING RETURNING note_id",
+                &[&note_id.as_slice(), &commitment.as_slice()],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn expected_mint_record(
+        &self,
+        global_index: &[u8; 32],
+        expected_mint: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO monitor_expected_mints \
+                 (global_index, expected_mint, ticks_pending, alerted) \
+                 VALUES ($1, $2, 0, FALSE) \
+                 ON CONFLICT (global_index) DO UPDATE \
+                 SET expected_mint = EXCLUDED.expected_mint, \
+                     ticks_pending = 0, \
+                     alerted = FALSE, \
+                     updated_at = now()",
+                &[&global_index.as_slice(), &expected_mint.as_slice()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn expected_mint_remove(&self, global_index: &[u8; 32]) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM monitor_expected_mints WHERE global_index = $1",
+                &[&global_index.as_slice()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT global_index, expected_mint, ticks_pending, alerted \
+                 FROM monitor_expected_mints",
+                &[],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let gi: &[u8] = r.get(0);
+            let em: &[u8] = r.get(1);
+            if gi.len() != 32 || em.len() != 32 {
+                continue;
+            }
+            let ticks: i32 = r.get(2);
+            let alerted: bool = r.get(3);
+            out.push((
+                bytes_to_array_32(gi),
+                bytes_to_array_32(em),
+                ticks.max(0) as u32,
+                alerted,
+            ));
+        }
+        Ok(out)
+    }
+
+    async fn expected_mint_update_tick(
+        &self,
+        global_index: &[u8; 32],
+        ticks_pending: u32,
+        alerted: bool,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        // Bound ticks_pending into i32 range so the column write never
+        // panics on saturating_add edges. INT in postgres is signed 32-bit;
+        // u32::MAX would overflow.
+        let ticks_i32 = i32::try_from(ticks_pending).unwrap_or(i32::MAX);
+        client
+            .execute(
+                "UPDATE monitor_expected_mints \
+                 SET ticks_pending = $1, alerted = $2, updated_at = now() \
+                 WHERE global_index = $3",
+                &[&ticks_i32, &alerted, &global_index.as_slice()],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 fn pg_row_to_faucet_entry(row: &tokio_postgres::Row) -> Option<FaucetEntry> {

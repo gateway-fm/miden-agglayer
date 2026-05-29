@@ -495,3 +495,88 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
     // ClaimEvent dedup query finds the row.
     assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
 }
+
+// ── RD-913 monitor trackers ─────────────────────────────────
+
+/// PgStore round-trip for monitor_burn_serials. INSERT … ON CONFLICT
+/// must report true on first observation and false on the duplicate,
+/// matching the InMemoryStore contract.
+#[tokio::test]
+async fn test_pgstore_rd913_burn_serial_observe() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    // Use a random serial per-run so this test is safe to re-run without
+    // truncating the table (other suites may populate it concurrently).
+    let mut serial = [0u8; 32];
+    serial[..8].copy_from_slice(&rand_u64().to_be_bytes());
+    assert!(!store.burn_serial_seen(&serial).await.unwrap());
+    assert!(store.burn_serial_observe(&serial).await.unwrap());
+    assert!(store.burn_serial_seen(&serial).await.unwrap());
+    // Second insert returns false (Cantina #5 duplicate signal).
+    assert!(!store.burn_serial_observe(&serial).await.unwrap());
+}
+
+/// PgStore round-trip for monitor_twin_notes. Per-NoteId commitments
+/// must be retrievable for the twin-detection branch.
+#[tokio::test]
+async fn test_pgstore_rd913_twin_notes() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let mut note_id = [0u8; 32];
+    note_id[..8].copy_from_slice(&rand_u64().to_be_bytes());
+    let c1 = [0x11u8; 32];
+    let c2 = [0x22u8; 32];
+
+    assert!(store.twin_note_observe(&note_id, &c1).await.unwrap());
+    assert!(!store.twin_note_observe(&note_id, &c1).await.unwrap());
+    assert!(store.twin_note_observe(&note_id, &c2).await.unwrap());
+
+    let commitments = store.twin_note_commitments(&note_id).await.unwrap();
+    assert_eq!(commitments.len(), 2);
+    assert!(commitments.contains(&c1));
+    assert!(commitments.contains(&c2));
+}
+
+/// PgStore round-trip for monitor_expected_mints. Record → load → tick
+/// updates → remove. Exercises the full state machine the
+/// `ExpectedMintTracker` drives.
+#[tokio::test]
+async fn test_pgstore_rd913_expected_mints() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let mut gi = [0u8; 32];
+    gi[..8].copy_from_slice(&rand_u64().to_be_bytes());
+    let mint = [0xCCu8; 32];
+
+    store.expected_mint_record(&gi, &mint).await.unwrap();
+    let rows = store.expected_mint_load_all().await.unwrap();
+    let found = rows.iter().find(|(g, _, _, _)| *g == gi).unwrap();
+    assert_eq!(found.1, mint);
+    assert_eq!(found.2, 0);
+    assert!(!found.3);
+
+    // Bump tick + alerted flag.
+    store.expected_mint_update_tick(&gi, 5, true).await.unwrap();
+    let rows = store.expected_mint_load_all().await.unwrap();
+    let found = rows.iter().find(|(g, _, _, _)| *g == gi).unwrap();
+    assert_eq!(found.2, 5);
+    assert!(found.3);
+
+    // Remove. The row should be gone.
+    store.expected_mint_remove(&gi).await.unwrap();
+    let rows = store.expected_mint_load_all().await.unwrap();
+    assert!(rows.iter().all(|(g, _, _, _)| *g != gi));
+}
+
+/// Cheap, dependency-free PRNG seed source — `std::time` is enough to
+/// produce a per-run unique 8-byte prefix for the test fixtures above.
+fn rand_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64).wrapping_mul(2_654_435_761)
+}

@@ -362,6 +362,70 @@ pub trait Store: Send + Sync + 'static {
     async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>>;
     async fn set_address_mapping(&self, eth: Address, miden: AccountId) -> anyhow::Result<()>;
 
+    // === Monitor trackers (RD-913) — persistent source-of-truth for
+    //     burn-serial / twin-note / expected-mint observations so the
+    //     trackers survive process restart.
+    //     The in-memory tracker structs layer a bounded LRU cache on top;
+    //     these methods are the cache miss / write-through path.
+
+    /// Has this BURN serial been observed before? (Cantina #5)
+    async fn burn_serial_seen(&self, _serial: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Record an observed BURN serial. Returns `true` if newly inserted
+    /// (caller treats this as `New`); `false` if it already existed
+    /// (caller treats this as `Duplicate` and fires the Cantina #5 alert).
+    async fn burn_serial_observe(&self, _serial: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    /// Look up every prior commitment seen for this NoteId. Empty vec if
+    /// the NoteId is novel. (Cantina #6)
+    async fn twin_note_commitments(&self, _note_id: &[u8; 32]) -> anyhow::Result<Vec<[u8; 32]>> {
+        Ok(Vec::new())
+    }
+    /// Insert a (note_id, commitment) pair. Returns `true` on a new
+    /// insertion, `false` if the pair already existed.
+    async fn twin_note_observe(
+        &self,
+        _note_id: &[u8; 32],
+        _commitment: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    /// Persist an expected-MINT entry for a submitted claim. (Cantina #7)
+    /// Upserts on global_index — re-submission of the same claim resets
+    /// the staleness window, which matches the in-memory contract.
+    async fn expected_mint_record(
+        &self,
+        _global_index: &[u8; 32],
+        _expected_mint: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Delete the entry for `global_index` (called on Landed / mark_landed).
+    async fn expected_mint_remove(&self, _global_index: &[u8; 32]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Load all live entries for the staleness tick. Each row carries
+    /// `(global_index, expected_mint, ticks_pending, alerted)`.
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+        Ok(Vec::new())
+    }
+    /// Persist updated tick / alerted flags after a tick. Default impl
+    /// no-ops so InMemoryStore-only callers (tests) don't have to wire
+    /// it through — those callers reconstruct the tracker from the
+    /// in-memory cache directly.
+    async fn expected_mint_update_tick(
+        &self,
+        _global_index: &[u8; 32],
+        _ticks_pending: u32,
+        _alerted: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
     /// Mark note as processed, return the deposit count assigned to it.
