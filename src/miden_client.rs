@@ -767,7 +767,10 @@ mod tests {
         // invariant the restore call relies on. Pin both observations.
         let client = MidenClient::new_test();
         let _guard = client.pause_listeners();
-        assert!(client.listeners_paused(), "pause works regardless of alive state");
+        assert!(
+            client.listeners_paused(),
+            "pause works regardless of alive state"
+        );
         assert!(client.is_alive(), "test stub is alive");
     }
 }

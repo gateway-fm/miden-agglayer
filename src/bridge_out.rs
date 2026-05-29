@@ -607,7 +607,11 @@ impl BridgeOutScanner {
         // bound here so the bound is enforced regardless of backend.
         const MAX_DETAIL: usize = 4096;
         let detail = if detail.len() > MAX_DETAIL {
-            format!("{}…[truncated {} bytes]", &detail[..MAX_DETAIL], detail.len() - MAX_DETAIL)
+            format!(
+                "{}…[truncated {} bytes]",
+                &detail[..MAX_DETAIL],
+                detail.len() - MAX_DETAIL
+            )
         } else {
             detail
         };
@@ -1780,7 +1784,9 @@ mod tests {
     /// `parse_b2agg_storage` returns Err. Bridge-consumed so it passes the
     /// MA#3 gate and reaches the storage-parse skip site in
     /// `process_consumed_note`.
-    fn build_erased_b2agg_note(consumer_account: AccountId) -> miden_client::store::InputNoteRecord {
+    fn build_erased_b2agg_note(
+        consumer_account: AccountId,
+    ) -> miden_client::store::InputNoteRecord {
         use miden_client::store::InputNoteState;
         use miden_client::store::input_note_states::ConsumedExternalNoteState;
         use miden_protocol::Felt;

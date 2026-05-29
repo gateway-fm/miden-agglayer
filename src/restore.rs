@@ -179,8 +179,7 @@ pub async fn restore(
     // watcher uses so the synthetic logs are byte-identical (same tx-hash
     // derivation, same `commit_manual_claim_event_atomic` store path).
     tracing::info!("Phase 2.5: scanning miden consumed CLAIM notes (MA#27)...");
-    let (claims, claim_logs) =
-        restore_claims(store, miden_client, block_state, next_block).await?;
+    let (claims, claim_logs) = restore_claims(store, miden_client, block_state, next_block).await?;
     next_block += if claim_logs > 0 { 1 } else { 0 };
     total_logs += claim_logs;
     tracing::info!("Phase 2.5 complete: {claims} claims, {claim_logs} logs");
@@ -428,8 +427,7 @@ async fn restore_claims(
                     let decoded = match parse_claim_event_from_storage(details.storage()) {
                         Ok(d) => d,
                         Err(e) => {
-                            ::metrics::counter!("claim_watcher_storage_decode_total")
-                                .increment(1);
+                            ::metrics::counter!("claim_watcher_storage_decode_total").increment(1);
                             tracing::warn!(
                                 target: "restore::claims",
                                 note_id = %note_id_str,
@@ -889,10 +887,7 @@ mod tests {
         // public predicate.
         let other_note = "0xnoteB".to_string();
         assert!(
-            store
-                .has_claim_event_for_global_index(&gi)
-                .await
-                .unwrap(),
+            store.has_claim_event_for_global_index(&gi).await.unwrap(),
             "global_index dedup predicate must fire for a second observation"
         );
         // The mark step for the "already-recorded" branch is also exposed

@@ -646,18 +646,14 @@ async fn main() -> anyhow::Result<()> {
     // either name changes.
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(
-                "miden_proof_duration_seconds".to_string(),
-            ),
+            metrics_exporter_prometheus::Matcher::Full("miden_proof_duration_seconds".to_string()),
             &[
                 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
             ],
         )
         .context("set_buckets_for_metric (miden_proof_duration_seconds) failed")?
         .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(
-                "rpc_request_duration_seconds".to_string(),
-            ),
+            metrics_exporter_prometheus::Matcher::Full("rpc_request_duration_seconds".to_string()),
             &[
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
             ],
@@ -771,7 +767,13 @@ mod hardening_tests {
         signers: Option<Vec<alloy::primitives::Address>>,
         cors: Option<Vec<String>>,
     ) -> Command {
-        cmd_with_prover(require, admin, signers, cors, Some("http://prover:50051".into()))
+        cmd_with_prover(
+            require,
+            admin,
+            signers,
+            cors,
+            Some("http://prover:50051".into()),
+        )
     }
 
     /// Like [`cmd`] but leaves the prover-url tunable so the
