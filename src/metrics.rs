@@ -101,7 +101,7 @@ pub fn init_metrics() {
     describe_counter!(
         "bridge_out_quarantined_erased_b2agg_total",
         "B2AGG note observed consumed by the bridge but skipped by the \
-         indexer because the note contents were unparseable or referenced \
+         indexer because the note contents were unparsable or referenced \
          an unknown faucet (Cantina MA#18). A row was written to the \
          quarantine table so operators have a concrete handle for a \
          future recovery flow."
