@@ -1,0 +1,2549 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>bali bridge monitor · miden × agglayer</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23F2EFE9'/><path d='M5 12 L24 12 M20 8 L24 12 L20 16' stroke='%230F0F0F' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/><path d='M27 20 L8 20 M12 16 L8 20 L12 24' stroke='%23FF4400' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+
+  <style>
+    /* ---------- tokens ---------- */
+    :root {
+      --c-paper:    #F2EFE9;
+      --c-ink:      #0F0F0F;
+      --c-alert:    #FF4400;
+      --c-aluminum: #D4D4D4;
+      --c-signal:   #00FF88;
+      --c-gateway:  #8950FA;
+
+      --grid-cols: 12;
+      --gutter: 24px;
+      --margin-desktop: 48px;
+      --margin-mobile: 24px;
+
+      --border-struct: 2px solid var(--c-ink);
+      --border-thin:   1px solid var(--c-ink);
+      --border-row:    1px solid var(--c-aluminum);
+
+      --ease-micro: cubic-bezier(0.12, 0.8, 0.32, 1);
+      --ease-macro: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    /* ---------- reset ---------- */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      background: var(--c-paper);
+      color: var(--c-ink);
+      font-family: 'Inter', system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+      font-feature-settings: "ss01", "cv02", "cv11", "tnum";
+    }
+
+    /* printed-noise overlay */
+    body::before {
+      content: "";
+      position: fixed; inset: 0;
+      pointer-events: none;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+      mix-blend-mode: multiply;
+      z-index: 9999;
+    }
+    ::selection { background: var(--c-ink); color: var(--c-paper); }
+
+    /* keyboard focus — alert-orange ring, only when navigating by keyboard.
+       Mouse clicks don't paint rings (avoids the post-click halo). */
+    *:focus { outline: none; }
+    *:focus-visible {
+      outline: 2px solid var(--c-alert);
+      outline-offset: 2px;
+    }
+    /* Buttons with dark/orange backgrounds invert the ring colour so it stays visible */
+    .modal-close:focus-visible,
+    .watch-add:focus-visible,
+    .footer-btn:focus-visible {
+      outline-color: var(--c-paper);
+      outline-offset: -1px;
+    }
+
+    /* ---------- type ---------- */
+    .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+    .hero-title {
+      font-size: clamp(64px, 11vw, 160px);
+      font-weight: 600;
+      letter-spacing: -0.05em;
+      line-height: 0.92;
+      text-transform: uppercase;
+    }
+    /* "MONITOR" is the qualifier — solid aluminum so it reads as hierarchy
+       (a different role), not a muted/disabled state. Slightly larger than
+       0.55em so it carries enough weight to register as part of the title. */
+    .hero-title-third {
+      display: block;
+      font-size: 0.62em;
+      letter-spacing: -0.03em;
+      color: var(--c-aluminum);
+      opacity: 1;
+      margin-top: 6px;
+    }
+    .hero-sub {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--c-ink);
+      opacity: 0.55;
+      margin-top: 28px;
+      max-width: 60ch;
+    }
+    /* hero-strip: synth front-panel label — engraved KEY · VALUE pairs
+       running horizontally, separated by small vertical bars. No accent
+       colour by default; only the LIVE indicator gets the alert tint. */
+    .hero-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 14px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      margin-bottom: 28px;
+      padding: 10px 14px;
+      border: 1px solid var(--c-ink);
+      background: rgba(15, 15, 15, 0.02);
+      width: fit-content;
+      max-width: 100%;
+    }
+    /* Each KEY/VALUE is a single unbreakable inline unit so the strip can wrap
+       at separators without orphaning a value on a new row. */
+    .hero-strip-pair {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+    .hero-strip-key { opacity: 0.45; }
+    .hero-strip-val { font-weight: 500; }
+    .hero-strip-sep {
+      width: 1px;
+      height: 14px;
+      background: currentColor;
+      opacity: 0.25;
+    }
+    .hero-strip-live {
+      color: var(--c-alert);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .hero-strip-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--c-alert);
+      animation: pillPulse 1.6s ease-in-out infinite;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .hero-strip-dot { animation: none; }
+    }
+
+    /* Section header: a small JetBrains Mono "01 // INBOUND" eyebrow now
+       sits *above* the big Inter title "SEPOLIA → MIDEN", so the literal
+       direction is the most readable thing in the column. */
+    .section-eyebrow {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0.55;
+      margin-bottom: 6px;
+    }
+    .section-title {
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      line-height: 1.1;
+      border-bottom: var(--border-struct);
+      padding-bottom: 12px;
+      margin-bottom: 40px;
+    }
+    .section-title-sub {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.05em;
+      opacity: 0.5;
+      margin-left: 4px;
+    }
+
+    .label {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--c-ink);
+      opacity: 0.55;
+    }
+
+    /* ---------- layout ---------- */
+    .layout-grid {
+      display: grid;
+      grid-template-columns: repeat(var(--grid-cols), 1fr);
+      column-gap: var(--gutter);
+      padding: var(--margin-desktop);
+      max-width: 1440px;
+      margin: 0 auto;
+      min-height: 100vh;
+      grid-template-rows: auto auto 1fr auto;
+      position: relative;
+    }
+
+    /* dashed visible 12-col skeleton with cursor spotlight */
+    .grid-lines {
+      position: absolute;
+      top: 0; bottom: 0;
+      left: var(--margin-desktop); right: var(--margin-desktop);
+      display: grid;
+      grid-template-columns: repeat(var(--grid-cols), 1fr);
+      column-gap: var(--gutter);
+      pointer-events: none;
+      z-index: 0;
+      --mx: 50%; --my: 50%;
+      -webkit-mask-image: radial-gradient(circle 600px at var(--mx) var(--my), black 0%, rgba(0,0,0,0.18) 60%, rgba(0,0,0,0.18) 100%);
+              mask-image: radial-gradient(circle 600px at var(--mx) var(--my), black 0%, rgba(0,0,0,0.18) 60%, rgba(0,0,0,0.18) 100%);
+    }
+    .grid-line {
+      border-left: 1px dashed rgba(15, 15, 15, 0.18);
+      height: 100%;
+    }
+    .grid-line:last-child { border-right: 1px dashed rgba(15, 15, 15, 0.18); }
+
+    /* radar sweep — alert-orange tinted band moves down the skeleton */
+    .grid-lines::after {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 18vh;
+      background: linear-gradient(to bottom,
+        rgba(255, 68, 0, 0) 0%,
+        rgba(255, 68, 0, 0.06) 50%,
+        rgba(255, 68, 0, 0) 100%);
+      animation: radarScan 9s linear infinite;
+      pointer-events: none;
+    }
+    @keyframes radarScan {
+      0%   { transform: translateY(-100%); }
+      100% { transform: translateY(500%); }
+    }
+
+    /* ---------- header ---------- */
+    .header {
+      grid-column: 1 / -1;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0 24px 0;
+      z-index: 10;
+    }
+    .logo-block {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+    }
+    .logo-mark {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-mark .wordmark {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 13px;
+      font-weight: 500;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .gateway-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      padding-left: 24px;
+      border-left: 1px solid var(--c-aluminum);
+      height: 24px;
+      cursor: default;
+    }
+    .gateway-text {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--c-gateway);
+      line-height: 1;
+    }
+    /* iso cube — lifted from aggkit-proxy reference */
+    .iso-cube-container { width: 22px; height: 22px; perspective: 400px; }
+    .iso-cube {
+      width: 100%; height: 100%;
+      position: relative;
+      transform-style: preserve-3d;
+      transform: rotateX(-30deg) rotateY(45deg);
+      transition: transform 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+    .gateway-badge:hover .iso-cube { transform: rotateX(-20deg) rotateY(225deg) scale(1.15); }
+    .cube-face {
+      position: absolute;
+      width: 22px; height: 22px;
+      border: 1px solid var(--c-gateway);
+      background: rgba(137, 80, 250, 0.18);
+    }
+    .cube-face.front  { transform: rotateY(0deg)   translateZ(11px); }
+    .cube-face.back   { transform: rotateY(180deg) translateZ(11px); }
+    .cube-face.right  { transform: rotateY(90deg)  translateZ(11px); }
+    .cube-face.left   { transform: rotateY(-90deg) translateZ(11px); }
+    .cube-face.top    { transform: rotateX(90deg)  translateZ(11px); }
+    .cube-face.bottom { transform: rotateX(-90deg) translateZ(11px); }
+
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    /* watch-form UI removed — CONFIG.watchedAddresses + auto-discovery from
+       L1 ClaimEvents covers the real case-set. */
+    .header-status .network-tag {
+      padding: 6px 10px;
+      border: 1px solid var(--c-ink);
+      letter-spacing: 0.08em;
+    }
+    .led-block {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .status-led {
+      width: 9px; height: 9px;
+      border-radius: 50%;
+      background: var(--c-aluminum);
+      transition: background 200ms var(--ease-micro), box-shadow 200ms var(--ease-micro);
+    }
+    .status-led.live {
+      background: var(--c-signal);
+      box-shadow: 0 0 10px rgba(0, 255, 136, 0.55);
+      animation: ledPulse 2s ease-in-out infinite;
+    }
+    .status-led.error {
+      background: var(--c-alert);
+      box-shadow: 0 0 10px rgba(255, 68, 0, 0.55);
+    }
+    @keyframes ledPulse {
+      0%, 100% { box-shadow: 0 0 6px rgba(0,255,136,0.45); }
+      50%      { box-shadow: 0 0 14px rgba(0,255,136,0.75); }
+    }
+
+    /* ---------- hero ---------- */
+    .hero {
+      grid-column: 2 / -2;
+      z-index: 5;
+      padding: 36px 0 56px;
+    }
+
+    /* glitch-hover from reference, only here */
+    .glitch-hover { position: relative; display: inline-block; }
+    .glitch-hover:hover { animation: glitchSkew 0.35s cubic-bezier(0.25,0.46,0.45,0.94) both infinite; }
+    .glitch-hover:hover::before,
+    .glitch-hover:hover::after {
+      content: attr(data-text);
+      position: absolute; inset: 0;
+      background: var(--c-paper);
+    }
+    .glitch-hover:hover::before {
+      left: 2px;
+      text-shadow: -1px 0 #ff00c1;
+      clip-path: inset(40% 0 61% 0);
+      animation: glitchA 2s infinite linear alternate-reverse;
+    }
+    .glitch-hover:hover::after {
+      left: -2px;
+      text-shadow: 1px 0 #00fff9;
+      clip-path: inset(10% 0 54% 0);
+      animation: glitchB 3s infinite linear alternate-reverse;
+    }
+    @keyframes glitchA { 0%{clip-path:inset(80% 0 2% 0);} 20%{clip-path:inset(10% 0 80% 0);} 100%{clip-path:inset(40% 0 10% 0);} }
+    @keyframes glitchB { 0%{clip-path:inset(10% 0 60% 0);} 20%{clip-path:inset(80% 0 5% 0);} 100%{clip-path:inset(30% 0 20% 0);} }
+    @keyframes glitchSkew { 0%{transform:skew(0);} 20%{transform:skew(-2deg);} 40%{transform:skew(2deg);} 100%{transform:skew(0);} }
+
+    /* ---------- columns ---------- */
+    .column {
+      z-index: 5;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .column-inbound  { grid-column: 2 / 7;  }
+    .column-outbound { grid-column: 8 / 13; }   /* match inbound's 5-col span (cols 8-12) */
+
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 32px;
+      margin-bottom: 48px;
+    }
+    .stat-value {
+      font-size: clamp(48px, 6vw, 84px);
+      font-weight: 600;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+      transition: color 200ms var(--ease-micro);
+    }
+    .stat-value.tick { color: var(--c-alert); }
+    .stat-label {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--c-ink);
+      opacity: 0.6;
+      margin-top: 8px;
+    }
+
+    .activity-label {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.6;
+      margin-bottom: 20px;
+    }
+
+    /* scope eyebrow — labels the sparkline as a chart, not an artifact. Pairs
+       with a thin span "now →" anchor on the right so the orange tip reads as
+       a "you are here" mark instead of a stray dot. */
+    .scope-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      opacity: 0.5;
+      margin-bottom: 6px;
+    }
+    .scope-header-now { color: var(--c-alert); opacity: 0.85; }
+
+    /* mini-scope — a synth panel meter. Renders a stepped sparkline of
+       events-per-day over the 10-day window. Ink lines on paper, with the
+       alert-orange "now" tip lit on the right edge. */
+    .scope {
+      width: 100%;
+      height: 24px;
+      display: block;
+      margin-bottom: 32px;
+      stroke: var(--c-ink);
+      stroke-width: 1;
+      fill: none;
+      vector-effect: non-scaling-stroke;
+      opacity: 0.85;
+    }
+    .scope .scope-grid { stroke: var(--c-aluminum); stroke-dasharray: 1 3; opacity: 0.7; }
+    .scope .scope-line { stroke: var(--c-ink); fill: none; }
+    .scope .scope-area { fill: rgba(15,15,15,0.06); stroke: none; }
+    .scope .scope-tip  { fill: var(--c-alert); stroke: none; }
+
+    .rows { display: flex; flex-direction: column; }
+
+    .row {
+      padding: 22px 0;
+      border-top: var(--border-row);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: baseline;
+      column-gap: 16px;
+      row-gap: 6px;
+      min-width: 0;
+    }
+    .row > * { min-width: 0; }
+    /* Only newly-inserted rows animate; existing rows on re-render stay put. */
+    .row { animation: rowIn 360ms var(--ease-macro) both; }
+    .row.no-anim, .row[data-rendered] { animation: none; }
+    .row:last-child { border-bottom: var(--border-row); }
+    @keyframes rowIn {
+      0%   { opacity: 0; transform: translateY(-6px); }
+      100% { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Rows that landed during this session (not cache-restored) briefly tint
+       in alert orange so a viewer's eye is drawn to the actual movement. */
+    .row.fresh {
+      animation: rowIn 360ms var(--ease-macro), rowFresh 1800ms 360ms ease-out;
+    }
+    @keyframes rowFresh {
+      0%   { background: rgba(255, 68, 0, 0.22); }
+      100% { background: rgba(255, 68, 0, 0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .row, .row.fresh { animation: none !important; background: transparent !important; }
+    }
+
+    .row-amount {
+      font-size: clamp(28px, 3.4vw, 44px);
+      font-weight: 600;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .row-amount .row-unit {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      margin-left: 8px;
+      opacity: 0.55;
+      vertical-align: middle;
+    }
+    .row-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      justify-self: end;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    /* Mute the time text so the status pill carries the visual weight in
+       each row. CLAIMABLE rows override this to alert-orange via the
+       `:has(.pill.claimable) .row-time` rule. */
+    .row-meta .row-time { opacity: 0.55; }
+    .row-party {
+      grid-column: 1 / -1;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 13px;
+      letter-spacing: 0.02em;
+      opacity: 0.65;
+    }
+    .row-party {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      column-gap: 8px;
+      row-gap: 4px;
+    }
+    .row-party .party-arrow { opacity: 0.5; }
+    .row-party .party-chain {
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 11px;
+      opacity: 0.55;
+    }
+    .row-party .party-addr {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      letter-spacing: 0;
+      font-size: 12px;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      flex: 1 1 100%;
+      min-width: 0;
+      max-width: 100%;
+      color: inherit;
+      /* underline via text-decoration so the dotted line only paints under
+         glyphs, not under the flex container's trailing whitespace */
+      text-decoration: underline dotted transparent;
+      text-underline-offset: 3px;
+      text-decoration-thickness: 1px;
+      transition: color 120ms var(--ease-micro), text-decoration-color 120ms var(--ease-micro);
+    }
+    .row-party .party-addr:hover {
+      color: var(--c-alert);
+      text-decoration-color: var(--c-alert);
+    }
+
+    /* full tx hash row — stacked so the hash never overflows the column */
+    /* First column sized to the widest label we use ("AGGLAYER EVENT" ≈ 110px
+       at our type size + letter-spacing). Anything shorter still aligns. */
+    .row-tx {
+      grid-column: 1 / -1;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0;
+      opacity: 0.55;
+      display: grid;
+      grid-template-columns: 132px 1fr;
+      align-items: baseline;
+      column-gap: 16px;
+      row-gap: 2px;
+      margin-top: 4px;
+      max-width: 100%;
+      min-width: 0;
+    }
+    .row-tx .tx-label {
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0.85;
+      white-space: nowrap;
+    }
+    .row-tx a {
+      color: inherit;
+      text-decoration: underline dotted transparent;
+      text-underline-offset: 3px;
+      text-decoration-thickness: 1px;
+      transition: color 120ms var(--ease-micro), text-decoration-color 120ms var(--ease-micro);
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      min-width: 0;
+      max-width: 100%;
+    }
+    .row-tx a:hover {
+      color: var(--c-alert);
+      text-decoration-color: var(--c-alert);
+    }
+    .row-tx-static {
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      min-width: 0;
+      max-width: 100%;
+      opacity: 0.85;
+    }
+
+    /* ---------- JSON modal ---------- */
+    .modal { position: fixed; inset: 0; z-index: 1000; }
+    .modal[hidden] { display: none !important; }
+    .modal-backdrop {
+      position: absolute; inset: 0;
+      background: rgba(15, 15, 15, 0.55);
+      animation: modalFadeIn 180ms var(--ease-macro);
+    }
+    .modal-panel {
+      position: absolute;
+      top: 5vh; bottom: 5vh;
+      left: 50%; transform: translateX(-50%);
+      width: min(880px, calc(100vw - 48px));
+      background: var(--c-paper);
+      border: 2px solid var(--c-ink);
+      box-shadow: 8px 8px 0 var(--c-ink);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      animation: modalIn 220ms var(--ease-macro);
+    }
+    @keyframes modalFadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes modalIn {
+      from { opacity: 0; transform: translateX(-50%) translateY(-8px); }
+      to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+    .modal-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 20px 24px;
+      border-bottom: 2px solid var(--c-ink);
+    }
+    .modal-eyebrow {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      opacity: 0.6;
+      margin-bottom: 4px;
+    }
+    .modal-title {
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      line-height: 1.15;
+    }
+    .modal-title #modalGi {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 18px;
+      letter-spacing: 0;
+      opacity: 0.7;
+    }
+    .modal-close {
+      background: transparent;
+      border: 1px solid var(--c-ink);
+      color: var(--c-ink);
+      width: 32px; height: 32px;
+      font-size: 14px;
+      cursor: pointer;
+      flex: 0 0 auto;
+      transition: background 120ms var(--ease-micro), color 120ms var(--ease-micro);
+    }
+    .modal-close:hover { background: var(--c-alert); border-color: var(--c-alert); color: var(--c-paper); }
+    .modal-body {
+      flex: 1 1 auto;
+      overflow: auto;
+      padding: 20px 24px;
+      background: #FAF7EE;
+    }
+    .modal-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 24px;
+      border-top: 1px dashed var(--c-aluminum);
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .modal-source { opacity: 0.6; word-break: break-all; min-width: 0; flex: 1 1 auto; }
+    .modal-raw {
+      color: var(--c-ink);
+      text-decoration: underline dotted transparent;
+      text-underline-offset: 3px;
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+    .modal-raw:hover { color: var(--c-alert); text-decoration-color: var(--c-alert); }
+
+    /* JSON pretty-printer styling */
+    .json {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      letter-spacing: 0;
+      color: var(--c-ink);
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      margin: 0;
+    }
+    .json-key       { color: var(--c-alert); font-weight: 500; }
+    .json-string    { color: var(--c-ink); }
+    .json-number    { color: #009a52; }                 /* signal-green-ish, AA-on-paper */
+    .json-boolean   { color: var(--c-gateway); font-weight: 500; }
+    .json-null      { color: var(--c-aluminum); font-style: italic; }
+    .json-bracket   { color: var(--c-ink); opacity: 0.55; }
+    .json-comma     { color: var(--c-ink); opacity: 0.45; }
+    .json-empty     { opacity: 0.55; font-style: italic; }
+    .json-muted     { opacity: 0.5; }
+    .json-error     { color: var(--c-alert); }
+
+    /* ---------- agglayer event readout (modal body alt-view) ---------- */
+    /* Sectioned, labelled, explanation-rich render of one exit record.
+       Visual nod: each section is a panel on a synth front-plate; the amount
+       block reads like an LCD; the lifecycle is a tape-deck progress strip. */
+    .readout-mode {
+      display: inline-flex;
+      border: 1px solid var(--c-ink);
+      margin-bottom: 18px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .readout-mode button {
+      background: transparent;
+      border: none;
+      padding: 6px 14px;
+      cursor: pointer;
+      color: var(--c-ink);
+      font: inherit;
+      letter-spacing: inherit;
+      text-transform: inherit;
+    }
+    .readout-mode button.active {
+      background: var(--c-ink);
+      color: var(--c-paper);
+    }
+    .readout-mode button + button { border-left: 1px solid var(--c-ink); }
+
+    .readout-amount {
+      border: 2px solid var(--c-ink);
+      padding: 22px 24px 18px;
+      margin-bottom: 22px;
+      background: repeating-linear-gradient(
+        to bottom,
+        var(--c-paper) 0px,
+        var(--c-paper) 22px,
+        rgba(15, 15, 15, 0.025) 22px,
+        rgba(15, 15, 15, 0.025) 23px
+      );
+    }
+    .readout-amount-eyebrow {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      opacity: 0.55;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .readout-amount-value {
+      font-size: clamp(36px, 6vw, 64px);
+      font-weight: 600;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .readout-amount-unit {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 14px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      opacity: 0.55;
+      margin-left: 10px;
+      vertical-align: middle;
+    }
+
+    .readout-section { margin-bottom: 22px; }
+    .readout-section-title {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      opacity: 0.55;
+      margin-bottom: 10px;
+      padding-bottom: 6px;
+      border-bottom: 1px dashed var(--c-aluminum);
+    }
+    .readout-route {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 18px;
+      border: 1px solid var(--c-ink);
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+    }
+    .readout-route-side {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .readout-route-net {
+      font-size: 9px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      opacity: 0.55;
+    }
+    .readout-route-addr {
+      word-break: break-all;
+      overflow-wrap: anywhere;
+    }
+    .readout-route-to { text-align: right; }
+    .readout-route-to .readout-route-addr { text-align: right; }
+    .readout-route-arrow {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 18px;
+      color: var(--c-alert);
+      font-weight: 500;
+    }
+
+    .readout-lifecycle {
+      list-style: none;
+      margin: 0; padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    .lifecycle-stage {
+      display: grid;
+      grid-template-columns: 22px 1fr auto;
+      align-items: flex-start;
+      column-gap: 14px;
+      padding: 10px 0;
+      border-bottom: 1px dashed var(--c-aluminum);
+    }
+    .lifecycle-stage:last-child { border-bottom: none; }
+    .lifecycle-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      margin-top: 4px;
+      background: transparent;
+      border: 1.5px solid var(--c-aluminum);
+    }
+    .lifecycle-done .lifecycle-dot {
+      background: var(--c-signal);
+      border-color: var(--c-signal);
+      box-shadow: 0 0 0 3px rgba(0, 255, 136, 0.18);
+    }
+    .lifecycle-active .lifecycle-dot {
+      background: var(--c-alert);
+      border-color: var(--c-alert);
+      animation: pillPulse 1.6s ease-in-out infinite;
+    }
+    .lifecycle-label {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+    }
+    .lifecycle-desc {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      opacity: 0.55;
+      margin-top: 3px;
+      max-width: 56ch;
+    }
+    .lifecycle-tag {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      opacity: 0.6;
+      align-self: center;
+    }
+    .lifecycle-done .lifecycle-tag { color: #009a52; opacity: 1; }
+    .lifecycle-active .lifecycle-tag { color: var(--c-alert); opacity: 1; }
+    @media (prefers-reduced-motion: reduce) {
+      .lifecycle-active .lifecycle-dot { animation: none; }
+    }
+
+    .readout-refs {
+      display: grid;
+      grid-template-columns: 130px 1fr;
+      column-gap: 14px;
+      row-gap: 8px;
+      margin: 0;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+    }
+    .readout-refs dt {
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      opacity: 0.55;
+    }
+    .readout-refs dd {
+      margin: 0;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+    }
+    .readout-refs dd.muted { opacity: 0.5; font-style: italic; }
+
+    /* ---------- pending placeholder ---------- */
+    /* Reusable component for fields that are AWAITING something on-chain.
+       Hazard-stripe ground (synth "processing" semiotic) with a slow
+       alert-orange highlight band sweeping across, plus a TIME EST line
+       explaining what we're waiting for. */
+    .pending-box {
+      position: relative;
+      overflow: hidden;
+      border: 1px dashed var(--c-alert);
+      padding: 10px 14px;
+      background:
+        repeating-linear-gradient(
+          135deg,
+          transparent 0 6px,
+          rgba(255, 68, 0, 0.05) 6px 12px
+        );
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      letter-spacing: 0.10em;
+      color: var(--c-alert);
+      line-height: 1.4;
+    }
+    .pending-box::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        to right,
+        transparent 0%,
+        rgba(255, 68, 0, 0.22) 50%,
+        transparent 100%
+      );
+      transform: translateX(-100%);
+      animation: pendingSweep 2.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+      pointer-events: none;
+    }
+    @keyframes pendingSweep {
+      0%   { transform: translateX(-100%); }
+      55%  { transform: translateX(100%); }
+      100% { transform: translateX(100%); }
+    }
+    .pending-box .pending-label {
+      display: block;
+      text-transform: uppercase;
+      font-weight: 500;
+      position: relative;
+      z-index: 1;
+    }
+    .pending-box .pending-sub {
+      display: block;
+      margin-top: 4px;
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      text-transform: none;
+      opacity: 0.75;
+      position: relative;
+      z-index: 1;
+    }
+    .pending-box .pending-tick {
+      display: inline-block;
+      margin-right: 8px;
+      animation: pillPulse 1.6s ease-in-out infinite;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .pending-box::after,
+      .pending-box .pending-tick { animation: none; }
+    }
+    .readout-refs a {
+      color: inherit;
+      text-decoration: underline dotted transparent;
+      text-underline-offset: 3px;
+      transition: color 120ms var(--ease-micro), text-decoration-color 120ms var(--ease-micro);
+    }
+    .readout-refs a:hover {
+      color: var(--c-alert);
+      text-decoration-color: var(--c-alert);
+    }
+
+    @media (max-width: 600px) {
+      .readout-route { grid-template-columns: 1fr; }
+      .readout-route-to, .readout-route-to .readout-route-addr { text-align: left; }
+      .readout-route-arrow { transform: rotate(90deg); justify-self: center; }
+      .readout-refs { grid-template-columns: 1fr; row-gap: 4px; }
+      .readout-refs dt { margin-top: 8px; }
+      .lifecycle-stage { grid-template-columns: 18px 1fr; }
+      .lifecycle-tag { grid-column: 1 / -1; padding-left: 32px; }
+    }
+
+    /* the AGGLAYER EVENT link is a button under the hood — match the other tx
+       hash links visually exactly so the click affordance reads consistently */
+    .agg-link {
+      background: none;
+      border: none;
+      padding: 0;
+      margin: 0;
+      font: inherit;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+      text-decoration: underline dotted transparent;
+      text-underline-offset: 3px;
+      text-decoration-thickness: 1px;
+      transition: color 120ms var(--ease-micro), text-decoration-color 120ms var(--ease-micro);
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      min-width: 0;
+      max-width: 100%;
+    }
+    .agg-link:hover {
+      color: var(--c-alert);
+      text-decoration-color: var(--c-alert);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .modal-backdrop, .modal-panel { animation: none; }
+    }
+
+    /* status pill */
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border: 1px solid var(--c-aluminum);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-weight: 500;
+      line-height: 1;
+    }
+    .pill.pending {
+      color: var(--c-alert);
+      border-color: var(--c-alert);
+      background: rgba(255, 68, 0, 0.06);
+    }
+    .pill.landed {
+      color: var(--c-ink);
+      border-color: var(--c-aluminum);
+    }
+    /* CLAIMABLE = money in motion right now. Loudest state on the page:
+       solid alert-orange fill, paper text, slightly larger, pulsing dot. */
+    .pill.claimable {
+      color: var(--c-paper);
+      border-color: var(--c-alert);
+      background: var(--c-alert);
+      font-weight: 500;
+      font-size: 11px;
+      padding: 5px 10px;
+      letter-spacing: 0.12em;
+    }
+    .pill.claimable .dot {
+      background: var(--c-paper);
+      animation: pillPulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pillPulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.55; transform: scale(0.85); }
+    }
+    .pill.settled {
+      color: #009a52;
+      border-color: var(--c-signal);
+      background: rgba(0, 255, 136, 0.10);
+    }
+    .pill .dot {
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    /* CLAIMABLE row gets a barely-there alert tint so the eye lands on it
+       across the whole column without violating the side-stripe ban. */
+    .row:has(.pill.claimable) {
+      background: linear-gradient(to right, rgba(255, 68, 0, 0.05), rgba(255, 68, 0, 0));
+      padding-left: 4px;
+      padding-right: 4px;
+      margin-left: -4px;
+      margin-right: -4px;
+    }
+    .row:has(.pill.claimable) .row-time {
+      color: var(--c-alert);
+      opacity: 1;
+      font-weight: 500;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .pill.claimable .dot { animation: none; }
+    }
+
+    /* empty state */
+    .empty {
+      padding: 48px 0;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      opacity: 0.45;
+      border-top: var(--border-row);
+      border-bottom: var(--border-row);
+    }
+    .empty::before { content: "// "; opacity: 0.6; }
+
+    /* full-width initial-load banner — replaces both columns visually on cold cache */
+    /* HTML's `hidden` attribute sets `display: none` with author-stylesheet
+       priority; our `display: flex` below would silently override it. The
+       explicit `[hidden]` rule restores spec behaviour. */
+    .loading-banner[hidden] { display: none !important; }
+    .loading-banner {
+      grid-column: 2 / -2;
+      padding: 120px 0 96px;
+      border-top: var(--border-row);
+      border-bottom: var(--border-row);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 36px;
+      z-index: 6;
+    }
+    .layout-grid.is-loading .column { display: none; }
+
+    .spinner {
+      width: 72px; height: 72px;
+      border: 2px solid var(--c-aluminum);
+      border-top-color: var(--c-alert);
+      border-radius: 50%;
+      animation: spin 900ms linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-label {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0.55;
+      text-align: center;
+    }
+    .loading-label .loading-sub {
+      display: block;
+      margin-top: 6px;
+      opacity: 0.55;
+    }
+    .loading-banner .loading-label {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      text-align: center;
+      opacity: 0.65;
+    }
+    .loading-banner .loading-sub {
+      display: block;
+      margin-top: 8px;
+      font-size: 10px;
+      opacity: 0.55;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .spinner { animation: none; border-top-color: var(--c-aluminum); }
+    }
+
+    /* ---------- footer ---------- */
+    .footer {
+      grid-column: 1 / -1;
+      margin-top: 64px;
+      padding: 18px 0;
+      border-top: 1px dashed var(--c-aluminum);
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.7;
+      z-index: 5;
+      flex-wrap: wrap;
+    }
+
+    /* ---------- top-of-page poll progress ---------- */
+    .poll-progress {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: rgba(15, 15, 15, 0.06);
+      z-index: 100;
+      overflow: hidden;
+    }
+    .poll-progress-fill {
+      height: 100%;
+      width: 100%;
+      background: var(--c-alert);
+      transform: scaleX(0);
+      transform-origin: left;
+      transition: transform 240ms linear;
+      will-change: transform;
+    }
+    .poll-progress.error .poll-progress-fill {
+      background: var(--c-aluminum);
+      animation: pollErrorPulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pollErrorPulse {
+      0%, 100% { opacity: 0.4; }
+      50%      { opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .poll-progress-fill { transition: none; }
+      .poll-progress.error .poll-progress-fill { animation: none; }
+    }
+
+    /* footer scan links */
+    .footer a.footer-link {
+      color: inherit;
+      text-decoration: underline dotted transparent;
+      text-underline-offset: 3px;
+      transition: color 120ms var(--ease-micro), text-decoration-color 120ms var(--ease-micro);
+    }
+    .footer a.footer-link:hover {
+      color: var(--c-alert);
+      text-decoration-color: var(--c-alert);
+    }
+    .footer-center { letter-spacing: 0.06em; }
+    .footer-right { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+    /* footer reset button */
+    .footer-btn {
+      background: transparent;
+      border: 1px solid var(--c-ink);
+      color: var(--c-ink);
+      padding: 4px 10px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 120ms var(--ease-micro), color 120ms var(--ease-micro);
+      margin-left: 6px;
+    }
+    .footer-btn:hover {
+      background: var(--c-alert);
+      color: var(--c-paper);
+      border-color: var(--c-alert);
+    }
+    .footer-btn:active { transform: translateY(1px); }
+
+    /* ---------- responsive ---------- */
+    @media (max-width: 900px) {
+      .layout-grid { padding: var(--margin-mobile); display: block; }
+      .grid-lines { display: none; }
+      /* On phones, hero strip flips BELOW the title — metadata is supporting
+         context, not above-the-fold. DOM order kept for screen readers. */
+      .hero { padding: 16px 0 32px; display: flex; flex-direction: column; }
+      .hero .hero-strip { order: 3; margin-top: 24px; margin-bottom: 0; }
+      .hero .hero-title { order: 1; }
+      .hero .hero-sub   { order: 2; }
+      .column-inbound,
+      .column-outbound { grid-column: auto; margin-bottom: 64px; }
+      .stats { gap: 20px; }
+      .footer { flex-direction: column; gap: 12px; align-items: flex-start; }
+      .footer-right { width: 100%; justify-content: space-between; }
+
+      /* header: stack the watch form below the brand on narrow viewports
+         so the status row is never crushed. */
+      .header { flex-direction: column; align-items: stretch; gap: 16px; }
+      .logo-block { flex-wrap: wrap; gap: 12px; }
+      .header-status { flex-wrap: wrap; gap: 12px; }
+      .watch-form { flex: 1 1 100%; }
+      .watch-form input { width: 100%; min-width: 0; }
+
+      /* modal goes near-full-screen on phones */
+      .modal-panel {
+        top: 16px; bottom: 16px;
+        left: 16px; right: 16px;
+        transform: none;
+        width: auto;
+        max-width: none;
+      }
+      .modal-header { padding: 16px 18px; gap: 12px; }
+      .modal-body   { padding: 16px 18px; }
+      .modal-footer { padding: 12px 18px; flex-direction: column; align-items: flex-start; gap: 8px; }
+      .json { font-size: 11px; }
+
+      /* row tx hash row: collapse the label column on phones so 66-char
+         hashes have the full width to wrap into */
+      .row-tx { grid-template-columns: 1fr; row-gap: 4px; }
+      .row-tx .tx-label { font-size: 9px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .grid-lines::after,
+      .status-led.live,
+      .glitch-hover:hover,
+      .glitch-hover:hover::before,
+      .glitch-hover:hover::after,
+      .row { animation: none !important; }
+      .iso-cube,
+      .gateway-badge:hover .iso-cube { transition: none !important; }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- top-of-page poll progress bar — fills from left over the poll interval
+       so users can see the data isn't stale, just on cadence. -->
+  <div id="pollProgress" class="poll-progress" aria-hidden="true">
+    <div class="poll-progress-fill"></div>
+  </div>
+
+  <div class="layout-grid">
+
+    <!-- 12 vertical dashed grid lines, mouse spotlight -->
+    <div class="grid-lines" id="gridLines">
+      <div class="grid-line"></div><div class="grid-line"></div><div class="grid-line"></div>
+      <div class="grid-line"></div><div class="grid-line"></div><div class="grid-line"></div>
+      <div class="grid-line"></div><div class="grid-line"></div><div class="grid-line"></div>
+      <div class="grid-line"></div><div class="grid-line"></div><div class="grid-line"></div>
+    </div>
+
+    <header class="header">
+      <div class="logo-block">
+        <div class="logo-mark">
+          <svg width="22" height="22" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+            <rect width="32" height="32" fill="#0F0F0F"/>
+            <path d="M8 22V10l8 6 8-6v12" stroke="#F2EFE9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="wordmark">MIDEN × AGGLAYER</span>
+        </div>
+        <div class="gateway-badge" title="Powered by Gateway.fm">
+          <div class="iso-cube-container">
+            <div class="iso-cube">
+              <div class="cube-face front"></div>
+              <div class="cube-face back"></div>
+              <div class="cube-face right"></div>
+              <div class="cube-face left"></div>
+              <div class="cube-face top"></div>
+              <div class="cube-face bottom"></div>
+            </div>
+          </div>
+          <span class="gateway-text">POWERED_BY_GATEWAY.FM</span>
+        </div>
+      </div>
+
+      <div class="header-status">
+        <span class="network-tag" aria-label="Network: Bali testnet">BALI · TESTNET</span>
+        <span class="led-block">
+          <span class="status-led" id="statusLed" aria-hidden="true"></span>
+          <span id="statusText" aria-live="polite" aria-atomic="true">CONNECTING</span>
+        </span>
+      </div>
+    </header>
+
+    <section class="hero">
+      <!-- product-label strip: synth-front-panel STYLING (bordered key/value
+           strip in fixed-pitch type) but COPY is bridge-monitor-real, not
+           synth-larp. -->
+      <div class="hero-strip" aria-label="Monitor metadata">
+        <span class="hero-strip-pair"><span class="hero-strip-key">NETWORK</span><span class="hero-strip-val">BALI TESTNET</span></span>
+        <span class="hero-strip-sep"></span>
+        <span class="hero-strip-pair"><span class="hero-strip-key">BRIDGE</span><span class="hero-strip-val">SEPOLIA ↔ MIDEN</span></span>
+        <span class="hero-strip-sep"></span>
+        <span class="hero-strip-pair"><span class="hero-strip-key">LIVE SINCE</span><span class="hero-strip-val">20.05.2026</span></span>
+        <span class="hero-strip-sep"></span>
+        <span class="hero-strip-pair"><span class="hero-strip-key">NEXT POLL</span><span class="hero-strip-val hero-strip-live"><span class="hero-strip-dot"></span><span id="pollCountdown">30S</span></span></span>
+      </div>
+      <h1 class="hero-title glitch-hover" data-text="BALI BRIDGE MONITOR">BALI<br>BRIDGE<br><span class="hero-title-third">MONITOR</span></h1>
+      <p class="hero-sub">PUBLIC PROOF · MIDEN AGGLAYER BRIDGE · POLL 30S · NO CONTROLS</p>
+    </section>
+
+    <div id="loadingBanner" class="loading-banner" hidden>
+      <div class="spinner"></div>
+      <div class="loading-label">
+        SCANNING SEPOLIA
+        <span class="loading-sub">~12 DAYS · FIRST LOAD ONLY · CACHED ON SUBSEQUENT VISITS</span>
+      </div>
+    </div>
+
+    <section class="column column-inbound">
+      <p class="section-eyebrow">01 // INBOUND</p>
+      <h2 class="section-title">SEPOLIA → MIDEN<span class="section-title-sub"> · DEPOSITS</span></h2>
+
+      <div class="stats">
+        <div>
+          <div class="stat-value" id="inCount">·</div>
+          <div class="stat-label">DEPOSITS · 10D</div>
+        </div>
+        <div>
+          <div class="stat-value" id="inVolume">·</div>
+          <div class="stat-label" data-stat-label="in-volume">IN · 10D · ETH</div>
+        </div>
+      </div>
+      <div class="scope-header" aria-hidden="true">
+        <span>ACTIVITY · DEPOSITS · 10D</span>
+        <span class="scope-header-now">NOW ▸</span>
+      </div>
+      <svg class="scope" id="inboundScope" viewBox="0 0 200 20" preserveAspectRatio="none" aria-label="Daily deposit count over the last 10 days" role="img"></svg>
+
+      <p class="activity-label">RECENT DEPOSITS</p>
+      <div class="rows" id="inboundRows"></div>
+    </section>
+
+    <section class="column column-outbound">
+      <p class="section-eyebrow">02 // OUTBOUND</p>
+      <h2 class="section-title">MIDEN → SEPOLIA<span class="section-title-sub"> · WITHDRAWALS</span></h2>
+
+      <div class="stats">
+        <div>
+          <div class="stat-value" id="outCount">·</div>
+          <div class="stat-label">WITHDRAWALS · 10D</div>
+        </div>
+        <div>
+          <div class="stat-value" id="outVolume">·</div>
+          <div class="stat-label" data-stat-label="out-volume">OUT · 10D · ETH</div>
+        </div>
+      </div>
+      <div class="scope-header" aria-hidden="true">
+        <span>ACTIVITY · WITHDRAWALS · 10D</span>
+        <span class="scope-header-now">NOW ▸</span>
+      </div>
+      <svg class="scope" id="outboundScope" viewBox="0 0 200 20" preserveAspectRatio="none" aria-label="Daily withdrawal count over the last 10 days" role="img"></svg>
+
+      <p class="activity-label">RECENT WITHDRAWALS</p>
+      <div class="rows" id="outboundRows"></div>
+    </section>
+
+    <footer class="footer">
+      <span class="footer-left">BALI :: SEPOLIA → MIDEN</span>
+      <span class="footer-center">UPDATED <span id="lastUpdate" aria-live="polite">·</span> · NEXT IN <span id="pollCountdownFooter">—</span></span>
+      <span class="footer-right">
+        <a href="https://gateway.fm" target="_blank" rel="noopener" class="footer-link">GATEWAY.FM</a> ·
+        <a href="https://miden.xyz" target="_blank" rel="noopener" class="footer-link">MIDEN</a> ·
+        <a href="https://docs.agglayer.dev" target="_blank" rel="noopener" class="footer-link">AGGLAYER</a> ·
+        <button id="resetBtn" class="footer-btn" title="Clear localStorage and re-scan from the bali deployment block" aria-label="Reset cache">RESET CACHE</button>
+      </span>
+    </footer>
+  </div>
+
+  <script type="module">
+    import { ethers } from "https://esm.sh/ethers@6.13.4";
+
+    // ---------- cache bust ----------
+    // ?reset=1 or ?fresh=1 wipes ALL cached state before bootstrap runs.
+    // Bumping `storageKey` below also wipes (old keys are simply ignored).
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("reset") || url.searchParams.has("fresh") || url.searchParams.has("nocache")) {
+      try { Object.keys(localStorage).filter(k => k.startsWith("bali-bridge")).forEach(k => localStorage.removeItem(k)); } catch {}
+    }
+
+    // ---------- config ----------
+    const CONFIG = {
+      l1RpcUrl: "https://ethereum-sepolia-rpc.publicnode.com",
+      bridgeServiceUrl: "https://miden-testnet-bridge.dev.eu-north-3.gateway.fm/api",
+      bridgeContract: "0x1348947e282138d8f377b467f7d9c2eb0f335d1f",
+      midenNetworkId: 76,           // bali rollupId (per bali-l1-deposit.sh)
+      deploymentBlock: 10881795,    // bali rollup creation on Sepolia, 2026-05-20
+      windowDays: 10,               // rolling display window
+      windowMs: 10 * 24 * 60 * 60 * 1000,
+      pollIntervalMs: 30_000,
+      maxRowsPerColumn: 12,
+      chunkBlocks: 9_000,           // stay under provider 10k caps
+      maxChunksPerCycle: 12,        // ~108k blocks per cycle, drains backfill across cycles
+      // Addresses to ask bridge-service "show me all bali exits to/from this account".
+      // Without this we can only see CLAIMED outbounds via L1 logs. Add yours via
+      // window.appendWatchedAddress("0x…"); persists in localStorage.
+      watchedAddresses: [
+        "0xEFAD2016599b886A457Ffbf313dae2a7A4bfaa27",  // canonical bali test funder (per bridge-test-summary-r2-2026-05-20.md)
+        "0xC0fFCd2b7245D8B09E94f0526b92cDEDd292D19F",  // disposable bridge wallet from same summary
+      ],
+      storageKey: "bali-bridge:v5",
+    };
+
+    // Pre-baked watchedAddresses above + auto-discovery from L1 ClaimEvents
+    // (every dest_addr we ever see in a bali claim gets queried on the next
+    // poll) cover the realistic case set. No manual user-extension surface.
+
+    // Polygon-zkEVM unified-bridge ABI (only the two events we need)
+    const BRIDGE_ABI = [
+      "event BridgeEvent(uint8 leafType, uint32 originNetwork, address originAddress, uint32 destinationNetwork, address destinationAddress, uint256 amount, bytes metadata, uint32 depositCount)",
+      "event ClaimEvent(uint256 globalIndex, uint32 originNetwork, address originAddress, address destinationAddress, uint256 amount)",
+    ];
+
+    const iface = new ethers.Interface(BRIDGE_ABI);
+    const bridgeTopic = iface.getEvent("BridgeEvent").topicHash;
+    const claimTopic  = iface.getEvent("ClaimEvent").topicHash;
+
+    // ---------- ui handles ----------
+    const $ = (id) => document.getElementById(id);
+    const ui = {
+      led: $("statusLed"),
+      ledText: $("statusText"),
+      inCount: $("inCount"),
+      inVolume: $("inVolume"),
+      outCount: $("outCount"),
+      outVolume: $("outVolume"),
+      inboundRows: $("inboundRows"),
+      outboundRows: $("outboundRows"),
+      lastUpdate: $("lastUpdate"),
+    };
+
+    // ---------- helpers ----------
+    // No truncation — show full addresses and tx hashes. Long strings wrap
+    // mid-string via `word-break: break-all` in the row CSS.
+    //
+    // The bali deposit script encodes a 15-byte Miden Account ID into a
+    // 20-byte Eth slot as 0x00000000{30 hex chars}00. We strip the padding
+    // and surface the real Miden bytes for inbound rows.
+    const formatRecipient = (raw, kind) => {
+      if (!raw || typeof raw !== "string") return { label: "·", isMiden: false };
+      const lo = raw.toLowerCase();
+      if (kind === "inbound" && lo.length === 42 && lo.startsWith("0x00000000") && lo.endsWith("00")) {
+        const mid = lo.slice(10, 40); // 30 hex chars = 15 bytes of Miden Account ID
+        if (mid.replace(/0/g, "") !== "") {
+          return { label: "0x" + mid, isMiden: true };   // FULL Miden account id
+        }
+      }
+      return { label: lo, isMiden: false };               // FULL Eth address
+    };
+
+    // Return { value, unit } so the row can render the unit in a smaller
+    // style and the stat tile can choose to suppress it. We NEVER fall back
+    // to scientific notation — tiny amounts switch units (ETH → GWEI → WEI)
+    // so the number reads cleanly even on testnet-dust transfers.
+    const formatEth = (wei) => {
+      try {
+        if (wei == null) return { value: "·", unit: "" };
+        const eth = Number(ethers.formatEther(wei));
+        if (eth === 0)         return { value: "0",        unit: "ETH" };
+        if (eth >= 1000)       return { value: eth.toLocaleString(undefined, { maximumFractionDigits: 0 }), unit: "ETH" };
+        if (eth >= 1)          return { value: eth.toFixed(3).replace(/0+$/, "").replace(/\.$/, ""), unit: "ETH" };
+        if (eth >= 0.001)      return { value: eth.toFixed(4).replace(/0+$/, "").replace(/\.$/, ""), unit: "ETH" };
+        if (eth >= 0.00001)    return { value: eth.toFixed(5).replace(/0+$/, "").replace(/\.$/, ""), unit: "ETH" };
+        // Sub-10µETH: switch unit to GWEI so we don't lose precision rounding
+        // values like 2.49e-6 ETH down to "0.000002".
+        const gweiNum = Number(ethers.formatUnits(wei, "gwei"));
+        if (gweiNum >= 0.001) {
+          const decimals = gweiNum >= 100 ? 0 : gweiNum >= 1 ? 2 : 4;
+          return { value: gweiNum.toLocaleString(undefined, { maximumFractionDigits: decimals }), unit: "GWEI" };
+        }
+        return { value: wei.toString(), unit: "WEI" };
+      } catch { return { value: "·", unit: "" }; }
+    };
+    const formatEthInline = (wei) => {
+      const { value, unit } = formatEth(wei);
+      return unit ? `${value} ${unit}` : value;
+    };
+
+    const timeAgo = (msAgo) => {
+      // Defensive: caller passes null/undefined/NaN when ts is missing.
+      if (msAgo == null || !Number.isFinite(msAgo)) return "·";
+      const s = Math.max(0, Math.round(msAgo / 1000));
+      // Suppress "0 sec ago" / "1 sec ago" — that's a misleading-precision read
+      // on data sourced from a 12s-block chain. Anything fresher than 10s is
+      // really "just now".
+      if (s < 10) return "just now";
+      if (s < 60) return s + " sec ago";
+      const m = Math.round(s / 60);
+      if (m < 60) return m + " min ago";
+      const h = Math.round(m / 60);
+      if (h < 24) return h + " hr ago";
+      const d = Math.round(h / 24);
+      return d + " day" + (d > 1 ? "s" : "") + " ago";
+    };
+
+    const formatClock = (date) => {
+      const pad = (n) => String(n).padStart(2, "0");
+      return pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
+    };
+
+    // ---------- persistence ----------
+    const loadState = () => {
+      try {
+        const raw = localStorage.getItem(CONFIG.storageKey);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        // restore bigints
+        for (const arr of [parsed.inbound || [], parsed.outbound || []]) {
+          for (const ev of arr) ev.amount = BigInt(ev.amount);
+        }
+        return parsed;
+      } catch { return null; }
+    };
+    const saveState = (state) => {
+      try {
+        const serializable = {
+          ...state,
+          inbound:  state.inbound.map(e  => ({ ...e, amount: e.amount.toString() })),
+          outbound: state.outbound.map(e => ({ ...e, amount: e.amount.toString() })),
+        };
+        localStorage.setItem(CONFIG.storageKey, JSON.stringify(serializable));
+      } catch {}
+    };
+
+    // ---------- rpc ----------
+    const rpc = async (method, params) => {
+      const resp = await fetch(CONFIG.l1RpcUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      if (!resp.ok) throw new Error(method + ": HTTP " + resp.status);
+      const json = await resp.json();
+      if (json.error) throw new Error(method + ": " + json.error.message);
+      return json.result;
+    };
+
+    const getBlockNumber = async () => parseInt(await rpc("eth_blockNumber", []), 16);
+
+    // Returns {logs, drainedTo}. Stops after CONFIG.maxChunksPerCycle so the
+    // first visit doesn't lock the page on a multi-month backfill — subsequent
+    // ticks continue from `drainedTo + 1`.
+    const getLogsChunked = async (fromBlock, toBlock, topic0) => {
+      const all = [];
+      let from = fromBlock;
+      let chunks = 0;
+      while (from <= toBlock && chunks < CONFIG.maxChunksPerCycle) {
+        const to = Math.min(toBlock, from + CONFIG.chunkBlocks);
+        const logs = await rpc("eth_getLogs", [{
+          fromBlock: "0x" + from.toString(16),
+          toBlock:   "0x" + to.toString(16),
+          address:   CONFIG.bridgeContract,
+          topics:    [topic0],
+        }]);
+        all.push(...logs);
+        from = to + 1;
+        chunks += 1;
+      }
+      return { logs: all, drainedTo: from - 1 };
+    };
+
+    const getBlockTimestamp = async (blockNumberHex) => {
+      const block = await rpc("eth_getBlockByNumber", [blockNumberHex, false]);
+      return parseInt(block.timestamp, 16) * 1000;
+    };
+
+    // ---------- bridge-service ----------
+    // GET /api/bridges/{address} returns every L2→L1 exit ever credited to
+    // this L1 recipient. claim_tx_hash="" => unclaimed (the user hasn't
+    // pulled it yet on Sepolia). claim_tx_hash filled => already settled
+    // (we ALSO see it on L1 via decodeClaim, dedupe on globalIndex).
+    const fetchBridgeServiceExits = async (address) => {
+      try {
+        const r = await fetch(CONFIG.bridgeServiceUrl + "/bridges/" + address, { cache: "no-store" });
+        if (!r.ok) return [];
+        const json = await r.json();
+        const exits = json.deposits || [];
+        // Filter to bali → sepolia withdrawals only
+        return exits.filter(e =>
+          Number(e.network_id) === CONFIG.midenNetworkId && Number(e.dest_net) === 0
+        );
+      } catch (e) {
+        console.warn("bridge-service unreachable:", e.message);
+        return [];
+      }
+    };
+
+    const decodeBridgeServiceExit = (e) => {
+      const claimed = !!(e.claim_tx_hash && e.claim_tx_hash !== "" && e.claim_tx_hash !== "0x");
+      // Global index uniquely identifies a bali exit; use it as the row id so we
+      // dedupe cleanly against L1-derived ClaimEvent rows.
+      const id = "bali-exit:" + e.global_index;
+      return {
+        kind: "outbound",
+        id,
+        // Bridge service knows the Miden-side synthetic tx hash. When/if it
+        // settles, claim_tx_hash holds the L1 claimAsset tx.
+        txHash: claimed ? e.claim_tx_hash : e.tx_hash,
+        l1ClaimTx: claimed ? e.claim_tx_hash : null,
+        midenTx: e.tx_hash,
+        // IMPORTANT: do NOT carry the L2 block_num here. enrichTimestamp would
+        // try to resolve it against the L1 RPC, which would either fail or
+        // return a long-ago Sepolia timestamp (because the L2 block index
+        // overlaps with ancient L1 history). Bridge-service rows get their
+        // timestamp from the matching L1 ClaimEvent; truly-unclaimed rows
+        // display "awaiting claim" instead of a misleading time.
+        blockNumber: null,
+        l2BlockNumber: claimed ? null : Number(e.block_num),
+        amount: BigInt(e.amount),
+        counterparty: e.dest_addr,
+        claimed,
+        globalIndex: e.global_index,
+      };
+    };
+
+    // ---------- decode ----------
+    const decodeBridge = (log) => {
+      const parsed = iface.parseLog({ topics: log.topics, data: log.data });
+      if (!parsed) return null;
+      const a = parsed.args;
+      // Filter: only inbound to Miden bali
+      if (Number(a.destinationNetwork) !== CONFIG.midenNetworkId) return null;
+      // leafType 0 = asset bridge. leafType 1 = message. We surface asset bridges.
+      if (Number(a.leafType) !== 0) return null;
+      return {
+        kind: "inbound",
+        id: log.transactionHash + ":" + parseInt(log.logIndex, 16),
+        txHash: log.transactionHash,
+        blockNumber: parseInt(log.blockNumber, 16),
+        amount: a.amount,                                  // bigint wei
+        counterparty: a.destinationAddress,                // miden recipient
+      };
+    };
+
+    const decodeClaim = (log) => {
+      const parsed = iface.parseLog({ topics: log.topics, data: log.data });
+      if (!parsed) return null;
+      const a = parsed.args;
+      // The ClaimEvent's `originNetwork` is the asset's origin network (0 for
+      // ETH bridged out from a rollup whose underlying token traces back to L1),
+      // NOT the rollup the withdrawal came from. The rollup is encoded in
+      // globalIndex bits 32-63 as `rollupIndex = networkID - 1` (with bit 64
+      // set to 1 for L1-originated refunds, which we skip).
+      const gi = BigInt(a.globalIndex);
+      const mainnetFlag = gi >> 64n;
+      if (mainnetFlag !== 0n) return null;
+      const rollupIndex = Number((gi >> 32n) & 0xFFFFFFFFn);
+      if (rollupIndex + 1 !== CONFIG.midenNetworkId) return null;
+      return {
+        kind: "outbound",
+        // Same id format as decodeBridgeServiceExit so that when a CLAIMABLE
+        // bridge-service row later settles, the new L1 ClaimEvent merges
+        // onto the existing state entry instead of creating a duplicate row.
+        id: "bali-exit:" + a.globalIndex.toString(),
+        txHash: log.transactionHash,
+        l1ClaimTx: log.transactionHash,                    // explicit for merge logic
+        blockNumber: parseInt(log.blockNumber, 16),
+        amount: a.amount,                                  // bigint wei
+        counterparty: a.destinationAddress,                // L1 recipient
+        globalIndex: a.globalIndex.toString(),             // ← join key against bridge-service
+        claimed: true,
+      };
+    };
+
+    // ---------- enrich w/ timestamp ----------
+    // Cache: blockNumber → timestamp ms (avoid hammering eth_getBlockByNumber)
+    const blockTsCache = new Map();
+    const enrichTimestamp = async (events) => {
+      const wanted = [...new Set(events.filter(e => !e.ts).map(e => e.blockNumber))];
+      // small concurrency limit
+      const batch = 5;
+      for (let i = 0; i < wanted.length; i += batch) {
+        const slice = wanted.slice(i, i + batch);
+        await Promise.all(slice.map(async (bn) => {
+          if (blockTsCache.has(bn)) return;
+          try {
+            const ts = await getBlockTimestamp("0x" + bn.toString(16));
+            blockTsCache.set(bn, ts);
+          } catch { /* leave undefined; row will show 'just now' */ }
+        }));
+      }
+      for (const ev of events) {
+        if (!ev.ts && blockTsCache.has(ev.blockNumber)) ev.ts = blockTsCache.get(ev.blockNumber);
+      }
+    };
+
+    // ---------- status state ----------
+    // INBOUND: no Miden-side data → optimistic time-based estimate.
+    //   <5 min after L1 broadcast → "pending"; otherwise → "landed".
+    const inboundStatus = (ev) => {
+      const ageMs = Date.now() - (ev.ts || Date.now());
+      return ageMs < 5 * 60_000 ? "pending" : "landed";
+    };
+    // OUTBOUND: bridge-service exits with empty claim_tx_hash haven't been
+    // pulled to L1 yet → "claimable". Otherwise → "settled".
+    const outboundStatus = (ev) => {
+      if (ev && ev.claimed === false) return "claimable";
+      return "settled";
+    };
+
+    // ---------- render ----------
+    const setLed = (mode) => {
+      ui.led.className = "status-led " + (mode === "live" ? "live" : mode === "error" ? "error" : "");
+      ui.ledText.textContent = mode === "live" ? "LIVE" : mode === "error" ? "DEGRADED" : "CONNECTING";
+    };
+
+    const tickStat = (el, value) => {
+      if (el.textContent !== value) {
+        el.classList.add("tick");
+        el.textContent = value;
+        setTimeout(() => el.classList.remove("tick"), 240);
+      }
+    };
+
+    // 10-day rolling window. On a quiet testnet this gives "is the bridge
+    // alive this week?" — a tighter answer than lifetime totals without going
+    // so narrow that a quiet day shows zeroes.
+    const renderStat = (kind, events, now) => {
+      const cutoff = now - CONFIG.windowMs;
+      const recent = events.filter(e => (e.ts || now) >= cutoff);
+      const sumWei = recent.reduce((acc, e) => acc + e.amount, 0n);
+      const { value: sumValue, unit: sumUnit } = formatEth(sumWei);
+      // Tile value gets the number; the unit ETH/GWEI is part of the label.
+      const labelEl = kind === "inbound"
+        ? document.querySelector('[data-stat-label="in-volume"]')
+        : document.querySelector('[data-stat-label="out-volume"]');
+      if (labelEl) labelEl.textContent = (kind === "inbound" ? "IN" : "OUT") + " · 10D · " + (sumUnit || "ETH");
+
+      if (kind === "inbound") {
+        tickStat(ui.inCount,  String(recent.length));
+        tickStat(ui.inVolume, sumValue);
+      } else {
+        tickStat(ui.outCount,  String(recent.length));
+        tickStat(ui.outVolume, sumValue);
+      }
+    };
+
+    const arrow = (kind) => kind === "inbound" ? "→" : "←";
+
+    const statusLabel = (s) => ({
+      pending:   "PENDING",
+      landed:    "LANDED",
+      claimable: "CLAIMABLE",
+      settled:   "SETTLED",
+    })[s] || s.toUpperCase();
+
+    const explorerUrls = {
+      sepoliaTx:      (h) => "https://sepolia.etherscan.io/tx/"      + h,
+      sepoliaAddress: (a) => "https://sepolia.etherscan.io/address/" + a,
+      midenAccount:   (a) => "https://testnet.midenscan.com/account/" + a,
+    };
+
+    const buildRow = (ev, kind, now) => {
+      const state = kind === "inbound" ? inboundStatus(ev) : outboundStatus(ev);
+      const row = document.createElement("div");
+      row.className = "row";
+      row.dataset.id = ev.id;
+      const recipient = formatRecipient(ev.counterparty, kind);
+      // For unclaimed outbound rows we have no on-chain L1 timestamp; surface
+      // that explicitly instead of synthesising a 'just now' reading.
+      const timeText = (kind === "outbound" && ev.claimed === false)
+        ? "awaiting claim"
+        : timeAgo(ev.ts ? (now - ev.ts) : null);
+
+      let partyChain, partyHref;
+      if (kind === "inbound") {
+        if (recipient.isMiden) {
+          partyChain = "MIDEN ACCT";
+          partyHref  = explorerUrls.midenAccount(recipient.label);
+        } else {
+          // dev-mode deposits that re-used a raw L1 EOA as the Miden target
+          partyChain = "MIDEN ACCT";
+          partyHref  = explorerUrls.midenAccount(recipient.label);
+        }
+      } else {
+        partyChain = "SEPOLIA ADDR";
+        partyHref  = explorerUrls.sepoliaAddress(recipient.label);
+      }
+
+      // Outbound rows can have a Miden-side hash (from bridge-service) AND
+      // an L1 claim tx (once claimed). Inbound rows just have the L1 tx.
+      //
+      // The "midenTx" on outbound is actually the agglayer's SYNTHETIC EVM
+      // event hash, not a real Miden chain tx — midenscan returns an error
+      // for it (it's not indexed there). We surface it as a non-linked
+      // "AGGLAYER EVENT" hash for traceability without a broken link.
+      const midenTxHash = ev.midenTx || null;
+      const l1TxHash    = ev.l1ClaimTx || (kind === "inbound" ? ev.txHash : (ev.midenTx ? null : ev.txHash));
+
+      const amt = formatEth(ev.amount);
+      row.innerHTML = `
+        <div class="row-amount">${amt.value}<span class="row-unit">${amt.unit}</span></div>
+        <div class="row-meta">
+          <span class="row-time">${timeText}</span>
+          <span class="pill ${state}"><span class="dot"></span>${statusLabel(state)}</span>
+        </div>
+        <div class="row-party">
+          <span class="party-arrow">${arrow(kind)}</span>
+          <span class="party-chain">${partyChain}</span>
+          <a class="party-addr" href="${partyHref}" target="_blank" rel="noopener">${recipient.label}</a>
+        </div>
+        ${midenTxHash ? `
+        <div class="row-tx">
+          <span class="tx-label">AGGLAYER EVENT</span>
+          <button type="button" class="agg-link"
+            data-agg-event="${midenTxHash}"
+            data-dest-addr="${ev.counterparty}"
+            data-global-index="${ev.globalIndex || ''}"
+            title="Click to inspect the bridge-service JSON record for this exit"
+            aria-label="Inspect bridge-service record for agglayer event ${midenTxHash.slice(0, 10)}…"
+          >${midenTxHash}</button>
+        </div>` : ""}
+        ${l1TxHash ? `
+        <div class="row-tx">
+          <span class="tx-label">L1 TX</span>
+          <a href="https://sepolia.etherscan.io/tx/${l1TxHash}" target="_blank" rel="noopener">${l1TxHash}</a>
+        </div>` : ""}
+        ${!l1TxHash && !midenTxHash ? `
+        <div class="row-tx">
+          <span class="tx-label">L1 TX</span>
+          <a href="${explorerUrls.sepoliaTx(ev.txHash)}" target="_blank" rel="noopener">${ev.txHash}</a>
+        </div>` : ""}
+      `;
+      // Flag as "already animated" once the rowIn animation has finished so
+      // re-ordering doesn't trigger it again on subsequent polls.
+      setTimeout(() => row.setAttribute("data-rendered", "1"), 400);
+      return row;
+    };
+
+    // In-place update for a row that's still on screen — only mutate the
+    // text nodes that can drift (time-ago + status pill). Avoids the redraw
+    // that was causing the list to jump on every poll.
+    const updateRowMeta = (node, ev, kind, now) => {
+      const state = kind === "inbound" ? inboundStatus(ev) : outboundStatus(ev);
+      const timeText = (kind === "outbound" && ev.claimed === false)
+        ? "awaiting claim"
+        : timeAgo(ev.ts ? (now - ev.ts) : null);
+      const timeEl = node.querySelector(".row-time");
+      if (timeEl && timeEl.textContent !== timeText) timeEl.textContent = timeText;
+      const pill = node.querySelector(".pill");
+      if (pill && !pill.classList.contains(state)) {
+        pill.className = "pill " + state;
+        pill.innerHTML = `<span class="dot"></span>${statusLabel(state)}`;
+      }
+    };
+
+    // Whether we've finished the first render. Used to tag genuinely-new
+    // rows with .fresh (orange pulse) only when they ARRIVE during a session,
+    // not on cache-restore.
+    let firstRenderDone = false;
+
+    // Incremental, jump-free render. Existing rows stay put; only deltas
+    // touch the DOM. The `rowIn` animation only fires on truly-new rows.
+    const renderRows = (container, events, kind, now) => {
+      if (!events.length) {
+        // Only set the empty state once — don't blow away an existing empty node.
+        if (!container.querySelector(".empty")) {
+          const msg = kind === "inbound"
+            ? "No deposits in window · waiting for next bridge in"
+            : "Waiting for first outbound · no Miden → Sepolia withdrawal yet";
+          container.innerHTML = `<div class="empty">${msg}</div>`;
+        }
+        return;
+      }
+
+      // First-data transition: drop the loading or empty placeholder.
+      const placeholder = container.querySelector(".loading, .empty");
+      if (placeholder) placeholder.remove();
+
+      const visible = events.slice(0, CONFIG.maxRowsPerColumn);
+      const wantedIds = new Set(visible.map(e => e.id));
+
+      // Remove rows that fell off the visible window.
+      for (const node of [...container.querySelectorAll(".row")]) {
+        if (!wantedIds.has(node.dataset.id)) node.remove();
+      }
+
+      // Re-order / insert / update. Walk visible newest-first, ensuring each
+      // row sits in the right slot.
+      let cursor = null; // last-correctly-placed row
+      for (const ev of visible) {
+        const sel = `.row[data-id="${cssEscape(ev.id)}"]`;
+        let node = container.querySelector(sel);
+        if (!node) {
+          node = buildRow(ev, kind, now);
+          if (firstRenderDone) node.classList.add("fresh");
+          if (cursor) cursor.after(node);
+          else container.prepend(node);
+        } else {
+          updateRowMeta(node, ev, kind, now);
+          // Reposition only if it's out of order (cheap no-op when already correct).
+          const expectedNext = cursor ? cursor.nextElementSibling : container.firstElementChild;
+          if (node !== expectedNext) {
+            if (cursor) cursor.after(node);
+            else container.prepend(node);
+          }
+        }
+        cursor = node;
+      }
+    };
+
+    // Minimal CSS.escape polyfill — older Safari and some embedded webviews
+    // don't have it, and we need it for `.row[data-id="0xCAFE:0"]` selectors.
+    const cssEscape = (s) =>
+      (typeof CSS !== "undefined" && CSS.escape)
+        ? CSS.escape(s)
+        : String(s).replace(/[^a-zA-Z0-9_\-]/g, (c) => "\\" + c);
+
+    // Mini-scope renderer: 10 bins (one per day of the window), height
+     // normalised to the max bin. Renders directly into the existing <svg>.
+    const renderScope = (svgId, events, now) => {
+      const svg = document.getElementById(svgId);
+      if (!svg) return;
+      const days = 10;
+      const dayMs = 24 * 60 * 60 * 1000;
+      const bins = new Array(days).fill(0);
+      for (const e of events) {
+        const ts = e.ts || now;
+        const age = now - ts;
+        if (age < 0 || age >= days * dayMs) continue;
+        const idx = days - 1 - Math.floor(age / dayMs); // newest on the right
+        bins[idx]++;
+      }
+      const max = Math.max(1, ...bins);
+      const w = 200, h = 20, stepX = w / (days - 1);
+      const y = (v) => h - (v / max) * (h - 2) - 1;
+      const linePts = bins.map((v, i) => (i * stepX).toFixed(1) + "," + y(v).toFixed(1)).join(" ");
+      const areaPts = "0," + h + " " + linePts + " " + w + "," + h;
+      // 4 horizontal grid ticks
+      let grid = "";
+      for (let i = 1; i < 4; i++) {
+        const gy = (i / 4) * h;
+        grid += `<line class="scope-grid" x1="0" y1="${gy}" x2="${w}" y2="${gy}" />`;
+      }
+      const tipX = (days - 1) * stepX;
+      const tipY = y(bins[days - 1]);
+      svg.innerHTML =
+        grid +
+        `<polyline class="scope-area" points="${areaPts}" />` +
+        `<polyline class="scope-line" points="${linePts}" />` +
+        `<circle class="scope-tip" cx="${tipX.toFixed(1)}" cy="${tipY.toFixed(1)}" r="2.2" />`;
+    };
+
+    const renderAll = (state) => {
+      const now = Date.now();
+      // Newest first. Unclaimed bridge-service exits have no on-chain L1
+      // timestamp (we deliberately don't carry the L2 block as a fake ts),
+      // so we sort them ABOVE every claimed row — they're "happening now".
+      // Tie-breaker for two unclaimed rows: higher globalIndex == later exit.
+      const effTs = (e) => {
+        if (e && e.claimed === false) return Number.MAX_SAFE_INTEGER;
+        return e?.ts || 0;
+      };
+      const sortFn = (a, b) => {
+        const dt = effTs(b) - effTs(a);
+        if (dt !== 0) return dt;
+        if (a?.globalIndex && b?.globalIndex) return Number(b.globalIndex) - Number(a.globalIndex);
+        return (b?.blockNumber || 0) - (a?.blockNumber || 0);
+      };
+      const inb = [...state.inbound].sort(sortFn);
+      const out = [...state.outbound].sort(sortFn);
+      renderStat("inbound", inb, now);
+      renderStat("outbound", out, now);
+      renderScope("inboundScope",  inb, now);
+      renderScope("outboundScope", out, now);
+      renderRows(ui.inboundRows, inb, "inbound", now);
+      renderRows(ui.outboundRows, out, "outbound", now);
+      ui.lastUpdate.textContent = formatClock(new Date(now));
+      // After the first paint, subsequent inserts are "fresh" arrivals.
+      firstRenderDone = true;
+    };
+
+    // ---------- merge + dedupe ----------
+    const mergeEvents = (oldArr, newArr) => {
+      const byId = new Map();
+      for (const e of oldArr) byId.set(e.id, e);
+      for (const e of newArr) byId.set(e.id, { ...byId.get(e.id), ...e });
+      // keep most recent 200 per side (storage hygiene)
+      return [...byId.values()].sort((a, b) => b.blockNumber - a.blockNumber).slice(0, 200);
+    };
+
+    // ---------- one poll cycle ----------
+    let state = loadState() || {
+      lastBlock: 0,
+      inbound: [],
+      outbound: [],
+    };
+
+    const pollOnce = async () => {
+      const head = await getBlockNumber();
+      const fromBlock = state.lastBlock > 0
+        ? state.lastBlock + 1
+        : CONFIG.deploymentBlock;     // first visit: backfill from rollup creation
+      const toBlock = head;
+      if (fromBlock > toBlock) {
+        setLed("live");
+        ui.lastUpdate.textContent = formatClock(new Date());
+        return;
+      }
+
+      // Step 1: scan L1 logs in this block range.
+      const [{ logs: bridgeLogs, drainedTo: bridgeTo }, { logs: claimLogs, drainedTo: claimTo }] = await Promise.all([
+        getLogsChunked(fromBlock, toBlock, bridgeTopic),
+        getLogsChunked(fromBlock, toBlock, claimTopic),
+      ]);
+
+      const newInbound    = bridgeLogs.map(decodeBridge).filter(Boolean);
+      const newOutboundL1 = claimLogs.map(decodeClaim).filter(Boolean);
+
+      // Step 2: build the bridge-service query set — config + newly-seen L1
+      // dest addresses + every dest we already have in storage. This is how
+      // we discover the Miden tx for outbounds whose destination wasn't
+      // pre-configured.
+      const queryAddrs = new Set(CONFIG.watchedAddresses.map(a => a.toLowerCase()));
+      for (const e of newOutboundL1) if (e.counterparty) queryAddrs.add(e.counterparty.toLowerCase());
+      for (const e of state.outbound) if (e.counterparty) queryAddrs.add(e.counterparty.toLowerCase());
+
+      // Step 3: pull bridge-service exits for the full set in parallel.
+      const bsResults = await Promise.all([...queryAddrs].map(addr => fetchBridgeServiceExits(addr)));
+      const bsEvents  = bsResults.flat().map(decodeBridgeServiceExit);
+
+      // Step 4: index bridge-service results by globalIndex. This is the
+      // canonical join key between L1 ClaimEvents and bridge-service exits.
+      const bsByGi = new Map();
+      for (const e of bsEvents) bsByGi.set(String(e.globalIndex), e);
+
+      // Step 5: enrich the freshly-decoded L1 outbounds with Miden tx hash.
+      for (const ev of newOutboundL1) {
+        const bs = bsByGi.get(ev.globalIndex);
+        if (bs && bs.midenTx) ev.midenTx = bs.midenTx;
+      }
+      // Also retro-enrich any old stored events that missed enrichment on
+      // their original poll cycle (e.g. before this code shipped).
+      for (const ev of state.outbound) {
+        if (!ev.midenTx && ev.globalIndex) {
+          const bs = bsByGi.get(String(ev.globalIndex));
+          if (bs && bs.midenTx) ev.midenTx = bs.midenTx;
+        }
+      }
+
+      // Step 6: surface unclaimed bridge-service exits (no L1 ClaimEvent yet).
+      const newGiSet = new Set(newOutboundL1.map(e => e.globalIndex));
+      const stateGiSet = new Set(state.outbound.map(e => e.globalIndex).filter(Boolean));
+      const unclaimedExtras = bsEvents.filter(e =>
+        !e.claimed && !newGiSet.has(String(e.globalIndex)) && !stateGiSet.has(String(e.globalIndex))
+      );
+
+      const newOutboundCombined = [...newOutboundL1, ...unclaimedExtras];
+
+      await enrichTimestamp([...newInbound, ...newOutboundCombined]);
+
+      state.inbound  = mergeEvents(state.inbound,  newInbound);
+      state.outbound = mergeEvents(state.outbound, newOutboundCombined);
+      // Both queries chunk identically, so they drain to the same block; pick min
+      // to be safe against any future divergence.
+      state.lastBlock = Math.min(bridgeTo, claimTo);
+      saveState(state);
+
+      setLed("live");
+      renderAll(state);
+    };
+
+    // ---------- mouse spotlight ----------
+    const gridLines = $("gridLines");
+    document.addEventListener("mousemove", (e) => {
+      const rect = gridLines.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * 100;
+      const y = ((e.clientY - rect.top)  / rect.height) * 100;
+      gridLines.style.setProperty("--mx", x + "%");
+      gridLines.style.setProperty("--my", y + "%");
+    }, { passive: true });
+
+    // ---------- bootstrap ----------
+    const layoutGrid = document.querySelector(".layout-grid");
+    const loadingBanner = document.getElementById("loadingBanner");
+    const showLoadingBanner = () => {
+      if (loadingBanner) loadingBanner.hidden = false;
+      if (layoutGrid)    layoutGrid.classList.add("is-loading");
+    };
+    const hideLoadingBanner = () => {
+      if (loadingBanner) loadingBanner.hidden = true;
+      if (layoutGrid)    layoutGrid.classList.remove("is-loading");
+    };
+
+    // Top-of-page progress bar + hero-strip + footer countdown so users can
+    // see the data is on a 30s cadence, not stale.
+    const pollProgress       = document.getElementById("pollProgress");
+    const pollProgressFill   = pollProgress?.querySelector(".poll-progress-fill");
+    const pollCountdownEl    = document.getElementById("pollCountdown");
+    const pollCountdownFootEl= document.getElementById("pollCountdownFooter");
+    let lastPollAt = Date.now();
+    const updatePollProgress = () => {
+      const elapsed = Date.now() - lastPollAt;
+      const frac = Math.min(1, elapsed / CONFIG.pollIntervalMs);
+      if (pollProgressFill) pollProgressFill.style.transform = "scaleX(" + frac.toFixed(4) + ")";
+      const remainingSec = Math.max(0, Math.ceil((CONFIG.pollIntervalMs - elapsed) / 1000));
+      const label = remainingSec + "S";
+      if (pollCountdownEl)     pollCountdownEl.textContent = label;
+      if (pollCountdownFootEl) pollCountdownFootEl.textContent = label;
+    };
+    setInterval(updatePollProgress, 250);
+    updatePollProgress();
+
+    const bootstrap = async () => {
+      setLed("connecting");
+      // If we already have any cached events, render them immediately so the page never sits blank
+      const hasCache = state.inbound.length || state.outbound.length;
+      if (hasCache) renderAll(state);
+      else showLoadingBanner();
+
+      const tick = async () => {
+        // The new poll has STARTED — reset countdown to a full interval.
+        lastPollAt = Date.now();
+        pollProgress?.classList.remove("error");
+        updatePollProgress();
+        try {
+          await pollOnce();
+        } catch (err) {
+          console.warn("[bali-bridge] poll failed:", err);
+          setLed("error");
+          pollProgress?.classList.add("error");
+        } finally {
+          // Banner is only ever shown for the first cold-cache load; after the
+          // first tick (success or error) the columns take over.
+          hideLoadingBanner();
+        }
+      };
+      await tick();
+      setInterval(tick, CONFIG.pollIntervalMs);
+
+      // re-render relative times every 20s without polling
+      setInterval(() => renderAll(state), 20_000);
+    };
+
+    // wire reset button
+    document.getElementById("resetBtn")?.addEventListener("click", () => {
+      Object.keys(localStorage).filter(k => k.startsWith("bali-bridge")).forEach(k => localStorage.removeItem(k));
+      window.location.href = window.location.pathname + "?reset=1";
+    });
+
+    // ---------- JSON modal ----------
+    // Click any AGGLAYER EVENT hash → fetch its bridge-service record + open a
+    // syntax-highlighted modal. The bridge-service is the canonical source for
+    // these synthetic exits; we just pull the per-address response, filter to
+    // the specific exit by global_index, and render.
+    const modal        = document.getElementById("jsonModal");
+    const modalGi      = document.getElementById("modalGi");
+    const modalJson    = document.getElementById("modalJson");
+    const modalReadout = document.getElementById("modalReadout");
+    const modalSrc     = document.getElementById("modalSource");
+    const modalRaw     = document.getElementById("modalRaw");
+    const modeButtons  = modal?.querySelectorAll(".readout-mode button") || [];
+
+    const closeModal = () => {
+      if (!modal) return;
+      modal.hidden = true;
+      document.documentElement.style.overflow = "";
+      // Restore focus to the element that opened the modal — table-stakes a11y.
+      if (modalOpenerEl && typeof modalOpenerEl.focus === "function") {
+        modalOpenerEl.focus();
+      }
+      modalOpenerEl = null;
+    };
+    const openModal = () => {
+      if (!modal) return;
+      modal.hidden = false;
+      document.documentElement.style.overflow = "hidden";
+      // Move focus into the modal so keyboard users land here, not stranded
+      // wherever the page was scrolled.
+      setTimeout(() => modal.querySelector(".modal-close")?.focus(), 0);
+    };
+
+    // Esc + click-on-backdrop close
+    let modalOpenerEl = null; // restore focus to the element that opened the modal
+    document.addEventListener("keydown", (e) => {
+      if (!modal || modal.hidden) return;
+      if (e.key === "Escape") { closeModal(); return; }
+      if (e.key === "Tab") {
+        // Trap focus inside the modal panel
+        const focusables = modal.querySelectorAll("button, a[href], input, [tabindex]:not([tabindex='-1'])");
+        if (focusables.length === 0) return;
+        const first = focusables[0];
+        const last  = focusables[focusables.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    });
+    modal?.addEventListener("click", (e) => {
+      if (e.target && (e.target).dataset && (e.target).dataset.close !== undefined) closeModal();
+    });
+
+    // HTML escape — keeps user / network data from breaking the layout when
+    // we inject it into innerHTML for syntax highlighting.
+    const escHtml = (s) => String(s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+    // Lightweight JSON syntax highlighter. Walks the parsed value rather than
+    // regex-ing a stringified payload so we don't mis-tag keys vs string
+    // values. Produces span-wrapped HTML for the <pre>.
+    const renderJsonHtml = (value, indent) => {
+      indent = indent || 0;
+      const pad = "  ".repeat(indent);
+      const padInner = "  ".repeat(indent + 1);
+      if (value === null) return '<span class="json-null">null</span>';
+      const t = typeof value;
+      if (t === "number" || t === "bigint") return '<span class="json-number">' + escHtml(String(value)) + '</span>';
+      if (t === "boolean") return '<span class="json-boolean">' + String(value) + '</span>';
+      if (t === "string") {
+        if (value === "") return '<span class="json-string">""</span><span class="json-empty"> (empty)</span>';
+        return '<span class="json-string">"' + escHtml(value) + '"</span>';
+      }
+      if (Array.isArray(value)) {
+        if (value.length === 0) return '<span class="json-bracket">[]</span>';
+        const parts = value.map(v => padInner + renderJsonHtml(v, indent + 1));
+        return '<span class="json-bracket">[</span>\n' + parts.join('<span class="json-comma">,</span>\n') + '\n' + pad + '<span class="json-bracket">]</span>';
+      }
+      if (t === "object") {
+        const keys = Object.keys(value);
+        if (keys.length === 0) return '<span class="json-bracket">{}</span>';
+        const parts = keys.map(k =>
+          padInner + '<span class="json-key">"' + escHtml(k) + '"</span><span class="json-comma">:</span> ' + renderJsonHtml(value[k], indent + 1)
+        );
+        return '<span class="json-bracket">{</span>\n' + parts.join('<span class="json-comma">,</span>\n') + '\n' + pad + '<span class="json-bracket">}</span>';
+      }
+      return escHtml(String(value));
+    };
+
+    // Switch between the friendly readout and the raw JSON
+    const setModalMode = (mode) => {
+      modeButtons.forEach(b => {
+        const on = b.dataset.mode === mode;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-selected", on ? "true" : "false");
+      });
+      if (mode === "json") {
+        modalJson.hidden = false;
+        modalReadout.hidden = true;
+      } else {
+        modalJson.hidden = true;
+        modalReadout.hidden = false;
+      }
+    };
+    modeButtons.forEach(b => b.addEventListener("click", () => setModalMode(b.dataset.mode)));
+
+    // Build a human-readable readout of one bridge-service exit record.
+    // Lifecycle stages map the agglayer flow:
+    //   B2AGG note -> synthetic event -> aggsender cert -> claim on L1.
+    const renderAgglayerReadout = (exit) => {
+      const wei = BigInt(exit.amount);
+      const amt = formatEth(wei);
+      const claimed = !!(exit.claim_tx_hash && exit.claim_tx_hash !== "" && exit.claim_tx_hash !== "0x");
+      const readyForClaim = !!exit.ready_for_claim;
+
+      const stages = [
+        {
+          done: true, active: false,
+          label: "B2AGG note submitted on Miden",
+          desc: "User burned source tokens on Miden bali and registered a withdrawal intent."
+        },
+        {
+          done: true, active: false,
+          label: "Agglayer recorded synthetic exit event",
+          desc: "Bridge service indexed the L2 → L1 exit and assigned a global index."
+        },
+        {
+          done: readyForClaim, active: !readyForClaim,
+          label: "Aggsender certificate settled on L1",
+          desc: readyForClaim
+            ? "Pessimistic proof posted to Sepolia. The exit is now claimable."
+            : "Waiting for aggsender to roll up bali exits into a cert and post it on Sepolia. Typical: 30–90 minutes from the B2AGG submission."
+        },
+        {
+          done: claimed, active: readyForClaim && !claimed,
+          label: "User called claimAsset on Sepolia",
+          desc: claimed
+            ? "Funds credited to the L1 recipient. The exit is fully settled."
+            : (readyForClaim
+                ? "Anyone holding the proof can call claimAsset on the L1 bridge contract."
+                : "Becomes possible once the cert settles.")
+        },
+      ];
+
+      const tag = (s) => s.done ? "DONE" : (s.active ? "IN FLIGHT" : "PENDING");
+
+      const direction = (Number(exit.network_id) === 76 && Number(exit.dest_net) === 0)
+        ? { fromNet: "MIDEN · BALI · L2", fromAddr: "(L2 sender)", toNet: "SEPOLIA · L1", toAddr: exit.dest_addr, kind: "outbound" }
+        : (Number(exit.network_id) === 0 && Number(exit.dest_net) === 76)
+          ? { fromNet: "SEPOLIA · L1", fromAddr: "(L1 sender)", toNet: "MIDEN · BALI · L2", toAddr: exit.dest_addr, kind: "inbound" }
+          : { fromNet: "net " + exit.network_id, fromAddr: "·", toNet: "net " + exit.dest_net, toAddr: exit.dest_addr, kind: "other" };
+
+      // Pending L1 claim → quirky hazard-stripe placeholder. The label
+      // explains WHY we're waiting (cert state) so it doesn't feel inert.
+      const l1ClaimPending = readyForClaim
+        ? `
+          <div class="pending-box" role="status" aria-live="polite">
+            <span class="pending-label"><span class="pending-tick">●</span>READY · awaiting claim call</span>
+            <span class="pending-sub">Anyone holding the proof can now call claimAsset on the L1 bridge contract.</span>
+          </div>`
+        : `
+          <div class="pending-box" role="status" aria-live="polite">
+            <span class="pending-label"><span class="pending-tick">●</span>aggsender cert in flight</span>
+            <span class="pending-sub">Bali exits roll up into a pessimistic-proof certificate, then post to Sepolia. Typical: 30–90 min from B2AGG.</span>
+          </div>`;
+
+      return `
+        <header class="readout-amount">
+          <div class="readout-amount-eyebrow">
+            <span>EXIT VALUE · GI ${escHtml(exit.global_index)}</span>
+            <span>${escHtml(direction.kind.toUpperCase())}</span>
+          </div>
+          <div class="readout-amount-value">${escHtml(amt.value)}<span class="readout-amount-unit">${escHtml(amt.unit)}</span></div>
+        </header>
+
+        <section class="readout-section">
+          <h3 class="readout-section-title">Direction</h3>
+          <div class="readout-route">
+            <div class="readout-route-side readout-route-from">
+              <span class="readout-route-net">From</span>
+              <span class="readout-route-addr">${escHtml(direction.fromNet)}</span>
+            </div>
+            <span class="readout-route-arrow" aria-hidden="true">▶</span>
+            <div class="readout-route-side readout-route-to">
+              <span class="readout-route-net">To</span>
+              <span class="readout-route-addr">${escHtml(direction.toNet)}<br>${escHtml(direction.toAddr)}</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="readout-section">
+          <h3 class="readout-section-title">Lifecycle</h3>
+          <ol class="readout-lifecycle">
+            ${stages.map(s => `
+              <li class="lifecycle-stage ${s.done ? 'lifecycle-done' : (s.active ? 'lifecycle-active' : '')}">
+                <span class="lifecycle-dot" aria-hidden="true"></span>
+                <div class="lifecycle-body">
+                  <div class="lifecycle-label">${escHtml(s.label)}</div>
+                  <div class="lifecycle-desc">${escHtml(s.desc)}</div>
+                </div>
+                <span class="lifecycle-tag">${tag(s)}</span>
+              </li>
+            `).join('')}
+          </ol>
+        </section>
+
+        <section class="readout-section">
+          <h3 class="readout-section-title">References</h3>
+          <dl class="readout-refs">
+            <dt>Agglayer event</dt><dd>${escHtml(exit.tx_hash)}</dd>
+            <dt>L1 claim tx</dt>${claimed
+              ? `<dd><a href="https://sepolia.etherscan.io/tx/${escHtml(exit.claim_tx_hash)}" target="_blank" rel="noopener">${escHtml(exit.claim_tx_hash)}</a></dd>`
+              : `<dd>${l1ClaimPending}</dd>`}
+            <dt>L2 block</dt><dd>${escHtml(Number(exit.block_num).toLocaleString())}</dd>
+            <dt>Exit index</dt><dd>${escHtml(String(exit.deposit_cnt))}</dd>
+            <dt>Global index</dt><dd>${escHtml(exit.global_index)}</dd>
+            <dt>Amount (wei)</dt><dd>${escHtml(exit.amount)}</dd>
+            ${exit.metadata && exit.metadata !== "0x" ? `<dt>Metadata</dt><dd>${escHtml(exit.metadata)}</dd>` : ''}
+          </dl>
+        </section>
+      `;
+    };
+
+    const openAgglayerEventModal = async ({ aggHash, destAddr, globalIndex }) => {
+      const apiUrl = CONFIG.bridgeServiceUrl + "/bridges/" + destAddr;
+      modalGi.textContent = globalIndex ? "gi " + globalIndex : aggHash.slice(0, 10) + "…";
+      modalSrc.textContent = "GET /api/bridges/" + destAddr;
+      modalRaw.href = apiUrl;
+      modalReadout.innerHTML = '<span class="json-muted">loading…</span>';
+      modalJson.innerHTML = '<span class="json-muted">loading…</span>';
+      setModalMode("readout");
+      openModal();
+      try {
+        const r = await fetch(apiUrl, { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const json = await r.json();
+        const deposits = (json && json.deposits) || [];
+        const exit = deposits.find(d =>
+          (globalIndex && String(d.global_index) === String(globalIndex)) ||
+          (d.tx_hash && d.tx_hash.toLowerCase() === aggHash.toLowerCase())
+        );
+        if (!exit) {
+          const fallback = '<div class="readout-section"><span class="json-error">No matching exit found in bridge-service response for this hash.</span></div>';
+          modalReadout.innerHTML = fallback;
+          modalJson.innerHTML = renderJsonHtml({ matched: null, total_deposits_for_address: deposits.length }, 0);
+          return;
+        }
+        modalReadout.innerHTML = renderAgglayerReadout(exit);
+        modalJson.innerHTML = renderJsonHtml(exit, 0);
+      } catch (e) {
+        const err = '<div class="readout-section"><span class="json-error">Failed to load bridge-service record: ' + escHtml(e.message) + '</span></div>';
+        modalReadout.innerHTML = err;
+        modalJson.innerHTML = err;
+      }
+    };
+
+    // Delegated click handler — any agg-link in the page triggers the modal.
+    document.addEventListener("click", (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest(".agg-link") : null;
+      if (!btn) return;
+      e.preventDefault();
+      modalOpenerEl = btn;
+      openAgglayerEventModal({
+        aggHash: btn.dataset.aggEvent,
+        destAddr: btn.dataset.destAddr,
+        globalIndex: btn.dataset.globalIndex,
+      });
+    });
+
+    bootstrap();
+  </script>
+
+  <!-- JSON inspector modal (opened from AGGLAYER EVENT clicks) -->
+  <div id="jsonModal" class="modal" hidden role="dialog" aria-labelledby="jsonModalTitle" aria-modal="true">
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-panel" role="document">
+      <header class="modal-header">
+        <div class="modal-title-block">
+          <div class="modal-eyebrow">BRIDGE-SERVICE RECORD</div>
+          <h2 class="modal-title" id="jsonModalTitle">EXIT · <span id="modalGi">·</span></h2>
+        </div>
+        <button class="modal-close" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="modal-body">
+        <div class="readout-mode" role="tablist" aria-label="Display mode">
+          <button type="button" class="active" data-mode="readout" role="tab" aria-selected="true">READOUT</button>
+          <button type="button" data-mode="json" role="tab" aria-selected="false">RAW JSON</button>
+        </div>
+        <div id="modalReadout" class="readout"><span class="json-muted">loading…</span></div>
+        <pre id="modalJson" class="json" hidden><span class="json-muted">loading…</span></pre>
+      </div>
+      <footer class="modal-footer">
+        <span id="modalSource" class="modal-source"></span>
+        <a id="modalRaw" class="modal-raw" target="_blank" rel="noopener">open raw json ↗</a>
+      </footer>
+    </div>
+  </div>
+</body>
+</html>
