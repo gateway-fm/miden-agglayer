@@ -289,11 +289,24 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         "eth_blockNumber" => {
-            let block_num = service
-                .store
-                .get_latest_block_number()
-                .await
-                .map_err(|e| store_error(answer_id.clone(), e))?;
+            // RD-940 Phase 3 — hot read via the BlockMonitor AtomicU64
+            // tip mirror. Falls back to the store on cold boot (mirror
+            // is 0 until the first writer reports). Cuts a stable-state
+            // per-request store round-trip down to a relaxed-atomic load.
+            let mirrored = service.block_monitor.current_tip();
+            let block_num = if mirrored > 0 {
+                mirrored
+            } else {
+                let n = service
+                    .store
+                    .get_latest_block_number()
+                    .await
+                    .map_err(|e| store_error(answer_id.clone(), e))?;
+                if n > 0 {
+                    service.block_monitor.record_tip(n);
+                }
+                n
+            };
             let block_num_str = format!("{:#x}", block_num);
             Ok(JsonRpcResponse::success(answer_id, block_num_str))
         }
@@ -369,11 +382,41 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
         "eth_getTransactionCount" => {
             let params: (String, String) = request.parse_params()?;
-            let nonce = service
+            let addr = &params.0;
+            let tag = params.1.as_str();
+            let mut nonce = service
                 .store
-                .nonce_get(&params.0)
+                .nonce_get(addr)
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?;
+
+            // RD-940 Decision 4 — honour the block tag.
+            //
+            // `store.nonce_get` returns the **next-accepted** nonce because
+            // `eth_sendRawTransaction` advances it on accept (both legacy and
+            // worker paths). That value matches geth's `pending` semantics
+            // directly. For `latest` / `safe` / `finalized` / `earliest` the
+            // RPC must instead return the **next-committed** nonce, computed
+            // as `next-accepted - count(inflight non-terminal jobs from this
+            // signer)`.
+            //
+            // claim-sponsor's `nonce_cache.go:35` LRU reads `latest`; without
+            // this branch it sees queued/submitting txs leak into `latest`
+            // and races itself (Spec E). When the writer worker is disabled
+            // there are no inflight jobs so the two tags agree by
+            // construction.
+            //
+            // Empty / missing tag defaults to `latest` per the geth contract
+            // (`eth_getTransactionCount` second-param convention).
+            let treat_as_latest = matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest");
+            if treat_as_latest
+                && let Some(handle) = service.writer_handle.as_ref()
+                && let Ok(signer_addr) = addr.parse::<alloy::primitives::Address>()
+            {
+                let inflight = handle.count_non_terminal_for_signer(&signer_addr);
+                nonce = nonce.saturating_sub(inflight as u64);
+            }
+
             Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
         }
 
@@ -394,6 +437,24 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             match &result {
                 Ok(hash) => tracing::info!("eth_sendRawTransaction: OK hash={hash}"),
                 Err(err) => tracing::info!("eth_sendRawTransaction: ERR {err:#}"),
+            }
+            // RD-940 — promote writer-queue-saturation to JSON-RPC -32005
+            // (geth's `LimitExceeded`). aggkit's ethtxmanager retries
+            // `-32005` transparently; without this mapping the default
+            // `ApplicationError(1) = SendRawTransaction` would conflate
+            // queue backpressure with all other tx-submission failures,
+            // and ethtxmanager would not classify it as transient.
+            if let Err(err) = &result
+                && err
+                    .downcast_ref::<crate::writer_worker::WriterQueueSaturatedError>()
+                    .is_some()
+            {
+                let error = JsonRpcError::new(
+                    JsonRpcErrorReason::ServerError(-32005),
+                    "writer queue saturated; retry".to_string(),
+                    serde_json::Value::Null,
+                );
+                return Err(JsonRpcResponse::error(answer_id, error));
             }
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::SendRawTransaction)
         }
@@ -441,6 +502,30 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             {
                 let txn = data.to_rpc_transaction(txn_hash, &service.block_state);
                 return Ok(JsonRpcResponse::success(answer_id, txn));
+            }
+
+            // RD-940 Spec D — in-flight (writer-worker accepted but not yet
+            // committed). Returns the geth pending-tx shape: `blockHash`,
+            // `blockNumber`, `transactionIndex` JSON null, every other
+            // numeric field hex-encoded so aggkit's Go-side
+            // hexutil.Uint{,64}/Big unmarshallers don't panic. See
+            // service_helpers::build_inflight_pending_tx_json for the
+            // full contract.
+            if let Some(handle) = service.writer_handle.as_ref()
+                && let Some(entry) = handle.get_inflight(&txn_hash)
+            {
+                tracing::debug!(
+                    tx_hash = %txn_hash,
+                    state = ?entry.state,
+                    "eth_getTransactionByHash: returning in-flight pending shape"
+                );
+                return Ok(JsonRpcResponse::success(
+                    answer_id,
+                    crate::service_helpers::build_inflight_pending_tx_json(
+                        &entry,
+                        service.chain_id,
+                    ),
+                ));
             }
 
             // Fallback: synthetic transactions (bridge-out events)

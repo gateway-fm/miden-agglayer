@@ -264,6 +264,50 @@ e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
 e2e-rd913-restart-burn-collision: e2e-up ## Spin up stack + verify monitor state survives proxy restart (RD-913)
 	$(COMPOSE_ENV) ./scripts/e2e-rd913-restart-burn-collision.sh
 
+# --- RD-940 e2e -----------------------------------------------------------
+# All RD-940 e2e scripts require the writer worker active. The `e2e-rd940-up`
+# helper sets AGGLAYER_ENABLE_WRITER_WORKER=true before bringing up the stack.
+
+.PHONY: e2e-rd940-up
+e2e-rd940-up: e2e-clean-data ## Bring up the stack with the RD-940 writer worker enabled
+	AGGLAYER_ENABLE_WRITER_WORKER=true \
+	  AGGLAYER_WRITER_QUEUE_DEPTH=$${AGGLAYER_WRITER_QUEUE_DEPTH:-64} \
+	  AGGLAYER_WRITER_TX_TTL=$${AGGLAYER_WRITER_TX_TTL:-300} \
+	  $(E2E_COMPOSE) up -d --build --wait
+
+.PHONY: e2e-rd940-async-submit
+e2e-rd940-async-submit: e2e-rd940-up ## Golden async-submit + metric registration
+	$(COMPOSE_ENV) ./scripts/e2e-rd940-async-submit.sh
+
+.PHONY: e2e-rd940-pending-receipt
+e2e-rd940-pending-receipt: e2e-rd940-up ## Spec D wire-shape: null vs status:0x0 contract
+	$(COMPOSE_ENV) ./scripts/e2e-rd940-pending-receipt.sh
+
+.PHONY: e2e-rd940-queue-backpressure
+e2e-rd940-queue-backpressure: e2e-rd940-up ## -32005 mapping under concurrent burst
+	$(COMPOSE_ENV) ./scripts/e2e-rd940-queue-backpressure.sh
+
+.PHONY: e2e-rd940-restart-inflight
+e2e-rd940-restart-inflight: e2e-rd940-up ## SIGTERM -> graceful drain -> dropped_on_restart accounting
+	$(COMPOSE_ENV) ./scripts/e2e-rd940-restart-inflight.sh
+
+.PHONY: e2e-rd940-worker-panic
+e2e-rd940-worker-panic: e2e-rd940-up ## Failure-metric registration + claim_watcher floor
+	$(COMPOSE_ENV) ./scripts/e2e-rd940-worker-panic.sh
+
+.PHONY: e2e-rd940-claim-guard-cancellation
+e2e-rd940-claim-guard-cancellation: e2e-rd940-up ## 32 concurrent disconnects, no leaked locks
+	$(COMPOSE_ENV) ./scripts/e2e-rd940-claim-guard-cancellation.sh
+
+.PHONY: e2e-rd940
+e2e-rd940: e2e-rd940-up ## Run all 6 RD-940 e2e scripts in sequence
+	@set -e; \
+	for s in async-submit pending-receipt queue-backpressure restart-inflight \
+	         worker-panic claim-guard-cancellation; do \
+	    echo ""; echo "── RD-940 e2e: $$s ──"; \
+	    $(COMPOSE_ENV) ./scripts/e2e-rd940-$$s.sh; \
+	done
+
 .PHONY: repro-rd862
 repro-rd862: ## Run RD-862 GER-injection race repro (assumes stack is up); prints orphan rate
 	N_DEPOSITS=$${N_DEPOSITS:-30} INTER_DELAY_MS=$${INTER_DELAY_MS:-0} POLL_TIMEOUT=$${POLL_TIMEOUT:-300} \

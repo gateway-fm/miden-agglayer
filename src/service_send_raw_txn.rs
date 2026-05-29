@@ -126,14 +126,24 @@ async fn record_local_success_at_block(
         .await
 }
 
-/// Handle a claimAsset transaction: skip zero-amount or publish claim.
-async fn handle_claim_asset(
+/// Handle a `claimAsset` transaction: skip zero-amount or publish the claim.
+///
+/// RD-940 Phase 1: this is the unified dispatcher for both the legacy sync
+/// path and the new writer-worker path. **It does NOT advance the per-signer
+/// nonce** — the caller in `service_send_raw_txn` does that once, after the
+/// dispatch (sync) or after a successful `try_enqueue` (worker), so the two
+/// paths agree on when nonce advances.
+///
+/// `_` suffix in `_signer_str_unused` calls below is a deliberate marker that
+/// this function used to own three `nonce_increment` calls — see git blame on
+/// the previous revision.
+pub(crate) async fn worker_handle_claim_asset(
     service: &ServiceState,
     params: claimAssetCall,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     signer: Address,
-) -> anyhow::Result<TxHash> {
+) -> anyhow::Result<()> {
     // Only claims where destinationNetwork matches our network_id are processed.
     //
     // RD-703 — `service.network_id` is `u32` (validated at startup in
@@ -155,11 +165,7 @@ async fn handle_claim_asset(
     if params.amount.is_zero() {
         tracing::info!("skipping zero-amount claim (genesis batch)");
         record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![]).await?;
-        service
-            .store
-            .nonce_increment(&format!("{signer:#x}"))
-            .await?;
-        return Ok(txn_hash);
+        return Ok(());
     }
 
     // RD-860 — swallow unresolvable-destination claims permanently. If the
@@ -221,11 +227,7 @@ async fn handle_claim_asset(
         let event = crate::claim::ClaimEvent::from(params.clone());
         let log = <crate::claim::ClaimEvent as alloy::sol_types::SolEvent>::encode_log_data(&event);
         record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![log]).await?;
-        service
-            .store
-            .nonce_increment(&format!("{signer:#x}"))
-            .await?;
-        return Ok(txn_hash);
+        return Ok(());
     }
 
     // C6 — gate on `has_seen_ger` BEFORE acquiring the claim lock.
@@ -284,11 +286,7 @@ async fn handle_claim_asset(
     // the guard to forget so its Drop is a no-op.
     guard.commit();
 
-    service
-        .store
-        .nonce_increment(&format!("{signer:#x}"))
-        .await?;
-    Ok(txn_hash)
+    Ok(())
 }
 
 /// RAII guard that releases a `try_claim` lock if the holding future is dropped
@@ -396,6 +394,85 @@ async fn publish_and_record_claim(
     Ok(())
 }
 
+/// Best-effort resolution of `(mainnet_exit_root, rollup_exit_root)` from the
+/// L1 GER contract for an `insertGlobalExitRoot` call.
+///
+/// RD-940 Phase 1 — extracted from the inline block previously living at the
+/// top of the `insertGlobalExitRoot` dispatch in `service_send_raw_txn` so
+/// both the legacy sync path and the writer-worker enqueue path resolve in
+/// exactly the same way. **Runs on the request thread** so the worker doesn't
+/// block on slow L1 view calls; the mainnet/rollup pair is materialised into
+/// the `DecodedWriteCall::Ger` payload before enqueue.
+///
+/// Under the RD-862 race-path L1 has usually advanced past the pair that
+/// produced the combined hash, so the keccak check fails and we return
+/// `(None, None)`. That's non-fatal — `L1InfoTreeIndexer` backfills the row
+/// via UPSERT on its own poll loop (`src/l1_info_tree_indexer.rs:124-223`),
+/// so bridge-service's subsequent `zkevm_getExitRootsByGER` poll converges.
+async fn resolve_l1_exit_roots(
+    service: &ServiceState,
+    ger_bytes: [u8; 32],
+) -> (Option<[u8; 32]>, Option<[u8; 32]>) {
+    match (&service.l1_rpc_url, &service.ger_l1_address) {
+        (Some(l1_rpc), Some(ger_addr)) => match ger::fetch_l1_exit_roots(l1_rpc, ger_addr).await {
+            Ok((m, r)) => {
+                let computed = ger::combined_ger(&m, &r);
+                if computed == ger_bytes {
+                    (Some(m), Some(r))
+                } else {
+                    tracing::debug!(
+                        "L1 exit roots don't match injected GER (L1 may have advanced); \
+                         indexer will backfill via set_ger_exit_roots"
+                    );
+                    (None, None)
+                }
+            }
+            Err(e) => {
+                tracing::debug!("failed to fetch L1 exit roots ({e:#}); indexer will backfill");
+                (None, None)
+            }
+        },
+        _ => (None, None),
+    }
+}
+
+/// Unified GER-insert / updateExitRoot dispatcher used by both the legacy sync
+/// path and the writer-worker path. **Does NOT advance the per-signer
+/// nonce** — see the matching note on `worker_handle_claim_asset`.
+///
+/// `mainnet_root` / `rollup_root` are populated by `resolve_l1_exit_roots`
+/// (insertGlobalExitRoot) or by the call params directly (updateExitRoot), so
+/// the worker doesn't need to know which selector originated the call.
+pub(crate) async fn worker_handle_ger_insert(
+    service: &ServiceState,
+    ger_bytes: [u8; 32],
+    mainnet_root: Option<[u8; 32]>,
+    rollup_root: Option<[u8; 32]>,
+    txn_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+) -> anyhow::Result<()> {
+    handle_ger_result(
+        ger::insert_ger(
+            ger_bytes,
+            mainnet_root,
+            rollup_root,
+            &service.miden_client,
+            service.accounts.clone(),
+            &service.store,
+            &service.block_state,
+            txn_hash,
+        )
+        .await,
+        txn_hash,
+        txn_envelope,
+        signer,
+        service,
+        ger_bytes,
+    )
+    .await
+}
+
 /// Check whether the recovered signer is permitted to submit transactions.
 ///
 /// `None` = open mode (legacy default). `Some(list)` = explicit allow-list — every
@@ -447,6 +524,45 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let signer = txn_envelope.recover_signer()?;
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
+    // RD-940 Decision 3 — tx-hash dedup early-return, BEFORE the R4 nonce check.
+    //
+    // aggkit's ethtxmanager re-broadcasts stuck txs within its
+    // `WaitTxToBeMined = 2m` envelope (`fixtures/aggkit-config.toml:43`).
+    // Without this short-circuit the re-broadcast races R4's `tx.nonce ==
+    // expected_nonce` check (the first accept already advanced the nonce),
+    // the duplicate gets a "nonce mismatch" error, and aggkit's state machine
+    // wedges. Returning `Ok(hash)` on a known hash matches geth's idempotent
+    // re-broadcast behaviour (Spec D / Spec E).
+    //
+    // Two lookups, OR'd:
+    //   1. Writer in-flight cache — present when the worker has accepted but
+    //      not yet committed. Set/cleared by `WriterWorkerHandle::try_enqueue`
+    //      and the worker's `process` loop.
+    //   2. Store `txn_get` — present once a receipt has been written (either
+    //      Committed or Failed via TTL/worker-failure). Covers the case where
+    //      a re-broadcast arrives after the worker has finished.
+    //
+    // Runs BEFORE `per_signer_lock` so contention from re-broadcast bursts
+    // doesn't pile up on the lock.
+    if let Some(handle) = service.writer_handle.as_ref()
+        && handle.is_inflight(&txn_hash)
+    {
+        tracing::debug!(
+            target: "rpc::dedup",
+            %txn_hash,
+            "tx-hash dedup (inflight): returning OK without re-enqueueing"
+        );
+        return Ok(txn_hash);
+    }
+    if matches!(service.store.txn_get(txn_hash).await, Ok(Some(_))) {
+        tracing::debug!(
+            target: "rpc::dedup",
+            %txn_hash,
+            "tx-hash dedup (committed): returning OK without re-running R4"
+        );
+        return Ok(txn_hash);
+    }
+
     // R4 follow-up — serialise the entire nonce-check + handler critical section
     // for this signer. Without the mutex, two concurrent same-nonce txs both
     // pass the equality check before either calls `nonce_increment`. This guard
@@ -492,114 +608,123 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         );
     }
 
+    // ── Method decode ───────────────────────────────────────────────────
+    //
+    // Decoding the selector + ABI on the request thread (rather than inside
+    // the worker) keeps malformed payloads from poisoning the queue and lets
+    // both the legacy sync path and the worker path share the same dispatch
+    // shape downstream. The `DecodedWriteCall` enum is defined in
+    // `writer_worker` so it can also serve as the wire shape for the v1.5
+    // durable-queue migration sketched in `docs/design/RD-940-async-writer.md`.
     let params_encoded = &txn.input;
-    if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
+    let decoded = if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
         tracing::debug!("claimAsset call");
         let params = claimAssetCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
-        return handle_claim_asset(&service, params, txn_hash, txn_envelope, signer).await;
-    }
-
-    if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
+        crate::writer_worker::DecodedWriteCall::Claim {
+            params: Box::new(params),
+        }
+    } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
         tracing::debug!("insertGlobalExitRoot call");
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
         let ger_bytes: [u8; 32] = params.root.0;
-
-        // Best-effort resolve `(mainnet, rollup)` from L1 via view calls on
-        // the GER contract. This is the RD-862 race path: under deposit load
-        // L1 has usually advanced past the pair that produced the combined
-        // hash before we get here, so the keccak check fails. That's fine —
-        // the `L1InfoTreeIndexer` (see `l1_info_tree_indexer.rs`) reads
-        // `UpdateL1InfoTree` events directly and backfills the components
-        // via `set_ger_exit_roots` UPSERT. Bridge-service's subsequent
-        // `zkevm_getExitRootsByGER` poll picks up the resolved entry, so
-        // an `(None, None)` outcome here is non-fatal. Logged at debug
-        // because the indexer guarantees convergence — a stuck deposit
-        // would surface elsewhere (indexer cursor stalled, store error).
-        let (mainnet_root, rollup_root) = match (&service.l1_rpc_url, &service.ger_l1_address) {
-            (Some(l1_rpc), Some(ger_addr)) => {
-                match ger::fetch_l1_exit_roots(l1_rpc, ger_addr).await {
-                    Ok((m, r)) => {
-                        let computed = ger::combined_ger(&m, &r);
-                        if computed == ger_bytes {
-                            (Some(m), Some(r))
-                        } else {
-                            tracing::debug!(
-                                "L1 exit roots don't match injected GER (L1 may have advanced); \
-                                 indexer will backfill via set_ger_exit_roots"
-                            );
-                            (None, None)
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "failed to fetch L1 exit roots ({e:#}); indexer will backfill"
-                        );
-                        (None, None)
-                    }
-                }
-            }
-            _ => (None, None),
-        };
-
-        handle_ger_result(
-            ger::insert_ger(
-                ger_bytes,
-                mainnet_root,
-                rollup_root,
-                &service.miden_client,
-                service.accounts.clone(),
-                &service.store,
-                &service.block_state,
-                txn_hash,
-            )
-            .await,
-            txn_hash,
-            txn_envelope,
-            signer,
-            &service,
+        let (mainnet_root, rollup_root) = resolve_l1_exit_roots(&service, ger_bytes).await;
+        crate::writer_worker::DecodedWriteCall::Ger {
             ger_bytes,
-        )
-        .await?;
+            mainnet_root,
+            rollup_root,
+        }
     } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
         tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-
         let mainnet_root = params.newMainnetExitRoot.0;
         let rollup_root = params.newRollupExitRoot.0;
         let combined_ger = ger::combined_ger(&mainnet_root, &rollup_root);
-
-        handle_ger_result(
-            ger::insert_ger(
-                combined_ger,
-                Some(mainnet_root),
-                Some(rollup_root),
-                &service.miden_client,
-                service.accounts.clone(),
-                &service.store,
-                &service.block_state,
-                txn_hash,
-            )
-            .await,
-            txn_hash,
-            txn_envelope,
-            signer,
-            &service,
-            combined_ger,
-        )
-        .await?;
+        crate::writer_worker::DecodedWriteCall::Ger {
+            ger_bytes: combined_ger,
+            mainnet_root: Some(mainnet_root),
+            rollup_root: Some(rollup_root),
+        }
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");
         anyhow::bail!("unhandled txn method {params_encoded:?}");
-    }
+    };
 
-    service
-        .store
-        .nonce_increment(&format!("{signer:#x}"))
-        .await?;
-    Ok(txn_hash)
+    // ── Dispatch fork (RD-940) ──────────────────────────────────────────
+    //
+    // `enable_writer_worker` defaults to false — the legacy synchronous
+    // branch below is byte-identical to pre-RD-940 behaviour for the
+    // claim and GER paths. When the flag is enabled and a writer handle
+    // is plumbed, requests are enqueued for asynchronous Miden submission
+    // and the HTTP future returns the tx-hash as soon as `try_enqueue`
+    // succeeds.
+    //
+    // Nonce-advance ordering matters under both branches:
+    //   - legacy: dispatch runs to completion → nonce_increment (current
+    //     behaviour preserved bit-for-bit)
+    //   - worker: try_enqueue → on Ok, nonce_increment; on QueueFull, the
+    //     nonce is intentionally **not** advanced so the caller retries
+    //     with the same nonce and -32005 doesn't burn a sequence slot
+    //
+    // Decision 3 (idempotent re-broadcast) and Decision 4
+    // (eth_getTransactionCount tag honouring) land in Phase 2.
+    if service.enable_writer_worker {
+        let handle = service.writer_handle.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "enable_writer_worker=true but no writer_handle plumbed into ServiceState; \
+                 boot order bug — see main.rs writer spawn block"
+            )
+        })?;
+        let job = decoded.into_job(txn_envelope, signer, txn_hash);
+        match handle.try_enqueue(job) {
+            Ok(()) => {
+                service.store.nonce_increment(&signer_str).await?;
+                Ok(txn_hash)
+            }
+            Err(crate::writer_worker::TryEnqueueError::QueueFull) => {
+                // The downcast on this typed error in `service.rs`
+                // promotes the JSON-RPC error code to -32005 (geth's
+                // LimitExceeded), letting aggkit's ethtxmanager retry
+                // transparently. The metric was already incremented in
+                // try_enqueue.
+                Err(crate::writer_worker::WriterQueueSaturatedError.into())
+            }
+            Err(crate::writer_worker::TryEnqueueError::ShutDown) => {
+                anyhow::bail!(
+                    "writer worker has shut down — service is draining; retry against the next \
+                     replica"
+                );
+            }
+        }
+    } else {
+        // Legacy synchronous dispatch — unchanged behaviour.
+        match decoded {
+            crate::writer_worker::DecodedWriteCall::Claim { params } => {
+                worker_handle_claim_asset(&service, *params, txn_hash, txn_envelope, signer)
+                    .await?;
+            }
+            crate::writer_worker::DecodedWriteCall::Ger {
+                ger_bytes,
+                mainnet_root,
+                rollup_root,
+            } => {
+                worker_handle_ger_insert(
+                    &service,
+                    ger_bytes,
+                    mainnet_root,
+                    rollup_root,
+                    txn_hash,
+                    txn_envelope,
+                    signer,
+                )
+                .await?;
+            }
+        }
+        service.store.nonce_increment(&signer_str).await?;
+        Ok(txn_hash)
+    }
 }
 
 #[cfg(test)]
@@ -1170,6 +1295,45 @@ mod tests {
         assert!(is_signer_allowed(Some(&list), &alice));
         assert!(is_signer_allowed(Some(&list), &bob));
         assert!(!is_signer_allowed(Some(&list), &carol));
+    }
+
+    /// RD-940 Decision 3 — tx-hash dedup early-return.
+    ///
+    /// aggkit's ethtxmanager re-broadcasts stuck txs within
+    /// `WaitTxToBeMined = 2m`. Without dedup, the re-broadcast races R4
+    /// nonce equality (the original accept already advanced the nonce) and
+    /// the duplicate gets "nonce mismatch", wedging aggkit's state machine.
+    ///
+    /// Submit a tx twice, assert: (1) both calls return the same `Ok(hash)`,
+    /// (2) the nonce advanced exactly once. The dedup branch fires because
+    /// `txn_get` returns Some after the first accept commits a receipt.
+    #[tokio::test]
+    async fn rd940_decision3_idempotent_rebroadcast_returns_same_hash() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xCCu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+
+        // First submission — runs the full pipeline.
+        let first = service_send_raw_txn(service.clone(), input_hex.clone())
+            .await
+            .expect("first submit must succeed");
+        // Second submission with the SAME wire bytes — should hit the dedup
+        // path and return the same hash without re-running anything.
+        let second = service_send_raw_txn(service.clone(), input_hex)
+            .await
+            .expect("re-broadcast must succeed via dedup");
+        assert_eq!(first, second, "dedup must return the original tx hash");
+
+        // Nonce must have advanced exactly once.
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            1,
+            "dedup must not double-advance the nonce"
+        );
     }
 
     /// R2 integration repro — a signed tx whose signer is NOT on the allow-list

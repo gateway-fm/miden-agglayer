@@ -1,3 +1,4 @@
+use crate::block_monitor::BlockMonitor;
 use crate::block_state::BlockState;
 use crate::store::Store;
 use crate::*;
@@ -67,6 +68,10 @@ pub struct ServiceState {
     pub network_id: u32,
     pub store: Arc<dyn Store>,
     pub block_state: Arc<BlockState>,
+    /// RD-940 Phase 3 — single-reader fast tip cache for `eth_blockNumber`.
+    /// See `src/block_monitor.rs` module docstring. Cloned via `Arc`
+    /// across every dispatcher; shared write surface for tip mirror updates.
+    pub block_monitor: Arc<BlockMonitor>,
     /// L1 RPC URL for resolving exit roots from the L1 GER contract
     pub l1_rpc_url: Option<String>,
     /// L1 GER contract address
@@ -120,6 +125,22 @@ pub struct ServiceState {
     /// call. `None` when talking to the node directly; `Some(...)` when fronted by a
     /// gateway that rate-limits unauthenticated traffic. Redact if you ever log this.
     pub miden_api_key: Option<String>,
+    /// RD-940 async writer-worker dispatch toggle. When `false` (the default
+    /// until Phase 7 of the RD-940 rollout), `eth_sendRawTransaction` runs the
+    /// existing synchronous handler unchanged. When `true`, requests are
+    /// validated on the request thread and the actual Miden submission is
+    /// enqueued to the single writer-worker task. See
+    /// `docs/design/RD-940-async-writer.md` for the full design.
+    pub enable_writer_worker: bool,
+    /// RD-940 writer-worker producer handle. `None` when
+    /// `enable_writer_worker = false` *or* when the flag is set but the
+    /// worker failed to spawn at startup (logged-but-non-fatal — the sync
+    /// path remains usable as the fallback). `Some(handle)` is the live
+    /// `try_enqueue` surface plumbed into `service_send_raw_txn` and the
+    /// upcoming Phase 4 `eth_getTransactionByHash` in-flight reader. The
+    /// `Arc` shares the underlying channel + in-flight DashMap across every
+    /// `ServiceState::clone()` the dispatcher hands out.
+    pub writer_handle: Option<Arc<crate::writer_worker::WriterWorkerHandle>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -143,6 +164,7 @@ impl ServiceState {
         let expected_mints = Arc::new(crate::expected_mint_tracker::ExpectedMintTracker::new(
             store.clone(),
         ));
+        let block_monitor = Arc::new(BlockMonitor::new(block_state.clone()));
         Self {
             miden_client: Arc::new(miden_client),
             accounts,
@@ -150,6 +172,7 @@ impl ServiceState {
             network_id,
             store,
             block_state,
+            block_monitor,
             l1_rpc_url: None,
             ger_l1_address: None,
             miden_store_dir: PathBuf::new(),
@@ -163,6 +186,8 @@ impl ServiceState {
             reject_hardhat_alias: false,
             expected_mints,
             miden_api_key: None,
+            enable_writer_worker: false,
+            writer_handle: None,
         }
     }
 }

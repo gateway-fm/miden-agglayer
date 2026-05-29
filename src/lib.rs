@@ -1,6 +1,7 @@
 pub mod account_recovery;
 pub mod accounts_config;
 pub mod address_mapper;
+pub mod block_monitor;
 pub mod block_state;
 pub mod bridge_address;
 pub mod bridge_out;
@@ -39,6 +40,7 @@ pub mod store;
 pub mod test_helpers;
 pub mod twin_note_detector;
 pub mod unknown_wrapper_detector;
+pub mod writer_worker;
 
 pub const COMPONENT: &str = "miden-agglayer";
 

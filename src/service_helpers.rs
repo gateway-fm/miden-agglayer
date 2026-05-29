@@ -170,6 +170,120 @@ pub(crate) fn build_synthetic_tx_json(
     })
 }
 
+/// RD-940 Decision 3 wire-shape — `eth_getTransactionByHash` JSON for a
+/// **pending** (in-flight, not yet committed) transaction.
+///
+/// **Critical contract** (Spec D §2.4): only the three block-relative fields
+/// are JSON `null` — `blockHash`, `blockNumber`, `transactionIndex`. All
+/// other numeric fields must be hex strings, never `null`, because Go's
+/// `hexutil.Uint{,64}` and `hexutil.Big` value-type unmarshallers panic on
+/// `null`. aggkit's ethtxmanager treats the block-fields-null shape as
+/// "accepted but not yet mined" and keeps polling; a single missing or
+/// nulled non-block field is undetectable from Rust-only tests but breaks
+/// aggkit silently.
+///
+/// Fields populated from the signed envelope (nonce, gas, value, to, input,
+/// chainId); `from` is the recovered signer captured at enqueue time;
+/// `v`/`r`/`s` are placeholder values matching `build_synthetic_tx_json` —
+/// aggkit's monitor does not verify them.
+pub(crate) fn build_inflight_pending_tx_json(
+    entry: &crate::writer_worker::InFlightEntry,
+    chain_id: u64,
+) -> serde_json::Value {
+    use alloy::consensus::TxEnvelope;
+    use alloy::primitives::TxKind;
+
+    // Pull the wire fields out of the signed envelope. Each variant exposes
+    // the same surface but through a different concrete tx type — match
+    // exhaustively so a future EIP-7702 / EIP-4844 path doesn't silently
+    // emit zero-valued fields.
+    let (nonce, gas, gas_price, value, to, input) = match &entry.envelope {
+        TxEnvelope::Legacy(s) => {
+            let t = s.tx();
+            (
+                t.nonce,
+                t.gas_limit,
+                t.gas_price,
+                t.value,
+                t.to,
+                t.input.clone(),
+            )
+        }
+        TxEnvelope::Eip1559(s) => {
+            let t = s.tx();
+            (
+                t.nonce,
+                t.gas_limit,
+                t.max_fee_per_gas,
+                t.value,
+                t.to,
+                t.input.clone(),
+            )
+        }
+        TxEnvelope::Eip2930(s) => {
+            let t = s.tx();
+            (
+                t.nonce,
+                t.gas_limit,
+                t.gas_price,
+                t.value,
+                t.to,
+                t.input.clone(),
+            )
+        }
+        TxEnvelope::Eip4844(s) => {
+            let t = s.tx().tx();
+            (
+                t.nonce,
+                t.gas_limit,
+                t.max_fee_per_gas,
+                t.value,
+                TxKind::Call(t.to),
+                t.input.clone(),
+            )
+        }
+        TxEnvelope::Eip7702(s) => {
+            let t = s.tx();
+            (
+                t.nonce,
+                t.gas_limit,
+                t.max_fee_per_gas,
+                t.value,
+                TxKind::Call(t.to),
+                t.input.clone(),
+            )
+        }
+    };
+
+    let to_field = match to {
+        TxKind::Call(addr) => serde_json::Value::String(format!("{addr:#x}")),
+        TxKind::Create => serde_json::Value::Null,
+    };
+
+    serde_json::json!({
+        "type": "0x0",
+        "nonce": format!("0x{nonce:x}"),
+        "gasPrice": format!("0x{gas_price:x}"),
+        "gas": format!("0x{gas:x}"),
+        "to": to_field,
+        "value": format!("{value:#x}"),
+        "input": format!("0x{}", ::hex::encode(input.as_ref())),
+        // v/r/s placeholders — aggkit's monitor doesn't verify them on
+        // pending; the actual signature lives on the envelope we already
+        // accepted at sendRawTransaction time.
+        "v": "0x1b",
+        "r": "0x1",
+        "s": "0x1",
+        "hash": format!("{:#x}", entry.eth_tx_hash),
+        "from": format!("{:#x}", entry.signer),
+        // The three load-bearing nulls — pending tx, not yet mined.
+        "blockHash": serde_json::Value::Null,
+        "blockNumber": serde_json::Value::Null,
+        "transactionIndex": serde_json::Value::Null,
+        "chainId": format!("0x{chain_id:x}"),
+    })
+}
+
 /// Encode `bridgeAsset(...)` calldata from a BridgeEvent synthetic log.
 pub(crate) fn encode_bridge_asset_from_log(log: &crate::log_synthesis::SyntheticLog) -> String {
     let data_hex = log.data.strip_prefix("0x").unwrap_or(&log.data);

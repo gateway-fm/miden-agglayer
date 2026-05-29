@@ -8,8 +8,10 @@ extend-exclude = ["*.lock", "dist", "target", "fixtures"]
 abd = "abd"
 
 [default.extend-identifiers]
-# Short commit-SHA fragment referenced in postmortems, runbooks, and one
-# source comment. typos-cli's word splitter sees `dbe5c2d` as `dbe` + digits
-# and flags `dbe` as a typo of `be`. Allowlist the specific identifier
-# rather than the bare word so unrelated occurrences of `dbe` still surface.
+# Short commit-SHA fragments referenced in postmortems, runbooks, and source
+# comments. typos-cli's word splitter sees e.g. `dbe5c2d` as `dbe` + digits
+# and flags `dbe` as a typo of `be`; same for the RD-940 Phase 0 SHA
+# `2ba4b92` (`2ba` → `by`). Allowlist by exact identifier so unrelated
+# occurrences of `dbe`/`2ba` still surface.
 dbe5c2d = "dbe5c2d"
+"2ba4b92" = "2ba4b92"
