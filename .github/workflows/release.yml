@@ -27,18 +27,27 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: gatewayfm/miden-agglayer
+          # `latest=false` is load-bearing. docker/metadata-action defaults to
+          # `flavor: latest=auto`, which AUTO-appends a moving `:latest` tag for
+          # any semver git-tag push — independent of the `tags:` list below.
+          # That auto-`:latest` (NOT the `tags:` list) is what kept failing
+          # every release against Docker Hub tag-immutability, including v0.5.0:
+          # buildx pushed `:{version}` fine, then was denied on `:latest`. The
+          # earlier "drop :latest" edits only touched `tags:`, so the auto-flavor
+          # silently re-added it. Disabling the flavor is the actual fix.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
           # NOTE: Only the exact `:{version}` tag is pushed. The Docker Hub
           # repository has tag-immutability enabled across the board, so
           # any *moving* tag fails on the second release that tries to
-          # update it. `:latest` killed v0.2.0, v0.2.1, v0.3.0, and v0.4.0
-          # first attempt; `:{major}.{minor}` (e.g. `:0.4`) killed v0.4.0
-          # second attempt because the first attempt had already written
-          # it before failing on `:latest`. Both moving patterns are now
-          # removed. If a moving pointer is ever wanted, remove the
+          # update it. `:latest` killed v0.2.0, v0.2.1, v0.3.0, v0.4.0,
+          # v0.4.1, v0.4.2, and v0.5.0; `:{major}.{minor}` (e.g. `:0.4`)
+          # also failed. If a moving pointer is ever wanted, remove the
           # immutability rule on Docker Hub first, then re-add the
-          # corresponding `type=raw` / `type=semver` entry here.
+          # corresponding `type=raw` / `type=semver` entry here AND flip
+          # `flavor: latest` back on.
 
       - name: Build and push
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
