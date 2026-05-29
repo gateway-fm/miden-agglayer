@@ -2307,7 +2307,7 @@
       .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
     // Lightweight JSON syntax highlighter. Walks the parsed value rather than
-    // regex-ing a stringified payload so we don't mis-tag keys vs string
+    // regex-ing a stringified payload so we don't mislabel keys vs string
     // values. Produces span-wrapped HTML for the <pre>.
     const renderJsonHtml = (value, indent) => {
       indent = indent || 0;
