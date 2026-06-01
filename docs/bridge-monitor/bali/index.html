@@ -1130,21 +1130,21 @@
        Opening that URL (anywhere) scrolls the matching row into view and
        pulses it — see the deep-link wiring in the script. */
     .row-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       background: none;
       border: none;
-      padding: 0 2px;
-      margin-left: 2px;
-      font-family: 'JetBrains Mono', ui-monospace, monospace;
-      font-size: 12px;
-      font-weight: 500;
-      line-height: 1;
-      letter-spacing: 0.02em;
+      padding: 2px;
+      margin-left: 4px;
+      border-radius: 3px;
       color: var(--c-ink);
-      opacity: 0.35;
+      opacity: 0.4;
       cursor: pointer;
-      transition: color 120ms var(--ease-micro), opacity 120ms var(--ease-micro);
+      transition: color 120ms var(--ease-micro), opacity 120ms var(--ease-micro), background 120ms var(--ease-micro);
     }
-    .row-link:hover  { opacity: 1; color: var(--c-alert); }
+    .row-link svg { display: block; width: 13px; height: 13px; }
+    .row-link:hover  { opacity: 1; color: var(--c-alert); background: rgba(255, 68, 0, 0.08); }
     .row-link.copied { opacity: 1; color: #009a52; }
 
     /* Deep-link target: a few alert-orange pulses, then settle. The class is
@@ -1850,6 +1850,10 @@
     };
 
     // ---------- render ----------
+    // Per-row "copy link" affordance icons (feather-style: clipboard + check).
+    const COPY_ICON  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+
     const setLed = (mode) => {
       ui.led.className = "status-led " + (mode === "live" ? "live" : mode === "error" ? "error" : "");
       ui.ledText.textContent = mode === "live" ? "LIVE" : mode === "error" ? "DEGRADED" : "CONNECTING";
@@ -1945,8 +1949,8 @@
           <span class="row-time">${timeText}</span>
           <span class="pill ${state}"><span class="dot"></span>${statusLabel(state)}</span>
           <button type="button" class="row-link" data-link-id="${ev.id}"
-            title="Copy deep link to this ${kind === "inbound" ? "deposit" : "withdrawal"}"
-            aria-label="Copy deep link to this ${kind === "inbound" ? "deposit" : "withdrawal"}">#</button>
+            title="Copy a shareable link to this ${kind === "inbound" ? "deposit" : "withdrawal"}"
+            aria-label="Copy link to this ${kind === "inbound" ? "deposit" : "withdrawal"}">${COPY_ICON}</button>
         </div>
         <div class="row-party">
           <span class="party-arrow">${arrow(kind)}</span>
@@ -2669,7 +2673,8 @@
     // Back/forward, or a link pasted into the same tab.
     window.addEventListener("hashchange", applyHashState);
 
-    // Clicking a row's "#" copies its deep link, updates the URL, and pulses it.
+    // Clicking a row's copy button copies its deep link, updates the URL, and
+    // pulses the row.
     document.addEventListener("click", (e) => {
       const btn = e.target && e.target.closest ? e.target.closest(".row-link") : null;
       if (!btn) return;
@@ -2679,16 +2684,29 @@
       // replaceState updates the URL without firing our hashchange handler.
       try { history.replaceState(null, "", "#row=" + encodeURIComponent(id)); }
       catch { window.location.hash = "row=" + encodeURIComponent(id); }
+      // Swap clipboard icon → check on success; revert after a beat.
       const flash = (ok) => {
-        const prev = btn.textContent;
-        btn.textContent = ok ? "✓" : "!";
+        if (!ok) return;
+        btn.innerHTML = CHECK_ICON;
         btn.classList.add("copied");
-        setTimeout(() => { btn.textContent = prev; btn.classList.remove("copied"); }, 1300);
+        setTimeout(() => { btn.innerHTML = COPY_ICON; btn.classList.remove("copied"); }, 1300);
       };
+      // Legacy fallback for non-secure contexts where navigator.clipboard is absent.
+      const legacyCopy = (text) => {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+          document.body.appendChild(ta); ta.select();
+          const ok = document.execCommand("copy");
+          document.body.removeChild(ta);
+          return ok;
+        } catch { return false; }
+      };
+      const url = deepLinkUrl(id);
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(deepLinkUrl(id)).then(() => flash(true)).catch(() => flash(false));
+        navigator.clipboard.writeText(url).then(() => flash(true)).catch(() => flash(legacyCopy(url)));
       } else {
-        flash(false);
+        flash(legacyCopy(url));
       }
       // Immediate visual feedback; no scroll — the user is already on the row.
       focusDeepLink(id, { scroll: false });
