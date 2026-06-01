@@ -1124,6 +1124,51 @@
       .pill.claimable .dot { animation: none; }
     }
 
+    /* ---------- deep-link affordance + target pulse ---------- */
+    /* Each row carries a small "#" anchor in its meta cluster. Clicking it
+       writes a #row=<id> hash, copies the absolute URL, and pulses the row.
+       Opening that URL (anywhere) scrolls the matching row into view and
+       pulses it — see the deep-link wiring in the script. */
+    .row-link {
+      background: none;
+      border: none;
+      padding: 0 2px;
+      margin-left: 2px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 12px;
+      font-weight: 500;
+      line-height: 1;
+      letter-spacing: 0.02em;
+      color: var(--c-ink);
+      opacity: 0.35;
+      cursor: pointer;
+      transition: color 120ms var(--ease-micro), opacity 120ms var(--ease-micro);
+    }
+    .row-link:hover  { opacity: 1; color: var(--c-alert); }
+    .row-link.copied { opacity: 1; color: #009a52; }
+
+    /* Deep-link target: a few alert-orange pulses, then settle. The class is
+       removed by JS after the animation so the row returns to normal. */
+    .row.pulse-target { animation: rowPulse 1s ease-in-out 3; }
+    @keyframes rowPulse {
+      0%, 100% {
+        background: rgba(255, 68, 0, 0);
+        box-shadow: 0 0 0 0 rgba(255, 68, 0, 0);
+      }
+      18% {
+        background: rgba(255, 68, 0, 0.26);
+        box-shadow: 0 0 0 2px rgba(255, 68, 0, 0.45);
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      /* No flashing — hold a static highlight; JS still clears it after a beat. */
+      .row.pulse-target {
+        animation: none;
+        background: rgba(255, 68, 0, 0.12);
+        box-shadow: inset 0 0 0 1px rgba(255, 68, 0, 0.4);
+      }
+    }
+
     /* empty state */
     .empty {
       padding: 48px 0;
@@ -1899,6 +1944,9 @@
         <div class="row-meta">
           <span class="row-time">${timeText}</span>
           <span class="pill ${state}"><span class="dot"></span>${statusLabel(state)}</span>
+          <button type="button" class="row-link" data-link-id="${ev.id}"
+            title="Copy deep link to this ${kind === "inbound" ? "deposit" : "withdrawal"}"
+            aria-label="Copy deep link to this ${kind === "inbound" ? "deposit" : "withdrawal"}">#</button>
         </div>
         <div class="row-party">
           <span class="party-arrow">${arrow(kind)}</span>
@@ -2012,6 +2060,47 @@
         ? CSS.escape(s)
         : String(s).replace(/[^a-zA-Z0-9_\-]/g, (c) => "\\" + c);
 
+    // ---------- deep linking ----------
+    // A row is addressable by #row=<encoded ev.id>. Opening such a URL (or
+    // clicking a row's "#") scrolls the row into view and pulses it. We hold
+    // the requested id "pending" until its row actually exists AND is visible
+    // (the columns are display:none behind the cold-load banner), then fire.
+    const prefersReducedMotion =
+      !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    let pendingDeepLinkId = null;
+
+    const readDeepLinkHash = () => {
+      const m = (window.location.hash || "").match(/^#row=(.+)$/);
+      if (!m) return null;
+      try { return decodeURIComponent(m[1]); } catch { return m[1]; }
+    };
+
+    const deepLinkUrl = (id) =>
+      window.location.origin + window.location.pathname + "#row=" + encodeURIComponent(id);
+
+    // Scroll to + pulse the row for `id`. Returns true once handled; if the row
+    // isn't on screen yet (still loading, or not in the visible window) it
+    // stays pending and is retried after the next render / once loaded.
+    const focusDeepLink = (id, opts) => {
+      if (!id) return false;
+      const scroll = !opts || opts.scroll !== false;
+      const grid = document.querySelector(".layout-grid");
+      if (grid && grid.classList.contains("is-loading")) { pendingDeepLinkId = id; return false; }
+      const node = document.querySelector('.row[data-id="' + cssEscape(id) + '"]');
+      if (!node) { pendingDeepLinkId = id; return false; }
+      pendingDeepLinkId = null;
+      if (scroll) {
+        node.scrollIntoView({ behavior: prefersReducedMotion ? "auto" : "smooth", block: "center" });
+      }
+      // Restart the animation cleanly if the row is already mid-pulse.
+      node.classList.remove("pulse-target");
+      void node.offsetWidth;
+      node.classList.add("pulse-target");
+      clearTimeout(node._pulseTimer);
+      node._pulseTimer = setTimeout(() => node.classList.remove("pulse-target"), 3400);
+      return true;
+    };
+
     // Mini-scope renderer: 10 bins (one per day of the window), height
      // normalised to the max bin. Renders directly into the existing <svg>.
     const renderScope = (svgId, events, now) => {
@@ -2074,6 +2163,8 @@
       ui.lastUpdate.textContent = formatClock(new Date(now));
       // After the first paint, subsequent inserts are "fresh" arrivals.
       firstRenderDone = true;
+      // Honour a deep-link target now that the rows for it may exist.
+      if (pendingDeepLinkId) focusDeepLink(pendingDeepLinkId);
     };
 
     // ---------- merge + dedupe ----------
@@ -2232,6 +2323,8 @@
         }
       };
       await tick();
+      // Cold-load banner is down now — honour any #row=… from the opening URL.
+      if (pendingDeepLinkId) focusDeepLink(pendingDeepLinkId);
       setInterval(tick, CONFIG.pollIntervalMs);
 
       // re-render relative times every 20s without polling
@@ -2257,10 +2350,18 @@
     const modalRaw     = document.getElementById("modalRaw");
     const modeButtons  = modal?.querySelectorAll(".readout-mode button") || [];
 
+    // Tracks which exit the modal is currently showing (destAddr:gi), so the
+    // hashchange handler can tell "open a different exit" from "already shown".
+    let currentModalKey = null;
     const closeModal = () => {
       if (!modal) return;
       modal.hidden = true;
       document.documentElement.style.overflow = "";
+      currentModalKey = null;
+      // Drop the #agg=… deep-link hash on close (leave any other hash alone).
+      if (/^#agg=/.test(window.location.hash)) {
+        try { history.replaceState(null, "", window.location.pathname); } catch {}
+      }
       // Restore focus to the element that opened the modal — table-stakes a11y.
       if (modalOpenerEl && typeof modalOpenerEl.focus === "function") {
         modalOpenerEl.focus();
@@ -2307,7 +2408,7 @@
       .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
     // Lightweight JSON syntax highlighter. Walks the parsed value rather than
-    // regex-ing a stringified payload so we don't mis-tag keys vs string
+    // regex-ing a stringified payload so we don't mislabel keys vs string
     // values. Produces span-wrapped HTML for the <pre>.
     const renderJsonHtml = (value, indent) => {
       indent = indent || 0;
@@ -2473,7 +2574,18 @@
 
     const openAgglayerEventModal = async ({ aggHash, destAddr, globalIndex }) => {
       const apiUrl = CONFIG.bridgeServiceUrl + "/bridges/" + destAddr;
-      modalGi.textContent = globalIndex ? "gi " + globalIndex : aggHash.slice(0, 10) + "…";
+      // Make the open modal addressable: #agg=<destAddr>:<globalIndex>. The
+      // modal fetches its own data by address, so this link works on a cold
+      // load without waiting for the poll. (replaceState doesn't fire
+      // hashchange, so this won't re-enter our handler.)
+      currentModalKey = String(destAddr).toLowerCase() + ":" + String(globalIndex || "");
+      if (globalIndex) {
+        try {
+          history.replaceState(null, "",
+            "#agg=" + encodeURIComponent(destAddr) + ":" + encodeURIComponent(String(globalIndex)));
+        } catch {}
+      }
+      modalGi.textContent = globalIndex ? "gi " + globalIndex : (aggHash || "").slice(0, 10) + "…";
       modalSrc.textContent = "GET /api/bridges/" + destAddr;
       modalRaw.href = apiUrl;
       modalReadout.innerHTML = '<span class="json-muted">loading…</span>';
@@ -2515,6 +2627,71 @@
         destAddr: btn.dataset.destAddr,
         globalIndex: btn.dataset.globalIndex,
       });
+    });
+
+    // ---------- deep-link wiring ----------
+    // Two deep-link shapes share the hash:
+    //   #row=<encoded ev.id>           → scroll to + pulse a row
+    //   #agg=<destAddr>:<globalIndex>  → open the agglayer-info modal for an exit
+    const readAggDeepLink = () => {
+      const m = (window.location.hash || "").match(/^#agg=([^:]+):(.+)$/);
+      if (!m) return null;
+      try { return { destAddr: decodeURIComponent(m[1]), globalIndex: decodeURIComponent(m[2]) }; }
+      catch { return { destAddr: m[1], globalIndex: m[2] }; }
+    };
+
+    // Reconcile the modal + row pulse against whatever is in the hash now.
+    const applyHashState = () => {
+      const agg = readAggDeepLink();
+      if (agg) {
+        const key = String(agg.destAddr).toLowerCase() + ":" + agg.globalIndex;
+        if (modal && (modal.hidden || currentModalKey !== key)) {
+          openAgglayerEventModal({ aggHash: "", destAddr: agg.destAddr, globalIndex: agg.globalIndex });
+        }
+        return;
+      }
+      // No #agg → close the modal if it's showing a deep-linked exit.
+      if (modal && !modal.hidden && currentModalKey) closeModal();
+      const id = readDeepLinkHash();
+      if (id) focusDeepLink(id);
+    };
+
+    // Honour a deep link already present in the URL on first load.
+    const initialAgg = readAggDeepLink();
+    if (initialAgg) {
+      // The modal fetches its own data by address — safe to open straight away.
+      openAgglayerEventModal({ aggHash: "", destAddr: initialAgg.destAddr, globalIndex: initialAgg.globalIndex });
+    } else {
+      // bootstrap()'s first render (cached) or post-tick hook (cold) acts on this.
+      pendingDeepLinkId = readDeepLinkHash();
+    }
+
+    // Back/forward, or a link pasted into the same tab.
+    window.addEventListener("hashchange", applyHashState);
+
+    // Clicking a row's "#" copies its deep link, updates the URL, and pulses it.
+    document.addEventListener("click", (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest(".row-link") : null;
+      if (!btn) return;
+      e.preventDefault();
+      const id = btn.dataset.linkId;
+      if (!id) return;
+      // replaceState updates the URL without firing our hashchange handler.
+      try { history.replaceState(null, "", "#row=" + encodeURIComponent(id)); }
+      catch { window.location.hash = "row=" + encodeURIComponent(id); }
+      const flash = (ok) => {
+        const prev = btn.textContent;
+        btn.textContent = ok ? "✓" : "!";
+        btn.classList.add("copied");
+        setTimeout(() => { btn.textContent = prev; btn.classList.remove("copied"); }, 1300);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(deepLinkUrl(id)).then(() => flash(true)).catch(() => flash(false));
+      } else {
+        flash(false);
+      }
+      // Immediate visual feedback; no scroll — the user is already on the row.
+      focusDeepLink(id, { scroll: false });
     });
 
     bootstrap();
