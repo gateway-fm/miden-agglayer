@@ -125,7 +125,7 @@ make build
 |------|---------|---------|-------------|
 | `--port` | | `8546` | JSON-RPC HTTP port |
 | `--miden-node` | | `http://localhost:57291` | Miden node gRPC URL (or `devnet`/`testnet`) |
-| `--miden-store-dir` | | `$HOME/.miden` | Directory for miden-client data |
+| `--miden-store-dir` | `MIDEN_STORE_BASE` (containment) | `$HOME/.miden` | Directory for miden-client data. Absolute paths are accepted (deployments rely on it); `..` traversal and symlink-escape are rejected. Set `MIDEN_STORE_BASE` to require the store dir to live inside a fixed root — see note below. |
 | `--chain-id` | `CHAIN_ID` | `2` | EVM chain ID for `eth_chainId` |
 | `--network-id` | `NETWORK_ID` | `1` | Rollup network ID from RollupManager |
 | `--l1-rpc-url` | `L1_RPC_URL` | | L1 RPC URL (enables GER verification + claim forwarding) |
@@ -138,6 +138,16 @@ make build
 | `--init` | | | Initialize accounts config, then exit |
 | `--reset-miden-store` | | | Wipe miden-client sqlite before startup (preserves keystore + config) — see [Recovery](#recovery) |
 | `--unlock-miden-accounts` | | | Clear stale `locked` flags in miden-client sqlite, then exit — see [Recovery](#recovery) |
+
+> **Store-directory containment (`MIDEN_STORE_BASE`).** `--miden-store-dir`
+> always rejects `..` traversal and, for an existing directory, resolves
+> symlinks and re-checks. Absolute paths are allowed by design — every
+> deployment passes one (`/var/lib/miden-agglayer-service`, the `$HOME/.miden`
+> default). For defence-in-depth when the store dir may come from a
+> less-trusted source, set `MIDEN_STORE_BASE=/var/lib/miden-agglayer-service`
+> (or your chosen root): the resolved store directory must then live inside it,
+> and anything escaping the base — absolutely or via symlink — is rejected at
+> startup. Unset = unchanged behaviour. (Cantina MA#20.)
 
 ### ClaimSettler env vars
 

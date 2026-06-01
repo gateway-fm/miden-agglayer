@@ -3,7 +3,7 @@ use miden_protocol::account::AccountId;
 use miden_protocol::address::NetworkId;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::{Display, Formatter};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::{env, fs};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,8 +102,29 @@ impl AccountsConfigOnDisk {
     }
 }
 
-/// Reject paths containing parent-directory (`..`) traversal components.
-fn sanitize_store_dir(dir: &PathBuf) -> anyhow::Result<PathBuf> {
+/// Optional containment root for the store directory.
+///
+/// `--miden-store-dir` is an operator-supplied flag, so an absolute path is a
+/// legitimate and required input — every deployment (Dockerfile, compose, the
+/// e2e suite, the documented operator invocations) passes one, and the default
+/// is the absolute `$HOME/.miden`. Rejecting absolute paths outright would
+/// break all of them, so we do NOT.
+///
+/// Instead, defence-in-depth is opt-in: when `MIDEN_STORE_BASE` is set, the
+/// resolved store directory MUST live inside it, so a store dir injected from
+/// a less-trusted source (e.g. a templated env var) can't escape the area the
+/// operator intended. Unset = unchanged behaviour.
+fn store_base_from_env() -> Option<PathBuf> {
+    env::var_os("MIDEN_STORE_BASE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Validate the store directory: reject `..` traversal (lexical and
+/// post-symlink-resolution) and, when a containment `base` is configured,
+/// reject any directory that escapes it. Absolute paths are allowed by design
+/// (see [`store_base_from_env`]).
+fn sanitize_store_dir(dir: &PathBuf, base: Option<&Path>) -> anyhow::Result<PathBuf> {
     for component in dir.components() {
         if matches!(component, Component::ParentDir) {
             anyhow::bail!(
@@ -116,17 +137,37 @@ fn sanitize_store_dir(dir: &PathBuf) -> anyhow::Result<PathBuf> {
     // Canonicalize when the directory already exists on disk so that any
     // symlink-based traversal is also resolved. When it does not yet exist
     // (first run / --init), the lexical check above is sufficient.
-    if dir.exists() {
-        let canonical = dir.canonicalize()?;
+    let resolved = if dir.exists() {
+        let canonical = dir
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize store directory {dir:?}"))?;
         // After resolving symlinks, re-verify there are no `..` segments.
         for component in canonical.components() {
             if matches!(component, Component::ParentDir) {
                 anyhow::bail!("path traversal detected after canonicalization: {canonical:?}");
             }
         }
-        return Ok(canonical);
+        canonical
+    } else {
+        dir.clone()
+    };
+
+    // Opt-in containment: when MIDEN_STORE_BASE is configured the store dir
+    // must live inside it. The `resolved` form above means this also catches
+    // an existing dir that symlinks out of the base.
+    if let Some(base) = base {
+        let canonical_base = base.canonicalize().with_context(|| {
+            format!("MIDEN_STORE_BASE {base:?} does not exist or is not accessible")
+        })?;
+        if !resolved.starts_with(&canonical_base) {
+            anyhow::bail!(
+                "store directory {resolved:?} escapes the configured MIDEN_STORE_BASE \
+                 {canonical_base:?}"
+            );
+        }
     }
-    Ok(dir.clone())
+
+    Ok(resolved)
 }
 
 fn config_path(miden_store_dir_opt: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -135,7 +176,8 @@ fn config_path(miden_store_dir_opt: Option<PathBuf>) -> anyhow::Result<PathBuf> 
         let base_dir = env::home_dir().unwrap_or(current_dir);
         base_dir.join(".miden")
     });
-    let safe_dir = sanitize_store_dir(&miden_store_dir)?;
+    let base = store_base_from_env();
+    let safe_dir = sanitize_store_dir(&miden_store_dir, base.as_deref())?;
     Ok(safe_dir.join("bridge_accounts.toml"))
 }
 
@@ -254,6 +296,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Absolute paths are allowed BY DESIGN (Cantina MA#20): `--miden-store-dir`
+    /// is an operator-supplied flag and every deployment passes an absolute
+    /// path (`/var/lib/miden-agglayer-service`, the `$HOME/.miden` default,
+    /// etc). Containment is the opt-in `MIDEN_STORE_BASE` mechanism, exercised
+    /// by the `containment_*` tests below — not a blanket absolute-path ban.
     #[test]
     fn allows_clean_absolute_path() {
         let good = Some(PathBuf::from("/tmp/miden-test-store"));
@@ -261,6 +308,62 @@ mod tests {
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.ends_with("bridge_accounts.toml"));
+    }
+
+    #[test]
+    fn containment_allows_dir_inside_base() {
+        let base = tempdir().unwrap();
+        let inside = base.path().join("store");
+        // Not-yet-created dir under the base is accepted (first-run / --init).
+        let ok = sanitize_store_dir(&inside, Some(base.path()));
+        assert!(ok.is_ok(), "dir under base must be allowed: {ok:?}");
+    }
+
+    #[test]
+    fn containment_rejects_dir_outside_base() {
+        let base = tempdir().unwrap();
+        let outside = PathBuf::from("/var/lib/somewhere-else");
+        let result = sanitize_store_dir(&outside, Some(base.path()));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("escapes the configured"),
+            "expected containment-escape error"
+        );
+    }
+
+    #[test]
+    fn containment_rejects_symlink_escape() {
+        // A dir that exists but symlinks out of the base must be rejected once
+        // canonicalized, even though its lexical path sits under the base.
+        let base = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let link = base.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let result = sanitize_store_dir(&link, Some(base.path()));
+        assert!(
+            result.is_err(),
+            "symlink escaping the base must be rejected; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn no_base_allows_absolute_outside_any_root() {
+        // With no containment configured, behaviour is unchanged: a clean
+        // absolute path is accepted (only `..` / symlink-`..` are rejected).
+        let result = sanitize_store_dir(&PathBuf::from("/var/lib/miden-agglayer-service"), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_parent_dir_traversal_with_base() {
+        let base = tempdir().unwrap();
+        let bad = base.path().join("..").join("etc");
+        let result = sanitize_store_dir(&bad, Some(base.path()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("path traversal"));
     }
 
     #[test]
