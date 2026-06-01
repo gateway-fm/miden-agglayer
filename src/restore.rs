@@ -88,6 +88,23 @@ pub fn classify_ger_note(
     }
 }
 
+/// MA#28 restore policy: which `GerNoteVerdict`s mean "reconstruct this GER".
+///
+/// `Accept` (full metadata provenance verified) and `MissingMetadata`
+/// (consumed notes carry no metadata — see the call site) both reconstruct.
+/// `MissingMetadata` is safe at restore time because the note is recorded as
+/// *consumed*, i.e. the bridge network account already consumed it on-chain
+/// (only the targeted network account can consume a `NetworkAccountTarget`
+/// note) and the GER was already injected pre-crash. `SenderMismatch`,
+/// `TargetMismatch`, and `UndecodableTarget` only arise when metadata IS
+/// present and contradicts the expected provenance — those are refused.
+pub fn should_reconstruct_restored_ger(verdict: &GerNoteVerdict) -> bool {
+    matches!(
+        verdict,
+        GerNoteVerdict::Accept | GerNoteVerdict::MissingMetadata
+    )
+}
+
 /// Small wrapper so `classify_ger_note` doesn't have to import
 /// `miden_standards` into the public signature. Mirrors the decoder used
 /// by `bridge_out.rs::on_post_sync` for MINT notes.
@@ -591,15 +608,36 @@ async fn restore_gers(
                     // have restore silently replay it as a sanctioned GER
                     // injection. Pure-predicate classification is unit-tested
                     // via `classify_ger_note` — keep this match in sync.
-                    match classify_ger_note(note.metadata(), expected_sender, expected_target) {
+                    let verdict =
+                        classify_ger_note(note.metadata(), expected_sender, expected_target);
+                    match &verdict {
                         GerNoteVerdict::Accept => {}
                         GerNoteVerdict::MissingMetadata => {
+                            // MA#28 revisited (regression fix): consumed
+                            // UpdateGerNote records returned by
+                            // `get_input_notes(Consumed)` carry NO metadata —
+                            // the miden-client does not retain sender /
+                            // NetworkAccountTarget attachment on consumed
+                            // input-note records — so the sender/target
+                            // provenance signal is simply unavailable at
+                            // restore time. Absent metadata is therefore NOT a
+                            // spoof signal here: the note is recorded as
+                            // *consumed*, meaning the bridge network account
+                            // already consumed it on-chain (only the targeted
+                            // network account can consume a NetworkAccountTarget
+                            // note), and any GER it represents was already
+                            // injected into the pre-crash state. Restore
+                            // reconstructs prior reality; the anti-spoof control
+                            // lives at ingestion (`submit_update_ger_note`),
+                            // where metadata IS present. So we reconstruct and
+                            // record a metric for observability.
                             ::metrics::counter!("restore_ger_missing_metadata_total").increment(1);
                             tracing::warn!(
                                 note_id = %note.id(),
-                                "MA#28: UpdateGerNote-shaped consumed note has no metadata; skipping"
+                                "MA#28: consumed UpdateGerNote has no metadata (expected for \
+                                 consumed notes); reconstructing — on-chain consumption by the \
+                                 bridge is authoritative"
                             );
-                            continue;
                         }
                         GerNoteVerdict::SenderMismatch => {
                             ::metrics::counter!("restore_ger_sender_mismatch_total").increment(1);
@@ -610,7 +648,6 @@ async fn restore_gers(
                                 "MA#28: UpdateGerNote-shaped note has unexpected sender; \
                                  refusing to replay as restored GER"
                             );
-                            continue;
                         }
                         GerNoteVerdict::UndecodableTarget => {
                             ::metrics::counter!("restore_ger_no_target_total").increment(1);
@@ -619,7 +656,6 @@ async fn restore_gers(
                                 "MA#28: UpdateGerNote-shaped note has no decodable \
                                  NetworkAccountTarget attachment; refusing to replay"
                             );
-                            continue;
                         }
                         GerNoteVerdict::TargetMismatch => {
                             ::metrics::counter!("restore_ger_target_mismatch_total").increment(1);
@@ -629,8 +665,14 @@ async fn restore_gers(
                                 "MA#28: UpdateGerNote-shaped note targets a different \
                                  recipient than the configured bridge; refusing to replay"
                             );
-                            continue;
                         }
+                    }
+                    // Skip only the verdicts that indicate a note we must NOT
+                    // replay (provenance contradicted by metadata that IS
+                    // present). Accept + MissingMetadata both reconstruct — see
+                    // `should_reconstruct_restored_ger`.
+                    if !should_reconstruct_restored_ger(&verdict) {
+                        continue;
                     }
 
                     let storage = details.storage();
@@ -788,6 +830,28 @@ mod tests {
             classify_ger_note(None, sender, bridge),
             GerNoteVerdict::MissingMetadata,
         );
+    }
+
+    #[test]
+    fn ma28_restore_reconstructs_accept_and_missing_metadata_only() {
+        // Regression: consumed UpdateGerNotes have no metadata, so restore
+        // must reconstruct on MissingMetadata (on-chain consumption by the
+        // bridge is authoritative). It must still refuse the mismatch
+        // verdicts, which only occur when metadata IS present and contradicts
+        // the expected provenance.
+        assert!(should_reconstruct_restored_ger(&GerNoteVerdict::Accept));
+        assert!(should_reconstruct_restored_ger(
+            &GerNoteVerdict::MissingMetadata
+        ));
+        assert!(!should_reconstruct_restored_ger(
+            &GerNoteVerdict::SenderMismatch
+        ));
+        assert!(!should_reconstruct_restored_ger(
+            &GerNoteVerdict::TargetMismatch
+        ));
+        assert!(!should_reconstruct_restored_ger(
+            &GerNoteVerdict::UndecodableTarget
+        ));
     }
 
     #[test]
