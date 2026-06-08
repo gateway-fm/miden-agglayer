@@ -64,8 +64,8 @@ mod tests {
     /// - Renounced: owner has been cleared (DoS — faucet can never mint)
     #[test]
     fn cantina_4_faucet_ownership_predicate() {
-        let bridge = aid("0x3d7c9747558851900f8206226dfbea");
-        let attacker = aid("0x3d7c9747558851900f8206226dfbeb");
+        let bridge = aid("0xac0000000000dd110000ee000000fc");
+        let attacker = aid("0xaa0000000000bc110000bc000000de");
 
         // Healthy.
         assert_eq!(
@@ -92,7 +92,7 @@ mod tests {
     /// what we're comparing against.)
     #[test]
     fn cantina_4_predicate_trusts_configured_bridge() {
-        let bridge = aid("0x3d7c9747558851900f8206226dfbea");
+        let bridge = aid("0xac0000000000dd110000ee000000fc");
         // If somehow the configured bridge equals the observed owner, no alert.
         assert_eq!(
             check_faucet_owner(bridge, Some(bridge)),

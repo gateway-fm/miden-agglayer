@@ -124,17 +124,17 @@ mod tests {
         )));
         // Canonical format: 4 zero bytes + 16 bytes of AccountId data
         assert!(is_miden_compatible_address(address!(
-            "0x000000003d7c9747558851900f8206226dfbea00"
+            "0x00000000ac0000000000dd110000ee000000fc00"
         )));
     }
 
     #[test]
     fn test_account_id_from_address() {
-        let expected_account_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let expected_account_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         // Canonical EthEmbeddedAccountId: [4 zero bytes][prefix(8)][suffix(8)]
-        // AccountId 0x3d7c9747558851900f8206226dfbea has:
-        //   prefix = 0x3d7c974755885190, suffix = 0x0f8206226dfbea00
-        let address = address!("0x000000003d7c9747558851900f8206226dfbea00");
+        // AccountId 0xac0000000000dd110000ee000000fc has:
+        //   prefix = 0xac0000000000dd11, suffix = 0x0000ee000000fc00
+        let address = address!("0x00000000ac0000000000dd110000ee000000fc00");
         assert_eq!(account_id_from_address(address), Some(expected_account_id));
 
         assert_eq!(account_id_from_address(Address::from([42u8; 20])), None);
@@ -142,8 +142,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_zero_padded_address() {
-        let addr = address!("0x000000003d7c9747558851900f8206226dfbea00");
-        let expected = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let addr = address!("0x00000000ac0000000000dd110000ee000000fc00");
+        let expected = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         let result = account_id_from_address(addr);
         assert_eq!(result, Some(expected));
     }
@@ -160,7 +160,7 @@ mod tests {
         use crate::store::memory::InMemoryStore;
         let store = InMemoryStore::new();
         let cfg = test_accounts_config();
-        let zero_padded = address!("0x000000003d7c9747558851900f8206226dfbea00");
+        let zero_padded = address!("0x00000000ac0000000000dd110000ee000000fc00");
 
         // Default policy (reject = false): fallback succeeds.
         let r = resolve_address_with_policy(&store, zero_padded, &cfg, false, false).await;
@@ -183,7 +183,7 @@ mod tests {
         let store = InMemoryStore::new();
         let cfg = test_accounts_config();
         let mapped_addr = address!("0xabcdef1234567890abcdef1234567890abcdef12");
-        let target = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let target = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         store
             .set_address_mapping(mapped_addr, target)
             .await
@@ -255,7 +255,7 @@ mod tests {
         let store = InMemoryStore::new();
         let cfg = test_accounts_config();
         let mapped_addr = address!("0xabcdef1234567890abcdef1234567890abcdef12");
-        let target = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let target = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         store
             .set_address_mapping(mapped_addr, target)
             .await
@@ -270,7 +270,7 @@ mod tests {
 
     fn test_accounts_config() -> AccountsConfig {
         use crate::accounts_config::AccountIdBech32;
-        let id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         AccountsConfig {
             bridge: AccountIdBech32(id),
             ger_manager: Some(AccountIdBech32(id)),

@@ -176,16 +176,19 @@ install-tools: ## Install development tools
 # from miden-agglayer's account builders, so the e2e image is fully
 # reproducible.
 #
-# Wire-compat: both miden-node v0.14.10 and our miden-client v0.14.7 pin
-# miden-node-proto-build v0.14.10 — protos align. Hash function identical
-# (miden-crypto 0.23.0 on both). BURN script root identical between
-# miden-standards 0.14.4 (miden-node) and 0.14.5 (us) — empirically
-# verified.
+# Protocol 0.15.x: the node repo was renamed `0xMiden/miden-node` ->
+# `0xMiden/node` (package name stays `miden-node`, so `--bin miden-node` and
+# the `bundled bootstrap/start` CLI are unchanged, and the genesis sample
+# `02-with-account-files.toml` is at the same path). We pin to the exact rev
+# the miden-client 0.15 branch (PR #2224) was built against, so the node's
+# transitive miden-protocol 0.15.2 / miden-assembly 0.23.x match our
+# Cargo.toml pins and the BURN/MINT/CLAIM MAST roots agree on both sides.
+# When a stable v0.15.x miden-node tag ships, pin to the tag instead.
 #
 # Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
 # docker-compose so the Dockerfile picks it up at build time.
-MIDEN_NODE_GIT_URL := https://github.com/0xMiden/miden-node.git
-MIDEN_NODE_GIT_REF := v0.14.10
+MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
+MIDEN_NODE_GIT_REF := 6649a4ce774bc842c08e6bdc314f6ddafb816282
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 

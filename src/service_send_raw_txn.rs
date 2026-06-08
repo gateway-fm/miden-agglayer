@@ -905,7 +905,7 @@ mod tests {
             // unresolvable-destination short-circuit doesn't pre-empt the C6
             // GER pre-check we're testing here.
             destinationAddress: alloy::primitives::address!(
-                "0x000000003d7c9747558851900f8206226dfbea00"
+                "0x00000000ac0000000000dd110000ee000000fc00"
             ),
             amount: U256::from(1_000u64),
             metadata: Default::default(),
@@ -947,7 +947,7 @@ mod tests {
             originTokenAddress: Address::ZERO,
             destinationNetwork: 1,
             destinationAddress: alloy::primitives::address!(
-                "0x000000003d7c9747558851900f8206226dfbea00"
+                "0x00000000ac0000000000dd110000ee000000fc00"
             ),
             amount: U256::from(1_000_000u64),
             metadata: Default::default(),

@@ -38,10 +38,10 @@ use crate::bridge_out::{is_b2agg_note, parse_b2agg_storage, resolve_faucet_origi
 use crate::claim_watcher::{derive_manual_claim_tx_hash, parse_claim_event_from_storage};
 use crate::miden_client::MidenClient;
 use crate::store::Store;
-use miden_base_agglayer::{UpdateGerNote, claim_script};
+use miden_base_agglayer::UpdateGerNote;
 use miden_client::store::NoteFilter;
 use miden_protocol::account::AccountId;
-use miden_protocol::note::{NoteAttachment, NoteMetadata};
+use miden_protocol::note::{NoteAttachments, NoteMetadata};
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 
@@ -72,6 +72,7 @@ pub enum GerNoteVerdict {
 /// validate consumed-note feeds) can exercise the predicate directly.
 pub fn classify_ger_note(
     metadata: Option<&NoteMetadata>,
+    attachments: &NoteAttachments,
     expected_sender: AccountId,
     expected_target: AccountId,
 ) -> GerNoteVerdict {
@@ -81,7 +82,7 @@ pub fn classify_ger_note(
     if meta.sender() != expected_sender {
         return GerNoteVerdict::SenderMismatch;
     }
-    match decode_network_target(meta.attachment()) {
+    match decode_network_target(attachments) {
         None => GerNoteVerdict::UndecodableTarget,
         Some(target) if target != expected_target => GerNoteVerdict::TargetMismatch,
         Some(_) => GerNoteVerdict::Accept,
@@ -91,8 +92,8 @@ pub fn classify_ger_note(
 /// Small wrapper so `classify_ger_note` doesn't have to import
 /// `miden_standards` into the public signature. Mirrors the decoder used
 /// by `bridge_out.rs::on_post_sync` for MINT notes.
-fn decode_network_target(attachment: &NoteAttachment) -> Option<AccountId> {
-    miden_standards::note::NetworkAccountTarget::try_from(attachment)
+fn decode_network_target(attachments: &NoteAttachments) -> Option<AccountId> {
+    miden_standards::note::NetworkAccountTarget::try_from(attachments)
         .ok()
         .map(|nat| nat.target_id())
 }
@@ -266,7 +267,7 @@ async fn restore_bridge_outs(
                 // breaking any consumer that joins on (note_id,
                 // deposit_count). Sort by note_id (stable across re-syncs).
                 let mut sorted: Vec<&_> = consumed_notes.iter().collect();
-                sorted.sort_by_key(|n| n.id().to_string());
+                sorted.sort_by_key(|n| n.id().expect("input note record has committed metadata").to_string());
 
                 for note in sorted {
                     let details = note.details();
@@ -274,7 +275,7 @@ async fn restore_bridge_outs(
                         continue;
                     }
 
-                    let note_id_str = note.id().to_string();
+                    let note_id_str = note.id().expect("input note record has committed metadata").to_string();
                     if store_clone.is_note_processed(&note_id_str).await? {
                         continue;
                     }
@@ -293,7 +294,7 @@ async fn restore_bridge_outs(
                         continue;
                     };
                     let faucet_id = fungible_asset.faucet_id();
-                    let miden_amount = fungible_asset.amount();
+                    let miden_amount = u64::from(fungible_asset.amount());
                     let origin = match resolve_faucet_origin(faucet_id, &*store_clone).await {
                         Ok(v) => v,
                         Err(e) => {
@@ -393,7 +394,7 @@ async fn restore_claims(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
-                let claim_root = claim_script().root();
+                let claim_root = miden_base_agglayer::ClaimNote::script().root();
                 let block_hash = block_state_clone.get_block_hash(restore_block);
                 let bridge_address = get_bridge_address();
                 let mut claim_count = 0usize;
@@ -405,7 +406,7 @@ async fn restore_claims(
                 // deterministic for the operator-visible
                 // `claim_watcher_synthesised_total` counter and log stream.
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sorted_notes.sort_by_key(|n| n.id().to_string());
+                sorted_notes.sort_by_key(|n| n.id().expect("input note record has committed metadata").to_string());
 
                 for note in sorted_notes {
                     let details = note.details();
@@ -413,7 +414,7 @@ async fn restore_claims(
                         continue;
                     }
 
-                    let note_id_str = note.id().to_string();
+                    let note_id_str = note.id().expect("input note record has committed metadata").to_string();
 
                     // Dedup 1: was this CLAIM already replayed by an earlier
                     // restore (or by the live watcher)?
@@ -569,7 +570,7 @@ async fn restore_gers(
                 // different chain values without sorting. Lex-sort by
                 // NoteId for stability.
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sorted_notes.sort_by_key(|n| n.id().to_string());
+                sorted_notes.sort_by_key(|n| n.id().expect("input note record has committed metadata").to_string());
 
                 for note in sorted_notes {
                     let details = note.details();
@@ -591,12 +592,17 @@ async fn restore_gers(
                     // have restore silently replay it as a sanctioned GER
                     // injection. Pure-predicate classification is unit-tested
                     // via `classify_ger_note` — keep this match in sync.
-                    match classify_ger_note(note.metadata(), expected_sender, expected_target) {
+                    match classify_ger_note(
+                        note.metadata(),
+                        note.attachments(),
+                        expected_sender,
+                        expected_target,
+                    ) {
                         GerNoteVerdict::Accept => {}
                         GerNoteVerdict::MissingMetadata => {
                             ::metrics::counter!("restore_ger_missing_metadata_total").increment(1);
                             tracing::warn!(
-                                note_id = %note.id(),
+                                note_id = %note.id().expect("input note record has committed metadata"),
                                 "MA#28: UpdateGerNote-shaped consumed note has no metadata; skipping"
                             );
                             continue;
@@ -604,7 +610,7 @@ async fn restore_gers(
                         GerNoteVerdict::SenderMismatch => {
                             ::metrics::counter!("restore_ger_sender_mismatch_total").increment(1);
                             tracing::error!(
-                                note_id = %note.id(),
+                                note_id = %note.id().expect("input note record has committed metadata"),
                                 sender = ?note.metadata().map(|m| m.sender()),
                                 expected = %expected_sender,
                                 "MA#28: UpdateGerNote-shaped note has unexpected sender; \
@@ -615,7 +621,7 @@ async fn restore_gers(
                         GerNoteVerdict::UndecodableTarget => {
                             ::metrics::counter!("restore_ger_no_target_total").increment(1);
                             tracing::error!(
-                                note_id = %note.id(),
+                                note_id = %note.id().expect("input note record has committed metadata"),
                                 "MA#28: UpdateGerNote-shaped note has no decodable \
                                  NetworkAccountTarget attachment; refusing to replay"
                             );
@@ -624,7 +630,7 @@ async fn restore_gers(
                         GerNoteVerdict::TargetMismatch => {
                             ::metrics::counter!("restore_ger_target_mismatch_total").increment(1);
                             tracing::error!(
-                                note_id = %note.id(),
+                                note_id = %note.id().expect("input note record has committed metadata"),
                                 expected = %expected_target,
                                 "MA#28: UpdateGerNote-shaped note targets a different \
                                  recipient than the configured bridge; refusing to replay"
@@ -637,7 +643,7 @@ async fn restore_gers(
                     let items = storage.items();
                     if items.len() < UpdateGerNote::NUM_STORAGE_ITEMS {
                         tracing::warn!(
-                            note_id = %note.id(),
+                            note_id = %note.id().expect("input note record has committed metadata"),
                             storage_len = items.len(),
                             "restore: UpdateGerNote has unexpected storage size, skipping"
                         );
@@ -659,7 +665,7 @@ async fn restore_gers(
                             }
                             Err(_) => {
                                 tracing::error!(
-                                    note_id = %note.id(),
+                                    note_id = %note.id().expect("input note record has committed metadata"),
                                     limb_index = i,
                                     felt_value = felt.as_canonical_u64(),
                                     "restore: UpdateGerNote limb exceeds u32::MAX, skipping (X6)"
@@ -686,7 +692,7 @@ async fn restore_gers(
                     let tx_hash = {
                         let mut hasher = Keccak256::new();
                         hasher.update(b"restore-ger-miden-");
-                        hasher.update(note.id().to_string().as_bytes());
+                        hasher.update(note.id().expect("input note record has committed metadata").to_string().as_bytes());
                         format!("0x{}", hex::encode(hasher.finalize()))
                     };
 
@@ -705,7 +711,7 @@ async fn restore_gers(
                     store_clone.mark_ger_injected(ger_bytes).await?;
 
                     tracing::info!(
-                        note_id = %note.id(),
+                        note_id = %note.id().expect("input note record has committed metadata"),
                         ger = %hex::encode(ger_bytes),
                         "restore: rebuilt GER from consumed UpdateGerNote"
                     );
@@ -729,42 +735,50 @@ mod tests {
     use super::*;
     use crate::store::Store;
     use crate::store::memory::InMemoryStore;
-    use miden_protocol::note::{NoteAttachment, NoteMetadata, NoteType};
+    use miden_protocol::note::{
+        NoteAttachment, NoteAttachments, NoteMetadata, NoteType, PartialNoteMetadata,
+    };
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
 
-    // Test AccountIds. The 7th byte of the prefix encodes
-    // `(storage_mode << 6) | (account_type << 4) | version`. Network mode
-    // (which is required for `NetworkAccountTarget::new` to accept a
-    // target_id) is `0b01 << 6 = 0x40`. The existing crate-wide test ID
-    // (`0x3d7c9747558851900f8206226dfbea`) encodes Private mode (0x90);
-    // we patch byte 7 to 0x40 here to satisfy the network-target check
-    // without depending on the `testing` feature of `miden-protocol`
-    // (which would pull in `rand_xoshiro` etc. for what is otherwise a
-    // pure-predicate test). See
-    // `miden-protocol-0.14.4/src/account/account_id/v0/mod.rs:121-129`.
-    //
-    // _SENDER_* IDs use the Private-mode encoding because `NoteMetadata`'s
-    // sender field has no storage-mode constraint.
-    const TEST_TARGET_BRIDGE: &str = "0x3d7c9747558851400f8206226dfbea";
-    const TEST_TARGET_OTHER: &str = "0x3d7c9747558851400f8206226dfbeb";
-    const TEST_SENDER_MANAGER: &str = "0x3d7c9747558851900f8206226dfbec";
-    const TEST_SENDER_ATTACKER: &str = "0x3d7c9747558851900f8206226dfbed";
+    // Test AccountIds — four distinct, valid protocol-0.15 (version-1) ids.
+    // Protocol 0.15 dropped the 0.14 v0 id encoding (and folded the old
+    // Network *storage mode* away: `AccountType` is now just `Private`/`Public`,
+    // and network-account behaviour comes from the `AuthNetworkAccount`
+    // *component*, not an id bit). So `NetworkAccountTarget::new` no longer
+    // constrains the target id's encoding, and these plain public/private ids
+    // are accepted as targets. They are hardcoded hex (rather than pulled from
+    // the `testing` feature) to keep this a dependency-light pure-predicate test;
+    // the only property the ma28 classifier relies on is that the four ids are
+    // mutually distinct.
+    const TEST_TARGET_BRIDGE: &str = "0xaa0000000000bb110000cc000000dd";
+    const TEST_TARGET_OTHER: &str = "0xbb0000000000cc110000dd000000ee";
+    const TEST_SENDER_MANAGER: &str = "0xfa0000000000bb010000cc000000de";
+    const TEST_SENDER_ATTACKER: &str = "0xbf0000000000cc010000dc000000ee";
 
     fn id(hex: &str) -> AccountId {
         AccountId::from_hex(hex).expect("hex must decode")
     }
 
-    fn make_metadata(sender: AccountId, target: Option<AccountId>) -> NoteMetadata {
-        let base = NoteMetadata::new(sender, NoteType::Public);
+    fn make_metadata(
+        sender: AccountId,
+        target: Option<AccountId>,
+    ) -> (NoteMetadata, NoteAttachments) {
+        let partial = PartialNoteMetadata::new(sender, NoteType::Public);
         match target {
             Some(t) => {
                 let attachment = NoteAttachment::from(
                     NetworkAccountTarget::new(t, NoteExecutionHint::Always).expect("ok"),
                 );
-                base.with_attachment(attachment)
+                let attachments = NoteAttachments::from(attachment);
+                let metadata = NoteMetadata::new(partial, &attachments);
+                (metadata, attachments)
             }
-            None => base,
+            None => {
+                let attachments = NoteAttachments::default();
+                let metadata = NoteMetadata::new(partial, &attachments);
+                (metadata, attachments)
+            }
         }
     }
 
@@ -773,9 +787,9 @@ mod tests {
     fn ma28_classify_ger_note_accept() {
         let sender = id(TEST_SENDER_MANAGER);
         let bridge = id(TEST_TARGET_BRIDGE);
-        let meta = make_metadata(sender, Some(bridge));
+        let (meta, attachments) = make_metadata(sender, Some(bridge));
         assert_eq!(
-            classify_ger_note(Some(&meta), sender, bridge),
+            classify_ger_note(Some(&meta), &attachments, sender, bridge),
             GerNoteVerdict::Accept,
         );
     }
@@ -785,7 +799,7 @@ mod tests {
         let sender = id(TEST_SENDER_MANAGER);
         let bridge = id(TEST_TARGET_BRIDGE);
         assert_eq!(
-            classify_ger_note(None, sender, bridge),
+            classify_ger_note(None, &NoteAttachments::default(), sender, bridge),
             GerNoteVerdict::MissingMetadata,
         );
     }
@@ -795,9 +809,9 @@ mod tests {
         let expected_sender = id(TEST_SENDER_MANAGER);
         let attacker = id(TEST_SENDER_ATTACKER);
         let bridge = id(TEST_TARGET_BRIDGE);
-        let meta = make_metadata(attacker, Some(bridge));
+        let (meta, attachments) = make_metadata(attacker, Some(bridge));
         assert_eq!(
-            classify_ger_note(Some(&meta), expected_sender, bridge),
+            classify_ger_note(Some(&meta), &attachments, expected_sender, bridge),
             GerNoteVerdict::SenderMismatch,
         );
     }
@@ -807,9 +821,9 @@ mod tests {
         let sender = id(TEST_SENDER_MANAGER);
         let bridge = id(TEST_TARGET_BRIDGE);
         let other = id(TEST_TARGET_OTHER);
-        let meta = make_metadata(sender, Some(other));
+        let (meta, attachments) = make_metadata(sender, Some(other));
         assert_eq!(
-            classify_ger_note(Some(&meta), sender, bridge),
+            classify_ger_note(Some(&meta), &attachments, sender, bridge),
             GerNoteVerdict::TargetMismatch,
         );
     }
@@ -820,9 +834,9 @@ mod tests {
         let bridge = id(TEST_TARGET_BRIDGE);
         // Note metadata with no NetworkAccountTarget attachment at all —
         // this is the "forged-via-NoAuth" signature analogous to Cantina #4.
-        let meta = make_metadata(sender, None);
+        let (meta, attachments) = make_metadata(sender, None);
         assert_eq!(
-            classify_ger_note(Some(&meta), sender, bridge),
+            classify_ger_note(Some(&meta), &attachments, sender, bridge),
             GerNoteVerdict::UndecodableTarget,
         );
     }

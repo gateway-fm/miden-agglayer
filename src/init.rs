@@ -8,7 +8,7 @@ use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
-use miden_protocol::account::{Account, AccountId, AccountStorageMode};
+use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
 use miden_protocol::note::NoteType;
 use miden_standards::account::auth::AuthSingleSig;
@@ -152,7 +152,7 @@ async fn add_wallet(
     // the proxy doesn't use anyway.
     let (auth_component, key_pair) = create_auth_component(client)?;
     let account = Account::builder(client.rng().draw_word().into())
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(BasicWallet)
         .with_auth_component(auth_component)
         .build()?;

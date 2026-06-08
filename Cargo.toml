@@ -102,42 +102,38 @@ url = { features = ["serde"], version = "2.5" }
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 
-# miden-base — exact pin to 0.14.4 to match the miden-node binary's
-# transitive miden-assembly version (0.22.1). Different miden-assembly
-# patch versions compute DIFFERENT MAST roots for the same MASM source:
-#   miden-assembly 0.22.1 → BurnNote::script_root() = 0xdad2…
-#   miden-assembly 0.22.3 → BurnNote::script_root() = 0x2777…
-# When the two sides disagreed on the BURN root, every L2→L1 bridge-out
-# failed inside the miden-node's NTX `before_created` event handler with
-# "note script with root <X> not found in data store for public note"
-# because StandardNote::from_script_root(0x2777) returns None when the
-# node's BurnNote::script_root() is 0xdad2. Pinning miden-base to 0.14.4
-# (instead of caret-0.14) forces cargo to resolve miden-assembly 0.22.1
-# on this side too. Bump in lockstep with miden-node releases.
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.14.4" }
+# Protocol 0.15.x migration. The conversion metadata moved off the faucet onto
+# the bridge's `faucet_metadata_map` (CONFIG_AGG_BRIDGE note), `AccountStorageMode`
+# became `AccountType{Private,Public}`, `create_claim_note`/`create_agglayer_faucet`
+# were reshaped — see `feat/protocol-0.15-migration`. The base crates are released
+# on crates.io at 0.15.2; the matching miden-client (0.15.0) is NOT yet tagged, so
+# we track the upstream migration branch (PR 0xMiden/miden-client#2224) until a
+# v0.15.x tag ships, at which point this pins back to the tag.
+#
+# MAST-root consistency note (carried over from the 0.14 pins): the proxy-side
+# `BurnNote::script_root()` MUST match the miden-node binary's, or every L2→L1
+# bridge-out fails in the node's NTX `before_created` handler with
+# "note script with root <X> not found". The 0.15 base crates resolve
+# miden-assembly/core 0.23.x; keep these in lockstep with the deployed
+# miden-node v0.15.x release and tighten to an exact patch if a root mismatch
+# resurfaces during the e2e regression.
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.15.2" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "=0.14.4" }
-miden-standards = { default-features = false, version = "=0.14.4" }
-miden-tx = { default-features = false, version = "=0.14.4" }
+], version = "=0.15.2" }
+miden-standards = { default-features = false, version = "=0.15.2" }
+miden-tx = { default-features = false, version = "=0.15.2" }
 
-# miden-assembly/core MUST be pinned to 0.22.1 to match miden-node v0.14.10's
-# transitive resolution. Empirically `BurnNote::script_root()` differs:
-#   0.22.1 → 0xdad2020d27b388008dedb2dfa1952a1be7d45c9f8b8366ca734de06a07247f9e
-#   0.22.3 → 0x277784547e6a93bbd3a6811dc3ed6bd29141011ae3066dc4319cbf10bb8ab89b
-# Without these explicit pins cargo picks the latest 0.22.x, the proxy emits
-# BURN at the 0.22.3 root, and the node's lookup misses. Bump in lockstep
-# with miden-node releases.
-miden-assembly = { default-features = false, version = "=0.22.1" }
-miden-core = { default-features = false, version = "=0.22.1" }
+miden-assembly = { default-features = false, version = "0.23" }
+miden-core = { default-features = false, version = "0.23" }
 
-# miden-client v0.14.7 (tagged release). Upstream backport of #2101 ships
-# `GrpcClient::with_bearer_auth(token)` — the bearer-header API we need for
-# gateway-fronted nodes (RD-856). Released 2026-05-06.
+# miden-client 0.15.0 — tracked via the upstream protocol-0.15 migration branch
+# (PR 0xMiden/miden-client#2224) until a v0.15.x tag is published. Re-pin to the
+# tag once it lands.
 miden-client = { default-features = false, features = [
   "tonic",
-], git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.7" }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.7" }
+], git = "https://github.com/0xMiden/miden-client.git", branch = "mmagician-claude/agglayer-v0.15" }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "mmagician-claude/agglayer-v0.15" }
 
 [features]
 default = []

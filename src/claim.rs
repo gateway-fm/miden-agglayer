@@ -331,7 +331,8 @@ async fn create_claim(
     // CLAIM notes now target the bridge account (0.14.x). The bridge validates the proof and
     // produces a MINT note targeted at the faucet. The faucet then creates the final P2ID note
     // for the destination wallet (derived from leaf_data.destination_address).
-    let note = miden_base_agglayer::create_claim_note(storage, accounts.bridge.0, sender, rng)?;
+    let note =
+        miden_base_agglayer::ClaimNote::create(storage, accounts.bridge.0, sender, rng)?;
     Ok(note)
 }
 
@@ -887,7 +888,7 @@ mod tests {
         use miden_protocol::account::AccountId;
         use std::ops::{Add, Mul};
 
-        const DUMMY_ACCOUNT_HEX: &str = "0x3d7c9747558851900f8206226dfbea";
+        const DUMMY_ACCOUNT_HEX: &str = "0xac0000000000dd110000ee000000fc";
 
         fn faucet(origin_decimals: u8, miden_decimals: u8) -> Faucet {
             Faucet {
@@ -942,7 +943,7 @@ mod tests {
             use miden_client::asset::FungibleAsset;
 
             // Boundary: an amount that scales to exactly MAX_AMOUNT must succeed.
-            let max_native = FungibleAsset::MAX_AMOUNT; // 2^63 - 2^31
+            let max_native = u64::from(FungibleAsset::MAX_AMOUNT); // 2^63 - 2^31
             // For an 18→8 decimal layout, scale = 10. Pre-image wei = max_native * 10^10.
             let wei_at_max = U256::from(max_native).mul(U256::from(10u64).pow(U256::from(10u64)));
             let amount = scale_claim_amount(&eth_amount(wei_at_max), faucet(18, 8))

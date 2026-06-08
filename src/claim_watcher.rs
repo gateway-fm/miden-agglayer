@@ -30,7 +30,6 @@ use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
 use crate::miden_client::{MidenClientLib, SyncListener};
 use anyhow::{Context, anyhow};
-use miden_base_agglayer::claim_script;
 use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_client::sync::SyncSummary;
 use miden_protocol::note::NoteStorage;
@@ -221,7 +220,7 @@ impl ClaimWatcher {
     /// advance the cursor without writing a log, or readers seeing `latest >=
     /// N` won't find the log at N (aggsender skips, event lost forever).
     async fn process_consumed_claim(&self, note: &InputNoteRecord, block_number: u64) -> bool {
-        let note_id_str = note.id().to_string();
+        let note_id_str = note.id().expect("input note record has committed metadata").to_string();
 
         // 1. Fast-path: have we already processed this CLAIM observation?
         match self.store.is_claim_note_processed(&note_id_str).await {
@@ -393,7 +392,7 @@ impl SyncListener for ClaimWatcher {
         // Compute the CLAIM script root once per tick. `claim_script()` is
         // a cheap accessor over a baked-in constant; same pattern
         // `bridge_out.rs::on_post_sync` line 435 uses.
-        let claim_root = claim_script().root();
+        let claim_root = miden_base_agglayer::ClaimNote::script().root();
 
         for note in &consumed_notes {
             if note.details().script().root() != claim_root {

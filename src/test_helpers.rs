@@ -13,7 +13,9 @@ use miden_protocol::account::AccountId;
 use std::sync::Arc;
 
 /// A valid hex-encoded AccountId used across all test fixtures.
-const TEST_ACCOUNT_HEX: &str = "0x3d7c9747558851900f8206226dfbea";
+/// Protocol 0.15 rejects the old v0 AccountId encoding (`UnknownAccountIdVersion`);
+/// this is a valid 0.15 (version-1) public regular-account id.
+const TEST_ACCOUNT_HEX: &str = "0xac0000000000dd110000ee000000fc";
 
 fn dummy_account_id() -> AccountIdBech32 {
     AccountIdBech32(AccountId::from_hex(TEST_ACCOUNT_HEX).expect("valid test account ID"))
