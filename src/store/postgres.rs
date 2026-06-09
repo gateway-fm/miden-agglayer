@@ -95,6 +95,29 @@ impl Store for PgStore {
         Ok(val as u64)
     }
 
+    async fn get_raw_miden_height(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT raw_miden_height FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        let val: i64 = row.get(0);
+        Ok(val as u64)
+    }
+
+    async fn set_raw_miden_height(&self, height: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET raw_miden_height = $1, updated_at = now() WHERE id = 1",
+                &[&(height as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let row = client
@@ -476,25 +499,34 @@ impl Store for PgStore {
         Ok(())
     }
 
-    /// G5: atomic GER commit. The default Store-trait impl runs three
-    /// separate calls; this override folds all four writes (ger_entries
-    /// upsert, hash chain update, synthetic_logs insert, is_injected
-    /// flag, latest_block_number bump) into ONE postgres transaction so
-    /// a process crash anywhere mid-sequence either leaves nothing or
-    /// leaves the full GER commit visible.
-    #[allow(clippy::too_many_arguments)]
+    /// G5 + Cantina #5: atomic GER commit. The store ALLOCATES the synthetic
+    /// block number inside this transaction (no caller-chosen block number),
+    /// then folds all four writes (ger_entries upsert, hash chain update,
+    /// synthetic_logs insert, is_injected flag) into ONE postgres transaction
+    /// so a process crash anywhere mid-sequence either leaves nothing or
+    /// leaves the full GER commit visible. Returns the allocated block number.
     async fn commit_ger_event_atomic(
         &self,
-        block_number: u64,
-        block_hash: [u8; 32],
         tx_hash: &str,
         global_exit_root: &[u8; 32],
         mainnet_exit_root: Option<[u8; 32]>,
         rollup_exit_root: Option<[u8; 32]>,
-        timestamp: u64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
+
+        // Cantina #5 — allocate the synthetic block number INSIDE this
+        // transaction; the block hash and synthetic timestamp are pure
+        // functions of the number.
+        let block_row = txn
+            .query_one(
+                "UPDATE service_state SET latest_block_number = latest_block_number + 1, updated_at = now() WHERE id = 1 RETURNING latest_block_number",
+                &[],
+            )
+            .await?;
+        let block_number: u64 = block_row.get::<_, i64>(0) as u64;
+        let block_hash = crate::block_state::SyntheticBlock::compute_hash_for_number(block_number);
+        let timestamp = crate::block_state::BlockState::synthetic_timestamp(block_number);
 
         // Pre-existing add_ger_update_event sequence — duplicated here
         // so the whole bundle is one transaction.
@@ -576,15 +608,10 @@ impl Store for PgStore {
         )
         .await?;
 
-        // set_latest_block_number, fused.
-        txn.execute(
-            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
-            &[&(block_number as i64)],
-        )
-        .await?;
-
+        // The cursor was already advanced by the allocation UPDATE above —
+        // no separate set_latest_block_number step (Cantina #5).
         txn.commit().await?;
-        Ok(())
+        Ok(block_number)
     }
 
     // ── Transactions ─────────────────────────────────────────────
@@ -1221,9 +1248,35 @@ impl Store for PgStore {
         Ok(val as u64)
     }
 
-    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
+    async fn get_processed_deposit_count(&self, note_id: &str) -> anyhow::Result<Option<u32>> {
         let client = self.pool.get().await?;
         let row = client
+            .query_opt(
+                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, i32>(0) as u32))
+    }
+
+    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        // Cantina #15 — idempotent: if the note was already processed, REUSE
+        // its assigned deposit_count instead of allocating a new one (which
+        // would diverge the exported exit index from the Miden LET order).
+        if let Some(existing) = txn
+            .query_opt(
+                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?
+        {
+            let val: i32 = existing.get(0);
+            txn.commit().await?;
+            return Ok(val as u32);
+        }
+        let row = txn
             .query_one(
                 "WITH counter AS (
                     UPDATE service_state SET deposit_counter = deposit_counter + 1, updated_at = now() WHERE id = 1
@@ -1235,7 +1288,9 @@ impl Store for PgStore {
                 &[&note_id],
             )
             .await?;
-        Ok(row.get::<_, i32>(0) as u32)
+        let val = row.get::<_, i32>(0) as u32;
+        txn.commit().await?;
+        Ok(val)
     }
 
     /// B1: atomic B2AGG bridge-out commit. Folds five writes into one txn:
@@ -1266,6 +1321,23 @@ impl Store for PgStore {
     ) -> anyhow::Result<u32> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
+
+        // Cantina #15 — idempotent retry: if this note was already processed,
+        // REUSE its deposit_count and emit no new log. The synthetic block was
+        // allocated once for the batch by `allocate_synthetic_block` (Cantina
+        // #5/#19), so this method writes into `block_number` and does NOT
+        // advance the tip.
+        if let Some(existing) = txn
+            .query_opt(
+                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?
+        {
+            let deposit_count: u32 = existing.get::<_, i32>(0) as u32;
+            txn.commit().await?;
+            return Ok(deposit_count);
+        }
 
         // 1+2: allocate deposit_count, INSERT processed-note row.
         let row = txn
@@ -1323,13 +1395,8 @@ impl Store for PgStore {
         )
         .await?;
 
-        // 5: advance the cursor.
-        txn.execute(
-            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
-            &[&(block_number as i64)],
-        )
-        .await?;
-
+        // No tip advance here — the synthetic block was allocated once for the
+        // whole batch by `allocate_synthetic_block` (Cantina #5/#19).
         txn.commit().await?;
         Ok(deposit_count)
     }
@@ -1409,25 +1476,36 @@ impl Store for PgStore {
         Ok(!rpc_rows.is_empty())
     }
 
-    /// Atomic commit for a watcher-synthesised ClaimEvent. Single PG txn folding
-    /// the three writes the default impl chains separately. Mirrors the design
-    /// of `commit_b2agg_event_atomic` and `commit_ger_event_atomic`.
+    /// Cantina #5: atomic commit for a watcher-synthesised ClaimEvent. The
+    /// store ALLOCATES the synthetic block number inside this transaction
+    /// (no caller-chosen block number), folding the writes the default impl
+    /// chains separately. Mirrors `commit_b2agg_event_atomic` /
+    /// `commit_ger_event_atomic`. Returns the allocated block number.
     #[allow(clippy::too_many_arguments)]
     async fn commit_manual_claim_event_atomic(
         &self,
         note_id: String,
         bridge_address: &str,
-        block_number: u64,
-        block_hash: [u8; 32],
         tx_hash: &str,
         global_index: [u8; 32],
         origin_network: u32,
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
         amount: u64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
+
+        // Cantina #5 — allocate the synthetic block number INSIDE this
+        // transaction; the block hash is a pure function of the number.
+        let block_row = txn
+            .query_one(
+                "UPDATE service_state SET latest_block_number = latest_block_number + 1, updated_at = now() WHERE id = 1 RETURNING latest_block_number",
+                &[],
+            )
+            .await?;
+        let block_number: u64 = block_row.get::<_, i64>(0) as u64;
+        let block_hash = crate::block_state::SyntheticBlock::compute_hash_for_number(block_number);
 
         // 1. Mark the CLAIM note processed (idempotent — second observation no-ops).
         txn.execute(
@@ -1476,17 +1554,10 @@ impl Store for PgStore {
         )
         .await?;
 
-        // 4. Advance the cursor — write log THEN advance, so any reader who
-        //    sees latest >= N also sees the log at N. The same invariant
-        //    `bridge_out.rs::on_post_sync` documents at line 555.
-        txn.execute(
-            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
-            &[&(block_number as i64)],
-        )
-        .await?;
-
+        // The cursor was already advanced by the allocation UPDATE above —
+        // no separate set_latest_block_number step (Cantina #5).
         txn.commit().await?;
-        Ok(())
+        Ok(block_number)
     }
 
     // ── Faucet registry ──────────────────────────────────────────

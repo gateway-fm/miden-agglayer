@@ -761,7 +761,15 @@ async fn attempt_publish_claim(
                     local_prover_fallback,
                 )
                 .await?;
-                let block_num = store.get_latest_block_number().await? + 1;
+                // Cantina #5 — allocate the synthetic block store-side and
+                // transactionally via `allocate_synthetic_block`, instead of
+                // the racy `get_latest_block_number()+1`. Two concurrent claim
+                // publishers (or a claim racing a GER / bridge-out write) can
+                // never observe the same tip and both land in the same block.
+                // The allocation advances the tip; `txn_commit`'s own monotonic
+                // cursor guard then no-ops on it, so no separate
+                // `set_latest_block_number` is needed.
+                let block_num = store.allocate_synthetic_block().await?;
                 let block_hash = block_state.get_block_hash(block_num);
                 store
                     .txn_begin(
@@ -778,7 +786,6 @@ async fn attempt_publish_claim(
                 store
                     .txn_commit(txn_hash, Ok(()), block_num, block_hash)
                     .await?;
-                store.set_latest_block_number(block_num).await?;
                 tracing::info!(
                     eth_tx = %txn_hash,
                     block_num,

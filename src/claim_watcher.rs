@@ -202,6 +202,11 @@ pub fn derive_manual_claim_tx_hash(note_id_str: &str) -> String {
 /// the failure modes this covers.
 pub struct ClaimWatcher {
     store: Arc<dyn crate::store::Store>,
+    /// Cantina #5 — the synthetic block (number/hash/timestamp) is now owned
+    /// and derived by the store inside `commit_manual_claim_event_atomic`, so
+    /// the watcher no longer reads `block_state`. Retained in the struct +
+    /// `new()` signature for API stability with the callers that construct it.
+    #[allow(dead_code)]
     block_state: Arc<BlockState>,
 }
 
@@ -220,7 +225,7 @@ impl ClaimWatcher {
     /// follow-up contract in `bridge_out.rs::process_consumed_note`: never
     /// advance the cursor without writing a log, or readers seeing `latest >=
     /// N` won't find the log at N (aggsender skips, event lost forever).
-    async fn process_consumed_claim(&self, note: &InputNoteRecord, block_number: u64) -> bool {
+    async fn process_consumed_claim(&self, note: &InputNoteRecord) -> bool {
         let note_id_str = note.id().to_string();
 
         // 1. Fast-path: have we already processed this CLAIM observation?
@@ -237,6 +242,13 @@ impl ClaimWatcher {
                 return false;
             }
         }
+
+        // Current synthetic tip — used only to stamp the `block_number` column
+        // on the skip-path `mark_claim_note_processed` rows below (which emit
+        // no log). The actual synthetic block for a SYNTHESISED ClaimEvent is
+        // allocated store-side inside `commit_manual_claim_event_atomic`
+        // (Cantina #5), not chosen here.
+        let observed_block = self.store.get_latest_block_number().await.unwrap_or(0);
 
         // 2. Decode the CLAIM storage. Malformed storage gets quarantined the
         //    same way `bridge_out.rs::B8` treats an unknown faucet — mark
@@ -255,7 +267,7 @@ impl ClaimWatcher {
                 // not ideal but not load-bearing for correctness either.
                 if let Err(mark_err) = self
                     .store
-                    .mark_claim_note_processed(note_id_str.clone(), [0u8; 32], block_number)
+                    .mark_claim_note_processed(note_id_str.clone(), [0u8; 32], observed_block)
                     .await
                 {
                     tracing::error!(
@@ -293,7 +305,7 @@ impl ClaimWatcher {
                     .mark_claim_note_processed(
                         note_id_str.clone(),
                         decoded.global_index,
-                        block_number,
+                        observed_block,
                     )
                     .await
                 {
@@ -318,21 +330,18 @@ impl ClaimWatcher {
             }
         }
 
-        // 4. Write the synthetic ClaimEvent atomically. Race-safe invariant
-        //    (per `bridge_out.rs::on_post_sync` line 555): the log lands at
-        //    `block_number` BEFORE `latest_block_number` is advanced to
-        //    `block_number`, so any reader who sees `latest >= N` is
-        //    guaranteed to also see the log at N. The atomic store method
-        //    enforces the ordering inside one transaction.
+        // 4. Write the synthetic ClaimEvent atomically. Cantina #5 — the store
+        //    ALLOCATES the synthetic block inside `commit_manual_claim_event_atomic`
+        //    (no racy `get_latest_block_number()+1` here), writes the ClaimEvent
+        //    log at that block and advances the tip in ONE transaction, so the
+        //    race-safe "every reader who sees latest >= N also sees the log at
+        //    N" invariant holds and concurrent writers get distinct blocks.
         let tx_hash = derive_manual_claim_tx_hash(&note_id_str);
-        let block_hash = self.block_state.get_block_hash(block_number);
         match self
             .store
             .commit_manual_claim_event_atomic(
                 note_id_str.clone(),
                 get_bridge_address(),
-                block_number,
-                block_hash,
                 &tx_hash,
                 decoded.global_index,
                 decoded.origin_network,
@@ -342,7 +351,7 @@ impl ClaimWatcher {
             )
             .await
         {
-            Ok(()) => {
+            Ok(block_number) => {
                 ::metrics::counter!("claim_watcher_synthesised_total").increment(1);
                 tracing::info!(
                     target: "claim_watcher",
@@ -352,7 +361,7 @@ impl ClaimWatcher {
                     origin_network = decoded.origin_network,
                     amount = decoded.amount,
                     block_number,
-                    "synthesised ClaimEvent from consumed CLAIM note"
+                    "synthesised ClaimEvent from consumed CLAIM note (store-allocated block)"
                 );
                 true
             }
@@ -399,16 +408,11 @@ impl SyncListener for ClaimWatcher {
             if note.details().script().root() != claim_root {
                 continue;
             }
-            // Race-safe ordering: write the log at (current_latest + 1) and
-            // advance the cursor inside `commit_manual_claim_event_atomic`.
-            // Mirrors `bridge_out.rs::on_post_sync` line 555.
-            let block_number = self.store.get_latest_block_number().await? + 1;
-            let _wrote = self.process_consumed_claim(note, block_number).await;
-            // No additional set_latest_block_number here — the atomic commit
-            // does it inside the same transaction. `process_consumed_claim`
-            // returning false signals a skip path; the cursor was NOT
-            // advanced in that case, so re-using `(current_latest + 1)` on
-            // the next iteration is safe.
+            // Cantina #5 — the synthetic block is allocated store-side inside
+            // `commit_manual_claim_event_atomic` (no racy
+            // `get_latest_block_number()+1` here). A skipped note (returning
+            // false) allocates nothing, so no phantom block leaks.
+            let _wrote = self.process_consumed_claim(note).await;
         }
 
         Ok(())
@@ -591,12 +595,12 @@ mod tests {
         assert!(!store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(!store.has_claim_event_for_global_index(&gi).await.unwrap());
 
-        store
+        // Cantina #5 — the store allocates the synthetic block itself and
+        // returns it; the first commit lands at block 1.
+        let first_block = store
             .commit_manual_claim_event_atomic(
                 note_id.clone(),
                 "0xbridge",
-                1,
-                [0u8; 32],
                 "0xtx",
                 gi,
                 0,
@@ -606,25 +610,22 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(first_block, 1, "store-allocated first synthetic block is 1");
 
         // Both dedup predicates now return true.
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
         assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
 
-        // A second commit with the same note_id must NOT advance the block
-        // or duplicate the log — note that the InMemoryStore default impl
-        // re-inserts (the HashMap upsert), but the cursor advance is to the
-        // same block_number, and downstream dedup catches re-emission.
-        // The PgStore variant uses `ON CONFLICT DO NOTHING` so it's a true
-        // no-op. The InMemoryStore observable invariant is "ClaimEvent
-        // lookup still returns true and cursor doesn't go BACKWARD".
-        store
+        // A second RAW commit allocates a fresh block (the primitive itself is
+        // not note-idempotent — the watcher's `has_claim_event_for_global_index`
+        // guard above it is what prevents double-emission in production). What
+        // MUST hold is that the cursor only ever moves FORWARD (store-owned,
+        // monotonic allocation), never backward, and dedup still sees the leaf.
+        let second_block = store
             .commit_manual_claim_event_atomic(
                 note_id.clone(),
                 "0xbridge",
-                1,
-                [0u8; 32],
                 "0xtx",
                 gi,
                 0,
@@ -634,8 +635,12 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            second_block > first_block,
+            "store-owned allocation is monotonic: each commit gets a DISTINCT, higher block"
+        );
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
-        assert!(store.get_latest_block_number().await.unwrap() >= 1);
+        assert!(store.get_latest_block_number().await.unwrap() >= second_block);
     }
 }

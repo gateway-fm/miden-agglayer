@@ -148,20 +148,30 @@ pub async fn restore(
     crate::account_recovery::reimport_known_accounts(miden_client, accounts).await;
     tracing::info!("Phase 0 complete: bridge account reimport pass done");
 
-    // Phase 1: Sync miden state
+    // Phase 1: Sync miden state. Cantina #5 — anchor the synthetic EVM tip to
+    // the raw Miden height ONCE here, then let each phase's store-owned atomic
+    // commit allocate synthetic blocks ABOVE that anchor. The synthetic tip is
+    // no longer hand-assigned per phase (the old `next_block` plumbing + Phase
+    // 4 manual `set_latest_block_number` are gone): block allocation is owned
+    // by the store, exactly as in the live path.
     tracing::info!("Phase 1: syncing miden state...");
-    let block_num = sync_miden_block(miden_client, store).await?;
-    tracing::info!("Phase 1 complete: miden block {block_num}");
+    let miden_height = sync_miden_block(miden_client, store).await?;
+    store.set_raw_miden_height(miden_height).await?;
+    // Seed the synthetic tip at the raw Miden height so the first allocated
+    // synthetic block is `miden_height + 1` (monotonic; never rolls back below
+    // an already-published synthetic block).
+    let current_tip = store.get_latest_block_number().await?;
+    if miden_height > current_tip {
+        store.set_latest_block_number(miden_height).await?;
+    }
+    tracing::info!("Phase 1 complete: miden height {miden_height}");
 
-    // We'll assign synthetic logs to blocks starting after current
-    let mut next_block = block_num + 1;
     let mut total_logs = 0usize;
 
     // Phase 2: Scan miden consumed B2AGG notes
     tracing::info!("Phase 2: scanning miden consumed B2AGG notes...");
     let (bridge_outs, logs) =
-        restore_bridge_outs(store, miden_client, accounts, block_state, next_block).await?;
-    next_block += if logs > 0 { 1 } else { 0 };
+        restore_bridge_outs(store, miden_client, accounts, block_state).await?;
     total_logs += logs;
     tracing::info!("Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs");
 
@@ -179,26 +189,24 @@ pub async fn restore(
     // watcher uses so the synthetic logs are byte-identical (same tx-hash
     // derivation, same `commit_manual_claim_event_atomic` store path).
     tracing::info!("Phase 2.5: scanning miden consumed CLAIM notes (MA#27)...");
-    let (claims, claim_logs) = restore_claims(store, miden_client, block_state, next_block).await?;
-    next_block += if claim_logs > 0 { 1 } else { 0 };
+    let (claims, claim_logs) = restore_claims(store, miden_client, block_state).await?;
     total_logs += claim_logs;
     tracing::info!("Phase 2.5 complete: {claims} claims, {claim_logs} logs");
 
     // Phase 3: Scan consumed UpdateGerNote notes on Miden
     tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
-    let (gers, ger_logs) =
-        restore_gers(store, miden_client, accounts, block_state, next_block).await?;
+    let (gers, ger_logs) = restore_gers(store, miden_client, accounts, block_state).await?;
     total_logs += ger_logs;
     tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
 
-    // Phase 4: Update block number to cover all synthetic logs
-    let final_block = next_block + if ger_logs > 0 { 1 } else { 0 };
-    store.set_latest_block_number(final_block).await?;
-    tracing::info!("Phase 4: block number set to {final_block}");
+    // The synthetic tip now reflects every block the atomic commits allocated.
+    let final_block = store.get_latest_block_number().await?;
 
     // Phase 5: Verify
     tracing::info!("Phase 5: verification");
-    tracing::info!("  bridge_outs={bridge_outs}, claims={claims}, gers={gers}, logs={total_logs}");
+    tracing::info!(
+        "  bridge_outs={bridge_outs}, claims={claims}, gers={gers}, logs={total_logs}, tip={final_block}"
+    );
     tracing::info!("=== RESTORE: complete ===");
 
     Ok(RestoreResult {
@@ -235,7 +243,6 @@ async fn restore_bridge_outs(
     miden_client: &MidenClient,
     _accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
-    restore_block: u64,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -251,7 +258,6 @@ async fn restore_bridge_outs(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
-                let block_hash = block_state_clone.get_block_hash(restore_block);
                 let bridge_address = get_bridge_address();
                 let mut count = 0usize;
                 let mut logs = 0usize;
@@ -267,6 +273,15 @@ async fn restore_bridge_outs(
                 // deposit_count). Sort by note_id (stable across re-syncs).
                 let mut sorted: Vec<&_> = consumed_notes.iter().collect();
                 sorted.sort_by_key(|n| n.id().to_string());
+
+                // Cantina #5/#15/#19 — restore uses the SAME store-owned atomic
+                // primitive as the live path (`commit_b2agg_event_atomic`) and
+                // the SAME single-batch-block model: all restored bridge-outs
+                // share one synthetic block, allocated once store-side. This
+                // makes the deposit_count increment and the synthetic-log insert
+                // one transaction (#15), and the block allocation store-owned
+                // (#5), exactly as the live `bridge_out::on_post_sync` does.
+                let mut batch_block: Option<u64> = None;
 
                 for note in sorted {
                     let details = note.details();
@@ -317,13 +332,23 @@ async fn restore_bridge_outs(
                     // first-observation and restore paths (dedup-stable).
                     let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
 
-                    let deposit_count =
-                        store_clone.mark_note_processed(note_id_str.clone()).await?;
+                    // Lazily allocate the single batch block on the first
+                    // emitting note (store-owned, monotonic).
+                    let block_number = match batch_block {
+                        Some(b) => b,
+                        None => {
+                            let b = store_clone.allocate_synthetic_block().await?;
+                            batch_block = Some(b);
+                            b
+                        }
+                    };
+                    let block_hash = block_state_clone.get_block_hash(block_number);
 
-                    if let Err(err) = store_clone
-                        .add_bridge_event(
+                    let deposit_count = store_clone
+                        .commit_b2agg_event_atomic(
+                            note_id_str.clone(),
                             bridge_address,
-                            restore_block,
+                            block_number,
                             block_hash,
                             &tx_hash,
                             0, // LEAF_TYPE_ASSET
@@ -333,18 +358,14 @@ async fn restore_bridge_outs(
                             &destination_address,
                             origin_amount,
                             &[],
-                            deposit_count,
                         )
-                        .await
-                    {
-                        let _ = store_clone.unmark_note_processed(&note_id_str).await;
-                        return Err(err);
-                    }
+                        .await?;
 
                     tracing::info!(
                         note_id = %note_id_str,
                         deposit_count,
-                        "restore: rebuilt BridgeEvent"
+                        block_number,
+                        "restore: rebuilt BridgeEvent (atomic, store-allocated batch block)"
                     );
 
                     count += 1;
@@ -376,11 +397,9 @@ async fn restore_bridge_outs(
 async fn restore_claims(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
-    block_state: &Arc<BlockState>,
-    restore_block: u64,
+    _block_state: &Arc<BlockState>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
-    let block_state_clone = block_state.clone();
 
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
@@ -394,16 +413,15 @@ async fn restore_claims(
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
                 let claim_root = claim_script().root();
-                let block_hash = block_state_clone.get_block_hash(restore_block);
                 let bridge_address = get_bridge_address();
                 let mut claim_count = 0usize;
                 let mut log_count = 0usize;
 
-                // G7 — deterministic sort. CLAIM notes share the same
-                // restore_block (and therefore block_hash) and write into a
-                // dedup-keyed store, but we still sort to keep restore runs
-                // deterministic for the operator-visible
-                // `claim_watcher_synthesised_total` counter and log stream.
+                // G7 — deterministic sort. Each ClaimEvent's synthetic block is
+                // allocated store-side by `commit_manual_claim_event_atomic`
+                // (Cantina #5), so we sort to keep the allocation order — and
+                // therefore the operator-visible counter + log stream —
+                // deterministic across restore runs.
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
                 sorted_notes.sort_by_key(|n| n.id().to_string());
 
@@ -452,11 +470,14 @@ async fn restore_claims(
                         // Still mark the note processed so the next
                         // observation (live watcher or another restore) is
                         // a fast skip rather than a re-decode.
+                        // Stamp the skip-path marker with the current tip (no
+                        // log emitted on this path, so no new block allocated).
+                        let observed_block = store_clone.get_latest_block_number().await?;
                         if let Err(e) = store_clone
                             .mark_claim_note_processed(
                                 note_id_str.clone(),
                                 decoded.global_index,
-                                restore_block,
+                                observed_block,
                             )
                             .await
                         {
@@ -472,12 +493,11 @@ async fn restore_claims(
 
                     let tx_hash = derive_manual_claim_tx_hash(&note_id_str);
 
-                    store_clone
+                    // Cantina #5 — store allocates the synthetic block.
+                    let block_number = store_clone
                         .commit_manual_claim_event_atomic(
                             note_id_str.clone(),
                             bridge_address,
-                            restore_block,
-                            block_hash,
                             &tx_hash,
                             decoded.global_index,
                             decoded.origin_network,
@@ -495,7 +515,7 @@ async fn restore_claims(
                         global_index = %hex::encode(decoded.global_index),
                         origin_network = decoded.origin_network,
                         amount = decoded.amount,
-                        block_number = restore_block,
+                        block_number,
                         "restore: synthesised ClaimEvent from consumed CLAIM note (MA#27)"
                     );
 
@@ -527,11 +547,9 @@ async fn restore_gers(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
-    block_state: &Arc<BlockState>,
-    restore_block: u64,
+    _block_state: &Arc<BlockState>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
-    let block_state_clone = block_state.clone();
     // MA#28 — same fallback as `submit_update_ger_note` in `src/ger.rs`:
     // legacy deployments without a dedicated `ger_manager` mint
     // UpdateGerNotes from the `service` account. Use the same resolution
@@ -556,8 +574,6 @@ async fn restore_gers(
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
                 let ger_script_root = UpdateGerNote::script_root();
-                let block_hash = block_state_clone.get_block_hash(restore_block);
-                let timestamp = block_state_clone.get_block_timestamp(restore_block);
                 let mut ger_count = 0usize;
                 let mut log_count = 0usize;
 
@@ -690,24 +706,20 @@ async fn restore_gers(
                         format!("0x{}", hex::encode(hasher.finalize()))
                     };
 
-                    store_clone
-                        .add_ger_update_event(
-                            restore_block,
-                            block_hash,
-                            &tx_hash,
-                            &ger_bytes,
-                            None,
-                            None,
-                            timestamp,
-                        )
+                    // Cantina #5 — same store-owned atomic primitive as the
+                    // live GER path: `commit_ger_event_atomic` allocates the
+                    // synthetic block, derives hash + timestamp, writes the
+                    // UpdateHashChainValue log, and flips `is_injected`, all in
+                    // one transaction.
+                    let block_number = store_clone
+                        .commit_ger_event_atomic(&tx_hash, &ger_bytes, None, None)
                         .await?;
-
-                    store_clone.mark_ger_injected(ger_bytes).await?;
 
                     tracing::info!(
                         note_id = %note.id(),
                         ger = %hex::encode(ger_bytes),
-                        "restore: rebuilt GER from consumed UpdateGerNote"
+                        block_number,
+                        "restore: rebuilt GER from consumed UpdateGerNote (atomic, store-allocated block)"
                     );
 
                     ger_count += 1;
@@ -852,12 +864,10 @@ mod tests {
 
         // Phase 2.5 inner emission — mirror the call we make in
         // `restore_claims` for an accepted CLAIM.
-        store
+        let block = store
             .commit_manual_claim_event_atomic(
                 note_id.clone(),
                 bridge,
-                1,
-                [0u8; 32],
                 &tx_hash,
                 gi,
                 7,
@@ -868,6 +878,8 @@ mod tests {
             .await
             .unwrap();
 
+        // Cantina #5 — store-allocated synthetic block: first commit is block 1.
+        assert_eq!(block, 1);
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
         assert_eq!(store.get_latest_block_number().await.unwrap(), 1);

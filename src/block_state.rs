@@ -164,6 +164,14 @@ impl BlockState {
         GENESIS_TIMESTAMP + block_num * BLOCK_TIME
     }
 
+    /// Pure synthetic block timestamp for a given block number. Exposed as an
+    /// associated function so the store can derive the timestamp from a
+    /// store-allocated synthetic block number without holding a `BlockState`
+    /// (Cantina #5 — synthetic block allocation is store-owned).
+    pub fn synthetic_timestamp(block_num: u64) -> u64 {
+        Self::deterministic_timestamp(block_num)
+    }
+
     /// Compute the deterministic timestamp for any block number.
     pub fn get_block_timestamp(&self, block_num: u64) -> u64 {
         Self::deterministic_timestamp(block_num)

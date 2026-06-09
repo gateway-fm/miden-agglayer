@@ -412,8 +412,6 @@ async fn test_pgstore_has_claim_event_for_global_index_finds_both_sources() {
         .commit_manual_claim_event_atomic(
             note_id_a,
             "0xbridge",
-            (now_ns % 1_000_000) as u64,
-            [0u8; 32],
             "0xwatchertx",
             gi_a,
             0,
@@ -468,16 +466,15 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
         g
     };
     let note_id = format!("claim_atomic_test_{now_ns}");
-    // Use a high block_number namespaced by timestamp so tests don't fight.
-    let block = (now_ns % 1_000_000) as u64 + 10_000;
     let tx_hash = format!("0xclaim_atomic_{now_ns}");
 
-    store
+    // Cantina #5 — the store allocates the synthetic block and returns it; no
+    // caller-chosen block number.
+    let tip_before = store.get_latest_block_number().await.unwrap();
+    let block = store
         .commit_manual_claim_event_atomic(
             note_id.clone(),
             "0xbridge",
-            block,
-            [0u8; 32],
             &tx_hash,
             gi,
             0,
@@ -488,7 +485,8 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
         .await
         .unwrap();
 
-    // Cursor advanced.
+    // Store-owned allocation advanced the tip by exactly one.
+    assert_eq!(block, tip_before + 1);
     assert!(store.get_latest_block_number().await.unwrap() >= block);
     // Note processed.
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());

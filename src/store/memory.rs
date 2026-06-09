@@ -24,8 +24,18 @@ struct TxnReceipt {
 }
 
 pub struct InMemoryStore {
-    // Block number
+    // Block number — synthetic EVM tip.
     latest_block_number: RwLock<u64>,
+
+    // Raw Miden sync height — tracked SEPARATELY from the synthetic EVM tip
+    // (Cantina #5). The sync loop writes the observed Miden block here; it
+    // must never clobber `latest_block_number`.
+    raw_miden_height: RwLock<u64>,
+
+    // Bridge-out atomic-commit critical section (Cantina #5/#15). Held across
+    // block allocation + deposit_count allocation + log insert so the whole
+    // bundle is one atomic unit, matching the PgStore SERIALIZABLE transaction.
+    bridge_out_commit_lock: Mutex<()>,
 
     // Logs
     logs_by_block: RwLock<HashMap<u64, Vec<SyntheticLog>>>,
@@ -57,8 +67,10 @@ pub struct InMemoryStore {
     // Address mappings
     address_mappings: RwLock<HashMap<Address, AccountId>>,
 
-    // Bridge-out
-    processed_notes: RwLock<HashSet<String>>,
+    // Bridge-out — note_id → assigned deposit_count. Stored as a map (not a
+    // set) so an idempotent retry can REUSE the assigned count (Cantina #15)
+    // rather than re-incrementing the counter.
+    processed_notes: RwLock<HashMap<String, u32>>,
     deposit_counter: RwLock<u32>,
 
     // Claim watcher (independent from bridge-out so CLAIM observations do not
@@ -91,6 +103,8 @@ impl InMemoryStore {
     pub fn new() -> Self {
         Self {
             latest_block_number: RwLock::new(0),
+            raw_miden_height: RwLock::new(0),
+            bridge_out_commit_lock: Mutex::new(()),
             logs_by_block: RwLock::new(HashMap::new()),
             logs_by_tx: RwLock::new(HashMap::new()),
             log_counter: RwLock::new(0),
@@ -105,7 +119,7 @@ impl InMemoryStore {
             unclaimable: RwLock::new(HashMap::new()),
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
-            processed_notes: RwLock::new(HashSet::new()),
+            processed_notes: RwLock::new(HashMap::new()),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             faucets: RwLock::new(Vec::new()),
@@ -139,6 +153,15 @@ impl Store for InMemoryStore {
         let mut num = self.latest_block_number.write();
         *num += 1;
         Ok(*num)
+    }
+
+    async fn get_raw_miden_height(&self) -> anyhow::Result<u64> {
+        Ok(*self.raw_miden_height.read())
+    }
+
+    async fn set_raw_miden_height(&self, height: u64) -> anyhow::Result<()> {
+        *self.raw_miden_height.write() = height;
+        Ok(())
     }
 
     // ── Logs ─────────────────────────────────────────────────────
@@ -581,7 +604,11 @@ impl Store for InMemoryStore {
     // ── Bridge-out ───────────────────────────────────────────────
 
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
-        Ok(self.processed_notes.read().contains(note_id))
+        Ok(self.processed_notes.read().contains_key(note_id))
+    }
+
+    async fn get_processed_deposit_count(&self, note_id: &str) -> anyhow::Result<Option<u32>> {
+        Ok(self.processed_notes.read().get(note_id).copied())
     }
 
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
@@ -589,16 +616,98 @@ impl Store for InMemoryStore {
     }
 
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
-        self.processed_notes.write().insert(note_id);
+        // Cantina #15 — idempotent: a note already processed REUSES its
+        // assigned deposit_count rather than allocating a new one (which would
+        // diverge the exported exit index from the Miden LET order).
+        let mut processed = self.processed_notes.write();
+        if let Some(existing) = processed.get(&note_id) {
+            return Ok(*existing);
+        }
         let mut counter = self.deposit_counter.write();
         let deposit_count = *counter;
         *counter += 1;
+        processed.insert(note_id, deposit_count);
         Ok(deposit_count)
     }
 
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
         self.processed_notes.write().remove(note_id);
         Ok(())
+    }
+
+    /// Cantina #5/#15/#19 — atomic B2AGG commit for InMemoryStore at the
+    /// store-allocated batch block `block_number`. Holds the dedicated commit
+    /// lock across the deposit_count allocation + log insert so the bundle is
+    /// one critical section (mirrors the PgStore SERIALIZABLE transaction).
+    /// Does NOT advance the tip — `allocate_synthetic_block` already did, once
+    /// for the whole batch. Idempotent: an already-processed note reuses its
+    /// deposit_count and emits no duplicate log (Cantina #15).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        // The commit lock guards the idempotency check + deposit_count
+        // allocation as one critical section (so two concurrent commits never
+        // assign the same deposit_count, and a retry of an already-processed
+        // note reuses its count — Cantina #15). It is a non-Send parking_lot
+        // guard, so it is scoped to the synchronous section and dropped BEFORE
+        // the `add_bridge_event` await; the log insert itself is already
+        // serialised by `add_log`'s own internal locks, and the synthetic block
+        // was pre-allocated by `allocate_synthetic_block` (Cantina #5/#19).
+        let already_processed;
+        let deposit_count = {
+            let _guard = self.bridge_out_commit_lock.lock();
+            // Bind the read result to a local so the RwLock read guard is
+            // released BEFORE the `None` arm takes the write lock — a `match`
+            // scrutinee temporary would otherwise live for the whole match
+            // body and deadlock parking_lot (non-reentrant).
+            let existing = self.processed_notes.read().get(&note_id).copied();
+            match existing {
+                Some(dc) => {
+                    already_processed = true;
+                    dc
+                }
+                None => {
+                    already_processed = false;
+                    let mut counter = self.deposit_counter.write();
+                    let dc = *counter;
+                    *counter += 1;
+                    self.processed_notes.write().insert(note_id, dc);
+                    dc
+                }
+            }
+        };
+        if already_processed {
+            return Ok(deposit_count);
+        }
+        self.add_bridge_event(
+            bridge_address,
+            block_number,
+            block_hash,
+            tx_hash,
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        )
+        .await?;
+        Ok(deposit_count)
     }
 
     // ── Claim watcher ────────────────────────────────────────────
@@ -1190,6 +1299,261 @@ mod tests {
         let origin_amount =
             crate::bridge_out::reverse_scale_amount(1000, bridge_out_faucet.scale).unwrap();
         assert_eq!(origin_amount, 1000);
+    }
+
+    /// Cantina #5 — store-owned atomic synthetic block allocation regression.
+    ///
+    /// The auditor PoC (`poc-05.rs`,
+    /// `bridge_event_can_be_added_to_an_already_visible_block`) reproduced the
+    /// ROOT CAUSE: two writers reserved the SAME block number from the same
+    /// observed tip via `get_latest_block_number()+1`, the first event made
+    /// block N visible, and the second event was appended into that
+    /// already-visible block — without changing its hash, so undetectable.
+    ///
+    /// After the fix, block allocation is store-owned and transactional
+    /// (`allocate_synthetic_block` / the atomic commit helpers). This test is
+    /// the POSITIVE form of the PoC: two concurrent allocations MUST get
+    /// DISTINCT block numbers, and a late writer can never reuse a block an
+    /// earlier writer already published into. This is exactly the property
+    /// cergyk's objection said was missing.
+    #[tokio::test]
+    async fn cantina_5_concurrent_allocations_get_distinct_blocks() {
+        use crate::log_synthesis::{BRIDGE_EVENT_TOPIC, CLAIM_EVENT_TOPIC, LogFilter};
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+
+        // Start from a raw Miden tip of 100, mirroring the PoC's setup.
+        store.set_latest_block_number(100).await.unwrap();
+
+        // Model the PoC's two-writer race WITHOUT pre-bumping the tip between
+        // the reservations — which is exactly the scenario the racy
+        // `get_latest_block_number()+1` mishandled: both writers would have
+        // observed tip 100 and both reserved 101. With store-owned allocation
+        // each call is a single atomic advance-and-return, so back-to-back
+        // reservations from two store handles that have NOT published anything
+        // in between are still DISTINCT.
+        let writer_a = store.clone();
+        let writer_b = store.clone();
+        let res_a = writer_a.allocate_synthetic_block().await.unwrap();
+        let res_b = writer_b.allocate_synthetic_block().await.unwrap();
+        assert_ne!(
+            res_a, res_b,
+            "two writers reserving the next synthetic block from the same observed tip MUST \
+             get DISTINCT blocks — the PoC collision is impossible (Cantina #5)"
+        );
+        assert_eq!(
+            (res_a, res_b),
+            (101, 102),
+            "store-owned allocation hands out 101 then 102 — no shared block"
+        );
+
+        // Hammer it: many sequential reservations are all distinct and
+        // contiguous (no duplicate ever handed out).
+        let n = 64usize;
+        let mut more = BTreeSet::new();
+        for _ in 0..n {
+            assert!(
+                more.insert(store.allocate_synthetic_block().await.unwrap()),
+                "every store-owned allocation is unique — no block handed out twice"
+            );
+        }
+        assert_eq!(more.len(), n);
+        assert_eq!(*more.iter().min().unwrap(), 103);
+
+        // The first writer publishes a ClaimEvent into block 101.
+        let first_block = 101u64;
+        let first_hash = crate::block_state::SyntheticBlock::compute_hash_for_number(first_block);
+        store
+            .add_claim_event(
+                "0x0000000000000000000000000000000000000001",
+                first_block,
+                first_hash,
+                "0xclaim",
+                &[0x11; 32],
+                0,
+                &[0u8; 20],
+                &[1u8; 20],
+                1,
+            )
+            .await
+            .unwrap();
+
+        // A later bridge-out lands at its OWN distinct block (102), committed
+        // atomically (deposit_count + log, Cantina #15) — it can NOT be
+        // appended into the first writer's already-published block 101.
+        let second_block = 102u64;
+        let second_hash = crate::block_state::SyntheticBlock::compute_hash_for_number(second_block);
+        let deposit_count = store
+            .commit_b2agg_event_atomic(
+                "note-late".to_string(),
+                "0x0000000000000000000000000000000000000001",
+                second_block,
+                second_hash,
+                "0xbridge",
+                0,
+                0,
+                &[0u8; 20],
+                1,
+                &[1u8; 20],
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(deposit_count, 0, "first bridge-out gets deposit_count 0");
+
+        // The ClaimEvent is alone in block 101; the BridgeEvent is alone in the
+        // distinct block 102. The late log did NOT land in the already-visible
+        // first block — the PoC's failure is now impossible.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, second_block).await.unwrap();
+        let claim_log = logs
+            .iter()
+            .find(|l| l.topics[0] == CLAIM_EVENT_TOPIC)
+            .expect("ClaimEvent present");
+        let bridge_log = logs
+            .iter()
+            .find(|l| l.topics[0] == BRIDGE_EVENT_TOPIC)
+            .expect("BridgeEvent present");
+        assert_eq!(claim_log.block_number, first_block);
+        assert_eq!(bridge_log.block_number, second_block);
+        assert_ne!(
+            claim_log.block_number, bridge_log.block_number,
+            "the late BridgeEvent landed in a DISTINCT block, not the already-visible ClaimEvent block"
+        );
+        assert_ne!(
+            claim_log.block_hash, bridge_log.block_hash,
+            "distinct blocks have distinct hashes — no silent same-hash append"
+        );
+    }
+
+    /// Cantina #15 — the deposit_count increment is folded into the same
+    /// commit as the synthetic-log insert, and is idempotent on retry: a
+    /// re-commit of the same note REUSES the assigned deposit_count and emits
+    /// NO duplicate log (rather than re-incrementing and diverging the exported
+    /// exit index from the Miden Local Exit Tree order).
+    #[tokio::test]
+    async fn cantina_15_b2agg_commit_is_atomic_and_idempotent_on_retry() {
+        use crate::log_synthesis::LogFilter;
+        let store = InMemoryStore::new();
+
+        let block = store.allocate_synthetic_block().await.unwrap();
+        let hash = crate::block_state::SyntheticBlock::compute_hash_for_number(block);
+
+        // First commit assigns deposit_count 0 and writes one BridgeEvent.
+        let dc1 = store
+            .commit_b2agg_event_atomic(
+                "note-X".to_string(),
+                "0xbridge",
+                block,
+                hash,
+                "0xtx",
+                0,
+                0,
+                &[0u8; 20],
+                1,
+                &[1u8; 20],
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(dc1, 0);
+        assert_eq!(store.get_deposit_count().await.unwrap(), 1);
+
+        // Retry of the SAME note: reuses deposit_count 0, does NOT re-increment
+        // the counter, does NOT emit a second log.
+        let dc2 = store
+            .commit_b2agg_event_atomic(
+                "note-X".to_string(),
+                "0xbridge",
+                block,
+                hash,
+                "0xtx",
+                0,
+                0,
+                &[0u8; 20],
+                1,
+                &[1u8; 20],
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(dc2, 0, "retry REUSES the assigned deposit_count");
+        assert_eq!(
+            store.get_deposit_count().await.unwrap(),
+            1,
+            "retry must NOT re-increment the deposit_counter (Cantina #15)"
+        );
+
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, block).await.unwrap();
+        assert_eq!(logs.len(), 1, "retry must NOT emit a duplicate BridgeEvent");
+
+        // A DIFFERENT note gets the next deposit_count, atomically.
+        let dc3 = store
+            .commit_b2agg_event_atomic(
+                "note-Y".to_string(),
+                "0xbridge",
+                block,
+                hash,
+                "0xtx2",
+                0,
+                0,
+                &[0u8; 20],
+                1,
+                &[1u8; 20],
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(dc3, 1, "distinct note gets the next deposit_count");
+    }
+
+    /// Cantina #5 — the raw Miden sync height is tracked SEPARATELY from the
+    /// synthetic EVM tip. Advancing the raw height must never move the
+    /// synthetic tip, and allocating synthetic blocks must never move the raw
+    /// height.
+    #[tokio::test]
+    async fn cantina_5_raw_miden_height_is_separate_from_synthetic_tip() {
+        let store = InMemoryStore::new();
+
+        store.set_latest_block_number(50).await.unwrap();
+        store.set_raw_miden_height(123_456).await.unwrap();
+
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 50);
+        assert_eq!(store.get_raw_miden_height().await.unwrap(), 123_456);
+
+        // Allocating a synthetic block moves ONLY the synthetic tip.
+        let b = store.allocate_synthetic_block().await.unwrap();
+        assert_eq!(b, 51);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 51);
+        assert_eq!(
+            store.get_raw_miden_height().await.unwrap(),
+            123_456,
+            "synthetic allocation must not touch the raw Miden height"
+        );
+
+        // Bumping the raw Miden height moves ONLY the raw height.
+        store.set_raw_miden_height(123_999).await.unwrap();
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            51,
+            "raw Miden height must not clobber the synthetic tip"
+        );
+        assert_eq!(store.get_raw_miden_height().await.unwrap(), 123_999);
     }
 
     /// Cantina #1 — repro+regression. Two faucets registered for the same origin token

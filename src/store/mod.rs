@@ -210,10 +210,36 @@ impl TxnData {
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + 'static {
     // === Block number ===
+    /// The synthetic EVM tip — the highest synthetic block aggkit has
+    /// published a log into. This is what `eth_blockNumber` returns and what
+    /// aggsender / bridge-service poll against. It is OWNED by the store:
+    /// callers MUST NOT compute `get_latest_block_number()+1` and pass it back
+    /// in. Use [`Store::commit_b2agg_event_atomic`], `commit_ger_event_atomic`,
+    /// or `commit_manual_claim_event_atomic`, all of which allocate the next
+    /// synthetic block INSIDE the same store transaction (Cantina #5).
     async fn get_latest_block_number(&self) -> anyhow::Result<u64>;
     async fn set_latest_block_number(&self, n: u64) -> anyhow::Result<()>;
-    /// Increment block number by 1 and return the new value.
+    /// Atomically increment the synthetic EVM tip by 1 and return the new
+    /// value. This is the seed for store-owned synthetic block allocation —
+    /// the atomic commit helpers below call it inside their transaction so two
+    /// concurrent writers can never observe the same tip and both pick `N+1`
+    /// (Cantina #5).
     async fn advance_block_number(&self) -> anyhow::Result<u64>;
+
+    /// The raw Miden sync height — the Miden chain block number the sync loop
+    /// last observed. Tracked SEPARATELY from the synthetic EVM tip
+    /// (`latest_block_number`) per Cantina #5: the synthetic tip advances once
+    /// per synthetic log (claim / GER / bridge-out), driven by the store-owned
+    /// allocator, and must never be clobbered by the raw Miden height. Default
+    /// impls below are no-ops / `Ok(0)` so stores that don't persist it (older
+    /// deployments) keep compiling; `InMemoryStore` and `PgStore` override.
+    async fn get_raw_miden_height(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    /// Persist the raw Miden sync height. See [`Store::get_raw_miden_height`].
+    async fn set_raw_miden_height(&self, _height: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     // === L1 indexer cursor (RD-862 follow-up) ===
     /// Last successfully-polled L1 block. Returns 0 if the indexer has
@@ -273,28 +299,37 @@ pub trait Store: Send + Sync + 'static {
         timestamp: u64,
     ) -> anyhow::Result<()>;
 
-    /// G5: commit a GER injection in one atomic store operation. Combines
-    /// `add_ger_update_event` (hash chain + UpdateHashChainValue log),
-    /// `mark_ger_injected` (idempotency flag), and `set_latest_block_number`
-    /// (cursor advance) so a process crash mid-sequence cannot leave aggkit
-    /// in a state where the on-chain GER consumption has happened but
-    /// aggkit's view is split (log written but `is_ger_injected` still
-    /// false, or cursor advanced past a block with no log).
+    /// G5 + Cantina #5: commit a GER injection in one atomic store operation.
+    /// The store ALLOCATES the synthetic block number itself (via
+    /// `advance_block_number`) inside the same critical section, computes the
+    /// block hash from it, then combines `add_ger_update_event` (hash chain +
+    /// UpdateHashChainValue log) and `mark_ger_injected` (idempotency flag).
+    /// Returns the synthetic block number the log landed at.
     ///
-    /// The default impl below calls the three primitives sequentially —
-    /// safe for InMemoryStore where everything is in-process. PgStore
-    /// overrides with a single SERIALIZABLE postgres transaction.
-    #[allow(clippy::too_many_arguments)]
+    /// The caller MUST NOT pre-compute `get_latest_block_number()+1` and pass
+    /// it in: that was the non-atomic allocation cergyk flagged (Cantina #5),
+    /// where two writers observe the same tip and both publish into the same
+    /// synthetic block. Allocating inside the transaction guarantees every
+    /// concurrent writer gets a DISTINCT block.
+    ///
+    /// The default impl below allocates then calls the two primitives
+    /// sequentially — safe for InMemoryStore where `advance_block_number`
+    /// takes the same write lock the log inserts take. PgStore overrides with
+    /// a single SERIALIZABLE postgres transaction.
     async fn commit_ger_event_atomic(
         &self,
-        block_number: u64,
-        block_hash: [u8; 32],
         tx_hash: &str,
         global_exit_root: &[u8; 32],
         mainnet_exit_root: Option<[u8; 32]>,
         rollup_exit_root: Option<[u8; 32]>,
-        timestamp: u64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
+        let block_number = self.advance_block_number().await?;
+        let block_hash = crate::block_state::SyntheticBlock::compute_hash_for_number(block_number);
+        // The synthetic block timestamp is a pure function of the allocated
+        // block number, so it is derived here rather than guessed by the
+        // caller from a pre-allocation tip read (which could mismatch the
+        // actually-allocated block under a concurrent writer).
+        let timestamp = crate::block_state::BlockState::synthetic_timestamp(block_number);
         self.add_ger_update_event(
             block_number,
             block_hash,
@@ -306,8 +341,7 @@ pub trait Store: Send + Sync + 'static {
         )
         .await?;
         self.mark_ger_injected(*global_exit_root).await?;
-        self.set_latest_block_number(block_number).await?;
-        Ok(())
+        Ok(block_number)
     }
 
     // === Transactions ===
@@ -428,6 +462,12 @@ pub trait Store: Send + Sync + 'static {
 
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
+    /// Return the `deposit_count` already assigned to this note, or `None` if
+    /// it was never processed. Used by [`Store::commit_b2agg_event_atomic`] to
+    /// REUSE the assigned count on an idempotent retry instead of allocating a
+    /// new one (Cantina #15) — re-incrementing would diverge aggkit's exported
+    /// exit index from the real Miden Local Exit Tree order.
+    async fn get_processed_deposit_count(&self, note_id: &str) -> anyhow::Result<Option<u32>>;
     /// Mark note as processed, return the deposit count assigned to it.
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
     /// Roll back a processed-note marker when later persistence fails.
@@ -496,31 +536,33 @@ pub trait Store: Send + Sync + 'static {
         global_index: &[u8; 32],
     ) -> anyhow::Result<bool>;
 
-    /// Atomic commit for a watcher-synthesised ClaimEvent. Combines:
+    /// Atomic commit for a watcher-synthesised ClaimEvent. The store ALLOCATES
+    /// the synthetic block number itself (Cantina #5) inside the same critical
+    /// section, computes the block hash, then combines:
     ///   1. `mark_claim_note_processed`
     ///   2. `add_claim_event` (synthetic log emission)
-    ///   3. `set_latest_block_number` (cursor advance)
+    /// Returns the synthetic block number the ClaimEvent landed at.
     ///
     /// PgStore overrides with a single SERIALIZABLE postgres txn; the default
-    /// impl below chains the three primitives sequentially, which is fine for
-    /// `InMemoryStore` where every primitive is an in-process lock. The
-    /// race-safe ordering (log THEN cursor) is the same invariant
-    /// `commit_b2agg_event_atomic` and `commit_ger_event_atomic` enforce — see
-    /// the canonical comment at `src/bridge_out.rs::on_post_sync`.
+    /// impl below allocates then chains the two primitives sequentially, which
+    /// is fine for `InMemoryStore` where every primitive (including
+    /// `advance_block_number`) takes an in-process write lock. The caller must
+    /// NOT pre-allocate the block number — see the canonical comment at
+    /// `src/bridge_out.rs::on_post_sync`.
     #[allow(clippy::too_many_arguments)]
     async fn commit_manual_claim_event_atomic(
         &self,
         note_id: String,
         bridge_address: &str,
-        block_number: u64,
-        block_hash: [u8; 32],
         tx_hash: &str,
         global_index: [u8; 32],
         origin_network: u32,
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
         amount: u64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
+        let block_number = self.advance_block_number().await?;
+        let block_hash = crate::block_state::SyntheticBlock::compute_hash_for_number(block_number);
         self.mark_claim_note_processed(note_id, global_index, block_number)
             .await?;
         self.add_claim_event(
@@ -535,8 +577,7 @@ pub trait Store: Send + Sync + 'static {
             amount,
         )
         .await?;
-        self.set_latest_block_number(block_number).await?;
-        Ok(())
+        Ok(block_number)
     }
 
     // === Faucet registry ===
@@ -595,17 +636,30 @@ pub trait Store: Send + Sync + 'static {
         self.add_log(log).await
     }
 
-    /// B1: commit a B2AGG bridge-out synthetic event in one atomic store
-    /// operation. Combines `mark_note_processed` (allocate deposit_count),
-    /// `add_bridge_event` (encode + insert synthetic log), and
-    /// `set_latest_block_number` (cursor advance) so that a crash mid-
-    /// sequence cannot leave aggkit in a state where the deposit_count
-    /// has been allocated for a note but no log was emitted (which would
-    /// cause aggsender to skip the BridgeEvent permanently).
+    /// B1 + Cantina #5/#15/#19: commit a single B2AGG bridge-out synthetic
+    /// event into the synthetic block `block_number` that the STORE already
+    /// allocated for this sync tick's batch (via [`Store::allocate_synthetic_block`]).
+    /// Folds `mark_note_processed` (deposit_count + processed-row) and
+    /// `add_bridge_event` (encode + insert synthetic log) into ONE transaction.
+    /// Returns the assigned `deposit_count`.
     ///
-    /// Default impl below runs the three primitives sequentially —
-    /// suitable for InMemoryStore. PgStore overrides with a single
-    /// SERIALIZABLE postgres transaction.
+    /// Cantina #5 — the caller does NOT compute `get_latest_block_number()+1`.
+    /// The block is allocated once, atomically, store-side, by
+    /// `allocate_synthetic_block`; two concurrent writers can never land in the
+    /// same block. This method does NOT advance the tip — the allocation
+    /// already did, exactly once for the whole batch.
+    ///
+    /// Cantina #19 — because the whole tick's batch shares one allocated
+    /// `block_number`, processing 1000 notes in one Miden tx advances the
+    /// synthetic tip by exactly ONE block, not 1000.
+    ///
+    /// Cantina #15 — the `deposit_count` increment is part of THIS transaction,
+    /// and on retry the already-assigned `deposit_count` is REUSED rather than
+    /// re-incremented: an already-processed note returns its existing count
+    /// without re-emitting a log or re-incrementing the counter.
+    ///
+    /// Default impl below is suitable for InMemoryStore; PgStore overrides with
+    /// a single SERIALIZABLE postgres transaction.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
         &self,
@@ -622,6 +676,11 @@ pub trait Store: Send + Sync + 'static {
         amount: u128,
         metadata: &[u8],
     ) -> anyhow::Result<u32> {
+        // Idempotent retry (Cantina #15): an already-processed note reuses its
+        // assigned deposit_count and emits no duplicate log.
+        if let Some(deposit_count) = self.get_processed_deposit_count(&note_id).await? {
+            return Ok(deposit_count);
+        }
         let deposit_count = self.mark_note_processed(note_id).await?;
         self.add_bridge_event(
             bridge_address,
@@ -638,8 +697,21 @@ pub trait Store: Send + Sync + 'static {
             deposit_count,
         )
         .await?;
-        self.set_latest_block_number(block_number).await?;
         Ok(deposit_count)
+    }
+
+    /// Cantina #5 — store-owned, transactional synthetic-block allocation.
+    /// Atomically advances the synthetic EVM tip by one and returns the newly
+    /// allocated block number. This is THE allocation primitive the writers
+    /// (`bridge_out`, `claim`, `ger`, `claim_watcher`) call instead of the
+    /// racy `get_latest_block_number()+1`: because the increment is a single
+    /// atomic store write, two concurrent writers can never observe the same
+    /// tip and both pick `N+1`. A whole bridge-out batch shares ONE allocated
+    /// block (Cantina #19). Equivalent to `advance_block_number`; named
+    /// distinctly so the synthetic-block-allocation intent is explicit at every
+    /// call site.
+    async fn allocate_synthetic_block(&self) -> anyhow::Result<u64> {
+        self.advance_block_number().await
     }
 
     // === Convenience: bridge event log ===
@@ -727,13 +799,33 @@ impl SyncListener for StoreSyncListener {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(data) = data {
-            let block_hash = self.block_state.get_block_hash(data.block_num);
-            self.store.set_latest_block_number(data.block_num).await?;
+            // Cantina #5 — track the raw Miden sync height SEPARATELY from the
+            // synthetic EVM tip. Pre-fix this wrote the raw Miden block number
+            // straight into `latest_block_number` (the synthetic tip), which
+            // (a) conflated two distinct counters and (b) could roll the
+            // synthetic tip BACKWARDS below a block a store-owned allocator had
+            // already published a log into. Persist the raw height in its own
+            // field; the synthetic tip is owned by the atomic commit helpers
+            // (`commit_b2agg_event_atomic` etc) and only ever moved forward.
+            self.store.set_raw_miden_height(data.block_num).await?;
+
+            // The synthetic tip is anchored to the Miden height so the synthetic
+            // block space stays roughly in step with Miden, but it is advanced
+            // MONOTONICALLY: never below an already-published synthetic block.
+            // Committed / expired transaction receipts land at this synthetic
+            // tip (not the raw Miden number) so receipts and synthetic logs
+            // share one coherent block space.
+            let current_tip = self.store.get_latest_block_number().await?;
+            let receipt_block = data.block_num.max(current_tip);
+            if receipt_block > current_tip {
+                self.store.set_latest_block_number(receipt_block).await?;
+            }
+            let block_hash = self.block_state.get_block_hash(receipt_block);
             self.store
-                .txn_commit_pending(&data.committed_ids, data.block_num, block_hash)
+                .txn_commit_pending(&data.committed_ids, receipt_block, block_hash)
                 .await?;
             self.store
-                .txn_expire_pending(data.block_num, block_hash)
+                .txn_expire_pending(receipt_block, block_hash)
                 .await?;
         }
         Ok(())

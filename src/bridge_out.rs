@@ -266,18 +266,30 @@ impl BridgeOutScanner {
         destination_network == self.local_network_id
     }
 
-    /// Process a consumed B2AGG note. Returns `true` if the caller should advance
-    /// `latest_block_number` (a synthetic log was written at `block_number`),
-    /// `false` if the caller must NOT advance (the note was skipped, was a
-    /// non-B2AGG, errored on parse, or was a self-target poison leaf).
+    /// Process a consumed B2AGG note into the store-allocated batch block.
+    /// Returns `true` if a synthetic `BridgeEvent` log was written, `false` if
+    /// the note was skipped (non-B2AGG, parse error, reclaim, self-target
+    /// poison leaf, unknown faucet, etc).
     ///
-    /// Self-review: pre-fix this returned `()`, and the caller in `on_post_sync`
-    /// unconditionally bumped `latest_block_number` afterwards. When the
-    /// self-target circuit-break (Cantina #13) added an early return without a
-    /// log write, every poison leaf left a phantom block: `eth_blockNumber`
-    /// advanced but no log existed at that block, breaking the "every reader
-    /// who sees latest >= N also sees the log at N" invariant.
-    async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) -> bool {
+    /// Cantina #5/#19 — the synthetic block number is NOT chosen with the racy
+    /// `get_latest_block_number()+1`. `batch_block` is the single block the
+    /// store allocates for THIS sync tick's batch via the store-owned,
+    /// transactional `allocate_synthetic_block`. It is allocated lazily — on
+    /// the first note in the batch that actually emits — so:
+    ///   * a tick that emits N≥1 notes advances the synthetic tip by exactly
+    ///     ONE block, with all N BridgeEvents in that block (Cantina #19: a
+    ///     1000-note Miden tx no longer pushes the tip forward by 1000);
+    ///   * a tick where every note is skipped allocates nothing, preserving
+    ///     the no-phantom-block invariant from the Cantina #13 fix;
+    ///   * two concurrent writers each get a DISTINCT block because the
+    ///     allocation is a single atomic store write (Cantina #5).
+    /// `commit_b2agg_event_atomic` writes the log + deposit_count atomically
+    /// into that block WITHOUT re-advancing the tip.
+    async fn process_consumed_note(
+        &self,
+        note: &InputNoteRecord,
+        batch_block: &mut Option<u64>,
+    ) -> bool {
         let note_id_str = note.id().to_string();
 
         match self.store.is_note_processed(&note_id_str).await {
@@ -290,6 +302,13 @@ impl BridgeOutScanner {
                 return false;
             }
         }
+
+        // For quarantine rows on skip paths (Cantina MA#18), stamp with the
+        // batch block if one has been allocated, else the current tip.
+        let observed_block = match batch_block {
+            Some(b) => *b,
+            None => self.store.get_latest_block_number().await.unwrap_or(0),
+        };
 
         let details = note.details();
         if !is_b2agg_note(details) {
@@ -372,7 +391,7 @@ impl BridgeOutScanner {
                     self.quarantine_unbridgeable_b2agg(
                         &note_id_str,
                         note,
-                        block_number,
+                        observed_block,
                         crate::store::UnbridgeableBridgeOutReason::StorageParseFailed,
                         format!("parse_b2agg_storage failed: {e:#}"),
                     )
@@ -436,7 +455,7 @@ impl BridgeOutScanner {
             self.quarantine_unbridgeable_b2agg(
                 &note_id_str,
                 note,
-                block_number,
+                observed_block,
                 crate::store::UnbridgeableBridgeOutReason::NoFungibleAsset,
                 "iter_fungible returned None".to_string(),
             )
@@ -485,7 +504,7 @@ impl BridgeOutScanner {
                 self.quarantine_unbridgeable_b2agg(
                     &note_id_str,
                     note,
-                    block_number,
+                    observed_block,
                     crate::store::UnbridgeableBridgeOutReason::UnknownFaucet,
                     format!("resolve_faucet_origin(faucet_id={faucet_id}) failed: {e:#}"),
                 )
@@ -503,7 +522,7 @@ impl BridgeOutScanner {
                 self.quarantine_unbridgeable_b2agg(
                     &note_id_str,
                     note,
-                    block_number,
+                    observed_block,
                     crate::store::UnbridgeableBridgeOutReason::AmountOverflow,
                     format!("reverse_scale_amount failed: {e:#}"),
                 )
@@ -516,16 +535,36 @@ impl BridgeOutScanner {
         // helper (B5). Same hash on restore so dedup is stable.
         let tx_hash = derive_bridge_out_tx_hash(&note_id_str);
 
+        // Cantina #5/#19 — lazily allocate the batch's single synthetic block
+        // on the first note that reaches the emit point. Store-owned and
+        // transactional via `allocate_synthetic_block`, so concurrent writers
+        // never collide; subsequent notes in this batch reuse the same block.
+        let block_number = match *batch_block {
+            Some(b) => b,
+            None => {
+                let allocated = match self.store.allocate_synthetic_block().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(
+                            note_id = %note_id_str,
+                            error = %e,
+                            "failed to allocate synthetic block for B2AGG batch; skipping"
+                        );
+                        return false;
+                    }
+                };
+                *batch_block = Some(allocated);
+                allocated
+            }
+        };
+
         let block_hash = self.block_state.get_block_hash(block_number);
 
-        // B1 — atomic commit. Replaces the previous three sequential
-        // calls (mark_note_processed → add_bridge_event →
-        // set_latest_block_number) which had a crash window: if the
-        // process died between mark_note_processed and add_bridge_event,
-        // the deposit_count was permanently allocated for a note with no
-        // emitted log, causing aggsender to skip the BridgeEvent and
-        // wedge that bridge-out forever. PgStore folds all five writes
-        // into one transaction; InMemoryStore uses the default impl.
+        // B1 + Cantina #5/#15/#19 — atomic commit into the store-allocated
+        // batch block. The deposit_count increment and the BridgeEvent log
+        // insert happen in ONE transaction (Cantina #15). This does NOT advance
+        // the tip — the single batch allocation already did. On retry the
+        // assigned deposit_count is reused, no duplicate log emitted.
         match self
             .store
             .commit_b2agg_event_atomic(
@@ -552,7 +591,7 @@ impl BridgeOutScanner {
                     destination_network,
                     amount = origin_amount,
                     block_number,
-                    "emitted BridgeEvent for consumed B2AGG note (atomic B1)"
+                    "emitted BridgeEvent for consumed B2AGG note (atomic B1, store-allocated batch block)"
                 );
                 true
             }
@@ -570,7 +609,7 @@ impl BridgeOutScanner {
                 self.quarantine_unbridgeable_b2agg(
                     &note_id_str,
                     note,
-                    block_number,
+                    observed_block,
                     crate::store::UnbridgeableBridgeOutReason::AtomicCommitFailed,
                     format!("commit_b2agg_event_atomic failed: {e}"),
                 )
@@ -888,9 +927,22 @@ impl SyncListener for BridgeOutScanner {
             }
         }
 
+        // Cantina #5/#19 — the synthetic block for this tick's B2AGG batch is
+        // allocated ONCE, store-side, by `process_consumed_note` on the first
+        // note that emits, and shared across the batch via `batch_block`. The
+        // racy in-loop `get_latest_block_number()+1` / `set_latest_block_number`
+        // pair is gone: a single Miden tx carrying up to 1000 input notes now
+        // advances the synthetic tip by exactly ONE block (Cantina #19), the
+        // allocation is a single atomic store write so concurrent writers can
+        // never collide on it (Cantina #5), and the store's atomic commit still
+        // writes each log BEFORE the tip becomes visible at that block (the
+        // allocation+commit are one transaction in PgStore, one critical
+        // section in InMemoryStore), preserving the race-safe "every reader who
+        // sees latest >= N also sees the log at N" invariant.
+        let mut batch_block: Option<u64> = None;
         for note in &consumed_notes {
             // Only process B2AGG notes — other consumed notes (CLAIM, UpdateGerNote)
-            // must not trigger block advancement or they race with GER event writes.
+            // are handled by their own listeners.
             if !is_b2agg_note(note.details()) {
                 continue;
             }
@@ -902,25 +954,12 @@ impl SyncListener for BridgeOutScanner {
             if was_processed {
                 continue;
             }
-            // Race-safe ordering: write the log at (current_latest + 1) BEFORE
-            // advancing `latest_block_number`. If we advance first, there's a
-            // window where `eth_blockNumber` returns N but no log exists at N —
-            // aggsender polls during that window, sees no bridges in [X, N],
-            // advances its cursor past N, and permanently misses our BridgeEvent.
-            // By writing the log first and then bumping `latest_block_number`,
-            // every reader who sees `latest >= N` also sees the log at N.
-            //
-            // Cantina #13 follow-up: only bump `latest_block_number` if the note
-            // actually wrote a log. The Cantina #13 self-target circuit-break
-            // and other early-return paths now signal `false`, preventing
-            // phantom blocks (advances with no log) from leaking into the chain.
-            let block_number = self.store.get_latest_block_number().await? + 1;
-            if self.process_consumed_note(note, block_number).await {
-                self.store.set_latest_block_number(block_number).await?;
-            }
+            self.process_consumed_note(note, &mut batch_block).await;
+        }
+        if let Some(block_number) = batch_block {
             tracing::info!(
                 block_number,
-                "advanced latest_block_number to include BridgeEvent"
+                "advanced synthetic tip by one block to include this tick's B2AGG BridgeEvent batch"
             );
         }
 
@@ -1695,7 +1734,7 @@ mod tests {
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = note.id().to_string();
 
-        let advanced = scanner.process_consumed_note(&note, 100).await;
+        let advanced = scanner.process_consumed_note(&note, &mut None).await;
         assert!(!advanced, "reclaim must NOT signal block advance");
 
         // The note must NOT be marked processed — otherwise a future
@@ -1733,7 +1772,7 @@ mod tests {
         let note = build_b2agg_note_with_consumer(None);
         let note_id_str = note.id().to_string();
 
-        let advanced = scanner.process_consumed_note(&note, 100).await;
+        let advanced = scanner.process_consumed_note(&note, &mut None).await;
         assert!(
             !advanced,
             "untracked-consumer must NOT signal block advance"
@@ -1774,7 +1813,7 @@ mod tests {
         // contract here is: bridge-consumed notes are NOT short-circuited by
         // the gate. The pure-helper test pins the exact decision; this just
         // exercises the wiring end-to-end without a downstream panic.
-        let _ = scanner.process_consumed_note(&note, 100).await;
+        let _ = scanner.process_consumed_note(&note, &mut None).await;
     }
 
     // CANTINA MA#18 — UNBRIDGEABLE B2AGG QUARANTINE TESTS
@@ -1832,7 +1871,7 @@ mod tests {
         let note = build_erased_b2agg_note(bridge_id);
         let note_id_str = note.id().to_string();
 
-        let advanced = scanner.process_consumed_note(&note, 42).await;
+        let advanced = scanner.process_consumed_note(&note, &mut Some(42)).await;
         assert!(!advanced, "erased note must NOT signal block advance");
 
         let row = store
@@ -1878,7 +1917,7 @@ mod tests {
         let note_id_str = note.id().to_string();
 
         // First observation — quarantine row written.
-        let _ = scanner.process_consumed_note(&note, 1).await;
+        let _ = scanner.process_consumed_note(&note, &mut Some(1)).await;
         let first = store
             .get_unbridgeable_bridge_out(&note_id_str)
             .await
@@ -1887,7 +1926,7 @@ mod tests {
         let first_block = first.observed_block;
 
         // Second observation — quarantine row UNCHANGED.
-        let _ = scanner.process_consumed_note(&note, 2).await;
+        let _ = scanner.process_consumed_note(&note, &mut Some(2)).await;
         let second = store
             .get_unbridgeable_bridge_out(&note_id_str)
             .await
@@ -1918,7 +1957,7 @@ mod tests {
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = note.id().to_string();
 
-        let _ = scanner.process_consumed_note(&note, 1).await;
+        let _ = scanner.process_consumed_note(&note, &mut Some(1)).await;
 
         assert!(
             store
