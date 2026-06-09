@@ -655,7 +655,19 @@ async fn restore_gers(
                         // silently restoring the wrong root.
                         match u32::try_from(felt.as_canonical_u64()) {
                             Ok(v) => {
-                                ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes())
+                                // MA#11 — the GER limbs are packed
+                                // little-endian when the note is created:
+                                // `UpdateGerNote::create` stores
+                                // `ExitRoot::to_elements()`, which is
+                                // `bytes_to_packed_u32_elements` using
+                                // `u32::from_le_bytes` (its documented inverse
+                                // `packed_u32_elements_to_bytes` uses
+                                // `to_le_bytes`). Decoding with `to_be_bytes`
+                                // byte-swapped every limb, rebuilding and
+                                // republishing a GER hash that never existed on
+                                // L1. Use `to_le_bytes` so restore round-trips
+                                // the original injected root.
+                                ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes())
                             }
                             Err(_) => {
                                 tracing::error!(
@@ -930,5 +942,78 @@ mod tests {
             logs_created: 6,
         };
         assert_eq!(r.claims_restored, 2);
+    }
+
+    // MA#11 — restore must round-trip the GER limbs little-endian.
+    //
+    // `UpdateGerNote::create` stores `ExitRoot::to_elements()` (see
+    // miden-agglayer-0.14.4 src/update_ger_note.rs:94 and src/utils.rs:37),
+    // which packs the 32-byte root into 8 u32 limbs little-endian via
+    // `bytes_to_packed_u32_elements` (`u32::from_le_bytes`; its documented
+    // inverse `packed_u32_elements_to_bytes` uses `to_le_bytes`). `restore_gers`
+    // therefore MUST decode each limb with `to_le_bytes` to recover the
+    // original root. The prior code used `to_be_bytes`, byte-swapping every
+    // 4-byte limb and republishing a GER hash that never existed on L1, which
+    // could freeze a fresh AggKit's injected-GER view after recovery.
+    //
+    // This pins the production decode (mirroring the loop in `restore_gers`)
+    // against the production encode (`ExitRoot::to_elements`) and asserts a
+    // round-trip. Ported from the auditor PoC
+    // `restore_ger_decoder_byte_swaps_each_u32_limb_poc`; the PoC asserted the
+    // BUGGY `to_be_bytes` behaviour, so per its header note we invert it into
+    // the production assertion `restored == original`.
+    #[test]
+    fn ma11_restore_ger_decoder_round_trips_little_endian() {
+        use miden_base_agglayer::ExitRoot;
+
+        let original_ger_bytes: [u8; 32] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb,
+            0xdc, 0xed, 0xfe, 0x0f,
+        ];
+
+        // Production encode: identical to what `UpdateGerNote::create` writes
+        // into note storage (`ger.to_elements().to_vec()`).
+        let ger = ExitRoot::new(original_ger_bytes);
+        let items = ger.to_elements();
+        assert_eq!(
+            items.len(),
+            UpdateGerNote::NUM_STORAGE_ITEMS,
+            "test precondition: to_elements must produce 8 GER limbs",
+        );
+
+        // Production decode with the fix in place (mirrors `restore_gers`).
+        let mut restored_ger_bytes = [0u8; 32];
+        for (i, felt) in items.iter().take(8).enumerate() {
+            let v = u32::try_from(felt.as_canonical_u64()).expect("test limbs fit in u32");
+            restored_ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(
+            restored_ger_bytes, original_ger_bytes,
+            "MA#11: restore must round-trip the original GER bytes (little-endian)",
+        );
+
+        // Regression guard: the old `to_be_bytes` decode byte-swaps every limb,
+        // i.e. yields a DIFFERENT root. This fails (correctly) if anyone
+        // reintroduces big-endian decoding.
+        let mut buggy_be_bytes = [0u8; 32];
+        for (i, felt) in items.iter().take(8).enumerate() {
+            let v = felt.as_canonical_u64() as u32;
+            buggy_be_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+        }
+        let mut expected_buggy = [0u8; 32];
+        for (i, chunk) in original_ger_bytes.chunks_exact(4).enumerate() {
+            expected_buggy[i * 4..(i + 1) * 4]
+                .copy_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
+        }
+        assert_eq!(
+            buggy_be_bytes, expected_buggy,
+            "sanity: big-endian decode per-limb byte-swaps the root",
+        );
+        assert_ne!(
+            buggy_be_bytes, original_ger_bytes,
+            "MA#11: big-endian decode must NOT equal the original root \
+             (proves endianness is load-bearing here)",
+        );
     }
 }
