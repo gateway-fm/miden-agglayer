@@ -365,7 +365,6 @@ async fn create_claim(
     store: &dyn Store,
     rng: &mut impl FeltRng,
     reject_zero_padding: bool,
-    reject_hardhat_alias: bool,
 ) -> anyhow::Result<Note> {
     let sender = accounts.service.0;
 
@@ -374,7 +373,6 @@ async fn create_claim(
         params.destinationAddress,
         accounts,
         reject_zero_padding,
-        reject_hardhat_alias,
     )
     .await?;
 
@@ -456,7 +454,6 @@ async fn publish_claim_internal(
     store: &dyn Store,
     latest_block_num: BlockNumber,
     reject_zero_padding: bool,
-    reject_hardhat_alias: bool,
     expected_mints: Option<&Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
     // Opt-in local prover used as a fallback when the remote prover
     // configured on the surrounding `MidenClient` fails. `None` when
@@ -495,7 +492,6 @@ async fn publish_claim_internal(
         store,
         client.rng(),
         reject_zero_padding,
-        reject_hardhat_alias,
     )
     .await?;
     let claim_note_id = claim_note.id().to_string();
@@ -771,7 +767,6 @@ pub async fn publish_claim(
     txn_envelope: alloy::consensus::TxEnvelope,
     signer: alloy::primitives::Address,
     reject_zero_padding: bool,
-    reject_hardhat_alias: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
 ) -> anyhow::Result<PublishClaimTxn> {
     // Submit with runtime self-heal, mirroring the pattern in
@@ -799,7 +794,6 @@ pub async fn publish_claim(
         txn_envelope.clone(),
         signer,
         reject_zero_padding,
-        reject_hardhat_alias,
         expected_mints.clone(),
     )
     .await
@@ -822,7 +816,6 @@ pub async fn publish_claim(
                 txn_envelope,
                 signer,
                 reject_zero_padding,
-                reject_hardhat_alias,
                 expected_mints,
             )
             .await
@@ -842,7 +835,6 @@ async fn attempt_publish_claim(
     txn_envelope: alloy::consensus::TxEnvelope,
     signer: alloy::primitives::Address,
     reject_zero_padding: bool,
-    reject_hardhat_alias: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
 ) -> anyhow::Result<PublishClaimTxn> {
     // Snapshot the opt-in local-prover fallback BEFORE entering the
@@ -865,7 +857,6 @@ async fn attempt_publish_claim(
                     &*store,
                     latest_block_num,
                     reject_zero_padding,
-                    reject_hardhat_alias,
                     expected_mints.as_ref(),
                     local_prover_fallback,
                 )

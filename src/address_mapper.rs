@@ -3,11 +3,6 @@ use alloy::primitives::Address;
 use miden_base_agglayer::{EthAddress, EthEmbeddedAccountId};
 use miden_protocol::account::AccountId;
 
-const HARDHAT_ADDRESS: Address = Address::new([
-    0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf,
-    0xff, 0xb9, 0x22, 0x66,
-]);
-
 pub fn is_miden_compatible_address(address: Address) -> bool {
     // The canonical EthEmbeddedAccountId encoding embeds AccountId as:
     //   [4 zero bytes] [prefix(8 bytes)] [suffix(8 bytes)]
@@ -30,7 +25,15 @@ pub fn account_id_from_address(address: Address) -> Option<AccountId> {
 }
 
 /// Resolve an Ethereum address to a Miden AccountId.
-/// Resolution order: hardhat special case → known mapping → zero-padding.
+/// Resolution order: known store mapping → zero-padding.
+///
+/// Cantina MA#8 — there is no special case for the well-known Hardhat
+/// default-account address (`0xf39f...2266`). It flows through the normal
+/// mapping path like any other address: a deposit targeting it resolves
+/// only if an operator has explicitly mapped it (or it happens to be a
+/// zero-padded Miden id, which the Hardhat EOA is not). No dev-only remap
+/// to `wallet_hardhat`, no gate, no bail — the address is treated like any
+/// other EVM address.
 ///
 /// Self-review C5 — the zero-padding fallback maps any 4-leading-zero EVM
 /// address to a Miden AccountId WITHOUT verifying the account exists on
@@ -49,47 +52,24 @@ pub async fn resolve_address(
     address: Address,
     config: &AccountsConfig,
 ) -> anyhow::Result<AccountId> {
-    resolve_address_with_policy(store, address, config, false, false).await
+    resolve_address_with_policy(store, address, config, false).await
 }
 
 /// Same as `resolve_address` but allows the caller to disable the
 /// zero-padding fallback (production posture). When `reject_zero_padding`
 /// is `true`, addresses that aren't in the store mapping fail with a
 /// clear error rather than falling through to the structural reconstruction.
-///
-/// Cantina MA#8 — `reject_hardhat_alias`: when `true`, the special-case
-/// remap of the well-known Hardhat default-account address
-/// (`0xf39f...2266`) to `config.wallet_hardhat` is disabled. The alias is
-/// useful for local dev (the Hardhat default signer becomes a valid
-/// Miden bridge destination without an explicit mapping) but is
-/// dangerous in production: any deposit on L1 with that destination
-/// would be silently rerouted into the operator-owned `wallet_hardhat`
-/// account. Gated by `--require-hardening` at the caller layer.
 pub async fn resolve_address_with_policy(
     store: &dyn crate::store::Store,
     address: Address,
-    config: &AccountsConfig,
+    _config: &AccountsConfig,
     reject_zero_padding: bool,
-    reject_hardhat_alias: bool,
 ) -> anyhow::Result<AccountId> {
-    // 1. Hardhat special case (dev convenience) — gated by policy in production.
-    if address == HARDHAT_ADDRESS {
-        if reject_hardhat_alias {
-            ::metrics::counter!("address_mapper_hardhat_alias_rejected_total").increment(1);
-            anyhow::bail!(
-                "Hardhat default-account alias is disabled in this deployment \
-                 (MA#8). The Hardhat address {address} would have been rerouted \
-                 to wallet_hardhat — set --disable-hardhat-alias=false or add \
-                 an explicit store mapping for legitimate use."
-            );
-        }
-        return Ok(config.wallet_hardhat.0);
-    }
-    // 2. Check existing mapping from store
+    // 1. Check existing mapping from store
     if let Some(id) = store.get_address_mapping(&address).await? {
         return Ok(id);
     }
-    // 3. Try zero-padding (native Miden address) unless disabled.
+    // 2. Try zero-padding (native Miden address) unless disabled.
     if reject_zero_padding {
         anyhow::bail!(
             "no known Miden AccountId for Ethereum address {address}; \
@@ -163,11 +143,11 @@ mod tests {
         let zero_padded = address!("0x00000000ac0000000000dd110000ee000000fc00");
 
         // Default policy (reject = false): fallback succeeds.
-        let r = resolve_address_with_policy(&store, zero_padded, &cfg, false, false).await;
+        let r = resolve_address_with_policy(&store, zero_padded, &cfg, false).await;
         assert!(r.is_ok());
 
         // Strict policy (reject = true): fallback refused with clear error.
-        let r = resolve_address_with_policy(&store, zero_padded, &cfg, true, false).await;
+        let r = resolve_address_with_policy(&store, zero_padded, &cfg, true).await;
         let err = r.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("fallback disabled"));
@@ -190,82 +170,73 @@ mod tests {
             .unwrap();
 
         // With strict policy, the mapping still resolves.
-        let r = resolve_address_with_policy(&store, mapped_addr, &cfg, true, false).await;
+        let r = resolve_address_with_policy(&store, mapped_addr, &cfg, true).await;
         assert_eq!(r.unwrap(), target);
     }
 
-    /// Cantina MA#8 — the Hardhat default-account alias must be
-    /// rejectable in production. Pre-fix the remap fired
-    /// unconditionally on every claim, so a deposit on L1 with the
-    /// well-known Hardhat address as destination would always land in
-    /// `wallet_hardhat`. With `reject_hardhat_alias = true` the
-    /// resolver refuses the remap and the caller gets a clear error.
+    /// Cantina MA#8 — the well-known Hardhat default-account address
+    /// (`0xf39f...2266`) must NOT be special-cased in `resolve_address`.
+    /// Pre-fix there was an `if address == HARDHAT_ADDRESS` branch that
+    /// remapped it to `config.wallet_hardhat` on every claim (later
+    /// merely gated behind a flag). cergyk required the branch be
+    /// removed entirely so the address flows through the normal mapping
+    /// path with no special behavior. This test pins that: with no
+    /// explicit store mapping, the Hardhat EOA (which is not a
+    /// zero-padded Miden id) resolves to nothing — it does NOT silently
+    /// land in `wallet_hardhat`, and resolution behaves exactly as it
+    /// would for any other un-mapped, non-zero-padded EVM address.
     #[tokio::test]
-    async fn ma8_reject_hardhat_alias_when_policy_set() {
+    async fn ma8_hardhat_address_not_special_cased() {
         use crate::store::memory::InMemoryStore;
         let store = InMemoryStore::new();
         let cfg = test_accounts_config();
-        let hardhat = Address::new([
-            0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72,
-            0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
-        ]);
+        // `wallet_hardhat` in the config is a real, valid AccountId. If the
+        // old special case were still present, resolving the Hardhat EOA
+        // below would return `cfg.wallet_hardhat.0` (an `Ok`). With the
+        // branch removed it must error like any other un-mapped address.
+        let wallet_hardhat = cfg.wallet_hardhat.0;
+        let hardhat = address!("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
 
-        // Dev posture: alias still works.
-        let r = resolve_address_with_policy(&store, hardhat, &cfg, false, false).await;
-        assert_eq!(r.unwrap(), cfg.wallet_hardhat.0);
-
-        // Hardened posture: alias refused with a Cantina MA#8 error.
-        let r = resolve_address_with_policy(&store, hardhat, &cfg, false, true).await;
-        let err = r.unwrap_err();
-        let msg = format!("{err}");
+        // Default policy: the Hardhat EOA is NOT zero-padded (high bytes
+        // are 0xf39f...), there is no store mapping, so resolution errors
+        // exactly like any other un-mapped non-zero-padded address —
+        // never resolves to wallet_hardhat.
+        let r = resolve_address_with_policy(&store, hardhat, &cfg, false).await;
         assert!(
-            msg.contains("Hardhat default-account alias is disabled"),
-            "expected MA#8 error message, got: {msg}"
+            r.is_err(),
+            "Hardhat EOA must not be special-cased; expected the normal \
+             'no known Miden AccountId' error, but it resolved to {:?} \
+             (== wallet_hardhat? {})",
+            r.as_ref().ok(),
+            r.as_ref().ok() == Some(&wallet_hardhat)
         );
+
+        // And a generic un-mapped non-zero-padded address gives the same
+        // outcome — proving the Hardhat address gets no distinct treatment.
+        let other = address!("0xabcdef1234567890abcdef1234567890abcdef12");
+        let r_other = resolve_address_with_policy(&store, other, &cfg, false).await;
+        assert!(r_other.is_err());
     }
 
-    /// Cantina MA#8 — with the alias disabled and no explicit mapping,
-    /// the Hardhat address (which is not zero-padded) cannot be
-    /// resolved by any other branch, so resolution must error. This
-    /// pins the "no silent rerouting" guarantee: a production deposit
-    /// targeting `0xf39f...2266` is refused outright instead of
-    /// landing in `wallet_hardhat`.
+    /// Cantina MA#8 — once an operator explicitly maps the Hardhat EOA,
+    /// it resolves to exactly the mapped target via the normal store
+    /// path (no special case interferes).
     #[tokio::test]
-    async fn ma8_disabled_alias_no_silent_fallback() {
-        use crate::store::memory::InMemoryStore;
-        let store = InMemoryStore::new();
-        let cfg = test_accounts_config();
-        let hardhat = Address::new([
-            0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72,
-            0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
-        ]);
-
-        // Alias disabled, no store mapping, address is not zero-padded →
-        // resolution must error.
-        let r = resolve_address_with_policy(&store, hardhat, &cfg, false, true).await;
-        assert!(r.is_err());
-    }
-
-    /// Cantina MA#8 — non-Hardhat addresses must be unaffected by the
-    /// alias-rejection flag. Only the single special-case remap is gated.
-    #[tokio::test]
-    async fn ma8_non_hardhat_address_unaffected_by_alias_policy() {
+    async fn ma8_hardhat_address_resolves_via_explicit_mapping() {
         use crate::Store;
         use crate::store::memory::InMemoryStore;
         let store = InMemoryStore::new();
         let cfg = test_accounts_config();
-        let mapped_addr = address!("0xabcdef1234567890abcdef1234567890abcdef12");
+        let hardhat = address!("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
         let target = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        store
-            .set_address_mapping(mapped_addr, target)
-            .await
-            .unwrap();
+        store.set_address_mapping(hardhat, target).await.unwrap();
 
-        // With alias rejected (and zero-padding allowed), the explicit
-        // mapping still resolves cleanly — the MA#8 policy doesn't
-        // touch the store-mapping path.
-        let r = resolve_address_with_policy(&store, mapped_addr, &cfg, false, true).await;
-        assert_eq!(r.unwrap(), target);
+        let r = resolve_address_with_policy(&store, hardhat, &cfg, false).await;
+        assert_eq!(
+            r.unwrap(),
+            target,
+            "Hardhat EOA must resolve through the normal store mapping"
+        );
     }
 
     fn test_accounts_config() -> AccountsConfig {
