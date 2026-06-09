@@ -1,11 +1,14 @@
-use crate::miden_client::MidenClient;
+use crate::miden_client::{MidenClient, MidenClientLib};
 use alloy::primitives::{FixedBytes, LogData, TxHash};
 use alloy::sol_types::SolEvent;
 use alloy_rpc_types_eth::TransactionRequest;
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
+use miden_client::store::NoteFilter;
 use miden_client::transaction::TransactionRequestBuilder;
+use miden_protocol::note::NoteId;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
+use std::time::Duration;
 
 alloy_core::sol! {
     #[derive(Debug)]
@@ -94,10 +97,66 @@ pub struct GerInsertResult {
     pub is_new: bool,
 }
 
-/// Submit the actual UpdateGerNote Miden transaction. Factored out of
-/// `insert_ger` so the caller can run it twice — once eagerly, then again
-/// after `reimport_account` if the first attempt failed with a recoverable
-/// account-state error.
+/// How long `submit_update_ger_note` waits for the bridge account to CONSUME
+/// the freshly-created public `UpdateGerNote` before giving up. The note is a
+/// `NetworkAccountTarget` note (see `miden-agglayer/src/update_ger_note.rs`):
+/// the Miden node's network-transaction (NTX) builder is the party that
+/// consumes it into the bridge account's GER storage — typically within
+/// ~2-3 blocks (~5s). We poll up to 30×1s so a slow NTX cycle still resolves
+/// before we declare the GER visible.
+const GER_CONSUME_MAX_ATTEMPTS: usize = 30;
+const GER_CONSUME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Poll the local Miden store for the given note appearing as **consumed**.
+///
+/// Cantina MA#9 / MA#21 — authoritative bridge-side readiness signal. An
+/// `UpdateGerNote` only takes effect once the bridge account consumes it (the
+/// node NTX builder runs `update_ger`, writing the GER into bridge storage).
+/// Until then the GER is NOT actually claimable, even though the creator tx
+/// has committed. `NoteFilter::Consumed` surfaces the note in a consumed state
+/// — including `ConsumedExternal`, which is exactly the state a public note
+/// reaches once an account *we don't drive locally* (the network bridge
+/// account) spends it. Matching on the specific `NoteId` proves THIS GER's
+/// note was consumed, not merely that some GER note was.
+///
+/// Each attempt syncs first so newly-observed nullifiers (the bridge's
+/// consumption) land in the local store before we scan. Returns `Ok(true)`
+/// once the note is observed consumed, `Ok(false)` on timeout.
+async fn wait_for_ger_note_consumed(
+    client: &mut MidenClientLib,
+    note_id: NoteId,
+    max_attempts: usize,
+    poll_interval: Duration,
+) -> anyhow::Result<bool> {
+    for _ in 0..max_attempts {
+        // Sync first so the bridge's consumption (a nullifier on a public note
+        // we created but do not own) is pulled into the local store before we
+        // scan. The persistent client's cursor advances monotonically, so the
+        // consumption block is always inside [cursor, tip] on a later poll.
+        client.sync_state().await?;
+        let consumed = client.get_input_notes(NoteFilter::Consumed).await?;
+        if note_consumed_in(consumed.iter().map(|n| n.id()), note_id) {
+            return Ok(true);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+    Ok(false)
+}
+
+/// Pure predicate: does `note_id` appear among the ids of the consumed notes?
+///
+/// Cantina MA#9 / MA#21 — the bridge-consumption readiness check matches on the
+/// SPECIFIC `UpdateGerNote` id, not on "some GER note is consumed". Factored
+/// out of `wait_for_ger_note_consumed` so the matching rule is unit-testable
+/// without a live Miden node.
+fn note_consumed_in(consumed_ids: impl IntoIterator<Item = NoteId>, note_id: NoteId) -> bool {
+    consumed_ids.into_iter().any(|id| id == note_id)
+}
+
+/// Submit the actual UpdateGerNote Miden transaction AND wait for the bridge
+/// account to consume it. Factored out of `insert_ger` so the caller can run
+/// it twice — once eagerly, then again after `reimport_account` if the first
+/// attempt failed with a recoverable account-state error.
 ///
 /// Use the long-lived MidenClient. The dedicated ger_manager account
 /// (separate from the service account that the NTX builder constantly
@@ -109,6 +168,20 @@ pub struct GerInsertResult {
 /// the UpdateGerNote. The main client's subsequent sync_nullifiers only
 /// queries [current_cursor, tip], so those consumption events were never
 /// discovered and `NoteFilter::Consumed` returned nothing in restore.
+///
+/// Cantina MA#9 / MA#21 — this function now returns only once the bridge has
+/// CONSUMED the note (observed via `NoteFilter::Consumed`), not merely once the
+/// creator tx committed. We deliberately do NOT submit a second transaction
+/// against the bridge account to force consumption (the auditor's literal
+/// sketch): the bridge is an `AccountStorageMode::Network` account, and the
+/// Miden node RPC rejects any post-deployment user-submitted transaction
+/// against a network account with "Network transactions may not be submitted
+/// by users yet" (miden-node `crates/rpc/src/server/api.rs:255` —
+/// `reject_if_any_network_accounts`, gated on the ntx-builder auth header the
+/// service does not hold). Consuming network notes is structurally the node
+/// NTX builder's job. So we instead OBSERVE the NTX builder's consumption and
+/// gate readiness on it, which is the implementable form of the
+/// "wait for note consumption, not just creator-tx commit" recommendation.
 async fn submit_update_ger_note(
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
@@ -127,8 +200,9 @@ async fn submit_update_ger_note(
                 let bridge_id = inner_accounts.bridge.0;
                 let ger = ExitRoot::new(ger_bytes);
                 let note = UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
+                let note_id = note.id();
                 tracing::info!(
-                    note_id = %note.id(),
+                    note_id = %note_id,
                     ger = %hex::encode(ger_bytes),
                     "UpdateGerNote created"
                 );
@@ -157,6 +231,36 @@ async fn submit_update_ger_note(
                     anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
                 }
                 tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
+
+                // Cantina MA#9 / MA#21 — the creator tx committing only means
+                // the note now EXISTS on-chain; the bridge has not necessarily
+                // consumed it yet. Block here until the bridge account
+                // consumes the note (NTX builder runs `update_ger`), so that
+                // by the time `insert_ger` advances `is_injected` / publishes
+                // the synthetic UpdateHashChainValue log, the GER is genuinely
+                // claimable. This is the readiness wait that USED to live in
+                // the claim hot path (`publish_claim_internal`'s 15s sleep
+                // loop); moving it here means every claim can assume the GER
+                // is already injected.
+                let consumed = wait_for_ger_note_consumed(
+                    client,
+                    note_id,
+                    GER_CONSUME_MAX_ATTEMPTS,
+                    GER_CONSUME_POLL_INTERVAL,
+                )
+                .await?;
+                if !consumed {
+                    anyhow::bail!(
+                        "UpdateGerNote {note_id} created but not consumed by bridge after {}s; \
+                         GER not yet claimable",
+                        GER_CONSUME_MAX_ATTEMPTS
+                    );
+                }
+                tracing::info!(
+                    note_id = %note_id,
+                    ger = %hex::encode(ger_bytes),
+                    "UpdateGerNote consumed by bridge — GER injected and claimable"
+                );
                 Ok(())
             })
         })
@@ -235,7 +339,16 @@ pub async fn insert_ger(
         let block_hash = block_state.get_block_hash(block_number);
         let timestamp = block_state.get_block_timestamp(block_number);
 
-        // Miden submission succeeded — now record the event.
+        // Miden submission AND bridge consumption succeeded — now record the
+        // event. Cantina MA#9 — `submit_update_ger_note` only returns `Ok`
+        // after the bridge account has CONSUMED the UpdateGerNote
+        // (`NoteFilter::Consumed`), so reaching this point proves the GER is
+        // genuinely injected into bridge storage and claimable. The synthetic
+        // visibility state (`ger_entries`, `is_injected`, the
+        // UpdateHashChainValue log) is therefore advanced only after
+        // authoritative bridge-side consumption, never on the creator-tx
+        // commit alone — closing the false-positive early-visibility half of
+        // MA#9.
         //
         // G5 — single atomic store transaction. Replaces the previous
         // three sequential calls (add_ger_update_event,
@@ -310,5 +423,100 @@ mod tests {
         let a = [0x01u8; 32];
         let b = [0x02u8; 32];
         assert_ne!(combined_ger(&a, &b), combined_ger(&b, &a));
+    }
+
+    // Two distinct, deterministic NoteIds with no node / RNG dependency.
+    const NOTE_A: &str = "0xc9d31c82c098e060c9b6e3af2710b3fc5009a1a6f82ef9465f8f35d1f5ba4a80";
+    const NOTE_B: &str = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
+    fn note_id(hex: &str) -> NoteId {
+        NoteId::try_from_hex(hex).expect("valid note id hex")
+    }
+
+    /// Cantina MA#9 / MA#21 — the bridge-consumption readiness check matches on
+    /// the SPECIFIC UpdateGerNote id. A different GER note appearing in the
+    /// consumed set must NOT be mistaken for THIS GER being injected; that is
+    /// exactly the false-positive early-visibility class MA#9 describes.
+    #[test]
+    fn ma9_note_consumed_in_matches_only_exact_id() {
+        let target = note_id(NOTE_A);
+        let other = note_id(NOTE_B);
+
+        // Empty consumed set: not yet consumed — readiness must be false.
+        assert!(!note_consumed_in(std::iter::empty(), target));
+
+        // Only some OTHER note is consumed: still not THIS GER.
+        assert!(!note_consumed_in([other], target));
+
+        // The exact note appears (alongside an unrelated one): consumed.
+        assert!(note_consumed_in([other, target], target));
+        assert!(note_consumed_in([target], target));
+    }
+
+    /// Cantina MA#9 — pin the invariant that GER visibility is produced ONLY by
+    /// `commit_ger_event_atomic` (the call `insert_ger` now performs strictly
+    /// AFTER `submit_update_ger_note` has observed bridge consumption). Before
+    /// that call the store reports the GER as not-injected, no synthetic block
+    /// is advanced, and no UpdateHashChainValue log exists; after it, all three
+    /// flip together. Gating that single call behind observed consumption is
+    /// what makes "advance ger_entries / is_injected / synthetic log only after
+    /// the note is consumed" hold end-to-end.
+    #[tokio::test]
+    async fn ma9_visibility_only_after_atomic_commit() {
+        use crate::log_synthesis::LogFilter;
+        use crate::store::Store;
+        use crate::store::memory::InMemoryStore;
+
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let ger = [0xABu8; 32];
+
+        // BEFORE consumption is confirmed, `insert_ger` would NOT have called
+        // `commit_ger_event_atomic` (it bails on a non-consumed note). The
+        // store must therefore show the GER as invisible.
+        assert!(
+            !store.is_ger_injected(&ger).await.unwrap(),
+            "GER must not be visible before bridge consumption"
+        );
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            0,
+            "no synthetic block advanced before consumption"
+        );
+
+        // AFTER consumption is observed, `insert_ger` advances all visibility
+        // state in one atomic commit at block N = latest + 1.
+        let block_number = store.get_latest_block_number().await.unwrap() + 1;
+        store
+            .commit_ger_event_atomic(
+                block_number,
+                [0u8; 32],
+                "0xdeadbeef",
+                &ger,
+                Some([0x11u8; 32]),
+                Some([0x22u8; 32]),
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.is_ger_injected(&ger).await.unwrap(),
+            "GER visible only after the post-consumption atomic commit"
+        );
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            block_number,
+            "synthetic block advanced exactly once, after consumption"
+        );
+        // Default filter resolves from/to to `current_block`, so this scans
+        // exactly the synthetic block the commit advanced to.
+        let logs = store
+            .get_logs(&LogFilter::default(), block_number)
+            .await
+            .unwrap();
+        assert!(
+            !logs.is_empty(),
+            "UpdateHashChainValue synthetic log published with the GER commit"
+        );
     }
 }
