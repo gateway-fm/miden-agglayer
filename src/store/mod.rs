@@ -41,6 +41,19 @@ pub struct FaucetEntry {
     pub miden_decimals: u8,
     /// Decimal scaling factor: `origin_decimals - miden_decimals`.
     pub scale: u8,
+    /// Raw ABI metadata preimage whose `keccak256` is the on-chain
+    /// `MetadataHash` for this token (Cantina MA#13). For ERC-20s this is the
+    /// `abi.encode(name, symbol, decimals)` bytes the L1 bridge hashed when the
+    /// token was first bridged; for native ETH it is empty (`keccak256("")`).
+    ///
+    /// Persisting the preimage — not just the symbol/decimals projection — lets
+    /// the bridge-out reconstruction (`encode_bridge_event_data`) emit the EXACT
+    /// metadata bytes the certified Miden bridge leaf was built from, so the
+    /// synthetic `BridgeEvent` leaf/root matches the authoritative one. Without
+    /// it the reconstruction emitted empty metadata, diverging the exit tree for
+    /// every ERC-20 bridge-out and reverting `_deployWrappedToken` on the first
+    /// claim of that token on a fresh destination chain.
+    pub metadata: Vec<u8>,
 }
 
 /// Data for registering a new transaction.

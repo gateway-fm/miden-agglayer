@@ -1496,15 +1496,16 @@ impl Store for PgStore {
         let faucet_id = entry.faucet_id.to_hex();
         client
             .execute(
-                "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (faucet_id) DO UPDATE
                  SET origin_address = EXCLUDED.origin_address,
                      origin_network = EXCLUDED.origin_network,
                      symbol = EXCLUDED.symbol,
                      origin_decimals = EXCLUDED.origin_decimals,
                      miden_decimals = EXCLUDED.miden_decimals,
-                     scale = EXCLUDED.scale",
+                     scale = EXCLUDED.scale,
+                     metadata = EXCLUDED.metadata",
                 &[
                     &faucet_id,
                     &entry.origin_address.as_slice(),
@@ -1513,6 +1514,7 @@ impl Store for PgStore {
                     &(entry.origin_decimals as i16),
                     &(entry.miden_decimals as i16),
                     &(entry.scale as i16),
+                    &entry.metadata.as_slice(),
                 ],
             )
             .await?;
@@ -1528,7 +1530,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
+                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata
                  FROM faucet_registry
                  WHERE origin_address = $1 AND origin_network = $2",
                 &[&origin_address.as_slice(), &(origin_network as i32)],
@@ -1545,7 +1547,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
+                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata
                  FROM faucet_registry
                  WHERE origin_address = $1",
                 &[&origin_address.as_slice()],
@@ -1560,7 +1562,7 @@ impl Store for PgStore {
         let id_str = faucet_id.to_hex();
         let rows = client
             .query(
-                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
+                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata
                  FROM faucet_registry
                  WHERE faucet_id = $1",
                 &[&id_str],
@@ -1574,7 +1576,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
+                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata
                  FROM faucet_registry
                  ORDER BY created_at",
                 &[],
@@ -1743,6 +1745,7 @@ fn pg_row_to_faucet_entry(row: &tokio_postgres::Row) -> Option<FaucetEntry> {
     if origin_bytes.len() == 20 {
         origin_address.copy_from_slice(origin_bytes);
     }
+    let metadata: &[u8] = row.get(7);
     Some(FaucetEntry {
         faucet_id,
         origin_address,
@@ -1751,5 +1754,6 @@ fn pg_row_to_faucet_entry(row: &tokio_postgres::Row) -> Option<FaucetEntry> {
         origin_decimals: row.get::<_, i16>(4) as u8,
         miden_decimals: row.get::<_, i16>(5) as u8,
         scale: row.get::<_, i16>(6) as u8,
+        metadata: metadata.to_vec(),
     })
 }

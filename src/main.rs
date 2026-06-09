@@ -473,6 +473,9 @@ async fn main() -> anyhow::Result<()> {
                     origin_decimals: 18,
                     miden_decimals: 8,
                     scale: 10,
+                    // Native ETH: on-chain MetadataHash is keccak256("") so the
+                    // preimage is empty. Cantina MA#13.
+                    metadata: Vec::new(),
                 })
                 .await?;
             tracing::info!("seeded faucet registry with default ETH faucet");

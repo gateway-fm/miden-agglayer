@@ -1107,6 +1107,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
+                metadata: Vec::new(),
             })
             .await
             .unwrap();
@@ -1137,6 +1138,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
+                metadata: Vec::new(),
             })
             .await
             .unwrap();
@@ -1162,6 +1164,7 @@ mod tests {
                 origin_decimals: 6,
                 miden_decimals: 6,
                 scale: 0,
+                metadata: Vec::new(),
             })
             .await
             .unwrap();
@@ -1215,6 +1218,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
+                metadata: Vec::new(),
             })
             .await
             .unwrap();
@@ -1227,6 +1231,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
+                metadata: Vec::new(),
             })
             .await
             .unwrap();

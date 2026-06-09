@@ -125,6 +125,12 @@ pub struct FaucetOriginInfo {
     pub origin_network: u32,
     pub origin_address: [u8; 20],
     pub scale: u8,
+    /// Raw ABI metadata preimage for this token (Cantina MA#13). `keccak256` of
+    /// this equals the on-chain `MetadataHash` the certified Miden bridge leaf
+    /// was built from. Emitted verbatim by `encode_bridge_event_data` so the
+    /// synthetic bridge-out leaf matches the authoritative one. Empty for native
+    /// ETH (`keccak256("")`).
+    pub metadata: Vec<u8>,
 }
 
 /// Resolve faucet origin info from the dynamic faucet registry.
@@ -142,6 +148,7 @@ pub async fn resolve_faucet_origin(
         origin_network: entry.origin_network,
         origin_address: entry.origin_address,
         scale: entry.scale,
+        metadata: entry.metadata,
     })
 }
 
@@ -540,7 +547,16 @@ impl BridgeOutScanner {
                 destination_network,
                 &destination_address,
                 origin_amount,
-                &[],
+                // Cantina MA#13 — emit the EXACT raw ERC-20 metadata preimage
+                // persisted at faucet creation, not a hardcoded empty blob. The
+                // synthetic BridgeEvent leaf hashes this metadata; emitting empty
+                // bytes for an ERC-20 whose on-chain MetadataHash came from
+                // non-empty metadata diverges the exit tree from the certified
+                // Miden bridge state and reverts the first claim on a fresh
+                // destination chain (abi.decode of empty bytes in
+                // _deployWrappedToken). Native ETH persists empty metadata, so
+                // this stays keccak256("") for ETH.
+                &origin.metadata,
             )
             .await
         {
@@ -1977,5 +1993,276 @@ mod tests {
             classify_bridge_consumer_script(foreign, b2agg, claim),
             BridgeConsumerScript::Unknown
         );
+    }
+
+    // CANTINA MA#13 — ERC-20 METADATA PERSIST + EMIT
+    // ============================================================================================
+
+    /// Keccak256 leaf-hash for a bridge `BridgeEvent`, mirroring the on-chain
+    /// `getLeafValue` packing the certified Miden bridge leaf is built from.
+    /// Ported from the auditor PoC (poc-13.rs).
+    fn compute_leaf_hash(
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: [u8; 20],
+        destination_network: u32,
+        destination_address: [u8; 20],
+        amount: u128,
+        metadata_hash: [u8; 32],
+    ) -> [u8; 32] {
+        let mut encoded = Vec::with_capacity(1 + 4 + 20 + 4 + 20 + 32 + 32);
+        encoded.push(leaf_type);
+        encoded.extend_from_slice(&origin_network.to_be_bytes());
+        encoded.extend_from_slice(&origin_address);
+        encoded.extend_from_slice(&destination_network.to_be_bytes());
+        encoded.extend_from_slice(&destination_address);
+
+        let mut amount_bytes = [0u8; 32];
+        amount_bytes[16..].copy_from_slice(&amount.to_be_bytes());
+        encoded.extend_from_slice(&amount_bytes);
+        encoded.extend_from_slice(&metadata_hash);
+
+        let mut hasher = Keccak256::new();
+        hasher.update(&encoded);
+        hasher.finalize().into()
+    }
+
+    /// Single-leaf exit-tree root, ported from the auditor PoC (poc-13.rs).
+    fn derive_single_leaf_root(mut leaf_hash: [u8; 32]) -> [u8; 32] {
+        let mut zero_hash = [0u8; 32];
+        for _ in 0..32 {
+            let mut node_hasher = Keccak256::new();
+            node_hasher.update(leaf_hash);
+            node_hasher.update(zero_hash);
+            leaf_hash = node_hasher.finalize().into();
+
+            let mut zero_hasher = Keccak256::new();
+            zero_hasher.update(zero_hash);
+            zero_hasher.update(zero_hash);
+            zero_hash = zero_hasher.finalize().into();
+        }
+        leaf_hash
+    }
+
+    /// A valid fungible-faucet `AccountId` for asset construction. The
+    /// `FungibleAsset::new` constructor rejects any id whose `account_type()`
+    /// is not `FungibleFaucet`, so this id is shaped with the type bits
+    /// (TYPE_SHIFT = 4, value 0b10) set accordingly. Asserted in the test.
+    const ERC20_FAUCET_HEX: &str = "0x3d7c9747558851a00f8206226dfbea";
+
+    /// Build a bridge-consumed B2AGG `InputNoteRecord` carrying a real fungible
+    /// asset, with canonical 6-felt storage so `parse_b2agg_storage` recovers
+    /// the destination. Mirrors the asset path the auditor PoC exercises.
+    fn build_bridge_consumed_b2agg_with_asset(
+        faucet_id: AccountId,
+        bridge_id: AccountId,
+        amount: u64,
+        destination_network: u32,
+        destination_address: [u8; 20],
+    ) -> miden_client::store::InputNoteRecord {
+        use miden_client::asset::{Asset, FungibleAsset};
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::Felt;
+        use miden_protocol::Word;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{NoteAssets, NoteDetails, NoteRecipient, NoteStorage};
+
+        // Canonical B2AGG storage layout that parse_b2agg_storage reverses:
+        //   items[0] = u32::from_le_bytes(destination_network.to_be_bytes())
+        //   items[1..6] = address limbs (each = u32 read LE from a 4-byte chunk)
+        let net_felt = u32::from_le_bytes(destination_network.to_be_bytes());
+        let mut storage_elements = vec![Felt::from(net_felt)];
+        for i in 0..5 {
+            let mut limb = [0u8; 4];
+            limb.copy_from_slice(&destination_address[i * 4..(i + 1) * 4]);
+            storage_elements.push(Felt::from(u32::from_le_bytes(limb)));
+        }
+        let storage = NoteStorage::new(storage_elements).unwrap();
+
+        let asset: Asset = FungibleAsset::new(faucet_id, amount)
+            .expect("ERC20_FAUCET_HEX must be a valid fungible faucet id")
+            .into();
+        let assets = NoteAssets::new(vec![asset]).unwrap();
+        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+        let details = NoteDetails::new(assets, recipient);
+
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(1u32),
+            consumer_account: Some(bridge_id),
+            consumed_tx_order: Some(0),
+        });
+        miden_client::store::InputNoteRecord::new(details, None, state)
+    }
+
+    /// Cantina MA#13 — production regression. Pre-fix the synthetic BridgeEvent
+    /// for an ERC-20 bridge-out hardcoded empty metadata (`&[]`), so its leaf
+    /// hash used `keccak256("")` instead of the token's real `MetadataHash`,
+    /// diverging the synthetic leaf/root from the certified Miden bridge leaf
+    /// (and reverting `_deployWrappedToken(abi.decode(empty))` on the first
+    /// claim of that token on a fresh destination chain).
+    ///
+    /// The auditor PoC asserts the BUGGY behaviour (`synthetic != authoritative`).
+    /// This is the inverted PRODUCTION assertion: after persisting the raw ERC-20
+    /// metadata preimage in `FaucetEntry` and emitting it from
+    /// `process_consumed_note`, the synthetic leaf MUST equal the authoritative
+    /// leaf, and the single-leaf roots MUST match.
+    #[tokio::test]
+    async fn ma13_erc20_bridge_out_synthetic_leaf_matches_authoritative_after_fix() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use miden_base_agglayer::MetadataHash;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        block_state.set_current_block(1);
+
+        let faucet_id = AccountId::from_hex(ERC20_FAUCET_HEX).unwrap();
+        assert!(
+            faucet_id.is_faucet(),
+            "ERC20_FAUCET_HEX must encode a fungible faucet account type"
+        );
+        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+
+        // USDC-like token: real ABI metadata preimage = abi.encode(name, symbol, decimals).
+        let origin_address: [u8; 20] = hex::decode("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let destination_address: [u8; 20] = hex::decode("1234567890abcdef1122334455667788990011aa")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let origin_network: u32 = 0;
+        let destination_network: u32 = 0;
+        let amount: u64 = 50;
+
+        // The lossless preimage the L1 bridge hashed into the on-chain MetadataHash.
+        let metadata_preimage = encode_token_metadata_for_test("USD Coin", "USDC", 6);
+        let authoritative_metadata_hash =
+            *MetadataHash::from_token_info("USD Coin", "USDC", 6).as_bytes();
+        // Sanity: the preimage hashes to the authoritative MetadataHash.
+        assert_eq!(
+            *MetadataHash::from_abi_encoded(&metadata_preimage).as_bytes(),
+            authoritative_metadata_hash,
+            "test preimage must hash to the authoritative MetadataHash"
+        );
+
+        // Register the ERC-20 faucet WITH the real metadata preimage (the fix).
+        store
+            .register_faucet(crate::store::FaucetEntry {
+                faucet_id,
+                origin_address,
+                origin_network,
+                symbol: "USDC".into(),
+                origin_decimals: 6,
+                miden_decimals: 6,
+                scale: 0,
+                metadata: metadata_preimage.clone(),
+            })
+            .await
+            .unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_bridge_consumed_b2agg_with_asset(
+            faucet_id,
+            bridge_id,
+            amount,
+            destination_network,
+            destination_address,
+        );
+
+        let advanced = scanner.process_consumed_note(&note, 1).await;
+        assert!(
+            advanced,
+            "ERC-20 bridge-out must emit a synthetic BridgeEvent"
+        );
+
+        // Read the synthetic log back and decode its emitted metadata section.
+        let filter = crate::log_synthesis::LogFilter {
+            from_block: Some("0x0".into()),
+            to_block: Some("0x10".into()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 1).await.unwrap();
+        assert_eq!(logs.len(), 1, "expected exactly one synthetic BridgeEvent");
+        assert_eq!(
+            logs[0].topics,
+            vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()]
+        );
+
+        let log_bytes = hex::decode(&logs[0].data[2..]).unwrap();
+        // metadata length word sits at offset 256 (8 static params * 32 bytes);
+        // data follows at 288. Decode the emitted metadata bytes.
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&log_bytes[256 + 24..256 + 32]);
+        let meta_len = u64::from_be_bytes(len_bytes) as usize;
+        let emitted_metadata = &log_bytes[288..288 + meta_len];
+
+        // The emitted metadata MUST be the real preimage (post-fix), NOT empty.
+        assert!(
+            !emitted_metadata.is_empty(),
+            "post-fix the synthetic BridgeEvent must carry non-empty ERC-20 metadata"
+        );
+        assert_eq!(
+            emitted_metadata,
+            &metadata_preimage[..],
+            "synthetic BridgeEvent must emit the EXACT persisted metadata preimage"
+        );
+
+        // The synthetic leaf hashes keccak256(emitted_metadata); after the fix it
+        // must equal the authoritative leaf built from the real MetadataHash.
+        let synthetic_metadata_hash = *MetadataHash::from_abi_encoded(emitted_metadata).as_bytes();
+
+        let authoritative_leaf_hash = compute_leaf_hash(
+            LEAF_TYPE_ASSET,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount as u128,
+            authoritative_metadata_hash,
+        );
+        let synthetic_leaf_hash = compute_leaf_hash(
+            LEAF_TYPE_ASSET,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount as u128,
+            synthetic_metadata_hash,
+        );
+
+        assert_eq!(
+            synthetic_leaf_hash, authoritative_leaf_hash,
+            "post-fix: synthetic ERC-20 bridge-out leaf must equal the authoritative leaf"
+        );
+        assert_eq!(
+            derive_single_leaf_root(synthetic_leaf_hash),
+            derive_single_leaf_root(authoritative_leaf_hash),
+            "post-fix: synthetic exit-tree root must equal the authoritative root"
+        );
+    }
+
+    /// Local copy of the `abi.encode(name, symbol, decimals)` preimage used in
+    /// the MA#13 test, mirroring miden-agglayer's `encode_token_metadata`
+    /// (which is `pub(crate)` upstream). Kept in the test module so the
+    /// regression does not depend on production wiring to construct its input.
+    fn encode_token_metadata_for_test(name: &str, symbol: &str, decimals: u8) -> Vec<u8> {
+        use alloy_core::sol_types::SolValue;
+        alloy_core::sol! {
+            struct SolTokenMetadata {
+                string name;
+                string symbol;
+                uint8 decimals;
+            }
+        }
+        SolTokenMetadata {
+            name: name.into(),
+            symbol: symbol.into(),
+            decimals,
+        }
+        .abi_encode_params()
     }
 }

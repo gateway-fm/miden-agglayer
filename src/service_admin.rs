@@ -64,8 +64,22 @@ pub async fn admin_register_faucet(
     // contract's `keccak256(abi.encode(name, symbol, decimals))`. Callers that skip the
     // `name` field get `name = symbol`.
     let metadata_name = params.name.clone().unwrap_or_else(|| params.symbol.clone());
-    let metadata_hash =
-        MetadataHash::from_token_info(&metadata_name, &params.symbol, params.origin_decimals);
+    // Cantina MA#13 — the raw ABI metadata preimage whose keccak256 is the
+    // `MetadataHash`. `MetadataHash::from_token_info` hashes exactly
+    // `abi.encode(name, symbol, decimals)` (see miden-agglayer
+    // `eth_types::metadata_hash::encode_token_metadata`). We recompute that same
+    // preimage here so it can be persisted in `FaucetEntry` and emitted verbatim
+    // by the bridge-out reconstruction. Asserted equal to the authoritative hash
+    // below so any divergence from upstream's encoding fails loudly.
+    let metadata_preimage =
+        encode_token_metadata(&metadata_name, &params.symbol, params.origin_decimals);
+    let metadata_hash = MetadataHash::from_abi_encoded(&metadata_preimage);
+    debug_assert_eq!(
+        metadata_hash,
+        MetadataHash::from_token_info(&metadata_name, &params.symbol, params.origin_decimals),
+        "locally-encoded metadata preimage must hash to the same MetadataHash as \
+         miden-agglayer's from_token_info"
+    );
 
     // Create, deploy, register in bridge (using OnceLock pattern like publish_claim)
     let result = Arc::new(OnceLock::<AccountId>::new());
@@ -111,6 +125,10 @@ pub async fn admin_register_faucet(
             origin_decimals: params.origin_decimals,
             miden_decimals: params.miden_decimals,
             scale,
+            // Cantina MA#13 — persist the raw metadata preimage so the
+            // bridge-out reconstruction emits the exact bytes the on-chain
+            // MetadataHash was built from.
+            metadata: metadata_preimage,
         })
         .await?;
 
@@ -120,6 +138,35 @@ pub async fn admin_register_faucet(
         "admin_registerFaucet: faucet created and registered"
     );
     Ok(id_hex)
+}
+
+alloy_core::sol! {
+    /// Mirror of miden-agglayer `eth_types::metadata_hash::SolTokenMetadata`
+    /// (which is `pub(crate)` upstream and so not importable). The L1 bridge's
+    /// `getTokenMetadata` ABI-encodes `(string name, string symbol, uint8
+    /// decimals)`; `MetadataHash::from_token_info` hashes exactly these encoded
+    /// params. We must reproduce the SAME encoding so the persisted preimage's
+    /// keccak256 equals the authoritative `MetadataHash` (asserted in
+    /// `admin_register_faucet`). Cantina MA#13.
+    struct SolTokenMetadata {
+        string name;
+        string symbol;
+        uint8 decimals;
+    }
+}
+
+/// ABI-encode token metadata as `abi.encode(name, symbol, decimals)`.
+///
+/// Byte-for-byte identical to miden-agglayer's `encode_token_metadata` so the
+/// preimage we persist hashes to the same `MetadataHash` the L1 bridge produced.
+fn encode_token_metadata(name: &str, symbol: &str, decimals: u8) -> Vec<u8> {
+    use alloy_core::sol_types::SolValue;
+    SolTokenMetadata {
+        name: name.into(),
+        symbol: symbol.into(),
+        decimals,
+    }
+    .abi_encode_params()
 }
 
 fn parse_eth_address(s: &str) -> anyhow::Result<[u8; 20]> {

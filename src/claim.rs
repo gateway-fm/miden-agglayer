@@ -165,6 +165,12 @@ async fn find_or_create_faucet(
         origin_decimals,
         miden_decimals,
         scale,
+        // Cantina MA#13 — persist the EXACT raw metadata preimage the
+        // `MetadataHash` above was computed from (`metadata_hash =
+        // MetadataHash::from_abi_encoded(metadata.as_ref())`). This is the
+        // lossless bytes the bridge-out reconstruction must emit so the
+        // synthetic BridgeEvent leaf matches the certified Miden bridge leaf.
+        metadata: metadata.to_vec(),
     };
     store.register_faucet(entry).await?;
 
