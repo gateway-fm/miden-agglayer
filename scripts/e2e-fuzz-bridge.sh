@@ -36,7 +36,7 @@ AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
-DEST_NETWORK=1
+DEST_NETWORK=77  # Miden AggLayer network ID (MIDEN_NETWORK_ID constant in protocol 0.15)
 BRIDGE_ADDRESS=$(grep -E '^BRIDGE_ADDRESS=' "$FIXTURES_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || echo "0xC8cbEBf950B9Df44d987c8619f092beA980fF038")
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -498,7 +498,7 @@ fi
 L2_DEPOSITS=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$FUNDED_ADDR" 2>/dev/null | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-l2_deps = [dep for dep in d.get('deposits',[]) if dep.get('network_id')==1]
+l2_deps = [dep for dep in d.get('deposits',[]) if dep.get('network_id')==77]
 print(len(l2_deps))
 " 2>/dev/null || echo "0")
 log "  L2→L1 deposits visible: $L2_DEPOSITS"

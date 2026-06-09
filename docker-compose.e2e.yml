@@ -58,35 +58,148 @@ services:
   # service is intentionally removed — its replacement embeds the SQL via
   # `include_str!` into the binary so the proxy and its schema cannot drift.
 
-  # ── L2 Chain (Miden node in bundled mode) ──────────────────────────────────
-  # Built from `0xMiden/miden-node` (production binary), NOT the testing
-  # harness in miden-client. See Dockerfile.miden-node + Makefile's
-  # MIDEN_NODE_GIT_{URL,REF} for the agglayer-genesis rationale.
+  # ── L2 Chain (Miden node — protocol 0.15 microservice topology) ─────────────
+  # Protocol 0.15 decomposed the all-in-one `bundled` node into separate
+  # services (mirrors 0xMiden/node's own docker-compose.yml):
+  #   validator    — genesis bootstrap + block signing (:50101)
+  #   sequencer    — block production + public RPC (:57291)  [service `miden-node`]
+  #   ntx-builder  — consumes network-account notes, i.e. the agglayer bridge's
+  #                  CLAIM/CONFIG notes, and submits them as network txs (:50301)
+  #   tx-prover    — remote transaction prover (:50051)
+  # Images are built from 0xMiden/node @ the rev pinned in the Makefile by
+  # `make e2e-build-node` (tags: miden-node / miden-validator / miden-ntx-builder
+  # / miden-remote-prover). Genesis is bootstrapped from our vendored agglayer
+  # config (fixtures/genesis/02-with-account-files.toml → bridge + ETH/USDC
+  # faucets); the bridge is deployed but left UNCONFIGURED — faucet registration
+  # happens at runtime via the proxy's CONFIG_AGG_BRIDGE note.
+  #
+  # The ntx-builder authorises network-tx submission to the sequencer with a
+  # shared secret that MUST match on both sides (sequencer
+  # --rpc.network-tx-auth-header-value == ntx-builder --rpc.auth-header-value),
+  # else network txs are rejected with "Network transactions may not be
+  # submitted by users yet". The proxy submits ordinary user txs and needs no
+  # such header.
+
+  node-bootstrap-validator:
+    image: miden-validator
+    volumes:
+      - node_data:/data
+      - ./fixtures/genesis:/genesis:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -f /data/validator/.bootstrapped ]; then echo "validator already bootstrapped"; exit 0; fi
+        rm -rf /data/genesis /data/validator /data/accounts
+        mkdir -p /data/genesis /data/validator /data/accounts
+        miden-validator bootstrap \
+          --data-directory /data/validator \
+          --genesis-block-directory /data/genesis \
+          --accounts-directory /data/accounts \
+          --genesis-config-file /genesis/02-with-account-files.toml
+        touch /data/validator/.bootstrapped
+
+  node-bootstrap-sequencer:
+    image: miden-node
+    volumes:
+      - node_data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    depends_on:
+      node-bootstrap-validator:
+        condition: service_completed_successfully
+    command:
+      - |
+        set -e
+        if [ -f /data/node/.bootstrapped ]; then echo "node already bootstrapped"; exit 0; fi
+        rm -rf /data/node
+        mkdir -p /data/node
+        miden-node bootstrap --data-directory /data/node --file /data/genesis/genesis.dat
+        touch /data/node/.bootstrapped
+
+  node-bootstrap-ntx:
+    image: miden-ntx-builder
+    volumes:
+      - node_data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    depends_on:
+      node-bootstrap-validator:
+        condition: service_completed_successfully
+    command:
+      - |
+        set -e
+        if [ -f /data/ntx-builder/.bootstrapped ]; then echo "ntx-builder already bootstrapped"; exit 0; fi
+        rm -rf /data/ntx-builder
+        mkdir -p /data/ntx-builder
+        miden-ntx-builder bootstrap --data-directory /data/ntx-builder --file /data/genesis/genesis.dat
+        touch /data/ntx-builder/.bootstrapped
+
+  validator:
+    image: miden-validator
+    restart: on-failure
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-validator:
+        condition: service_completed_successfully
+    command:
+      - miden-validator
+      - start
+      - --listen=0.0.0.0:50101
+      - --data-directory=/data/validator
+
+  tx-prover:
+    image: miden-remote-prover
+    restart: on-failure
+    command:
+      - miden-remote-prover
+      - --kind=transaction
+      - --port=50051
+
+  # The sequencer is the RPC the proxy + aggkit talk to. Named `miden-node` so
+  # the existing `--miden-node=http://miden-node:57291` wiring is unchanged.
   miden-node:
-    build:
-      context: .
-      dockerfile: Dockerfile.miden-node
-      args:
-        MIDEN_NODE_GIT_URL: ${MIDEN_NODE_GIT_URL:?MIDEN_NODE_GIT_URL must be set (run via 'make e2e-up')}
-        MIDEN_NODE_GIT_REF: ${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
-    image: miden-agglayer/miden-node:${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
+    image: miden-node
     restart: on-failure
     ports:
       - "57291:57291"
     environment:
-      RUST_LOG: "info,miden_node_ntx_builder=debug,miden_tx=debug"
-      # Offload tx proving to Miden's devnet prover so local miden-node doesn't
-      # OOM-kill itself during bridge-consumption proof generation. Only
-      # `tx-prover.devnet.miden.io` is publicly exposed by Miden devnet; block
-      # proving stays in-process (no remote endpoint available). This env var
-      # maps to the `--tx-prover.url` flag of `miden-node bundled start`.
-      MIDEN_NODE_NTX_PROVER_URL: "${MIDEN_NODE_NTX_PROVER_URL:-https://tx-prover.devnet.miden.io}"
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 57291 || exit 1"]
-      interval: 3s
-      timeout: 2s
-      retries: 30
-      start_period: 30s
+      RUST_LOG: "info,miden_node_ntx_builder=debug"
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-sequencer:
+        condition: service_completed_successfully
+      validator:
+        condition: service_started
+    command:
+      - miden-node
+      - sequencer
+      - --rpc.listen=0.0.0.0:57291
+      - --data-directory=/data/node
+      - --validator.url=http://validator:50101
+      - --ntx-builder.url=http://ntx-builder:50301
+      - --rpc.network-tx-auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
+
+  ntx-builder:
+    image: miden-ntx-builder
+    restart: on-failure
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-ntx:
+        condition: service_completed_successfully
+      miden-node:
+        condition: service_started
+      tx-prover:
+        condition: service_started
+    command:
+      - miden-ntx-builder
+      - start
+      - --listen=0.0.0.0:50301
+      - --rpc.url=http://miden-node:57291
+      - --rpc.auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
+      - --tx-prover.url=http://tx-prover:50051
+      - --data-directory=/data/ntx-builder
 
     # ── L2 EVM Proxy (service under test) ──────────────────────────────────────
   miden-agglayer:
@@ -100,9 +213,17 @@ services:
       - ./fixtures/.env
     environment:
       CHAIN_ID: "${CHAIN_ID:-2}"
-      NETWORK_ID: "${NETWORK_ID:-1}"
+      NETWORK_ID: "${NETWORK_ID:-77}"
       DATABASE_URL: "host=agglayer-postgres user=agglayer password=agglayer dbname=agglayer_store"
       RUST_LOG: "info"
+      # Regression requirement: offload ALL proxy tx proving (CLAIM / GER /
+      # faucet / bridge-out / init) to an EXTERNAL Miden tx-prover instead of
+      # the in-process LocalTransactionProver. Fallback-to-local stays OFF
+      # (clap default false), so a prover outage fails loud rather than
+      # silently reverting to local proving — that is how we *verify* the
+      # external prover is actually exercised (assert
+      # miden_proof_generations_total{outcome="ok"} > 0, no local fallback).
+      MIDEN_PROVER_URL: "${MIDEN_PROVER_URL:-http://tx-prover:50051}"
       # Force all tmp I/O onto the bind-mounted dir so rocksdb / rusqlite
       # atomic-rename operations stay on the same device. Without this,
       # miden-client's on-disk store fails at startup with
@@ -137,7 +258,9 @@ services:
       # production deploys via copy-paste.
     depends_on:
       miden-node:
-        condition: service_healthy
+        condition: service_started
+      tx-prover:
+        condition: service_started
       agglayer-postgres:
         condition: service_healthy
     healthcheck:
@@ -209,6 +332,7 @@ services:
 volumes:
   agglayer_storage:
   agglayer_backups:
+  node_data:
 
 networks:
   default:

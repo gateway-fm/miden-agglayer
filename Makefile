@@ -202,15 +202,20 @@ e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
 	./scripts/setup-fixtures.sh
 
 .PHONY: e2e-clean-data
-e2e-clean-data: ## Wipe .miden-agglayer-data/ so proxy re-inits against the fresh miden-node
-	# The miden-node's genesis commitment is non-deterministic across container
-	# restarts, but the proxy's sqlite at .miden-agglayer-data/store.sqlite3
-	# pins a specific genesis. If we mount stale state into a fresh node, the
-	# client's sync is rejected with "accept header validation failed". Always
-	# start from a clean slate — the proxy's --init flow will redeploy accounts
-	# in ~45s, which is acceptable for E2E.
+e2e-clean-data: ## Wipe .miden-agglayer-data/ + node_data volume so the stack re-inits against fresh genesis
+	# Proto 0.15: the node is a microservice stack whose state (genesis block,
+	# store, validator + ntx-builder DBs) lives in the `node_data` Docker volume,
+	# and the proxy's genesis pin lives in .miden-agglayer-data/store.sqlite3.
+	# Mounting stale node state under a fresh proxy (or vice-versa) makes the
+	# client's sync fail ("accept header validation failed"), so wipe BOTH for a
+	# clean slate. The bootstrap services rebuild genesis (deterministic from the
+	# vendored agglayer .mac files) and the proxy's --init redeploys accounts in
+	# ~45s — acceptable for E2E. The volume rm is guarded so it no-ops when the
+	# volume is absent or still in use (containers must be down first, which the
+	# regression harness guarantees via `make e2e-down`).
 	rm -rf .miden-agglayer-data
 	mkdir -p .miden-agglayer-data/tmp
+	-docker volume rm miden-agglayer_node_data 2>/dev/null || true
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)

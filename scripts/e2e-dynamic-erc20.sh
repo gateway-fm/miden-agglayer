@@ -28,7 +28,7 @@ AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
-DEST_NETWORK=1  # Miden network ID
+DEST_NETWORK=77  # Miden AggLayer network ID (MIDEN_NETWORK_ID constant in protocol 0.15)
 
 # TestToken: 6 decimals. Bridge 1000 tokens = 1000 * 10^6 = 1_000_000_000 base units.
 # With 6 origin decimals and 6 miden decimals → scale=0, no scaling.
@@ -273,7 +273,7 @@ pass "Certificate settled on L1"
 # subsequent claim would pick the wrong (already-claimed) deposit and fail.
 EXPECTED_ORIG_ADDR=$(python3 -c "print('$TOKEN_ADDR'.lower())")
 wait_for "L2 deposit in bridge-service" \
-    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('claim_tx_hash') or '')=='' and (dep.get('orig_addr') or '').lower()==want for dep in d.get('deposits',[])) else 1)\"" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==77 and (dep.get('claim_tx_hash') or '')=='' and (dep.get('orig_addr') or '').lower()==want for dep in d.get('deposits',[])) else 1)\"" \
     120 5
 pass "TestToken L2→L1 deposit synced and ready_for_claim"
 
@@ -289,7 +289,7 @@ want = '$EXPECTED_ORIG_ADDR'
 for dep in d.get('deposits', []):
     if not dep.get('ready_for_claim'):
         continue
-    if dep.get('network_id') != 1:
+    if dep.get('network_id') != 77:
         continue
     if (dep.get('claim_tx_hash') or '') != '':
         continue

@@ -16,7 +16,7 @@ use clap::Parser;
 use miden_base_agglayer::{B2AggNote, EthAddress};
 use miden_client::DebugMode;
 use miden_client::RemoteTransactionProver;
-use miden_client::asset::{Asset, FungibleAsset};
+use miden_client::asset::{Asset, AssetCallbackFlag, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;
@@ -299,9 +299,18 @@ async fn main() -> anyhow::Result<()> {
     let l1_dest = EthAddress::from_hex(&args.dest_address)
         .map_err(|e| anyhow!("invalid dest address: {e}"))?;
 
-    // Create B2AGG note
+    // Create B2AGG note.
+    //
+    // Protocol 0.15 introduced per-asset callbacks: the asset vault is keyed by
+    // (faucet_id, callback_flag), and AggLayer faucets are registered with
+    // callbacks ENABLED. The bridged-in assets therefore sit in the wallet vault
+    // under the callbacks-enabled key. `FungibleAsset::new` defaults to
+    // callbacks DISABLED, so a default-flag asset addresses a different (empty)
+    // vault slot and the bridge-out tx fails with "amount in the vault is less
+    // than the amount to remove". Match the vault by enabling callbacks.
     let asset: Asset = FungibleAsset::new(faucet_id, args.amount)
         .map_err(|e| anyhow!("invalid asset: {e}"))?
+        .with_callbacks(AssetCallbackFlag::Enabled)
         .into();
     let note_assets = NoteAssets::new(vec![asset]).map_err(|e| anyhow!("note assets: {e}"))?;
 

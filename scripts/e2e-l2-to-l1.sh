@@ -124,7 +124,7 @@ BRIDGE_SERVICE_URL="http://localhost:18080"
 log "Step 4/5: Waiting for bridge-service to sync L2→L1 deposit..."
 # L2 deposits have network_id=1 (logged on L2 chain) and dest_net=0 (going to L1)
 wait_for "L2 deposit in bridge-service" \
-    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 for dep in d.get('deposits',[])) else 1)\"" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==77 for dep in d.get('deposits',[])) else 1)\"" \
     120 5
 pass "L2→L1 deposit synced and ready_for_claim"
 
@@ -138,7 +138,7 @@ DEPOSIT_INFO=$(echo "$DEPOSITS_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 for dep in d.get('deposits', []):
-    if dep.get('ready_for_claim') and dep.get('network_id') == 1:
+    if dep.get('ready_for_claim') and dep.get('network_id') == 77:
         print(json.dumps(dep))
         break
 ")

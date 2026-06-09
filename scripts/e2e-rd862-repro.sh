@@ -50,7 +50,7 @@ AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer
 
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
-DEST_NETWORK=1
+DEST_NETWORK=77  # Miden AggLayer network ID (MIDEN_NETWORK_ID constant in protocol 0.15)
 BRIDGE_ADDRESS=$(grep -E '^BRIDGE_ADDRESS=' "$FIXTURES_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || echo "0xC8cbEBf950B9Df44d987c8619f092beA980fF038")
 
 N_DEPOSITS="${N_DEPOSITS:-10}"
