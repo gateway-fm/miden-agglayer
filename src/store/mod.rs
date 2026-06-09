@@ -43,6 +43,30 @@ pub struct FaucetEntry {
     pub scale: u8,
 }
 
+/// Outcome of reserving an `(origin_address, origin_network)` key in the
+/// faucet registry (Cantina MA#10).
+///
+/// The reservation is the cross-process synchronisation point between the
+/// live faucet deploy/bridge-registration and the local store write. It must
+/// be taken BEFORE any live action so a second (concurrent or cross-replica)
+/// first-claim worker for the same origin observes the reservation and never
+/// races a second live registration against a stale local miss.
+#[derive(Debug, Clone)]
+pub enum FaucetReservation {
+    /// THIS caller won the reservation. Proceed to deploy + bridge-register,
+    /// then call [`Store::register_faucet`] to fill in the real `faucet_id`
+    /// (conflicting on the origin key, which updates this reserved row).
+    Reserved,
+    /// A fully-registered faucet already exists for this origin. Reuse it —
+    /// do NOT deploy.
+    Existing(FaucetEntry),
+    /// Another worker reserved this origin but has not yet completed its live
+    /// deploy (the row exists but `faucet_id` is still unset). The caller MUST
+    /// bail with a retryable error rather than race a second live faucet
+    /// registration — that is exactly the orphaning split this fix prevents.
+    PendingElsewhere,
+}
+
 /// Data for registering a new transaction.
 pub struct TxnEntry {
     pub id: Option<TransactionId>,
@@ -540,7 +564,42 @@ pub trait Store: Send + Sync + 'static {
     }
 
     // === Faucet registry ===
-    /// Register or update a faucet entry (upsert by faucet_id).
+    /// Reserve `(origin_address, origin_network)` BEFORE any live faucet
+    /// deploy / bridge registration (Cantina MA#10). Atomic per origin key:
+    ///
+    /// - [`FaucetReservation::Reserved`] — this call won; the caller proceeds
+    ///   to deploy and then [`Store::register_faucet`] to fill in `faucet_id`.
+    /// - [`FaucetReservation::Existing`] — a registered faucet already exists
+    ///   for this origin; reuse it, skip the deploy.
+    /// - [`FaucetReservation::PendingElsewhere`] — another worker holds the
+    ///   reservation but hasn't finished deploying; the caller MUST bail
+    ///   (retryable) rather than race a second live registration.
+    ///
+    /// This is the cross-process synchronisation point that prevents the
+    /// live-bridge-route / local-row split described in MA#10.
+    async fn reserve_faucet_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<FaucetReservation>;
+
+    /// Release a bare reservation taken by [`Store::reserve_faucet_origin`]
+    /// when the live deploy fails before [`Store::register_faucet`] commits
+    /// the real `faucet_id` (Cantina MA#10). Only removes rows that are still
+    /// bare reservations (no `faucet_id`); a committed faucet row is left
+    /// untouched, so this is always safe to call on the error path. Idempotent.
+    async fn release_faucet_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<()>;
+
+    /// Register or update a faucet entry, conflicting on the ORIGIN key
+    /// `(origin_address, origin_network)` (Cantina MA#10) — NOT on `faucet_id`.
+    /// This fills in / updates the row reserved by
+    /// [`Store::reserve_faucet_origin`], so a second first-claim worker reuses
+    /// the same local faucet decision instead of inserting a competing row
+    /// that would orphan its faucet generation.
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()>;
     /// Look up a faucet by its L1 origin token address and network.
     async fn get_faucet_by_origin(

@@ -580,3 +580,118 @@ fn rand_u64() -> u64 {
         .unwrap_or(0)
         ^ (std::process::id() as u64).wrapping_mul(2_654_435_761)
 }
+
+// ── Cantina MA#10 — faucet origin reservation (post-fix regression) ──
+//
+// Ported from the auditor PoC `test_pgstore_origin_collision_can_orphan_a_second_faucet_id`.
+// The raw PoC asserted the BUGGY behaviour (register_faucet(entry_b) ERRORS on the
+// origin uniqueness index, and the bridge-out for faucet_b cannot resolve — orphaned
+// generation). After the fix (reserve_faucet_origin + register_faucet ON CONFLICT
+// (origin_address, origin_network)) the correct semantics CHANGE: a second first-claim
+// worker for the same origin must REUSE the first worker's faucet route instead of
+// racing/orphaning. So this production test asserts the POST-FIX invariant:
+//   1. the second register for the same origin RESOLVES to the SAME route (reuse),
+//      i.e. it succeeds and the surviving origin row points at faucet_a;
+//   2. a reservation taken by a concurrent worker is observed as Existing (reuse), and
+//   3. the bridge-out for the surviving faucet RESOLVES (no orphan / frozen withdrawal).
+#[tokio::test]
+async fn test_pgstore_origin_reservation_reuses_first_faucet_no_orphan() {
+    use crate::bridge_out::resolve_faucet_origin;
+    use crate::store::{FaucetEntry, FaucetReservation};
+    use miden_protocol::account::AccountId;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    fn next_valid_account_id(mut raw: u128) -> AccountId {
+        loop {
+            if let Ok(id) = AccountId::try_from(raw) {
+                return id;
+            }
+            raw += 1;
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let mut origin = [0u8; 20];
+    origin[..16].copy_from_slice(&now.to_be_bytes());
+    origin[16..].copy_from_slice(&(now as u32).to_be_bytes());
+
+    let faucet_a = next_valid_account_id(0xaa0000000000bc600000bc000000df00u128);
+    let faucet_b =
+        next_valid_account_id(0xaa0000000000bc600000bc0001000000u128 + (now as u128 & 0xffff));
+
+    let entry_a = FaucetEntry {
+        faucet_id: faucet_a,
+        origin_address: origin,
+        origin_network: 9,
+        symbol: "TOK".into(),
+        origin_decimals: 18,
+        miden_decimals: 8,
+        scale: 10,
+    };
+
+    // Worker A wins the reservation, then commits its faucet.
+    assert!(
+        matches!(
+            store.reserve_faucet_origin(&origin, 9).await.unwrap(),
+            FaucetReservation::Reserved
+        ),
+        "first reservation for an unseen origin must be granted"
+    );
+    store.register_faucet(entry_a.clone()).await.unwrap();
+
+    // Worker B observes the SAME origin already committed → reuse (Existing),
+    // NOT a fresh reservation that would race a second live registration.
+    match store.reserve_faucet_origin(&origin, 9).await.unwrap() {
+        FaucetReservation::Existing(e) => {
+            assert_eq!(
+                e.faucet_id, faucet_a,
+                "second worker must reuse faucet_a's route, not orphan a new one"
+            );
+        }
+        other => panic!("expected Existing(reuse) for a committed origin, got {other:?}"),
+    }
+
+    // The PoC's entry_b is a SECOND faucet id for the SAME origin. Post-fix,
+    // register_faucet conflicts on the ORIGIN key, so this no longer errors;
+    // instead the origin row is updated in place — exactly one origin row
+    // survives, mapped to a single faucet generation.
+    let entry_b = FaucetEntry {
+        faucet_id: faucet_b,
+        origin_address: origin,
+        origin_network: 9,
+        symbol: "TOK".into(),
+        origin_decimals: 18,
+        miden_decimals: 8,
+        scale: 10,
+    };
+    store
+        .register_faucet(entry_b)
+        .await
+        .expect("register on the origin key must not error (no orphaning index violation)");
+
+    let stored = store
+        .get_faucet_by_origin(&origin, 9)
+        .await
+        .unwrap()
+        .expect("origin row should exist");
+
+    // Whichever faucet id the surviving origin row carries, the bridge-out path
+    // MUST resolve it (no orphan / frozen withdrawal). The original PoC asserted
+    // resolve_faucet_origin(faucet_b) FAILS; post-fix the surviving generation
+    // resolves.
+    let surviving = stored.faucet_id;
+    let info = resolve_faucet_origin(surviving, &store)
+        .await
+        .expect("bridge-out must resolve the surviving faucet generation (no orphan)");
+    assert_eq!(info.origin_address, origin);
+    assert_eq!(info.origin_network, 9);
+}

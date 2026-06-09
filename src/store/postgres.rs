@@ -4,8 +4,8 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason,
-    UnclaimableClaim, UnclaimableReason,
+    FaucetEntry, FaucetReservation, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
+    UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
@@ -1491,16 +1491,90 @@ impl Store for PgStore {
 
     // ── Faucet registry ──────────────────────────────────────────
 
+    async fn reserve_faucet_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<FaucetReservation> {
+        let client = self.pool.get().await?;
+        // Single atomic statement: try to insert a bare reservation row
+        // (faucet_id NULL) keyed by the origin. ON CONFLICT on the origin key
+        // means exactly one concurrent (even cross-process) first-claim worker
+        // wins the insert and gets a RETURNING row; the losers get nothing.
+        let inserted = client
+            .query(
+                "INSERT INTO faucet_registry
+                     (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale)
+                 VALUES (NULL, $1, $2, '', 0, 0, 0)
+                 ON CONFLICT (origin_address, origin_network) DO NOTHING
+                 RETURNING faucet_id",
+                &[&origin_address.as_slice(), &(origin_network as i32)],
+            )
+            .await?;
+        if !inserted.is_empty() {
+            tracing::info!(
+                origin_network,
+                "PgStore: reserved faucet origin (MA#10) — proceeding to deploy"
+            );
+            return Ok(FaucetReservation::Reserved);
+        }
+
+        // A row already exists for this origin. Decide whether it is a
+        // fully-registered faucet (reuse) or another worker's bare reservation
+        // (pending — bail rather than race a second live registration).
+        let rows = client
+            .query(
+                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
+                 FROM faucet_registry
+                 WHERE origin_address = $1 AND origin_network = $2",
+                &[&origin_address.as_slice(), &(origin_network as i32)],
+            )
+            .await?;
+        match rows.first() {
+            Some(row) if row.get::<_, Option<&str>>(0).is_some() => {
+                match pg_row_to_faucet_entry(row) {
+                    Some(entry) => Ok(FaucetReservation::Existing(entry)),
+                    // faucet_id present but unparseable — treat as pending so we
+                    // never deploy a competing live faucet against a bad row.
+                    None => Ok(FaucetReservation::PendingElsewhere),
+                }
+            }
+            _ => Ok(FaucetReservation::PendingElsewhere),
+        }
+    }
+
+    async fn release_faucet_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        // Only delete a bare reservation (faucet_id IS NULL). A committed
+        // faucet row for this origin is left untouched, so the error-path call
+        // is always safe.
+        client
+            .execute(
+                "DELETE FROM faucet_registry
+                 WHERE origin_address = $1 AND origin_network = $2 AND faucet_id IS NULL",
+                &[&origin_address.as_slice(), &(origin_network as i32)],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         let faucet_id = entry.faucet_id.to_hex();
+        // Cantina MA#10 — conflict on the ORIGIN key, not faucet_id. This fills
+        // in / updates the row reserved by reserve_faucet_origin so a second
+        // first-claim worker reuses the same local decision instead of
+        // inserting a competing row that would orphan its faucet generation.
         client
             .execute(
                 "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (faucet_id) DO UPDATE
-                 SET origin_address = EXCLUDED.origin_address,
-                     origin_network = EXCLUDED.origin_network,
+                 ON CONFLICT (origin_address, origin_network) DO UPDATE
+                 SET faucet_id = EXCLUDED.faucet_id,
                      symbol = EXCLUDED.symbol,
                      origin_decimals = EXCLUDED.origin_decimals,
                      miden_decimals = EXCLUDED.miden_decimals,
@@ -1530,7 +1604,7 @@ impl Store for PgStore {
             .query(
                 "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
                  FROM faucet_registry
-                 WHERE origin_address = $1 AND origin_network = $2",
+                 WHERE origin_address = $1 AND origin_network = $2 AND faucet_id IS NOT NULL",
                 &[&origin_address.as_slice(), &(origin_network as i32)],
             )
             .await?;
@@ -1547,7 +1621,7 @@ impl Store for PgStore {
             .query(
                 "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
                  FROM faucet_registry
-                 WHERE origin_address = $1",
+                 WHERE origin_address = $1 AND faucet_id IS NOT NULL",
                 &[&origin_address.as_slice()],
             )
             .await?;
@@ -1576,6 +1650,7 @@ impl Store for PgStore {
             .query(
                 "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale
                  FROM faucet_registry
+                 WHERE faucet_id IS NOT NULL
                  ORDER BY created_at",
                 &[],
             )
@@ -1736,7 +1811,8 @@ impl Store for PgStore {
 }
 
 fn pg_row_to_faucet_entry(row: &tokio_postgres::Row) -> Option<FaucetEntry> {
-    let id_str: &str = row.get(0);
+    // faucet_id is NULL for a bare MA#10 reservation row — skip those.
+    let id_str: &str = row.get::<_, Option<&str>>(0)?;
     let faucet_id = AccountId::from_hex(id_str).ok()?;
     let origin_bytes: &[u8] = row.get(1);
     let mut origin_address = [0u8; 20];

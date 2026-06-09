@@ -1,6 +1,9 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
-use super::{FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim};
+use super::{
+    FaucetEntry, FaucetReservation, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
+    UnclaimableClaim,
+};
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
@@ -67,6 +70,11 @@ pub struct InMemoryStore {
 
     // Faucet registry
     faucets: RwLock<Vec<FaucetEntry>>,
+    // Cantina MA#10 — origin keys reserved before a live faucet deploy but
+    // not yet backed by a committed `faucets` row. A `(origin_address,
+    // origin_network)` present here but absent from `faucets` is a bare
+    // reservation held by an in-flight first-claim worker.
+    faucet_origin_reservations: RwLock<HashSet<([u8; 20], u32)>>,
 
     // Monitor trackers (RD-913) — in-memory mirror of monitor_burn_serials,
     // monitor_twin_notes, monitor_expected_mints. With InMemoryStore the
@@ -109,6 +117,7 @@ impl InMemoryStore {
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             faucets: RwLock::new(Vec::new()),
+            faucet_origin_reservations: RwLock::new(HashSet::new()),
             monitor_burn_serials: RwLock::new(HashSet::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
@@ -654,13 +663,63 @@ impl Store for InMemoryStore {
 
     // ── Faucet registry ──────────────────────────────────────────
 
-    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
-        let mut faucets = self.faucets.write();
-        if let Some(existing) = faucets.iter_mut().find(|f| f.faucet_id == entry.faucet_id) {
-            *existing = entry;
-        } else {
-            faucets.push(entry);
+    async fn reserve_faucet_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<FaucetReservation> {
+        // Hold the faucets write lock for the whole check-then-reserve so the
+        // decision is atomic per origin key (mirrors the single Postgres
+        // statement in PgStore).
+        let faucets = self.faucets.write();
+        if let Some(existing) = faucets
+            .iter()
+            .find(|f| f.origin_address == *origin_address && f.origin_network == origin_network)
+        {
+            // A fully-registered faucet already exists — reuse it.
+            return Ok(FaucetReservation::Existing(existing.clone()));
         }
+        let mut reservations = self.faucet_origin_reservations.write();
+        if reservations.contains(&(*origin_address, origin_network)) {
+            // Someone reserved this origin but hasn't committed a faucet row.
+            return Ok(FaucetReservation::PendingElsewhere);
+        }
+        reservations.insert((*origin_address, origin_network));
+        Ok(FaucetReservation::Reserved)
+    }
+
+    async fn release_faucet_origin(
+        &self,
+        origin_address: &[u8; 20],
+        origin_network: u32,
+    ) -> anyhow::Result<()> {
+        // Only drop the bare reservation; a committed `faucets` row (if the
+        // register already landed) is untouched.
+        self.faucet_origin_reservations
+            .write()
+            .remove(&(*origin_address, origin_network));
+        Ok(())
+    }
+
+    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+        let origin_key = (entry.origin_address, entry.origin_network);
+        {
+            let mut faucets = self.faucets.write();
+            // Cantina MA#10 — conflict on the ORIGIN key, not faucet_id.
+            // Whatever row already holds this origin (a prior committed faucet,
+            // or our own reservation now being filled in) is the one we update,
+            // so a second first-claim worker reuses the same local decision.
+            if let Some(existing) = faucets
+                .iter_mut()
+                .find(|f| f.origin_address == origin_key.0 && f.origin_network == origin_key.1)
+            {
+                *existing = entry;
+            } else {
+                faucets.push(entry);
+            }
+        }
+        // Clear any bare reservation now backed by a committed row.
+        self.faucet_origin_reservations.write().remove(&origin_key);
         Ok(())
     }
 
@@ -1254,5 +1313,125 @@ mod tests {
             .await
             .unwrap();
         assert!(other.is_empty());
+    }
+
+    /// Cantina MA#10 — in-memory analogue of the auditor PoC (executes without
+    /// DATABASE_URL). The PoC asserted the BUGGY behaviour: a second faucet id
+    /// for the same origin ERRORS on the origin uniqueness index and its
+    /// bridge-out cannot resolve (orphaned generation). Post-fix, the origin
+    /// reservation is the synchronisation point, so:
+    ///   1. the FIRST first-claim worker wins `Reserved`;
+    ///   2. a SECOND worker observing the committed origin gets `Existing`
+    ///      (REUSE) — it never races a second live registration;
+    ///   3. registering a second faucet id for the same origin updates the row
+    ///      in place (conflict on the origin key) — exactly one origin row
+    ///      survives and its bridge-out RESOLVES (no orphan / frozen withdrawal).
+    #[tokio::test]
+    async fn cantina_10_origin_reservation_reuses_first_faucet_no_orphan() {
+        use crate::bridge_out::resolve_faucet_origin;
+        use crate::store::FaucetReservation;
+
+        let store = InMemoryStore::new();
+        let origin = [0xC1u8; 20];
+        let faucet_a = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let faucet_b = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+
+        // 1. First worker wins the reservation, then commits faucet_a.
+        assert!(
+            matches!(
+                store.reserve_faucet_origin(&origin, 9).await.unwrap(),
+                FaucetReservation::Reserved
+            ),
+            "first reservation for an unseen origin must be granted"
+        );
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_a,
+                origin_address: origin,
+                origin_network: 9,
+                symbol: "TOK".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+            })
+            .await
+            .unwrap();
+
+        // 2. Second worker observes the committed origin → REUSE, not a fresh
+        //    reservation that would race a second live faucet deploy.
+        match store.reserve_faucet_origin(&origin, 9).await.unwrap() {
+            FaucetReservation::Existing(e) => assert_eq!(
+                e.faucet_id, faucet_a,
+                "second worker must reuse faucet_a, not orphan a new generation"
+            ),
+            other => panic!("expected Existing(reuse) for a committed origin, got {other:?}"),
+        }
+
+        // 3. Registering a second faucet id for the SAME origin must NOT error
+        //    (conflict on the origin key) and must collapse to one origin row.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_b,
+                origin_address: origin,
+                origin_network: 9,
+                symbol: "TOK".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+            })
+            .await
+            .expect("register on the origin key must not error");
+
+        assert_eq!(
+            store.list_faucets().await.unwrap().len(),
+            1,
+            "exactly one origin row must survive (no orphaned second generation)"
+        );
+
+        let surviving = store
+            .get_faucet_by_origin(&origin, 9)
+            .await
+            .unwrap()
+            .expect("origin row should exist")
+            .faucet_id;
+
+        // The surviving faucet's bridge-out path resolves — withdrawals not frozen.
+        let info = resolve_faucet_origin(surviving, &store)
+            .await
+            .expect("bridge-out must resolve the surviving faucet generation");
+        assert_eq!(info.origin_address, origin);
+        assert_eq!(info.origin_network, 9);
+    }
+
+    /// Cantina MA#10 — a reservation held by an in-flight worker (deploy not yet
+    /// committed) must be observed as `PendingElsewhere`, and `release_faucet_origin`
+    /// must free it (e.g. after a failed deploy) so the origin is not permanently
+    /// pinned. A committed faucet row is NOT removed by release.
+    #[tokio::test]
+    async fn cantina_10_pending_reservation_then_release() {
+        use crate::store::FaucetReservation;
+
+        let store = InMemoryStore::new();
+        let origin = [0xC2u8; 20];
+
+        // First reservation granted.
+        assert!(matches!(
+            store.reserve_faucet_origin(&origin, 9).await.unwrap(),
+            FaucetReservation::Reserved
+        ));
+        // Second observes the in-flight (uncommitted) reservation.
+        assert!(matches!(
+            store.reserve_faucet_origin(&origin, 9).await.unwrap(),
+            FaucetReservation::PendingElsewhere
+        ));
+
+        // Deploy failed → release the bare reservation.
+        store.release_faucet_origin(&origin, 9).await.unwrap();
+
+        // Origin is free again — a retry can win a fresh reservation.
+        assert!(matches!(
+            store.reserve_faucet_origin(&origin, 9).await.unwrap(),
+            FaucetReservation::Reserved
+        ));
     }
 }

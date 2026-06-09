@@ -69,15 +69,20 @@ struct Faucet {
 /// On the first bridge of a new ERC-20 token, the faucet is created on Miden,
 /// registered in the bridge, and saved to the Store — all automatically.
 ///
-/// Concurrency: this function is always called inside a
-/// `MidenClient::with(|client| ...)` closure, which holds the global Miden
-/// client mutex for its duration. Two concurrent first-bridge claims for the
-/// same token therefore serialise on that lock — the second call sees the
-/// faucet already registered by the first and takes the fast `get_faucet_by_origin`
-/// path. The Cantina #1 colliding-network refusal predicate (added in `e6a33ae`)
-/// is consequently TOCTOU-safe by virtue of the surrounding lock; a future
-/// refactor that moves auto-create outside the client mutex must add an
-/// explicit per-token-address mutex (analogous to `PerSignerLocks` for R4).
+/// Concurrency (Cantina MA#10): within a single replica this runs inside the
+/// global Miden client mutex, so two first-bridge claims for the same token
+/// serialise on that lock. That lock is NOT enough on its own — a second
+/// replica, or a crash/restart between the live deploy and the local store
+/// write, has no such serialisation, which previously let one worker overwrite
+/// the live bridge route while the local row stayed pinned to another faucet
+/// generation (orphaning later withdrawals). The durable fix is to RESERVE the
+/// `(origin_address, origin_network)` key in the store BEFORE any live deploy
+/// (`store.reserve_faucet_origin`) and fill that reserved row in afterwards via
+/// `store.register_faucet` (which conflicts on the origin key). A concurrent
+/// worker that observes the reservation either reuses the committed decision or
+/// bails retryably while a deploy is in flight — it never races a second live
+/// registration. The Cantina #1 colliding-network refusal predicate runs before
+/// the reservation and remains TOCTOU-safe under the same store key.
 async fn find_or_create_faucet(
     token_address: alloy::primitives::Address,
     origin_network: u32,
@@ -119,60 +124,128 @@ async fn find_or_create_faucet(
         );
     }
 
-    // 3. Auto-create: parse token metadata from claimAsset call
-    let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
-    let miden_decimals: u8 = origin_decimals.min(8);
-    let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
-        anyhow::anyhow!(
-            "origin decimals {origin_decimals} < miden decimals {miden_decimals} for token {token_address}"
+    // 3. Cantina MA#10 — RESERVE the origin key in the local store BEFORE any
+    //    live faucet deploy / bridge registration. The reservation is the
+    //    cross-process synchronisation point: the in-process Miden client mutex
+    //    only serialises first-claims within ONE replica, but the durable
+    //    reservation row also serialises a second replica (or a crash/restart
+    //    between deploy and register). A second first-claim worker that observes
+    //    the reservation REUSES this decision (or bails retryably while a deploy
+    //    is in flight) instead of racing a competing live registration whose
+    //    local row would then orphan the faucet generation.
+    match store
+        .reserve_faucet_origin(&token_address.0.0, origin_network)
+        .await?
+    {
+        crate::store::FaucetReservation::Existing(entry) => {
+            // A concurrent worker already deployed + registered this faucet —
+            // reuse its decision, do NOT deploy a second live faucet.
+            return Ok(Faucet {
+                id: entry.faucet_id,
+                decimals: entry.miden_decimals,
+                origin_token_decimals: entry.origin_decimals,
+            });
+        }
+        crate::store::FaucetReservation::PendingElsewhere => {
+            // Another worker holds the reservation but hasn't finished its live
+            // deploy. Bail with a retryable error rather than race a second live
+            // registration — the retry will hit the fast `get_faucet_by_origin`
+            // path or the `Existing` arm once that worker commits.
+            anyhow::bail!(
+                "faucet for token {token_address} (network {origin_network}) is being created by \
+                 a concurrent first-claim worker; retry shortly (Cantina MA#10 reservation held)"
+            );
+        }
+        crate::store::FaucetReservation::Reserved => {
+            // We won the reservation — proceed to deploy and then register,
+            // which fills in our reserved row (conflict on the origin key).
+        }
+    }
+
+    // We hold the reservation from here on. Any failure before register_faucet
+    // commits the real faucet_id must RELEASE the bare reservation, otherwise a
+    // crashed deploy would pin the origin to a permanent `PendingElsewhere` and
+    // freeze every future first-claim for this token. We run the deploy+register
+    // in an inner async block and release on error.
+    let result: anyhow::Result<Faucet> = async {
+        // 5. Auto-create: parse token metadata from claimAsset call
+        let (symbol, origin_decimals) =
+            faucet_ops::parse_token_metadata(metadata, &token_address)?;
+        let miden_decimals: u8 = origin_decimals.min(8);
+        let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
+            anyhow::anyhow!(
+                "origin decimals {origin_decimals} < miden decimals {miden_decimals} for token {token_address}"
+            )
+        })?;
+
+        tracing::info!(
+            token_address = %token_address,
+            symbol = %symbol,
+            origin_decimals,
+            scale,
+            "auto-creating faucet for new ERC-20 token"
+        );
+
+        // 6. Create faucet on Miden, deploy, register in bridge. The faucet's stored
+        //    metadata_hash must match the CLAIM note's leaf_data.metadata_hash, which is
+        //    keccak256(metadata) (both empty for native ETH and abi.encode(name,symbol,decimals)
+        //    for ERC-20s). Using MetadataHash::from_abi_encoded on the raw metadata bytes matches
+        //    the L1 bridge contract exactly.
+        let metadata_hash = MetadataHash::from_abi_encoded(metadata.as_ref());
+
+        let faucet_account = faucet_ops::create_and_register_faucet(
+            client,
+            &symbol,
+            miden_decimals,
+            &token_address.0.0,
+            origin_network,
+            scale,
+            accounts.service.0,
+            accounts.bridge.0,
+            metadata_hash,
         )
-    })?;
+        .await?;
 
-    tracing::info!(
-        token_address = %token_address,
-        symbol = %symbol,
-        origin_decimals,
-        scale,
-        "auto-creating faucet for new ERC-20 token"
-    );
+        // 7. Fill in the reserved row with the real faucet_id (conflict on the
+        //    origin key — see Store::register_faucet).
+        let entry = FaucetEntry {
+            faucet_id: faucet_account.id(),
+            origin_address: token_address.0.0,
+            origin_network,
+            symbol,
+            origin_decimals,
+            miden_decimals,
+            scale,
+        };
+        store.register_faucet(entry).await?;
 
-    // 3. Create faucet on Miden, deploy, register in bridge. The faucet's stored
-    //    metadata_hash must match the CLAIM note's leaf_data.metadata_hash, which is
-    //    keccak256(metadata) (both empty for native ETH and abi.encode(name,symbol,decimals)
-    //    for ERC-20s). Using MetadataHash::from_abi_encoded on the raw metadata bytes matches
-    //    the L1 bridge contract exactly.
-    let metadata_hash = MetadataHash::from_abi_encoded(metadata.as_ref());
+        Ok(Faucet {
+            id: faucet_account.id(),
+            decimals: miden_decimals,
+            origin_token_decimals: origin_decimals,
+        })
+    }
+    .await;
 
-    let faucet_account = faucet_ops::create_and_register_faucet(
-        client,
-        &symbol,
-        miden_decimals,
-        &token_address.0.0,
-        origin_network,
-        scale,
-        accounts.service.0,
-        accounts.bridge.0,
-        metadata_hash,
-    )
-    .await?;
+    if result.is_err() {
+        // Best-effort release so the origin isn't pinned to a permanent
+        // PendingElsewhere. If this itself fails the passive bare-reservation
+        // is still recoverable via admin repair; surface the original error.
+        if let Err(release_err) = store
+            .release_faucet_origin(&token_address.0.0, origin_network)
+            .await
+        {
+            tracing::error!(
+                token_address = %token_address,
+                origin_network,
+                error = ?release_err,
+                "MA#10: failed to release faucet-origin reservation after a failed deploy; \
+                 origin may be temporarily pinned until admin repair"
+            );
+        }
+    }
 
-    // 4. Save to store
-    let entry = FaucetEntry {
-        faucet_id: faucet_account.id(),
-        origin_address: token_address.0.0,
-        origin_network,
-        symbol,
-        origin_decimals,
-        miden_decimals,
-        scale,
-    };
-    store.register_faucet(entry).await?;
-
-    Ok(Faucet {
-        id: faucet_account.id(),
-        decimals: miden_decimals,
-        origin_token_decimals: origin_decimals,
-    })
+    result
 }
 
 fn bytes32_array_to_smt_nodes(values: [FixedBytes<32>; 32]) -> [SmtNode; 32] {
