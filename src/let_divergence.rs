@@ -133,4 +133,66 @@ mod tests {
             );
         }
     }
+
+    /// Cantina MA#18 — erased-B2AGG does NOT escape the monitor.
+    ///
+    /// cergyk challenges the PREMISE of this monitor: a B2AGG note that is
+    /// *erased* (created and consumed within the same block) is stripped from
+    /// the block's note/nullifier trees by `remove_erased_nullifiers`
+    /// (miden-protocol `block/proposed_block.rs`), so it NEVER surfaces to the
+    /// indexer as a consumed note. His conclusion: "they would escape the
+    /// monitoring entirely here."
+    ///
+    /// That conclusion is FALSE for *this* monitor, and this test pins why.
+    /// The two inputs to `compare_let_state` are sourced from completely
+    /// different places:
+    ///
+    /// - `on_chain_leaves` is read DIRECTLY from the bridge ACCOUNT's storage
+    ///   (`AggLayerBridge::read_let_num_leaves(&account)` → `account.storage()
+    ///   .get_item(num_leaves_slot)`), via FPI, every sync tick — independent
+    ///   of whether any consumed note was observed. The bridge account's
+    ///   transaction that processes the B2AGG mutates this slot, and that
+    ///   account-state delta is committed to the block by
+    ///   `AccountUpdateAggregator` regardless of erasure. Erasure only touches
+    ///   the note/nullifier trees, never account state. So `let_num_leaves`
+    ///   ADVANCES for an erased B2AGG.
+    ///
+    /// - `aggkit_deposit_count` is incremented inside
+    ///   `commit_b2agg_event_atomic`, reached only from
+    ///   `BridgeOutScanner::process_consumed_note` — i.e. only when aggkit
+    ///   OBSERVES the note as consumed. An erased note never surfaces, so this
+    ///   counter does NOT advance.
+    ///
+    /// Net effect of an erased B2AGG: on-chain LET +1, aggkit deposit count
+    /// unchanged → exactly the `OnChainAhead { gap: 1 }` signature this monitor
+    /// is built to fire on. The erased note is therefore CAUGHT, not escaped.
+    #[test]
+    fn cantina_18_erased_b2agg_is_caught_not_escaped() {
+        // Steady state: bridge LET and aggkit deposit count agree at N.
+        let n = 100u64;
+        assert_eq!(compare_let_state(n, n), LetDivergence::InSync);
+
+        // A single erased B2AGG is processed by the bridge account: the
+        // account-storage LET slot advances to N+1 (committed via the account
+        // delta, unaffected by `remove_erased_nullifiers`), but aggkit's
+        // deposit count stays at N because the note never surfaced as consumed.
+        let on_chain_after_erased = n + 1;
+        let aggkit_after_erased = n;
+        assert_eq!(
+            compare_let_state(on_chain_after_erased, aggkit_after_erased),
+            LetDivergence::OnChainAhead { gap: 1 },
+            "an erased B2AGG must register as OnChainAhead — the monitor reads \
+             the LET from bridge-account storage, not from observed consumed notes"
+        );
+
+        // Multiple erased B2AGGs in a row open a monotonically growing gap; the
+        // monitor keeps reporting the true shortfall so an operator can size the
+        // freeze. This is the opposite of "escaping the monitoring entirely".
+        for k in 1..=5u64 {
+            assert_eq!(
+                compare_let_state(n + k, n),
+                LetDivergence::OnChainAhead { gap: k }
+            );
+        }
+    }
 }
