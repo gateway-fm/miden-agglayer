@@ -542,6 +542,16 @@ pub trait Store: Send + Sync + 'static {
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()>;
+    /// Replace any existing faucet route keyed by `(origin_address, origin_network)`
+    /// with `entry`, atomically. Used by the admin repair path (Cantina MA#17) to
+    /// overwrite a *poisoned* route — one persisted with an unclaimable
+    /// decimals/scale (e.g. a 27-decimal token auto-created with the legacy fixed
+    /// 8 local decimals → scale 19 > MAX_SCALING_FACTOR). Because the registry has a
+    /// UNIQUE index on `(origin_address, origin_network)` but a different
+    /// `faucet_id`, a plain `register_faucet` upsert (which keys on `faucet_id`)
+    /// could not overwrite it. This deletes every row sharing the origin key and
+    /// inserts the replacement in one transaction.
+    async fn replace_faucet_by_origin(&self, entry: FaucetEntry) -> anyhow::Result<()>;
     /// Look up a faucet by its L1 origin token address and network.
     async fn get_faucet_by_origin(
         &self,

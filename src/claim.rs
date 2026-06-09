@@ -121,12 +121,13 @@ async fn find_or_create_faucet(
 
     // 3. Auto-create: parse token metadata from claimAsset call
     let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
-    let miden_decimals: u8 = origin_decimals.min(8);
-    let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
-        anyhow::anyhow!(
-            "origin decimals {origin_decimals} < miden decimals {miden_decimals} for token {token_address}"
-        )
-    })?;
+    // Cantina MA#17 — derive local faucet decimals dynamically so the route always
+    // satisfies BOTH protocol bounds (miden_decimals <= 12 AND scale <= 18). The
+    // legacy fixed `origin_decimals.min(8)` produced scale 19..22 (> MAX_SCALING_FACTOR)
+    // for 27..=30 decimal tokens, persisting an UNCLAIMABLE route even though the
+    // protocol supports them via a higher local decimal count.
+    let (miden_decimals, scale) = faucet_ops::derive_faucet_decimals(origin_decimals)
+        .map_err(|e| anyhow::anyhow!("cannot auto-create faucet for token {token_address}: {e}"))?;
 
     tracing::info!(
         token_address = %token_address,
@@ -801,6 +802,118 @@ mod tests {
     use crate::store::memory::InMemoryStore;
     use crate::test_helpers::seed_test_faucets;
     use alloy::primitives::address;
+
+    use crate::faucet_ops::{
+        MAX_SCALING_FACTOR, MAX_TOKEN_DECIMALS, MIDEN_FAUCET_MAX_DECIMALS, derive_faucet_decimals,
+    };
+    use miden_base_agglayer::{EthAmount, EthAmountError};
+    use miden_standards::account::faucets::TokenMetadata;
+
+    // Cantina MA#17 — auditor PoC (verbatim envelope). Documents that the legacy
+    // service-style `27 -> 8 -> scale 19` route crosses the shared scale limit while
+    // a `27 -> 9 -> scale 18` route is valid. Stays passing post-fix as a guard rail.
+    #[test]
+    fn auto_created_27_decimal_route_exceeds_shared_scale_limit_while_9_decimal_route_is_valid() {
+        let origin_decimals = 27u8;
+        let service_miden_decimals = origin_decimals.min(8);
+        let service_scale = origin_decimals
+            .checked_sub(service_miden_decimals)
+            .expect("service-style route should downscale");
+        let valid_miden_decimals = 9u8;
+        let valid_scale = origin_decimals
+            .checked_sub(valid_miden_decimals)
+            .expect("9-decimal route should downscale");
+
+        assert_eq!(service_miden_decimals, 8);
+        assert_eq!(service_scale, 19);
+        assert_eq!(valid_scale, 18);
+        assert!(
+            valid_miden_decimals <= TokenMetadata::MAX_DECIMALS,
+            "the nearby 9-decimal route is still supported by the faucet component",
+        );
+
+        let raw_amount = EthAmount::from_uint_str("100000000000000000000").unwrap();
+        let valid_amount = raw_amount
+            .scale_to_token_amount(valid_scale as u32)
+            .expect("scale=18 should remain valid");
+        assert_eq!(valid_amount.as_canonical_u64(), 100);
+        assert_eq!(
+            raw_amount.scale_to_token_amount(service_scale as u32),
+            Err(EthAmountError::ScaleTooLarge),
+            "scale=19 exceeds the shared amount-scaling limit",
+        );
+    }
+
+    // Cantina MA#17 PRODUCTION assertion. The FIX: `derive_faucet_decimals` (used by
+    // `find_or_create_faucet`) must pick a local decimal count that yields a CLAIMABLE
+    // route for EVERY supportable origin decimals (0..=30) — i.e. miden_decimals <= 12
+    // AND scale <= 18, with the scale actually accepted by the shared conversion path.
+    // This passes ONLY when auto-create derives decimals dynamically (the legacy fixed
+    // `min(8)` produced scale 19..22 for 27..=30 and would fail here).
+    #[test]
+    fn derive_faucet_decimals_yields_claimable_route_for_every_supportable_decimal() {
+        // A modest raw amount so the ONLY thing under test is the scale bound itself
+        // (a huge amount would trip `ScaledValueExceedsMaxFungibleAmount`, an unrelated
+        // magnitude check — the finding is specifically about scale > MAX_SCALING_FACTOR).
+        let raw_amount = EthAmount::from_uint_str("1000000000000000000").unwrap();
+
+        for origin_decimals in 0..=MAX_TOKEN_DECIMALS {
+            let (miden_decimals, scale) =
+                derive_faucet_decimals(origin_decimals).unwrap_or_else(|e| {
+                    panic!("decimals {origin_decimals} should be supportable: {e}")
+                });
+
+            // Both protocol bounds must hold.
+            assert!(
+                miden_decimals <= MIDEN_FAUCET_MAX_DECIMALS,
+                "origin {origin_decimals}: miden_decimals {miden_decimals} > local max {MIDEN_FAUCET_MAX_DECIMALS}",
+            );
+            assert!(
+                scale <= MAX_SCALING_FACTOR,
+                "origin {origin_decimals}: scale {scale} > MAX_SCALING_FACTOR {MAX_SCALING_FACTOR}",
+            );
+            assert_eq!(
+                miden_decimals as u16 + scale as u16,
+                origin_decimals as u16,
+                "origin {origin_decimals}: miden_decimals + scale must reconstruct origin_decimals",
+            );
+
+            // The shared conversion path must NOT reject the derived scale as too large.
+            // (The legacy fixed `min(8)` produced scale 19..22 for 27..=30, which the
+            // path rejects with `ScaleTooLarge` — exactly the unclaimable route MA#17
+            // describes.)
+            assert_ne!(
+                raw_amount.scale_to_token_amount(scale as u32),
+                Err(EthAmountError::ScaleTooLarge),
+                "origin {origin_decimals}: derived scale {scale} rejected as too large by the shared conversion path",
+            );
+
+            // The common low-decimal case must keep the historical local decimals so
+            // existing routes are unchanged (regression guard).
+            if origin_decimals <= 26 {
+                assert_eq!(
+                    miden_decimals,
+                    origin_decimals.min(8),
+                    "origin {origin_decimals}: low-decimal routes must keep legacy local decimals",
+                );
+            }
+        }
+
+        // The exact regression the finding describes: 27..=30 are now claimable.
+        for origin_decimals in 27..=30u8 {
+            let (miden_decimals, scale) = derive_faucet_decimals(origin_decimals).unwrap();
+            assert_eq!(
+                scale, 18,
+                "origin {origin_decimals}: scale should be pinned at the cap 18"
+            );
+            assert_eq!(
+                miden_decimals,
+                origin_decimals - 18,
+                "origin {origin_decimals}: local decimals should rise to keep scale <= 18",
+            );
+            assert!(miden_decimals <= MIDEN_FAUCET_MAX_DECIMALS);
+        }
+    }
 
     #[test]
     fn test_metadata_hash_empty() {

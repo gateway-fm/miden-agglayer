@@ -664,6 +664,18 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn replace_faucet_by_origin(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+        let mut faucets = self.faucets.write();
+        // Drop every route sharing the origin key (Cantina MA#17 admin repair),
+        // then insert the replacement — mirrors the postgres DELETE-then-INSERT
+        // under the UNIQUE(origin_address, origin_network) index.
+        faucets.retain(|f| {
+            !(f.origin_address == entry.origin_address && f.origin_network == entry.origin_network)
+        });
+        faucets.push(entry);
+        Ok(())
+    }
+
     async fn get_faucet_by_origin(
         &self,
         origin_address: &[u8; 20],

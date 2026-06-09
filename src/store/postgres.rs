@@ -1520,6 +1520,42 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn replace_faucet_by_origin(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let faucet_id = entry.faucet_id.to_hex();
+        // Atomic DELETE-then-INSERT: the UNIQUE(origin_address, origin_network)
+        // index blocks a plain INSERT of a new faucet_id over a poisoned route,
+        // and ON CONFLICT (faucet_id) can't reach the old row (different id). One
+        // transaction so a crash can't leave the origin key with zero rows
+        // (Cantina MA#17 admin repair).
+        let tx = client.transaction().await?;
+        tx.execute(
+            "DELETE FROM faucet_registry WHERE origin_address = $1 AND origin_network = $2",
+            &[
+                &entry.origin_address.as_slice(),
+                &(entry.origin_network as i32),
+            ],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &faucet_id,
+                &entry.origin_address.as_slice(),
+                &(entry.origin_network as i32),
+                &entry.symbol,
+                &(entry.origin_decimals as i16),
+                &(entry.miden_decimals as i16),
+                &(entry.scale as i16),
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::info!(faucet_id = %faucet_id, symbol = %entry.symbol, "PgStore: faucet route replaced (origin repair)");
+        Ok(())
+    }
+
     async fn get_faucet_by_origin(
         &self,
         origin_address: &[u8; 20],

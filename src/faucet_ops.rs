@@ -154,6 +154,68 @@ pub async fn register_faucet_in_bridge(
 /// or buggy ERC-20, which then overflows U256 arithmetic in the claim path.
 pub const MAX_TOKEN_DECIMALS: u8 = 30;
 
+/// Maximum decimals a Miden faucet (local) may declare —
+/// `miden_standards::account::faucets::TokenMetadata::MAX_DECIMALS`. Vendored as
+/// a plain const here so the auto-create derivation can stay in this crate
+/// without dragging the `miden_standards` type into `claim.rs`. Keep in lockstep
+/// with the pinned `miden-standards` version.
+pub const MIDEN_FAUCET_MAX_DECIMALS: u8 = 12;
+
+/// Maximum downscale exponent the shared asset-conversion path accepts —
+/// `miden_base_agglayer`'s `MAX_SCALING_FACTOR` (`scale_to_token_amount` returns
+/// `EthAmountError::ScaleTooLarge` above this). Vendored for the same reason as
+/// `MIDEN_FAUCET_MAX_DECIMALS`.
+pub const MAX_SCALING_FACTOR: u8 = 18;
+
+/// Derive the local Miden faucet decimals for a freshly auto-created route.
+///
+/// Cantina MA#17. The legacy choice `origin_decimals.min(8)` produces a downscale
+/// of `origin_decimals - 8`, which exceeds the shared `MAX_SCALING_FACTOR` (18)
+/// once `origin_decimals > 26`, persisting an *unclaimable* route for 27..=30
+/// decimal tokens even though the protocol can support them via a higher local
+/// decimal count (e.g. 27 via a 9-decimal faucet: `27 - 9 = 18`).
+///
+/// We derive `miden_decimals` dynamically so the resulting route always satisfies
+/// BOTH protocol bounds:
+///   * `miden_decimals <= MIDEN_FAUCET_MAX_DECIMALS` (12), and
+///   * `origin_decimals - miden_decimals <= MAX_SCALING_FACTOR` (18).
+///
+/// Concretely `miden_decimals = origin_decimals.min(8)` (unchanged for the common
+/// `<= 26` case — preserves every route the old code produced) raised to at least
+/// `origin_decimals - 18` so the scale never exceeds 18. The result is a valid,
+/// claimable route for every `origin_decimals` up to `MAX_TOKEN_DECIMALS` (30).
+///
+/// Returns `(miden_decimals, scale)` or an error if `origin_decimals` is outside
+/// the supportable envelope (i.e. would need `miden_decimals > 12`, which only
+/// happens for `origin_decimals > 30` — already rejected by `parse_token_metadata`).
+pub fn derive_faucet_decimals(origin_decimals: u8) -> anyhow::Result<(u8, u8)> {
+    // Lowest local-decimal floor that keeps scale <= MAX_SCALING_FACTOR.
+    let floor = origin_decimals.saturating_sub(MAX_SCALING_FACTOR);
+    let miden_decimals = origin_decimals.min(8).max(floor);
+
+    if miden_decimals > MIDEN_FAUCET_MAX_DECIMALS {
+        anyhow::bail!(
+            "origin decimals {origin_decimals} unsupportable: requires local faucet decimals \
+             {miden_decimals} > {MIDEN_FAUCET_MAX_DECIMALS} (TokenMetadata::MAX_DECIMALS)"
+        );
+    }
+
+    let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
+        anyhow::anyhow!(
+            "origin decimals {origin_decimals} < derived miden decimals {miden_decimals}"
+        )
+    })?;
+
+    if scale > MAX_SCALING_FACTOR {
+        anyhow::bail!(
+            "origin decimals {origin_decimals} unsupportable: derived scale {scale} > \
+             {MAX_SCALING_FACTOR} (MAX_SCALING_FACTOR)"
+        );
+    }
+
+    Ok((miden_decimals, scale))
+}
+
 /// Maximum byte length for an ABI-decoded token symbol/name. Token symbols are
 /// always short (1-12 chars in practice). Cap at 64 bytes so a malicious
 /// metadata claiming `length = 1 GB` cannot trigger a huge allocation before
