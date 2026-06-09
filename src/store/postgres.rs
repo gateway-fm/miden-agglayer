@@ -34,6 +34,24 @@ fn bytes_to_array_32(bytes: &[u8]) -> [u8; 32] {
     arr
 }
 
+/// Cantina MA#30 — post-match cap on `get_logs` response size. Applied AFTER
+/// `LogFilter::matches` (never before), mirroring `InMemoryStore::get_logs`
+/// which only ever bounds the *matched* result length. This is a response-size
+/// safety bound, not a pre-filter row budget that could silently drop rows the
+/// caller actually asked for.
+const MAX_GET_LOGS: usize = 1000;
+
+/// Cantina MA#30 — decode a `0x`-prefixed 32-byte hex block hash (as supplied
+/// in an `eth_getLogs` `blockHash` filter) into raw bytes for an exact-match
+/// SQL predicate. Returns `None` for any malformed input so the caller can
+/// short-circuit to an empty result (a non-decodable hash matches no row),
+/// exactly as `LogFilter::matches` would have rejected it in Rust.
+fn decode_block_hash(s: &str) -> Option<Vec<u8>> {
+    let trimmed = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    let bytes = hex::decode(trimmed).ok()?;
+    if bytes.len() == 32 { Some(bytes) } else { None }
+}
+
 impl PgStore {
     pub async fn new(database_url: &str) -> anyhow::Result<Self> {
         let config: tokio_postgres::Config = database_url.parse()?;
@@ -188,16 +206,59 @@ impl Store for PgStore {
         let from = filter.from_block_number(current_block) as i64;
         let to = filter.to_block_number(current_block) as i64;
 
-        let rows = client
-            .query(
-                "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
-                 FROM synthetic_logs
-                 WHERE block_number >= $1 AND block_number <= $2
-                 ORDER BY block_number, log_index
-                 LIMIT 1000",
-                &[&from, &to],
-            )
-            .await?;
+        // Cantina MA#30 — the previous query applied `LIMIT 1000` directly in
+        // SQL, i.e. BEFORE `LogFilter::matches` ran in Rust. Earlier synthetic
+        // rows in the block range consumed the budget before the caller's
+        // address/topics predicates were ever evaluated, so a query for a
+        // specific claim could return a *successful but incomplete* result
+        // (truncated 1000-row prefix) and silently hide later matching rows.
+        // Any user able to write 1000+ logs into a single block (e.g. a dense
+        // restore replay, or note-spam) could push genuinely-requested rows
+        // past the cap. `InMemoryStore::get_logs` caps AFTER matching, so this
+        // was a PgStore-only divergence.
+        //
+        // Fix: push every predicate we can express *correctly* into the SQL
+        // WHERE clause so the database filters before any cap is reached, and
+        // remove the silent pre-filter `LIMIT 1000`. Only the `block_hash`
+        // equality is safe to push down losslessly here — `matches` treats a
+        // `block_hash` filter as an exact equality on the row's block_hash
+        // (and ignores the block range in that case). The `address` predicate
+        // canNOT be pushed down because `matches` has the MA#26
+        // UpdateHashChainValue passthrough that admits rows whose address does
+        // NOT equal the queried address; topic matching is positional and
+        // case-insensitive over Postgres `text[]` arrays. Those stay in the
+        // Rust `matches` pass. After the (now lossless) DB filter we apply
+        // `LogFilter::matches`, THEN cap at `MAX_GET_LOGS` AFTER matching —
+        // byte-for-byte parity with `InMemoryStore`.
+        let rows = if let Some(block_hash) = filter.block_hash.as_ref() {
+            // block_hash is a 0x-prefixed 32-byte hex string. Decode to the
+            // raw bytea the column stores; a malformed hash matches nothing.
+            let hash_bytes = decode_block_hash(block_hash);
+            match hash_bytes {
+                Some(bytes) => {
+                    client
+                        .query(
+                            "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
+                             FROM synthetic_logs
+                             WHERE block_hash = $1
+                             ORDER BY block_number, log_index",
+                            &[&bytes.as_slice()],
+                        )
+                        .await?
+                }
+                None => Vec::new(),
+            }
+        } else {
+            client
+                .query(
+                    "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
+                     FROM synthetic_logs
+                     WHERE block_number >= $1 AND block_number <= $2
+                     ORDER BY block_number, log_index",
+                    &[&from, &to],
+                )
+                .await?
+        };
 
         let logs: Vec<SyntheticLog> = rows
             .iter()
@@ -218,9 +279,14 @@ impl Store for PgStore {
             })
             .collect();
 
+        // Filter, THEN cap — parity with InMemoryStore (memory.rs caps result
+        // length only after `matches`). The cap is now a post-match safety
+        // bound on the response size, not a pre-filter row budget that can
+        // silently drop requested rows.
         Ok(logs
             .into_iter()
             .filter(|l| filter.matches(l, current_block))
+            .take(MAX_GET_LOGS)
             .collect())
     }
 

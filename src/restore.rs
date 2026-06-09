@@ -45,6 +45,27 @@ use miden_protocol::note::{NoteAttachment, NoteMetadata};
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 
+/// Cantina MA#12 — maximum number of synthetic logs packed into a single
+/// restore block before recovery rotates to a NEW synthetic block. Held at
+/// the same value as `PgStore`'s `get_logs` response cap (`MAX_GET_LOGS`):
+/// each restore block therefore holds at most this many logs, so a single
+/// `eth_getLogs` query bounded to one block returns the whole block (no tail
+/// hidden behind a truncating cap). Pre-fix, restore packed *every* recovered
+/// bridge-out / GER into ONE block; a replay of >1000 historical exits left
+/// the 1001st+ permanently behind the cap while `deposit_count` still advanced
+/// across all of them, opening a hidden gap that halts later withdrawal sync.
+const RESTORE_BLOCK_LOG_CAP: usize = 1000;
+
+/// Cantina MA#12 — pure rotation predicate shared by both restore phases.
+/// Given how many logs have already been written into the current restore
+/// block, decide whether the NEXT log must start a fresh block. Extracted so
+/// the rotation invariant ("no restore block ever exceeds the get_logs cap")
+/// is directly unit-testable without a live Miden client. Returns `true` when
+/// the next write must rotate to a new block.
+fn restore_block_should_rotate(logs_in_current_block: usize) -> bool {
+    logs_in_current_block >= RESTORE_BLOCK_LOG_CAP
+}
+
 /// MA#28 — outcome of verifying an `UpdateGerNote`-shaped consumed note's
 /// authoritative provenance. Pulled out of `restore_gers` so the
 /// fast-path verification can be unit-tested without spinning up a Miden
@@ -159,11 +180,16 @@ pub async fn restore(
 
     // Phase 2: Scan miden consumed B2AGG notes
     tracing::info!("Phase 2: scanning miden consumed B2AGG notes...");
-    let (bridge_outs, logs) =
+    let (bridge_outs, logs, bridge_blocks) =
         restore_bridge_outs(store, miden_client, accounts, block_state, next_block).await?;
-    next_block += if logs > 0 { 1 } else { 0 };
+    // MA#12 — advance by the number of synthetic blocks this phase actually
+    // occupied (it rotates across multiple blocks for a dense replay), not a
+    // fixed +1, so the next phase lands on a fresh, non-overlapping block.
+    next_block += bridge_blocks;
     total_logs += logs;
-    tracing::info!("Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs");
+    tracing::info!(
+        "Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs, {bridge_blocks} blocks"
+    );
 
     // Phase 2.5: Scan miden consumed CLAIM notes — Cantina MA#27
     //
@@ -186,13 +212,15 @@ pub async fn restore(
 
     // Phase 3: Scan consumed UpdateGerNote notes on Miden
     tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
-    let (gers, ger_logs) =
+    let (gers, ger_logs, ger_blocks) =
         restore_gers(store, miden_client, accounts, block_state, next_block).await?;
     total_logs += ger_logs;
-    tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
+    tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs, {ger_blocks} blocks");
 
     // Phase 4: Update block number to cover all synthetic logs
-    let final_block = next_block + if ger_logs > 0 { 1 } else { 0 };
+    // MA#12 — advance past every block GER restoration occupied (it can rotate
+    // across several for a dense replay), not a fixed +1.
+    let final_block = next_block + ger_blocks;
     store.set_latest_block_number(final_block).await?;
     tracing::info!("Phase 4: block number set to {final_block}");
 
@@ -229,18 +257,26 @@ async fn sync_miden_block(
 }
 
 /// Phase 2: scan miden consumed B2AGG notes and rebuild bridge-out state.
-/// Returns (notes_processed, logs_created).
+/// Returns `(notes_processed, logs_created, blocks_used)`.
+///
+/// Cantina MA#12 — `blocks_used` is the number of synthetic blocks this phase
+/// occupied. Recovery output is ROTATED across new synthetic blocks before any
+/// single restore block reaches [`RESTORE_BLOCK_LOG_CAP`] logs, so a dense
+/// replay (>1000 historical bridge-outs) is no longer packed into one block
+/// where `PgStore::get_logs`' post-match cap would hide the tail. The caller
+/// advances its block cursor by `blocks_used` so later phases land on fresh,
+/// non-overlapping blocks.
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
     _accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, u64)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
 
-    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize, 0u64)));
     let result_inner = result.clone();
 
     miden_client
@@ -251,10 +287,17 @@ async fn restore_bridge_outs(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
-                let block_hash = block_state_clone.get_block_hash(restore_block);
                 let bridge_address = get_bridge_address();
                 let mut count = 0usize;
                 let mut logs = 0usize;
+                // MA#12 — rotating block cursor. `current_block` starts at the
+                // phase's first block; `logs_in_block` tracks how many logs we
+                // have emitted into it. When it would hit the cap we advance to
+                // a new block (recomputing its hash) BEFORE writing the next
+                // log, so no block is ever packed beyond the get_logs cap.
+                let mut current_block = restore_block;
+                let mut block_hash = block_state_clone.get_block_hash(current_block);
+                let mut logs_in_block = 0usize;
 
                 // G7 — sort B2AGG notes deterministically before assigning
                 // deposit_count. The Miden client returns consumed notes in
@@ -317,13 +360,22 @@ async fn restore_bridge_outs(
                     // first-observation and restore paths (dedup-stable).
                     let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
 
+                    // MA#12 — rotate to a new synthetic block before this block
+                    // would exceed the get_logs cap. Done BEFORE the write so
+                    // the about-to-be-written log lands in the fresh block.
+                    if restore_block_should_rotate(logs_in_block) {
+                        current_block += 1;
+                        block_hash = block_state_clone.get_block_hash(current_block);
+                        logs_in_block = 0;
+                    }
+
                     let deposit_count =
                         store_clone.mark_note_processed(note_id_str.clone()).await?;
 
                     if let Err(err) = store_clone
                         .add_bridge_event(
                             bridge_address,
-                            restore_block,
+                            current_block,
                             block_hash,
                             &tx_hash,
                             0, // LEAF_TYPE_ASSET
@@ -344,21 +396,31 @@ async fn restore_bridge_outs(
                     tracing::info!(
                         note_id = %note_id_str,
                         deposit_count,
+                        block_number = current_block,
                         "restore: rebuilt BridgeEvent"
                     );
 
                     count += 1;
                     logs += 1;
+                    logs_in_block += 1;
                 }
 
-                *result_inner.lock().unwrap() = (count, logs);
+                // MA#12 — blocks occupied by this phase. Zero if no log was
+                // written (current_block never advanced past restore_block and
+                // logs_in_block stayed 0), else (current_block - restore_block + 1).
+                let blocks_used = if logs > 0 {
+                    current_block - restore_block + 1
+                } else {
+                    0
+                };
+                *result_inner.lock().unwrap() = (count, logs, blocks_used);
                 Ok(())
             })
         })
         .await?;
 
-    let (count, logs) = *result.lock().unwrap();
-    Ok((count, logs))
+    let (count, logs, blocks_used) = *result.lock().unwrap();
+    Ok((count, logs, blocks_used))
 }
 
 /// Phase 2.5: scan miden consumed CLAIM notes and replay any missing
@@ -529,7 +591,7 @@ async fn restore_gers(
     accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, u64)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
     // MA#28 — same fallback as `submit_update_ger_note` in `src/ger.rs`:
@@ -544,7 +606,7 @@ async fn restore_gers(
         .unwrap_or(accounts.service.0);
     let expected_target = accounts.bridge.0;
 
-    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize, 0u64)));
     let result_inner = result.clone();
 
     miden_client
@@ -556,10 +618,15 @@ async fn restore_gers(
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
                 let ger_script_root = UpdateGerNote::script_root();
-                let block_hash = block_state_clone.get_block_hash(restore_block);
-                let timestamp = block_state_clone.get_block_timestamp(restore_block);
                 let mut ger_count = 0usize;
                 let mut log_count = 0usize;
+                // MA#12 — rotating block cursor (same shape as restore_bridge_outs).
+                // GER logs additionally carry a per-block timestamp, so we
+                // recompute both hash AND timestamp on rotation.
+                let mut current_block = restore_block;
+                let mut block_hash = block_state_clone.get_block_hash(current_block);
+                let mut timestamp = block_state_clone.get_block_timestamp(current_block);
+                let mut logs_in_block = 0usize;
 
                 // G7 — sort GER notes deterministically before reconstructing
                 // the hash chain. Iteration order from the miden client is
@@ -690,9 +757,21 @@ async fn restore_gers(
                         format!("0x{}", hex::encode(hasher.finalize()))
                     };
 
+                    // MA#12 — rotate before writing so no restore block exceeds
+                    // the get_logs cap. The GER hash chain is order-sensitive
+                    // but order is preserved across the rotation (same iteration
+                    // order, monotonically increasing block numbers), so the
+                    // reconstructed chain is unchanged.
+                    if restore_block_should_rotate(logs_in_block) {
+                        current_block += 1;
+                        block_hash = block_state_clone.get_block_hash(current_block);
+                        timestamp = block_state_clone.get_block_timestamp(current_block);
+                        logs_in_block = 0;
+                    }
+
                     store_clone
                         .add_ger_update_event(
-                            restore_block,
+                            current_block,
                             block_hash,
                             &tx_hash,
                             &ger_bytes,
@@ -707,21 +786,28 @@ async fn restore_gers(
                     tracing::info!(
                         note_id = %note.id(),
                         ger = %hex::encode(ger_bytes),
+                        block_number = current_block,
                         "restore: rebuilt GER from consumed UpdateGerNote"
                     );
 
                     ger_count += 1;
                     log_count += 1;
+                    logs_in_block += 1;
                 }
 
-                *result_inner.lock().unwrap() = (ger_count, log_count);
+                let blocks_used = if log_count > 0 {
+                    current_block - restore_block + 1
+                } else {
+                    0
+                };
+                *result_inner.lock().unwrap() = (ger_count, log_count, blocks_used);
                 Ok(())
             })
         })
         .await?;
 
-    let (count, logs) = *result.lock().unwrap();
-    Ok((count, logs))
+    let (count, logs, blocks_used) = *result.lock().unwrap();
+    Ok((count, logs, blocks_used))
 }
 
 #[cfg(test)]
@@ -930,5 +1016,157 @@ mod tests {
             logs_created: 6,
         };
         assert_eq!(r.claims_restored, 2);
+    }
+
+    // ── Cantina MA#12 — restore block rotation ───────────────────
+
+    use crate::log_synthesis::LogFilter;
+
+    /// MA#12 — the pure rotation predicate: a fresh block is started exactly
+    /// when the current one is full (>= cap), never before. This pins the
+    /// invariant that drives both `restore_bridge_outs` and `restore_gers`.
+    #[test]
+    fn ma12_rotation_predicate_fires_only_at_cap() {
+        assert!(!restore_block_should_rotate(0));
+        assert!(!restore_block_should_rotate(RESTORE_BLOCK_LOG_CAP - 1));
+        // The 1000th log fills the block; the NEXT (1001st) write rotates.
+        assert!(restore_block_should_rotate(RESTORE_BLOCK_LOG_CAP));
+        assert!(restore_block_should_rotate(RESTORE_BLOCK_LOG_CAP + 1));
+    }
+
+    /// MA#12 — in-memory analogue that ACTUALLY EXECUTES (no DATABASE_URL
+    /// needed). Replays the exact block-rotation logic `restore_bridge_outs`
+    /// now runs — same `restore_block_should_rotate` predicate, same
+    /// "rotate before writing, recompute block_hash" sequence, same
+    /// `add_bridge_event` store call — over 1001 recovered exits against a
+    /// real `InMemoryStore`, then proves the previously-hidden 1001st exit IS
+    /// retrievable.
+    ///
+    /// Pre-fix, restore packed all 1001 into ONE block; a single-block
+    /// `eth_getLogs` query (what the bridge-service issues, syncing
+    /// block-by-block) hit the 1000-row cap and the 1001st exit was lost
+    /// while `deposit_count` still advanced across all 1001. Post-fix the
+    /// rotation puts the 1001st exit in a fresh block where a block-scoped
+    /// query returns it.
+    #[tokio::test]
+    async fn ma12_in_memory_restore_rotates_and_exposes_1001st_exit() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_address = get_bridge_address();
+
+        let first_block = 100u64;
+        let mut current_block = first_block;
+        let mut block_hash = block_state.get_block_hash(current_block);
+        let mut logs_in_block = 0usize;
+
+        let mut first_tx_hash = String::new();
+        let mut hidden_tx_hash = String::new();
+        let mut first_deposit_count: Option<u32> = None;
+
+        for i in 0..1001u32 {
+            // MA#12 — identical rotation gate to restore_bridge_outs.
+            if restore_block_should_rotate(logs_in_block) {
+                current_block += 1;
+                block_hash = block_state.get_block_hash(current_block);
+                logs_in_block = 0;
+            }
+
+            let note_id = format!("restore-note-{i}");
+            let deposit_count = store.mark_note_processed(note_id).await.unwrap();
+            if i == 0 {
+                first_deposit_count = Some(deposit_count);
+            }
+
+            let tx_hash = format!("0x{:064x}", i);
+            if i == 0 {
+                first_tx_hash = tx_hash.clone();
+            }
+            if i == 1000 {
+                hidden_tx_hash = tx_hash.clone();
+            }
+
+            store
+                .add_bridge_event(
+                    bridge_address,
+                    current_block,
+                    block_hash,
+                    &tx_hash,
+                    0,
+                    0,
+                    &[0u8; 20],
+                    1,
+                    &[0x11u8; 20],
+                    1000,
+                    &[],
+                    deposit_count,
+                )
+                .await
+                .unwrap();
+
+            logs_in_block += 1;
+        }
+
+        // Rotation must have spilled into a second block: 1001 logs, cap 1000.
+        let last_block = current_block;
+        assert!(
+            last_block > first_block,
+            "restore must rotate to a new block before exceeding the cap"
+        );
+
+        // The first block holds at most the cap; it must NOT have all 1001.
+        let first_block_logs = {
+            let f = LogFilter {
+                from_block: Some(format!("0x{:x}", first_block)),
+                to_block: Some(format!("0x{:x}", first_block)),
+                address: None,
+                topics: None,
+                block_hash: None,
+            };
+            store.get_logs(&f, last_block).await.unwrap()
+        };
+        assert!(
+            first_block_logs.len() <= RESTORE_BLOCK_LOG_CAP,
+            "no restore block may exceed the get_logs cap"
+        );
+        assert!(
+            !first_block_logs
+                .iter()
+                .any(|l| l.transaction_hash == hidden_tx_hash),
+            "the 1001st exit must NOT be packed into the first (full) block"
+        );
+        assert!(
+            first_block_logs
+                .iter()
+                .any(|l| l.transaction_hash == first_tx_hash),
+            "the first exit lives in the first block"
+        );
+
+        // The previously-hidden 1001st exit IS retrievable via a block-scoped
+        // query of the rotated block — the core post-fix guarantee.
+        let last_block_logs = {
+            let f = LogFilter {
+                from_block: Some(format!("0x{:x}", last_block)),
+                to_block: Some(format!("0x{:x}", last_block)),
+                address: None,
+                topics: None,
+                block_hash: None,
+            };
+            store.get_logs(&f, last_block).await.unwrap()
+        };
+        assert!(
+            last_block_logs
+                .iter()
+                .any(|l| l.transaction_hash == hidden_tx_hash),
+            "the previously-hidden 1001st restored exit must now be retrievable"
+        );
+
+        // deposit_count still advanced across all 1001 (unchanged behaviour) —
+        // the point of the fix is that the log for that count is no longer
+        // hidden, not that the count stops advancing.
+        let next = store
+            .mark_note_processed("next-live-note".to_string())
+            .await
+            .unwrap();
+        assert_eq!(next, first_deposit_count.unwrap() + 1001);
     }
 }

@@ -580,3 +580,215 @@ fn rand_u64() -> u64 {
         .unwrap_or(0)
         ^ (std::process::id() as u64).wrapping_mul(2_654_435_761)
 }
+
+// ── Cantina MA#30 — predicate pushdown / no silent pre-filter cap ─────
+
+/// MA#30 — the offending pre-fix query was `... ORDER BY ... LIMIT 1000`,
+/// i.e. the row cap was applied in SQL BEFORE `LogFilter::matches` ran in
+/// Rust. cergyk: "The limit 1000 in the PostgreSQL query needs to be removed,
+/// because otherwise any user can spam notes in any single block to reach over
+/// this limit." This test reproduces exactly that spam: 1000 logs carrying a
+/// DIFFERENT topic are written into a block AHEAD of a single log carrying the
+/// requested topic. Under the old pre-filter `LIMIT 1000`, the 1000 spam rows
+/// consumed the budget (they sort first by log_index), the requested row was
+/// truncated away, and `matches` then yielded ZERO — a "successful but
+/// incomplete" result. After the fix the predicate is evaluated before any cap
+/// (block_hash/range pushed into SQL, address/topics matched over the full
+/// fetched set), so the requested row is returned.
+#[tokio::test]
+async fn test_pgstore_ma30_predicate_evaluated_before_cap() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let block_number = 2_000_000_000u64 + (seed % 1_000_000_000);
+    store.set_latest_block_number(block_number).await.unwrap();
+
+    let spam_topic = format!("0x{:064x}", 0xAAAA_AAAAu64);
+    let wanted_topic = format!("0x{:064x}", 0xBBBB_BBBBu64);
+    let wanted_tx = format!("0x{:064x}", seed);
+
+    // 1000 spam rows with the unwanted topic (these sort first by log_index).
+    for i in 0..1000u32 {
+        let log = SyntheticLog {
+            log_index: 0,
+            address: "0xspam".to_string(),
+            topics: vec![spam_topic.clone()],
+            data: "0x".to_string(),
+            block_number,
+            block_hash: [0u8; 32],
+            transaction_hash: format!("0x{:064x}", seed ^ (i as u64 + 1)),
+            transaction_index: 0,
+            removed: false,
+        };
+        store.add_log(log).await.unwrap();
+    }
+    // The genuinely-requested row, written LAST (highest log_index).
+    let wanted = SyntheticLog {
+        log_index: 0,
+        address: "0xwanted".to_string(),
+        topics: vec![wanted_topic.clone()],
+        data: "0x".to_string(),
+        block_number,
+        block_hash: [0u8; 32],
+        transaction_hash: wanted_tx.clone(),
+        transaction_index: 0,
+        removed: false,
+    };
+    store.add_log(wanted).await.unwrap();
+
+    let filter = LogFilter {
+        from_block: Some(format!("0x{:x}", block_number)),
+        to_block: Some(format!("0x{:x}", block_number)),
+        address: None,
+        topics: Some(vec![Some(crate::log_synthesis::TopicFilter::Single(
+            wanted_topic.clone(),
+        ))]),
+        block_hash: None,
+    };
+    let results = store.get_logs(&filter, block_number).await.unwrap();
+
+    // Pre-fix: 0 (the wanted row was truncated by LIMIT 1000 before matching).
+    // Post-fix: exactly the one requested row.
+    assert_eq!(
+        results.len(),
+        1,
+        "the requested topic must be returned even when buried behind 1000 spam rows"
+    );
+    assert_eq!(results[0].transaction_hash, wanted_tx);
+}
+
+// ── Cantina MA#12 — restore block rotation (auditor PoC, production form) ──
+
+/// MA#12 — auditor-supplied PoC `test_pgstore_logs_silently_truncate_dense_restore_block_poc`,
+/// adapted to the PRODUCTION assertion. The raw PoC asserted the BUGGY
+/// behaviour (1001 exits packed into ONE block, the 1001st hidden behind the
+/// 1000-row prefix). With the fix, restore ROTATES recovery output across new
+/// synthetic blocks before any block reaches the cap, so the 1001st exit lands
+/// in a fresh block and IS retrievable. This test mirrors the rotation restore
+/// now performs (`restore_block_should_rotate` → bump block → recompute hash)
+/// and asserts the previously-hidden `hidden_tx_hash` is returned by a
+/// block-scoped query of the rotated block.
+#[tokio::test]
+async fn test_pgstore_dense_restore_rotates_and_exposes_1001st_exit() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let unique_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let first_block = 3_000_000_000u64 + (unique_seed % 1_000_000_000);
+    let block_hash = [0xABu8; 32];
+    let bridge_address = crate::bridge_address::get_bridge_address();
+
+    let mut first_deposit_count = None;
+    let mut first_tx_hash = String::new();
+    let mut hidden_tx_hash = String::new();
+
+    // Rotation cursor — mirrors restore_bridge_outs exactly.
+    let cap = 1000usize;
+    let mut current_block = first_block;
+    let mut logs_in_block = 0usize;
+
+    for i in 0..1001u32 {
+        if logs_in_block >= cap {
+            current_block += 1;
+            logs_in_block = 0;
+        }
+
+        let deposit_count = store
+            .mark_note_processed(format!("restore-note-{unique_seed}-{i}"))
+            .await
+            .unwrap();
+        if i == 0 {
+            first_deposit_count = Some(deposit_count);
+            first_tx_hash = format!("0x{:064x}", unique_seed);
+        }
+        if i == 1000 {
+            hidden_tx_hash = format!("0x{:064x}", unique_seed.wrapping_add(1000));
+        }
+        let tx_hash = format!("0x{:064x}", unique_seed.wrapping_add(i as u64));
+        store
+            .add_bridge_event(
+                bridge_address,
+                current_block,
+                block_hash,
+                &tx_hash,
+                0,
+                0,
+                &[0u8; 20],
+                1,
+                &[0x11; 20],
+                1000,
+                &[],
+                deposit_count,
+            )
+            .await
+            .unwrap();
+        logs_in_block += 1;
+    }
+
+    store.set_latest_block_number(current_block).await.unwrap();
+
+    // Rotation must have advanced to a second block.
+    assert!(
+        current_block > first_block,
+        "dense restore must rotate to a fresh block before the cap"
+    );
+
+    // First (full) block: holds the first exit, NOT the 1001st.
+    let first_filter = LogFilter {
+        from_block: Some(format!("0x{:x}", first_block)),
+        to_block: Some(format!("0x{:x}", first_block)),
+        address: None,
+        topics: None,
+        block_hash: None,
+    };
+    let first_results = store.get_logs(&first_filter, current_block).await.unwrap();
+    assert!(
+        first_results
+            .iter()
+            .any(|log| log.transaction_hash == first_tx_hash),
+        "first exit is in the first block"
+    );
+    assert!(
+        !first_results
+            .iter()
+            .any(|log| log.transaction_hash == hidden_tx_hash),
+        "the 1001st exit must not be packed into the first (full) block"
+    );
+
+    // Rotated block: the previously-hidden 1001st exit IS retrievable.
+    let last_filter = LogFilter {
+        from_block: Some(format!("0x{:x}", current_block)),
+        to_block: Some(format!("0x{:x}", current_block)),
+        address: None,
+        topics: None,
+        block_hash: None,
+    };
+    let last_results = store.get_logs(&last_filter, current_block).await.unwrap();
+    assert!(
+        last_results
+            .iter()
+            .any(|log| log.transaction_hash == hidden_tx_hash),
+        "the 1001st restored exit must be retrievable after rotation (MA#12)"
+    );
+
+    // deposit_count still advances across the full replay (unchanged).
+    let next_deposit_count = store
+        .mark_note_processed(format!("next-live-note-{unique_seed}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_deposit_count,
+        first_deposit_count.expect("first deposit count should be set") + 1001
+    );
+}
