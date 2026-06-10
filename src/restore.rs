@@ -267,7 +267,7 @@ async fn restore_bridge_outs(
                 // breaking any consumer that joins on (note_id,
                 // deposit_count). Sort by note_id (stable across re-syncs).
                 let mut sorted: Vec<&_> = consumed_notes.iter().collect();
-                sorted.sort_by_key(|n| n.id().expect("input note record has committed metadata").to_string());
+                sorted.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
 
                 for note in sorted {
                     let details = note.details();
@@ -275,7 +275,7 @@ async fn restore_bridge_outs(
                         continue;
                     }
 
-                    let note_id_str = note.id().expect("input note record has committed metadata").to_string();
+                    let note_id_str = hex::encode(note.details_commitment().as_bytes());
                     if store_clone.is_note_processed(&note_id_str).await? {
                         continue;
                     }
@@ -406,7 +406,7 @@ async fn restore_claims(
                 // deterministic for the operator-visible
                 // `claim_watcher_synthesised_total` counter and log stream.
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sorted_notes.sort_by_key(|n| n.id().expect("input note record has committed metadata").to_string());
+                sorted_notes.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
 
                 for note in sorted_notes {
                     let details = note.details();
@@ -414,7 +414,7 @@ async fn restore_claims(
                         continue;
                     }
 
-                    let note_id_str = note.id().expect("input note record has committed metadata").to_string();
+                    let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
                     // Dedup 1: was this CLAIM already replayed by an earlier
                     // restore (or by the live watcher)?
@@ -570,7 +570,7 @@ async fn restore_gers(
                 // different chain values without sorting. Lex-sort by
                 // NoteId for stability.
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sorted_notes.sort_by_key(|n| n.id().expect("input note record has committed metadata").to_string());
+                sorted_notes.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
 
                 for note in sorted_notes {
                     let details = note.details();
@@ -602,7 +602,7 @@ async fn restore_gers(
                         GerNoteVerdict::MissingMetadata => {
                             ::metrics::counter!("restore_ger_missing_metadata_total").increment(1);
                             tracing::warn!(
-                                note_id = %note.id().expect("input note record has committed metadata"),
+                                note_id = %hex::encode(note.details_commitment().as_bytes()),
                                 "MA#28: UpdateGerNote-shaped consumed note has no metadata; skipping"
                             );
                             continue;
@@ -610,7 +610,7 @@ async fn restore_gers(
                         GerNoteVerdict::SenderMismatch => {
                             ::metrics::counter!("restore_ger_sender_mismatch_total").increment(1);
                             tracing::error!(
-                                note_id = %note.id().expect("input note record has committed metadata"),
+                                note_id = %hex::encode(note.details_commitment().as_bytes()),
                                 sender = ?note.metadata().map(|m| m.sender()),
                                 expected = %expected_sender,
                                 "MA#28: UpdateGerNote-shaped note has unexpected sender; \
@@ -621,7 +621,7 @@ async fn restore_gers(
                         GerNoteVerdict::UndecodableTarget => {
                             ::metrics::counter!("restore_ger_no_target_total").increment(1);
                             tracing::error!(
-                                note_id = %note.id().expect("input note record has committed metadata"),
+                                note_id = %hex::encode(note.details_commitment().as_bytes()),
                                 "MA#28: UpdateGerNote-shaped note has no decodable \
                                  NetworkAccountTarget attachment; refusing to replay"
                             );
@@ -630,7 +630,7 @@ async fn restore_gers(
                         GerNoteVerdict::TargetMismatch => {
                             ::metrics::counter!("restore_ger_target_mismatch_total").increment(1);
                             tracing::error!(
-                                note_id = %note.id().expect("input note record has committed metadata"),
+                                note_id = %hex::encode(note.details_commitment().as_bytes()),
                                 expected = %expected_target,
                                 "MA#28: UpdateGerNote-shaped note targets a different \
                                  recipient than the configured bridge; refusing to replay"
@@ -643,7 +643,7 @@ async fn restore_gers(
                     let items = storage.items();
                     if items.len() < UpdateGerNote::NUM_STORAGE_ITEMS {
                         tracing::warn!(
-                            note_id = %note.id().expect("input note record has committed metadata"),
+                            note_id = %hex::encode(note.details_commitment().as_bytes()),
                             storage_len = items.len(),
                             "restore: UpdateGerNote has unexpected storage size, skipping"
                         );
@@ -665,7 +665,7 @@ async fn restore_gers(
                             }
                             Err(_) => {
                                 tracing::error!(
-                                    note_id = %note.id().expect("input note record has committed metadata"),
+                                    note_id = %hex::encode(note.details_commitment().as_bytes()),
                                     limb_index = i,
                                     felt_value = felt.as_canonical_u64(),
                                     "restore: UpdateGerNote limb exceeds u32::MAX, skipping (X6)"
@@ -692,7 +692,7 @@ async fn restore_gers(
                     let tx_hash = {
                         let mut hasher = Keccak256::new();
                         hasher.update(b"restore-ger-miden-");
-                        hasher.update(note.id().expect("input note record has committed metadata").to_string().as_bytes());
+                        hasher.update(hex::encode(note.details_commitment().as_bytes()).as_bytes());
                         format!("0x{}", hex::encode(hasher.finalize()))
                     };
 
@@ -711,7 +711,7 @@ async fn restore_gers(
                     store_clone.mark_ger_injected(ger_bytes).await?;
 
                     tracing::info!(
-                        note_id = %note.id().expect("input note record has committed metadata"),
+                        note_id = %hex::encode(note.details_commitment().as_bytes()),
                         ger = %hex::encode(ger_bytes),
                         "restore: rebuilt GER from consumed UpdateGerNote"
                     );

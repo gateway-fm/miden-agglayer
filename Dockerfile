@@ -6,6 +6,9 @@ WORKDIR /usr/src/app
 COPY src src
 COPY axum-jrpc axum-jrpc
 COPY migrations migrations
+# Local 0.15 topology patch: [patch.crates-io] path dependency (vendored
+# miden-agglayer with MIDEN_NETWORK_ID=1 — see fixtures/patches/README.md).
+COPY vendor-miden-agglayer vendor-miden-agglayer
 COPY Cargo.* .
 
 # build

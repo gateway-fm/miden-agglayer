@@ -220,7 +220,7 @@ impl ClaimWatcher {
     /// advance the cursor without writing a log, or readers seeing `latest >=
     /// N` won't find the log at N (aggsender skips, event lost forever).
     async fn process_consumed_claim(&self, note: &InputNoteRecord, block_number: u64) -> bool {
-        let note_id_str = note.id().expect("input note record has committed metadata").to_string();
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         // 1. Fast-path: have we already processed this CLAIM observation?
         match self.store.is_claim_note_processed(&note_id_str).await {

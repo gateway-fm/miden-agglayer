@@ -138,3 +138,18 @@ miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git
 [features]
 default = []
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+
+# LOCAL E2E TOPOLOGY PATCH: vendored miden-agglayer 0.15.2 with
+# MIDEN_NETWORK_ID = 1 (upstream hardcodes 77 in the MASM; the Rust constant is
+# generated from the MASM at build time). The local L1 fixture registers the
+# Miden rollup as network 1, and the AggLayer pessimistic proof rejects
+# certificates whose imported exits carry a different destination network
+# (InvalidExitNetwork) — while the unpatched MASM rejects network-1 claims with
+# ERR_CLAIM_LEAF_DESTINATION_NETWORK_MISMATCH. No single network id satisfies
+# both ends with stock artifacts, so the local stack is made coherent at
+# network 1 (the 0.14 topology). MUST be kept in lockstep with the identical
+# vendored copy in the local 0xMiden/node checkout (script MAST roots must
+# match the genesis bridge). Drop both copies once the Miden team's 0.15
+# deployment reconciles the network id; question raised with them.
+[patch.crates-io]
+miden-agglayer = { path = "vendor-miden-agglayer" }
