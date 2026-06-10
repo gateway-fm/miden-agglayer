@@ -252,6 +252,10 @@ e2e-l2-to-l1: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund wallet + run L2→
 e2e-l2-to-l1-best-effort: e2e-l1-to-l2 ## L2→L1 with extended timeout + miden-node crash detection (exits 2 on upstream miden-node v0.14.10 crash-loop, 1 on real regression)
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-best-effort.sh
 
+.PHONY: e2e-l2-to-l1-autoclaim
+e2e-l2-to-l1-autoclaim: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund + L2→L1 bridge-out claimed automatically by the bridge-autoclaim service
+	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-autoclaim.sh
+
 .PHONY: e2e-restore
 e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test
 	$(COMPOSE_ENV) ./scripts/e2e-restore.sh

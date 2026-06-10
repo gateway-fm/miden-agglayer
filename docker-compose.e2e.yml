@@ -271,11 +271,17 @@ services:
       interval: 3s
       timeout: 2s
       retries: 30
-      start_period: 60s
+      # 180s (was 60s): on a busy host the proxy's --init account redeploy +
+      # external-prover handshake can push the first healthy check past 60s,
+      # which makes `docker compose up --wait` abort dependents prematurely.
+      start_period: 180s
 
   # ── Bridge Service ─────────────────────────────────────────────────────────
   bridge-service:
-    image: ghcr.io/0xpolygon/zkevm-bridge-service:v0.6.4-RC2
+    # Patched image: /pending-bridges disambiguates the already-claimed check by
+    # source rollup (see revitteth/zkevm-bridge-service#1). Built locally via
+    # `docker buildx build -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges`.
+    image: zkevm-bridge-service:v0.6.4-RC2-pendingbridges
     entrypoint: ["/app/zkevm-bridge"]
     command: ["run", "--cfg", "/etc/zkevm/bridge-config.toml"]
     ports:
@@ -291,6 +297,23 @@ services:
         condition: service_healthy
       miden-agglayer:
         condition: service_healthy
+
+  # ── L2->L1 auto-claimer ────────────────────────────────────────────────────
+  # Standalone zkevm-autoclaimer: polls the bridge-service for ready Miden L2->L1
+  # exits and sponsors claimAsset on L1 (Anvil), replacing the manual claim step.
+  # Same patched image as bridge-service.
+  bridge-autoclaim:
+    image: zkevm-bridge-service:v0.6.4-RC2-pendingbridges
+    entrypoint: ["/app/zkevm-autoclaimer"]
+    command: ["run", "--cfg", "/etc/zkevm/autoclaim-config.toml"]
+    volumes:
+      - ./fixtures/autoclaim-config.toml:/etc/zkevm/autoclaim-config.toml:ro
+      - ./fixtures/claimsponsor.keystore:/etc/zkevm/claimsponsor.keystore:ro
+    depends_on:
+      anvil:
+        condition: service_healthy
+      bridge-service:
+        condition: service_started
 
   # ── AggLayer (certificate aggregation) ─────────────────────────────────────
   agglayer:
