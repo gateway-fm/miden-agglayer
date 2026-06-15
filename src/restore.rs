@@ -556,6 +556,26 @@ async fn restore_gers(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
+                // Protocol 0.15: notes consumed by the bridge land in the client
+                // store as `ConsumedExternal`, a state that carries NO metadata —
+                // so `note.metadata()` is `None` for every sanctioned GER note and
+                // the MA#28 sender check below would skip all of them, restoring
+                // zero GERs. The proxy MINTED those notes itself, and the client
+                // store's output-note records retain the full metadata
+                // permanently. Recover the sender from our own output records,
+                // keyed by the details commitment. This is fail-closed and
+                // strictly stronger than the plain sender check: a GER-shaped
+                // note we did not mint has no output record, stays metadata-less,
+                // and is skipped as MissingMetadata — exactly the MA#28 posture.
+                let own_output_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> =
+                    client
+                        .get_output_notes(NoteFilter::All)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
+                        .into_iter()
+                        .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
+                        .collect();
+
                 let ger_script_root = UpdateGerNote::script_root();
                 let block_hash = block_state_clone.get_block_hash(restore_block);
                 let timestamp = block_state_clone.get_block_timestamp(restore_block);
@@ -592,8 +612,14 @@ async fn restore_gers(
                     // have restore silently replay it as a sanctioned GER
                     // injection. Pure-predicate classification is unit-tested
                     // via `classify_ger_note` — keep this match in sync.
+                    // Prefer the record's own metadata (pre-0.15 states still
+                    // carry it); fall back to our output-note record for the
+                    // metadata-less `ConsumedExternal` state (see map above).
+                    let effective_metadata = note.metadata().or_else(|| {
+                        own_output_metadata.get(&note.details_commitment().as_bytes())
+                    });
                     match classify_ger_note(
-                        note.metadata(),
+                        effective_metadata,
                         note.attachments(),
                         expected_sender,
                         expected_target,
@@ -611,7 +637,7 @@ async fn restore_gers(
                             ::metrics::counter!("restore_ger_sender_mismatch_total").increment(1);
                             tracing::error!(
                                 note_id = %hex::encode(note.details_commitment().as_bytes()),
-                                sender = ?note.metadata().map(|m| m.sender()),
+                                sender = ?effective_metadata.map(|m| m.sender()),
                                 expected = %expected_sender,
                                 "MA#28: UpdateGerNote-shaped note has unexpected sender; \
                                  refusing to replay as restored GER"

@@ -314,18 +314,6 @@ async fn main() -> anyhow::Result<()> {
         .into();
     let note_assets = NoteAssets::new(vec![asset]).map_err(|e| anyhow!("note assets: {e}"))?;
 
-    let b2agg = B2AggNote::create(
-        args.dest_network,
-        l1_dest,
-        note_assets,
-        bridge_id,
-        wallet_id,
-        client.rng(),
-    )
-    .map_err(|e| anyhow!("B2AGG creation failed: {e}"))?;
-
-    println!("[bridge-out] B2AGG note created");
-
     // Re-import bridge account so the NoteScreener has the latest asset tree.
     // Without this, submit_new_transaction fails with FetchAssetWitnessFailed
     // after CLAIM modified the bridge account.
@@ -333,26 +321,61 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[bridge-out] bridge re-import: {e} (may already be tracked)");
     }
 
-    // Final sync right before submit to minimize the window where the service's
-    // background sync loop can change our shared SQLite state.
-    client
-        .sync_state()
+    // Create + submit, with a bounded retry. The remote tx-prover applies
+    // backpressure with a bounded queue: when the ntx-builder is proving
+    // network txs (bridge consumptions) at the same moment, our Prove request
+    // can be rejected with RESOURCE_EXHAUSTED ("proof queue is full"), which
+    // surfaces as "transaction proving failed". Proving happens BEFORE node
+    // submission, so retrying is clean; a fresh note (new serial) and request
+    // are built per attempt since both are consumed by the submission path.
+    const SUBMIT_ATTEMPTS: u32 = 4;
+    let mut tx_id = None;
+    for attempt in 1..=SUBMIT_ATTEMPTS {
+        // Sync right before each attempt to minimize the window where the
+        // service's background sync loop can change our shared SQLite state.
+        client
+            .sync_state()
+            .await
+            .map_err(|e| anyhow!("pre-submit sync failed: {e}"))?;
+
+        let b2agg = B2AggNote::create(
+            args.dest_network,
+            l1_dest,
+            note_assets.clone(),
+            bridge_id,
+            wallet_id,
+            client.rng(),
+        )
+        .map_err(|e| anyhow!("B2AGG creation failed: {e}"))?;
+        println!("[bridge-out] B2AGG note created");
+
+        let tx_request = TransactionRequestBuilder::new()
+            .own_output_notes(vec![b2agg])
+            .build()
+            .map_err(|e| anyhow!("tx request build failed: {e}"))?;
+
+        println!("[bridge-out] submitting transaction (attempt {attempt}/{SUBMIT_ATTEMPTS})...");
+        match miden_agglayer_service::metrics::meter_proof(
+            miden_agglayer_service::metrics::ProofKind::BridgeOut,
+            client.submit_new_transaction(wallet_id, tx_request),
+        )
         .await
-        .map_err(|e| anyhow!("pre-submit sync failed: {e}"))?;
-
-    // Submit transaction
-    let tx_request = TransactionRequestBuilder::new()
-        .own_output_notes(vec![b2agg])
-        .build()
-        .map_err(|e| anyhow!("tx request build failed: {e}"))?;
-
-    println!("[bridge-out] submitting transaction...");
-    let tx_id = miden_agglayer_service::metrics::meter_proof(
-        miden_agglayer_service::metrics::ProofKind::BridgeOut,
-        client.submit_new_transaction(wallet_id, tx_request),
-    )
-    .await
-    .map_err(|e| anyhow!("submit failed: {e}"))?;
+        {
+            Ok(id) => {
+                tx_id = Some(id);
+                break;
+            }
+            Err(e) if attempt < SUBMIT_ATTEMPTS => {
+                eprintln!(
+                    "[bridge-out] submit attempt {attempt} failed: {e}; retrying in 10s \
+                     (prover backpressure is the common cause)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+            Err(e) => return Err(anyhow!("submit failed after {SUBMIT_ATTEMPTS} attempts: {e}")),
+        }
+    }
+    let tx_id = tx_id.expect("loop either sets tx_id or returns");
 
     println!("[bridge-out] transaction submitted: {tx_id}");
 

@@ -66,13 +66,26 @@ pass "writer worker is active in $AGGLAYER_CONTAINER"
 # drain_outcome) as zero-touch — their descriptors are in
 # `init_metrics()` (verifiable via `git grep`) and they will surface as
 # soon as their condition fires.
-METRICS_PROBE=$(curl -fsS "$L2_RPC/metrics" 2>/dev/null || echo "")
+# The first writer dispatch comes from aggoracle's first GER push through
+# eth_sendRawTransaction, which on a freshly-up stack can land a minute or
+# two after the containers report healthy. An instant probe races it and
+# false-fails the suite — retry until the full surface (all three series AND
+# a committed job) is present, then run the assertions once on that snapshot.
+METRICS_PROBE=""
+for _ in $(seq 1 60); do
+    METRICS_PROBE=$(curl -fsS "$L2_RPC/metrics" 2>/dev/null || echo "")
+    if grep -q "^# HELP agglayer_writer_queue_depth" <<<"$METRICS_PROBE" \
+        && grep -qE '^agglayer_writer_job_duration_seconds_count\{.*outcome="committed"' <<<"$METRICS_PROBE"; then
+        break
+    fi
+    sleep 3
+done
 for metric in \
     agglayer_writer_queue_depth \
     agglayer_writer_inflight_jobs \
     agglayer_writer_job_duration_seconds; do
     if ! grep -q "^# HELP $metric" <<<"$METRICS_PROBE"; then
-        fail "Prometheus series $metric not exposed (expected after at least one worker dispatch)"
+        fail "Prometheus series $metric not exposed within 180s (expected after at least one worker dispatch)"
     fi
 done
 pass "writer-active metrics surface present (queue_depth + inflight_jobs + job_duration)"
@@ -81,7 +94,7 @@ pass "writer-active metrics surface present (queue_depth + inflight_jobs + job_d
 # we can't tell whether the worker is wired correctly or is silently sitting
 # idle. The histogram's _count series increments on every terminal job.
 if ! grep -qE '^agglayer_writer_job_duration_seconds_count\{.*outcome="committed"' <<<"$METRICS_PROBE"; then
-    fail "no committed jobs in agglayer_writer_job_duration_seconds — worker may be inert"
+    fail "no committed jobs in agglayer_writer_job_duration_seconds within 180s — worker may be inert"
 fi
 pass "at least one job committed via the worker (RD-940 dispatch is live)"
 
