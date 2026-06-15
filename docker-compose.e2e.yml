@@ -250,6 +250,15 @@ services:
       - "--miden-store-dir=/var/lib/miden-agglayer-service"
       - "--l1-rpc-url=http://anvil:8545"
       - "--ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+      # Index L1 from genesis (block 1), not from L1 head. The kurtosis L1
+      # snapshot already has the bridge deployed and its initial
+      # UpdateL1InfoTree leaf emitted at a block BEFORE the proxy boots, and
+      # the aggoracle injects that initial GER within seconds of startup. If
+      # the indexer started at head it would never index that pre-head leaf,
+      # leaving the startup GER permanently orphaned (RD-862 repro's
+      # deterministic 0x133e6a88… orphan). Anvil's history is ~100s of blocks
+      # so a from-genesis scan is trivial (max_range chunks it).
+      - "--l1-indexer-from-block=1"
       # R1 admin-auth key is supplied via the `ADMIN_API_KEY` env var
       # from `fixtures/.env`, generated fresh per setup by
       # scripts/setup-fixtures.sh (or scripts/ensure-e2e-secrets.sh on

@@ -272,15 +272,19 @@ pass "Certificate settled on L1"
 # deposit that's `ready_for_claim` — a loose filter would match that and the
 # subsequent claim would pick the wrong (already-claimed) deposit and fail.
 EXPECTED_ORIG_ADDR=$(python3 -c "print('$TOKEN_ADDR'.lower())")
-# Match the deposit once it's ready_for_claim regardless of claim status: the
-# stack runs the bridge-autoclaim service, which may claim this L2→L1 deposit
-# before we do. Requiring claim_tx_hash=='' here would hang until timeout on an
-# already-autoclaimed deposit (the autoclaim-already-claimed case is handled
-# below, mirroring e2e-l2-to-l1.sh).
-wait_for "L2 deposit in bridge-service" \
-    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('orig_addr') or '').lower()==want for dep in d.get('deposits',[])) else 1)\"" \
-    120 5
-pass "TestToken L2→L1 deposit synced and ready_for_claim"
+# The stack runs the bridge-autoclaim service, which claims every L2→L1 deposit
+# on L1 automatically. Racing it with a manual claimAsset is flaky (the manual
+# claim reverts AlreadyClaimed, or the merkle-proof fetch races the claim). The
+# autoclaimer is reliable (see the passing l2-to-l1 strict suite), and the
+# end-state we assert — L1 token balance += bridged amount — is identical
+# whoever submits the claim. So wait for the deposit to be ready_for_claim AND
+# autoclaimed (claim_tx_hash present), then verify the autoclaim receipt +
+# balance (handled below). This is race-free and still exercises the full
+# L2→L1 path (the autoclaimer performs the on-chain claimAsset).
+wait_for "L2 deposit autoclaimed on L1" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('orig_addr') or '').lower()==want and (dep.get('claim_tx_hash') or '')!='' for dep in d.get('deposits',[])) else 1)\"" \
+    180 5
+pass "TestToken L2→L1 deposit synced + autoclaimed on L1"
 
 # Claim on L1. Filter by BOTH origin token address (to skip any unrelated ETH
 # deposits left over from e2e-l2-to-l1.sh when this test runs inside the full
@@ -298,10 +302,12 @@ for dep in d.get('deposits', []):
         continue
     if (dep.get('orig_addr') or '').lower() != want:
         continue
+    if (dep.get('claim_tx_hash') or '') == '':
+        continue
     print(json.dumps(dep))
     break
 ")
-[[ -z "$DEPOSIT_INFO" ]] && fail "Could not find ready L2→L1 deposit"
+[[ -z "$DEPOSIT_INFO" ]] && fail "Could not find ready, autoclaimed L2→L1 deposit"
 
 DEPOSIT_CNT=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['deposit_cnt'])")
 ORIG_NET=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['orig_net'])")
