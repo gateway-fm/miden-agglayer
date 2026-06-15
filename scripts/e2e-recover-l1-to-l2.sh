@@ -61,8 +61,8 @@ ENV_FILE="$PROJECT_DIR/fixtures/.env"
 # docker-compose.e2e.yml requires these at interpolation time even for
 # stop/start/ps — `make e2e-up` exports them, but ad-hoc compose calls
 # from this script need them set explicitly.
-export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/miden-node.git}"
-export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.14.10}"
+export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/node.git}"
+export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.15.0}"
 
 # Distinguishable garbage hashes so re-runs don't collide with prior repros.
 RUN_SUFFIX="$(date +%s)"

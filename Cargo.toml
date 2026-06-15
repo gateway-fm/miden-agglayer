@@ -105,10 +105,9 @@ deadpool-postgres = { version = "0.14", optional = true }
 # Protocol 0.15.x migration. The conversion metadata moved off the faucet onto
 # the bridge's `faucet_metadata_map` (CONFIG_AGG_BRIDGE note), `AccountStorageMode`
 # became `AccountType{Private,Public}`, `create_claim_note`/`create_agglayer_faucet`
-# were reshaped — see `feat/protocol-0.15-migration`. The base crates are released
-# on crates.io at 0.15.2; the matching miden-client (0.15.0) is NOT yet tagged, so
-# we track the upstream migration branch (PR 0xMiden/miden-client#2224) until a
-# v0.15.x tag ships, at which point this pins back to the tag.
+# were reshaped — see `feat/protocol-0.15-migration`. Base crates are released on
+# crates.io at 0.15.3; the matching miden-client is released at 0.15.0 (crates.io,
+# 2026-06-12, which tracks base 0.15.3) and pinned below.
 #
 # MAST-root consistency note (carried over from the 0.14 pins): the proxy-side
 # `BurnNote::script_root()` MUST match the miden-node binary's, or every L2→L1
@@ -116,40 +115,36 @@ deadpool-postgres = { version = "0.14", optional = true }
 # "note script with root <X> not found". The 0.15 base crates resolve
 # miden-assembly/core 0.23.x; keep these in lockstep with the deployed
 # miden-node v0.15.x release and tighten to an exact patch if a root mismatch
-# resurfaces during the e2e regression.
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.15.2" }
+# resurfaces during the e2e regression. As of 0.15.3 the AggLayer network id is
+# a runtime storage slot (set at bridge-account creation), NOT a hardcoded MASM
+# constant — so the stock crate's MAST roots now match the stock node binary and
+# the network-id=1 vendor patch below is no longer needed (removed).
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.15.3" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "=0.15.2" }
-miden-standards = { default-features = false, version = "=0.15.2" }
-miden-tx = { default-features = false, version = "=0.15.2" }
+], version = "=0.15.3" }
+miden-standards = { default-features = false, version = "=0.15.3" }
+miden-tx = { default-features = false, version = "=0.15.3" }
 
 miden-assembly = { default-features = false, version = "0.23" }
 miden-core = { default-features = false, version = "0.23" }
 
-# miden-client 0.15.0 — tracked via the upstream protocol-0.15 migration branch
-# (PR 0xMiden/miden-client#2224) until a v0.15.x tag is published. Re-pin to the
-# tag once it lands.
+# miden-client 0.15.0 — released to crates.io 2026-06-12, which includes the
+# agglayer integration (PR 0xMiden/miden-client#2224, merged 2026-06-12 into the
+# release). Re-pinned from the tracking branch `mmagician-claude/agglayer-v0.15`
+# now that the tag has shipped; the git source is no longer needed.
 miden-client = { default-features = false, features = [
   "tonic",
-], git = "https://github.com/0xMiden/miden-client.git", branch = "mmagician-claude/agglayer-v0.15" }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "mmagician-claude/agglayer-v0.15" }
+], version = "=0.15.0" }
+miden-client-sqlite-store = { version = "=0.15.0" }
 
 [features]
 default = []
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 
-# LOCAL E2E TOPOLOGY PATCH: vendored miden-agglayer 0.15.2 with
-# MIDEN_NETWORK_ID = 1 (upstream hardcodes 77 in the MASM; the Rust constant is
-# generated from the MASM at build time). The local L1 fixture registers the
-# Miden rollup as network 1, and the AggLayer pessimistic proof rejects
-# certificates whose imported exits carry a different destination network
-# (InvalidExitNetwork) — while the unpatched MASM rejects network-1 claims with
-# ERR_CLAIM_LEAF_DESTINATION_NETWORK_MISMATCH. No single network id satisfies
-# both ends with stock artifacts, so the local stack is made coherent at
-# network 1 (the 0.14 topology). MUST be kept in lockstep with the identical
-# vendored copy in the local 0xMiden/node checkout (script MAST roots must
-# match the genesis bridge). Drop both copies once the Miden team's 0.15
-# deployment reconciles the network id; question raised with them.
-[patch.crates-io]
-miden-agglayer = { path = "vendor-miden-agglayer" }
+# NOTE (0.15.3): the previous `[patch.crates-io] miden-agglayer = vendor-...`
+# override carried a MASM patch setting MIDEN_NETWORK_ID = 1 (upstream baked 77
+# into the MASM). As of 0.15.3 the AggLayer network id is a per-account runtime
+# storage slot written at bridge-account creation (`create_bridge_account(..,
+# network_id)`), so no MASM patch is needed and the vendor crate was removed.
+# The deployment's network id is now passed explicitly at genesis/init time.

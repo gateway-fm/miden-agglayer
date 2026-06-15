@@ -188,7 +188,13 @@ install-tools: ## Install development tools
 # Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
 # docker-compose so the Dockerfile picks it up at build time.
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
-MIDEN_NODE_GIT_REF := 6649a4ce774bc842c08e6bdc314f6ddafb816282
+# v0.15.0 (final tag). Builds against miden-protocol/standards/tx 0.15.3 — the
+# same base crates as our service — so BURN/MINT/CLAIM/B2AGG MAST roots agree
+# across the node/client boundary with no Cargo.lock-alignment hack. The
+# node-store callback-vault-key bug is fixed upstream at this tag (the buggy
+# select_vault_balances_by_faucet_ids is gone), so fixtures/patches/0001 is no
+# longer applied. Network id is now a runtime storage slot, so no vendor patch.
+MIDEN_NODE_GIT_REF := v0.15.0
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 

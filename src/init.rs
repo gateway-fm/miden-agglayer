@@ -91,8 +91,14 @@ async fn add_bridge(
     _keystore: Arc<FilesystemKeyStore>,
     service_id: AccountId,
     ger_manager_id: AccountId,
+    network_id: u32,
 ) -> anyhow::Result<Account> {
-    let account = create_bridge_account(client.rng().draw_word(), service_id, ger_manager_id);
+    // 0.15.3: the AggLayer network id is written into a bridge storage slot at
+    // creation (was a hardcoded MASM constant pre-0.15.3). Must match the id the
+    // L1 RollupManager assigns this rollup, or claims fail destination-network
+    // checks on both ends.
+    let account =
+        create_bridge_account(client.rng().draw_word(), service_id, ger_manager_id, network_id);
     client.add_account(&account, false).await?;
 
     deploy_account(client, account.id(), "bridge").await?;
@@ -164,11 +170,13 @@ async fn add_wallet(
 async fn add_accounts(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
+    network_id: u32,
 ) -> anyhow::Result<Accounts> {
     let service = add_wallet(client, keystore.clone()).await?;
     let ger_manager = add_wallet(client, keystore.clone()).await?;
     deploy_account(client, ger_manager.id(), "ger_manager").await?;
-    let bridge = add_bridge(client, keystore.clone(), service.id(), ger_manager.id()).await?;
+    let bridge =
+        add_bridge(client, keystore.clone(), service.id(), ger_manager.id(), network_id).await?;
     // ETH: 18 origin decimals → 8 miden decimals (scale=10). Native ETH has empty metadata on
     // the L1 bridge, so the faucet's stored metadata_hash is keccak256("") — matches any
     // CLAIM leaf_data.metadata_hash for ETH deposits.
@@ -226,10 +234,11 @@ async fn init_internal(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
     net_id: NetworkId,
+    network_id: u32,
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
-    let accounts = add_accounts(client, keystore).await?;
+    let accounts = add_accounts(client, keystore, network_id).await?;
 
     // Wait for the NTX builder to process account creation transactions
     // before submitting notes that target those accounts.
@@ -270,15 +279,17 @@ async fn init_internal(
 pub async fn init(
     client: &MidenClient,
     net_id: NetworkId,
+    network_id: u32,
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     let result = Arc::new(OnceLock::<PathBuf>::new());
     let result_internal = result.clone();
     let keystore = client.get_keystore();
 
-    let future = client.with(|client| {
+    let future = client.with(move |client| {
         Box::new(async move {
-            let result = init_internal(client, keystore, net_id, miden_store_dir).await?;
+            let result =
+                init_internal(client, keystore, net_id, network_id, miden_store_dir).await?;
             result_internal.set(result).unwrap();
             Ok(())
         })

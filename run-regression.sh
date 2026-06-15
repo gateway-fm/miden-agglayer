@@ -7,11 +7,12 @@ set -uo pipefail
 
 cd /home/max/github/gateway/miden/miden-agglayer
 
-# Protocol 0.15.x: node repo renamed 0xMiden/miden-node -> 0xMiden/node; pin the
-# exact rev the miden-client 0.15 branch (PR #2224) targets for MAST consistency.
-# NOTE: the Makefile sets these with `:=` so its values win; kept here in sync.
+# Protocol 0.15.x: node repo renamed 0xMiden/miden-node -> 0xMiden/node. Pinned
+# to the v0.15.0 tag, which builds against base crates 0.15.3 (matching our
+# service) for MAST consistency. NOTE: the Makefile sets these with `:=` so its
+# values win; kept here in sync.
 export MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-export MIDEN_NODE_GIT_REF="6649a4ce774bc842c08e6bdc314f6ddafb816282"
+export MIDEN_NODE_GIT_REF="v0.15.0"
 export PATH="/home/max/.local/bin:/home/max/.foundry/bin:$PATH"
 
 OUT=out
