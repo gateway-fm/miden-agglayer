@@ -272,8 +272,13 @@ pass "Certificate settled on L1"
 # deposit that's `ready_for_claim` — a loose filter would match that and the
 # subsequent claim would pick the wrong (already-claimed) deposit and fail.
 EXPECTED_ORIG_ADDR=$(python3 -c "print('$TOKEN_ADDR'.lower())")
+# Match the deposit once it's ready_for_claim regardless of claim status: the
+# stack runs the bridge-autoclaim service, which may claim this L2→L1 deposit
+# before we do. Requiring claim_tx_hash=='' here would hang until timeout on an
+# already-autoclaimed deposit (the autoclaim-already-claimed case is handled
+# below, mirroring e2e-l2-to-l1.sh).
 wait_for "L2 deposit in bridge-service" \
-    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('claim_tx_hash') or '')=='' and (dep.get('orig_addr') or '').lower()==want for dep in d.get('deposits',[])) else 1)\"" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('orig_addr') or '').lower()==want for dep in d.get('deposits',[])) else 1)\"" \
     120 5
 pass "TestToken L2→L1 deposit synced and ready_for_claim"
 
@@ -290,8 +295,6 @@ for dep in d.get('deposits', []):
     if not dep.get('ready_for_claim'):
         continue
     if dep.get('network_id') != 1:
-        continue
-    if (dep.get('claim_tx_hash') or '') != '':
         continue
     if (dep.get('orig_addr') or '').lower() != want:
         continue
@@ -310,6 +313,36 @@ METADATA_CLAIM=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; m=json.load
 GLOBAL_INDEX=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['global_index'])")
 
 log "Deposit #$DEPOSIT_CNT: amount=$AMOUNT_CLAIM, globalIndex=$GLOBAL_INDEX"
+
+# If the bridge-autoclaim service already claimed this deposit on L1, it carries
+# a claim_tx_hash. Re-claiming would revert (AlreadyClaimed), so verify the
+# autoclaim receipt + the L1 token balance change instead and finish. Mirrors
+# the ETH-path handling in e2e-l2-to-l1.sh.
+CLAIM_TX_HASH=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
+if [[ -n "$CLAIM_TX_HASH" ]]; then
+    log "Deposit already claimed on L1 by the autoclaim service (tx $CLAIM_TX_HASH); verifying..."
+    RECEIPT_STATUS=$(cast receipt --rpc-url "$L1_RPC" "$CLAIM_TX_HASH" status 2>/dev/null || echo "")
+    [[ "$RECEIPT_STATUS" == *1* || "$RECEIPT_STATUS" == *true* ]] \
+        || fail "autoclaim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
+    pass "L1 claim transaction succeeded (via autoclaim service)!"
+    L1_TOKEN_BAL_AFTER=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
+    L1_TOKEN_BAL_BEFORE_CLEAN=$(echo "$L1_TOKEN_BAL_BEFORE" | awk '{print $1}')
+    L1_TOKEN_BAL_AFTER_CLEAN=$(echo "$L1_TOKEN_BAL_AFTER" | awk '{print $1}')
+    L1_CHANGE=$(python3 -c "print(int('$L1_TOKEN_BAL_AFTER_CLEAN') - int('$L1_TOKEN_BAL_BEFORE_CLEAN'))")
+    log "L1 TestToken balance: $L1_TOKEN_BAL_BEFORE_CLEAN → $L1_TOKEN_BAL_AFTER_CLEAN (+$L1_CHANGE, autoclaimed)"
+    if [[ "$L1_CHANGE" != "$EXPECTED_L1_TOKENS" ]]; then
+        fail "L1 token balance change mismatch: got $L1_CHANGE, expected $EXPECTED_L1_TOKENS"
+    fi
+    pass "Dynamic ERC-20 bridge COMPLETE (L2→L1 via autoclaim service)!"
+    pass "  L1→L2: $BRIDGE_AMOUNT base units → $EXPECTED_L2_BALANCE Miden units"
+    pass "  L2→L1: $BRIDGE_OUT_AMOUNT Miden units → $EXPECTED_L1_TOKENS base units"
+    pass "  Faucet auto-created: $NEW_FAUCET_ID (symbol=TT, decimals=$TOKEN_DECIMALS)"
+    echo ""
+    log "======================================================================"
+    log "  DYNAMIC ERC-20 E2E TEST DONE"
+    log "======================================================================"
+    exit 0
+fi
 
 NETWORK_ID_VAL=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['network_id'])")
 PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEPOSIT_CNT&net_id=$NETWORK_ID_VAL")
