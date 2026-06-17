@@ -1,4 +1,4 @@
-FROM rustlang/rust:nightly-bookworm-slim AS builder
+FROM rustlang/rust:nightly-trixie-slim AS builder
 
 WORKDIR /usr/src/app
 
@@ -19,7 +19,7 @@ RUN \
     && cp target/release/miden-agglayer-service bin/miden-agglayer-service \
     && cp target/release/bridge-out-tool bin/bridge-out-tool
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
