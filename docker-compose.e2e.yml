@@ -206,6 +206,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Tag the built image so the bridge-autoclaim service can reuse it without a
+    # second build (the Rust auto-claimer ships in the same image).
+    image: miden-agglayer-e2e:latest
     restart: on-failure
     ports:
       - "8546:8546"
@@ -308,21 +311,39 @@ services:
         condition: service_healthy
 
   # ── L2->L1 auto-claimer ────────────────────────────────────────────────────
-  # Standalone zkevm-autoclaimer: polls the bridge-service for ready Miden L2->L1
-  # exits and sponsors claimAsset on L1 (Anvil), replacing the manual claim step.
-  # Same patched image as bridge-service.
+  # Our standalone Rust bridge-autoclaim (NOT the upstream zkevm-autoclaimer —
+  # Polygon declined the /pending-bridges fix). It discovers our rollup's exits
+  # from the proxy's own synthetic BridgeEvent (eth_getLogs), gates on the L1
+  # bridge's on-chain isClaimed, fetches proofs from the bridge-service GetClaim
+  # path (/merkle-proof), and sponsors claimAsset on L1 (Anvil). Ships in the
+  # same image as the proxy. See README "L2->L1 auto-claimer".
+  #
+  # SPONSOR_PRIVATE_KEY is injected via fixtures/.env (written by
+  # scripts/ensure-sponsor-key.sh, which decrypts claimsponsor.keystore); it is
+  # never a flag and never committed. BRIDGE_ADDRESS interpolates from
+  # --env-file fixtures/.env (== L1 bridge == the address stamped on synthetic
+  # BridgeEvents in this CDK deploy).
   bridge-autoclaim:
-    image: zkevm-bridge-service:v0.6.4-RC2-pendingbridges
-    entrypoint: ["/app/zkevm-autoclaimer"]
-    command: ["run", "--cfg", "/etc/zkevm/autoclaim-config.toml"]
-    volumes:
-      - ./fixtures/autoclaim-config.toml:/etc/zkevm/autoclaim-config.toml:ro
-      - ./fixtures/claimsponsor.keystore:/etc/zkevm/claimsponsor.keystore:ro
+    image: miden-agglayer-e2e:latest
+    restart: on-failure
+    env_file:
+      - ./fixtures/.env
+    entrypoint: ["bridge-autoclaim"]
+    command:
+      - "--l2-rpc-url=http://miden-agglayer:8546"
+      - "--l1-rpc-url=http://anvil:8545"
+      - "--bridge-address=${BRIDGE_ADDRESS}"
+      - "--bridge-service-url=http://bridge-service:8080"
+      - "--network-id=${NETWORK_ID:-1}"
+      - "--poll-interval-secs=5"
+      - "--cursor-db=/tmp/bridge-autoclaim-cursor.sqlite"
     depends_on:
       anvil:
         condition: service_healthy
       bridge-service:
         condition: service_started
+      miden-agglayer:
+        condition: service_healthy
 
   # ── AggLayer (certificate aggregation) ─────────────────────────────────────
   agglayer:

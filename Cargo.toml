@@ -20,6 +20,15 @@ path = "src/bin/bridge_out_tool.rs"
 name = "check-burn-root"
 path = "src/bin/check_burn_root.rs"
 
+# Standalone L2->L1 auto-claimer. Discovers our rollup's exits from the proxy's
+# own synthetic BridgeEvent (eth_getLogs), gates on the L1 bridge's on-chain
+# isClaimed, fetches proofs from the bridge-service GetClaim path
+# (/merkle-proof), and submits claimAsset on L1 with a sponsor wallet. See
+# README "L2->L1 auto-claimer" for the full design + decision record.
+[[bin]]
+name = "bridge-autoclaim"
+path = "src/bin/bridge_autoclaim.rs"
+
 [dev-dependencies]
 tempfile = "3.10"
 # Used only by `r5_oversize_error_matches_aggsender_parser` to mirror aggkit's
@@ -35,6 +44,14 @@ alloy = { features = [
   "eips",
   "k256",
   "signers",
+  # bridge-autoclaim signs L1 claimAsset txns with a local sponsor key:
+  # `signer-local` brings in `alloy::signers::local::PrivateKeySigner`,
+  # `provider-http` + `reqwest` the HTTP transport, `rpc-types` the
+  # TransactionReceipt status accessor.
+  "signer-local",
+  "provider-http",
+  "reqwest",
+  "rpc-types",
   "network",
 ], version = "1.5.2" }
 alloy-core = { features = ["sol-types"], version = "1.5.2" }

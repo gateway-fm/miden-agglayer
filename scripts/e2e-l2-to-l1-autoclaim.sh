@@ -2,9 +2,11 @@
 # L2→L1 bridge-out test — AUTO-CLAIM variant.
 #
 # Identical to e2e-l2-to-l1.sh through certificate settlement + bridge-service
-# sync, but instead of submitting claimAsset manually it asserts that the
-# standalone `bridge-autoclaim` service (zkevm-autoclaimer, patched image)
-# sponsors the claim on L1 by itself. Verifies the L1 recipient is funded.
+# sync, but instead of submitting claimAsset manually it asserts that our
+# standalone Rust `bridge-autoclaim` service sponsors the claim on L1 by itself.
+# Verifies the L1 recipient is credited the full bridged amount (sponsor pays
+# gas). The assertions are claimer-agnostic, so this script is unchanged from
+# the previous Go-autoclaimer wiring beyond this comment.
 #
 # Requires: stack up WITH the bridge-autoclaim service, and the wallet funded
 # from a prior L1→L2 deposit+claim (run `make e2e-l1-to-l2` first).

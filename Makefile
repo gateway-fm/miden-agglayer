@@ -258,8 +258,15 @@ e2e-l2-to-l1: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund wallet + run L2→
 e2e-l2-to-l1-best-effort: e2e-l1-to-l2 ## L2→L1 with extended timeout + miden-node crash detection (exits 2 on upstream miden-node v0.14.10 crash-loop, 1 on real regression)
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-best-effort.sh
 
+.PHONY: ensure-sponsor-key
+ensure-sponsor-key: ## Decrypt claimsponsor.keystore -> SPONSOR_PRIVATE_KEY in fixtures/.env (for the Rust bridge-autoclaim)
+	./scripts/ensure-sponsor-key.sh
+
 .PHONY: e2e-l2-to-l1-autoclaim
-e2e-l2-to-l1-autoclaim: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund + L2→L1 bridge-out claimed automatically by the bridge-autoclaim service
+# ensure-sponsor-key MUST precede e2e-l1-to-l2: the latter triggers e2e-up,
+# which starts the bridge-autoclaim service reading SPONSOR_PRIVATE_KEY from
+# fixtures/.env. Prerequisites are built left-to-right (serial make).
+e2e-l2-to-l1-autoclaim: ensure-sponsor-key e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund + L2→L1 bridge-out claimed automatically by the Rust bridge-autoclaim
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-autoclaim.sh
 
 .PHONY: e2e-restore

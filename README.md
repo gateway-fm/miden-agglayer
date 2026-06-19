@@ -95,6 +95,84 @@ note is built.
 [cantina-12]: src/claim.rs
 [accepts]: src/claim.rs
 
+## L2→L1 auto-claimer (`bridge-autoclaim`)
+
+`bridge-autoclaim` is a standalone binary (`src/bin/bridge_autoclaim.rs`,
+logic in `src/l2_to_l1_claimer.rs`) that closes the L2→L1 loop: it watches for
+withdrawals leaving our rollup and submits the matching `claimAsset` on L1 so
+users don't have to claim manually.
+
+### Why it isn't the upstream `zkevm-autoclaimer`
+
+The stock autoclaimer discovers work via the bridge-service `/pending-bridges`
+endpoint. That endpoint's already-claimed gate matches a recorded L1 claim on
+`(destination_network, leaf_index)` **only** — it drops the source rollup. On a
+shared agglayer rollup manager every rollup claims its L2→L1 exits on the *same*
+L1 bridge under `network_id = 0`, and per-rollup leaf indices overlap (every
+rollup has an exit `#23`). So once any co-tenant claims their `#23`, that single
+`(network=0, index=23)` row masks ours **forever**, and `/pending-bridges`
+returns zero rows for ready, unclaimed exits.
+
+The bug is in the bridge-service SQL and is present identically on upstream
+`v0.6.4-RC2`/`main`/`develop`. **Polygon declined to fix it** — they classify
+shared-manager L2→L1 auto-claiming as an "unsupported mode of operation" — so
+the patched-fork-image path is dead. This binary is the replacement.
+
+### How it sidesteps the bug
+
+1. **Discovery — the proxy's own `BridgeEvent` via `eth_getLogs`.** The proxy
+   emits a synthetic `BridgeEvent` for every B2AGG bridge-out it processes, and
+   it only ever processes *our* rollup's exits. Discovering from those logs is
+   rollup-scoped **by construction** — no co-tenant data is ever in scope, so
+   there's nothing to disambiguate and no `SourceNetworkID` knob to get wrong.
+2. **Already-claimed gate — on-chain `isClaimed`.** Each exit is gated on the L1
+   bridge's `isClaimed(leafIndex, sourceBridgeNetwork)`, which is rollup-
+   qualified and authoritative — structurally immune to the leaf-index
+   collision that poisons `/pending-bridges`.
+3. **Proofs — `/merkle-proof`.** Backed by the bridge-service `GetClaim` path,
+   which was always correctly rollup-qualified and never had the bug.
+4. **Submission — `claimAsset` on L1** with a sponsor wallet.
+
+Note `sourceBridgeNetwork` (the source *rollup* = our network id, e.g. 76) is
+distinct from the asset's `originNetwork` (0 for native ETH); and the agglayer
+`globalIndex` for our exits is `((network_id − 1) << 32) | leafIndex`.
+
+### Design decisions
+
+- **Readiness = attempt-and-retry (option b).** Implemented as a pre-flight
+  `eth_call` simulation of `claimAsset`. A not-yet-settled GER reverts with
+  `GlobalExitRootInvalid`; we classify that as transient and retry on the next
+  poll rather than burning gas on a doomed send. Only a clean simulation is
+  followed by a signed submission. (We deliberately did *not* pre-check the GER
+  via the GlobalExitRootManager — the simulation covers readiness *and* every
+  other revert reason in one call.)
+- **Idempotency = block cursor + on-chain `isClaimed`.** A tiny sqlite file
+  (`--cursor-db`) records the last L2 block scanned so a restart resumes instead
+  of re-scanning from genesis. It is **not** a claim ledger — the authoritative
+  double-spend guard is `isClaimed`, so the claimer is correct even if the
+  cursor is lost, reset, or rewound.
+- **Sponsor key = `--sponsor-key-env`.** The private key is read from the
+  environment variable *named* by that flag (default `SPONSOR_PRIVATE_KEY`),
+  which deployment populates from the secret store. The key is never a CLI flag
+  and is never logged. The sponsor EOA must hold L1 funds — it pays gas for
+  `claimAsset`.
+
+### Run
+
+```bash
+SPONSOR_PRIVATE_KEY=<from-secret-store> \
+bridge-autoclaim \
+  --l2-rpc-url http://localhost:8546 \
+  --l1-rpc-url http://localhost:8545 \
+  --bridge-address 0x<bridge> \
+  --bridge-service-url http://localhost:18080 \
+  --network-id 1
+```
+
+All flags also read from env (`L2_RPC_URL`, `L1_RPC_URL`, `BRIDGE_ADDRESS`,
+`BRIDGE_SERVICE_URL`, `NETWORK_ID`, `POLL_INTERVAL_SECS`, `MAX_RANGE`,
+`START_BLOCK`, `CURSOR_DB`, `SPONSOR_KEY_ENV`).
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs) (1.90+, nightly for Docker builds)
