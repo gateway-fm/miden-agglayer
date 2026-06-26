@@ -5,7 +5,9 @@
 # Keeps the external-prover MIDEN_PROVER_URL change in docker-compose.e2e.yml.
 set -uo pipefail
 
-cd /home/max/github/gateway/miden/miden-agglayer
+# Run from the repo root (this script's own directory), so the matrix is
+# portable across checkouts instead of pinned to one contributor's path.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Protocol 0.15.x: node repo renamed 0xMiden/miden-node -> 0xMiden/node. Pinned
 # to the v0.15.0 tag, which builds against base crates 0.15.3 (matching our
@@ -13,7 +15,9 @@ cd /home/max/github/gateway/miden/miden-agglayer
 # values win; kept here in sync.
 export MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
 export MIDEN_NODE_GIT_REF="v0.15.0"
-export PATH="/home/max/.local/bin:/home/max/.foundry/bin:$PATH"
+# Prefer locally-installed foundry/node/etc; keep the contributor dirs as
+# fallbacks if present.
+export PATH="/usr/local/bin:$HOME/.local/bin:$HOME/.foundry/bin:$PATH"
 
 OUT=out
 mkdir -p "$OUT"

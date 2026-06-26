@@ -70,6 +70,13 @@ $KURTOSIS service exec "$ENCLAVE" contracts-001 'cat /opt/keystores/aggoracle.ke
     > "$FIXTURES_DIR/aggoracle.keystore"
 $KURTOSIS service exec "$ENCLAVE" contracts-001 'cat /opt/keystores/aggregator.keystore' 2>/dev/null \
     > "$FIXTURES_DIR/aggregator.keystore"
+# The aggsender signs L2->L1 certificates with the sequencer key — that address
+# is the one registered in the rollup's on-chain aggchain signer committee, and
+# aggkit requires the cert proposer to equal committee[0]. Without this keystore
+# the aggsender falls back to the aggoracle key and every cert is rejected with
+# "expected proposer ... to be the first member of the validator committee".
+$KURTOSIS service exec "$ENCLAVE" contracts-001 'cat /opt/keystores/sequencer.keystore' 2>/dev/null \
+    > "$FIXTURES_DIR/sequencer.keystore"
 
 # ── Step 3: Parse contract addresses from combined.json ──────────────────────
 
@@ -203,7 +210,13 @@ FinalizedGEREnabled = true
         MaxConns = 20
 
 [NetworkConfig]
-L1GenBlockNumber = $l1GenBlockNumber
+# Anvil replays the L1 deployment from genesis (scripts/replay-txs.sh), so the
+# first bridge deposit (depositCount 0, emitted during CDK sovereign-contract
+# setup) lands in an early anvil block — well before the original kurtosis
+# $l1GenBlockNumber. The bridge-service must sync from block 1 to ingest deposit
+# 0; starting later makes it reject the next deposit with "mismatched deposit
+# count: N, expected: 0" and the bridge tree never builds.
+L1GenBlockNumber = 1
 L2GenBlockNumbers = [0]
 PolygonBridgeAddress = "$polygonZkEVMBridgeAddress"
 PolygonZkEVMGlobalExitRootAddress = "$polygonZkEVMGlobalExitRootAddress"
@@ -317,9 +330,26 @@ AggchainProofURL = ""
 SequencerPrivateKeyPath = "/etc/aggkit/aggoracle.keystore"
 SequencerPrivateKeyPassword = "$KEYSTORE_PASSWORD"
 
+# Anvil replays the L1 deployment txs from genesis (see scripts/replay-txs.sh),
+# so the contracts land in the first few anvil blocks — NOT at the original
+# kurtosis deployment height ($deploymentRollupManagerBlockNumber). These three
+# fields have OPPOSITE requirements in aggkit:
+#
+#   * rollupManagerCreationBlockNumber + genesisBlockNumber are event-scan START
+#     blocks (Initialized-event scan / L1InfoTreeSync). They must be <= the anvil
+#     deploy block (~4), else aggkit crashes with "no Initialized events found".
+#     Use 1 (>0, since aggkit rejects 0, and below the first deployment tx).
+#
+#   * rollupCreationBlockNumber is the HISTORICAL block at which aggsender calls
+#     RollupManager.rollupIDToRollupData (aggsender/query/ler_query.go ->
+#     RollupCreationBlockL1 -> l1GenesisBlock). It must be >= the anvil deploy
+#     block, or the call fails with "no contract code at given address" and no
+#     L2->L1 certificate can ever be built. The original kurtosis height works:
+#     anvil mines well past it (replay + anvil_mine 50, then 1s blocks) and the
+#     RollupManager has code there.
 rollupCreationBlockNumber = $deploymentRollupManagerBlockNumber
-rollupManagerCreationBlockNumber = $deploymentRollupManagerBlockNumber
-genesisBlockNumber = $deploymentRollupManagerBlockNumber
+rollupManagerCreationBlockNumber = 1
+genesisBlockNumber = 1
 
 [Log]
 Level = "info"
@@ -361,7 +391,11 @@ URL = "http://miden-agglayer:8546"
 L1ChainID = 2
 
 [AggSender]
-AggSenderPrivateKey = {Path = "/etc/aggkit/aggoracle.keystore", Password = "$KEYSTORE_PASSWORD"}
+# Sign certs with the sequencer key (== on-chain aggchain committee member);
+# field is `AggsenderPrivateKey` (SignerConfig) and REQUIRES Method="local",
+# else the signer silently falls back to SequencerPrivateKeyPath (aggoracle) and
+# the cert is rejected at the committee proposer==committee[0] check.
+AggsenderPrivateKey = {Method = "local", Path = "/etc/aggkit/sequencer.keystore", Password = "$KEYSTORE_PASSWORD"}
 Mode = "PessimisticProof"
 CheckStatusCertificateInterval = "1s"
 TriggerCertMode = "ASAP"
@@ -400,7 +434,8 @@ SyncFromInBridges = "false"
 FinalizedBlock = "LatestBlock"
 
 [L1InfoTreeSync]
-InitialBlock = $deploymentRollupManagerBlockNumber
+# Anvil replays from genesis (see above) — sync the L1 info tree from block 1.
+InitialBlock = 1
 
 [L2GERSync]
 BlockFinality = "LatestBlock"

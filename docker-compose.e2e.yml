@@ -374,6 +374,11 @@ services:
     volumes:
       - ./fixtures/aggkit-config.toml:/etc/aggkit/config.toml:ro
       - ./fixtures/aggoracle.keystore:/etc/aggkit/aggoracle.keystore:ro
+      # aggsender signs L2->L1 certs with the sequencer key, which is the address
+      # registered in the rollup's on-chain aggchain signer committee (threshold
+      # 1). aggkit requires the cert proposer == committee[0], so the AggSender
+      # key MUST be the sequencer (aggoracle is kept for L1->L2 GER injection).
+      - ./fixtures/sequencer.keystore:/etc/aggkit/sequencer.keystore:ro
     depends_on:
       anvil:
         condition: service_healthy
