@@ -240,6 +240,14 @@ BRIDGE_OUT_AMOUNT=$((BALANCE / 2))
 EXPECTED_L1_TOKENS=$((BRIDGE_OUT_AMOUNT * WEI_PER_MIDEN_UNIT))
 log "Step 6/7: Bridging $BRIDGE_OUT_AMOUNT Miden units back to L1..."
 
+# Snapshot the L1 recipient balance BEFORE the exit exists. The bridge-autoclaim
+# service claims as soon as the certificate settles (often within ~1s), which
+# races a snapshot taken after the bridge-out — capturing here (no exit yet, so
+# definitively pre-claim) makes the delta equal the bridged amount regardless of
+# how fast the autoclaimer fires.
+L1_TOKEN_BAL_BEFORE=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
+log "L1 TestToken balance before bridge-out: $L1_TOKEN_BAL_BEFORE"
+
 docker exec $AGGLAYER_CONTAINER bridge-out-tool \
     --store-dir /var/lib/miden-agglayer-service \
     --node-url http://miden-node:57291 \
@@ -257,10 +265,6 @@ pass "BridgeEvent emitted for TestToken bridge-out"
 
 # Wait for certificate settlement
 log "Step 7/7: Waiting for certificate settlement on L1..."
-
-# Get L1 token balance before claim
-L1_TOKEN_BAL_BEFORE=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
-log "L1 TestToken balance before claim: $L1_TOKEN_BAL_BEFORE"
 
 wait_for "certificate settled" \
     "docker logs $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
