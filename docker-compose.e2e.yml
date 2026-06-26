@@ -154,6 +154,14 @@ services:
       - miden-remote-prover
       - --kind=transaction
       - --port=50051
+      # The prover serves one proof at a time and rejects (not queues) excess
+      # requests once `capacity` permits are taken — try_acquire => immediate
+      # "proof queue is full". The default of 1 is too low here: the proxy (GER
+      # notes + claims), the ntx-builder (B2AGG consumption) and the sequencer
+      # (block proving) all hit this single prover concurrently, so a GER
+      # injection gets rejected mid-deposit and the deposit never becomes
+      # claimable. Allow requests to queue instead of failing.
+      - --capacity=16
 
   # The sequencer is the RPC the proxy + aggkit talk to. Named `miden-node` so
   # the existing `--miden-node=http://miden-node:57291` wiring is unchanged.

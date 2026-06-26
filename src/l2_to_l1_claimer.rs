@@ -45,6 +45,7 @@
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::eips::BlockNumberOrTag;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
@@ -325,22 +326,29 @@ impl CursorStore {
 
 // ─── I/O ──────────────────────────────────────────────────────────────────
 
-/// Discover our rollup's L2→L1 asset exits in `[from, to]` from the proxy's
-/// synthetic `BridgeEvent` logs.
+/// Discover our rollup's L2→L1 asset exits from block `from` onward, from the
+/// proxy's synthetic `BridgeEvent` logs.
+///
+/// The upper bound is the `latest` tag, NOT `eth_blockNumber`: the proxy's
+/// `eth_blockNumber` mirror can lag the synthetic-log tip (it is advanced by
+/// some write paths but not the bridge-out synthetic-log path), while
+/// `eth_getLogs` with the `latest` tag is resolved against the true tip. Bounding
+/// by `eth_blockNumber` made `discover` miss every bridge-out whose
+/// (Miden-derived) block number exceeded the lagging head — so no exit was ever
+/// claimed.
 async fn discover<P: Provider>(
     l2: &P,
     bridge_address: Address,
     from: u64,
-    to: u64,
 ) -> anyhow::Result<Vec<PendingExit>> {
     let filter = Filter::new()
         .address(bridge_address)
         .from_block(from)
-        .to_block(to)
+        .to_block(BlockNumberOrTag::Latest)
         .event_signature(BridgeEvent::SIGNATURE_HASH);
 
     let logs = l2.get_logs(&filter).await?;
-    tracing::debug!(from, to, %bridge_address, raw_logs = logs.len(), "discover: get_logs returned");
+    tracing::debug!(from, %bridge_address, raw_logs = logs.len(), "discover: get_logs returned");
     let mut out = Vec::new();
     for log in logs {
         let block = log.block_number.unwrap_or(0);
@@ -435,6 +443,14 @@ async fn submit<P: Provider>(
 }
 
 /// Process one exit end-to-end: gate on isClaimed, fetch proof, simulate, submit.
+///
+/// Returns `true` when the exit is RESOLVED (claimed now, already claimed, or a
+/// permanent failure we won't keep retrying) so the caller may advance the block
+/// cursor past it; `false` when it is merely NOT-READY-YET (proof not synced /
+/// GER not settled on L1) and must be re-discovered on a later poll. The caller
+/// holds the cursor below any not-ready exit so re-discovery actually happens —
+/// advancing unconditionally would skip the block forever and the exit would
+/// never be claimed.
 async fn process_exit<P1: Provider, P2: Provider>(
     l1: &P1,
     _l2: &P2,
@@ -442,12 +458,12 @@ async fn process_exit<P1: Provider, P2: Provider>(
     cfg: &ClaimerConfig,
     sponsor: Address,
     exit: &PendingExit,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let src_net = source_bridge_network(cfg.network_id);
 
     if is_claimed(l1, cfg.bridge_address, exit.leaf_index, src_net).await? {
         tracing::debug!(leaf = exit.leaf_index, "already claimed on L1; skipping");
-        return Ok(());
+        return Ok(true);
     }
 
     let proof = match fetch_proof(http, &cfg.bridge_service_url, exit.leaf_index, cfg.network_id).await
@@ -455,16 +471,16 @@ async fn process_exit<P1: Provider, P2: Provider>(
         Ok(p) => p,
         Err(e) => {
             // The exit was discovered from the proxy's log, but the
-            // bridge-service may not have synced/derived its proof yet. Treat
-            // as transient: re-tried on the next poll.
+            // bridge-service may not have synced/derived its proof yet. Not
+            // ready: hold the cursor so we re-discover it next poll.
             tracing::info!(leaf = exit.leaf_index, error = %e, "merkle-proof not available yet; will retry");
-            return Ok(());
+            return Ok(false);
         }
     };
 
     let call = build_claim_call(exit, &proof, cfg.network_id);
 
-    match simulate(l1, cfg.bridge_address, sponsor, &call).await {
+    let resolved = match simulate(l1, cfg.bridge_address, sponsor, &call).await {
         Readiness::Ready => {
             let tx = submit(l1, cfg.bridge_address, &call).await?;
             tracing::info!(
@@ -475,20 +491,25 @@ async fn process_exit<P1: Provider, P2: Provider>(
                 "claimed L2->L1 exit on L1"
             );
             metrics::counter!("bridge_autoclaim_claims_total").increment(1);
+            true
         }
         Readiness::NotReadyRetry => {
             tracing::info!(leaf = exit.leaf_index, "GER not settled yet; will retry next poll");
             metrics::counter!("bridge_autoclaim_not_ready_total").increment(1);
+            false
         }
         Readiness::AlreadyClaimed => {
             tracing::debug!(leaf = exit.leaf_index, "simulation says already claimed; skipping");
+            true
         }
         Readiness::Permanent(err) => {
-            tracing::error!(leaf = exit.leaf_index, error = %err, "claim simulation failed permanently; skipping this poll");
+            // Doomed: advance past it rather than re-scanning every poll forever.
+            tracing::error!(leaf = exit.leaf_index, error = %err, "claim simulation failed permanently; skipping");
             metrics::counter!("bridge_autoclaim_permanent_failures_total").increment(1);
+            true
         }
-    }
-    Ok(())
+    };
+    Ok(resolved)
 }
 
 /// Run the claimer poll loop until cancelled (Ctrl-C / SIGTERM).
@@ -556,30 +577,49 @@ async fn poll_once<P1: Provider, P2: Provider>(
     cursor: &CursorStore,
     last_processed: &mut u64,
 ) -> anyhow::Result<()> {
-    let head = l2.get_block_number().await?;
-    tracing::debug!(head, last_processed = *last_processed, "poll_once: l2 head");
-    if head <= *last_processed {
-        return Ok(());
-    }
     let from = *last_processed + 1;
-    let to = head.min(from + cfg.max_range - 1);
-
-    let exits = discover(l2, cfg.bridge_address, from, to).await?;
+    // Scan to the `latest` tag (see `discover`): the proxy's `eth_blockNumber`
+    // can lag the synthetic-log tip, so a numeric head bound would skip exits.
+    let exits = discover(l2, cfg.bridge_address, from).await?;
     if !exits.is_empty() {
-        tracing::info!(from, to, count = exits.len(), "discovered L2->L1 exits");
+        tracing::info!(from, count = exits.len(), "discovered L2->L1 exits");
     }
+    // Track the lowest block of any exit that is NOT yet resolved (proof not
+    // synced / GER not settled / transient RPC error) — the cursor must not pass
+    // it or that block is never re-scanned and the exit is never claimed — and
+    // the highest block we DID resolve, so we can advance past settled work.
+    let mut retry_from: Option<u64> = None;
+    let mut max_resolved: u64 = *last_processed;
     for exit in &exits {
-        if let Err(e) = process_exit(l1, l2, http, cfg, sponsor, exit).await {
-            // Don't let one bad exit wedge the cursor; log and continue. It'll
-            // be re-discovered until isClaimed flips (which is idempotent).
-            tracing::warn!(leaf = exit.leaf_index, error = %e, "failed to process exit");
-            metrics::counter!("bridge_autoclaim_exit_errors_total").increment(1);
+        let resolved = match process_exit(l1, l2, http, cfg, sponsor, exit).await {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                // Transient error (e.g. RPC) — treat as not-ready and retry.
+                tracing::warn!(leaf = exit.leaf_index, error = %e, "failed to process exit");
+                metrics::counter!("bridge_autoclaim_exit_errors_total").increment(1);
+                false
+            }
+        };
+        if resolved {
+            max_resolved = max_resolved.max(exit.block_number);
+        } else {
+            retry_from = Some(retry_from.map_or(exit.block_number, |b| b.min(exit.block_number)));
         }
     }
 
-    *last_processed = to;
-    if let Err(e) = cursor.set(to) {
-        tracing::warn!(error = %e, cursor = to, "failed to persist cursor; continuing in-memory");
+    // Advance only up to (but not past) the first not-ready exit, so it is
+    // re-discovered next poll; otherwise advance past everything we resolved.
+    // Never move backwards (no logs / all not-ready => cursor stays put and the
+    // range is cheaply re-scanned; isClaimed makes re-processing idempotent).
+    let new_cursor = match retry_from {
+        Some(b) => b.saturating_sub(1).max(*last_processed),
+        None => max_resolved,
+    };
+    if new_cursor > *last_processed {
+        *last_processed = new_cursor;
+        if let Err(e) = cursor.set(new_cursor) {
+            tracing::warn!(error = %e, cursor = new_cursor, "failed to persist cursor; continuing in-memory");
+        }
     }
     Ok(())
 }
