@@ -372,7 +372,11 @@ async fn main() -> anyhow::Result<()> {
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
-            Err(e) => return Err(anyhow!("submit failed after {SUBMIT_ATTEMPTS} attempts: {e}")),
+            Err(e) => {
+                return Err(anyhow!(
+                    "submit failed after {SUBMIT_ATTEMPTS} attempts: {e}"
+                ));
+            }
         }
     }
     let tx_id = tx_id.expect("loop either sets tx_id or returns");

@@ -59,7 +59,7 @@ L1ChainID = 2
 # proposer to equal committee[0]. Field is `AggsenderPrivateKey` (SignerConfig)
 # and REQUIRES Method="local"; otherwise the signer silently falls back to
 # SequencerPrivateKeyPath (aggoracle) -> "expected proposer ... first member".
-AggsenderPrivateKey = {Method = "local", Path = "/etc/aggkit/sequencer.keystore", Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"}
+AggsenderPrivateKey = { Method = "local", Path = "/etc/aggkit/sequencer.keystore", Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m" }
 Mode = "PessimisticProof"
 RollupCreationBlockL1 = 90
 CheckStatusCertificateInterval = "1s"

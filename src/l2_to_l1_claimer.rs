@@ -43,9 +43,9 @@
 //!   named environment variable (populated from the secret store in
 //!   deployment); it is never a CLI flag and never logged.
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
-use alloy::eips::BlockNumberOrTag;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
@@ -119,7 +119,11 @@ pub struct ClaimerConfig {
 /// For an L2→L1 exit the source is a rollup, so `mainnet = false` and
 /// `rollup_index = network_id - 1`.
 pub fn global_index(mainnet: bool, rollup_index: u32, leaf_index: u32) -> U256 {
-    let flag = if mainnet { U256::from(1u64) << 64 } else { U256::ZERO };
+    let flag = if mainnet {
+        U256::from(1u64) << 64
+    } else {
+        U256::ZERO
+    };
     flag | (U256::from(rollup_index) << 32) | U256::from(leaf_index)
 }
 
@@ -308,7 +312,9 @@ impl CursorStore {
     pub fn get(&self) -> anyhow::Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         let v: Option<i64> = conn
-            .query_row("SELECT last_block FROM cursor WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT last_block FROM cursor WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .ok();
         Ok(v.map(|n| n as u64))
     }
@@ -381,7 +387,11 @@ async fn is_claimed<P: Provider>(
         sourceBridgeNetwork: source_network,
     };
     let ret = l1
-        .call(TransactionRequest::default().to(bridge).input(call.abi_encode().into()))
+        .call(
+            TransactionRequest::default()
+                .to(bridge)
+                .input(call.abi_encode().into()),
+        )
         .await?;
     // bool return is a 32-byte word; non-zero == true.
     Ok(ret.iter().any(|b| *b != 0))
@@ -437,7 +447,10 @@ async fn submit<P: Provider>(
     let pending = l1.send_transaction(tx).await?;
     let receipt = pending.get_receipt().await?;
     if !receipt.status() {
-        anyhow::bail!("claimAsset tx {} reverted on-chain", receipt.transaction_hash);
+        anyhow::bail!(
+            "claimAsset tx {} reverted on-chain",
+            receipt.transaction_hash
+        );
     }
     Ok(receipt.transaction_hash)
 }
@@ -466,7 +479,13 @@ async fn process_exit<P1: Provider, P2: Provider>(
         return Ok(true);
     }
 
-    let proof = match fetch_proof(http, &cfg.bridge_service_url, exit.leaf_index, cfg.network_id).await
+    let proof = match fetch_proof(
+        http,
+        &cfg.bridge_service_url,
+        exit.leaf_index,
+        cfg.network_id,
+    )
+    .await
     {
         Ok(p) => p,
         Err(e) => {
@@ -494,12 +513,18 @@ async fn process_exit<P1: Provider, P2: Provider>(
             true
         }
         Readiness::NotReadyRetry => {
-            tracing::info!(leaf = exit.leaf_index, "GER not settled yet; will retry next poll");
+            tracing::info!(
+                leaf = exit.leaf_index,
+                "GER not settled yet; will retry next poll"
+            );
             metrics::counter!("bridge_autoclaim_not_ready_total").increment(1);
             false
         }
         Readiness::AlreadyClaimed => {
-            tracing::debug!(leaf = exit.leaf_index, "simulation says already claimed; skipping");
+            tracing::debug!(
+                leaf = exit.leaf_index,
+                "simulation says already claimed; skipping"
+            );
             true
         }
         Readiness::Permanent(err) => {
@@ -514,10 +539,11 @@ async fn process_exit<P1: Provider, P2: Provider>(
 
 /// Run the claimer poll loop until cancelled (Ctrl-C / SIGTERM).
 pub async fn run(cfg: ClaimerConfig) -> anyhow::Result<()> {
-    let signer: PrivateKeySigner = cfg
-        .sponsor_key
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid sponsor private key (from --sponsor-key-env); refusing to log the value"))?;
+    let signer: PrivateKeySigner = cfg.sponsor_key.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid sponsor private key (from --sponsor-key-env); refusing to log the value"
+        )
+    })?;
     let sponsor = signer.address();
     let wallet = EthereumWallet::from(signer);
 
@@ -559,7 +585,8 @@ pub async fn run(cfg: ClaimerConfig) -> anyhow::Result<()> {
             _ = ticker.tick() => {}
         }
 
-        if let Err(e) = poll_once(&l1, &l2, &http, &cfg, sponsor, &cursor, &mut last_processed).await
+        if let Err(e) =
+            poll_once(&l1, &l2, &http, &cfg, sponsor, &cursor, &mut last_processed).await
         {
             tracing::warn!(error = %e, last_processed, "poll failed; retrying next tick");
             metrics::counter!("bridge_autoclaim_poll_errors_total").increment(1);
@@ -664,15 +691,24 @@ mod tests {
     #[test]
     fn classify_ger_not_settled_is_retry() {
         // By decoded name...
-        assert_eq!(classify_revert("execution reverted: GlobalExitRootInvalid()"), Readiness::NotReadyRetry);
+        assert_eq!(
+            classify_revert("execution reverted: GlobalExitRootInvalid()"),
+            Readiness::NotReadyRetry
+        );
         // ...and by raw selector hex.
-        let sel = format!("reverted, data: \"{}\"", selector_hex::<GlobalExitRootInvalid>());
+        let sel = format!(
+            "reverted, data: \"{}\"",
+            selector_hex::<GlobalExitRootInvalid>()
+        );
         assert_eq!(classify_revert(&sel), Readiness::NotReadyRetry);
     }
 
     #[test]
     fn classify_already_claimed() {
-        assert_eq!(classify_revert("AlreadyClaimed()"), Readiness::AlreadyClaimed);
+        assert_eq!(
+            classify_revert("AlreadyClaimed()"),
+            Readiness::AlreadyClaimed
+        );
         let sel = selector_hex::<AlreadyClaimed>();
         assert_eq!(classify_revert(&sel), Readiness::AlreadyClaimed);
     }
@@ -700,7 +736,9 @@ mod tests {
 
     #[test]
     fn parse_smt_array_rejects_over_32() {
-        let arr: Vec<String> = (0..33).map(|_| "0x".to_string() + &"00".repeat(32)).collect();
+        let arr: Vec<String> = (0..33)
+            .map(|_| "0x".to_string() + &"00".repeat(32))
+            .collect();
         assert!(parse_smt_array(&arr).is_err());
     }
 

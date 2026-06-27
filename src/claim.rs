@@ -331,8 +331,7 @@ async fn create_claim(
     // CLAIM notes now target the bridge account (0.14.x). The bridge validates the proof and
     // produces a MINT note targeted at the faucet. The faucet then creates the final P2ID note
     // for the destination wallet (derived from leaf_data.destination_address).
-    let note =
-        miden_base_agglayer::ClaimNote::create(storage, accounts.bridge.0, sender, rng)?;
+    let note = miden_base_agglayer::ClaimNote::create(storage, accounts.bridge.0, sender, rng)?;
     Ok(note)
 }
 

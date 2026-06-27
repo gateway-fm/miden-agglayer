@@ -97,8 +97,12 @@ async fn add_bridge(
     // creation (was a hardcoded MASM constant pre-0.15.3). Must match the id the
     // L1 RollupManager assigns this rollup, or claims fail destination-network
     // checks on both ends.
-    let account =
-        create_bridge_account(client.rng().draw_word(), service_id, ger_manager_id, network_id);
+    let account = create_bridge_account(
+        client.rng().draw_word(),
+        service_id,
+        ger_manager_id,
+        network_id,
+    );
     client.add_account(&account, false).await?;
 
     deploy_account(client, account.id(), "bridge").await?;
@@ -175,8 +179,14 @@ async fn add_accounts(
     let service = add_wallet(client, keystore.clone()).await?;
     let ger_manager = add_wallet(client, keystore.clone()).await?;
     deploy_account(client, ger_manager.id(), "ger_manager").await?;
-    let bridge =
-        add_bridge(client, keystore.clone(), service.id(), ger_manager.id(), network_id).await?;
+    let bridge = add_bridge(
+        client,
+        keystore.clone(),
+        service.id(),
+        ger_manager.id(),
+        network_id,
+    )
+    .await?;
     // ETH: 18 origin decimals → 8 miden decimals (scale=10). Native ETH has empty metadata on
     // the L1 bridge, so the faucet's stored metadata_hash is keccak256("") — matches any
     // CLAIM leaf_data.metadata_hash for ETH deposits.

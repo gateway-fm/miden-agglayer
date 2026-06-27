@@ -418,8 +418,13 @@ async fn main() -> anyhow::Result<()> {
                 command.network_id
             )
         })?;
-        let config_path =
-            init::init(&init_client, init_net_id, init_network_id, miden_store_dir.clone()).await?;
+        let config_path = init::init(
+            &init_client,
+            init_net_id,
+            init_network_id,
+            miden_store_dir.clone(),
+        )
+        .await?;
         tracing::info!("new config created at {config_path:?}");
 
         init_client.shutdown()?;

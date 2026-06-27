@@ -33,8 +33,8 @@ pub async fn create_and_register_faucet(
     bridge_id: AccountId,
     metadata_hash: MetadataHash,
 ) -> anyhow::Result<Account> {
-    let max_supply = Felt::new(u64::from(FungibleAsset::MAX_AMOUNT))
-        .expect("value is a valid field element");
+    let max_supply =
+        Felt::new(u64::from(FungibleAsset::MAX_AMOUNT)).expect("value is a valid field element");
     let origin_addr = EthAddress::new(*origin_token_address);
 
     // Protocol 0.15: the faucet no longer stores conversion metadata. `create_agglayer_faucet`

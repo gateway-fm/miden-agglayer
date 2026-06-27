@@ -67,7 +67,11 @@ struct Args {
     start_block: Option<u64>,
 
     /// Path to the sqlite cursor file.
-    #[arg(long, env = "CURSOR_DB", default_value = "bridge-autoclaim-cursor.sqlite")]
+    #[arg(
+        long,
+        env = "CURSOR_DB",
+        default_value = "bridge-autoclaim-cursor.sqlite"
+    )]
     cursor_db: String,
 }
 
@@ -91,7 +95,10 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     if sponsor_key.trim().is_empty() {
-        anyhow::bail!("sponsor private key env var '{}' is empty", args.sponsor_key_env);
+        anyhow::bail!(
+            "sponsor private key env var '{}' is empty",
+            args.sponsor_key_env
+        );
     }
 
     let bridge_address = args
