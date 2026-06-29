@@ -8,11 +8,77 @@ on:
 permissions:
   contents: read
 
+# Multi-arch (linux/amd64 + linux/arm64) build. Each arch builds natively on its
+# own GitHub-hosted runner (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm —
+# free for this public repo), pushes by digest, then a merge job assembles the
+# multi-arch manifest under the `:{version}` tag. Native runners avoid the very
+# slow QEMU emulation of the Rust + RocksDB build.
 jobs:
-  docker:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (labels only)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: gatewayfm/miden-agglayer
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          outputs: type=image,name=gatewayfm/miden-agglayer,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Normalise platform name for artifact
+        run: echo "PAIR=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
@@ -27,34 +93,24 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: gatewayfm/miden-agglayer
-          # `latest=false` is load-bearing. docker/metadata-action defaults to
-          # `flavor: latest=auto`, which AUTO-appends a moving `:latest` tag for
-          # any semver git-tag push — independent of the `tags:` list below.
-          # That auto-`:latest` (NOT the `tags:` list) is what kept failing
-          # every release against Docker Hub tag-immutability, including v0.5.0:
-          # buildx pushed `:{version}` fine, then was denied on `:latest`. The
-          # earlier "drop :latest" edits only touched `tags:`, so the auto-flavor
-          # silently re-added it. Disabling the flavor is the actual fix.
+          # `latest=false` is load-bearing — see history below. Docker Hub has
+          # tag-immutability enabled, so any *moving* tag (`:latest`,
+          # `:{major}.{minor}`) fails on the second release that tries to update
+          # it. Only the exact `:{version}` tag is pushed. metadata-action
+          # defaults to `flavor: latest=auto`, which auto-appends `:latest` for
+          # a semver tag push independent of the `tags:` list; that auto-flavor
+          # (not `tags:`) killed v0.2.0–v0.5.0. Disabling the flavor is the fix.
           flavor: |
             latest=false
           tags: |
             type=semver,pattern={{version}}
-          # NOTE: Only the exact `:{version}` tag is pushed. The Docker Hub
-          # repository has tag-immutability enabled across the board, so
-          # any *moving* tag fails on the second release that tries to
-          # update it. `:latest` killed v0.2.0, v0.2.1, v0.3.0, v0.4.0,
-          # v0.4.1, v0.4.2, and v0.5.0; `:{major}.{minor}` (e.g. `:0.4`)
-          # also failed. If a moving pointer is ever wanted, remove the
-          # immutability rule on Docker Hub first, then re-add the
-          # corresponding `type=raw` / `type=semver` entry here AND flip
-          # `flavor: latest` back on.
 
-      - name: Build and push
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create multi-arch manifest and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'gatewayfm/miden-agglayer@sha256:%s ' *)
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect gatewayfm/miden-agglayer:${{ steps.meta.outputs.version }}
