@@ -1,4 +1,4 @@
-FROM rustlang/rust:nightly-bookworm-slim AS builder
+FROM rustlang/rust:nightly-trixie-slim AS builder
 
 WORKDIR /usr/src/app
 
@@ -20,7 +20,7 @@ RUN \
     && cp target/release/bridge-out-tool bin/bridge-out-tool \
     && cp target/release/bridge-autoclaim bin/bridge-autoclaim
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \

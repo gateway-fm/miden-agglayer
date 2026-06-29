@@ -26,7 +26,7 @@
 ARG MIDEN_NODE_GIT_URL
 ARG MIDEN_NODE_GIT_REF
 
-FROM rust:1.93-slim-bookworm AS builder
+FROM rust:1.93-slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -63,7 +63,7 @@ RUN cargo build --release --bin miden-node
 RUN cp -r crates/store/src/genesis/config/samples /tmp/genesis-samples
 
 # Runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 COPY --from=builder /tmp/miden-node-commit.txt /app/miden-node-commit.txt
 COPY --from=builder /tmp/genesis-samples /app/genesis-samples
