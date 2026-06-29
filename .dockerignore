@@ -1,0 +1,11 @@
+# Runtime + build artefacts that must never enter the proxy image build context.
+# .miden-agglayer-data holds a root-owned keystore (created by the proxy
+# container) that the unprivileged build daemon cannot read — including it
+# fails the build with "permission denied".
+.miden-agglayer-data/
+target/
+out/
+cache/
+node-0.15/
+*.log
+.git/

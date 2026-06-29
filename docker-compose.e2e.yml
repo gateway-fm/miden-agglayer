@@ -58,41 +58,165 @@ services:
   # service is intentionally removed — its replacement embeds the SQL via
   # `include_str!` into the binary so the proxy and its schema cannot drift.
 
-  # ── L2 Chain (Miden node in bundled mode) ──────────────────────────────────
-  # Built from `0xMiden/miden-node` (production binary), NOT the testing
-  # harness in miden-client. See Dockerfile.miden-node + Makefile's
-  # MIDEN_NODE_GIT_{URL,REF} for the agglayer-genesis rationale.
+  # ── L2 Chain (Miden node — protocol 0.15 microservice topology) ─────────────
+  # Protocol 0.15 decomposed the all-in-one `bundled` node into separate
+  # services (mirrors 0xMiden/node's own docker-compose.yml):
+  #   validator    — genesis bootstrap + block signing (:50101)
+  #   sequencer    — block production + public RPC (:57291)  [service `miden-node`]
+  #   ntx-builder  — consumes network-account notes, i.e. the agglayer bridge's
+  #                  CLAIM/CONFIG notes, and submits them as network txs (:50301)
+  #   tx-prover    — remote transaction prover (:50051)
+  # Images are built from 0xMiden/node @ the rev pinned in the Makefile by
+  # `make e2e-build-node` (tags: miden-node / miden-validator / miden-ntx-builder
+  # / miden-remote-prover). Genesis is bootstrapped from our vendored agglayer
+  # config (fixtures/genesis/02-with-account-files.toml → bridge + ETH/USDC
+  # faucets); the bridge is deployed but left UNCONFIGURED — faucet registration
+  # happens at runtime via the proxy's CONFIG_AGG_BRIDGE note.
+  #
+  # The ntx-builder authorises network-tx submission to the sequencer with a
+  # shared secret that MUST match on both sides (sequencer
+  # --rpc.network-tx-auth-header-value == ntx-builder --rpc.auth-header-value),
+  # else network txs are rejected with "Network transactions may not be
+  # submitted by users yet". The proxy submits ordinary user txs and needs no
+  # such header.
+
+  node-bootstrap-validator:
+    image: miden-validator
+    volumes:
+      - node_data:/data
+      - ./fixtures/genesis:/genesis:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -f /data/validator/.bootstrapped ]; then echo "validator already bootstrapped"; exit 0; fi
+        rm -rf /data/genesis /data/validator /data/accounts
+        mkdir -p /data/genesis /data/validator /data/accounts
+        miden-validator bootstrap \
+          --data-directory /data/validator \
+          --genesis-block-directory /data/genesis \
+          --accounts-directory /data/accounts \
+          --genesis-config-file /genesis/02-with-account-files.toml
+        touch /data/validator/.bootstrapped
+
+  node-bootstrap-sequencer:
+    image: miden-node
+    volumes:
+      - node_data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    depends_on:
+      node-bootstrap-validator:
+        condition: service_completed_successfully
+    command:
+      - |
+        set -e
+        if [ -f /data/node/.bootstrapped ]; then echo "node already bootstrapped"; exit 0; fi
+        rm -rf /data/node
+        mkdir -p /data/node
+        miden-node bootstrap --data-directory /data/node --file /data/genesis/genesis.dat
+        touch /data/node/.bootstrapped
+
+  node-bootstrap-ntx:
+    image: miden-ntx-builder
+    volumes:
+      - node_data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    depends_on:
+      node-bootstrap-validator:
+        condition: service_completed_successfully
+    command:
+      - |
+        set -e
+        if [ -f /data/ntx-builder/.bootstrapped ]; then echo "ntx-builder already bootstrapped"; exit 0; fi
+        rm -rf /data/ntx-builder
+        mkdir -p /data/ntx-builder
+        miden-ntx-builder bootstrap --data-directory /data/ntx-builder --file /data/genesis/genesis.dat
+        touch /data/ntx-builder/.bootstrapped
+
+  validator:
+    image: miden-validator
+    restart: on-failure
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-validator:
+        condition: service_completed_successfully
+    command:
+      - miden-validator
+      - start
+      - --listen=0.0.0.0:50101
+      - --data-directory=/data/validator
+
+  tx-prover:
+    image: miden-remote-prover
+    restart: on-failure
+    command:
+      - miden-remote-prover
+      - --kind=transaction
+      - --port=50051
+      # The prover serves one proof at a time and rejects (not queues) excess
+      # requests once `capacity` permits are taken — try_acquire => immediate
+      # "proof queue is full". The default of 1 is too low here: the proxy (GER
+      # notes + claims), the ntx-builder (B2AGG consumption) and the sequencer
+      # (block proving) all hit this single prover concurrently, so a GER
+      # injection gets rejected mid-deposit and the deposit never becomes
+      # claimable. Allow requests to queue instead of failing.
+      - --capacity=16
+
+  # The sequencer is the RPC the proxy + aggkit talk to. Named `miden-node` so
+  # the existing `--miden-node=http://miden-node:57291` wiring is unchanged.
   miden-node:
-    build:
-      context: .
-      dockerfile: Dockerfile.miden-node
-      args:
-        MIDEN_NODE_GIT_URL: ${MIDEN_NODE_GIT_URL:?MIDEN_NODE_GIT_URL must be set (run via 'make e2e-up')}
-        MIDEN_NODE_GIT_REF: ${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
-    image: miden-agglayer/miden-node:${MIDEN_NODE_GIT_REF:?MIDEN_NODE_GIT_REF must be set (run via 'make e2e-up')}
+    image: miden-node
     restart: on-failure
     ports:
       - "57291:57291"
     environment:
-      RUST_LOG: "info,miden_node_ntx_builder=debug,miden_tx=debug"
-      # Offload tx proving to Miden's devnet prover so local miden-node doesn't
-      # OOM-kill itself during bridge-consumption proof generation. Only
-      # `tx-prover.devnet.miden.io` is publicly exposed by Miden devnet; block
-      # proving stays in-process (no remote endpoint available). This env var
-      # maps to the `--tx-prover.url` flag of `miden-node bundled start`.
-      MIDEN_NODE_NTX_PROVER_URL: "${MIDEN_NODE_NTX_PROVER_URL:-https://tx-prover.devnet.miden.io}"
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 57291 || exit 1"]
-      interval: 3s
-      timeout: 2s
-      retries: 30
-      start_period: 30s
+      RUST_LOG: "info,miden_node_ntx_builder=debug"
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-sequencer:
+        condition: service_completed_successfully
+      validator:
+        condition: service_started
+    command:
+      - miden-node
+      - sequencer
+      - --rpc.listen=0.0.0.0:57291
+      - --data-directory=/data/node
+      - --validator.url=http://validator:50101
+      - --ntx-builder.url=http://ntx-builder:50301
+      - --rpc.network-tx-auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
+
+  ntx-builder:
+    image: miden-ntx-builder
+    restart: on-failure
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-ntx:
+        condition: service_completed_successfully
+      miden-node:
+        condition: service_started
+      tx-prover:
+        condition: service_started
+    command:
+      - miden-ntx-builder
+      - start
+      - --listen=0.0.0.0:50301
+      - --rpc.url=http://miden-node:57291
+      - --rpc.auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
+      - --tx-prover.url=http://tx-prover:50051
+      - --data-directory=/data/ntx-builder
 
     # ── L2 EVM Proxy (service under test) ──────────────────────────────────────
   miden-agglayer:
     build:
       context: .
       dockerfile: Dockerfile
+    # Tag the built image so the bridge-autoclaim service can reuse it without a
+    # second build (the Rust auto-claimer ships in the same image).
+    image: miden-agglayer-e2e:latest
     restart: on-failure
     ports:
       - "8546:8546"
@@ -103,6 +227,14 @@ services:
       NETWORK_ID: "${NETWORK_ID:-1}"
       DATABASE_URL: "host=agglayer-postgres user=agglayer password=agglayer dbname=agglayer_store"
       RUST_LOG: "info"
+      # Regression requirement: offload ALL proxy tx proving (CLAIM / GER /
+      # faucet / bridge-out / init) to an EXTERNAL Miden tx-prover instead of
+      # the in-process LocalTransactionProver. Fallback-to-local stays OFF
+      # (clap default false), so a prover outage fails loud rather than
+      # silently reverting to local proving — that is how we *verify* the
+      # external prover is actually exercised (assert
+      # miden_proof_generations_total{outcome="ok"} > 0, no local fallback).
+      MIDEN_PROVER_URL: "${MIDEN_PROVER_URL:-http://tx-prover:50051}"
       # Force all tmp I/O onto the bind-mounted dir so rocksdb / rusqlite
       # atomic-rename operations stay on the same device. Without this,
       # miden-client's on-disk store fails at startup with
@@ -129,6 +261,15 @@ services:
       - "--miden-store-dir=/var/lib/miden-agglayer-service"
       - "--l1-rpc-url=http://anvil:8545"
       - "--ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+      # Index L1 from genesis (block 1), not from L1 head. The kurtosis L1
+      # snapshot already has the bridge deployed and its initial
+      # UpdateL1InfoTree leaf emitted at a block BEFORE the proxy boots, and
+      # the aggoracle injects that initial GER within seconds of startup. If
+      # the indexer started at head it would never index that pre-head leaf,
+      # leaving the startup GER permanently orphaned (RD-862 repro's
+      # deterministic 0x133e6a88… orphan). Anvil's history is ~100s of blocks
+      # so a from-genesis scan is trivial (max_range chunks it).
+      - "--l1-indexer-from-block=1"
       # R1 admin-auth key is supplied via the `ADMIN_API_KEY` env var
       # from `fixtures/.env`, generated fresh per setup by
       # scripts/setup-fixtures.sh (or scripts/ensure-e2e-secrets.sh on
@@ -137,7 +278,9 @@ services:
       # production deploys via copy-paste.
     depends_on:
       miden-node:
-        condition: service_healthy
+        condition: service_started
+      tx-prover:
+        condition: service_started
       agglayer-postgres:
         condition: service_healthy
     healthcheck:
@@ -148,11 +291,17 @@ services:
       interval: 3s
       timeout: 2s
       retries: 30
-      start_period: 60s
+      # 180s (was 60s): on a busy host the proxy's --init account redeploy +
+      # external-prover handshake can push the first healthy check past 60s,
+      # which makes `docker compose up --wait` abort dependents prematurely.
+      start_period: 180s
 
   # ── Bridge Service ─────────────────────────────────────────────────────────
   bridge-service:
-    image: ghcr.io/0xpolygon/zkevm-bridge-service:v0.6.4-RC2
+    # Patched image: /pending-bridges disambiguates the already-claimed check by
+    # source rollup (see revitteth/zkevm-bridge-service#1). Built locally via
+    # `docker buildx build -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges`.
+    image: zkevm-bridge-service:v0.6.4-RC2-pendingbridges
     entrypoint: ["/app/zkevm-bridge"]
     command: ["run", "--cfg", "/etc/zkevm/bridge-config.toml"]
     ports:
@@ -166,6 +315,41 @@ services:
         condition: service_healthy
       anvil:
         condition: service_healthy
+      miden-agglayer:
+        condition: service_healthy
+
+  # ── L2->L1 auto-claimer ────────────────────────────────────────────────────
+  # Our standalone Rust bridge-autoclaim (NOT the upstream zkevm-autoclaimer —
+  # Polygon declined the /pending-bridges fix). It discovers our rollup's exits
+  # from the proxy's own synthetic BridgeEvent (eth_getLogs), gates on the L1
+  # bridge's on-chain isClaimed, fetches proofs from the bridge-service GetClaim
+  # path (/merkle-proof), and sponsors claimAsset on L1 (Anvil). Ships in the
+  # same image as the proxy. See README "L2->L1 auto-claimer".
+  #
+  # SPONSOR_PRIVATE_KEY is injected via fixtures/.env (written by
+  # scripts/ensure-sponsor-key.sh, which decrypts claimsponsor.keystore); it is
+  # never a flag and never committed. BRIDGE_ADDRESS interpolates from
+  # --env-file fixtures/.env (== L1 bridge == the address stamped on synthetic
+  # BridgeEvents in this CDK deploy).
+  bridge-autoclaim:
+    image: miden-agglayer-e2e:latest
+    restart: on-failure
+    env_file:
+      - ./fixtures/.env
+    entrypoint: ["bridge-autoclaim"]
+    command:
+      - "--l2-rpc-url=http://miden-agglayer:8546"
+      - "--l1-rpc-url=http://anvil:8545"
+      - "--bridge-address=${BRIDGE_ADDRESS}"
+      - "--bridge-service-url=http://bridge-service:8080"
+      - "--network-id=${NETWORK_ID:-1}"
+      - "--poll-interval-secs=5"
+      - "--cursor-db=/tmp/bridge-autoclaim-cursor.sqlite"
+    depends_on:
+      anvil:
+        condition: service_healthy
+      bridge-service:
+        condition: service_started
       miden-agglayer:
         condition: service_healthy
 
@@ -198,6 +382,11 @@ services:
     volumes:
       - ./fixtures/aggkit-config.toml:/etc/aggkit/config.toml:ro
       - ./fixtures/aggoracle.keystore:/etc/aggkit/aggoracle.keystore:ro
+      # aggsender signs L2->L1 certs with the sequencer key, which is the address
+      # registered in the rollup's on-chain aggchain signer committee (threshold
+      # 1). aggkit requires the cert proposer == committee[0], so the AggSender
+      # key MUST be the sequencer (aggoracle is kept for L1->L2 GER injection).
+      - ./fixtures/sequencer.keystore:/etc/aggkit/sequencer.keystore:ro
     depends_on:
       anvil:
         condition: service_healthy
@@ -209,6 +398,7 @@ services:
 volumes:
   agglayer_storage:
   agglayer_backups:
+  node_data:
 
 networks:
   default:

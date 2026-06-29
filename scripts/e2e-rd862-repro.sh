@@ -50,7 +50,7 @@ AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer
 
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
-DEST_NETWORK=1
+DEST_NETWORK=1  # Miden network id — local topology patch pins MIDEN_NETWORK_ID=1 (see fixtures/patches)
 BRIDGE_ADDRESS=$(grep -E '^BRIDGE_ADDRESS=' "$FIXTURES_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || echo "0xC8cbEBf950B9Df44d987c8619f092beA980fF038")
 
 N_DEPOSITS="${N_DEPOSITS:-10}"
@@ -214,13 +214,37 @@ DELTA_SEEN=$((FINAL_TOTAL - BASELINE_TOTAL))
 DELTA_READY=$((FINAL_READY - BASELINE_READY))
 
 # ── Orphan enumeration ────────────────────────────────────────────────────────
-step "Enumerating GERs committed by the proxy since $START_TS..."
+# RD-862's canonical metric is the *permanent* orphan: a GER whose roots NEVER
+# resolve because "nothing ever retries". With the L1InfoTreeIndexer in place,
+# the retry exists — it backfills (mainnet, rollup) from `UpdateL1InfoTree`
+# events at a 1s cadence. Resolution is therefore eventually-consistent and
+# asynchronous: a GER whose L1 leaf was emitted in the last second can be
+# momentarily null at the instant we enumerate, then resolve a beat later. That
+# transient is NOT the bug. So re-poll each null GER over a bounded grace window
+# (ORPHAN_GRACE_SECS, default 45 — comfortably above the ~1s indexer cadence
+# plus aggoracle jitter); only a GER still null after the window is a true
+# orphan. A genuine RD-862 phantom GER (a (mainnet,rollup) pair L1 never
+# emitted) never appears as an `UpdateL1InfoTree` leaf, so it stays null through
+# the whole window and is still caught.
+ORPHAN_GRACE_SECS="${ORPHAN_GRACE_SECS:-45}"
+step "Enumerating GERs committed by the proxy since $START_TS (orphan grace ${ORPHAN_GRACE_SECS}s)..."
 mapfile -t GERS < <(committed_gers_since "$START_TS" | sort -u)
 ORPHANS=()
 RESOLVED=0
 for g in "${GERS[@]}"; do
     [[ -z "$g" ]] && continue
     status=$(query_ger "$g")
+    if [[ "$status" == "null" ]]; then
+        # Give the async indexer time to backfill before declaring it orphaned.
+        waited=0
+        while [[ "$status" == "null" && $waited -lt $ORPHAN_GRACE_SECS ]]; do
+            sleep 3
+            waited=$((waited + 3))
+            status=$(query_ger "$g")
+        done
+        [[ "$status" == "resolved" ]] \
+            && log "  GER $g resolved after ${waited}s (indexer backfill — not an orphan)"
+    fi
     case "$status" in
         resolved) RESOLVED=$((RESOLVED + 1)) ;;
         null)     ORPHANS+=("$g") ;;

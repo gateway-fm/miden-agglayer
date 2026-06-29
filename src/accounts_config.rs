@@ -271,7 +271,9 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    const TEST_ACCOUNT_HEX: &str = "0x27525024cc2047507cb35ee9ed00d4";
+    // Valid protocol-0.15 (version-1) account id; the 0.14 v0 encoding is
+    // rejected by the 0.15 codec (`UnknownAccountIdVersion`).
+    const TEST_ACCOUNT_HEX: &str = "0xcc0000000000dd010000ee000000ff";
 
     fn dummy() -> AccountIdBech32 {
         AccountIdBech32(AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap())

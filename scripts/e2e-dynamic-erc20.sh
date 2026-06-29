@@ -28,7 +28,7 @@ AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
-DEST_NETWORK=1  # Miden network ID
+DEST_NETWORK=1  # Miden network id — local topology patch pins MIDEN_NETWORK_ID=1 (see fixtures/patches)
 
 # TestToken: 6 decimals. Bridge 1000 tokens = 1000 * 10^6 = 1_000_000_000 base units.
 # With 6 origin decimals and 6 miden decimals → scale=0, no scaling.
@@ -240,6 +240,14 @@ BRIDGE_OUT_AMOUNT=$((BALANCE / 2))
 EXPECTED_L1_TOKENS=$((BRIDGE_OUT_AMOUNT * WEI_PER_MIDEN_UNIT))
 log "Step 6/7: Bridging $BRIDGE_OUT_AMOUNT Miden units back to L1..."
 
+# Snapshot the L1 recipient balance BEFORE the exit exists. The bridge-autoclaim
+# service claims as soon as the certificate settles (often within ~1s), which
+# races a snapshot taken after the bridge-out — capturing here (no exit yet, so
+# definitively pre-claim) makes the delta equal the bridged amount regardless of
+# how fast the autoclaimer fires.
+L1_TOKEN_BAL_BEFORE=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
+log "L1 TestToken balance before bridge-out: $L1_TOKEN_BAL_BEFORE"
+
 docker exec $AGGLAYER_CONTAINER bridge-out-tool \
     --store-dir /var/lib/miden-agglayer-service \
     --node-url http://miden-node:57291 \
@@ -258,10 +266,6 @@ pass "BridgeEvent emitted for TestToken bridge-out"
 # Wait for certificate settlement
 log "Step 7/7: Waiting for certificate settlement on L1..."
 
-# Get L1 token balance before claim
-L1_TOKEN_BAL_BEFORE=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
-log "L1 TestToken balance before claim: $L1_TOKEN_BAL_BEFORE"
-
 wait_for "certificate settled" \
     "docker logs $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
     900 10
@@ -272,10 +276,19 @@ pass "Certificate settled on L1"
 # deposit that's `ready_for_claim` — a loose filter would match that and the
 # subsequent claim would pick the wrong (already-claimed) deposit and fail.
 EXPECTED_ORIG_ADDR=$(python3 -c "print('$TOKEN_ADDR'.lower())")
-wait_for "L2 deposit in bridge-service" \
-    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('claim_tx_hash') or '')=='' and (dep.get('orig_addr') or '').lower()==want for dep in d.get('deposits',[])) else 1)\"" \
-    120 5
-pass "TestToken L2→L1 deposit synced and ready_for_claim"
+# The stack runs the bridge-autoclaim service, which claims every L2→L1 deposit
+# on L1 automatically. Racing it with a manual claimAsset is flaky (the manual
+# claim reverts AlreadyClaimed, or the merkle-proof fetch races the claim). The
+# autoclaimer is reliable (see the passing l2-to-l1 strict suite), and the
+# end-state we assert — L1 token balance += bridged amount — is identical
+# whoever submits the claim. So wait for the deposit to be ready_for_claim AND
+# autoclaimed (claim_tx_hash present), then verify the autoclaim receipt +
+# balance (handled below). This is race-free and still exercises the full
+# L2→L1 path (the autoclaimer performs the on-chain claimAsset).
+wait_for "L2 deposit autoclaimed on L1" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); want='$EXPECTED_ORIG_ADDR'; exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and (dep.get('orig_addr') or '').lower()==want and (dep.get('claim_tx_hash') or '')!='' for dep in d.get('deposits',[])) else 1)\"" \
+    180 5
+pass "TestToken L2→L1 deposit synced + autoclaimed on L1"
 
 # Claim on L1. Filter by BOTH origin token address (to skip any unrelated ETH
 # deposits left over from e2e-l2-to-l1.sh when this test runs inside the full
@@ -291,14 +304,14 @@ for dep in d.get('deposits', []):
         continue
     if dep.get('network_id') != 1:
         continue
-    if (dep.get('claim_tx_hash') or '') != '':
-        continue
     if (dep.get('orig_addr') or '').lower() != want:
+        continue
+    if (dep.get('claim_tx_hash') or '') == '':
         continue
     print(json.dumps(dep))
     break
 ")
-[[ -z "$DEPOSIT_INFO" ]] && fail "Could not find ready L2→L1 deposit"
+[[ -z "$DEPOSIT_INFO" ]] && fail "Could not find ready, autoclaimed L2→L1 deposit"
 
 DEPOSIT_CNT=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['deposit_cnt'])")
 ORIG_NET=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['orig_net'])")
@@ -310,6 +323,36 @@ METADATA_CLAIM=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; m=json.load
 GLOBAL_INDEX=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['global_index'])")
 
 log "Deposit #$DEPOSIT_CNT: amount=$AMOUNT_CLAIM, globalIndex=$GLOBAL_INDEX"
+
+# If the bridge-autoclaim service already claimed this deposit on L1, it carries
+# a claim_tx_hash. Re-claiming would revert (AlreadyClaimed), so verify the
+# autoclaim receipt + the L1 token balance change instead and finish. Mirrors
+# the ETH-path handling in e2e-l2-to-l1.sh.
+CLAIM_TX_HASH=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
+if [[ -n "$CLAIM_TX_HASH" ]]; then
+    log "Deposit already claimed on L1 by the autoclaim service (tx $CLAIM_TX_HASH); verifying..."
+    RECEIPT_STATUS=$(cast receipt --rpc-url "$L1_RPC" "$CLAIM_TX_HASH" status 2>/dev/null || echo "")
+    [[ "$RECEIPT_STATUS" == *1* || "$RECEIPT_STATUS" == *true* ]] \
+        || fail "autoclaim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
+    pass "L1 claim transaction succeeded (via autoclaim service)!"
+    L1_TOKEN_BAL_AFTER=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
+    L1_TOKEN_BAL_BEFORE_CLEAN=$(echo "$L1_TOKEN_BAL_BEFORE" | awk '{print $1}')
+    L1_TOKEN_BAL_AFTER_CLEAN=$(echo "$L1_TOKEN_BAL_AFTER" | awk '{print $1}')
+    L1_CHANGE=$(python3 -c "print(int('$L1_TOKEN_BAL_AFTER_CLEAN') - int('$L1_TOKEN_BAL_BEFORE_CLEAN'))")
+    log "L1 TestToken balance: $L1_TOKEN_BAL_BEFORE_CLEAN → $L1_TOKEN_BAL_AFTER_CLEAN (+$L1_CHANGE, autoclaimed)"
+    if [[ "$L1_CHANGE" != "$EXPECTED_L1_TOKENS" ]]; then
+        fail "L1 token balance change mismatch: got $L1_CHANGE, expected $EXPECTED_L1_TOKENS"
+    fi
+    pass "Dynamic ERC-20 bridge COMPLETE (L2→L1 via autoclaim service)!"
+    pass "  L1→L2: $BRIDGE_AMOUNT base units → $EXPECTED_L2_BALANCE Miden units"
+    pass "  L2→L1: $BRIDGE_OUT_AMOUNT Miden units → $EXPECTED_L1_TOKENS base units"
+    pass "  Faucet auto-created: $NEW_FAUCET_ID (symbol=TT, decimals=$TOKEN_DECIMALS)"
+    echo ""
+    log "======================================================================"
+    log "  DYNAMIC ERC-20 E2E TEST DONE"
+    log "======================================================================"
+    exit 0
+fi
 
 NETWORK_ID_VAL=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['network_id'])")
 PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEPOSIT_CNT&net_id=$NETWORK_ID_VAL")

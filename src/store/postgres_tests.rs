@@ -311,14 +311,14 @@ async fn test_pgstore_address_mappings() {
 
     // Set + get round-trip
     let miden_id =
-        miden_protocol::account::AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        miden_protocol::account::AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
     store.set_address_mapping(eth, miden_id).await.unwrap();
     let retrieved = store.get_address_mapping(&eth).await.unwrap();
     assert_eq!(retrieved, Some(miden_id));
 
     // Overwrite with a different value
     let miden_id2 =
-        miden_protocol::account::AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        miden_protocol::account::AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
     store.set_address_mapping(eth, miden_id2).await.unwrap();
     let retrieved2 = store.get_address_mapping(&eth).await.unwrap();
     assert_eq!(retrieved2, Some(miden_id2));

@@ -71,8 +71,8 @@ ENV_FILE="$PROJECT_DIR/fixtures/.env"
 # compose-file parse time because the whole file is interpolated regardless of
 # which service the run targets. Defaults match the Makefile's MIDEN_NODE_GIT_*
 # (the source of truth — bump both together).
-export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/miden-node.git}"
-export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.14.10}"
+export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/node.git}"
+export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.15.0}"
 
 L1_RPC="${L1_RPC:-http://localhost:8545}"
 L2_RPC="${L2_RPC:-http://localhost:8546}"

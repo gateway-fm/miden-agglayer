@@ -1,0 +1,31 @@
+# Standalone L2->L1 auto-claimer (zkevm-autoclaimer) for the local E2E stack.
+#
+# Sponsors claimAsset on L1 (Anvil) for Miden L2->L1 bridge-outs, replacing the
+# manual `cast send claimAsset` step in scripts/e2e-l2-to-l1.sh.
+#
+# WARNING: TEST-ONLY credentials for the local E2E docker-compose stack. The
+# claimsponsor.keystore + password are the same funded sponsor used by the
+# bridge-service ClaimTxManager (see bridge-config.toml). Do NOT use in prod.
+
+[Log]
+Level = "info"
+Outputs = ["stderr"]
+
+[AutoClaim]
+AuthorizedClaimMessageAddresses = []
+AutoClaimInterval = "10s"
+# 0 = individual claims (no claim compressor on this stack).
+MaxNumberOfClaimsPerGroup = 0
+BridgeURL = "http://bridge-service:8080"
+# Only sponsor bridges originating from our own rollup. The local Miden rollup
+# is registered as rollup #1 on the rollup manager, so its deposits carry
+# network_id = 1 (see scripts/e2e-l2-to-l1.sh). On Bali this is 76.
+SourceNetworkID = 1
+
+[BlockchainManager]
+# For L2->L1 the claim lands on L1, so "L2RPC" points at the L1 node and
+# PolygonBridgeAddress at the L1 bridge.
+L2RPC = "http://anvil:8545"
+PrivateKey = { Path = "/etc/zkevm/claimsponsor.keystore", Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m" }
+PolygonBridgeAddress = "0xC8cbEBf950B9Df44d987c8619f092beA980fF038"
+ClaimCompressorAddress = "0x0000000000000000000000000000000000000000"

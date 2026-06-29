@@ -20,6 +20,15 @@ path = "src/bin/bridge_out_tool.rs"
 name = "check-burn-root"
 path = "src/bin/check_burn_root.rs"
 
+# Standalone L2->L1 auto-claimer. Discovers our rollup's exits from the proxy's
+# own synthetic BridgeEvent (eth_getLogs), gates on the L1 bridge's on-chain
+# isClaimed, fetches proofs from the bridge-service GetClaim path
+# (/merkle-proof), and submits claimAsset on L1 with a sponsor wallet. See
+# README "L2->L1 auto-claimer" for the full design + decision record.
+[[bin]]
+name = "bridge-autoclaim"
+path = "src/bin/bridge_autoclaim.rs"
+
 [dev-dependencies]
 tempfile = "3.10"
 # Used only by `r5_oversize_error_matches_aggsender_parser` to mirror aggkit's
@@ -35,6 +44,14 @@ alloy = { features = [
   "eips",
   "k256",
   "signers",
+  # bridge-autoclaim signs L1 claimAsset txns with a local sponsor key:
+  # `signer-local` brings in `alloy::signers::local::PrivateKeySigner`,
+  # `provider-http` + `reqwest` the HTTP transport, `rpc-types` the
+  # TransactionReceipt status accessor.
+  "signer-local",
+  "provider-http",
+  "reqwest",
+  "rpc-types",
   "network",
 ], version = "1.5.2" }
 alloy-core = { features = ["sol-types"], version = "1.5.2" }
@@ -102,43 +119,49 @@ url = { features = ["serde"], version = "2.5" }
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 
-# miden-base — exact pin to 0.14.4 to match the miden-node binary's
-# transitive miden-assembly version (0.22.1). Different miden-assembly
-# patch versions compute DIFFERENT MAST roots for the same MASM source:
-#   miden-assembly 0.22.1 → BurnNote::script_root() = 0xdad2…
-#   miden-assembly 0.22.3 → BurnNote::script_root() = 0x2777…
-# When the two sides disagreed on the BURN root, every L2→L1 bridge-out
-# failed inside the miden-node's NTX `before_created` event handler with
-# "note script with root <X> not found in data store for public note"
-# because StandardNote::from_script_root(0x2777) returns None when the
-# node's BurnNote::script_root() is 0xdad2. Pinning miden-base to 0.14.4
-# (instead of caret-0.14) forces cargo to resolve miden-assembly 0.22.1
-# on this side too. Bump in lockstep with miden-node releases.
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.14.4" }
+# Protocol 0.15.x migration. The conversion metadata moved off the faucet onto
+# the bridge's `faucet_metadata_map` (CONFIG_AGG_BRIDGE note), `AccountStorageMode`
+# became `AccountType{Private,Public}`, `create_claim_note`/`create_agglayer_faucet`
+# were reshaped — see `feat/protocol-0.15-migration`. Base crates are released on
+# crates.io at 0.15.3; the matching miden-client is released at 0.15.0 (crates.io,
+# 2026-06-12, which tracks base 0.15.3) and pinned below.
+#
+# MAST-root consistency note (carried over from the 0.14 pins): the proxy-side
+# `BurnNote::script_root()` MUST match the miden-node binary's, or every L2→L1
+# bridge-out fails in the node's NTX `before_created` handler with
+# "note script with root <X> not found". The 0.15 base crates resolve
+# miden-assembly/core 0.23.x; keep these in lockstep with the deployed
+# miden-node v0.15.x release and tighten to an exact patch if a root mismatch
+# resurfaces during the e2e regression. As of 0.15.3 the AggLayer network id is
+# a runtime storage slot (set at bridge-account creation), NOT a hardcoded MASM
+# constant — so the stock crate's MAST roots now match the stock node binary and
+# the network-id=1 vendor patch below is no longer needed (removed).
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.15.3" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "=0.14.4" }
-miden-standards = { default-features = false, version = "=0.14.4" }
-miden-tx = { default-features = false, version = "=0.14.4" }
+], version = "=0.15.3" }
+miden-standards = { default-features = false, version = "=0.15.3" }
+miden-tx = { default-features = false, version = "=0.15.3" }
 
-# miden-assembly/core MUST be pinned to 0.22.1 to match miden-node v0.14.10's
-# transitive resolution. Empirically `BurnNote::script_root()` differs:
-#   0.22.1 → 0xdad2020d27b388008dedb2dfa1952a1be7d45c9f8b8366ca734de06a07247f9e
-#   0.22.3 → 0x277784547e6a93bbd3a6811dc3ed6bd29141011ae3066dc4319cbf10bb8ab89b
-# Without these explicit pins cargo picks the latest 0.22.x, the proxy emits
-# BURN at the 0.22.3 root, and the node's lookup misses. Bump in lockstep
-# with miden-node releases.
-miden-assembly = { default-features = false, version = "=0.22.1" }
-miden-core = { default-features = false, version = "=0.22.1" }
+miden-assembly = { default-features = false, version = "0.23" }
+miden-core = { default-features = false, version = "0.23" }
 
-# miden-client v0.14.7 (tagged release). Upstream backport of #2101 ships
-# `GrpcClient::with_bearer_auth(token)` — the bearer-header API we need for
-# gateway-fronted nodes (RD-856). Released 2026-05-06.
+# miden-client 0.15.0 — released to crates.io 2026-06-12, which includes the
+# agglayer integration (PR 0xMiden/miden-client#2224, merged 2026-06-12 into the
+# release). Re-pinned from the tracking branch `mmagician-claude/agglayer-v0.15`
+# now that the tag has shipped; the git source is no longer needed.
 miden-client = { default-features = false, features = [
   "tonic",
-], git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.7" }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", tag = "v0.14.7" }
+], version = "=0.15.0" }
+miden-client-sqlite-store = { version = "=0.15.0" }
 
 [features]
 default = []
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+
+# NOTE (0.15.3): the previous `[patch.crates-io] miden-agglayer = vendor-...`
+# override carried a MASM patch setting MIDEN_NETWORK_ID = 1 (upstream baked 77
+# into the MASM). As of 0.15.3 the AggLayer network id is a per-account runtime
+# storage slot written at bridge-account creation (`create_bridge_account(..,
+# network_id)`), so no MASM patch is needed and the vendor crate was removed.
+# The deployment's network id is now passed explicitly at genesis/init time.

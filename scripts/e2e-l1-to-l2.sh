@@ -18,7 +18,7 @@ COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
 AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 
 FUNDED_KEY="0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625"
-DEST_NETWORK=1  # Miden network ID from RollupManager
+DEST_NETWORK=1  # Miden network id — local topology patch pins MIDEN_NETWORK_ID=1 (see fixtures/patches)
 DEPOSIT_AMOUNT="10000000000000" # 10^13 wei → 1000 Miden units (scale 10^10: 18 ETH - 8 Miden decimals)
 WEI_PER_MIDEN_UNIT=10000000000  # 10^10
 EXPECTED_L2_BALANCE=$((DEPOSIT_AMOUNT / WEI_PER_MIDEN_UNIT))
@@ -93,8 +93,18 @@ wait_for_progress() {
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 command -v cast >/dev/null || fail "cast (foundry) not found"
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 (Anvil) not reachable"
-curl -sf "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000" >/dev/null 2>&1 \
-    || fail "Bridge service not reachable at $BRIDGE_SERVICE_URL"
+# Retry for up to 60s: the bridge-service container reports healthy before its
+# HTTP API binds (it syncs L1 config first), so an instant probe right after
+# `docker compose up --wait` races it and flakes the whole suite.
+BRIDGE_UP=false
+for _ in $(seq 1 30); do
+    if curl -sf "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000" >/dev/null 2>&1; then
+        BRIDGE_UP=true
+        break
+    fi
+    sleep 2
+done
+[[ "$BRIDGE_UP" == "true" ]] || fail "Bridge service not reachable at $BRIDGE_SERVICE_URL after 60s"
 
 # ── Get account IDs ──────────────────────────────────────────────────────────
 ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \

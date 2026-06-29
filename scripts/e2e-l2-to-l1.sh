@@ -155,6 +155,34 @@ GLOBAL_INDEX=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.lo
 
 log "Deposit #$DEPOSIT_CNT: amount=$AMOUNT_CLAIM, globalIndex=$GLOBAL_INDEX"
 
+# If the stack runs the bridge-autoclaim service (the restore suite does), it
+# may have already claimed this deposit on L1 — the deposit then carries a
+# claim_tx_hash. Re-claiming would revert (AlreadyClaimed), so verify the
+# autoclaim receipt + balance instead and finish successfully.
+CLAIM_TX_HASH=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
+if [[ -n "$CLAIM_TX_HASH" ]]; then
+    log "Deposit already claimed on L1 by the autoclaim service (tx $CLAIM_TX_HASH); verifying..."
+    RECEIPT_STATUS=$(cast receipt --rpc-url "$L1_RPC" "$CLAIM_TX_HASH" status 2>/dev/null || echo "")
+    # cast prints the receipt status as "1", "0x1", "true" or "1 (success)"
+    # depending on the foundry version — accept any success spelling.
+    [[ "$RECEIPT_STATUS" == *1* || "$RECEIPT_STATUS" == *true* ]] \
+        || fail "autoclaim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
+    pass "L1 claim transaction succeeded (via autoclaim service)!"
+    L1_BAL_AFTER=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
+    ACTUAL_L1_CHANGE=$((L1_BAL_AFTER - L1_BAL_BEFORE))
+    # The autoclaimer pays gas from its own keystore account, so the
+    # destination receives exactly the bridged amount.
+    if [[ "$ACTUAL_L1_CHANGE" -ne "$EXPECTED_L1_CHANGE" ]]; then
+        fail "L1 balance change mismatch: got $ACTUAL_L1_CHANGE wei, expected $EXPECTED_L1_CHANGE wei"
+    fi
+    pass "L2→L1 COMPLETE! L1 balance: $L1_BAL_BEFORE → $L1_BAL_AFTER (+$ACTUAL_L1_CHANGE wei, autoclaimed)"
+    echo ""
+    log "======================================================================"
+    log "  L2→L1 TEST DONE"
+    log "======================================================================"
+    exit 0
+fi
+
 # Get merkle proof from bridge-service (net_id=1 for L2 deposits)
 NETWORK_ID_VAL=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['network_id'])")
 PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEPOSIT_CNT&net_id=$NETWORK_ID_VAL")

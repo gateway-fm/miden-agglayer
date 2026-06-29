@@ -278,7 +278,14 @@ impl BridgeOutScanner {
     /// advanced but no log existed at that block, breaking the "every reader
     /// who sees latest >= N also sees the log at N" invariant.
     async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) -> bool {
-        let note_id_str = note.id().to_string();
+        // Stable per-note dedup/quarantine key. Protocol 0.15: `InputNoteRecord::id()`
+        // returns `Option<NoteId>` and is `None` for metadata-less records — including
+        // the `ConsumedExternal` notes this scanner routinely sees (a B2AGG note
+        // reclaimed by a user, or consumed by an untracked account). `details_commitment()`
+        // is derived from the recipient (which carries the note's unique serial) + assets,
+        // so it is present in every state and unique per note — the correct state-independent
+        // key here. (Was `note.id()` under 0.14, when the id was always available.)
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         match self.store.is_note_processed(&note_id_str).await {
             Ok(true) => return false,
@@ -444,7 +451,7 @@ impl BridgeOutScanner {
             return false;
         };
         let faucet_id = fungible_asset.faucet_id();
-        let miden_amount = fungible_asset.amount();
+        let miden_amount = u64::from(fungible_asset.amount());
 
         // Resolve origin info from faucet registry.
         //
@@ -723,7 +730,7 @@ impl SyncListener for BridgeOutScanner {
         // crate); compute once per sync instead of caching, since
         // `claim_script()` returns by value and the cost is negligible
         // versus the on-chain query that follows.
-        let claim_root = miden_base_agglayer::claim_script().root();
+        let claim_root = miden_base_agglayer::ClaimNote::script().root();
         let mut landed_claim_ids: std::collections::HashSet<[u8; 32]> =
             std::collections::HashSet::new();
         let registered_faucets: std::collections::HashSet<AccountId> = self
@@ -735,7 +742,7 @@ impl SyncListener for BridgeOutScanner {
             .unwrap_or_default();
 
         for note in &consumed_notes {
-            let id_bytes: [u8; 32] = note.id().as_bytes();
+            let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
             let Some(commitment_word) = note.commitment() else {
                 // Notes without a commitment (incomplete InputNoteRecord)
                 // shouldn't show up in the Consumed filter; skip defensively.
@@ -750,7 +757,7 @@ impl SyncListener for BridgeOutScanner {
                     metrics::counter!("bridge_twin_note_detected_total").increment(1);
                     tracing::error!(
                         target: "bridge_out::twin",
-                        note_id = %note.id(),
+                        note_id = ?note.details_commitment(),
                         observed_commitment = %hex::encode(commitment_bytes),
                         prior_count = prior_commitments.len(),
                         "Cantina #6: twin NoteId observed — different metadata, same NoteId"
@@ -761,7 +768,7 @@ impl SyncListener for BridgeOutScanner {
                 Err(e) => {
                     tracing::warn!(
                         target: "bridge_out::twin",
-                        note_id = %note.id(),
+                        note_id = ?note.details_commitment(),
                         error = ?e,
                         "RD-913: twin-note tracker store failure; \
                          continuing without classification"
@@ -785,7 +792,7 @@ impl SyncListener for BridgeOutScanner {
                         metrics::counter!("bridge_burn_serial_collision_total").increment(1);
                         tracing::error!(
                             target: "bridge_out::burn",
-                            note_id = %note.id(),
+                            note_id = ?note.details_commitment(),
                             serial = %hex::encode(serial.as_bytes()),
                             "Cantina #5: BURN serial collision — second BURN with same serial \
                              observed; faucet token_supply at risk"
@@ -795,7 +802,7 @@ impl SyncListener for BridgeOutScanner {
                     Err(e) => {
                         tracing::warn!(
                             target: "bridge_out::burn",
-                            note_id = %note.id(),
+                            note_id = ?note.details_commitment(),
                             error = ?e,
                             "RD-913: burn-serial tracker store failure; continuing"
                         );
@@ -804,15 +811,15 @@ impl SyncListener for BridgeOutScanner {
             }
             // Cantina #2 + #4 — MINT attachment-target + forged-MINT detection.
             if script_root == mint_root {
-                // The MINT note's metadata.attachment() carries a
-                // NetworkAccountTarget identifying the intended consuming
-                // faucet. We decode via TryFrom<&NoteAttachment>.
-                let Some(metadata) = note.metadata() else {
+                // The MINT note's attachments carry a NetworkAccountTarget
+                // identifying the intended consuming faucet. We decode via
+                // TryFrom<&NoteAttachments>.
+                let Some(_metadata) = note.metadata() else {
                     continue;
                 };
-                let attachment = metadata.attachment();
+                let attachments = note.attachments();
                 let intended_faucet: Option<AccountId> =
-                    miden_standards::note::NetworkAccountTarget::try_from(attachment)
+                    miden_standards::note::NetworkAccountTarget::try_from(attachments)
                         .ok()
                         .map(|nat| nat.target_id());
                 if let Some(intended) = intended_faucet {
@@ -827,7 +834,7 @@ impl SyncListener for BridgeOutScanner {
                         metrics::counter!("bridge_mint_target_mismatch_total").increment(1);
                         tracing::error!(
                             target: "bridge_out::mint_attach",
-                            note_id = %note.id(),
+                            note_id = ?note.details_commitment(),
                             intended_faucet = %intended,
                             "Cantina #2: MINT NetworkAccountTarget points at a \
                              faucet not in aggkit's registry — possible \
@@ -841,7 +848,7 @@ impl SyncListener for BridgeOutScanner {
                     metrics::counter!("bridge_forged_mint_total").increment(1);
                     tracing::error!(
                         target: "bridge_out::forged_mint",
-                        note_id = %note.id(),
+                        note_id = ?note.details_commitment(),
                         "Cantina #4: MINT note observed with no decodable \
                          NetworkAccountTarget attachment — forged via NoAuth"
                     );
@@ -876,7 +883,7 @@ impl SyncListener for BridgeOutScanner {
                     metrics::counter!("bridge_unknown_wrapper_consumed_total").increment(1);
                     tracing::warn!(
                         target: "bridge_out::unknown_wrapper",
-                        note_id = %note.id(),
+                        note_id = ?note.details_commitment(),
                         observed_script_root = %hex::encode(observed_bytes),
                         bridge = %self.bridge_account_id,
                         "Cantina MA#4: bridge account consumed a note whose script \
@@ -896,7 +903,7 @@ impl SyncListener for BridgeOutScanner {
             }
             let was_processed = self
                 .store
-                .is_note_processed(&note.id().to_string())
+                .is_note_processed(&hex::encode(note.details_commitment().as_bytes()))
                 .await
                 .unwrap_or(true);
             if was_processed {
@@ -1464,7 +1471,7 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
 
         // Local network = 7 (typical rollup id assigned by RollupManager).
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         let scanner = BridgeOutScanner::new(store.clone(), block_state.clone(), 7, bridge_id);
         assert!(
             scanner.is_self_targeted(7),
@@ -1572,7 +1579,7 @@ mod tests {
         use miden_protocol::Felt;
 
         // 1 felt only — short of the required 6.
-        let storage = NoteStorage::new(vec![Felt::new(0)]).unwrap();
+        let storage = NoteStorage::new(vec![Felt::from(0u32)]).unwrap();
         let err = parse_b2agg_storage(&storage).expect_err("short storage must error");
         let msg = format!("{err:#}");
         assert!(
@@ -1582,23 +1589,23 @@ mod tests {
 
         // 5 felts — still short.
         let storage = NoteStorage::new(vec![
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
         ])
         .unwrap();
         assert!(parse_b2agg_storage(&storage).is_err());
 
         // 6 felts — exact minimum, must succeed.
         let storage = NoteStorage::new(vec![
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
         ])
         .unwrap();
         assert!(parse_b2agg_storage(&storage).is_ok());
@@ -1613,8 +1620,8 @@ mod tests {
     #[test]
     fn ma3_classify_b2agg_consumer_branches() {
         // Two distinct AccountIds (last hex char differs).
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        let user_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
         assert_ne!(bridge_id, user_id, "test ids must be distinct");
 
         // 1. Bridge-consumed → Emit (real bridge-out).
@@ -1655,12 +1662,12 @@ mod tests {
         // B2AGG storage: 6 felts (network + 5 address limbs). Values don't matter
         // for the gate — only the script root distinguishes B2AGG.
         let storage = NoteStorage::new(vec![
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
         ])
         .unwrap();
         let script = B2AggNote::script();
@@ -1674,7 +1681,12 @@ mod tests {
             consumed_tx_order: None,
         });
 
-        miden_client::store::InputNoteRecord::new(details, None, state)
+        miden_client::store::InputNoteRecord::new(
+            details,
+            miden_protocol::note::NoteAttachments::default(),
+            None,
+            state,
+        )
     }
 
     /// Cantina MA#3 — wiring repro. A B2AGG note consumed by a user account
@@ -1688,12 +1700,12 @@ mod tests {
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        let user_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
         let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(Some(user_id));
-        let note_id_str = note.id().to_string();
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         let advanced = scanner.process_consumed_note(&note, 100).await;
         assert!(!advanced, "reclaim must NOT signal block advance");
@@ -1727,11 +1739,11 @@ mod tests {
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
         let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(None);
-        let note_id_str = note.id().to_string();
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         let advanced = scanner.process_consumed_note(&note, 100).await;
         assert!(
@@ -1764,7 +1776,7 @@ mod tests {
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
         let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(Some(bridge_id));
@@ -1797,7 +1809,7 @@ mod tests {
         // 1 felt: too short for parse_b2agg_storage (which requires ≥6).
         // This simulates an "erased" B2AGG — the bridge consumed it on-chain
         // (LET advanced) but the indexer cannot reconstruct the destination.
-        let storage = NoteStorage::new(vec![Felt::new(0)]).unwrap();
+        let storage = NoteStorage::new(vec![Felt::from(0u32)]).unwrap();
         let script = B2AggNote::script();
         let recipient = NoteRecipient::new(Word::default(), script, storage);
         let assets = NoteAssets::new(vec![]).unwrap();
@@ -1809,7 +1821,12 @@ mod tests {
             consumed_tx_order: None,
         });
 
-        miden_client::store::InputNoteRecord::new(details, None, state)
+        miden_client::store::InputNoteRecord::new(
+            details,
+            miden_protocol::note::NoteAttachments::default(),
+            None,
+            state,
+        )
     }
 
     /// Cantina MA#18 — wiring repro. A B2AGG with un-parseable storage
@@ -1826,11 +1843,11 @@ mod tests {
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
         let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_erased_b2agg_note(bridge_id);
-        let note_id_str = note.id().to_string();
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         let advanced = scanner.process_consumed_note(&note, 42).await;
         assert!(!advanced, "erased note must NOT signal block advance");
@@ -1871,11 +1888,11 @@ mod tests {
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
         let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_erased_b2agg_note(bridge_id);
-        let note_id_str = note.id().to_string();
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         // First observation — quarantine row written.
         let _ = scanner.process_consumed_note(&note, 1).await;
@@ -1911,12 +1928,12 @@ mod tests {
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
-        let bridge_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        let user_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
         let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(Some(user_id));
-        let note_id_str = note.id().to_string();
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         let _ = scanner.process_consumed_note(&note, 1).await;
 
@@ -1957,7 +1974,7 @@ mod tests {
         // Use the real B2AGG + CLAIM roots so a future MASM regen that
         // changes either is caught here.
         let b2agg = B2AggNote::script_root().as_bytes();
-        let claim = miden_base_agglayer::claim_script().root().as_bytes();
+        let claim = miden_base_agglayer::ClaimNote::script().root().as_bytes();
         assert_ne!(b2agg, claim, "B2AGG and CLAIM must have distinct roots");
 
         // Known roots — the bridge legitimately consumes both.

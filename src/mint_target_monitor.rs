@@ -64,8 +64,8 @@ mod tests {
     /// both ids for operator attribution.
     #[test]
     fn cantina_2_mint_target_predicate() {
-        let faucet_a = aid("0x3d7c9747558851900f8206226dfbea");
-        let faucet_b = aid("0x3d7c9747558851900f8206226dfbeb");
+        let faucet_a = aid("0xac0000000000dd110000ee000000fc");
+        let faucet_b = aid("0xaa0000000000bc110000bc000000de");
 
         // Healthy: A consumed by A.
         assert_eq!(

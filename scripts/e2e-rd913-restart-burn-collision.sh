@@ -39,8 +39,8 @@ source "$FIXTURES_DIR/.env"
 # Required by docker-compose.e2e.yml's miden-node build args, even for
 # `docker compose run` invocations the file is fully interpolated. Same
 # defaults as the Makefile (source-of-truth — bump both together).
-export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/miden-node.git}"
-export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.14.10}"
+export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/node.git}"
+export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.15.0}"
 
 L1_RPC="http://localhost:8545"
 L2_RPC="http://localhost:8546"

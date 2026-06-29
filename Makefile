@@ -176,16 +176,25 @@ install-tools: ## Install development tools
 # from miden-agglayer's account builders, so the e2e image is fully
 # reproducible.
 #
-# Wire-compat: both miden-node v0.14.10 and our miden-client v0.14.7 pin
-# miden-node-proto-build v0.14.10 — protos align. Hash function identical
-# (miden-crypto 0.23.0 on both). BURN script root identical between
-# miden-standards 0.14.4 (miden-node) and 0.14.5 (us) — empirically
-# verified.
+# Protocol 0.15.x: the node repo was renamed `0xMiden/miden-node` ->
+# `0xMiden/node` (package name stays `miden-node`, so `--bin miden-node` and
+# the `bundled bootstrap/start` CLI are unchanged, and the genesis sample
+# `02-with-account-files.toml` is at the same path). We pin to the exact rev
+# the miden-client 0.15 branch (PR #2224) was built against, so the node's
+# transitive miden-protocol 0.15.2 / miden-assembly 0.23.x match our
+# Cargo.toml pins and the BURN/MINT/CLAIM MAST roots agree on both sides.
+# When a stable v0.15.x miden-node tag ships, pin to the tag instead.
 #
 # Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
 # docker-compose so the Dockerfile picks it up at build time.
-MIDEN_NODE_GIT_URL := https://github.com/0xMiden/miden-node.git
-MIDEN_NODE_GIT_REF := v0.14.10
+MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
+# v0.15.0 (final tag). Builds against miden-protocol/standards/tx 0.15.3 — the
+# same base crates as our service — so BURN/MINT/CLAIM/B2AGG MAST roots agree
+# across the node/client boundary with no Cargo.lock-alignment hack. The
+# node-store callback-vault-key bug is fixed upstream at this tag (the buggy
+# select_vault_balances_by_faucet_ids is gone), so fixtures/patches/0001 is no
+# longer applied. Network id is now a runtime storage slot, so no vendor patch.
+MIDEN_NODE_GIT_REF := v0.15.0
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
@@ -199,15 +208,20 @@ e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
 	./scripts/setup-fixtures.sh
 
 .PHONY: e2e-clean-data
-e2e-clean-data: ## Wipe .miden-agglayer-data/ so proxy re-inits against the fresh miden-node
-	# The miden-node's genesis commitment is non-deterministic across container
-	# restarts, but the proxy's sqlite at .miden-agglayer-data/store.sqlite3
-	# pins a specific genesis. If we mount stale state into a fresh node, the
-	# client's sync is rejected with "accept header validation failed". Always
-	# start from a clean slate — the proxy's --init flow will redeploy accounts
-	# in ~45s, which is acceptable for E2E.
+e2e-clean-data: ## Wipe .miden-agglayer-data/ + node_data volume so the stack re-inits against fresh genesis
+	# Proto 0.15: the node is a microservice stack whose state (genesis block,
+	# store, validator + ntx-builder DBs) lives in the `node_data` Docker volume,
+	# and the proxy's genesis pin lives in .miden-agglayer-data/store.sqlite3.
+	# Mounting stale node state under a fresh proxy (or vice-versa) makes the
+	# client's sync fail ("accept header validation failed"), so wipe BOTH for a
+	# clean slate. The bootstrap services rebuild genesis (deterministic from the
+	# vendored agglayer .mac files) and the proxy's --init redeploys accounts in
+	# ~45s — acceptable for E2E. The volume rm is guarded so it no-ops when the
+	# volume is absent or still in use (containers must be down first, which the
+	# regression harness guarantees via `make e2e-down`).
 	rm -rf .miden-agglayer-data
 	mkdir -p .miden-agglayer-data/tmp
+	-docker volume rm miden-agglayer_node_data 2>/dev/null || true
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)
@@ -243,6 +257,17 @@ e2e-l2-to-l1: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund wallet + run L2→
 .PHONY: e2e-l2-to-l1-best-effort
 e2e-l2-to-l1-best-effort: e2e-l1-to-l2 ## L2→L1 with extended timeout + miden-node crash detection (exits 2 on upstream miden-node v0.14.10 crash-loop, 1 on real regression)
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-best-effort.sh
+
+.PHONY: ensure-sponsor-key
+ensure-sponsor-key: ## Decrypt claimsponsor.keystore -> SPONSOR_PRIVATE_KEY in fixtures/.env (for the Rust bridge-autoclaim)
+	./scripts/ensure-sponsor-key.sh
+
+.PHONY: e2e-l2-to-l1-autoclaim
+# ensure-sponsor-key MUST precede e2e-l1-to-l2: the latter triggers e2e-up,
+# which starts the bridge-autoclaim service reading SPONSOR_PRIVATE_KEY from
+# fixtures/.env. Prerequisites are built left-to-right (serial make).
+e2e-l2-to-l1-autoclaim: ensure-sponsor-key e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund + L2→L1 bridge-out claimed automatically by the Rust bridge-autoclaim
+	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-autoclaim.sh
 
 .PHONY: e2e-restore
 e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test

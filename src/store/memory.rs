@@ -1064,7 +1064,7 @@ mod tests {
         let addr = Address::from([42u8; 20]);
         assert!(store.get_address_mapping(&addr).await.unwrap().is_none());
 
-        let miden_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let miden_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         store.set_address_mapping(addr, miden_id).await.unwrap();
         assert_eq!(
             store.get_address_mapping(&addr).await.unwrap(),
@@ -1084,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn test_faucet_registry() {
         let store = InMemoryStore::new();
-        let faucet_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let faucet_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
         // Initially empty
         assert!(store.list_faucets().await.unwrap().is_empty());
@@ -1149,7 +1149,7 @@ mod tests {
     async fn test_faucet_registry_dynamic_erc20_bidirectional() {
         // Simulate: register a new ERC-20 (USDC), then resolve it for bridge-out
         let store = InMemoryStore::new();
-        let usdc_id = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
+        let usdc_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
         // Simulate auto-creation during first L1→L2 claim
         let usdc_origin = [0xA0; 20]; // USDC contract address
@@ -1203,8 +1203,8 @@ mod tests {
         let store = InMemoryStore::new();
         let token_addr = [0xA0u8; 20]; // shared origin token address (e.g. CREATE2-cloned)
 
-        let faucet_n0 = AccountId::from_hex("0x3d7c9747558851900f8206226dfbea").unwrap();
-        let faucet_n1 = AccountId::from_hex("0x3d7c9747558851900f8206226dfbeb").unwrap();
+        let faucet_n0 = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let faucet_n1 = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
         store
             .register_faucet(FaucetEntry {

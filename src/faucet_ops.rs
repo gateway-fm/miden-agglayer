@@ -6,7 +6,9 @@
 use crate::accounts_config::AccountIdBech32;
 use crate::miden_client::MidenClientLib;
 use alloy::primitives::{Address, Bytes};
-use miden_base_agglayer::{ConfigAggBridgeNote, EthAddress, MetadataHash, create_agglayer_faucet};
+use miden_base_agglayer::{
+    ConfigAggBridgeNote, ConversionMetadata, EthAddress, MetadataHash, create_agglayer_faucet,
+};
 use miden_client::Felt;
 use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
@@ -31,19 +33,20 @@ pub async fn create_and_register_faucet(
     bridge_id: AccountId,
     metadata_hash: MetadataHash,
 ) -> anyhow::Result<Account> {
-    let max_supply = Felt::new(FungibleAsset::MAX_AMOUNT);
+    let max_supply =
+        Felt::new(u64::from(FungibleAsset::MAX_AMOUNT)).expect("value is a valid field element");
     let origin_addr = EthAddress::new(*origin_token_address);
 
+    // Protocol 0.15: the faucet no longer stores conversion metadata. `create_agglayer_faucet`
+    // is now 5-arg (seed, symbol, decimals, max_supply, bridge_id). The origin token address,
+    // network, scale and metadata hash are registered on the bridge's `faucet_metadata_map`
+    // via the CONFIG_AGG_BRIDGE note in `register_faucet_in_bridge` below.
     let account = create_agglayer_faucet(
         client.rng().draw_word(),
         symbol,
         miden_decimals,
         max_supply,
         bridge_id,
-        &origin_addr,
-        origin_network,
-        scale,
-        metadata_hash,
     );
     client.add_account(&account, false).await?;
 
@@ -79,6 +82,9 @@ pub async fn create_and_register_faucet(
         bridge_id,
         account.id(),
         &origin_addr,
+        origin_network,
+        scale,
+        metadata_hash,
         symbol,
     )
     .await?;
@@ -91,12 +97,22 @@ pub async fn create_and_register_faucet(
 /// Required for CLAIM note FPI validation: the bridge account must know which
 /// faucets are valid sources for claim operations, and the on-chain `token_registry_map`
 /// must map `hash(origin_token_address)` to the faucet's `AccountId`. Idempotent.
+///
+/// Protocol 0.15: the full conversion metadata (origin token address, network, scale,
+/// `is_native` flag, metadata hash) now lives on the bridge's `faucet_metadata_map` and is
+/// supplied here as a [`ConversionMetadata`] struct. Every faucet the service creates is a
+/// bridge-owned (mint/burn) faucet for an L1-origin token, so `is_native` is always `false`;
+/// Miden-native (lock/unlock) faucets are not created by the proxy.
+#[allow(clippy::too_many_arguments)]
 pub async fn register_faucet_in_bridge(
     client: &mut MidenClientLib,
     service_id: AccountId,
     bridge_id: AccountId,
     faucet_id: AccountId,
     origin_token_address: &EthAddress,
+    origin_network: u32,
+    scale: u8,
+    metadata_hash: MetadataHash,
     faucet_name: &str,
 ) -> anyhow::Result<()> {
     tracing::info!(
@@ -107,8 +123,14 @@ pub async fn register_faucet_in_bridge(
     );
 
     let note = ConfigAggBridgeNote::create(
-        faucet_id,
-        origin_token_address,
+        ConversionMetadata {
+            faucet_account_id: faucet_id,
+            origin_token_address: *origin_token_address,
+            scale,
+            origin_network,
+            is_native: false,
+            metadata_hash,
+        },
         service_id,
         bridge_id,
         client.rng(),

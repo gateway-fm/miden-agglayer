@@ -408,7 +408,23 @@ async fn main() -> anyhow::Result<()> {
             command.miden_node.as_deref(),
         )?;
 
-        let config_path = init::init(&init_client, init_net_id, miden_store_dir.clone()).await?;
+        // 0.15.3: the bridge account stores its AggLayer network id (set at
+        // creation). Same u32 validation as the service path below (the MASM
+        // only reads the low 32 bits, so a value that doesn't fit u32 would be
+        // silently truncated).
+        let init_network_id = u32::try_from(command.network_id).map_err(|_| {
+            anyhow::anyhow!(
+                "network_id {} does not fit in u32 (AggLayer network ids are u32)",
+                command.network_id
+            )
+        })?;
+        let config_path = init::init(
+            &init_client,
+            init_net_id,
+            init_network_id,
+            miden_store_dir.clone(),
+        )
+        .await?;
         tracing::info!("new config created at {config_path:?}");
 
         init_client.shutdown()?;
