@@ -124,6 +124,25 @@ fn store_base_from_env() -> Option<PathBuf> {
 /// post-symlink-resolution) and, when a containment `base` is configured,
 /// reject any directory that escapes it. Absolute paths are allowed by design
 /// (see [`store_base_from_env`]).
+///
+/// Canonicalize the longest existing ancestor of `dir` and re-append the
+/// not-yet-created tail. Keeps a missing store dir in the same canonical
+/// namespace as a canonicalized base so containment compares like-for-like
+/// (macOS `/var` -> `/private/var`, or a symlinked mount on Linux). Best-effort:
+/// returns `dir` unchanged when nothing can be canonicalized.
+fn canonicalize_existing_prefix(dir: &Path) -> PathBuf {
+    let Some(existing) = dir
+        .ancestors()
+        .find(|p| !p.as_os_str().is_empty() && p.exists())
+    else {
+        return dir.to_path_buf();
+    };
+    match (existing.canonicalize(), dir.strip_prefix(existing)) {
+        (Ok(canon), Ok(rel)) => canon.join(rel),
+        _ => dir.to_path_buf(),
+    }
+}
+
 fn sanitize_store_dir(dir: &PathBuf, base: Option<&Path>) -> anyhow::Result<PathBuf> {
     for component in dir.components() {
         if matches!(component, Component::ParentDir) {
@@ -149,7 +168,13 @@ fn sanitize_store_dir(dir: &PathBuf, base: Option<&Path>) -> anyhow::Result<Path
         }
         canonical
     } else {
-        dir.clone()
+        // Not yet on disk (first run / --init): resolve the existing-ancestor
+        // prefix so the result shares the same canonical namespace as a
+        // canonicalized base. Without this, a base that canonicalizes
+        // differently from `dir` (macOS `/var` -> `/private/var`, or a
+        // symlinked mount on Linux) makes a legitimate dir-inside-base look
+        // like it escapes. The lexical `..` check above already ran.
+        canonicalize_existing_prefix(dir)
     };
 
     // Opt-in containment: when MIDEN_STORE_BASE is configured the store dir
