@@ -21,6 +21,7 @@ pub mod l2_to_l1_claimer;
 pub mod let_divergence;
 pub mod log_synthesis;
 pub mod logging;
+pub mod metadata_recovery;
 pub mod metrics;
 pub mod miden_client;
 pub mod mint_target_monitor;

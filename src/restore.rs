@@ -39,7 +39,8 @@ use crate::bridge_out::{
     resolve_faucet_origin,
 };
 use crate::claim_watcher::{derive_manual_claim_tx_hash, parse_claim_event_from_storage};
-use crate::miden_client::MidenClient;
+use crate::metadata_recovery::{EmitMetadata, METADATA_UNRECOVERABLE_METRIC};
+use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::Store;
 use miden_base_agglayer::UpdateGerNote;
 use miden_client::store::{InputNoteRecord, NoteFilter};
@@ -119,6 +120,7 @@ pub async fn restore(
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
+    l1_rpc_url: Option<String>,
 ) -> anyhow::Result<RestoreResult> {
     tracing::info!("=== RESTORE: starting state reconstruction ===");
 
@@ -163,8 +165,15 @@ pub async fn restore(
 
     // Phase 2: Scan miden consumed B2AGG notes
     tracing::info!("Phase 2: scanning miden consumed B2AGG notes...");
-    let (bridge_outs, logs) =
-        restore_bridge_outs(store, miden_client, accounts, block_state, next_block).await?;
+    let (bridge_outs, logs) = restore_bridge_outs(
+        store,
+        miden_client,
+        accounts,
+        block_state,
+        next_block,
+        l1_rpc_url.clone(),
+    )
+    .await?;
     next_block += if logs > 0 { 1 } else { 0 };
     total_logs += logs;
     tracing::info!("Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs");
@@ -240,6 +249,7 @@ async fn restore_bridge_outs(
     accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
+    l1_rpc_url: Option<String>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -250,6 +260,8 @@ async fn restore_bridge_outs(
 
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
+    // Owned copy moved into the 'static closure (Cantina #13 L2 recovery).
+    let l1_url = l1_rpc_url;
 
     miden_client
         .with(move |client| {
@@ -284,6 +296,8 @@ async fn restore_bridge_outs(
                         restore_block,
                         block_hash,
                         bridge_address,
+                        Some(&mut *client),
+                        l1_url.as_deref(),
                     )
                     .await?;
                     if outcome == B2AggRestoreOutcome::Emitted {
@@ -325,6 +339,7 @@ enum B2AggRestoreOutcome {
 ///
 /// Extracted from `restore_bridge_outs` so the per-note decision is unit-testable
 /// without a live Miden client (mirrors `BridgeOutScanner::process_consumed_note`).
+#[allow(clippy::too_many_arguments)]
 async fn restore_one_b2agg_note(
     store: &Arc<dyn Store>,
     note: &InputNoteRecord,
@@ -332,6 +347,8 @@ async fn restore_one_b2agg_note(
     restore_block: u64,
     block_hash: [u8; 32],
     bridge_address: &str,
+    client: Option<&mut MidenClientLib>,
+    l1_rpc_url: Option<&str>,
 ) -> anyhow::Result<B2AggRestoreOutcome> {
     let details = note.details();
     if !is_b2agg_note(details) {
@@ -422,22 +439,87 @@ async fn restore_one_b2agg_note(
         }
     };
 
-    // Cantina #13 follow-up — DoS guard. `origin.metadata` ultimately derives
-    // from untrusted L1 calldata and the BridgeEvent encoder does not cap it, so
-    // an oversized blob would drive a huge allocation. Refuse to encode it.
-    //
-    // Record the note as unbridgeable (Cantina MA#18 quarantine) — exactly as the
-    // live scanner does — so this permanent skip is not re-attempted on every
-    // restore run. The restore path has a clean `store` handle and the same
-    // `note` / `bridge_id` / block context the live path uses, so we can record
-    // the quarantine row directly via the shared helper.
-    if origin.metadata.len() > crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES {
+    // Cantina #13 Layer 2 — recover + validate empty ERC-20 metadata before
+    // rebuilding the BridgeEvent. Legacy/DB-loss faucet rows carry empty
+    // metadata; emitting that for an ERC-20 is a poison leaf. Mirrors
+    // `BridgeOutScanner::resolve_emit_metadata`. Native ETH stays empty.
+    let emit_metadata = {
+        let needs_recovery = origin.metadata.is_empty() && origin.origin_address != [0u8; 20];
+        let (bridge_account, faucet_account) = if needs_recovery {
+            match client {
+                Some(client) => {
+                    let bridge = client.get_account(bridge_id).await.ok().flatten();
+                    let faucet = client.get_account(faucet_id).await.ok().flatten();
+                    (bridge, faucet)
+                }
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        crate::metadata_recovery::recover_bridge_out_metadata(
+            &origin.origin_address,
+            &origin.metadata,
+            origin.origin_decimals,
+            faucet_id,
+            bridge_account.as_ref(),
+            faucet_account.as_ref(),
+            l1_rpc_url,
+        )
+        .await
+    };
+    let emit_metadata = match emit_metadata {
+        EmitMetadata::Ready(bytes) => bytes,
+        EmitMetadata::Recovered(bytes) => {
+            // One-time self-heal: backfill the validated preimage.
+            if let Ok(Some(mut entry)) = store.get_faucet_by_id(faucet_id).await {
+                entry.metadata = bytes.clone();
+                if let Err(e) = store.register_faucet(entry).await {
+                    tracing::warn!(
+                        note_id = %note_id_str,
+                        faucet_id = %faucet_id,
+                        error = ?e,
+                        "restore: Cantina #13 L2 metadata backfill failed (recovery will re-run)"
+                    );
+                } else {
+                    tracing::info!(
+                        note_id = %note_id_str,
+                        faucet_id = %faucet_id,
+                        "restore: Cantina #13 L2 recovered + backfilled ERC-20 metadata"
+                    );
+                }
+            }
+            bytes
+        }
+        EmitMetadata::Unrecoverable => {
+            // FAIL-SAFE GATE: refuse to rebuild an ERC-20 BridgeEvent with empty
+            // metadata. Skip without marking processed so a later restore (after
+            // the registry is backfilled / an L1 RPC is wired) retries it.
+            ::metrics::counter!(METADATA_UNRECOVERABLE_METRIC).increment(1);
+            tracing::warn!(
+                note_id = %note_id_str,
+                faucet_id = %faucet_id,
+                origin_network = origin.origin_network,
+                "restore: Cantina #13 L2 — ERC-20 bridge-out has empty metadata that could not \
+                 be recovered + validated against the bridge's metadata hash; skipping (refusing \
+                 to emit empty/unvalidated metadata). Backfill the faucet registry or supply an \
+                 L1 RPC for the token's origin network, then re-run restore."
+            );
+            return Ok(B2AggRestoreOutcome::Skipped);
+        }
+    };
+
+    // Cantina #13 follow-up — DoS guard, now applied to the FINAL emit bytes
+    // (Layer-1 stored OR Layer-2 recovered): the metadata derives from untrusted
+    // L1 calldata, and a malicious token's name() could yield an oversized
+    // recovered blob. Cap before encoding; skip without marking the note processed.
+    if emit_metadata.len() > crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES {
         ::metrics::counter!("bridge_out_b2agg_metadata_too_large_total").increment(1);
         tracing::warn!(
             note_id = %note_id_str,
-            metadata_len = origin.metadata.len(),
+            metadata_len = emit_metadata.len(),
             cap = crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES,
-            "restore: B2AGG faucet metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
+            "restore: B2AGG metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
         );
         crate::bridge_out::quarantine_unbridgeable_b2agg(
             &**store,
@@ -447,8 +529,8 @@ async fn restore_one_b2agg_note(
             restore_block,
             crate::store::UnbridgeableBridgeOutReason::MetadataTooLarge,
             format!(
-                "origin.metadata.len()={} exceeds MAX_BRIDGE_EVENT_METADATA_BYTES={}",
-                origin.metadata.len(),
+                "emit_metadata.len()={} exceeds MAX_BRIDGE_EVENT_METADATA_BYTES={}",
+                emit_metadata.len(),
                 crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES
             ),
         )
@@ -475,7 +557,7 @@ async fn restore_one_b2agg_note(
             destination_network,
             &destination_address,
             origin_amount,
-            &origin.metadata,
+            &emit_metadata,
             deposit_count,
         )
         .await
@@ -1187,10 +1269,18 @@ mod tests {
         let note = ma3_b2agg_input_note(faucet_id, Some(sender_id));
         let note_id = hex::encode(note.details_commitment().as_bytes());
 
-        let outcome =
-            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
-                .await
-                .unwrap();
+        let outcome = restore_one_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1216,10 +1306,18 @@ mod tests {
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
         let note_id = hex::encode(note.details_commitment().as_bytes());
 
-        let outcome =
-            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
-                .await
-                .unwrap();
+        let outcome = restore_one_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1244,10 +1342,18 @@ mod tests {
         let note = ma3_b2agg_input_note(faucet_id, None);
         let note_id = hex::encode(note.details_commitment().as_bytes());
 
-        let outcome =
-            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
-                .await
-                .unwrap();
+        let outcome = restore_one_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1275,10 +1381,18 @@ mod tests {
         let note = ma3_b2agg_input_note(faucet_id, Some(other));
         let note_id = hex::encode(note.details_commitment().as_bytes());
 
-        let outcome =
-            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
-                .await
-                .unwrap();
+        let outcome = restore_one_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1306,10 +1420,18 @@ mod tests {
         let note_id = hex::encode(note.details_commitment().as_bytes());
         store.mark_note_processed(note_id.clone()).await.unwrap();
 
-        let outcome =
-            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
-                .await
-                .unwrap();
+        let outcome = restore_one_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1330,10 +1452,18 @@ mod tests {
         let note_id = hex::encode(note.details_commitment().as_bytes());
         store.mark_note_processed(note_id.clone()).await.unwrap();
 
-        let outcome =
-            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
-                .await
-                .unwrap();
+        let outcome = restore_one_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1366,10 +1496,18 @@ mod tests {
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
         let note_id = hex::encode(note.details_commitment().as_bytes());
 
-        let outcome =
-            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
-                .await
-                .unwrap();
+        let outcome = restore_one_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,

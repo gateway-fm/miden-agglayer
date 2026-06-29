@@ -130,6 +130,12 @@ pub struct FaucetOriginInfo {
     /// synthetic bridge-out `BridgeEvent` so the exit leaf carries the real
     /// metadata (Cantina #13).
     pub metadata: Vec<u8>,
+    /// Token symbol (sanitised, as stored on the Miden faucet). Used by the
+    /// Cantina #13 Layer-2 recovery path when `metadata` is empty for an ERC-20.
+    pub symbol: String,
+    /// Token decimals on the origin chain — part of the metadata preimage that
+    /// Layer-2 recovery re-derives and validates.
+    pub origin_decimals: u8,
 }
 
 /// Resolve faucet origin info from the dynamic faucet registry.
@@ -148,6 +154,8 @@ pub async fn resolve_faucet_origin(
         origin_address: entry.origin_address,
         scale: entry.scale,
         metadata: entry.metadata,
+        symbol: entry.symbol,
+        origin_decimals: entry.origin_decimals,
     })
 }
 
@@ -231,6 +239,12 @@ pub struct BridgeOutScanner {
     ownership_probe_every_n_ticks: u32,
     /// Internal tick counter for ownership probe scheduling.
     tick_counter: std::sync::atomic::AtomicU32,
+    /// Optional L1 JSON-RPC endpoint. Used by the Cantina #13 Layer-2 recovery
+    /// path to fetch a token's canonical `name()`/`symbol()`/`decimals()` when a
+    /// legacy faucet row has empty ERC-20 metadata. `None` disables the L1
+    /// fallback (recovery then relies solely on the all-Miden candidate, and
+    /// gates if that does not validate).
+    l1_rpc_url: Option<String>,
 }
 
 impl BridgeOutScanner {
@@ -261,7 +275,16 @@ impl BridgeOutScanner {
             expected_mints,
             ownership_probe_every_n_ticks: 5, // every 5 sync ticks (~30s at 6s/tick)
             tick_counter: std::sync::atomic::AtomicU32::new(0),
+            l1_rpc_url: None,
         }
+    }
+
+    /// Wire an L1 JSON-RPC endpoint for Cantina #13 Layer-2 ERC-20 metadata
+    /// recovery (see [`Self::l1_rpc_url`]). Builder so existing call sites and
+    /// tests that don't need recovery stay unchanged.
+    pub fn with_l1_rpc_url(mut self, l1_rpc_url: Option<String>) -> Self {
+        self.l1_rpc_url = l1_rpc_url;
+        self
     }
 
     /// Returns true if a parsed B2AGG `destination_network` is the bridge's own network,
@@ -283,7 +306,12 @@ impl BridgeOutScanner {
     /// log write, every poison leaf left a phantom block: `eth_blockNumber`
     /// advanced but no log existed at that block, breaking the "every reader
     /// who sees latest >= N also sees the log at N" invariant.
-    async fn process_consumed_note(&self, note: &InputNoteRecord, block_number: u64) -> bool {
+    async fn process_consumed_note(
+        &self,
+        note: &InputNoteRecord,
+        block_number: u64,
+        client: Option<&mut MidenClientLib>,
+    ) -> bool {
         // Stable per-note dedup/quarantine key. Protocol 0.15: `InputNoteRecord::id()`
         // returns `Option<NoteId>` and is `None` for metadata-less records — including
         // the `ConsumedExternal` notes this scanner routinely sees (a B2AGG note
@@ -525,6 +553,43 @@ impl BridgeOutScanner {
             }
         };
 
+        // Cantina #13 Layer 2 — ensure the metadata we are about to emit is
+        // correct. Layer 1 persists the real ABI preimage at faucet creation,
+        // but legacy rows (and any registry rebuilt after DB loss) have EMPTY
+        // metadata. Emitting empty metadata for an ERC-20 is a poison leaf, so
+        // recover + keccak-validate it against the bridge's stored hash here.
+        // Native ETH (zero origin address) legitimately stays empty.
+        let emit_metadata = match self.resolve_emit_metadata(&origin, faucet_id, client).await {
+            crate::metadata_recovery::EmitMetadata::Ready(bytes) => bytes,
+            crate::metadata_recovery::EmitMetadata::Recovered(bytes) => {
+                // One-time self-heal: backfill the validated preimage so the
+                // next bridge-out of this faucet takes the Layer-1 happy path.
+                self.backfill_faucet_metadata(faucet_id, &bytes).await;
+                bytes
+            }
+            crate::metadata_recovery::EmitMetadata::Unrecoverable => {
+                // FAIL-SAFE GATE: never emit empty/unvalidated metadata for an
+                // ERC-20. Defer (do NOT mark processed) so the bridge-out
+                // re-surfaces once an operator backfills the registry or wires
+                // an L1 RPC for the token's origin network. Mirrors the
+                // self-targeted poison-leaf gate (Cantina #13).
+                ::metrics::counter!(crate::metadata_recovery::METADATA_UNRECOVERABLE_METRIC)
+                    .increment(1);
+                tracing::warn!(
+                    target: "bridge_out::metadata_recovery",
+                    note_id = %note_id_str,
+                    faucet_id = %faucet_id,
+                    origin_network = origin.origin_network,
+                    "Cantina #13 L2: ERC-20 bridge-out has empty metadata that could not be \
+                     recovered + validated against the bridge's metadata hash; deferring \
+                     (refusing to emit empty/unvalidated metadata). Operator action: backfill \
+                     the faucet registry (admin_registerFaucet) or supply an L1 RPC reachable \
+                     for the token's origin network."
+                );
+                return false;
+            }
+        };
+
         // Generate synthetic tx hash via the versioned domain-separated
         // helper (B5). Same hash on restore so dedup is stable.
         let tx_hash = derive_bridge_out_tx_hash(&note_id_str);
@@ -540,18 +605,19 @@ impl BridgeOutScanner {
         // wedge that bridge-out forever. PgStore folds all five writes
         // into one transaction; InMemoryStore uses the default impl.
         //
-        // Cantina #13 follow-up — DoS guard. `origin.metadata` ultimately derives
-        // from untrusted L1 calldata and the BridgeEvent encoder does not cap it,
-        // so an oversized blob would drive a huge allocation. Refuse to encode it;
-        // skip + alert rather than emit (the cap is far above any legit token's
-        // abi.encode(name,symbol,decimals)).
-        if origin.metadata.len() > MAX_BRIDGE_EVENT_METADATA_BYTES {
+        // Cantina #13 follow-up — DoS guard, applied to the FINAL emit bytes
+        // (Layer-1 stored OR Layer-2 recovered). The metadata derives from
+        // untrusted L1 calldata and the BridgeEvent encoder does not cap it; a
+        // malicious token's name() could even yield an oversized *recovered* blob.
+        // Refuse to encode it; skip + alert (the cap is far above any legit
+        // token's abi.encode(name,symbol,decimals)).
+        if emit_metadata.len() > MAX_BRIDGE_EVENT_METADATA_BYTES {
             ::metrics::counter!("bridge_out_b2agg_metadata_too_large_total").increment(1);
             tracing::warn!(
                 note_id = %note_id_str,
-                metadata_len = origin.metadata.len(),
+                metadata_len = emit_metadata.len(),
                 cap = MAX_BRIDGE_EVENT_METADATA_BYTES,
-                "B2AGG faucet metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
+                "B2AGG metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
             );
             // Cantina #13 follow-up — record the note as unbridgeable so this
             // permanent skip is not re-attempted every sync tick (the gate would
@@ -585,7 +651,7 @@ impl BridgeOutScanner {
                 destination_network,
                 &destination_address,
                 origin_amount,
-                &origin.metadata,
+                &emit_metadata,
             )
             .await
         {
@@ -622,6 +688,90 @@ impl BridgeOutScanner {
                 .await;
                 false
             }
+        }
+    }
+
+    /// Cantina #13 Layer 2 — resolve the metadata bytes to emit for a bridge-out,
+    /// recovering + validating empty ERC-20 metadata when needed.
+    ///
+    /// The happy and native paths return without any account reads. The ERC-20
+    /// recovery path reads the bridge account (authoritative metadata hash) and
+    /// the faucet account (all-Miden candidate) via the live `client`; without a
+    /// client it fails safe ([`EmitMetadata::Unrecoverable`]). The actual
+    /// keccak-gated decision lives in the pure, unit-tested
+    /// [`crate::metadata_recovery::resolve_emit_metadata`].
+    async fn resolve_emit_metadata(
+        &self,
+        origin: &FaucetOriginInfo,
+        faucet_id: AccountId,
+        client: Option<&mut MidenClientLib>,
+    ) -> crate::metadata_recovery::EmitMetadata {
+        use crate::metadata_recovery::EmitMetadata;
+
+        // Fast paths — no account reads needed.
+        if !origin.metadata.is_empty() {
+            return EmitMetadata::Ready(origin.metadata.clone());
+        }
+        if origin.origin_address == [0u8; 20] {
+            return EmitMetadata::Ready(Vec::new());
+        }
+
+        // ERC-20 with empty metadata: recovery requires the live client to read
+        // the bridge + faucet accounts. Without it we cannot validate → gate.
+        let Some(client) = client else {
+            return EmitMetadata::Unrecoverable;
+        };
+        let bridge_account = client
+            .get_account(self.bridge_account_id)
+            .await
+            .ok()
+            .flatten();
+        let faucet_account = client.get_account(faucet_id).await.ok().flatten();
+
+        crate::metadata_recovery::recover_bridge_out_metadata(
+            &origin.origin_address,
+            &origin.metadata,
+            origin.origin_decimals,
+            faucet_id,
+            bridge_account.as_ref(),
+            faucet_account.as_ref(),
+            self.l1_rpc_url.as_deref(),
+        )
+        .await
+    }
+
+    /// Cantina #13 Layer 2 — one-time self-heal: write recovered+validated
+    /// metadata back into the faucet registry so future bridge-outs of this
+    /// faucet take the Layer-1 happy path. Best-effort: a write failure is logged
+    /// but must not abort the bridge-out (the emit already used the recovered
+    /// bytes).
+    async fn backfill_faucet_metadata(&self, faucet_id: AccountId, metadata: &[u8]) {
+        match self.store.get_faucet_by_id(faucet_id).await {
+            Ok(Some(mut entry)) => {
+                entry.metadata = metadata.to_vec();
+                match self.store.register_faucet(entry).await {
+                    Ok(()) => tracing::info!(
+                        target: "bridge_out::metadata_recovery",
+                        faucet_id = %faucet_id,
+                        "Cantina #13 L2: recovered + backfilled ERC-20 metadata into the faucet \
+                         registry (one-time self-heal)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "bridge_out::metadata_recovery",
+                        faucet_id = %faucet_id,
+                        error = ?e,
+                        "Cantina #13 L2: failed to backfill recovered metadata; \
+                         recovery will re-run on the next bridge-out"
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                target: "bridge_out::metadata_recovery",
+                faucet_id = %faucet_id,
+                error = ?e,
+                "Cantina #13 L2: failed to read faucet entry for metadata backfill"
+            ),
         }
     }
 
@@ -994,7 +1144,13 @@ impl SyncListener for BridgeOutScanner {
             // and other early-return paths now signal `false`, preventing
             // phantom blocks (advances with no log) from leaking into the chain.
             let block_number = self.store.get_latest_block_number().await? + 1;
-            if self.process_consumed_note(note, block_number).await {
+            // Reborrow the client so the Cantina #13 Layer-2 recovery path can
+            // read the bridge + faucet accounts; the reborrow ends with each
+            // iteration so `client` stays available for the monitors below.
+            if self
+                .process_consumed_note(note, block_number, Some(&mut *client))
+                .await
+            {
                 self.store.set_latest_block_number(block_number).await?;
             }
             tracing::info!(
@@ -1761,6 +1917,155 @@ mod tests {
         )
     }
 
+    /// Build a fully-formed bridge-out B2AGG note: a fungible asset from
+    /// `faucet_id`, valid 6-felt storage (a non-zero, non-precompile destination
+    /// address and a non-self-target network), consumed by `consumer`. This
+    /// reaches the metadata-resolution / commit path in `process_consumed_note`
+    /// (unlike `build_b2agg_note_with_consumer`, whose empty asset set short-
+    /// circuits at the no-fungible-asset skip).
+    fn build_b2agg_bridge_out_note(
+        faucet_id: AccountId,
+        consumer: AccountId,
+    ) -> miden_client::store::InputNoteRecord {
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::asset::{Asset, FungibleAsset};
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{NoteAssets, NoteDetails, NoteRecipient, NoteStorage};
+        use miden_protocol::{Felt, Word};
+
+        // storage: [network=0, addr_limb0=0x11111111, 0, 0, 0, 0] → destination
+        // network 0 (not the local 7) and address 0x11111111000…0 (non-zero,
+        // not a precompile).
+        let storage = NoteStorage::new(vec![
+            Felt::from(0u32),
+            Felt::from(0x1111_1111u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+        ])
+        .unwrap();
+        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+        let asset: Asset = FungibleAsset::new(faucet_id, 50).unwrap().into();
+        let assets = NoteAssets::new(vec![asset]).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: Some(consumer),
+            consumed_tx_order: None,
+        });
+        miden_client::store::InputNoteRecord::new(
+            details,
+            miden_protocol::note::NoteAttachments::default(),
+            None,
+            state,
+        )
+    }
+
+    /// Cantina #13 Layer 2 — FAIL-SAFE GATE, wired end-to-end. A bridge-consumed
+    /// ERC-20 bridge-out whose faucet row has EMPTY metadata must NOT emit when
+    /// the metadata can't be recovered + validated (here: no live client, so the
+    /// bridge's metadata hash is unreadable). It must defer: no log, and the note
+    /// must stay un-processed so it re-surfaces once an operator backfills.
+    #[tokio::test]
+    async fn cantina13_l2_erc20_empty_metadata_unrecoverable_is_gated() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        // A real fungible-faucet id (so FungibleAsset::new accepts it).
+        let faucet_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+
+        // Register an ERC-20 faucet (non-zero origin address) with EMPTY metadata
+        // — the exact legacy/DB-loss state Layer 2 must guard.
+        store
+            .register_faucet(crate::store::FaucetEntry {
+                faucet_id,
+                origin_address: [0x42u8; 20],
+                origin_network: 0,
+                symbol: "USDC".into(),
+                origin_decimals: 6,
+                miden_decimals: 6,
+                scale: 0,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_b2agg_bridge_out_note(faucet_id, bridge_id);
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        // No client → bridge metadata hash unreadable → Unrecoverable → gated.
+        let advanced = scanner.process_consumed_note(&note, 100, None).await;
+        assert!(
+            !advanced,
+            "ERC-20 empty-metadata bridge-out must NOT advance/emit"
+        );
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "gated bridge-out must stay un-processed so it can re-surface after backfill",
+        );
+        let logs = store
+            .get_logs(&crate::log_synthesis::LogFilter::default(), 1000)
+            .await
+            .unwrap_or_default();
+        assert!(
+            logs.is_empty(),
+            "no synthetic BridgeEvent may be emitted with empty ERC-20 metadata"
+        );
+    }
+
+    /// Cantina #13 Layer 2 — native ETH is UNTOUCHED. A bridge-consumed native-ETH
+    /// bridge-out (zero origin address) with empty metadata is correct and must
+    /// STILL emit (and be marked processed), even with no client — recovery is
+    /// never attempted for native ETH.
+    #[tokio::test]
+    async fn cantina13_l2_native_eth_empty_metadata_still_emits() {
+        use crate::block_state::BlockState;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let faucet_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+
+        // Native ETH faucet: zero origin address, empty metadata (correct).
+        store
+            .register_faucet(crate::store::FaucetEntry {
+                faucet_id,
+                origin_address: [0u8; 20],
+                origin_network: 0,
+                symbol: "ETH".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
+        let note = build_b2agg_bridge_out_note(faucet_id, bridge_id);
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let advanced = scanner.process_consumed_note(&note, 100, None).await;
+        assert!(
+            advanced,
+            "native-ETH bridge-out with empty metadata must still emit"
+        );
+        assert!(
+            store.is_note_processed(&note_id).await.unwrap(),
+            "emitted native-ETH note must be marked processed",
+        );
+    }
+
     /// Cantina MA#3 — wiring repro. A B2AGG note consumed by a user account
     /// (reclaim branch in B2AGG.masm:65-71) must NOT trigger a synthetic
     /// BridgeEvent or be marked processed.
@@ -1779,7 +2084,7 @@ mod tests {
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let advanced = scanner.process_consumed_note(&note, 100).await;
+        let advanced = scanner.process_consumed_note(&note, 100, None).await;
         assert!(!advanced, "reclaim must NOT signal block advance");
 
         // The note must NOT be marked processed — otherwise a future
@@ -1817,7 +2122,7 @@ mod tests {
         let note = build_b2agg_note_with_consumer(None);
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let advanced = scanner.process_consumed_note(&note, 100).await;
+        let advanced = scanner.process_consumed_note(&note, 100, None).await;
         assert!(
             !advanced,
             "untracked-consumer must NOT signal block advance"
@@ -1858,7 +2163,7 @@ mod tests {
         // contract here is: bridge-consumed notes are NOT short-circuited by
         // the gate. The pure-helper test pins the exact decision; this just
         // exercises the wiring end-to-end without a downstream panic.
-        let _ = scanner.process_consumed_note(&note, 100).await;
+        let _ = scanner.process_consumed_note(&note, 100, None).await;
     }
 
     // CANTINA MA#18 — UNBRIDGEABLE B2AGG QUARANTINE TESTS
@@ -1921,7 +2226,7 @@ mod tests {
         let note = build_erased_b2agg_note(bridge_id);
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let advanced = scanner.process_consumed_note(&note, 42).await;
+        let advanced = scanner.process_consumed_note(&note, 42, None).await;
         assert!(!advanced, "erased note must NOT signal block advance");
 
         let row = store
@@ -1967,7 +2272,7 @@ mod tests {
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         // First observation — quarantine row written.
-        let _ = scanner.process_consumed_note(&note, 1).await;
+        let _ = scanner.process_consumed_note(&note, 1, None).await;
         let first = store
             .get_unbridgeable_bridge_out(&note_id_str)
             .await
@@ -1976,7 +2281,7 @@ mod tests {
         let first_block = first.observed_block;
 
         // Second observation — quarantine row UNCHANGED.
-        let _ = scanner.process_consumed_note(&note, 2).await;
+        let _ = scanner.process_consumed_note(&note, 2, None).await;
         let second = store
             .get_unbridgeable_bridge_out(&note_id_str)
             .await
@@ -2007,7 +2312,7 @@ mod tests {
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let _ = scanner.process_consumed_note(&note, 1).await;
+        let _ = scanner.process_consumed_note(&note, 1, None).await;
 
         assert!(
             store

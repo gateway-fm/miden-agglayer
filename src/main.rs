@@ -512,12 +512,17 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     let bridge_out_local_network_id = local_network_id_u32;
-    let bridge_out_scanner = Arc::new(BridgeOutScanner::new(
-        store.clone(),
-        block_state.clone(),
-        bridge_out_local_network_id,
-        accounts.0.bridge.0,
-    ));
+    let bridge_out_scanner = Arc::new(
+        BridgeOutScanner::new(
+            store.clone(),
+            block_state.clone(),
+            bridge_out_local_network_id,
+            accounts.0.bridge.0,
+        )
+        // Cantina #13 Layer 2 — wire the L1 RPC so legacy ERC-20 faucet rows with
+        // empty metadata can be recovered + validated before a bridge-out emits.
+        .with_l1_rpc_url(command.l1_rpc_url.clone()),
+    );
     // Cantina #7: clone the tracker handle now so we can plumb it into
     // ServiceState below — `bridge_out_scanner` is moved into the listener
     // vec a few lines down.
@@ -563,9 +568,14 @@ async fn main() -> anyhow::Result<()> {
     // their initial `submit_new_transaction` deploys them on-chain.
     // Run restore if requested
     if command.restore {
-        let result =
-            miden_agglayer_service::restore::restore(&store, &client, &accounts.0, &block_state)
-                .await?;
+        let result = miden_agglayer_service::restore::restore(
+            &store,
+            &client,
+            &accounts.0,
+            &block_state,
+            command.l1_rpc_url.clone(),
+        )
+        .await?;
 
         tracing::info!(
             "Restore complete: block={}, bridge_outs={}, claims={}, gers={}, logs={}",
