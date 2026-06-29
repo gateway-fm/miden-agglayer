@@ -525,6 +525,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
+                metadata: vec![],
             })
             .await
             .unwrap();
