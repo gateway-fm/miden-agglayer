@@ -34,12 +34,15 @@
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
-use crate::bridge_out::{is_b2agg_note, parse_b2agg_storage, resolve_faucet_origin};
+use crate::bridge_out::{
+    B2AggConsumerClass, classify_b2agg_consumer, is_b2agg_note, parse_b2agg_storage,
+    resolve_faucet_origin,
+};
 use crate::claim_watcher::{derive_manual_claim_tx_hash, parse_claim_event_from_storage};
 use crate::miden_client::MidenClient;
 use crate::store::Store;
 use miden_base_agglayer::UpdateGerNote;
-use miden_client::store::NoteFilter;
+use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_protocol::account::AccountId;
 use miden_protocol::note::{NoteAttachments, NoteMetadata};
 use sha3::{Digest, Keccak256};
@@ -234,12 +237,16 @@ async fn sync_miden_block(
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
-    _accounts: &AccountsConfig,
+    accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
+    // Cantina MA#3 — the configured bridge account is the only legitimate
+    // consumer of a *bridge-out* B2AGG note; reclaim/untracked consumptions are
+    // gated out in `restore_one_b2agg_note`.
+    let bridge_id = accounts.bridge.0;
 
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
@@ -270,86 +277,19 @@ async fn restore_bridge_outs(
                 sorted.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
 
                 for note in sorted {
-                    let details = note.details();
-                    if !is_b2agg_note(details) {
-                        continue;
+                    let outcome = restore_one_b2agg_note(
+                        &store_clone,
+                        note,
+                        bridge_id,
+                        restore_block,
+                        block_hash,
+                        bridge_address,
+                    )
+                    .await?;
+                    if outcome == B2AggRestoreOutcome::Emitted {
+                        count += 1;
+                        logs += 1;
                     }
-
-                    let note_id_str = hex::encode(note.details_commitment().as_bytes());
-                    if store_clone.is_note_processed(&note_id_str).await? {
-                        continue;
-                    }
-
-                    let (destination_network, destination_address) = match parse_b2agg_storage(
-                        details.storage(),
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
-                            continue;
-                        }
-                    };
-
-                    let Some(fungible_asset) = details.assets().iter_fungible().next() else {
-                        continue;
-                    };
-                    let faucet_id = fungible_asset.faucet_id();
-                    let miden_amount = u64::from(fungible_asset.amount());
-                    let origin = match resolve_faucet_origin(faucet_id, &*store_clone).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
-                            continue;
-                        }
-                    };
-                    let origin_amount = match crate::bridge_out::reverse_scale_amount(
-                        miden_amount,
-                        origin.scale,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
-                            continue;
-                        }
-                    };
-
-                    // B5 — share the versioned domain-separated helper with
-                    // bridge_out so the tx_hash is byte-identical across
-                    // first-observation and restore paths (dedup-stable).
-                    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
-
-                    let deposit_count =
-                        store_clone.mark_note_processed(note_id_str.clone()).await?;
-
-                    if let Err(err) = store_clone
-                        .add_bridge_event(
-                            bridge_address,
-                            restore_block,
-                            block_hash,
-                            &tx_hash,
-                            0, // LEAF_TYPE_ASSET
-                            origin.origin_network,
-                            &origin.origin_address,
-                            destination_network,
-                            &destination_address,
-                            origin_amount,
-                            &[],
-                            deposit_count,
-                        )
-                        .await
-                    {
-                        let _ = store_clone.unmark_note_processed(&note_id_str).await;
-                        return Err(err);
-                    }
-
-                    tracing::info!(
-                        note_id = %note_id_str,
-                        deposit_count,
-                        "restore: rebuilt BridgeEvent"
-                    );
-
-                    count += 1;
-                    logs += 1;
                 }
 
                 *result_inner.lock().unwrap() = (count, logs);
@@ -360,6 +300,163 @@ async fn restore_bridge_outs(
 
     let (count, logs) = *result.lock().unwrap();
     Ok((count, logs))
+}
+
+/// Outcome of attempting to rebuild one consumed B2AGG note during restore.
+#[derive(Debug, PartialEq, Eq)]
+enum B2AggRestoreOutcome {
+    /// A synthetic `BridgeEvent` was (re)built for a real bridge-out.
+    Emitted,
+    /// Skipped for a benign reason: not a B2AGG note, unparsable, no asset, a
+    /// reclaim/untracked consumer (Cantina MA#3 gate), or a note an earlier run
+    /// already processed correctly.
+    Skipped,
+    /// The note was already marked processed by an earlier run, but the MA#3 gate
+    /// would now REJECT it (consumer != the configured bridge). A pre-fix restore
+    /// likely emitted an *invalid* synthetic `BridgeEvent` for a reclaim/untracked
+    /// consumption. We do NOT auto-mutate that legacy state (an operator decision)
+    /// — we surface it (warn + `restore_b2agg_legacy_processed_gated_total`) so it
+    /// can be detected and reset/rebuilt.
+    LegacyProcessedGated,
+}
+
+/// Rebuild the synthetic `BridgeEvent` for a single consumed note, if and only if
+/// it is a *bridge-out* B2AGG note consumed by the configured `bridge_id`.
+///
+/// Extracted from `restore_bridge_outs` so the per-note decision is unit-testable
+/// without a live Miden client (mirrors `BridgeOutScanner::process_consumed_note`).
+async fn restore_one_b2agg_note(
+    store: &Arc<dyn Store>,
+    note: &InputNoteRecord,
+    bridge_id: AccountId,
+    restore_block: u64,
+    block_hash: [u8; 32],
+    bridge_address: &str,
+) -> anyhow::Result<B2AggRestoreOutcome> {
+    let details = note.details();
+    if !is_b2agg_note(details) {
+        return Ok(B2AggRestoreOutcome::Skipped);
+    }
+
+    let note_id_str = hex::encode(note.details_commitment().as_bytes());
+
+    // Cantina MA#3 — reclaim gate. A B2AGG note has a reclaim branch (consumer ==
+    // sender, asset stays on Miden) and a bridge branch (consumer == bridge, asset
+    // leaves). Only the latter is a real bridge-out; rebuilding a synthetic
+    // BridgeEvent for a reclaim would hand the user a claimable withdrawal for
+    // value that never left. Mirrors `BridgeOutScanner::process_consumed_note`.
+    let consumer = note.consumer_account();
+    let class = classify_b2agg_consumer(consumer, bridge_id);
+
+    // Dedup. A note an earlier run already handled is normally a no-op — UNLESS
+    // the gate would now reject it: that means a pre-fix run emitted an invalid
+    // BridgeEvent for a reclaim/untracked consumption. Surface it (warn + metric)
+    // rather than silently skipping, so operators can detect legacy bad state and
+    // reset/rebuild. We do not auto-remove the stale event here.
+    if store.is_note_processed(&note_id_str).await? {
+        if !matches!(class, B2AggConsumerClass::Emit) {
+            ::metrics::counter!("restore_b2agg_legacy_processed_gated_total").increment(1);
+            tracing::warn!(
+                note_id = %note_id_str,
+                consumer = ?consumer,
+                bridge = %bridge_id,
+                "restore: already-processed B2AGG note would now be gated out (consumer != \
+                 bridge) — a pre-fix run may have emitted an INVALID synthetic BridgeEvent; \
+                 review and reset/rebuild bridge-out state (Cantina MA#3)"
+            );
+            return Ok(B2AggRestoreOutcome::LegacyProcessedGated);
+        }
+        return Ok(B2AggRestoreOutcome::Skipped);
+    }
+
+    match class {
+        B2AggConsumerClass::Emit => {}
+        B2AggConsumerClass::Reclaimed => {
+            ::metrics::counter!("bridge_out_reclaimed_b2agg_total").increment(1);
+            tracing::info!(
+                note_id = %note_id_str,
+                consumer = ?consumer,
+                bridge = %bridge_id,
+                "restore: B2AGG note was reclaimed by user (consumed by non-bridge \
+                 account); skipping synthetic BridgeEvent (Cantina MA#3)"
+            );
+            return Ok(B2AggRestoreOutcome::Skipped);
+        }
+        B2AggConsumerClass::UntrackedConsumer => {
+            ::metrics::counter!("bridge_out_b2agg_untracked_consumer_total").increment(1);
+            tracing::info!(
+                note_id = %note_id_str,
+                bridge = %bridge_id,
+                "restore: B2AGG note consumed by untracked account (consumer_account \
+                 = None); fail-closed skip (Cantina MA#3)"
+            );
+            return Ok(B2AggRestoreOutcome::Skipped);
+        }
+    }
+
+    let (destination_network, destination_address) = match parse_b2agg_storage(details.storage()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            return Ok(B2AggRestoreOutcome::Skipped);
+        }
+    };
+
+    let Some(fungible_asset) = details.assets().iter_fungible().next() else {
+        return Ok(B2AggRestoreOutcome::Skipped);
+    };
+    let faucet_id = fungible_asset.faucet_id();
+    let miden_amount = u64::from(fungible_asset.amount());
+    let origin = match resolve_faucet_origin(faucet_id, &**store).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            return Ok(B2AggRestoreOutcome::Skipped);
+        }
+    };
+    let origin_amount = match crate::bridge_out::reverse_scale_amount(miden_amount, origin.scale) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            return Ok(B2AggRestoreOutcome::Skipped);
+        }
+    };
+
+    // B5 — share the versioned domain-separated helper with bridge_out so the
+    // tx_hash is byte-identical across first-observation and restore paths
+    // (dedup-stable).
+    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
+
+    let deposit_count = store.mark_note_processed(note_id_str.clone()).await?;
+
+    if let Err(err) = store
+        .add_bridge_event(
+            bridge_address,
+            restore_block,
+            block_hash,
+            &tx_hash,
+            0, // LEAF_TYPE_ASSET
+            origin.origin_network,
+            &origin.origin_address,
+            destination_network,
+            &destination_address,
+            origin_amount,
+            &[],
+            deposit_count,
+        )
+        .await
+    {
+        let _ = store.unmark_note_processed(&note_id_str).await;
+        return Err(err);
+    }
+
+    tracing::info!(
+        note_id = %note_id_str,
+        deposit_count,
+        "restore: rebuilt BridgeEvent"
+    );
+
+    Ok(B2AggRestoreOutcome::Emitted)
 }
 
 /// Phase 2.5: scan miden consumed CLAIM notes and replay any missing
@@ -970,5 +1067,243 @@ mod tests {
             logs_created: 6,
         };
         assert_eq!(r.claims_restored, 2);
+    }
+
+    // ── Cantina MA#3 — restore reclaim gate (Finding #3, restore path) ───────
+    //
+    // bridge_out.rs's scanner was fixed (PR #63) to emit a synthetic BridgeEvent
+    // only when a consumed B2AGG note's `consumer_account == bridge`. The restore
+    // path (`restore_one_b2agg_note`) must apply the SAME gate: a B2AGG note has
+    // a reclaim branch (consumer == sender, asset stays on Miden) and a bridge
+    // branch (consumer == bridge, asset leaves). Rebuilding a BridgeEvent for a
+    // reclaim hands the user a claimable withdrawal for value that never left.
+
+    /// `(faucet_id, bridge_id, sender_id)` — valid protocol-0.15 ids. The faucet
+    /// is a real fungible-faucet id (reused from the store tests) so
+    /// `FungibleAsset::new` accepts it; bridge/sender reuse this module's ids.
+    fn ma3_accounts() -> (AccountId, AccountId, AccountId) {
+        (
+            id("0xac0000000000dd110000ee000000fc"),
+            id(TEST_TARGET_BRIDGE),
+            id(TEST_SENDER_MANAGER),
+        )
+    }
+
+    /// Build a consumed B2AGG `InputNoteRecord` (current miden-client API, mirrors
+    /// `bridge_out::tests::build_b2agg_note_with_consumer`) carrying a fungible
+    /// asset from `faucet_id` and recording `consumer` as the consuming account.
+    /// The gate keys on the note's script root + `consumer_account()` (the note
+    /// STATE), so only `faucet_id` and `consumer` matter here. The asset is
+    /// present so restore's emit path is actually reached when the gate is
+    /// absent — i.e. the RED test fails on the missing gate, not a no-asset skip.
+    fn ma3_b2agg_input_note(faucet_id: AccountId, consumer: Option<AccountId>) -> InputNoteRecord {
+        use miden_base_agglayer::B2AggNote;
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::asset::{Asset, FungibleAsset};
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{
+            NoteAssets, NoteAttachments, NoteDetails, NoteRecipient, NoteStorage,
+        };
+        use miden_protocol::{Felt, Word};
+
+        // B2AGG storage: 6 felts (network + 5 address limbs); zeros parse fine.
+        let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
+        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+        let asset: Asset = FungibleAsset::new(faucet_id, 50).unwrap().into();
+        let assets = NoteAssets::new(vec![asset]).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: consumer,
+            consumed_tx_order: None,
+        });
+        InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
+    async fn ma3_register_faucet(store: &StdArc<dyn Store>, faucet_id: AccountId) {
+        store
+            .register_faucet(crate::store::FaucetEntry {
+                faucet_id,
+                origin_address: [0u8; 20],
+                origin_network: 0,
+                symbol: "ETH".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// RED → GREEN regression for Finding #3: a reclaimed B2AGG note (consumer ==
+    /// sender, not the bridge) must NOT rebuild a synthetic BridgeEvent on restore.
+    #[tokio::test]
+    async fn ma3_restore_reclaimed_b2agg_note_is_not_emitted() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, sender_id) = ma3_accounts();
+        // Register the faucet so the (ungated) emit path would otherwise SUCCEED:
+        // the test then fails on the missing gate, not on an unrelated
+        // unresolved-faucet skip.
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // Reclaim branch: consumer == sender (the user), NOT the bridge.
+        let note = ma3_b2agg_input_note(faucet_id, Some(sender_id));
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome =
+            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "reclaimed B2AGG note (consumer != bridge) must NOT rebuild a BridgeEvent",
+        );
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "reclaimed note must not be marked processed",
+        );
+    }
+
+    /// Bridge branch: a B2AGG note consumed by the configured bridge IS a real
+    /// bridge-out and must still be rebuilt on restore (the gate must not be
+    /// over-eager).
+    #[tokio::test]
+    async fn ma3_restore_emits_for_bridge_consumed_b2agg() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // consumer == bridge → real bridge-out.
+        let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome =
+            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Emitted,
+            "bridge-consumed B2AGG note must rebuild a BridgeEvent"
+        );
+        assert!(
+            store.is_note_processed(&note_id).await.unwrap(),
+            "emitted note must be marked processed",
+        );
+    }
+
+    /// Fail-closed: a consumed B2AGG note with no recorded consumer
+    /// (`consumer_account == None`) is an anomaly and must be skipped, not
+    /// emitted on an unverifiable basis.
+    #[tokio::test]
+    async fn ma3_restore_skips_b2agg_with_untracked_consumer() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        let note = ma3_b2agg_input_note(faucet_id, None);
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome =
+            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "untracked-consumer B2AGG note must NOT rebuild a BridgeEvent",
+        );
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "skipped note must not be marked processed",
+        );
+    }
+
+    /// Defense-in-depth: a B2AGG note consumed by an account that is neither the
+    /// bridge NOR the original sender (an anomalous third party) must still be
+    /// skipped — the gate is an allow-list of exactly the configured bridge
+    /// account, so anything else is gated out (classified `Reclaimed`).
+    #[tokio::test]
+    async fn ma3_restore_skips_b2agg_consumed_by_other_account() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // A third account, distinct from BOTH the bridge and the sender.
+        let other = id(TEST_TARGET_OTHER);
+        let note = ma3_b2agg_input_note(faucet_id, Some(other));
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome =
+            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "B2AGG note consumed by a non-bridge third party must NOT rebuild a BridgeEvent",
+        );
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "skipped note must not be marked processed",
+        );
+    }
+
+    /// Review follow-up: if a PRE-FIX restore wrongly marked a reclaimed B2AGG
+    /// note processed (emitting an invalid BridgeEvent), an upgraded run must NOT
+    /// silently skip it — it must surface the legacy bad state so operators can
+    /// reset/rebuild.
+    #[tokio::test]
+    async fn ma3_restore_flags_legacy_processed_reclaimed_b2agg() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // Reclaim consumer, but a pre-fix run already marked it processed.
+        let note = ma3_b2agg_input_note(faucet_id, Some(id(TEST_SENDER_MANAGER)));
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+        store.mark_note_processed(note_id.clone()).await.unwrap();
+
+        let outcome =
+            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::LegacyProcessedGated,
+            "an already-processed gated note must be flagged as legacy bad state",
+        );
+    }
+
+    /// A legitimately bridge-out note already processed by an earlier run is a
+    /// benign no-op — it must NOT be flagged as legacy bad state.
+    #[tokio::test]
+    async fn ma3_restore_already_processed_bridge_b2agg_is_benign() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+        store.mark_note_processed(note_id.clone()).await.unwrap();
+
+        let outcome =
+            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "a correctly-processed bridge-out note must be a benign skip, not flagged",
+        );
     }
 }
