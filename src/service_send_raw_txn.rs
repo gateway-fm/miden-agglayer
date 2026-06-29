@@ -1197,17 +1197,24 @@ mod tests {
 
         let oks = [&res_a, &res_b].iter().filter(|r| r.is_ok()).count();
 
-        // SAFETY invariant (RD-1021): the per-signer lock + the
-        // `nonce_get` -> check -> handler -> `nonce_increment` critical section
-        // let at most ONE same-nonce tx pass the gate. With distinct hashes the
-        // dedup can't mask the loser, so this is deterministic — the loser hits
-        // the nonce-equality check (tx.nonce 0 != expected 1) and is rejected.
+        // SAFETY invariant (RD-1021): the per-signer lock serialises both
+        // same-nonce txs through the `nonce_get` -> check -> handler ->
+        // `nonce_increment` section, and the nonce advances ONLY on a handler
+        // that succeeds. So at most one can succeed: once one reaches
+        // `nonce_increment` (expected 0 -> 1) the other fails the equality check
+        // (tx.nonce 0 != expected 1) and is rejected; and if the first instead
+        // fails inside the handler WITHOUT incrementing, expected stays 0 and the
+        // second passes the check (0 == 0) for a fresh attempt — but only its own
+        // success could then increment, so the success count still can't exceed
+        // one. Distinct tx hashes make this reachable: identical hashes would let
+        // the RD-940 dedup mask the second tx before the lock is ever exercised.
         //
-        // `oks` can be 0 (not only 1): the winner's handler runs the GER-insert
-        // path through the test `MidenClient` stub, whose request/response hops a
+        // Hence `oks` can be 0 (not only 1): the handler runs the GER-insert path
+        // through the test `MidenClient` stub, whose request/response hops a
         // `std::thread` + oneshot channel; under load that round-trip can fail the
-        // winner — a liveness hiccup, not a safety violation. The lone-tx happy
-        // path is covered deterministically by `r4_correct_nonce_accepted`.
+        // tx that holds the gate — a liveness hiccup, not a safety violation. The
+        // lone-tx happy path is covered deterministically by
+        // `r4_correct_nonce_accepted`.
         assert!(
             oks <= 1,
             "at most one same-nonce tx may succeed (got {oks}) — double-submit guard broken"
