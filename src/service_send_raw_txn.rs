@@ -758,12 +758,14 @@ mod tests {
     }
 
     /// Build + encode a legacy tx REALLY signed by `signer_key` with an explicit
-    /// `gas_price`. Two calls with the same key + nonce + calldata but different
-    /// `gas_price` recover to the SAME signer yet produce DIFFERENT tx-hashes (the
-    /// hash is keccak over the signed RLP, which includes gas_price). Distinct
-    /// hashes are the point: they stop the RD-940 tx-hash dedup (idempotent
-    /// re-broadcast) from short-circuiting the loser, so the per-signer nonce lock
-    /// is the actual guard exercised by the concurrency test.
+    /// `gas_price`. The nonce is intentionally FIXED to 0 (not a parameter): this
+    /// helper exists solely for the same-nonce concurrency test, so don't reuse it
+    /// for arbitrary nonces. Two calls with the same key + nonce 0 + calldata but
+    /// different `gas_price` recover to the SAME signer yet produce DIFFERENT
+    /// tx-hashes (the hash is keccak over the signed RLP, which includes
+    /// gas_price). Distinct hashes are the point: they stop the RD-940 tx-hash
+    /// dedup (idempotent re-broadcast) from short-circuiting the loser, so the
+    /// per-signer nonce lock is the actual guard exercised by the concurrency test.
     fn encode_legacy_tx_signed(
         signer_key: &alloy::signers::local::PrivateKeySigner,
         input: Vec<u8>,
@@ -1184,6 +1186,14 @@ mod tests {
         .abi_encode();
         let input_a = encode_legacy_tx_signed(&signer_key, calldata.clone(), 0);
         let input_b = encode_legacy_tx_signed(&signer_key, calldata, 1);
+        // Enforce the test's premise: distinct gas_price -> distinct signed RLP ->
+        // distinct tx hashes, so the RD-940 tx-hash dedup can't conflate the two
+        // and short-circuit the loser before the per-signer nonce lock is hit.
+        // Fails loudly if alloy encoding/signing ever makes these collide.
+        assert_ne!(
+            input_a, input_b,
+            "distinct gas_price must produce distinct encoded txs (distinct tx hashes)"
+        );
 
         let service = create_test_service();
         let store = service.store.clone();
