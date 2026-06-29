@@ -39,7 +39,7 @@ use crate::claim_watcher::{derive_manual_claim_tx_hash, parse_claim_event_from_s
 use crate::miden_client::MidenClient;
 use crate::store::Store;
 use miden_base_agglayer::UpdateGerNote;
-use miden_client::store::NoteFilter;
+use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_protocol::account::AccountId;
 use miden_protocol::note::{NoteAttachments, NoteMetadata};
 use sha3::{Digest, Keccak256};
@@ -234,12 +234,16 @@ async fn sync_miden_block(
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
-    _accounts: &AccountsConfig,
+    accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
+    // Cantina MA#3 — the configured bridge account is the only legitimate
+    // consumer of a *bridge-out* B2AGG note; reclaim/untracked consumptions are
+    // gated out in `restore_one_b2agg_note`.
+    let bridge_id = accounts.bridge.0;
 
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
@@ -270,86 +274,19 @@ async fn restore_bridge_outs(
                 sorted.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
 
                 for note in sorted {
-                    let details = note.details();
-                    if !is_b2agg_note(details) {
-                        continue;
-                    }
-
-                    let note_id_str = hex::encode(note.details_commitment().as_bytes());
-                    if store_clone.is_note_processed(&note_id_str).await? {
-                        continue;
-                    }
-
-                    let (destination_network, destination_address) = match parse_b2agg_storage(
-                        details.storage(),
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
-                            continue;
-                        }
-                    };
-
-                    let Some(fungible_asset) = details.assets().iter_fungible().next() else {
-                        continue;
-                    };
-                    let faucet_id = fungible_asset.faucet_id();
-                    let miden_amount = u64::from(fungible_asset.amount());
-                    let origin = match resolve_faucet_origin(faucet_id, &*store_clone).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
-                            continue;
-                        }
-                    };
-                    let origin_amount = match crate::bridge_out::reverse_scale_amount(
-                        miden_amount,
-                        origin.scale,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
-                            continue;
-                        }
-                    };
-
-                    // B5 — share the versioned domain-separated helper with
-                    // bridge_out so the tx_hash is byte-identical across
-                    // first-observation and restore paths (dedup-stable).
-                    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
-
-                    let deposit_count =
-                        store_clone.mark_note_processed(note_id_str.clone()).await?;
-
-                    if let Err(err) = store_clone
-                        .add_bridge_event(
-                            bridge_address,
-                            restore_block,
-                            block_hash,
-                            &tx_hash,
-                            0, // LEAF_TYPE_ASSET
-                            origin.origin_network,
-                            &origin.origin_address,
-                            destination_network,
-                            &destination_address,
-                            origin_amount,
-                            &[],
-                            deposit_count,
-                        )
-                        .await
+                    if restore_one_b2agg_note(
+                        &store_clone,
+                        note,
+                        bridge_id,
+                        restore_block,
+                        block_hash,
+                        bridge_address,
+                    )
+                    .await?
                     {
-                        let _ = store_clone.unmark_note_processed(&note_id_str).await;
-                        return Err(err);
+                        count += 1;
+                        logs += 1;
                     }
-
-                    tracing::info!(
-                        note_id = %note_id_str,
-                        deposit_count,
-                        "restore: rebuilt BridgeEvent"
-                    );
-
-                    count += 1;
-                    logs += 1;
                 }
 
                 *result_inner.lock().unwrap() = (count, logs);
@@ -360,6 +297,100 @@ async fn restore_bridge_outs(
 
     let (count, logs) = *result.lock().unwrap();
     Ok((count, logs))
+}
+
+/// Rebuild the synthetic `BridgeEvent` for a single consumed note, if and only
+/// if it is a *bridge-out* B2AGG note consumed by the configured `bridge_id`.
+///
+/// Returns `Ok(true)` when a synthetic BridgeEvent was emitted, `Ok(false)` when
+/// the note was skipped (not B2AGG, already processed, unparseable, or — the
+/// Cantina MA#3 gate — reclaimed/consumed by a non-bridge account). Extracted
+/// from `restore_bridge_outs` so the per-note decision is unit-testable without a
+/// live Miden client (mirrors `BridgeOutScanner::process_consumed_note`).
+async fn restore_one_b2agg_note(
+    store: &Arc<dyn Store>,
+    note: &InputNoteRecord,
+    bridge_id: AccountId,
+    restore_block: u64,
+    block_hash: [u8; 32],
+    bridge_address: &str,
+) -> anyhow::Result<bool> {
+    let details = note.details();
+    if !is_b2agg_note(details) {
+        return Ok(false);
+    }
+
+    let note_id_str = hex::encode(note.details_commitment().as_bytes());
+    if store.is_note_processed(&note_id_str).await? {
+        return Ok(false);
+    }
+
+    // Cantina MA#3 reclaim gate is inserted here in the fix commit.
+    let _ = bridge_id;
+
+    let (destination_network, destination_address) = match parse_b2agg_storage(details.storage()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            return Ok(false);
+        }
+    };
+
+    let Some(fungible_asset) = details.assets().iter_fungible().next() else {
+        return Ok(false);
+    };
+    let faucet_id = fungible_asset.faucet_id();
+    let miden_amount = u64::from(fungible_asset.amount());
+    let origin = match resolve_faucet_origin(faucet_id, &**store).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            return Ok(false);
+        }
+    };
+    let origin_amount = match crate::bridge_out::reverse_scale_amount(miden_amount, origin.scale) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            return Ok(false);
+        }
+    };
+
+    // B5 — share the versioned domain-separated helper with bridge_out so the
+    // tx_hash is byte-identical across first-observation and restore paths
+    // (dedup-stable).
+    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
+
+    let deposit_count = store.mark_note_processed(note_id_str.clone()).await?;
+
+    if let Err(err) = store
+        .add_bridge_event(
+            bridge_address,
+            restore_block,
+            block_hash,
+            &tx_hash,
+            0, // LEAF_TYPE_ASSET
+            origin.origin_network,
+            &origin.origin_address,
+            destination_network,
+            &destination_address,
+            origin_amount,
+            &[],
+            deposit_count,
+        )
+        .await
+    {
+        let _ = store.unmark_note_processed(&note_id_str).await;
+        return Err(err);
+    }
+
+    tracing::info!(
+        note_id = %note_id_str,
+        deposit_count,
+        "restore: rebuilt BridgeEvent"
+    );
+
+    Ok(true)
 }
 
 /// Phase 2.5: scan miden consumed CLAIM notes and replay any missing
