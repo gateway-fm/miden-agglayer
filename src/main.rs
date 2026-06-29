@@ -190,6 +190,16 @@ struct Command {
     /// it lands in Phase 1.
     #[arg(long, env = "AGGLAYER_ENABLE_WRITER_WORKER", default_value_t = false)]
     enable_writer_worker: bool,
+
+    /// Synthetic-indexer redesign — enable the `SyntheticProjector` as the sole
+    /// owner of the synthetic EVM chain (`docs/SYNTHETIC-INDEXER-REDESIGN.md`).
+    /// DEFAULT-OFF. In Phase 2a the flag is only declared, parsed and logged at
+    /// startup; the running service does NOT branch on it yet (the projector is
+    /// not registered as a live sync listener, and the legacy writers keep
+    /// emitting), so `false` *and* `true` are currently identical at runtime.
+    /// The actual cut-over fork lands in Phase 2b.
+    #[arg(long, env = "SYNTHETIC_PROJECTOR", default_value_t = false)]
+    synthetic_projector_enabled: bool,
 }
 
 /// Validate the `--require-hardening` invariants. Returns a list of
@@ -300,6 +310,10 @@ impl std::fmt::Debug for Command {
                 &self.miden_prover_fallback_to_local,
             )
             .field("enable_writer_worker", &self.enable_writer_worker)
+            .field(
+                "synthetic_projector_enabled",
+                &self.synthetic_projector_enabled,
+            )
             .finish()
     }
 }
@@ -650,6 +664,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Synthetic-indexer redesign (Phase 2a) — the flag is declared and logged
+    // but NOT acted on yet (default-off, zero production behaviour change). The
+    // projector is wired in as a live sync listener in Phase 2b; here we only
+    // surface the configured value so deployments can confirm it parses.
+    tracing::info!(
+        synthetic_projector_enabled = command.synthetic_projector_enabled,
+        "synthetic projector flag parsed (Phase 2a: declared only, not yet wired \
+         into the live service; no behaviour change regardless of value)"
+    );
+
     // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
     // proactively indexing every (mainnet, rollup) pair as L1 emits it,
     // instead of trying to recover the pair from a racing view call after the
@@ -953,6 +977,7 @@ mod hardening_tests {
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
             enable_writer_worker: false,
+            synthetic_projector_enabled: false,
         }
     }
 

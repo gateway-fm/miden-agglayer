@@ -86,21 +86,23 @@ pub struct SyntheticProjector {
     bridge_id: AccountId,
     /// Expected GER sender (ger_manager, or service for legacy deployments).
     expected_ger_sender: AccountId,
-    /// Last projected Miden block height. The projector is the single owner of
-    /// this cursor (SINGLE-PROCESS ONLY).
+    /// Last projected Miden block height — an in-memory cache of the persisted
+    /// `Store::get_projector_cursor`. The projector is the single owner of this
+    /// cursor (SINGLE-PROCESS ONLY) and persists every advance in `tick`.
     cursor: AtomicU64,
 }
 
 impl SyntheticProjector {
-    /// Build a projector from the account configuration. `start_cursor` is the
-    /// last already-projected Miden block height (0 for a fresh chain).
-    pub fn new(
+    /// Build a projector from the account configuration. The starting cursor is
+    /// **loaded from the store** (`Store::get_projector_cursor`, 0 for a fresh
+    /// chain), so a restart resumes catch-up from the last persisted block
+    /// rather than re-scanning from genesis. `tick` persists each advance.
+    pub async fn new(
         store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
         source: Arc<dyn ConsumedNoteSource>,
         accounts: &AccountsConfig,
-        start_cursor: u64,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         // MA#28 — same fallback as `restore_gers` / `submit_update_ger_note`:
         // legacy deployments without a dedicated ger_manager mint GER notes
         // from the service account.
@@ -109,14 +111,15 @@ impl SyntheticProjector {
             .as_ref()
             .map(|a| a.0)
             .unwrap_or(accounts.service.0);
-        Self {
+        let start_cursor = store.get_projector_cursor().await?;
+        Ok(Self {
             store,
             block_state,
             source,
             bridge_id: accounts.bridge.0,
             expected_ger_sender,
             cursor: AtomicU64::new(start_cursor),
-        }
+        })
     }
 
     /// The current cursor (last projected Miden block height).
@@ -250,6 +253,9 @@ impl SyntheticProjector {
             self.project_block(next).await?;
             // Advance the cursor only after the block is fully projected, so a
             // crash mid-block re-projects (idempotently) rather than skipping.
+            // Persist BEFORE updating the in-memory cache so the durable cursor
+            // never runs ahead of fully-projected state.
+            self.store.set_projector_cursor(next).await?;
             self.cursor.store(next, Ordering::Release);
             cursor = next;
         }
@@ -561,7 +567,9 @@ mod tests {
         });
         let block_state = StdArc::new(BlockState::new());
         let projector =
-            SyntheticProjector::new(store.clone(), block_state, source, &test_accounts(), 0);
+            SyntheticProjector::new(store.clone(), block_state, source, &test_accounts())
+                .await
+                .unwrap();
 
         let written = projector.project_block(5).await.unwrap();
         assert_eq!(written, 3, "all three derivations must emit one log each");
@@ -616,8 +624,9 @@ mod tests {
             StdArc::new(BlockState::new()),
             source,
             &test_accounts(),
-            0,
-        );
+        )
+        .await
+        .unwrap();
 
         let first = projector.project_block(7).await.unwrap();
         assert_eq!(first, 3);
@@ -647,8 +656,9 @@ mod tests {
             StdArc::new(BlockState::new()),
             source,
             &test_accounts(),
-            0,
-        );
+        )
+        .await
+        .unwrap();
 
         // Project block 3: only the B2AGG note belongs here.
         assert_eq!(projector.project_block(3).await.unwrap(), 1);
@@ -696,8 +706,9 @@ mod tests {
                 StdArc::new(BlockState::new()),
                 source,
                 &test_accounts(),
-                0,
-            );
+            )
+            .await
+            .unwrap();
             let cursor = projector.tick().await.unwrap();
             assert_eq!(cursor, 9, "tick must advance the cursor to the Miden tip");
             logs_in_range(&store, 0, 9).await

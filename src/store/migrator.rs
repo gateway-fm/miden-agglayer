@@ -78,6 +78,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "008_faucet_metadata.sql",
         include_str!("../../migrations/008_faucet_metadata.sql"),
     ),
+    (
+        "009_synthetic_projector.sql",
+        include_str!("../../migrations/009_synthetic_projector.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

@@ -242,6 +242,55 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
+    /// Last fully-projected Miden block height owned by the `SyntheticProjector`
+    /// (`docs/SYNTHETIC-INDEXER-REDESIGN.md`). Returns 0 if the projector has
+    /// never persisted a cursor on this deployment (fresh chain). The projector
+    /// is the single in-process owner of this cursor (SINGLE-PROCESS ONLY).
+    async fn get_projector_cursor(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    /// Persist the last fully-projected Miden block height. Called by the
+    /// projector after each block so a restart resumes catch-up from here
+    /// instead of re-scanning the whole chain.
+    async fn set_projector_cursor(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    // === Receipts map (synthetic-indexer redesign, Phase 2b substrate) ===
+    //
+    // See the "Receipts — the submit ⟂ project handoff" section of
+    // `docs/SYNTHETIC-INDEXER-REDESIGN.md`. The map is the ONLY state the two
+    // workers share, and it is a *first-write associative map, not a shared
+    // counter*, so it carries none of Finding #5's race. UNUSED in Phase 2a —
+    // it is the substrate the Phase-2b receipts lifecycle is built on.
+    /// First-write-wins association `evm_tx_hash -> note_commitment`. Worker 1
+    /// (submit) records this when it submits a CLAIM/GER note to Miden; worker 2
+    /// (the projector) looks it up when it observes the note consumed, to
+    /// complete the *right* receipt. A second write for an already-linked
+    /// `tx_hash` is a no-op (first-write-wins): the on-chain note is the real
+    /// handoff and this map only answers "which receipt does this note belong
+    /// to". UNUSED in Phase 2a.
+    async fn record_tx_note_link(
+        &self,
+        _tx_hash: &str,
+        _note_commitment: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Forward lookup: the note commitment first-associated with `tx_hash`, or
+    /// `None`. See [`Store::record_tx_note_link`]. UNUSED in Phase 2a.
+    async fn get_note_link_for_tx(&self, _tx_hash: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+    /// Reverse lookup: the `evm_tx_hash` first-associated with `note_commitment`,
+    /// or `None`. The projector uses this direction when it holds the consumed
+    /// note and needs the caller's receipt key. See
+    /// [`Store::record_tx_note_link`]. UNUSED in Phase 2a.
+    async fn get_tx_for_note(&self, _note_commitment: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     // === Synthetic logs ===
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;
     async fn get_logs(

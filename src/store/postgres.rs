@@ -123,6 +123,82 @@ impl Store for PgStore {
         Ok(())
     }
 
+    // ── Synthetic projector cursor (Phase 2a) ────────────────────
+    //
+    // Persisted as a column on the single-row service_state table, mirroring
+    // latest_block_number / log_counter (migration 009).
+
+    async fn get_projector_cursor(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT projector_cursor FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        let val: i64 = row.get(0);
+        Ok(val as u64)
+    }
+
+    async fn set_projector_cursor(&self, block: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET projector_cursor = $1, updated_at = now() WHERE id = 1",
+                &[&(block as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ── Receipts map (Phase 2b substrate; unused in 2a) ──────────
+    //
+    // First-write-wins evm_tx_hash -> note_commitment (migration 009). The
+    // PRIMARY KEY on tx_hash plus ON CONFLICT DO NOTHING enforces first-write
+    // semantics; the reverse lookup is served by idx_tx_note_links_note_commitment.
+
+    async fn record_tx_note_link(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO tx_note_links (tx_hash, note_commitment) VALUES ($1, $2)
+                 ON CONFLICT (tx_hash) DO NOTHING",
+                &[&tx_hash, &note_commitment],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn get_note_link_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<String>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT note_commitment FROM tx_note_links WHERE tx_hash = $1",
+                &[&tx_hash],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, String>(0)))
+    }
+
+    async fn get_tx_for_note(&self, note_commitment: &str) -> anyhow::Result<Option<String>> {
+        // First-associated tx for a note: order by created_at so a stable
+        // (first) row is returned even if the reverse direction ever has
+        // multiple tx_hash rows for one commitment.
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT tx_hash FROM tx_note_links WHERE note_commitment = $1
+                 ORDER BY created_at ASC LIMIT 1",
+                &[&note_commitment],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, String>(0)))
+    }
+
     // ── Logs ─────────────────────────────────────────────────────
 
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {
