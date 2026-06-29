@@ -100,10 +100,12 @@ provision() {
 
   section "0b · companion repos (siblings of this checkout)"
   [ -d "$WORK/aggkit-proxy" ]   || git clone https://github.com/mandrigin/aggkit-proxy.git "$WORK/aggkit-proxy"
-  git -C "$WORK/aggkit-proxy" checkout -q feat/protocol-0.15-migration 2>/dev/null || true
+  # The 0.15 migration is now on main (feat/protocol-0.15-migration merged in).
+  git -C "$WORK/aggkit-proxy" checkout -q main 2>/dev/null || true
+  git -C "$WORK/aggkit-proxy" pull -q --ff-only 2>/dev/null || true
   # L1-snapshot-only gate so kurtosis doesn't demand the local miden/aggkit images:
   local cdkpkg="$WORK/aggkit-proxy/kurtosis/miden-cdk"
-  grep -q "deploy_miden_services" "$cdkpkg/main.star" 2>/dev/null || warn "miden-cdk main.star lacks deploy_miden_services gate (already patched on the 0.15 branch)"
+  grep -q "deploy_miden_services" "$cdkpkg/main.star" 2>/dev/null || warn "miden-cdk main.star lacks deploy_miden_services gate (already patched on main)"
   grep -q "deploy_miden_services: false" "$cdkpkg/params.yaml" 2>/dev/null || \
     sed -i 's/^miden:/miden:\n  deploy_miden_services: false/' "$cdkpkg/params.yaml" 2>/dev/null || true
   [ -d "$WORK/kurtosis-cdk" ]   || git clone --depth 1 https://github.com/0xPolygon/kurtosis-cdk.git "$WORK/kurtosis-cdk"
