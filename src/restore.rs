@@ -424,8 +424,13 @@ async fn restore_one_b2agg_note(
 
     // Cantina #13 follow-up — DoS guard. `origin.metadata` ultimately derives
     // from untrusted L1 calldata and the BridgeEvent encoder does not cap it, so
-    // an oversized blob would drive a huge allocation. Refuse to encode it; skip
-    // without marking the note processed (mirrors the live scanner's guard).
+    // an oversized blob would drive a huge allocation. Refuse to encode it.
+    //
+    // Record the note as unbridgeable (Cantina MA#18 quarantine) — exactly as the
+    // live scanner does — so this permanent skip is not re-attempted on every
+    // restore run. The restore path has a clean `store` handle and the same
+    // `note` / `bridge_id` / block context the live path uses, so we can record
+    // the quarantine row directly via the shared helper.
     if origin.metadata.len() > crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES {
         ::metrics::counter!("bridge_out_b2agg_metadata_too_large_total").increment(1);
         tracing::warn!(
@@ -434,6 +439,20 @@ async fn restore_one_b2agg_note(
             cap = crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES,
             "restore: B2AGG faucet metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
         );
+        crate::bridge_out::quarantine_unbridgeable_b2agg(
+            &**store,
+            bridge_id,
+            &note_id_str,
+            note,
+            restore_block,
+            crate::store::UnbridgeableBridgeOutReason::MetadataTooLarge,
+            format!(
+                "origin.metadata.len()={} exceeds MAX_BRIDGE_EVENT_METADATA_BYTES={}",
+                origin.metadata.len(),
+                crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES
+            ),
+        )
+        .await;
         return Ok(B2AggRestoreOutcome::Skipped);
     }
 

@@ -1148,6 +1148,7 @@ impl Store for PgStore {
             "unknown_faucet" => UnbridgeableBridgeOutReason::UnknownFaucet,
             "amount_overflow" => UnbridgeableBridgeOutReason::AmountOverflow,
             "atomic_commit_failed" => UnbridgeableBridgeOutReason::AtomicCommitFailed,
+            "metadata_too_large" => UnbridgeableBridgeOutReason::MetadataTooLarge,
             other => anyhow::bail!("unknown unbridgeable_bridge_outs.reason value: {other}"),
         };
 
@@ -1505,7 +1506,15 @@ impl Store for PgStore {
                      origin_decimals = EXCLUDED.origin_decimals,
                      miden_decimals = EXCLUDED.miden_decimals,
                      scale = EXCLUDED.scale,
-                     metadata = EXCLUDED.metadata",
+                     -- Cantina #13 — never clobber stored metadata with empty. A
+                     -- blank re-register (metadata = vec![]) must not wipe good
+                     -- metadata persisted by an earlier non-empty registration or
+                     -- the Layer-2 backfill (which always writes non-empty, so it
+                     -- still updates here).
+                     metadata = CASE
+                         WHEN EXCLUDED.metadata = ''::bytea THEN faucet_registry.metadata
+                         ELSE EXCLUDED.metadata
+                     END",
                 &[
                     &faucet_id,
                     &entry.origin_address.as_slice(),

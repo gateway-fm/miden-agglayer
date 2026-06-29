@@ -553,6 +553,22 @@ impl BridgeOutScanner {
                 cap = MAX_BRIDGE_EVENT_METADATA_BYTES,
                 "B2AGG faucet metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
             );
+            // Cantina #13 follow-up — record the note as unbridgeable so this
+            // permanent skip is not re-attempted every sync tick (the gate would
+            // otherwise re-surface the same oversized-metadata note forever — a
+            // free DoS on the sync loop). Mirrors the other MA#18 skip gates.
+            self.quarantine_unbridgeable_b2agg(
+                &note_id_str,
+                note,
+                block_number,
+                crate::store::UnbridgeableBridgeOutReason::MetadataTooLarge,
+                format!(
+                    "origin.metadata.len()={} exceeds MAX_BRIDGE_EVENT_METADATA_BYTES={}",
+                    origin.metadata.len(),
+                    MAX_BRIDGE_EVENT_METADATA_BYTES
+                ),
+            )
+            .await;
             return false;
         }
         match self
@@ -631,64 +647,98 @@ impl BridgeOutScanner {
         reason: crate::store::UnbridgeableBridgeOutReason,
         detail: String,
     ) {
-        // Bound the detail field so a flood of malformed notes can't
-        // bloat individual rows. The Postgres column has no length cap;
-        // bound here so the bound is enforced regardless of backend.
-        const MAX_DETAIL: usize = 4096;
-        let detail = if detail.len() > MAX_DETAIL {
-            format!(
-                "{}…[truncated {} bytes]",
-                &detail[..MAX_DETAIL],
-                detail.len() - MAX_DETAIL
-            )
-        } else {
-            detail
-        };
-
-        let note_dump = dump_note_for_quarantine(note);
-        metrics::counter!(
-            "bridge_out_quarantined_erased_b2agg_total",
-            "reason" => reason.as_str()
-        )
-        .increment(1);
-
-        let entry = crate::store::UnbridgeableBridgeOut {
-            note_id: note_id_str.to_string(),
-            bridge_account: self.bridge_account_id,
+        // Delegate to the shared free helper so the live scanner and the offline
+        // restore path (`restore.rs`) record quarantine rows identically.
+        quarantine_unbridgeable_b2agg(
+            &*self.store,
+            self.bridge_account_id,
+            note_id_str,
+            note,
+            observed_block,
             reason,
             detail,
-            note_dump,
-            observed_block,
-        };
+        )
+        .await;
+    }
+}
 
-        match self.store.record_unbridgeable_bridge_out(entry).await {
-            Ok(true) => {
-                tracing::warn!(
-                    target: "bridge_out::quarantine",
-                    note_id = %note_id_str,
-                    reason = reason.as_str(),
-                    "Cantina MA#18: B2AGG quarantined — operator handle persisted"
-                );
-            }
-            Ok(false) => {
-                // Already quarantined; idempotent — no spam.
-                tracing::debug!(
-                    target: "bridge_out::quarantine",
-                    note_id = %note_id_str,
-                    reason = reason.as_str(),
-                    "Cantina MA#18: B2AGG already quarantined (idempotent skip)"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "bridge_out::quarantine",
-                    note_id = %note_id_str,
-                    reason = reason.as_str(),
-                    error = %e,
-                    "Cantina MA#18: failed to record quarantine row — \
-                     metric still fired but recovery handle is lost"
-                );
-            }
+/// Record a quarantine (`unbridgeable_bridge_outs`) row for a B2AGG that was
+/// observed consumed by the bridge but skipped by the indexer (Cantina MA#18).
+///
+/// Shared by the live scanner ([`BridgeOutScanner::quarantine_unbridgeable_b2agg`])
+/// and the offline restore path so both record a note as a *permanent skip*
+/// (note_id + reason + diagnostic) and the same oversized / erased note is not
+/// re-attempted on every sync tick or restore run.
+///
+/// Best-effort: a quarantine-write failure must not propagate — the caller's
+/// contract is that a skip path's only side effect is the skip itself.
+/// Quarantine errors are logged and the metric still fires.
+pub(crate) async fn quarantine_unbridgeable_b2agg(
+    store: &dyn crate::store::Store,
+    bridge_account: AccountId,
+    note_id_str: &str,
+    note: &InputNoteRecord,
+    observed_block: u64,
+    reason: crate::store::UnbridgeableBridgeOutReason,
+    detail: String,
+) {
+    // Bound the detail field so a flood of malformed notes can't
+    // bloat individual rows. The Postgres column has no length cap;
+    // bound here so the bound is enforced regardless of backend.
+    const MAX_DETAIL: usize = 4096;
+    let detail = if detail.len() > MAX_DETAIL {
+        format!(
+            "{}…[truncated {} bytes]",
+            &detail[..MAX_DETAIL],
+            detail.len() - MAX_DETAIL
+        )
+    } else {
+        detail
+    };
+
+    let note_dump = dump_note_for_quarantine(note);
+    metrics::counter!(
+        "bridge_out_quarantined_erased_b2agg_total",
+        "reason" => reason.as_str()
+    )
+    .increment(1);
+
+    let entry = crate::store::UnbridgeableBridgeOut {
+        note_id: note_id_str.to_string(),
+        bridge_account,
+        reason,
+        detail,
+        note_dump,
+        observed_block,
+    };
+
+    match store.record_unbridgeable_bridge_out(entry).await {
+        Ok(true) => {
+            tracing::warn!(
+                target: "bridge_out::quarantine",
+                note_id = %note_id_str,
+                reason = reason.as_str(),
+                "Cantina MA#18: B2AGG quarantined — operator handle persisted"
+            );
+        }
+        Ok(false) => {
+            // Already quarantined; idempotent — no spam.
+            tracing::debug!(
+                target: "bridge_out::quarantine",
+                note_id = %note_id_str,
+                reason = reason.as_str(),
+                "Cantina MA#18: B2AGG already quarantined (idempotent skip)"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "bridge_out::quarantine",
+                note_id = %note_id_str,
+                reason = reason.as_str(),
+                error = %e,
+                "Cantina MA#18: failed to record quarantine row — \
+                 metric still fired but recovery handle is lost"
+            );
         }
     }
 }
@@ -702,7 +752,7 @@ impl BridgeOutScanner {
 /// Kept simple text rather than `serde_json::to_string` to avoid pulling
 /// serde into the bridge_out hot path and to keep the format human-readable
 /// in psql.
-fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
+pub(crate) fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
     use std::fmt::Write as _;
     let details = note.details();
     let script_root_hex = hex::encode(details.script().root().as_bytes());
@@ -1981,6 +2031,49 @@ mod tests {
         assert_eq!(R::UnknownFaucet.as_str(), "unknown_faucet");
         assert_eq!(R::AmountOverflow.as_str(), "amount_overflow");
         assert_eq!(R::AtomicCommitFailed.as_str(), "atomic_commit_failed");
+        assert_eq!(R::MetadataTooLarge.as_str(), "metadata_too_large");
+    }
+
+    /// Cantina #13 follow-up — the oversized-metadata DoS guard must RECORD the
+    /// note as unbridgeable (not silently skip), so the same note isn't
+    /// re-attempted on every sync tick / restore run. This exercises the shared
+    /// free helper both call sites use, pinning that a `MetadataTooLarge`
+    /// quarantine row is persisted with the expected reason + forensic dump.
+    #[tokio::test]
+    async fn cantina13_metadata_too_large_records_unbridgeable() {
+        use crate::store::UnbridgeableBridgeOutReason;
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let note = build_b2agg_note_with_consumer(Some(bridge_id));
+        let note_id_str = hex::encode(note.details_commitment().as_bytes());
+
+        quarantine_unbridgeable_b2agg(
+            &*store,
+            bridge_id,
+            &note_id_str,
+            &note,
+            99,
+            UnbridgeableBridgeOutReason::MetadataTooLarge,
+            "origin.metadata.len()=70000 exceeds MAX_BRIDGE_EVENT_METADATA_BYTES=65536".to_string(),
+        )
+        .await;
+
+        let row = store
+            .get_unbridgeable_bridge_out(&note_id_str)
+            .await
+            .unwrap()
+            .expect("metadata-too-large note must be quarantined, not silently skipped");
+        assert_eq!(row.note_id, note_id_str);
+        assert_eq!(row.bridge_account, bridge_id);
+        assert_eq!(row.reason, UnbridgeableBridgeOutReason::MetadataTooLarge);
+        assert_eq!(row.observed_block, 99);
+        assert!(
+            row.detail
+                .contains("exceeds MAX_BRIDGE_EVENT_METADATA_BYTES")
+        );
     }
 
     /// Cantina MA#4 — wiring repro for the unknown-wrapper detector. Pins
