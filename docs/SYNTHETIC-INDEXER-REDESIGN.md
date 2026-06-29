@@ -57,6 +57,55 @@ Catch-up (cursor → tip) **is** recovery **is** the normal loop.
 
 The projector unifies these three per-note derivations into one cursor-driven loop.
 
+## Receipts — the submit ⟂ project handoff
+
+The proxy exposes an EVM-compatible RPC surface; aggkit and the bridge stack fetch
+**transaction receipts** (`eth_getTransactionReceipt`). Today the writer produces the synthetic
+block + logs synchronously at submit, so the receipt is ready immediately. Under the projector the
+receipt lifecycle **splits in two**, and that split is what keeps "sending" decoupled from
+"projecting":
+
+- **Submit (worker 1).** Submits the CLAIM/GER note to Miden; cares only that Miden *accepts* it.
+  On acceptance it records a **pending receipt** keyed by the caller's EVM `tx_hash` (status known;
+  `blockNumber`/`blockHash`/`logs` still empty). On Miden *rejection* it returns an error — no
+  receipt. Worker 1 never touches the synthetic tip or produces logs.
+- **Projection (worker 2).** When the projector observes that note **consumed** in Miden block `N`,
+  it derives the synthetic log and **completes** the receipt: `blockNumber = N`, block hash, `logs`,
+  `transactionHash`, `logIndex`, `status = success`. A receipt is immutable once complete.
+- **`eth_getTransactionReceipt`** returns `null` until the projector reaches block `N`, then the
+  full receipt — i.e. **standard "wait for the tx to be mined."** aggkit already polls receipts, so
+  the ≈1-block lag is normal EVM async, and the receipt now reflects *finalized* Miden state instead
+  of an optimistic guess.
+
+### Linking a consumed note back to its receipt
+
+The projector must complete the *right* receipt. Two cases:
+
+- **Bridge-outs** — no caller tx; the synthetic `tx_hash` is already a deterministic function of the
+  note (`derive_bridge_out_tx_hash(note_id)`). The projector re-derives it from the consumed note —
+  **no mapping needed.**
+- **Claims / GERs** — the caller signed a real `claimAsset` / `insertGlobalExitRoot` tx and holds
+  *its* hash. So worker 1, at submit, writes a small durable mapping **`evm_tx_hash → note
+  commitment`**; the projector looks it up when it consumes the note.
+
+That map is the **only** state the two workers share, and it is a **first-write associative map,
+not a shared counter** — it carries none of Finding #5's race. The Miden chain remains the real
+handoff; the map only answers "which receipt does this note belong to."
+
+### Edge cases (all clean)
+
+- **Rejected at submit** → immediate error, no receipt.
+- **Accepted but never consumed** (stuck note) → receipt stays pending → expires, like a dropped EVM
+  tx. The existing receipt store already carries `expires_at` on its `TxnReceipt` LRU.
+- **Crash between submit and projection** → the mapping is durable and the note is on-chain, so the
+  projector completes the receipt during catch-up (recovery ≡ live again).
+
+### Contract
+
+A receipt is `pending` from submit until the projector reaches the note's Miden block, then
+`complete` and immutable. **The projector never produces a receipt for a note it has not observed
+consumed.** This is the explicit cutover target for Phases 2–3.
+
 ## Phased migration — every phase gated by the FULL e2e regression matrix
 
 - **Phase 0 — foundation.** This doc + the cursor/ordering contract + a `SyntheticProjector`
