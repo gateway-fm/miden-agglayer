@@ -772,12 +772,17 @@ mod tests {
         use alloy::consensus::SignableTransaction;
         use alloy::signers::SignerSync;
         let txn = TxLegacy {
+            // Explicit so the test's "same nonce" semantics don't silently ride
+            // on `TxLegacy::default()` (would break if the default ever changes).
+            nonce: 0,
             input: input.into(),
             chain_id: Some(1),
             gas_price,
             ..Default::default()
         };
-        let signature = signer_key.sign_hash_sync(&txn.signature_hash()).unwrap();
+        let signature = signer_key
+            .sign_hash_sync(&txn.signature_hash())
+            .expect("signing the legacy test tx must succeed");
         let envelope: TxEnvelope = txn.into_signed(signature).into();
         let mut encoded = Vec::new();
         envelope.encode_2718(&mut encoded);
