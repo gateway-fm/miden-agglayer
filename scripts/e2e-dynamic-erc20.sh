@@ -324,6 +324,30 @@ GLOBAL_INDEX=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.lo
 
 log "Deposit #$DEPOSIT_CNT: amount=$AMOUNT_CLAIM, globalIndex=$GLOBAL_INDEX"
 
+# ── Cantina #13 — synthetic BridgeEvent must carry the real ERC20 metadata ────
+# When an ERC20 is bridged out, the proxy SYNTHESISES the BridgeEvent. Its
+# `metadata` must be the token's abi.encode(name, symbol, decimals) — the same
+# preimage that produced the faucet's MetadataHash on Miden. With empty metadata
+# (the bug) the certified exit leaf diverges from Miden's bridge state, and a
+# first claim of this ERC20 on a fresh NON-origin destination reverts inside
+# `_deployWrappedToken`'s `abi.decode`. The cross-L2 revert isn't reproducible on
+# this single-L2 stack, so we assert the metadata directly (the prerequisite the
+# PoC also targets). `METADATA_CLAIM` was read above from the bridge-service
+# deposit, i.e. exactly the bytes the proxy's synthetic event carried.
+TOKEN_NAME_CLEAN=$(printf '%s' "$TOKEN_NAME" | tr -d '"')
+TOKEN_SYMBOL_CLEAN=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "symbol()(string)" 2>/dev/null | tr -d '"')
+EXPECTED_METADATA=$(cast abi-encode 'f(string,string,uint8)' \
+    "$TOKEN_NAME_CLEAN" "$TOKEN_SYMBOL_CLEAN" "$TOKEN_DECIMALS")
+log "bridge-out metadata: got=$METADATA_CLAIM"
+log "  expected abi.encode($TOKEN_NAME_CLEAN, $TOKEN_SYMBOL_CLEAN, $TOKEN_DECIMALS) = $EXPECTED_METADATA"
+[[ "$METADATA_CLAIM" == "0x" ]] && fail \
+    "Cantina #13: ERC20 bridge-out BridgeEvent has EMPTY metadata (0x). It must carry \
+abi.encode(name,symbol,decimals); empty metadata diverges the exit leaf from Miden and \
+breaks first claims on fresh non-origin chains (_deployWrappedToken abi.decode revert)."
+[[ "$(printf '%s' "$METADATA_CLAIM" | tr 'A-F' 'a-f')" == "$(printf '%s' "$EXPECTED_METADATA" | tr 'A-F' 'a-f')" ]] || fail \
+    "Cantina #13: ERC20 bridge-out metadata mismatch — got '$METADATA_CLAIM', expected '$EXPECTED_METADATA'."
+pass "Cantina #13: bridge-out BridgeEvent carries correct ERC20 metadata"
+
 # If the bridge-autoclaim service already claimed this deposit on L1, it carries
 # a claim_tx_hash. Re-claiming would revert (AlreadyClaimed), so verify the
 # autoclaim receipt + the L1 token balance change instead and finish. Mirrors
