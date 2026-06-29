@@ -125,6 +125,11 @@ pub struct FaucetOriginInfo {
     pub origin_network: u32,
     pub origin_address: [u8; 20],
     pub scale: u8,
+    /// Raw ABI-encoded token metadata preimage (`abi.encode(name, symbol,
+    /// decimals)` for ERC-20s, empty for native ETH). Threaded into the
+    /// synthetic bridge-out `BridgeEvent` so the exit leaf carries the real
+    /// metadata (Cantina #13).
+    pub metadata: Vec<u8>,
 }
 
 /// Resolve faucet origin info from the dynamic faucet registry.
@@ -142,6 +147,7 @@ pub async fn resolve_faucet_origin(
         origin_network: entry.origin_network,
         origin_address: entry.origin_address,
         scale: entry.scale,
+        metadata: entry.metadata,
     })
 }
 
@@ -547,7 +553,7 @@ impl BridgeOutScanner {
                 destination_network,
                 &destination_address,
                 origin_amount,
-                &[],
+                &origin.metadata,
             )
             .await
         {

@@ -1,0 +1,12 @@
+-- Cantina #13 — thread real ERC-20 token metadata through bridge-outs.
+--
+-- The faucet registry now persists the raw ABI-encoded metadata preimage
+-- (`abi.encode(name, symbol, decimals)` for ERC-20s, empty for native ETH),
+-- whose keccak256 is the faucet's on-Miden MetadataHash. A bridge-out's
+-- synthetic BridgeEvent carries these exact bytes so the downstream exit leaf
+-- matches Miden's bridge state and a fresh-destination
+-- `_deployWrappedToken(abi.decode(...))` succeeds.
+--
+-- Legacy rows (written before this column existed) default to empty, matching
+-- the native-ETH / unknown-metadata case.
+ALTER TABLE faucet_registry ADD COLUMN IF NOT EXISTS metadata BYTEA NOT NULL DEFAULT ''::bytea;

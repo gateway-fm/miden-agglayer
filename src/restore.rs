@@ -441,7 +441,7 @@ async fn restore_one_b2agg_note(
             destination_network,
             &destination_address,
             origin_amount,
-            &[],
+            &origin.metadata,
             deposit_count,
         )
         .await
@@ -1132,6 +1132,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
+                metadata: vec![],
             })
             .await
             .unwrap();

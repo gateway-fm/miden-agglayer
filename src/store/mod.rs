@@ -41,6 +41,14 @@ pub struct FaucetEntry {
     pub miden_decimals: u8,
     /// Decimal scaling factor: `origin_decimals - miden_decimals`.
     pub scale: u8,
+    /// Raw ABI-encoded token metadata preimage — `abi.encode(name, symbol,
+    /// decimals)` for ERC-20s, empty for native ETH. This is the exact byte
+    /// string whose keccak256 is the faucet's on-Miden `MetadataHash`, and the
+    /// `metadata` a bridge-out's synthetic `BridgeEvent` must carry so the
+    /// downstream exit leaf matches Miden's bridge state and a fresh-destination
+    /// `_deployWrappedToken(abi.decode(...))` succeeds (Cantina #13). Empty for
+    /// legacy rows written before this field existed.
+    pub metadata: Vec<u8>,
 }
 
 /// Data for registering a new transaction.

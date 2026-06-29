@@ -165,6 +165,10 @@ async fn find_or_create_faucet(
         origin_decimals,
         miden_decimals,
         scale,
+        // Cantina #13 — store the raw ABI metadata preimage (same bytes whose
+        // keccak256 is the faucet's MetadataHash) so a future bridge-out emits
+        // the real metadata in its synthetic BridgeEvent. Empty for native ETH.
+        metadata: metadata.to_vec(),
     };
     store.register_faucet(entry).await?;
 
