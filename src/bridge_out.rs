@@ -539,6 +539,22 @@ impl BridgeOutScanner {
         // emitted log, causing aggsender to skip the BridgeEvent and
         // wedge that bridge-out forever. PgStore folds all five writes
         // into one transaction; InMemoryStore uses the default impl.
+        //
+        // Cantina #13 follow-up — DoS guard. `origin.metadata` ultimately derives
+        // from untrusted L1 calldata and the BridgeEvent encoder does not cap it,
+        // so an oversized blob would drive a huge allocation. Refuse to encode it;
+        // skip + alert rather than emit (the cap is far above any legit token's
+        // abi.encode(name,symbol,decimals)).
+        if origin.metadata.len() > MAX_BRIDGE_EVENT_METADATA_BYTES {
+            ::metrics::counter!("bridge_out_b2agg_metadata_too_large_total").increment(1);
+            tracing::warn!(
+                note_id = %note_id_str,
+                metadata_len = origin.metadata.len(),
+                cap = MAX_BRIDGE_EVENT_METADATA_BYTES,
+                "B2AGG faucet metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
+            );
+            return false;
+        }
         match self
             .store
             .commit_b2agg_event_atomic(
