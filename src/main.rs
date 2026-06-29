@@ -526,6 +526,16 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     let bridge_out_local_network_id = local_network_id_u32;
+
+    // Synthetic-indexer redesign (Phase 2b) — the cut-over flip. When
+    // `synthetic_projector_enabled` is ON, the `SyntheticProjector` becomes the
+    // SOLE synthetic-event producer: it is registered as a sync listener, and
+    // the legacy writers SUPPRESS their synthetic emission (bridge-out + claim
+    // here via constructor flags; ger + claim submit paths via
+    // `ServiceState::suppress_synthetic_emission` below). When OFF (default) the
+    // projector is not registered and every legacy path is byte-identical.
+    let projector_enabled = command.synthetic_projector_enabled;
+
     let bridge_out_scanner = Arc::new(
         BridgeOutScanner::new(
             store.clone(),
@@ -535,7 +545,8 @@ async fn main() -> anyhow::Result<()> {
         )
         // Cantina #13 Layer 2 — wire the L1 RPC so legacy ERC-20 faucet rows with
         // empty metadata can be recovered + validated before a bridge-out emits.
-        .with_l1_rpc_url(command.l1_rpc_url.clone()),
+        .with_l1_rpc_url(command.l1_rpc_url.clone())
+        .with_suppress_synthetic_emission(projector_enabled),
     );
     // Cantina #7: clone the tracker handle now so we can plumb it into
     // ServiceState below — `bridge_out_scanner` is moved into the listener
@@ -548,18 +559,42 @@ async fn main() -> anyhow::Result<()> {
     // BridgeOutScanner so the two listeners don't both try to claim the same
     // (latest + 1) slot in the same sync tick — BridgeOutScanner consumes
     // the slot for any B2AGG it processes; ClaimWatcher takes the next slot.
-    let claim_watcher = Arc::new(miden_agglayer_service::claim_watcher::ClaimWatcher::new(
-        store.clone(),
-        block_state.clone(),
-    ));
+    let claim_watcher = Arc::new(
+        miden_agglayer_service::claim_watcher::ClaimWatcher::new(
+            store.clone(),
+            block_state.clone(),
+        )
+        .with_suppress_synthetic_emission(projector_enabled),
+    );
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
-    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
+    let mut sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
         sync_listener,
         block_state.clone(),
         bridge_out_scanner,
         claim_watcher,
     ];
+
+    // Register the projector LAST so it observes the same consumed-note feed the
+    // legacy listeners saw this tick, then advances the synthetic tip itself
+    // (the suppressed legacy writers no longer touch it — no race, Finding #5).
+    if projector_enabled {
+        let projector = Arc::new(
+            miden_agglayer_service::synthetic_projector::SyntheticProjector::new(
+                store.clone(),
+                block_state.clone(),
+                &accounts.0,
+                command.l1_rpc_url.clone(),
+            )
+            .await?,
+        );
+        tracing::warn!(
+            "SYNTHETIC_PROJECTOR enabled: the SyntheticProjector is the SOLE synthetic-event \
+             producer and the SINGLE owner of the synthetic tip. SINGLE-PROCESS ONLY — multiple \
+             replicas are NOT supported."
+        );
+        sync_listeners.push(projector);
+    }
 
     let client = MidenClient::new(
         miden_store_dir.clone(),
@@ -628,6 +663,12 @@ async fn main() -> anyhow::Result<()> {
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     state.miden_api_key = command.miden_api_key;
     state.enable_writer_worker = command.enable_writer_worker;
+    // Phase 2b cut-over: when the projector is enabled it is the sole synthetic-
+    // event producer, so the submit-path writers (`claim::publish_claim`,
+    // `ger::insert_ger`) suppress their synthetic emission + tip reservation
+    // while still submitting to Miden. Mirrors the bridge-out/claim-watcher
+    // listener suppression wired above.
+    state.suppress_synthetic_emission = projector_enabled;
 
     // RD-940 — spawn the writer worker if the flag is set. The worker is a
     // single tokio task with a bounded mpsc queue between it and

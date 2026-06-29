@@ -17,75 +17,64 @@
 //! instance; this is a hard invariant from the design doc, asserted loudly at
 //! the cut-over phase.
 //!
-//! ## Phase 1 status — core only, NOT wired into the live service
+//! ## Phase 2b status — the cut-over flip (feature-flag gated)
 //!
-//! This module is built in isolation and unit-tested. It is **not** invoked by
-//! `main.rs` or any running loop yet, so it causes **zero production behaviour
-//! change**. A later phase cuts the live writers over to it. In Phase 1 the
-//! projector writes into the store exactly the way `restore` does — through the
-//! shared `project_b2agg_note` / `project_claim_note` / `project_ger_note`
+//! When `synthetic_projector_enabled` (env `SYNTHETIC_PROJECTOR`, default
+//! `false`) is ON, the projector is registered as a [`SyncListener`] and is the
+//! **sole** synthetic-event producer: the four legacy writer sites suppress
+//! their synthetic emission + tip reservation (but still submit to Miden). When
+//! OFF (default) the projector is not registered and behaviour is unchanged.
+//!
+//! The projector writes into the store exactly the way `restore` does — through
+//! the shared `project_b2agg_note` / `project_claim_note` / `project_ger_note`
 //! derivations — and is idempotent via the existing `is_*_processed` /
 //! `is_ger_injected` dedup keys.
 //!
-//! ## Determinism contract
+//! ## Determinism + numbering contract
 //!
-//! Synthetic block `N` is a pure function of Miden block `N`'s consumed notes.
-//! Intra-block events are ordered by `(consumed_tx_order, note_id)`, so
-//! re-running the projector over the same chain yields byte-identical synthetic
-//! blocks (numbers, hashes, log order, log indices).
+//! Synthetic blocks are assigned **sequentially, one per emitted log** (NOT one
+//! per Miden block), so the downstream numbering is identical to today (dense,
+//! one log per block). Within a Miden block, consumed notes are ordered by
+//! `(consumed_tx_order, note_id)` before deriving, so re-running the projector
+//! over the same chain yields byte-identical synthetic blocks (numbers, hashes,
+//! log order, log indices). The projector is the sole assigner of the synthetic
+//! tip, so there is no reservation race.
 
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
-use crate::miden_client::MidenClient;
+use crate::miden_client::{MidenClientLib, SyncListener};
 use crate::restore::{
     B2AggRestoreOutcome, ClaimProjectOutcome, GerProjectOutcome, project_b2agg_note,
     project_claim_note, project_ger_note,
 };
 use crate::store::Store;
 use miden_client::store::{InputNoteRecord, NoteFilter};
+use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
 use miden_protocol::note::NoteMetadata;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Snapshot of the consumed-note feed the projector derives synthetic events
-/// from. Abstracted behind a trait so the deterministic projection core can be
-/// unit-tested with an in-memory feed, and the production adapter
-/// ([`MidenClientNoteSource`]) can pull the same data from the live Miden
-/// client without the projector core knowing about the `MidenClient::with`
-/// closure plumbing.
-#[async_trait::async_trait]
-pub trait ConsumedNoteSource: Send + Sync {
-    /// All consumed input notes known to the client (`NoteFilter::Consumed`).
-    ///
-    /// There is no server-side block-range filter for notes yet (see the
-    /// restore module TODOs), so the projector pulls the full consumed set and
-    /// filters by `nullifier_block_height` itself.
-    async fn consumed_notes(&self) -> anyhow::Result<Vec<InputNoteRecord>>;
-
-    /// Metadata of our *own* output-note records keyed by details-commitment
-    /// bytes. This is the MA#28 provenance fallback for the metadata-less
-    /// `ConsumedExternal` state a GER note lands in after the bridge consumes
-    /// it (see `restore::project_ger_note`).
-    async fn output_note_metadata(&self) -> anyhow::Result<HashMap<[u8; 32], NoteMetadata>>;
-
-    /// The current (synced) Miden chain tip block height.
-    async fn miden_tip(&self) -> anyhow::Result<u64>;
-}
-
 /// The synthetic projector. Owns the cursor (last projected Miden block height)
-/// and is the only thing that would advance the synthetic tip.
+/// and, when registered as the live [`SyncListener`], is the **sole** assigner
+/// of the synthetic tip (`Store::latest_block_number`) — so there is no
+/// reservation race (Finding #5 eliminated by construction).
 pub struct SyntheticProjector {
     store: Arc<dyn Store>,
     block_state: Arc<BlockState>,
-    source: Arc<dyn ConsumedNoteSource>,
     /// Bridge account id — the sole legitimate consumer of a bridge-out B2AGG
     /// note (MA#3) and the expected GER target (MA#28).
     bridge_id: AccountId,
     /// Expected GER sender (ger_manager, or service for legacy deployments).
     expected_ger_sender: AccountId,
+    /// L1 JSON-RPC endpoint for the Cantina #13 Layer-2 ERC-20 metadata
+    /// recovery path (mirrors `BridgeOutScanner::l1_rpc_url`). Threaded into
+    /// `project_b2agg_note` so legacy/DB-loss faucet rows with empty ERC-20
+    /// metadata recover + validate instead of being skipped. `None` disables
+    /// the L1 fallback (recovery then relies solely on the all-Miden candidate).
+    l1_rpc_url: Option<String>,
     /// Last projected Miden block height — an in-memory cache of the persisted
     /// `Store::get_projector_cursor`. The projector is the single owner of this
     /// cursor (SINGLE-PROCESS ONLY) and persists every advance in `tick`.
@@ -100,8 +89,8 @@ impl SyntheticProjector {
     pub async fn new(
         store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
-        source: Arc<dyn ConsumedNoteSource>,
         accounts: &AccountsConfig,
+        l1_rpc_url: Option<String>,
     ) -> anyhow::Result<Self> {
         // MA#28 — same fallback as `restore_gers` / `submit_update_ger_note`:
         // legacy deployments without a dedicated ger_manager mint GER notes
@@ -115,9 +104,9 @@ impl SyntheticProjector {
         Ok(Self {
             store,
             block_state,
-            source,
             bridge_id: accounts.bridge.0,
             expected_ger_sender,
+            l1_rpc_url,
             cursor: AtomicU64::new(start_cursor),
         })
     }
@@ -127,20 +116,31 @@ impl SyntheticProjector {
         self.cursor.load(Ordering::Acquire)
     }
 
-    /// Project exactly one synthetic block `miden_block` from the notes consumed
-    /// at that Miden block.
+    /// Project the notes consumed at one Miden block (`miden_block`) into
+    /// **sequential** synthetic blocks — one synthetic block per *emitted* log.
     ///
-    /// Fetches the consumed-note feed, keeps only notes whose consumed-state
-    /// `nullifier_block_height == miden_block`, sorts them deterministically by
-    /// `(consumed_tx_order, note_id_hex)`, and runs each through the shared
-    /// `project_*` derivations, writing logs at synthetic block `== miden_block`.
-    /// Returns the number of synthetic logs written.
+    /// This keeps today's downstream numbering exactly: the legacy writers each
+    /// reserve `latest_block_number + 1` and emit a single log there, so the
+    /// synthetic chain is dense with one log per block. The projector preserves
+    /// that by reserving the next synthetic block per emission rather than one
+    /// per Miden block (so an empty/all-skipped Miden block reserves nothing).
     ///
-    /// Idempotent: re-projecting the same Miden block writes no duplicate logs
-    /// (the `project_*` derivations short-circuit on the existing dedup keys).
-    pub async fn project_block(&self, miden_block: u64) -> anyhow::Result<usize> {
-        let consumed = self.source.consumed_notes().await?;
-
+    /// Determinism: within the Miden block, consumed notes are ordered by
+    /// `(consumed_tx_order, note_id_hex)` before deriving, so re-running over the
+    /// same chain yields byte-identical synthetic blocks. Idempotent: the
+    /// `project_*` derivations short-circuit on the existing dedup keys.
+    ///
+    /// `client` (the live `&mut MidenClientLib`) is threaded through to
+    /// `project_b2agg_note` for the Cantina #13 Layer-2 ERC-20 metadata
+    /// recovery (`None` in unit tests, where the in-memory feed is supplied
+    /// directly).
+    async fn project_notes(
+        &self,
+        consumed: &[InputNoteRecord],
+        output_metadata: &HashMap<[u8; 32], NoteMetadata>,
+        miden_block: u64,
+        mut client: Option<&mut MidenClientLib>,
+    ) -> anyhow::Result<usize> {
         // Keep only notes attributed to this Miden block by their consumed
         // state's nullifier_block_height. Notes that aren't in a consumed state
         // (no nullifier_block_height) are not attributed to any block.
@@ -166,16 +166,21 @@ impl SyntheticProjector {
             })
         });
 
-        let block_hash = self.block_state.get_block_hash(miden_block);
-        let timestamp = self.block_state.get_block_timestamp(miden_block);
         let bridge_address = get_bridge_address();
-
-        // GER provenance fallback map — only needed if a GER-shaped note shows
-        // up, but fetched once for the block to keep derivation pure/ordered.
-        let output_metadata = self.source.output_note_metadata().await?;
 
         let mut logs = 0usize;
         for note in notes {
+            // Reserve the next synthetic block for THIS note's potential log.
+            // The block number is an input to the `project_*` write, so it is
+            // reserved BEFORE the derivation runs; the tip is advanced only AFTER
+            // an emission (write-log-before-tip-advance, exactly like the legacy
+            // writers). A skipped derivation leaves `latest_block_number`
+            // untouched, so the same reserved number is re-used by the next note
+            // — keeping the synthetic chain dense (no phantom blocks).
+            let next = self.store.get_latest_block_number().await? + 1;
+            let block_hash = self.block_state.get_block_hash(next);
+            let timestamp = self.block_state.get_block_timestamp(next);
+
             // A consumed note matches at most one of the three script roots, so
             // trying all three derivations emits at most one synthetic log per
             // note. This is exactly the unification the design doc calls for:
@@ -184,26 +189,29 @@ impl SyntheticProjector {
                 &self.store,
                 note,
                 self.bridge_id,
-                miden_block,
+                next,
                 block_hash,
                 bridge_address,
-                // Cantina #13 metadata recovery (client + L1 RPC) is wired in at
-                // the cut-over phase, alongside the persisted cursor; Phase-1 the
-                // projector is isolated, so no recovery context is threaded yet.
-                None,
-                None,
+                // Cantina #13 recovery context: the live client + the projector's
+                // L1 RPC, so legacy/empty-metadata ERC-20 bridge-outs recover.
+                client.as_deref_mut(),
+                self.l1_rpc_url.as_deref(),
             )
             .await?
                 == B2AggRestoreOutcome::Emitted
             {
+                self.store.set_latest_block_number(next).await?;
                 logs += 1;
                 continue;
             }
 
-            if project_claim_note(&self.store, note, miden_block, block_hash, bridge_address)
-                .await?
+            if project_claim_note(&self.store, note, next, block_hash, bridge_address).await?
                 == ClaimProjectOutcome::Emitted
             {
+                // `commit_manual_claim_event_atomic` already advances the tip to
+                // `next` inside its transaction; setting it again is a harmless
+                // no-op and keeps the advance explicit at the call site.
+                self.store.set_latest_block_number(next).await?;
                 logs += 1;
                 continue;
             }
@@ -211,32 +219,61 @@ impl SyntheticProjector {
             if project_ger_note(
                 &self.store,
                 note,
-                &output_metadata,
+                output_metadata,
                 self.expected_ger_sender,
                 self.bridge_id,
-                miden_block,
+                next,
                 block_hash,
                 timestamp,
             )
             .await?
                 == GerProjectOutcome::Emitted
             {
+                self.store.set_latest_block_number(next).await?;
                 logs += 1;
                 continue;
             }
         }
 
-        // Atomic visibility: the block's logs are all written above BEFORE the
-        // synthetic tip advances to `miden_block`. The block hash is a pure
-        // function of the block number (`BlockState`), so this is deterministic.
-        // Mapping is 1:1 and gap-free — an empty Miden block yields an empty
-        // synthetic block and the tip still advances.
-        self.block_state.set_current_block(miden_block);
-        if self.store.get_latest_block_number().await? < miden_block {
-            self.store.set_latest_block_number(miden_block).await?;
-        }
-
         Ok(logs)
+    }
+
+    /// Project one Miden block `miden_block` from the live client: fetch the
+    /// consumed-note feed + our own output-note metadata (the MA#28 GER
+    /// provenance fallback) through the passed `&mut MidenClientLib`, then run
+    /// the deterministic [`Self::project_notes`] core. Returns the number of
+    /// synthetic logs written.
+    ///
+    /// Fetching through the *passed* client (not `MidenClient::with`) is
+    /// mandatory: `on_post_sync` already holds the client borrow inside the sync
+    /// loop, and re-entering via `with` would deadlock the request queue.
+    pub async fn project_block(
+        &self,
+        client: &mut MidenClientLib,
+        miden_block: u64,
+    ) -> anyhow::Result<usize> {
+        // There is no server-side block-range filter for notes yet (see the
+        // restore module TODOs), so pull the full consumed set and filter by
+        // nullifier_block_height in `project_notes`.
+        let consumed = client
+            .get_input_notes(NoteFilter::Consumed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+
+        // Protocol 0.15: notes consumed by the bridge land as `ConsumedExternal`,
+        // which carries NO metadata — so the MA#28 sender check in
+        // `project_ger_note` needs the metadata from our own output-note records
+        // (we minted those notes; the client store retains them permanently).
+        let output_metadata: HashMap<[u8; 32], NoteMetadata> = client
+            .get_output_notes(NoteFilter::All)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
+            .into_iter()
+            .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
+            .collect();
+
+        self.project_notes(&consumed, &output_metadata, miden_block, Some(client))
+            .await
     }
 
     /// Process every Miden block from `cursor + 1` to the current Miden tip in
@@ -245,12 +282,16 @@ impl SyntheticProjector {
     ///
     /// This is the normal projector loop; catch-up after a restart is the same
     /// code path (the cursor simply starts further behind the tip).
-    pub async fn tick(&self) -> anyhow::Result<u64> {
-        let tip = self.source.miden_tip().await?;
+    pub async fn tick(&self, client: &mut MidenClientLib) -> anyhow::Result<u64> {
+        let tip = client
+            .get_sync_height()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
+            .as_u64();
         let mut cursor = self.cursor.load(Ordering::Acquire);
         while cursor < tip {
             let next = cursor + 1;
-            self.project_block(next).await?;
+            self.project_block(client, next).await?;
             // Advance the cursor only after the block is fully projected, so a
             // crash mid-block re-projects (idempotently) rather than skipping.
             // Persist BEFORE updating the in-memory cache so the durable cursor
@@ -263,79 +304,16 @@ impl SyntheticProjector {
     }
 }
 
-/// Production adapter pulling the consumed-note feed from the live
-/// [`MidenClient`]. **Phase 1: defined but not wired into any running loop** —
-/// the cut-over phase constructs the projector with this source.
-pub struct MidenClientNoteSource {
-    client: Arc<MidenClient>,
-}
-
-impl MidenClientNoteSource {
-    pub fn new(client: Arc<MidenClient>) -> Self {
-        Self { client }
-    }
-}
-
 #[async_trait::async_trait]
-impl ConsumedNoteSource for MidenClientNoteSource {
-    async fn consumed_notes(&self) -> anyhow::Result<Vec<InputNoteRecord>> {
-        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let out_inner = out.clone();
-        self.client
-            .with(move |client| {
-                Box::new(async move {
-                    let notes = client
-                        .get_input_notes(NoteFilter::Consumed)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
-                    *out_inner.lock().unwrap() = notes;
-                    Ok(())
-                })
-            })
-            .await?;
-        let notes = std::mem::take(&mut *out.lock().unwrap());
-        Ok(notes)
+impl SyncListener for SyntheticProjector {
+    fn on_sync(&self, _summary: &SyncSummary) {
+        // no-op — projection happens in `on_post_sync`, where we hold the live
+        // client needed to fetch consumed notes and run Cantina #13 recovery.
     }
 
-    async fn output_note_metadata(&self) -> anyhow::Result<HashMap<[u8; 32], NoteMetadata>> {
-        let out = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let out_inner = out.clone();
-        self.client
-            .with(move |client| {
-                Box::new(async move {
-                    let map: HashMap<[u8; 32], NoteMetadata> = client
-                        .get_output_notes(NoteFilter::All)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
-                        .into_iter()
-                        .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
-                        .collect();
-                    *out_inner.lock().unwrap() = map;
-                    Ok(())
-                })
-            })
-            .await?;
-        let map = std::mem::take(&mut *out.lock().unwrap());
-        Ok(map)
-    }
-
-    async fn miden_tip(&self) -> anyhow::Result<u64> {
-        let out = Arc::new(std::sync::Mutex::new(0u64));
-        let out_inner = out.clone();
-        self.client
-            .with(move |client| {
-                Box::new(async move {
-                    let height = client
-                        .get_sync_height()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?;
-                    *out_inner.lock().unwrap() = height.as_u64();
-                    Ok(())
-                })
-            })
-            .await?;
-        let tip = *out.lock().unwrap();
-        Ok(tip)
+    async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
+        self.tick(client).await?;
+        Ok(())
     }
 }
 
@@ -499,26 +477,17 @@ mod tests {
         (record, (key, metadata))
     }
 
-    /// In-memory consumed-note source for the deterministic projector tests.
-    struct VecNoteSource {
-        notes: Vec<InputNoteRecord>,
-        output_metadata: HashMap<[u8; 32], NoteMetadata>,
-        tip: u64,
-    }
-
-    #[async_trait::async_trait]
-    impl ConsumedNoteSource for VecNoteSource {
-        async fn consumed_notes(&self) -> anyhow::Result<Vec<InputNoteRecord>> {
-            // InputNoteRecord isn't Clone-cheap to assume; rebuild refs by
-            // cloning the records (cheap for the small test feeds).
-            Ok(self.notes.clone())
-        }
-        async fn output_note_metadata(&self) -> anyhow::Result<HashMap<[u8; 32], NoteMetadata>> {
-            Ok(self.output_metadata.clone())
-        }
-        async fn miden_tip(&self) -> anyhow::Result<u64> {
-            Ok(self.tip)
-        }
+    /// Build a projector for the deterministic-core tests. The cursor/tip loop
+    /// (`tick`) needs a live `&mut MidenClientLib`, so the unit tests drive the
+    /// `project_notes` core directly with an in-memory consumed-note feed and a
+    /// `None` recovery client.
+    async fn test_projector(
+        store: &StdArc<dyn Store>,
+        block_state: &StdArc<BlockState>,
+    ) -> SyntheticProjector {
+        SyntheticProjector::new(store.clone(), block_state.clone(), &test_accounts(), None)
+            .await
+            .unwrap()
     }
 
     async fn register_faucet(store: &StdArc<dyn Store>) {
@@ -549,10 +518,11 @@ mod tests {
     }
 
     /// (i) A Miden block with a bridge-consumed B2AGG note + a CLAIM note + a
-    /// GER note projects to ONE synthetic block carrying all three logs, in the
-    /// deterministic `(consumed_tx_order, note_id)` order.
+    /// GER note projects to THREE *sequential* synthetic blocks (one per emitted
+    /// log), in the deterministic `(consumed_tx_order, note_id)` order. Numbering
+    /// is dense and starts at `latest_block_number + 1` (== 1 on a fresh store).
     #[tokio::test]
-    async fn projects_three_derivations_into_one_block() {
+    async fn projects_three_derivations_into_sequential_blocks() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         register_faucet(&store).await;
 
@@ -560,32 +530,37 @@ mod tests {
         let n_claim = claim_note(5, Some(1));
         let (n_ger, ger_meta) = ger_note(5, Some(2), 0x11);
 
-        let source = StdArc::new(VecNoteSource {
-            notes: vec![n_ger.clone(), n_claim.clone(), n_b2agg.clone()],
-            output_metadata: HashMap::from([ger_meta]),
-            tip: 5,
-        });
+        // Intentionally shuffled input order — the projector's deterministic
+        // sort, not arrival order, fixes the output.
+        let notes = vec![n_ger.clone(), n_claim.clone(), n_b2agg.clone()];
+        let output_metadata = HashMap::from([ger_meta]);
         let block_state = StdArc::new(BlockState::new());
-        let projector =
-            SyntheticProjector::new(store.clone(), block_state, source, &test_accounts())
-                .await
-                .unwrap();
+        let projector = test_projector(&store, &block_state).await;
 
-        let written = projector.project_block(5).await.unwrap();
+        let written = projector
+            .project_notes(&notes, &output_metadata, 5, None)
+            .await
+            .unwrap();
         assert_eq!(written, 3, "all three derivations must emit one log each");
 
-        let logs = logs_in_range(&store, 5, 5).await;
-        assert_eq!(logs.len(), 3, "exactly three logs in synthetic block 5");
-        // All logs land in synthetic block 5.
-        assert!(logs.iter().all(|l| l.block_number == 5));
+        // One log per synthetic block, sequential: 1, 2, 3.
+        let logs = logs_in_range(&store, 1, 3).await;
+        assert_eq!(logs.len(), 3, "three logs across three synthetic blocks");
+        assert_eq!(
+            logs.iter().map(|l| l.block_number).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "sequential one-log-per-block numbering",
+        );
+        // The synthetic tip is the last emitted block.
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 3);
         // Log indices are sequential in projection order.
         assert_eq!(
             logs.iter().map(|l| l.log_index).collect::<Vec<_>>(),
             vec![0, 1, 2],
         );
 
-        // Deterministic order matches the consumed_tx_order we set: B2AGG(0),
-        // CLAIM(1), GER(2). Identify each by its distinctive tx-hash shape.
+        // Deterministic order matches the consumed_tx_order we set: B2AGG(0)@1,
+        // CLAIM(1)@2, GER(2)@3. Identify each by its distinctive tx-hash shape.
         let b2agg_id = hex::encode(n_b2agg.details_commitment().as_bytes());
         let claim_id = hex::encode(n_claim.details_commitment().as_bytes());
         assert_eq!(
@@ -605,7 +580,7 @@ mod tests {
     }
 
     /// (ii) Re-projecting the same Miden block is idempotent — no duplicate
-    /// logs (the `project_*` dedup keys short-circuit).
+    /// logs and no tip advance (the `project_*` dedup keys short-circuit).
     #[tokio::test]
     async fn reprojecting_same_block_is_idempotent() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
@@ -614,104 +589,104 @@ mod tests {
         let n_b2agg = b2agg_note(7, Some(0));
         let n_claim = claim_note(7, Some(1));
         let (n_ger, ger_meta) = ger_note(7, Some(2), 0x22);
-        let source = StdArc::new(VecNoteSource {
-            notes: vec![n_b2agg, n_claim, n_ger],
-            output_metadata: HashMap::from([ger_meta]),
-            tip: 7,
-        });
-        let projector = SyntheticProjector::new(
-            store.clone(),
-            StdArc::new(BlockState::new()),
-            source,
-            &test_accounts(),
-        )
-        .await
-        .unwrap();
+        let notes = vec![n_b2agg, n_claim, n_ger];
+        let output_metadata = HashMap::from([ger_meta]);
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
 
-        let first = projector.project_block(7).await.unwrap();
+        let first = projector
+            .project_notes(&notes, &output_metadata, 7, None)
+            .await
+            .unwrap();
         assert_eq!(first, 3);
-        let second = projector.project_block(7).await.unwrap();
-        assert_eq!(second, 0, "second projection must emit no new logs");
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 3);
 
-        let logs = logs_in_range(&store, 7, 7).await;
+        let second = projector
+            .project_notes(&notes, &output_metadata, 7, None)
+            .await
+            .unwrap();
+        assert_eq!(second, 0, "second projection must emit no new logs");
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            3,
+            "tip must not advance on a no-op re-projection",
+        );
+
+        let logs = logs_in_range(&store, 1, 3).await;
         assert_eq!(logs.len(), 3, "no duplicate logs after re-projection");
     }
 
-    /// (iii) Notes with different `nullifier_block_height` project into
-    /// different synthetic blocks.
+    /// (iii) Notes consumed at different Miden blocks still project into a
+    /// single dense, sequential synthetic chain (numbering is per-emitted-log,
+    /// decoupled from the Miden block height).
     #[tokio::test]
-    async fn distinct_nullifier_heights_project_into_distinct_blocks() {
+    async fn distinct_nullifier_heights_project_into_sequential_blocks() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         register_faucet(&store).await;
 
-        let n_b2agg = b2agg_note(3, Some(0)); // block 3
-        let n_claim = claim_note(8, Some(0)); // block 8
-        let source = StdArc::new(VecNoteSource {
-            notes: vec![n_b2agg.clone(), n_claim.clone()],
-            output_metadata: HashMap::new(),
-            tip: 8,
-        });
-        let projector = SyntheticProjector::new(
-            store.clone(),
-            StdArc::new(BlockState::new()),
-            source,
-            &test_accounts(),
-        )
-        .await
-        .unwrap();
+        let n_b2agg = b2agg_note(3, Some(0)); // consumed at Miden block 3
+        let n_claim = claim_note(8, Some(0)); // consumed at Miden block 8
+        let notes = vec![n_b2agg.clone(), n_claim.clone()];
+        let output_metadata = HashMap::new();
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
 
-        // Project block 3: only the B2AGG note belongs here.
-        assert_eq!(projector.project_block(3).await.unwrap(), 1);
-        // Project block 8: only the CLAIM note belongs here.
-        assert_eq!(projector.project_block(8).await.unwrap(), 1);
-
-        let logs3 = logs_in_range(&store, 3, 3).await;
-        let logs8 = logs_in_range(&store, 8, 8).await;
-        assert_eq!(logs3.len(), 1);
-        assert_eq!(logs8.len(), 1);
-        assert_eq!(logs3[0].block_number, 3);
-        assert_eq!(logs8[0].block_number, 8);
+        // Project Miden block 3: only the B2AGG note belongs here → synthetic 1.
         assert_eq!(
-            logs3[0].transaction_hash,
+            projector
+                .project_notes(&notes, &output_metadata, 3, None)
+                .await
+                .unwrap(),
+            1
+        );
+        // Project Miden block 8: only the CLAIM note belongs here → synthetic 2.
+        assert_eq!(
+            projector
+                .project_notes(&notes, &output_metadata, 8, None)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let logs = logs_in_range(&store, 1, 2).await;
+        assert_eq!(logs.len(), 2);
+        // Dense + sequential: synthetic blocks 1 then 2, regardless of the
+        // (3, 8) Miden heights.
+        assert_eq!(logs[0].block_number, 1);
+        assert_eq!(logs[1].block_number, 2);
+        assert_eq!(
+            logs[0].transaction_hash,
             crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
                 n_b2agg.details_commitment().as_bytes()
             ))
         );
         assert_eq!(
-            logs8[0].transaction_hash,
+            logs[1].transaction_hash,
             derive_manual_claim_tx_hash(&hex::encode(n_claim.details_commitment().as_bytes()))
         );
-        // No cross-contamination.
-        assert!(logs_in_range(&store, 4, 7).await.is_empty());
     }
 
     /// (iv) Two independent runs over the same consumed-note set produce
-    /// byte-identical synthetic logs: same block numbers, block hashes, log
-    /// indices and ordering.
+    /// byte-identical synthetic logs: same (sequential) block numbers, block
+    /// hashes, log indices and ordering.
     #[tokio::test]
     async fn two_runs_are_byte_identical() {
         async fn run() -> Vec<SyntheticLog> {
             let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
             register_faucet(&store).await;
             let (n_ger, ger_meta) = ger_note(9, Some(2), 0x33);
-            let source = StdArc::new(VecNoteSource {
-                // Intentionally shuffled input order to prove the projector's
-                // deterministic sort — not arrival order — fixes the output.
-                notes: vec![n_ger, claim_note(9, Some(1)), b2agg_note(9, Some(0))],
-                output_metadata: HashMap::from([ger_meta]),
-                tip: 9,
-            });
-            let projector = SyntheticProjector::new(
-                store.clone(),
-                StdArc::new(BlockState::new()),
-                source,
-                &test_accounts(),
-            )
-            .await
-            .unwrap();
-            let cursor = projector.tick().await.unwrap();
-            assert_eq!(cursor, 9, "tick must advance the cursor to the Miden tip");
-            logs_in_range(&store, 0, 9).await
+            // Intentionally shuffled input order to prove the projector's
+            // deterministic sort — not arrival order — fixes the output.
+            let notes = vec![n_ger, claim_note(9, Some(1)), b2agg_note(9, Some(0))];
+            let output_metadata = HashMap::from([ger_meta]);
+            let block_state = StdArc::new(BlockState::new());
+            let projector = test_projector(&store, &block_state).await;
+            let written = projector
+                .project_notes(&notes, &output_metadata, 9, None)
+                .await
+                .unwrap();
+            assert_eq!(written, 3);
+            logs_in_range(&store, 1, 3).await
         }
 
         let run_a = run().await;

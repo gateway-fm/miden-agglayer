@@ -202,11 +202,30 @@ pub fn derive_manual_claim_tx_hash(note_id_str: &str) -> String {
 pub struct ClaimWatcher {
     store: Arc<dyn crate::store::Store>,
     block_state: Arc<BlockState>,
+    /// Synthetic-indexer redesign (Phase 2b). When `true`, the
+    /// [`SyntheticProjector`](crate::synthetic_projector) is the sole
+    /// synthetic-event producer, so this watcher SUPPRESSES its own
+    /// `process_consumed_claim` emit loop in `on_post_sync`. Default `false`
+    /// (projector off) keeps the legacy behaviour byte-identical.
+    suppress_synthetic_emission: bool,
 }
 
 impl ClaimWatcher {
     pub fn new(store: Arc<dyn crate::store::Store>, block_state: Arc<BlockState>) -> Self {
-        Self { store, block_state }
+        Self {
+            store,
+            block_state,
+            suppress_synthetic_emission: false,
+        }
+    }
+
+    /// Phase 2b cut-over: when `true`, suppress this watcher's synthetic
+    /// `ClaimEvent` emission (the `SyntheticProjector` owns it). Builder so
+    /// existing call sites and tests stay unchanged (default `false` = legacy
+    /// behaviour). See [`Self::suppress_synthetic_emission`].
+    pub fn with_suppress_synthetic_emission(mut self, suppress: bool) -> Self {
+        self.suppress_synthetic_emission = suppress;
+        self
     }
 
     /// Process a single consumed CLAIM note. Returns `true` if a synthetic
@@ -384,6 +403,16 @@ impl SyncListener for ClaimWatcher {
     /// `claim_watcher_unrecoverable_total` counter is the operator's escape
     /// valve for that case.
     async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
+        // Phase 2b cut-over: when the SyntheticProjector is the sole synthetic-
+        // event producer, suppress this watcher's ClaimEvent emit loop. The
+        // CLAIM note submission to Miden happens in `claim::publish_claim`, not
+        // here — this watcher only synthesises the log for already-on-chain
+        // CLAIMs — so nothing tx-facing is skipped; the projector re-derives the
+        // same ClaimEvent from the consumed CLAIM note.
+        if self.suppress_synthetic_emission {
+            return Ok(());
+        }
+
         let consumed_notes = client
             .get_input_notes(NoteFilter::Consumed)
             .await

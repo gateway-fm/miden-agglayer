@@ -384,6 +384,7 @@ async fn publish_and_record_claim(
         service.reject_zero_padding_addresses,
         service.reject_hardhat_alias,
         Some(service.expected_mints.clone()),
+        service.suppress_synthetic_emission,
     )
     .await?;
     tracing::info!(
@@ -462,6 +463,7 @@ pub(crate) async fn worker_handle_ger_insert(
             &service.store,
             &service.block_state,
             txn_hash,
+            service.suppress_synthetic_emission,
         )
         .await,
         txn_hash,

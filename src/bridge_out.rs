@@ -245,6 +245,13 @@ pub struct BridgeOutScanner {
     /// fallback (recovery then relies solely on the all-Miden candidate, and
     /// gates if that does not validate).
     l1_rpc_url: Option<String>,
+    /// Synthetic-indexer redesign (Phase 2b). When `true`, the
+    /// [`SyntheticProjector`](crate::synthetic_projector) is the sole
+    /// synthetic-event producer, so this scanner SUPPRESSES its own
+    /// `process_consumed_note` emit loop + tip reservation in `on_post_sync`
+    /// (the Miden-facing monitors below the loop still run). Default `false`
+    /// (projector off) keeps the legacy behaviour byte-identical.
+    suppress_synthetic_emission: bool,
 }
 
 impl BridgeOutScanner {
@@ -276,6 +283,7 @@ impl BridgeOutScanner {
             ownership_probe_every_n_ticks: 5, // every 5 sync ticks (~30s at 6s/tick)
             tick_counter: std::sync::atomic::AtomicU32::new(0),
             l1_rpc_url: None,
+            suppress_synthetic_emission: false,
         }
     }
 
@@ -284,6 +292,15 @@ impl BridgeOutScanner {
     /// tests that don't need recovery stay unchanged.
     pub fn with_l1_rpc_url(mut self, l1_rpc_url: Option<String>) -> Self {
         self.l1_rpc_url = l1_rpc_url;
+        self
+    }
+
+    /// Phase 2b cut-over: when `true`, suppress this scanner's synthetic
+    /// `BridgeEvent` emission + tip reservation (the `SyntheticProjector` owns
+    /// it). Builder so existing call sites and tests stay unchanged (default
+    /// `false` = legacy behaviour). See [`Self::suppress_synthetic_emission`].
+    pub fn with_suppress_synthetic_emission(mut self, suppress: bool) -> Self {
+        self.suppress_synthetic_emission = suppress;
         self
     }
 
@@ -1117,46 +1134,55 @@ impl SyncListener for BridgeOutScanner {
             }
         }
 
-        for note in &consumed_notes {
-            // Only process B2AGG notes — other consumed notes (CLAIM, UpdateGerNote)
-            // must not trigger block advancement or they race with GER event writes.
-            if !is_b2agg_note(note.details()) {
-                continue;
+        // Phase 2b cut-over: when the SyntheticProjector is the sole synthetic-
+        // event producer, suppress this scanner's BridgeEvent emit loop + tip
+        // reservation entirely. The Miden submission for a bridge-out is the
+        // user's own B2AGG note (already on-chain — this scanner never submits
+        // it), so nothing tx-facing is skipped here; the projector re-derives
+        // the same BridgeEvent from the consumed B2AGG note. The monitors below
+        // (LET-divergence, ownership) still run on every tick.
+        if !self.suppress_synthetic_emission {
+            for note in &consumed_notes {
+                // Only process B2AGG notes — other consumed notes (CLAIM, UpdateGerNote)
+                // must not trigger block advancement or they race with GER event writes.
+                if !is_b2agg_note(note.details()) {
+                    continue;
+                }
+                let was_processed = self
+                    .store
+                    .is_note_processed(&hex::encode(note.details_commitment().as_bytes()))
+                    .await
+                    .unwrap_or(true);
+                if was_processed {
+                    continue;
+                }
+                // Race-safe ordering: write the log at (current_latest + 1) BEFORE
+                // advancing `latest_block_number`. If we advance first, there's a
+                // window where `eth_blockNumber` returns N but no log exists at N —
+                // aggsender polls during that window, sees no bridges in [X, N],
+                // advances its cursor past N, and permanently misses our BridgeEvent.
+                // By writing the log first and then bumping `latest_block_number`,
+                // every reader who sees `latest >= N` also sees the log at N.
+                //
+                // Cantina #13 follow-up: only bump `latest_block_number` if the note
+                // actually wrote a log. The Cantina #13 self-target circuit-break
+                // and other early-return paths now signal `false`, preventing
+                // phantom blocks (advances with no log) from leaking into the chain.
+                let block_number = self.store.get_latest_block_number().await? + 1;
+                // Reborrow the client so the Cantina #13 Layer-2 recovery path can
+                // read the bridge + faucet accounts; the reborrow ends with each
+                // iteration so `client` stays available for the monitors below.
+                if self
+                    .process_consumed_note(note, block_number, Some(&mut *client))
+                    .await
+                {
+                    self.store.set_latest_block_number(block_number).await?;
+                }
+                tracing::info!(
+                    block_number,
+                    "advanced latest_block_number to include BridgeEvent"
+                );
             }
-            let was_processed = self
-                .store
-                .is_note_processed(&hex::encode(note.details_commitment().as_bytes()))
-                .await
-                .unwrap_or(true);
-            if was_processed {
-                continue;
-            }
-            // Race-safe ordering: write the log at (current_latest + 1) BEFORE
-            // advancing `latest_block_number`. If we advance first, there's a
-            // window where `eth_blockNumber` returns N but no log exists at N —
-            // aggsender polls during that window, sees no bridges in [X, N],
-            // advances its cursor past N, and permanently misses our BridgeEvent.
-            // By writing the log first and then bumping `latest_block_number`,
-            // every reader who sees `latest >= N` also sees the log at N.
-            //
-            // Cantina #13 follow-up: only bump `latest_block_number` if the note
-            // actually wrote a log. The Cantina #13 self-target circuit-break
-            // and other early-return paths now signal `false`, preventing
-            // phantom blocks (advances with no log) from leaking into the chain.
-            let block_number = self.store.get_latest_block_number().await? + 1;
-            // Reborrow the client so the Cantina #13 Layer-2 recovery path can
-            // read the bridge + faucet accounts; the reborrow ends with each
-            // iteration so `client` stays available for the monitors below.
-            if self
-                .process_consumed_note(note, block_number, Some(&mut *client))
-                .await
-            {
-                self.store.set_latest_block_number(block_number).await?;
-            }
-            tracing::info!(
-                block_number,
-                "advanced latest_block_number to include BridgeEvent"
-            );
         }
 
         // Cantina #9 — LET divergence monitor. After processing consumed
