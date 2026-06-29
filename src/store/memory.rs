@@ -1107,7 +1107,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
-            metadata: vec![],
+                metadata: vec![],
             })
             .await
             .unwrap();
@@ -1138,7 +1138,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
-            metadata: vec![],
+                metadata: vec![],
             })
             .await
             .unwrap();
@@ -1164,7 +1164,7 @@ mod tests {
                 origin_decimals: 6,
                 miden_decimals: 6,
                 scale: 0,
-            metadata: vec![],
+                metadata: vec![],
             })
             .await
             .unwrap();
@@ -1218,7 +1218,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
-            metadata: vec![],
+                metadata: vec![],
             })
             .await
             .unwrap();
@@ -1231,7 +1231,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
-            metadata: vec![],
+                metadata: vec![],
             })
             .await
             .unwrap();
