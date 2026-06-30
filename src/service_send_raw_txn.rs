@@ -393,60 +393,17 @@ async fn publish_and_record_claim(
     Ok(())
 }
 
-/// Best-effort resolution of `(mainnet_exit_root, rollup_exit_root)` from the
-/// L1 GER contract for an `insertGlobalExitRoot` call.
-///
-/// RD-940 Phase 1 — extracted from the inline block previously living at the
-/// top of the `insertGlobalExitRoot` dispatch in `service_send_raw_txn` so
-/// both the legacy sync path and the writer-worker enqueue path resolve in
-/// exactly the same way. **Runs on the request thread** so the worker doesn't
-/// block on slow L1 view calls; the mainnet/rollup pair is materialised into
-/// the `DecodedWriteCall::Ger` payload before enqueue.
-///
-/// Under the RD-862 race-path L1 has usually advanced past the pair that
-/// produced the combined hash, so the keccak check fails and we return
-/// `(None, None)`. That's non-fatal — `L1InfoTreeIndexer` backfills the row
-/// via UPSERT on its own poll loop (`src/l1_info_tree_indexer.rs:124-223`),
-/// so bridge-service's subsequent `zkevm_getExitRootsByGER` poll converges.
-async fn resolve_l1_exit_roots(
-    service: &ServiceState,
-    ger_bytes: [u8; 32],
-) -> (Option<[u8; 32]>, Option<[u8; 32]>) {
-    match (&service.l1_rpc_url, &service.ger_l1_address) {
-        (Some(l1_rpc), Some(ger_addr)) => match ger::fetch_l1_exit_roots(l1_rpc, ger_addr).await {
-            Ok((m, r)) => {
-                let computed = ger::combined_ger(&m, &r);
-                if computed == ger_bytes {
-                    (Some(m), Some(r))
-                } else {
-                    tracing::debug!(
-                        "L1 exit roots don't match injected GER (L1 may have advanced); \
-                         indexer will backfill via set_ger_exit_roots"
-                    );
-                    (None, None)
-                }
-            }
-            Err(e) => {
-                tracing::debug!("failed to fetch L1 exit roots ({e:#}); indexer will backfill");
-                (None, None)
-            }
-        },
-        _ => (None, None),
-    }
-}
-
 /// Unified GER-insert / updateExitRoot dispatcher used by both the legacy sync
 /// path and the writer-worker path. **Does NOT advance the per-signer
 /// nonce** — see the matching note on `worker_handle_claim_asset`.
 ///
-/// `mainnet_root` / `rollup_root` are populated by `resolve_l1_exit_roots`
-/// (insertGlobalExitRoot) or by the call params directly (updateExitRoot), so
-/// the worker doesn't need to know which selector originated the call.
+/// The GER synthetic log (and the decomposed exit roots it carried) is now
+/// emitted by the `SyntheticProjector` from the consumed `UpdateGerNote`, so
+/// this path only needs the combined `ger_bytes` to submit to Miden — the
+/// decomposed mainnet/rollup roots are no longer threaded through.
 pub(crate) async fn worker_handle_ger_insert(
     service: &ServiceState,
     ger_bytes: [u8; 32],
-    mainnet_root: Option<[u8; 32]>,
-    rollup_root: Option<[u8; 32]>,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     signer: Address,
@@ -454,8 +411,6 @@ pub(crate) async fn worker_handle_ger_insert(
     handle_ger_result(
         ger::insert_ger(
             ger_bytes,
-            mainnet_root,
-            rollup_root,
             &service.miden_client,
             service.accounts.clone(),
             &service.store,
@@ -628,23 +583,15 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
         let ger_bytes: [u8; 32] = params.root.0;
-        let (mainnet_root, rollup_root) = resolve_l1_exit_roots(&service, ger_bytes).await;
-        crate::writer_worker::DecodedWriteCall::Ger {
-            ger_bytes,
-            mainnet_root,
-            rollup_root,
-        }
+        crate::writer_worker::DecodedWriteCall::Ger { ger_bytes }
     } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
         tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-        let mainnet_root = params.newMainnetExitRoot.0;
-        let rollup_root = params.newRollupExitRoot.0;
-        let combined_ger = ger::combined_ger(&mainnet_root, &rollup_root);
+        let combined_ger =
+            ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
         crate::writer_worker::DecodedWriteCall::Ger {
             ger_bytes: combined_ger,
-            mainnet_root: Some(mainnet_root),
-            rollup_root: Some(rollup_root),
         }
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");
@@ -704,21 +651,9 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 worker_handle_claim_asset(&service, *params, txn_hash, txn_envelope, signer)
                     .await?;
             }
-            crate::writer_worker::DecodedWriteCall::Ger {
-                ger_bytes,
-                mainnet_root,
-                rollup_root,
-            } => {
-                worker_handle_ger_insert(
-                    &service,
-                    ger_bytes,
-                    mainnet_root,
-                    rollup_root,
-                    txn_hash,
-                    txn_envelope,
-                    signer,
-                )
-                .await?;
+            crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
+                worker_handle_ger_insert(&service, ger_bytes, txn_hash, txn_envelope, signer)
+                    .await?;
             }
         }
         service.store.nonce_increment(&signer_str).await?;

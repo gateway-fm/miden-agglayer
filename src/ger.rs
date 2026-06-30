@@ -1,52 +1,9 @@
 use crate::miden_client::MidenClient;
 use alloy::primitives::TxHash;
-use alloy_rpc_types_eth::TransactionRequest;
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
 use miden_client::transaction::TransactionRequestBuilder;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
-
-alloy_core::sol! {
-    #[derive(Debug)]
-    interface IGlobalExitRootV2 {
-        function lastMainnetExitRoot() external view returns (bytes32);
-        function lastRollupExitRoot() external view returns (bytes32);
-    }
-}
-
-/// Read the individual exit roots from the L1 GER contract.
-pub async fn fetch_l1_exit_roots(
-    l1_rpc_url: &str,
-    ger_address: &str,
-) -> anyhow::Result<([u8; 32], [u8; 32])> {
-    use alloy::providers::{Provider, ProviderBuilder};
-    use alloy::sol_types::SolCall;
-
-    let provider = ProviderBuilder::new().connect_http(l1_rpc_url.parse()?);
-    let ger_addr: alloy::primitives::Address = ger_address.parse()?;
-
-    let mainnet_call = IGlobalExitRootV2::lastMainnetExitRootCall {};
-    let mainnet_result = provider
-        .call(
-            TransactionRequest::default()
-                .to(ger_addr)
-                .input(mainnet_call.abi_encode().into()),
-        )
-        .await?;
-    let mainnet_root: [u8; 32] = mainnet_result[..32].try_into()?;
-
-    let rollup_call = IGlobalExitRootV2::lastRollupExitRootCall {};
-    let rollup_result = provider
-        .call(
-            TransactionRequest::default()
-                .to(ger_addr)
-                .input(rollup_call.abi_encode().into()),
-        )
-        .await?;
-    let rollup_root: [u8; 32] = rollup_result[..32].try_into()?;
-
-    Ok((mainnet_root, rollup_root))
-}
 
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/sovereignChains/GlobalExitRootManagerL2SovereignChain.sol#L166
@@ -137,15 +94,8 @@ async fn submit_update_ger_note(
         .await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
-    // Vestigial after the cut-over: the GER synthetic log (and the exit-root
-    // detail it carried) is now emitted by the SyntheticProjector from the
-    // consumed UpdateGerNote, not here. Kept in the signature so the GER-inject
-    // call chain stays unchanged; a follow-up can prune the exit-root threading.
-    _mainnet_exit_root: Option<[u8; 32]>,
-    _rollup_exit_root: Option<[u8; 32]>,
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: &Arc<dyn crate::store::Store>,

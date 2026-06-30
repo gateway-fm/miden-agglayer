@@ -131,8 +131,6 @@ pub enum DecodedWriteCall {
     },
     Ger {
         ger_bytes: [u8; 32],
-        mainnet_root: Option<[u8; 32]>,
-        rollup_root: Option<[u8; 32]>,
     },
 }
 
@@ -154,14 +152,8 @@ impl DecodedWriteCall {
                 eth_tx_hash,
                 job_id,
             },
-            DecodedWriteCall::Ger {
+            DecodedWriteCall::Ger { ger_bytes } => WriteJob::Ger {
                 ger_bytes,
-                mainnet_root,
-                rollup_root,
-            } => WriteJob::Ger {
-                ger_bytes,
-                mainnet_root,
-                rollup_root,
                 envelope,
                 signer,
                 eth_tx_hash,
@@ -206,8 +198,6 @@ pub enum WriteJob {
     },
     Ger {
         ger_bytes: [u8; 32],
-        mainnet_root: Option<[u8; 32]>,
-        rollup_root: Option<[u8; 32]>,
         envelope: TxEnvelope,
         signer: Address,
         eth_tx_hash: TxHash,
@@ -857,8 +847,6 @@ async fn dispatch_job(service: &ServiceState, job: WriteJob) -> anyhow::Result<(
         }
         WriteJob::Ger {
             ger_bytes,
-            mainnet_root,
-            rollup_root,
             envelope,
             signer,
             eth_tx_hash,
@@ -867,8 +855,6 @@ async fn dispatch_job(service: &ServiceState, job: WriteJob) -> anyhow::Result<(
             crate::service_send_raw_txn::worker_handle_ger_insert(
                 service,
                 ger_bytes,
-                mainnet_root,
-                rollup_root,
                 eth_tx_hash,
                 envelope,
                 signer,
@@ -951,8 +937,6 @@ mod tests {
         };
         WriteJob::Ger {
             ger_bytes: [0u8; 32],
-            mainnet_root: None,
-            rollup_root: None,
             envelope: env,
             signer,
             eth_tx_hash: hash,
@@ -1007,17 +991,14 @@ mod tests {
         assert!(JobState::Failed.is_terminal());
     }
 
-    /// DecodedWriteCall::Ger preserves Option<[u8;32]> mainnet/rollup roots —
-    /// these may be `None` under the RD-862 race-path (Phase 1 unchanged
-    /// from current behaviour; L1InfoTreeIndexer backfills via UPSERT).
+    /// `DecodedWriteCall::Ger` carries the combined `ger_bytes` through
+    /// `into_job` into `WriteJob::Ger`. The decomposed mainnet/rollup exit roots
+    /// are no longer threaded — the `SyntheticProjector` re-derives them from the
+    /// consumed `UpdateGerNote`, so only the combined hash needs to reach Miden.
     #[test]
-    fn decoded_ger_preserves_optional_roots() {
-        let mainnet = Some([1u8; 32]);
-        let rollup = Some([2u8; 32]);
+    fn decoded_ger_into_job_preserves_ger_bytes() {
         let decoded = DecodedWriteCall::Ger {
             ger_bytes: [3u8; 32],
-            mainnet_root: mainnet,
-            rollup_root: rollup,
         };
         let (env, addr) = fake_envelope(0);
         let hash = *match &env {
@@ -1026,13 +1007,8 @@ mod tests {
         };
         let job = decoded.into_job(env, addr, hash);
         match job {
-            WriteJob::Ger {
-                mainnet_root,
-                rollup_root,
-                ..
-            } => {
-                assert_eq!(mainnet_root, mainnet);
-                assert_eq!(rollup_root, rollup);
+            WriteJob::Ger { ger_bytes, .. } => {
+                assert_eq!(ger_bytes, [3u8; 32]);
             }
             _ => panic!("expected WriteJob::Ger"),
         }
@@ -1120,12 +1096,7 @@ mod tests {
         }
         .abi_encode();
         let (env, signer, hash) = encode_legacy_envelope(calldata);
-        let job = DecodedWriteCall::Ger {
-            ger_bytes,
-            mainnet_root: None,
-            rollup_root: None,
-        }
-        .into_job(env, signer, hash);
+        let job = DecodedWriteCall::Ger { ger_bytes }.into_job(env, signer, hash);
 
         handle.try_enqueue(job).expect("enqueue must succeed");
 
