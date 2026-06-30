@@ -25,6 +25,23 @@ use std::sync::Arc;
 
 // ── Types ────────────────────────────────────────────────────────────
 
+/// Typed error returned by [`Store::try_claim`] when the `global_index` is
+/// already locked/claimed.
+///
+/// Carried inside the `anyhow` chain so callers can `.downcast_ref::<…>()`
+/// instead of string-matching the message (mirrors `WriterQueueSaturatedError`).
+/// The accept/drain path in `service_send_raw_txn` treats a duplicate like a
+/// reverting-but-mined EVM tx: the eth tx is valid and consumes its nonce, and
+/// because the `global_index` is already claimed the Miden-side execution is a
+/// harmless no-op. Distinguishing this from a transient failure is what lets the
+/// proxy advance the nonce (instead of sticking it) and record a success
+/// receipt so aggkit stops re-claiming.
+#[derive(Debug, thiserror::Error)]
+#[error("claim already submitted for global_index {global_index}")]
+pub struct ClaimAlreadySubmitted {
+    pub global_index: U256,
+}
+
 /// Faucet registry entry — metadata for a bridged token's Miden faucet.
 #[derive(Debug, Clone)]
 pub struct FaucetEntry {

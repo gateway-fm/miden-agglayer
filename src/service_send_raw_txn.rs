@@ -609,7 +609,16 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // nonce == expected — decode the method and dispatch via the existing fork,
     // then advance the nonce and drain any queued successors.
     let decoded = decode_write_call(&txn.input)?;
-    dispatch_accepted(&service, decoded, txn_envelope, signer, txn_hash).await?;
+    match dispatch_accepted(&service, decoded, txn_envelope.clone(), signer, txn_hash).await? {
+        DispatchOutcome::Processed => {}
+        DispatchOutcome::AlreadyClaimed => {
+            // Duplicate re-claim: the global_index is already claimed, so this is
+            // a harmless no-op that must still consume its nonce. Record a success
+            // receipt for this tx hash so aggkit stops re-claiming, then fall
+            // through to advance the nonce (instead of sticking it).
+            record_duplicate_claim_success(&service, txn_hash, txn_envelope, signer).await?;
+        }
+    }
     service.store.nonce_increment(&signer_str).await?;
     drain_queued(&service, &signer_str).await;
     Ok(txn_hash)
@@ -654,19 +663,55 @@ fn decode_write_call(
     }
 }
 
+/// Outcome of dispatching one accepted (nonce == expected) tx.
+///
+/// Both variants CONSUME the nonce — the distinction is only whether the caller
+/// must also write an idempotent success receipt for the eth tx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchOutcome {
+    /// Normal dispatch — the handler (or the enqueue) recorded / will record the
+    /// receipt itself. The caller just advances the nonce.
+    Processed,
+    /// The claim's `global_index` was already claimed (a duplicate re-claim from
+    /// aggkit). Treated like a reverting-but-mined EVM tx: the eth tx is valid
+    /// (nonce + signature ok) and its Miden-side execution is a harmless no-op,
+    /// so it must still CONSUME its nonce. The caller records a SUCCESS receipt
+    /// for this tx hash (so `eth_getTransactionReceipt` resolves and aggkit
+    /// stops re-claiming) and advances the nonce. The original claim's lock is
+    /// left untouched — a duplicate must NOT trigger an unclaim (R9).
+    AlreadyClaimed,
+}
+
+/// Record the idempotent success receipt for a duplicate claim. Mirrors the
+/// duplicate-GER branch in `handle_ger_result`: immediate success at the
+/// current tip with NO synthetic log — the ORIGINAL claim already emitted the
+/// `ClaimEvent` on its own receipt, so re-emitting here would double-count.
+async fn record_duplicate_claim_success(
+    service: &ServiceState,
+    txn_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+) -> anyhow::Result<()> {
+    record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![]).await
+}
+
 /// Dispatch one decoded, accepted (nonce == expected) tx through the existing
 /// fork: the async writer worker when enabled, else the legacy synchronous
 /// claim/GER handlers. **Does NOT advance the nonce** — the caller does that
 /// after this returns `Ok` (so a `QueueFull` from the worker leaves the nonce
 /// untouched and the caller retries). This is the reusable "process one decoded
 /// accepted tx" body the drain also calls.
+///
+/// Returns [`DispatchOutcome::AlreadyClaimed`] (instead of an `Err`) when the
+/// claim's `global_index` is already claimed, so the caller can consume the
+/// nonce and write an idempotent success receipt rather than sticking the nonce.
 async fn dispatch_accepted(
     service: &ServiceState,
     decoded: crate::writer_worker::DecodedWriteCall,
     txn_envelope: TxEnvelope,
     signer: Address,
     txn_hash: TxHash,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DispatchOutcome> {
     if service.enable_writer_worker {
         let handle = service.writer_handle.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -676,7 +721,7 @@ async fn dispatch_accepted(
         })?;
         let job = decoded.into_job(txn_envelope, signer, txn_hash);
         match handle.try_enqueue(job) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(DispatchOutcome::Processed),
             // The downcast on this typed error in `service.rs` promotes the
             // JSON-RPC error code to -32005 (geth's LimitExceeded) so aggkit's
             // ethtxmanager retries transparently.
@@ -691,26 +736,51 @@ async fn dispatch_accepted(
             }
         }
     } else {
-        // Legacy synchronous dispatch — unchanged behaviour.
+        // Legacy synchronous dispatch — unchanged behaviour, except a duplicate
+        // claim is mapped to `AlreadyClaimed` rather than propagated as an error.
         match decoded {
             crate::writer_worker::DecodedWriteCall::Claim { params } => {
-                worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer).await
+                match worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer)
+                    .await
+                {
+                    Ok(()) => Ok(DispatchOutcome::Processed),
+                    // Typed downcast (NOT string-matching) — `try_claim` returns
+                    // `ClaimAlreadySubmitted` on a duplicate, raised before the
+                    // R9 guard is installed, so no unclaim fires.
+                    Err(e)
+                        if e.downcast_ref::<crate::store::ClaimAlreadySubmitted>()
+                            .is_some() =>
+                    {
+                        ::metrics::counter!("rpc_claim_already_submitted_total").increment(1);
+                        Ok(DispatchOutcome::AlreadyClaimed)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
-                worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer).await
+                worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer)
+                    .await
+                    .map(|()| DispatchOutcome::Processed)
             }
         }
     }
 }
 
 /// Process one tx pulled from the mempool queue: re-decode its raw envelope and
-/// dispatch it exactly as an in-order accept would.
+/// dispatch it exactly as an in-order accept would. On a duplicate claim it
+/// writes the idempotent success receipt and returns `Ok` so the drain advances
+/// the nonce and continues (rather than sticking and stopping the drain).
 async fn process_queued(service: &ServiceState, q: crate::store::QueuedTxn) -> anyhow::Result<()> {
     let envelope = q.envelope;
     let txn = unwrap_txn_envelope(envelope.clone())?;
     let signer = envelope.recover_signer()?;
     let decoded = decode_write_call(&txn.input)?;
-    dispatch_accepted(service, decoded, envelope, signer, q.tx_hash).await
+    match dispatch_accepted(service, decoded, envelope.clone(), signer, q.tx_hash).await? {
+        DispatchOutcome::Processed => Ok(()),
+        DispatchOutcome::AlreadyClaimed => {
+            record_duplicate_claim_success(service, q.tx_hash, envelope, signer).await
+        }
+    }
 }
 
 /// Drain the contiguous run of queued txns for `signer`, starting at the
@@ -1672,6 +1742,150 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "queue must be empty after resume"
+        );
+    }
+
+    /// Build a `claimAsset` legacy tx for `global_index` at `nonce`, signed by
+    /// the SAME fixed key as `ger_tx` so claims and GER-inserts in one test share
+    /// a signer (and therefore a nonce sequence). Resolvable zero-padded
+    /// destination + all-zero exit roots so it gets past RD-860 and C6 once the
+    /// all-zero combined GER is marked injected.
+    fn claim_tx(nonce: u64, global_index: u64) -> (String, Address) {
+        use alloy::consensus::SignableTransaction;
+        use alloy::signers::SignerSync;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer_key: PrivateKeySigner =
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .parse()
+                .expect("fixed test key");
+        let from = signer_key.address();
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: U256::from(global_index),
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 1,
+            destinationAddress: alloy::primitives::address!(
+                "0x00000000ac0000000000dd110000ee000000fc00"
+            ),
+            amount: U256::from(1_000u64),
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 0,
+            gas_limit: 21_000,
+            to: alloy::primitives::TxKind::Call(from),
+            value: U256::ZERO,
+            input: calldata.into(),
+        };
+        let signature = signer_key.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let envelope: TxEnvelope = tx.into_signed(signature).into();
+        let mut encoded = Vec::new();
+        envelope.encode_2718(&mut encoded);
+        (format!("0x{}", ::hex::encode(encoded)), from)
+    }
+
+    /// Nonce-jam regression. When aggkit re-claims an already-claimed deposit,
+    /// the second `claimAsset` for the same `global_index` hits
+    /// `try_claim` → `ClaimAlreadySubmitted`. Pre-fix that errored out WITHOUT
+    /// advancing the nonce, so the proxy's next-expected nonce stuck forever and
+    /// every later claim (including future-nonce txs that then expired) jammed.
+    ///
+    /// Post-fix the duplicate is treated like a reverting-but-mined EVM tx: it
+    /// CONSUMES its nonce and gets a SUCCESS receipt (the global_index IS
+    /// claimed), and a higher-nonce tx parked behind it drains. The original
+    /// claim's lock is left intact (a duplicate must not unclaim — R9).
+    #[tokio::test]
+    async fn claim_duplicate_consumes_nonce_records_receipt_and_drains() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        crate::test_helpers::seed_test_faucets(&*store).await;
+
+        // C6 — the all-zero combined GER these claims reference must be injected.
+        let ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
+        store
+            .mark_ger_seen(
+                &ger,
+                crate::log_synthesis::GerEntry {
+                    mainnet_exit_root: Some([0u8; 32]),
+                    rollup_exit_root: Some([0u8; 32]),
+                    block_number: 1,
+                    timestamp: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store.mark_ger_injected(ger).await.unwrap();
+
+        let global_index = 7u64;
+        let (_, signer) = claim_tx(0, global_index);
+        let signer_str = format!("{signer:#x}");
+
+        // Simulate the FIRST claim having already committed: the global_index is
+        // locked and its nonce was advanced to 1. (We seed the lock directly
+        // rather than run a full publish through the MidenClient stub, which is
+        // not deterministic for the claim path — the precondition under test is
+        // simply "global_index already claimed, nonce at the next slot".)
+        store.try_claim(U256::from(global_index)).await.unwrap();
+        store.nonce_increment(&signer_str).await.unwrap();
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+
+        // Park a higher-nonce GER tx (nonce 2) BEHIND the duplicate. It sits in
+        // the queue until the gap at nonce 1 fills.
+        let (ger2, _) = ger_tx(2, 0xF2);
+        service_send_raw_txn(service.clone(), ger2).await.unwrap();
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(2),
+            "the higher-nonce tx must be parked"
+        );
+
+        // The SECOND (duplicate) claim for the SAME global_index arrives at
+        // nonce == next (1). Pre-fix this errored and stuck the nonce at 1.
+        let (dup, _) = claim_tx(1, global_index);
+        let dup_hash = service_send_raw_txn(service.clone(), dup)
+            .await
+            .expect("duplicate claim must be accepted idempotently, not error");
+
+        // Nonce advanced past the duplicate (to 2) AND drained the parked nonce-2
+        // GER tx (to 3).
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            3,
+            "duplicate must consume its nonce and the parked successor must drain"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none(),
+            "queue must be empty after the drain"
+        );
+
+        // A SUCCESS receipt exists for the duplicate's tx hash so
+        // eth_getTransactionReceipt resolves and aggkit stops re-claiming.
+        let (status, _block) = store
+            .txn_receipt(dup_hash)
+            .await
+            .unwrap()
+            .expect("duplicate claim must have a receipt");
+        assert!(
+            status.is_ok(),
+            "duplicate claim receipt must report success (global_index IS claimed): {status:?}"
+        );
+
+        // R9 — the original claim's lock is untouched (no unclaim fired).
+        assert!(
+            store.is_claimed(&U256::from(global_index)).await.unwrap(),
+            "a duplicate must NOT unclaim the original"
         );
     }
 }

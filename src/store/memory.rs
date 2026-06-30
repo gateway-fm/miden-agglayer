@@ -685,7 +685,7 @@ impl Store for InMemoryStore {
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
         let mut claimed = self.claimed.write();
         if !claimed.insert(global_index) {
-            anyhow::bail!("claim already submitted for global_index {global_index}");
+            return Err(super::ClaimAlreadySubmitted { global_index }.into());
         }
         Ok(())
     }

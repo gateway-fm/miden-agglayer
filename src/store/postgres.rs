@@ -62,6 +62,15 @@ fn parse_queued_hash(hash_str: &str) -> anyhow::Result<TxHash> {
         .map_err(|e| anyhow::anyhow!("stored queued tx_hash {hash_str} is invalid ({e})"))
 }
 
+/// Whether a `tokio_postgres` error is a unique-constraint violation
+/// (SQLSTATE 23505). Used by `try_claim` to distinguish a duplicate claim
+/// (the PK on `claimed_indices.global_index` already exists — a no-op) from a
+/// genuinely transient DB failure (connection drop, deadlock, …), which must
+/// NOT advance the nonce.
+fn is_unique_violation(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().map(|db| db.code()) == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+}
+
 /// Build a `QueuedTxn` from a `RETURNING tx_hash, envelope, expires_at` row.
 fn row_to_queued_txn(
     signer: String,
@@ -1116,7 +1125,15 @@ impl Store for PgStore {
 
         match result {
             Ok(_) => Ok(()),
-            Err(_) => anyhow::bail!("claim already submitted for global_index {global_index}"),
+            // A unique-violation means the index is already locked/claimed; surface
+            // it as a typed error so the accept/drain path can downcast instead of
+            // string-matching. Other DB errors stay generic (genuinely transient).
+            Err(e) if is_unique_violation(&e) => {
+                Err(super::ClaimAlreadySubmitted { global_index }.into())
+            }
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "try_claim insert failed for global_index {global_index}"
+            ))),
         }
     }
 
