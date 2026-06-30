@@ -428,6 +428,14 @@ impl MidenClient {
                         Err(other_err) => {
                             metrics::counter!("miden_sync_errors_total", "kind" => "other")
                                 .increment(1);
+                            // RD-1112 — tag the sqlite "database is locked"
+                            // contention with a stable prod-grep token (no-op
+                            // for any other error); the existing line below is
+                            // kept for the per-tick backoff context.
+                            crate::sqlite_pragmas::trace_store_locked(
+                                "miden_client::sync",
+                                &other_err,
+                            );
                             tracing::error!(
                                 "MidenClient::sync non-connection error: {other_err:#}, retrying in {backoff:?}..."
                             );
@@ -645,7 +653,16 @@ pub async fn wait_for_transaction_commit(
                         );
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
-                    Err(other_err) => return Err(other_err),
+                    Err(other_err) => {
+                        // RD-1112 — post-submit sync contention surfaces here;
+                        // previously propagated silently with no log, hiding
+                        // the write-side lock from prod telemetry.
+                        crate::sqlite_pragmas::trace_store_locked(
+                            "wait_for_transaction_commit",
+                            &other_err,
+                        );
+                        return Err(other_err);
+                    }
                 },
             }
         }
