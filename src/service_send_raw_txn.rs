@@ -757,6 +757,40 @@ mod tests {
         (format!("0x{}", ::hex::encode(encoded)), signer)
     }
 
+    /// Build + encode a legacy tx REALLY signed by `signer_key` with an explicit
+    /// `gas_price`. The nonce is intentionally FIXED to 0 (not a parameter): this
+    /// helper exists solely for the same-nonce concurrency test, so don't reuse it
+    /// for arbitrary nonces. Two calls with the same key + nonce 0 + calldata but
+    /// different `gas_price` recover to the SAME signer yet produce DIFFERENT
+    /// tx-hashes (the hash is keccak over the signed RLP, which includes
+    /// gas_price). Distinct hashes are the point: they stop the RD-940 tx-hash
+    /// dedup (idempotent re-broadcast) from short-circuiting the loser, so the
+    /// per-signer nonce lock is the actual guard exercised by the concurrency test.
+    fn encode_legacy_tx_signed(
+        signer_key: &alloy::signers::local::PrivateKeySigner,
+        input: Vec<u8>,
+        gas_price: u128,
+    ) -> String {
+        use alloy::consensus::SignableTransaction;
+        use alloy::signers::SignerSync;
+        let txn = TxLegacy {
+            // Explicit so the test's "same nonce" semantics don't silently ride
+            // on `TxLegacy::default()` (would break if the default ever changes).
+            nonce: 0,
+            input: input.into(),
+            chain_id: Some(1),
+            gas_price,
+            ..Default::default()
+        };
+        let signature = signer_key
+            .sign_hash_sync(&txn.signature_hash())
+            .expect("signing the legacy test tx must succeed");
+        let envelope: TxEnvelope = txn.into_signed(signature).into();
+        let mut encoded = Vec::new();
+        envelope.encode_2718(&mut encoded);
+        format!("0x{}", ::hex::encode(encoded))
+    }
+
     #[tokio::test]
     async fn test_service_send_raw_txn_invalid_hex() {
         let service = create_test_service();
@@ -1132,21 +1166,34 @@ mod tests {
     /// `claimAsset`, `try_claim` dedupes by `globalIndex`; for the GER injection
     /// path, no dedup existed, so both could double-process.
     ///
-    /// This test concurrently launches two `service_send_raw_txn` calls from
-    /// the same signer at the same nonce and asserts that exactly ONE
-    /// succeeds (the second receives a "nonce mismatch" error). Pre-fix both
-    /// would have succeeded.
+    /// Two DISTINCT txs from the SAME signer at the SAME nonce (identical
+    /// calldata + nonce, different `gas_price`, so they share a signer but have
+    /// different tx-hashes). Asserts the per-signer lock lets at most ONE pass
+    /// the nonce gate. Pre-fix (no lock) both would have advanced the nonce — a
+    /// same-nonce double-spend.
     #[tokio::test]
     async fn r4_followup_concurrent_same_nonce_serialised() {
-        // Build two identical legacy txs; encode_legacy_tx signs with the same
-        // private key + same nonce by construction, so both yield the same
-        // signer + nonce.
+        // Distinct hashes are deliberate: with identical hashes the loser would
+        // RD-940-dedup-return Ok WITHOUT touching the nonce, masking the lock and
+        // making the old "exactly one Ok" assertion flaky. Different gas_price ->
+        // different hash -> the dedup can't conflate them, so the nonce lock is
+        // the real guard under test.
+        let signer_key = alloy::signers::local::PrivateKeySigner::random();
+        let signer = signer_key.address();
         let calldata = insertGlobalExitRootCall {
             root: FixedBytes::from([0xAAu8; 32]),
         }
         .abi_encode();
-        let (input_a, signer) = encode_legacy_tx(calldata.clone());
-        let (input_b, _) = encode_legacy_tx(calldata);
+        let input_a = encode_legacy_tx_signed(&signer_key, calldata.clone(), 0);
+        let input_b = encode_legacy_tx_signed(&signer_key, calldata, 1);
+        // Enforce the test's premise: distinct gas_price -> distinct signed RLP ->
+        // distinct tx hashes, so the RD-940 tx-hash dedup can't conflate the two
+        // and short-circuit the loser before the per-signer nonce lock is hit.
+        // Fails loudly if alloy encoding/signing ever makes these collide.
+        assert_ne!(
+            input_a, input_b,
+            "distinct gas_price must produce distinct encoded txs (distinct tx hashes)"
+        );
 
         let service = create_test_service();
         let store = service.store.clone();
@@ -1158,44 +1205,37 @@ mod tests {
         let res_a = h_a.await.unwrap();
         let res_b = h_b.await.unwrap();
 
-        let (oks, errs): (Vec<_>, Vec<_>) = [res_a, res_b].into_iter().partition(|r| r.is_ok());
+        let oks = [&res_a, &res_b].iter().filter(|r| r.is_ok()).count();
 
-        // SAFETY invariant (the real regression target): two same-nonce txs must
-        // NEVER both pass the gate — that would double-spend a nonce. The
-        // per-signer lock (`service.per_signer_locks`) plus the
-        // `nonce_get` -> check -> handler -> `nonce_increment` critical section
-        // guarantee at most one succeeds, and the store nonce advances by exactly
-        // the number of successes.
+        // SAFETY invariant (RD-1021): the per-signer lock serialises both
+        // same-nonce txs through the `nonce_get` -> check -> handler ->
+        // `nonce_increment` section, and the nonce advances ONLY on a handler
+        // that succeeds. So at most one can succeed: once one reaches
+        // `nonce_increment` (expected 0 -> 1) the other fails the equality check
+        // (tx.nonce 0 != expected 1) and is rejected; and if the first instead
+        // fails inside the handler WITHOUT incrementing, expected stays 0 and the
+        // second passes the check (0 == 0) for a fresh attempt — but only its own
+        // success could then increment, so the success count still can't exceed
+        // one. Distinct tx hashes make this reachable: identical hashes would let
+        // the RD-940 dedup mask the second tx before the lock is ever exercised.
         //
-        // We deliberately DON'T assert "exactly one succeeds". The winning tx's
-        // handler runs the GER-insert path through the test `MidenClient` stub,
-        // whose request/response hops a `std::thread` + oneshot channel; under CI
-        // load that cross-thread round-trip can occasionally fail the winner too,
-        // yielding zero successes. That is a liveness hiccup in the *stub*, not a
-        // safety violation — asserting "exactly one" made this test flaky
-        // (RD-1021). Asserting the safety invariant keeps it a real regression
-        // guard while making it deterministic. The happy path (a lone tx
-        // succeeds) is covered deterministically by `r4_correct_nonce_accepted`.
+        // Hence `oks` can be 0 (not only 1): the handler runs the GER-insert path
+        // through the test `MidenClient` stub, whose request/response hops a
+        // `std::thread` + oneshot channel; under load that round-trip can fail the
+        // tx that holds the gate — a liveness hiccup, not a safety violation. The
+        // lone-tx happy path is covered deterministically by
+        // `r4_correct_nonce_accepted`.
         assert!(
-            oks.len() <= 1,
-            "at most one same-nonce tx may succeed (got {}) — double-submit guard broken",
-            oks.len()
+            oks <= 1,
+            "at most one same-nonce tx may succeed (got {oks}) — double-submit guard broken"
         );
+        // The store nonce must advance by EXACTLY the number of successes — never
+        // twice for two same-nonce txs (the double-spend), never out of step.
         let final_nonce = store.nonce_get(&format!("{signer:#x}")).await.unwrap();
         assert_eq!(
-            final_nonce,
-            oks.len() as u64,
-            "store nonce must advance by exactly the number of successful txs"
+            final_nonce, oks as u64,
+            "store nonce ({final_nonce}) must equal the number of successful txs ({oks})"
         );
-        // When there IS a winner, the loser must be rejected at the nonce gate,
-        // not silently accepted.
-        if oks.len() == 1 {
-            let err_msg = format!("{}", errs[0].as_ref().unwrap_err());
-            assert!(
-                err_msg.contains("nonce mismatch"),
-                "the losing tx must be rejected with nonce mismatch: {err_msg}"
-            );
-        }
     }
 
     /// Self-review R4 — repro+regression. Two failure modes:
