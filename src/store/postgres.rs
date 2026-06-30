@@ -191,8 +191,11 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
+                // Secondary `tx_hash` key makes "first associated tx" stable even
+                // when two rows share a `created_at` (possible under load) — a bare
+                // `created_at` order leaves the winner up to Postgres.
                 "SELECT tx_hash FROM tx_note_links WHERE note_commitment = $1
-                 ORDER BY created_at ASC LIMIT 1",
+                 ORDER BY created_at ASC, tx_hash ASC LIMIT 1",
                 &[&note_commitment],
             )
             .await?;

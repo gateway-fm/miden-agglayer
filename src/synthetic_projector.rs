@@ -142,36 +142,52 @@ impl SyntheticProjector {
     /// `project_b2agg_note` for the Cantina #13 Layer-2 ERC-20 metadata
     /// recovery (`None` in unit tests, where the in-memory feed is supplied
     /// directly).
+    /// Filter `consumed` to the notes consumed at `miden_block`, then project
+    /// them. Used by `project_block` (live single-block) and the unit tests;
+    /// `tick` pre-groups the feed once and calls [`Self::project_block_notes`]
+    /// directly to avoid an O(blocks × notes) per-block re-scan during catch-up.
     async fn project_notes(
         &self,
         consumed: &[InputNoteRecord],
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
-        mut client: Option<&mut MidenClientLib>,
+        client: Option<&mut MidenClientLib>,
     ) -> anyhow::Result<usize> {
-        // Keep only notes attributed to this Miden block by their consumed
-        // state's nullifier_block_height. Notes that aren't in a consumed state
-        // (no nullifier_block_height) are not attributed to any block.
-        let mut notes: Vec<&InputNoteRecord> = consumed
+        let block_notes: Vec<&InputNoteRecord> = consumed
             .iter()
             .filter(|n| n.state().consumed_block_height().map(|h| h.as_u64()) == Some(miden_block))
             .collect();
+        self.project_block_notes(&block_notes, output_metadata, miden_block, client)
+            .await
+    }
 
-        // Determinism: order intra-block events by (consumed_tx_order,
-        // note_id_hex). `consumed_tx_order` is the per-account position of the
-        // consuming transaction within the block; the note-id hex is the stable
-        // tie-breaker (matches the G7 sort the restore phases use). `None`
-        // tx-orders sort first and stay stable under the secondary key.
+    /// Project the already-filtered notes consumed at `miden_block` into the
+    /// single synthetic block `miden_block` (Miden-1:1), advancing the tip once
+    /// after the block (write-before-advance), even when there are zero notes.
+    async fn project_block_notes(
+        &self,
+        block_notes: &[&InputNoteRecord],
+        output_metadata: &HashMap<[u8; 32], NoteMetadata>,
+        miden_block: u64,
+        mut client: Option<&mut MidenClientLib>,
+    ) -> anyhow::Result<usize> {
+        let mut notes: Vec<&InputNoteRecord> = block_notes.to_vec();
+
+        // Determinism: order intra-block events by (consumed_tx_order, note-id).
+        // `consumed_tx_order` is the per-account position of the consuming
+        // transaction within the block; the 32-byte details-commitment is the
+        // stable tie-breaker. Compare the commitment bytes directly — identical
+        // ordering to the old hex-string compare, but no per-comparison
+        // allocation (matters when many notes share a block).
         notes.sort_by(|a, b| {
-            let order = a
-                .state()
+            a.state()
                 .consumed_tx_order()
-                .cmp(&b.state().consumed_tx_order());
-            order.then_with(|| {
-                let ka = hex::encode(a.details_commitment().as_bytes());
-                let kb = hex::encode(b.details_commitment().as_bytes());
-                ka.cmp(&kb)
-            })
+                .cmp(&b.state().consumed_tx_order())
+                .then_with(|| {
+                    a.details_commitment()
+                        .as_bytes()
+                        .cmp(&b.details_commitment().as_bytes())
+                })
         });
 
         let bridge_address = get_bridge_address();
@@ -315,9 +331,20 @@ impl SyntheticProjector {
             .into_iter()
             .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
             .collect();
+        // Pre-group the consumed feed by Miden block ONCE (not once per block): a
+        // per-block re-scan of the full feed makes catch-up O(blocks_behind ×
+        // total_consumed). Each block then projects from its precomputed bucket.
+        let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
+        for note in &consumed {
+            if let Some(h) = note.state().consumed_block_height().map(|h| h.as_u64()) {
+                by_block.entry(h).or_default().push(note);
+            }
+        }
+        let no_notes: Vec<&InputNoteRecord> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
-            self.project_notes(&consumed, &output_metadata, next, Some(client))
+            let bucket = by_block.get(&next).unwrap_or(&no_notes);
+            self.project_block_notes(bucket, &output_metadata, next, Some(client))
                 .await?;
             // Advance the cursor only after the block is fully projected, so a
             // crash mid-block re-projects (idempotently) rather than skipping.

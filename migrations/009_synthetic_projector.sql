@@ -3,10 +3,11 @@
 -- ============================================================================
 --
 -- See docs/SYNTHETIC-INDEXER-REDESIGN.md. This migration adds the durable
--- substrate for the `SyntheticProjector`. It is ADDITIVE and DEFAULT-OFF:
--- nothing in the running service reads or writes these yet (the projector is
--- not registered as a live sync listener until Phase 2b), so applying this
--- migration is a no-op for production behaviour.
+-- substrate for the `SyntheticProjector`, which is the always-on, sole producer
+-- of synthetic events and the sole advancer of `latest_block_number`. The
+-- running service reads + writes these at runtime: the projector persists its
+-- cursor here every tick, and the claim path records `tx_note_links` so the
+-- projected ClaimEvent rides the real `claimAsset` tx hash.
 --
 -- 1. Projector cursor — the "last fully-projected Miden block height". The
 --    projector is the single in-process owner of this cursor (SINGLE-PROCESS

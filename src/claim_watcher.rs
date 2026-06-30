@@ -181,7 +181,6 @@ pub fn derive_manual_claim_tx_hash(note_id_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_state::BlockState;
     use crate::store::memory::InMemoryStore;
     use miden_base_agglayer::{
         ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,

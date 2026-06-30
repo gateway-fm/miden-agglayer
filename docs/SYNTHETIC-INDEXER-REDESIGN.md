@@ -26,7 +26,9 @@ effect** of submitting work to Miden, each reserving block numbers ad-hoc with
 2. **Projector / Indexer** (worker 2) — the *sole* owner of the synthetic EVM chain. Follows the
    Miden chain block-by-block on a persisted cursor. For each new Miden block `N`, it scans the
    consumed notes attributed to `N` (`nullifier_block_height == N`), derives the synthetic events
-   in deterministic order, and emits exactly one synthetic block `N`. Synthetic tip = Miden tip − 1.
+   in deterministic order, and emits exactly one synthetic block `N`. Numbering is **Miden-1:1**
+   (see "Numbering: Miden-1:1 (final)" below): synthetic block `N` == Miden block `N`, the tip
+   advances to `N` even for empty Miden blocks, so `eth_blockNumber` tracks the Miden tip.
 
 Single ordered projector ⇒ **no reservation, no race** (Finding #5 eliminated by construction).
 Catch-up (cursor → tip) **is** recovery **is** the normal loop.

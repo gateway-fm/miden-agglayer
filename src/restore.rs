@@ -136,6 +136,42 @@ pub struct RestoreResult {
     pub logs_created: usize,
 }
 
+/// The Miden block a consumed note is attributed to (Miden-1:1), or `fallback`
+/// when the note carries no consumed-block height (should not happen for a note
+/// in a consumed state, but keeps restore total rather than dropping it).
+fn note_consumed_block(note: &InputNoteRecord, fallback: u64) -> u64 {
+    note.state()
+        .consumed_block_height()
+        .map(|h| h.as_u64())
+        .unwrap_or(fallback)
+}
+
+/// Order consumed notes into the [`SyntheticProjector`](crate::synthetic_projector)'s
+/// canonical projection order: `(consumed_block_height, consumed_tx_order,
+/// details-commitment bytes)`. Restore MUST replay in this exact order so its
+/// per-note synthetic block numbers, the `deposit_count` assignment, and the
+/// order-sensitive GER hash chain are byte-identical to a fresh live projection.
+/// (Byte compare on the 32-byte commitment — same order as a hex compare, no
+/// allocation.)
+fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
+    notes.sort_by(|a, b| {
+        a.state()
+            .consumed_block_height()
+            .map(|h| h.as_u64())
+            .cmp(&b.state().consumed_block_height().map(|h| h.as_u64()))
+            .then_with(|| {
+                a.state()
+                    .consumed_tx_order()
+                    .cmp(&b.state().consumed_tx_order())
+            })
+            .then_with(|| {
+                a.details_commitment()
+                    .as_bytes()
+                    .cmp(&b.details_commitment().as_bytes())
+            })
+    });
+}
+
 /// Run the full restore algorithm.
 pub async fn restore(
     store: &Arc<dyn Store>,
@@ -177,13 +213,13 @@ pub async fn restore(
     crate::account_recovery::reimport_known_accounts(miden_client, accounts).await;
     tracing::info!("Phase 0 complete: bridge account reimport pass done");
 
-    // Phase 1: Sync miden state
+    // Phase 1: Sync miden state + read the Miden tip — the block the synthetic
+    // chain catches up to under Miden-1:1. Each restored event is attributed to
+    // its OWN consumed block (below); `miden_tip` is only the orphan fallback.
     tracing::info!("Phase 1: syncing miden state...");
-    let block_num = sync_miden_block(miden_client, store).await?;
-    tracing::info!("Phase 1 complete: miden block {block_num}");
+    let miden_tip = sync_miden_block(miden_client).await?;
+    tracing::info!("Phase 1 complete: miden tip {miden_tip}");
 
-    // We'll assign synthetic logs to blocks starting after current
-    let mut next_block = block_num + 1;
     let mut total_logs = 0usize;
 
     // Phase 2: Scan miden consumed B2AGG notes
@@ -194,11 +230,10 @@ pub async fn restore(
         accounts,
         local_network_id,
         block_state,
-        next_block,
+        miden_tip,
         l1_rpc_url.clone(),
     )
     .await?;
-    next_block += if logs > 0 { 1 } else { 0 };
     total_logs += logs;
     tracing::info!("Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs");
 
@@ -216,22 +251,25 @@ pub async fn restore(
     // watcher uses so the synthetic logs are byte-identical (same tx-hash
     // derivation, same `commit_manual_claim_event_atomic` store path).
     tracing::info!("Phase 2.5: scanning miden consumed CLAIM notes (MA#27)...");
-    let (claims, claim_logs) = restore_claims(store, miden_client, block_state, next_block).await?;
-    next_block += if claim_logs > 0 { 1 } else { 0 };
+    let (claims, claim_logs) = restore_claims(store, miden_client, block_state, miden_tip).await?;
     total_logs += claim_logs;
     tracing::info!("Phase 2.5 complete: {claims} claims, {claim_logs} logs");
 
     // Phase 3: Scan consumed UpdateGerNote notes on Miden
     tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
     let (gers, ger_logs) =
-        restore_gers(store, miden_client, accounts, block_state, next_block).await?;
+        restore_gers(store, miden_client, accounts, block_state, miden_tip).await?;
     total_logs += ger_logs;
     tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
 
-    // Phase 4: Update block number to cover all synthetic logs
-    let final_block = next_block + if ger_logs > 0 { 1 } else { 0 };
-    store.set_latest_block_number(final_block).await?;
-    tracing::info!("Phase 4: block number set to {final_block}");
+    // Phase 4: Miden-1:1 — the synthetic tip == the Miden tip, and the projector
+    // cursor is set to the Miden tip so the live projector resumes from there
+    // rather than re-scanning the blocks restore just replayed (idempotent dedup
+    // would skip them anyway). The restored events already sit at their own
+    // Miden blocks.
+    store.set_latest_block_number(miden_tip).await?;
+    store.set_projector_cursor(miden_tip).await?;
+    tracing::info!("Phase 4: synthetic tip + projector cursor set to Miden tip {miden_tip}");
 
     // Phase 5: Verify
     tracing::info!("Phase 5: verification");
@@ -239,7 +277,7 @@ pub async fn restore(
     tracing::info!("=== RESTORE: complete ===");
 
     Ok(RestoreResult {
-        block_number: final_block,
+        block_number: miden_tip,
         bridge_outs_restored: bridge_outs,
         claims_restored: claims,
         gers_restored: gers,
@@ -247,22 +285,26 @@ pub async fn restore(
     })
 }
 
-/// Phase 1: sync miden and return current block number.
-async fn sync_miden_block(
-    miden_client: &MidenClient,
-    store: &Arc<dyn Store>,
-) -> anyhow::Result<u64> {
+/// Phase 1: sync miden and return the current MIDEN tip (sync height) — the
+/// block the synthetic chain catches up to under Miden-1:1.
+async fn sync_miden_block(miden_client: &MidenClient) -> anyhow::Result<u64> {
+    let height = Arc::new(std::sync::Mutex::new(0u64));
+    let height_inner = height.clone();
     miden_client
-        .with(|client| {
+        .with(move |client| {
             Box::new(async move {
                 client.sync_state().await?;
+                *height_inner.lock().unwrap() = client
+                    .get_sync_height()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
+                    .as_u64();
                 Ok(())
             })
         })
         .await?;
-
-    let block_num = store.get_latest_block_number().await?;
-    Ok(block_num)
+    let h = *height.lock().unwrap();
+    Ok(h)
 }
 
 /// Phase 2: scan miden consumed B2AGG notes and rebuild bridge-out state.
@@ -296,30 +338,28 @@ async fn restore_bridge_outs(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
-                let block_hash = block_state_clone.get_block_hash(restore_block);
                 let bridge_address = get_bridge_address();
                 let mut count = 0usize;
                 let mut logs = 0usize;
 
-                // G7 — sort B2AGG notes deterministically before assigning
-                // deposit_count. The Miden client returns consumed notes in
-                // store-arrival order, which can differ between runs (e.g.
-                // sync re-orderings, partial restores). Without sorting, the
-                // (note_id → deposit_count) mapping is non-deterministic
-                // across restore runs — two restores from the same on-chain
-                // state could produce different deposit_count assignments,
-                // breaking any consumer that joins on (note_id,
-                // deposit_count). Sort by note_id (stable across re-syncs).
+                // Miden-1:1: replay each B2AGG note at its OWN Miden consumption
+                // block, in the projector's canonical (block, tx_order, note_id)
+                // order. This keeps deposit_count assignment deterministic across
+                // restore runs AND byte-identical to a fresh live projection —
+                // the Miden client returns consumed notes in store-arrival order,
+                // which varies between runs.
                 let mut sorted: Vec<&_> = consumed_notes.iter().collect();
-                sorted.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
+                sort_consumed_for_projection(&mut sorted);
 
                 for note in sorted {
+                    let blk = note_consumed_block(note, restore_block);
+                    let block_hash = block_state_clone.get_block_hash(blk);
                     let outcome = project_b2agg_note(
                         &store_clone,
                         note,
                         bridge_id,
                         local_network_id,
-                        restore_block,
+                        blk,
                         block_hash,
                         bridge_address,
                         Some(&mut *client),
@@ -442,10 +482,10 @@ pub(crate) async fn project_b2agg_note(
         Ok(v) => v,
         Err(e) => {
             // MA#18 — the bridge consumed this B2AGG (LET advanced) but its storage
-            // is unparseable, so we cannot reconstruct the destination. Quarantine
+            // is unparsable, so we cannot reconstruct the destination. Quarantine
             // (record unbridgeable) so it is surfaced for operator rescue instead of
             // silently skipped. Ported from `project_b2agg_note`.
-            tracing::warn!(note_id = %note_id_str, "restore: B2AGG storage unparseable: {e:#}");
+            tracing::warn!(note_id = %note_id_str, "restore: B2AGG storage unparsable: {e:#}");
             crate::bridge_out::quarantine_unbridgeable_b2agg(
                 &**store,
                 bridge_id,
@@ -837,32 +877,24 @@ async fn restore_claims(
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
-                let block_hash = block_state_clone.get_block_hash(restore_block);
                 let bridge_address = get_bridge_address();
                 let mut claim_count = 0usize;
                 let mut log_count = 0usize;
 
-                // G7 — deterministic sort. CLAIM notes share the same
-                // restore_block (and therefore block_hash) and write into a
-                // dedup-keyed store, but we still sort to keep restore runs
-                // deterministic for the operator-visible
-                // `claim_watcher_synthesised_total` counter and log stream.
+                // Miden-1:1: replay each CLAIM at its OWN Miden consumption block,
+                // in the projector's canonical (block, tx_order, note_id) order
+                // (deterministic across runs + parity with the live projector).
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sorted_notes.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
+                sort_consumed_for_projection(&mut sorted_notes);
 
                 for note in sorted_notes {
+                    let blk = note_consumed_block(note, restore_block);
+                    let block_hash = block_state_clone.get_block_hash(blk);
                     // Per-note CLAIM derivation lives in `project_claim_note` so
                     // the live cursor-driven projector and this recovery phase
-                    // share one implementation. Behaviour is unchanged from the
-                    // previous inline loop body.
-                    if project_claim_note(
-                        &store_clone,
-                        note,
-                        restore_block,
-                        block_hash,
-                        bridge_address,
-                    )
-                    .await?
+                    // share one implementation.
+                    if project_claim_note(&store_clone, note, blk, block_hash, bridge_address)
+                        .await?
                         == ClaimProjectOutcome::Emitted
                     {
                         claim_count += 1;
@@ -1100,34 +1132,33 @@ async fn restore_gers(
                     .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
                     .collect();
 
-                let block_hash = block_state_clone.get_block_hash(restore_block);
-                let timestamp = block_state_clone.get_block_timestamp(restore_block);
                 let mut ger_count = 0usize;
                 let mut log_count = 0usize;
 
-                // G7 — sort GER notes deterministically before reconstructing
-                // the hash chain. Iteration order from the miden client is
-                // insertion-order, but the GER hash chain is order-sensitive
-                // (each new value mixes into a rolling Keccak), so two
-                // restore runs over the same on-chain state could produce
-                // different chain values without sorting. Lex-sort by
-                // NoteId for stability.
+                // The GER hash chain is ORDER-SENSITIVE (each value mixes into a
+                // rolling Keccak), so restore MUST replay in the projector's exact
+                // (block, tx_order, note_id) order — otherwise the restored chain
+                // diverges from a fresh live projection (and from aggkit's view).
+                // Each GER is also emitted at its OWN Miden consumption block
+                // (Miden-1:1), with that block's hash + timestamp.
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sorted_notes.sort_by_key(|n| hex::encode(n.details_commitment().as_bytes()));
+                sort_consumed_for_projection(&mut sorted_notes);
 
                 for note in sorted_notes {
+                    let blk = note_consumed_block(note, restore_block);
+                    let block_hash = block_state_clone.get_block_hash(blk);
+                    let timestamp = block_state_clone.get_block_timestamp(blk);
                     // Per-note GER derivation (MA#28 provenance + hash-chain
                     // replay) lives in `project_ger_note` so the live
                     // cursor-driven projector and this recovery phase share one
-                    // implementation. Behaviour is unchanged from the previous
-                    // inline loop body.
+                    // implementation.
                     if project_ger_note(
                         &store_clone,
                         note,
                         &own_output_metadata,
                         expected_sender,
                         expected_target,
-                        restore_block,
+                        blk,
                         block_hash,
                         timestamp,
                     )
