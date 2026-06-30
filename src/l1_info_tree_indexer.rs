@@ -29,7 +29,7 @@
 //! `ON CONFLICT (ger_hash) DO UPDATE SET mainnet_exit_root = EXCLUDED, ...`,
 //! so:
 //!   - Indexer fires before `insert_ger` → entry pre-populated with (M, R).
-//!     `commit_ger_event_atomic` then does `ON CONFLICT DO NOTHING` and
+//!     `the projector GER commit` then does `ON CONFLICT DO NOTHING` and
 //!     preserves the indexer's roots.
 //!   - `insert_ger` fires before indexer → entry exists with `None` roots.
 //!     Indexer's UPSERT fills them in. Bridge-service's polling eventually

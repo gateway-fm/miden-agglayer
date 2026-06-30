@@ -1,11 +1,14 @@
-//! Bridge-Out (L2 → L1) — Detect B2AGG note consumption and emit BridgeEvent logs.
+//! Bridge-Out (L2 → L1) — B2AGG consumption: shared derivation helpers + monitors.
 //!
 //! When the bridge account consumes a B2AGG note, assets are burned and a corresponding
-//! deposit is recorded on the L2 side. This module scans for consumed B2AGG notes and
-//! emits synthetic `BridgeEvent` EVM logs so the bridge-service can index them.
+//! deposit is recorded on the L2 side. The synthetic `BridgeEvent` log is emitted by the
+//! [`crate::synthetic_projector::SyntheticProjector`] via the shared `project_b2agg_note`
+//! derivation. This module hosts the derivation helpers that path shares
+//! (`classify_b2agg_consumer`, `parse_b2agg_storage`, `is_b2agg_note`, `is_self_targeted`,
+//! `derive_bridge_out_tx_hash`) plus the live `BridgeOutScanner`, whose remaining job is the
+//! Miden-facing monitors (Cantina #9 LET-divergence, Cantina #4 ownership probe) — it no
+//! longer emits logs or reserves block numbers.
 
-use crate::block_state::BlockState;
-use crate::bridge_address::get_bridge_address;
 use crate::miden_client::{MidenClientLib, SyncListener};
 use anyhow::Context;
 use miden_base_agglayer::B2AggNote;
@@ -16,8 +19,6 @@ use miden_protocol::account::AccountId;
 use miden_protocol::note::{NoteDetails, NoteStorage};
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
-
-const LEAF_TYPE_ASSET: u8 = 0;
 
 // B2AGG NOTE PARSING
 // ================================================================================================
@@ -200,7 +201,7 @@ pub enum B2AggConsumerClass {
 /// Given the `consumer_account` field from miden-client's `InputNoteRecord`
 /// and this scanner's `bridge_account_id`, classify whether to emit a synthetic
 /// BridgeEvent. Pure (no I/O, no metrics) so it can be unit-tested directly.
-/// Metric emission and tracing live at the call site in `process_consumed_note`.
+/// Metric emission and tracing live at the call site in `project_b2agg_note`.
 pub fn classify_b2agg_consumer(
     consumer_account: Option<AccountId>,
     bridge_account_id: AccountId,
@@ -218,7 +219,6 @@ pub fn classify_b2agg_consumer(
 /// Scans for consumed B2AGG notes and emits synthetic BridgeEvent logs.
 pub struct BridgeOutScanner {
     store: Arc<dyn crate::store::Store>,
-    block_state: Arc<BlockState>,
     /// Local network id, used to detect self-targeted bridge-outs (Cantina #13). A B2AGG
     /// note whose `destination_network` equals this value is a poison leaf — the on-chain
     /// bridge accepts and processes it (LET frontier advances, BURN emitted), but the next
@@ -250,7 +250,6 @@ pub struct BridgeOutScanner {
 impl BridgeOutScanner {
     pub fn new(
         store: Arc<dyn crate::store::Store>,
-        block_state: Arc<BlockState>,
         local_network_id: u32,
         bridge_account_id: AccountId,
     ) -> Self {
@@ -267,7 +266,6 @@ impl BridgeOutScanner {
         ));
         Self {
             store,
-            block_state,
             local_network_id,
             bridge_account_id,
             burn_serials,
@@ -293,522 +291,6 @@ impl BridgeOutScanner {
     /// pre-validate a B2AGG before submission.
     pub fn is_self_targeted(&self, destination_network: u32) -> bool {
         destination_network == self.local_network_id
-    }
-
-    /// Process a consumed B2AGG note. Returns `true` if the caller should advance
-    /// `latest_block_number` (a synthetic log was written at `block_number`),
-    /// `false` if the caller must NOT advance (the note was skipped, was a
-    /// non-B2AGG, errored on parse, or was a self-target poison leaf).
-    ///
-    /// Self-review: pre-fix this returned `()`, and the caller in `on_post_sync`
-    /// unconditionally bumped `latest_block_number` afterwards. When the
-    /// self-target circuit-break (Cantina #13) added an early return without a
-    /// log write, every poison leaf left a phantom block: `eth_blockNumber`
-    /// advanced but no log existed at that block, breaking the "every reader
-    /// who sees latest >= N also sees the log at N" invariant.
-    async fn process_consumed_note(
-        &self,
-        note: &InputNoteRecord,
-        block_number: u64,
-        client: Option<&mut MidenClientLib>,
-    ) -> bool {
-        // Stable per-note dedup/quarantine key. Protocol 0.15: `InputNoteRecord::id()`
-        // returns `Option<NoteId>` and is `None` for metadata-less records — including
-        // the `ConsumedExternal` notes this scanner routinely sees (a B2AGG note
-        // reclaimed by a user, or consumed by an untracked account). `details_commitment()`
-        // is derived from the recipient (which carries the note's unique serial) + assets,
-        // so it is present in every state and unique per note — the correct state-independent
-        // key here. (Was `note.id()` under 0.14, when the id was always available.)
-        let note_id_str = hex::encode(note.details_commitment().as_bytes());
-
-        match self.store.is_note_processed(&note_id_str).await {
-            Ok(true) => return false,
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(
-                    "B2AGG note {note_id_str}: storage error checking processed state: {e:#}"
-                );
-                return false;
-            }
-        }
-
-        let details = note.details();
-        if !is_b2agg_note(details) {
-            return false;
-        }
-
-        // Cantina MA#3 — reclaim gate. The B2AGG MASM script has TWO consumption
-        // paths (asm/note_scripts/B2AGG.masm lines 53-109):
-        //   1. Reclaim (lines 65-71, `if consuming_account == sender`) — assets
-        //      are added back to the sender via `basic_wallet::add_assets_to_account`.
-        //      NO `bridge_out::bridge_out` call, NO BURN, NO LET advance.
-        //   2. Bridge (lines 72-107) — calls `bridge_out::bridge_out` which BURNs
-        //      and advances the LET frontier.
-        //
-        // Both paths land the note in `NoteFilter::Consumed`, so without a gate
-        // here we emit a synthetic BridgeEvent for reclaims too. That synthetic
-        // event triggers an aggsender certificate covering a non-existent LET
-        // leaf, which `pessimistic-proof-core` rejects with `InvalidExit`, and
-        // the entire bridge-out window stalls.
-        //
-        // Gate: only emit when the note was consumed BY the bridge account.
-        // miden-client's `InputNoteRecord::consumer_account()` is set from sync
-        // data and is exactly what we need — it returns Some(consumer) for
-        // notes in any consumed state and None when the consumer isn't tracked
-        // by this client (which is unexpected for B2AGG and treated fail-closed).
-        // Pure classification lives in `classify_b2agg_consumer`; this match
-        // wires in the observability (metric + tracing) for each skip branch.
-        let consumer = note.consumer_account();
-        match classify_b2agg_consumer(consumer, self.bridge_account_id) {
-            B2AggConsumerClass::Emit => {
-                // Real bridge-out — proceed.
-            }
-            B2AggConsumerClass::Reclaimed => {
-                // Reclaim path: the user's wallet consumed the note via the
-                // `consuming_account == sender` branch in B2AGG.masm. Expected
-                // behaviour — record a metric so we can graph reclaim rate and
-                // log at info (not warn — reclaims are normal user flow).
-                metrics::counter!("bridge_out_reclaimed_b2agg_total").increment(1);
-                tracing::info!(
-                    target: "bridge_out",
-                    note_id = %note_id_str,
-                    consumer = ?consumer,
-                    bridge = %self.bridge_account_id,
-                    "B2AGG note was reclaimed by user (consumed by non-bridge account); \
-                     skipping synthetic BridgeEvent emission (Cantina MA#3)"
-                );
-                return false;
-            }
-            B2AggConsumerClass::UntrackedConsumer => {
-                // Fail-closed: a consumed B2AGG with no known consumer is an
-                // anomaly — miden-client should normally populate this field
-                // for any note we observe as Consumed. Skip rather than risk
-                // emitting an unverifiable BridgeEvent; an operator can probe
-                // the note manually if the metric trips.
-                metrics::counter!("bridge_out_b2agg_untracked_consumer_total").increment(1);
-                tracing::info!(
-                    target: "bridge_out",
-                    note_id = %note_id_str,
-                    bridge = %self.bridge_account_id,
-                    "B2AGG note consumed by untracked account (consumer_account = None); \
-                     fail-closed skip (Cantina MA#3)"
-                );
-                return false;
-            }
-        }
-
-        // Parse B2AGG storage
-        let (destination_network, destination_address) =
-            match parse_b2agg_storage(details.storage()) {
-                Ok(v) => v,
-                Err(e) => {
-                    // Cantina MA#18 — erased / malformed B2AGG storage. The
-                    // bridge consumed the note (LET frontier advanced on-chain),
-                    // but aggkit cannot reconstruct destination_network /
-                    // destination_address to form the BridgeEvent. Pre-fix the
-                    // failure surfaced only via the LET-divergence symptom
-                    // monitor (Cantina #9); a positive quarantine row gives
-                    // operators a concrete per-note handle for recovery.
-                    tracing::error!("B2AGG note {note_id_str}: failed to parse storage: {e:#}");
-                    self.quarantine_unbridgeable_b2agg(
-                        &note_id_str,
-                        note,
-                        block_number,
-                        crate::store::UnbridgeableBridgeOutReason::StorageParseFailed,
-                        format!("parse_b2agg_storage failed: {e:#}"),
-                    )
-                    .await;
-                    return false;
-                }
-            };
-
-        // B7 — reject obviously-invalid destination addresses before they
-        // reach the EVM-side bridge-service. The L1 PolygonZkEVMBridgeV2
-        // contract does its own validation, but emitting a synthetic
-        // BridgeEvent for an address aggkit knows is invalid wastes
-        // bridge-service work and pollutes its log stream. Catch:
-        // - the zero address (claim recipient that nobody controls)
-        // - the EVM precompile range 0x00..0x09 (low addresses
-        //   reserved for ecrecover/sha256/etc.)
-        if is_invalid_destination_address(&destination_address) {
-            ::metrics::counter!("bridge_out_invalid_destination_total").increment(1);
-            tracing::warn!(
-                target: "bridge_out",
-                note_id = %note_id_str,
-                destination = ?destination_address,
-                "B2AGG bridge-out targets the zero or precompile address; refusing to emit synthetic event"
-            );
-            return false;
-        }
-
-        // Cantina #13 — circuit-break self-targeted bridge-outs. The on-chain bridge_out
-        // procedure has no `dest_network != local_network` assertion, so a B2AGG note with
-        // `destination_network == this rollup's network_id` is consumed successfully (LET
-        // frontier advances, BURN emitted), but the next agglayer certificate covering it
-        // is rejected with `InvalidExit` and every legitimate B2AGG since the last good
-        // certificate is stranded. We can't prevent the on-chain leaf from being appended —
-        // it's already there by the time we observe the consumed note — but we MUST refuse
-        // to emit the synthetic BridgeEvent: forwarding it would have the bridge-service
-        // mint an aggsender certificate it can't settle, compounding the wedge. Skip the
-        // mark_note_processed step too so the note re-surfaces on each sync tick (and the
-        // metric keeps incrementing) until an operator quarantines it manually.
-        if self.is_self_targeted(destination_network) {
-            metrics::counter!("bridge_out_self_targeted_total").increment(1);
-            tracing::error!(
-                target: "bridge_out",
-                note_id = %note_id_str,
-                destination_network,
-                local_network_id = self.local_network_id,
-                "POISON LEAF: B2AGG bridge-out targets the local network. The on-chain LET \
-                 has been advanced; aggsender certificate covering this leaf will be rejected \
-                 with InvalidExit. Refusing to emit synthetic BridgeEvent to avoid compounding \
-                 the wedge. Operator action required: identify the depositor, decide whether \
-                 to drop the cert or fork the LET, and quarantine this note. Cantina #13."
-            );
-            return false;
-        }
-
-        // Get the fungible asset
-        let Some(fungible_asset) = details.assets().iter_fungible().next() else {
-            tracing::warn!("B2AGG note {note_id_str} has no fungible asset, skipping");
-            // Cantina MA#18 — bridge consumed an empty B2AGG. Quarantine so
-            // an operator can decide whether the LET advance was legitimate
-            // (zero-amount probe) or attacker-induced.
-            self.quarantine_unbridgeable_b2agg(
-                &note_id_str,
-                note,
-                block_number,
-                crate::store::UnbridgeableBridgeOutReason::NoFungibleAsset,
-                "iter_fungible returned None".to_string(),
-            )
-            .await;
-            return false;
-        };
-        let faucet_id = fungible_asset.faucet_id();
-        let miden_amount = u64::from(fungible_asset.amount());
-
-        // Resolve origin info from faucet registry.
-        //
-        // B8 — pre-fix this returned `false` without marking the note
-        // processed, so the next sync tick would observe the same note,
-        // re-attempt the lookup, log the same error, and loop forever.
-        // For an attacker who can submit B2AGG notes for unregistered
-        // faucets, that's a free DoS on the sync loop. Mark the note
-        // processed (consuming a deposit_count slot — not ideal, but the
-        // alternative is the infinite-loop) and emit a metric so
-        // operators can see the spike.
-        let origin = match resolve_faucet_origin(faucet_id, &*self.store).await {
-            Ok(v) => v,
-            Err(e) => {
-                ::metrics::counter!("bridge_out_unknown_faucet_total").increment(1);
-                tracing::error!(
-                    target: "bridge_out",
-                    note_id = %note_id_str,
-                    faucet_id = %faucet_id,
-                    error = ?e,
-                    "B8: B2AGG note references an unregistered faucet — quarantining"
-                );
-                if let Err(mark_err) = self.store.mark_note_processed(note_id_str.clone()).await {
-                    tracing::error!(
-                        target: "bridge_out",
-                        note_id = %note_id_str,
-                        error = ?mark_err,
-                        "B8: failed to mark unknown-faucet note as processed; \
-                         next tick will re-observe it"
-                    );
-                }
-                // Cantina MA#18 — positive quarantine in addition to the
-                // mark_note_processed B8 already does. mark_note_processed
-                // prevents the infinite re-scan loop but leaves no
-                // forensic trail; the quarantine row gives operators a
-                // structured record of every B8 hit, including the faucet
-                // id that needs registering.
-                self.quarantine_unbridgeable_b2agg(
-                    &note_id_str,
-                    note,
-                    block_number,
-                    crate::store::UnbridgeableBridgeOutReason::UnknownFaucet,
-                    format!("resolve_faucet_origin(faucet_id={faucet_id}) failed: {e:#}"),
-                )
-                .await;
-                return false;
-            }
-        };
-        let origin_amount = match reverse_scale_amount(miden_amount, origin.scale) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("B2AGG note {note_id_str}: {e:#}");
-                // Cantina MA#18 — amount × 10^scale overflowed u128.
-                // Practically impossible for legitimate amounts, but a
-                // malicious B2AGG could trigger it.
-                self.quarantine_unbridgeable_b2agg(
-                    &note_id_str,
-                    note,
-                    block_number,
-                    crate::store::UnbridgeableBridgeOutReason::AmountOverflow,
-                    format!("reverse_scale_amount failed: {e:#}"),
-                )
-                .await;
-                return false;
-            }
-        };
-
-        // Cantina #13 Layer 2 — ensure the metadata we are about to emit is
-        // correct. Layer 1 persists the real ABI preimage at faucet creation,
-        // but legacy rows (and any registry rebuilt after DB loss) have EMPTY
-        // metadata. Emitting empty metadata for an ERC-20 is a poison leaf, so
-        // recover + keccak-validate it against the bridge's stored hash here.
-        // Native ETH (zero origin address) legitimately stays empty.
-        let emit_metadata = match self.resolve_emit_metadata(&origin, faucet_id, client).await {
-            crate::metadata_recovery::EmitMetadata::Ready(bytes) => bytes,
-            crate::metadata_recovery::EmitMetadata::Recovered(bytes) => {
-                // One-time self-heal: backfill the validated preimage so the
-                // next bridge-out of this faucet takes the Layer-1 happy path.
-                self.backfill_faucet_metadata(faucet_id, &bytes).await;
-                bytes
-            }
-            crate::metadata_recovery::EmitMetadata::Unrecoverable => {
-                // FAIL-SAFE GATE: never emit empty/unvalidated metadata for an
-                // ERC-20. Defer (do NOT mark processed) so the bridge-out
-                // re-surfaces once an operator backfills the registry or wires
-                // an L1 RPC for the token's origin network. Mirrors the
-                // self-targeted poison-leaf gate (Cantina #13).
-                ::metrics::counter!(crate::metadata_recovery::METADATA_UNRECOVERABLE_METRIC)
-                    .increment(1);
-                tracing::warn!(
-                    target: "bridge_out::metadata_recovery",
-                    note_id = %note_id_str,
-                    faucet_id = %faucet_id,
-                    origin_network = origin.origin_network,
-                    "Cantina #13 L2: ERC-20 bridge-out has empty metadata that could not be \
-                     recovered + validated against the bridge's metadata hash; deferring \
-                     (refusing to emit empty/unvalidated metadata). Operator action: backfill \
-                     the faucet registry (admin_registerFaucet) or supply an L1 RPC reachable \
-                     for the token's origin network."
-                );
-                return false;
-            }
-        };
-
-        // Generate synthetic tx hash via the versioned domain-separated
-        // helper (B5). Same hash on restore so dedup is stable.
-        let tx_hash = derive_bridge_out_tx_hash(&note_id_str);
-
-        let block_hash = self.block_state.get_block_hash(block_number);
-
-        // B1 — atomic commit. Replaces the previous three sequential
-        // calls (mark_note_processed → add_bridge_event →
-        // set_latest_block_number) which had a crash window: if the
-        // process died between mark_note_processed and add_bridge_event,
-        // the deposit_count was permanently allocated for a note with no
-        // emitted log, causing aggsender to skip the BridgeEvent and
-        // wedge that bridge-out forever. PgStore folds all five writes
-        // into one transaction; InMemoryStore uses the default impl.
-        //
-        // Cantina #13 follow-up — DoS guard, applied to the FINAL emit bytes
-        // (Layer-1 stored OR Layer-2 recovered). The metadata derives from
-        // untrusted L1 calldata and the BridgeEvent encoder does not cap it; a
-        // malicious token's name() could even yield an oversized *recovered* blob.
-        // Refuse to encode it; skip + alert (the cap is far above any legit
-        // token's abi.encode(name,symbol,decimals)).
-        if emit_metadata.len() > MAX_BRIDGE_EVENT_METADATA_BYTES {
-            ::metrics::counter!("bridge_out_b2agg_metadata_too_large_total").increment(1);
-            tracing::warn!(
-                note_id = %note_id_str,
-                metadata_len = emit_metadata.len(),
-                cap = MAX_BRIDGE_EVENT_METADATA_BYTES,
-                "B2AGG metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
-            );
-            // Cantina #13 follow-up — record the note as unbridgeable so this
-            // permanent skip is not re-attempted every sync tick (the gate would
-            // otherwise re-surface the same oversized-metadata note forever — a
-            // free DoS on the sync loop). Mirrors the other MA#18 skip gates.
-            self.quarantine_unbridgeable_b2agg(
-                &note_id_str,
-                note,
-                block_number,
-                crate::store::UnbridgeableBridgeOutReason::MetadataTooLarge,
-                format!(
-                    "origin.metadata.len()={} exceeds MAX_BRIDGE_EVENT_METADATA_BYTES={}",
-                    origin.metadata.len(),
-                    MAX_BRIDGE_EVENT_METADATA_BYTES
-                ),
-            )
-            .await;
-            return false;
-        }
-        match self
-            .store
-            .commit_b2agg_event_atomic(
-                note_id_str.clone(),
-                get_bridge_address(),
-                block_number,
-                block_hash,
-                &tx_hash,
-                LEAF_TYPE_ASSET,
-                origin.origin_network,
-                &origin.origin_address,
-                destination_network,
-                &destination_address,
-                origin_amount,
-                &emit_metadata,
-            )
-            .await
-        {
-            Ok(deposit_count) => {
-                tracing::info!(
-                    note_id = %note_id_str,
-                    synthetic_tx_hash = %tx_hash,
-                    deposit_count,
-                    destination_network,
-                    amount = origin_amount,
-                    block_number,
-                    "emitted BridgeEvent for consumed B2AGG note (atomic B1)"
-                );
-                true
-            }
-            Err(e) => {
-                tracing::error!(
-                    note_id = %note_id_str,
-                    error = %e,
-                    "atomic B2AGG commit failed; transaction rolled back, no state advanced"
-                );
-                // Cantina MA#18 — atomic commit failed mid-write. The store
-                // rolled back, so a retry on the next tick may succeed; the
-                // quarantine row gives operators visibility into commit-side
-                // flakiness without losing the leaf-recovery handle if the
-                // failure is persistent.
-                self.quarantine_unbridgeable_b2agg(
-                    &note_id_str,
-                    note,
-                    block_number,
-                    crate::store::UnbridgeableBridgeOutReason::AtomicCommitFailed,
-                    format!("commit_b2agg_event_atomic failed: {e}"),
-                )
-                .await;
-                false
-            }
-        }
-    }
-
-    /// Cantina #13 Layer 2 — resolve the metadata bytes to emit for a bridge-out,
-    /// recovering + validating empty ERC-20 metadata when needed.
-    ///
-    /// The happy and native paths return without any account reads. The ERC-20
-    /// recovery path reads the bridge account (authoritative metadata hash) and
-    /// the faucet account (all-Miden candidate) via the live `client`; without a
-    /// client it fails safe ([`EmitMetadata::Unrecoverable`]). The actual
-    /// keccak-gated decision lives in the pure, unit-tested
-    /// [`crate::metadata_recovery::resolve_emit_metadata`].
-    async fn resolve_emit_metadata(
-        &self,
-        origin: &FaucetOriginInfo,
-        faucet_id: AccountId,
-        client: Option<&mut MidenClientLib>,
-    ) -> crate::metadata_recovery::EmitMetadata {
-        use crate::metadata_recovery::EmitMetadata;
-
-        // Fast paths — no account reads needed.
-        if !origin.metadata.is_empty() {
-            return EmitMetadata::Ready(origin.metadata.clone());
-        }
-        if origin.origin_address == [0u8; 20] {
-            return EmitMetadata::Ready(Vec::new());
-        }
-
-        // ERC-20 with empty metadata: recovery requires the live client to read
-        // the bridge + faucet accounts. Without it we cannot validate → gate.
-        let Some(client) = client else {
-            return EmitMetadata::Unrecoverable;
-        };
-        let bridge_account = client
-            .get_account(self.bridge_account_id)
-            .await
-            .ok()
-            .flatten();
-        let faucet_account = client.get_account(faucet_id).await.ok().flatten();
-
-        crate::metadata_recovery::recover_bridge_out_metadata(
-            &origin.origin_address,
-            &origin.metadata,
-            origin.origin_decimals,
-            faucet_id,
-            bridge_account.as_ref(),
-            faucet_account.as_ref(),
-            self.l1_rpc_url.as_deref(),
-        )
-        .await
-    }
-
-    /// Cantina #13 Layer 2 — one-time self-heal: write recovered+validated
-    /// metadata back into the faucet registry so future bridge-outs of this
-    /// faucet take the Layer-1 happy path. Best-effort: a write failure is logged
-    /// but must not abort the bridge-out (the emit already used the recovered
-    /// bytes).
-    async fn backfill_faucet_metadata(&self, faucet_id: AccountId, metadata: &[u8]) {
-        match self.store.get_faucet_by_id(faucet_id).await {
-            Ok(Some(mut entry)) => {
-                entry.metadata = metadata.to_vec();
-                match self.store.register_faucet(entry).await {
-                    Ok(()) => tracing::info!(
-                        target: "bridge_out::metadata_recovery",
-                        faucet_id = %faucet_id,
-                        "Cantina #13 L2: recovered + backfilled ERC-20 metadata into the faucet \
-                         registry (one-time self-heal)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: "bridge_out::metadata_recovery",
-                        faucet_id = %faucet_id,
-                        error = ?e,
-                        "Cantina #13 L2: failed to backfill recovered metadata; \
-                         recovery will re-run on the next bridge-out"
-                    ),
-                }
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                target: "bridge_out::metadata_recovery",
-                faucet_id = %faucet_id,
-                error = ?e,
-                "Cantina #13 L2: failed to read faucet entry for metadata backfill"
-            ),
-        }
-    }
-
-    /// Cantina MA#18 — record a quarantine row for a B2AGG that was observed
-    /// consumed by the bridge but skipped by the indexer.
-    ///
-    /// The on-chain LET frontier has already advanced; without this row the
-    /// failure surfaces only as a `bridge_let_divergence_total` symptom and an
-    /// operator has no per-note handle to drive recovery. The quarantine row
-    /// captures `(note_id, reason, detail, note_dump)` so a future recovery
-    /// RPC can re-attempt synthesis once the underlying cause (parse bug,
-    /// missing faucet, etc) is fixed.
-    ///
-    /// Best-effort: a quarantine-write failure must not panic or surface
-    /// from `process_consumed_note` — the caller's contract is that
-    /// returning `false` is the only side effect a skip path produces.
-    /// Quarantine errors are logged and the metric still fires.
-    async fn quarantine_unbridgeable_b2agg(
-        &self,
-        note_id_str: &str,
-        note: &InputNoteRecord,
-        observed_block: u64,
-        reason: crate::store::UnbridgeableBridgeOutReason,
-        detail: String,
-    ) {
-        // Delegate to the shared free helper so the live scanner and the offline
-        // restore path (`restore.rs`) record quarantine rows identically.
-        quarantine_unbridgeable_b2agg(
-            &*self.store,
-            self.bridge_account_id,
-            note_id_str,
-            note,
-            observed_block,
-            reason,
-            detail,
-        )
-        .await;
     }
 }
 
@@ -1115,48 +597,6 @@ impl SyncListener for BridgeOutScanner {
                     );
                 }
             }
-        }
-
-        for note in &consumed_notes {
-            // Only process B2AGG notes — other consumed notes (CLAIM, UpdateGerNote)
-            // must not trigger block advancement or they race with GER event writes.
-            if !is_b2agg_note(note.details()) {
-                continue;
-            }
-            let was_processed = self
-                .store
-                .is_note_processed(&hex::encode(note.details_commitment().as_bytes()))
-                .await
-                .unwrap_or(true);
-            if was_processed {
-                continue;
-            }
-            // Race-safe ordering: write the log at (current_latest + 1) BEFORE
-            // advancing `latest_block_number`. If we advance first, there's a
-            // window where `eth_blockNumber` returns N but no log exists at N —
-            // aggsender polls during that window, sees no bridges in [X, N],
-            // advances its cursor past N, and permanently misses our BridgeEvent.
-            // By writing the log first and then bumping `latest_block_number`,
-            // every reader who sees `latest >= N` also sees the log at N.
-            //
-            // Cantina #13 follow-up: only bump `latest_block_number` if the note
-            // actually wrote a log. The Cantina #13 self-target circuit-break
-            // and other early-return paths now signal `false`, preventing
-            // phantom blocks (advances with no log) from leaking into the chain.
-            let block_number = self.store.get_latest_block_number().await? + 1;
-            // Reborrow the client so the Cantina #13 Layer-2 recovery path can
-            // read the bridge + faucet accounts; the reborrow ends with each
-            // iteration so `client` stays available for the monitors below.
-            if self
-                .process_consumed_note(note, block_number, Some(&mut *client))
-                .await
-            {
-                self.store.set_latest_block_number(block_number).await?;
-            }
-            tracing::info!(
-                block_number,
-                "advanced latest_block_number to include BridgeEvent"
-            );
         }
 
         // Cantina #9 — LET divergence monitor. After processing consumed
@@ -1612,41 +1052,6 @@ mod tests {
         assert!(reverse_scale_amount(1, 39).is_err());
     }
 
-    /// Cantina #13 follow-up — repro+regression. The original Cantina #13 commit
-    /// added an early `return` from `process_consumed_note` for self-target poison
-    /// leaves but the caller in `on_post_sync` still bumped `latest_block_number`
-    /// unconditionally. That left a phantom block: `eth_blockNumber` advanced
-    /// while no log existed at that block, breaking the
-    /// "every reader who sees latest >= N also sees a log at N" invariant.
-    ///
-    /// Post-fix `process_consumed_note` returns `bool` (true = log written).
-    /// This test pins the contract: every early-return path returns false so the
-    /// caller skips the block bump.
-    #[test]
-    fn cantina_13_followup_process_returns_false_on_skip_paths() {
-        // The function is async and requires a Store + InputNoteRecord, which is
-        // expensive to construct. Instead we pin the predicate: any future return
-        // statement that adds a `return` (without a `true`) MUST return false.
-        // This is enforced at the type level — `process_consumed_note` returns
-        // `bool` rather than `()`, so a forgotten boolean is a compile error.
-        // (The compile-time check is the test; this assertion is documentation.)
-        // If the function ever stops being `bool`-returning, this commit's intent
-        // has been lost.
-        fn assert_bool<F, Fut>(_: F)
-        where
-            F: Fn() -> Fut,
-            Fut: std::future::Future<Output = bool>,
-        {
-        }
-        // Unfortunately we can't statically reference `BridgeOutScanner::process_consumed_note`
-        // because it takes a `&InputNoteRecord` which is hard to mock. The signature
-        // check below is a placeholder; the real proof is the type signature at the
-        // function definition (`async fn process_consumed_note(...) -> bool`).
-        assert_bool::<_, std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>>(|| {
-            Box::pin(async { true })
-        });
-    }
-
     /// Self-review of-the-fix follow-up — repro+regression. The original
     /// `encode_bridge_event_data` had no cap on metadata size — a misuse passing
     /// huge metadata would allocate proportionally and OOM the indexer on a
@@ -1686,21 +1091,19 @@ mod tests {
     /// This test asserts the load-bearing predicate `is_self_targeted` correctly
     /// distinguishes self-target (poison) from cross-network (legitimate) and from the
     /// edge case `network_id = 0` (mainnet, where any B2AGG is by definition cross-net).
-    /// The actual emit-skip happens in `process_consumed_note` and is exercised by the
+    /// The actual emit-skip happens in `project_b2agg_note` and is exercised by the
     /// e2e test suite under `scripts/security-repro/cantina-13-self-target.sh` once the
     /// docker stack is up — see CANTINA_FIXES.md.
     #[test]
     fn cantina_13_is_self_targeted_distinguishes_poison_from_legitimate() {
-        use crate::block_state::BlockState;
         use crate::store::memory::InMemoryStore;
         use std::sync::Arc as StdArc;
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
-        let block_state = StdArc::new(BlockState::new());
 
         // Local network = 7 (typical rollup id assigned by RollupManager).
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let scanner = BridgeOutScanner::new(store.clone(), block_state.clone(), 7, bridge_id);
+        let scanner = BridgeOutScanner::new(store.clone(), 7, bridge_id);
         assert!(
             scanner.is_self_targeted(7),
             "destination_network == local must be flagged as poison"
@@ -1720,7 +1123,7 @@ mod tests {
 
         // Edge: a service deployed with network_id = 0 (mainnet bridge) flags
         // destination 0 as self-target.
-        let mainnet_scanner = BridgeOutScanner::new(store, block_state, 0, bridge_id);
+        let mainnet_scanner = BridgeOutScanner::new(store, 0, bridge_id);
         assert!(mainnet_scanner.is_self_targeted(0));
         assert!(!mainnet_scanner.is_self_targeted(1));
     }
@@ -1874,7 +1277,7 @@ mod tests {
     /// Build a minimal B2AGG `InputNoteRecord` in a chosen consumed state for
     /// gate-wiring tests. Empty asset set so we never need to construct a
     /// FungibleAsset (which would require a faucet-typed AccountId) — the gate
-    /// runs strictly before asset extraction in `process_consumed_note`, so
+    /// runs strictly before asset extraction in `project_b2agg_note`, so
     /// the downstream code path that reads assets is unreachable for the
     /// reclaim/untracked tests.
     fn build_b2agg_note_with_consumer(
@@ -1920,7 +1323,7 @@ mod tests {
     /// Build a fully-formed bridge-out B2AGG note: a fungible asset from
     /// `faucet_id`, valid 6-felt storage (a non-zero, non-precompile destination
     /// address and a non-self-target network), consumed by `consumer`. This
-    /// reaches the metadata-resolution / commit path in `process_consumed_note`
+    /// reaches the metadata-resolution / commit path in `project_b2agg_note`
     /// (unlike `build_b2agg_note_with_consumer`, whose empty asset set short-
     /// circuits at the no-fungible-asset skip).
     fn build_b2agg_bridge_out_note(
@@ -1964,6 +1367,34 @@ mod tests {
         )
     }
 
+    /// Run a consumed B2AGG note through the PRODUCTION derivation
+    /// (`restore::project_b2agg_note`, what the SyntheticProjector uses) and map
+    /// its outcome to the legacy `project_b2agg_note` bool (Emitted == "advanced").
+    /// `local_network_id = 7`; every note built here targets destination-network 0,
+    /// so the Cantina #13 self-target gate never fires (that gate has its own test).
+    async fn run_b2agg_emit(
+        store: &std::sync::Arc<dyn crate::store::Store>,
+        block_state: &std::sync::Arc<crate::block_state::BlockState>,
+        note: &miden_client::store::InputNoteRecord,
+        bridge_id: AccountId,
+        block: u64,
+    ) -> bool {
+        crate::restore::project_b2agg_note(
+            store,
+            note,
+            bridge_id,
+            7,
+            block,
+            block_state.get_block_hash(block),
+            crate::bridge_address::get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+            == crate::restore::B2AggRestoreOutcome::Emitted
+    }
+
     /// Cantina #13 Layer 2 — FAIL-SAFE GATE, wired end-to-end. A bridge-consumed
     /// ERC-20 bridge-out whose faucet row has EMPTY metadata must NOT emit when
     /// the metadata can't be recovered + validated (here: no live client, so the
@@ -1997,12 +1428,11 @@ mod tests {
             .await
             .unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_bridge_out_note(faucet_id, bridge_id);
         let note_id = hex::encode(note.details_commitment().as_bytes());
 
         // No client → bridge metadata hash unreadable → Unrecoverable → gated.
-        let advanced = scanner.process_consumed_note(&note, 100, None).await;
+        let advanced = run_b2agg_emit(&store, &block_state, &note, bridge_id, 100).await;
         assert!(
             !advanced,
             "ERC-20 empty-metadata bridge-out must NOT advance/emit"
@@ -2051,11 +1481,10 @@ mod tests {
             .await
             .unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_bridge_out_note(faucet_id, bridge_id);
         let note_id = hex::encode(note.details_commitment().as_bytes());
 
-        let advanced = scanner.process_consumed_note(&note, 100, None).await;
+        let advanced = run_b2agg_emit(&store, &block_state, &note, bridge_id, 100).await;
         assert!(
             advanced,
             "native-ETH bridge-out with empty metadata must still emit"
@@ -2070,7 +1499,7 @@ mod tests {
     /// (reclaim branch in B2AGG.masm:65-71) must NOT trigger a synthetic
     /// BridgeEvent or be marked processed.
     #[tokio::test]
-    async fn ma3_process_consumed_note_skips_b2agg_reclaimed_by_user() {
+    async fn ma3_skips_b2agg_reclaimed_by_user() {
         use crate::block_state::BlockState;
         use crate::store::memory::InMemoryStore;
         use std::sync::Arc as StdArc;
@@ -2080,11 +1509,10 @@ mod tests {
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let advanced = scanner.process_consumed_note(&note, 100, None).await;
+        let advanced = run_b2agg_emit(&store, &block_state, &note, bridge_id, 100).await;
         assert!(!advanced, "reclaim must NOT signal block advance");
 
         // The note must NOT be marked processed — otherwise a future
@@ -2109,7 +1537,7 @@ mod tests {
     /// account (miden-client gap or transient sync state) must be treated as
     /// fail-closed: skip emission, no state mutation.
     #[tokio::test]
-    async fn ma3_process_consumed_note_skips_b2agg_with_unknown_consumer() {
+    async fn ma3_skips_b2agg_with_unknown_consumer() {
         use crate::block_state::BlockState;
         use crate::store::memory::InMemoryStore;
         use std::sync::Arc as StdArc;
@@ -2118,11 +1546,10 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(None);
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let advanced = scanner.process_consumed_note(&note, 100, None).await;
+        let advanced = run_b2agg_emit(&store, &block_state, &note, bridge_id, 100).await;
         assert!(
             !advanced,
             "untracked-consumer must NOT signal block advance"
@@ -2136,7 +1563,7 @@ mod tests {
     /// Cantina MA#3 — positive wiring. A B2AGG note consumed by the bridge
     /// account passes the gate and proceeds to downstream processing. In this
     /// test the note carries no fungible asset so the subsequent
-    /// "no fungible asset" branch in `process_consumed_note` returns false —
+    /// "no fungible asset" branch in `project_b2agg_note` returns false —
     /// what we're pinning here is that the gate did NOT short-circuit, i.e.
     /// the reclaim metric path was NOT taken. We assert this indirectly: the
     /// reclaim-skip path returns false WITHOUT ever calling
@@ -2146,7 +1573,7 @@ mod tests {
     /// here that the scanner doesn't panic / blow up when the bridge consumes
     /// a B2AGG (i.e. it proceeds past the gate cleanly).
     #[tokio::test]
-    async fn ma3_process_consumed_note_emits_for_bridge_consumed_b2agg() {
+    async fn ma3_emits_for_bridge_consumed_b2agg() {
         use crate::block_state::BlockState;
         use crate::store::memory::InMemoryStore;
         use std::sync::Arc as StdArc;
@@ -2155,7 +1582,6 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(Some(bridge_id));
 
         // Must not panic — the gate accepts and we fall through to the
@@ -2163,7 +1589,7 @@ mod tests {
         // contract here is: bridge-consumed notes are NOT short-circuited by
         // the gate. The pure-helper test pins the exact decision; this just
         // exercises the wiring end-to-end without a downstream panic.
-        let _ = scanner.process_consumed_note(&note, 100, None).await;
+        let _ = run_b2agg_emit(&store, &block_state, &note, bridge_id, 100).await;
     }
 
     // CANTINA MA#18 — UNBRIDGEABLE B2AGG QUARANTINE TESTS
@@ -2172,7 +1598,7 @@ mod tests {
     /// Build a B2AGG note with INVALID storage (only 1 felt) so
     /// `parse_b2agg_storage` returns Err. Bridge-consumed so it passes the
     /// MA#3 gate and reaches the storage-parse skip site in
-    /// `process_consumed_note`.
+    /// `project_b2agg_note`.
     fn build_erased_b2agg_note(
         consumer_account: AccountId,
     ) -> miden_client::store::InputNoteRecord {
@@ -2222,11 +1648,10 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_erased_b2agg_note(bridge_id);
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let advanced = scanner.process_consumed_note(&note, 42, None).await;
+        let advanced = run_b2agg_emit(&store, &block_state, &note, bridge_id, 42).await;
         assert!(!advanced, "erased note must NOT signal block advance");
 
         let row = store
@@ -2267,12 +1692,11 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_erased_b2agg_note(bridge_id);
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
         // First observation — quarantine row written.
-        let _ = scanner.process_consumed_note(&note, 1, None).await;
+        let _ = run_b2agg_emit(&store, &block_state, &note, bridge_id, 1).await;
         let first = store
             .get_unbridgeable_bridge_out(&note_id_str)
             .await
@@ -2281,7 +1705,7 @@ mod tests {
         let first_block = first.observed_block;
 
         // Second observation — quarantine row UNCHANGED.
-        let _ = scanner.process_consumed_note(&note, 2, None).await;
+        let _ = run_b2agg_emit(&store, &block_state, &note, bridge_id, 2).await;
         let second = store
             .get_unbridgeable_bridge_out(&note_id_str)
             .await
@@ -2308,11 +1732,10 @@ mod tests {
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
-        let scanner = BridgeOutScanner::new(store.clone(), block_state, 7, bridge_id);
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
-        let _ = scanner.process_consumed_note(&note, 1, None).await;
+        let _ = run_b2agg_emit(&store, &block_state, &note, bridge_id, 1).await;
 
         assert!(
             store
