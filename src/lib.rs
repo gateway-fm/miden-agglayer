@@ -38,7 +38,6 @@ pub mod service_send_raw_txn;
 pub mod service_state;
 pub(crate) mod service_zkevm;
 pub mod store;
-pub mod synthetic_projector;
 #[cfg(test)]
 pub mod test_helpers;
 pub mod twin_note_detector;

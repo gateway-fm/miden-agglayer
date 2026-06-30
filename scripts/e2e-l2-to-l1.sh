@@ -82,14 +82,6 @@ BRIDGE_AMOUNT=$((BALANCE / 2))
 EXPECTED_L1_CHANGE=$((BRIDGE_AMOUNT * WEI_PER_MIDEN_UNIT))
 log "Bridge-out amount: $BRIDGE_AMOUNT Miden units (expect +$EXPECTED_L1_CHANGE wei on L1)"
 
-# Capture the L1 baseline BEFORE the deposit exists. The bridge-autoclaim
-# service runs continuously and — now that the bridge-out→cert→claim path is
-# fast and reliable — can settle + claim on L1 before a baseline sampled later
-# (e.g. after the BridgeEvent wait) would run, which makes AFTER-BEFORE read 0.
-# Sampling here, before the bridge-out, makes the +amount delta race-free.
-L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
-log "L1 balance before bridge-out: $L1_BAL_BEFORE"
-
 # ── Step 1: Create B2AGG note (bridge-out) ────────────────────────────────────
 log "Step 1/4: Creating B2AGG bridge-out note..."
 docker exec $AGGLAYER_CONTAINER bridge-out-tool \
@@ -114,8 +106,9 @@ wait_for "BridgeEvent in eth_getLogs" \
 pass "BridgeEvent detected in L2"
 
 # ── Step 3: Wait for certificate settlement on L1 ────────────────────────────
-# (L1_BAL_BEFORE was captured above, before the bridge-out, to avoid racing the
-# autoclaim service.)
+L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
+log "L1 balance before settlement: $L1_BAL_BEFORE"
+
 log "Step 3/5: Waiting for certificate settlement on AggLayer..."
 # 900s, not 300s: cold-start agglayer prover can blow past 5 min on the first
 # proof of a fresh `make test-e2e` run (circuit compile + load). Warm reruns

@@ -512,18 +512,10 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     let bridge_out_local_network_id = local_network_id_u32;
-
-    // Synthetic-indexer redesign — the SyntheticProjector is the SOLE
-    // synthetic-event producer and the SINGLE owner of the synthetic tip
-    // (Finding #5 eliminated by construction). The legacy writer paths only
-    // submit to Miden; the projector re-derives every BridgeEvent / ClaimEvent /
-    // GER log from the consumed Miden notes and advances the tip itself
-    // (Miden-1:1). The BridgeOutScanner remains a sync listener purely for its
-    // Miden-facing monitors (Cantina #9 LET-divergence, ownership probe).
-
     let bridge_out_scanner = Arc::new(
         BridgeOutScanner::new(
             store.clone(),
+            block_state.clone(),
             bridge_out_local_network_id,
             accounts.0.bridge.0,
         )
@@ -536,30 +528,23 @@ async fn main() -> anyhow::Result<()> {
     // vec a few lines down.
     let expected_mints_handle = bridge_out_scanner.expected_mints.clone();
 
-    let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
+    // CLAIM-side chain-tail watcher: synthesises missing ClaimEvent logs for
+    // CLAIMs the normal eth_sendRawTransaction path didn't fully record
+    // (crash recovery + foreign CLAIM observations). Must run AFTER
+    // BridgeOutScanner so the two listeners don't both try to claim the same
+    // (latest + 1) slot in the same sync tick — BridgeOutScanner consumes
+    // the slot for any B2AGG it processes; ClaimWatcher takes the next slot.
+    let claim_watcher = Arc::new(miden_agglayer_service::claim_watcher::ClaimWatcher::new(
+        store.clone(),
+        block_state.clone(),
+    ));
 
-    // Register the projector LAST so it observes the same consumed-note feed the
-    // monitors saw this tick, then advances the synthetic tip itself (no race —
-    // it is the only writer of `latest_block_number`, Finding #5).
-    let projector = Arc::new(
-        miden_agglayer_service::synthetic_projector::SyntheticProjector::new(
-            store.clone(),
-            block_state.clone(),
-            &accounts.0,
-            local_network_id_u32,
-            command.l1_rpc_url.clone(),
-        )
-        .await?,
-    );
-    tracing::info!(
-        "SyntheticProjector registered: the SOLE synthetic-event producer and the SINGLE owner of \
-         the synthetic tip. SINGLE-PROCESS ONLY — multiple replicas are NOT supported."
-    );
+    let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
     let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
         sync_listener,
         block_state.clone(),
         bridge_out_scanner,
-        projector,
+        claim_watcher,
     ];
 
     let client = MidenClient::new(
@@ -587,7 +572,6 @@ async fn main() -> anyhow::Result<()> {
             &store,
             &client,
             &accounts.0,
-            local_network_id_u32,
             &block_state,
             command.l1_rpc_url.clone(),
         )

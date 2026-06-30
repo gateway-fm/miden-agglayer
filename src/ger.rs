@@ -1,9 +1,53 @@
 use crate::miden_client::MidenClient;
-use alloy::primitives::TxHash;
+use alloy::primitives::{FixedBytes, LogData, TxHash};
+use alloy::sol_types::SolEvent;
+use alloy_rpc_types_eth::TransactionRequest;
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
 use miden_client::transaction::TransactionRequestBuilder;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
+
+alloy_core::sol! {
+    #[derive(Debug)]
+    interface IGlobalExitRootV2 {
+        function lastMainnetExitRoot() external view returns (bytes32);
+        function lastRollupExitRoot() external view returns (bytes32);
+    }
+}
+
+/// Read the individual exit roots from the L1 GER contract.
+pub async fn fetch_l1_exit_roots(
+    l1_rpc_url: &str,
+    ger_address: &str,
+) -> anyhow::Result<([u8; 32], [u8; 32])> {
+    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::sol_types::SolCall;
+
+    let provider = ProviderBuilder::new().connect_http(l1_rpc_url.parse()?);
+    let ger_addr: alloy::primitives::Address = ger_address.parse()?;
+
+    let mainnet_call = IGlobalExitRootV2::lastMainnetExitRootCall {};
+    let mainnet_result = provider
+        .call(
+            TransactionRequest::default()
+                .to(ger_addr)
+                .input(mainnet_call.abi_encode().into()),
+        )
+        .await?;
+    let mainnet_root: [u8; 32] = mainnet_result[..32].try_into()?;
+
+    let rollup_call = IGlobalExitRootV2::lastRollupExitRootCall {};
+    let rollup_result = provider
+        .call(
+            TransactionRequest::default()
+                .to(ger_addr)
+                .input(rollup_call.abi_encode().into()),
+        )
+        .await?;
+    let rollup_root: [u8; 32] = rollup_result[..32].try_into()?;
+
+    Ok((mainnet_root, rollup_root))
+}
 
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/sovereignChains/GlobalExitRootManagerL2SovereignChain.sol#L166
@@ -25,6 +69,31 @@ pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+alloy_core::sol! {
+    // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/sovereignChains/GlobalExitRootManagerL2SovereignChain.sol#L52
+    #[derive(Debug)]
+    event UpdateHashChainValue(
+        bytes32 indexed newGlobalExitRoot,
+        bytes32 indexed newHashChainValue
+    );
+}
+
+impl UpdateHashChainValue {
+    fn new(ger: FixedBytes<32>, chain_hash: FixedBytes<32>) -> Self {
+        UpdateHashChainValue {
+            newGlobalExitRoot: ger,
+            newHashChainValue: chain_hash,
+        }
+    }
+}
+
+/// Result of a GER insertion.
+pub struct GerInsertResult {
+    pub log_data: LogData,
+    pub block_number: u64,
+    pub is_new: bool,
+}
+
 /// Submit the actual UpdateGerNote Miden transaction. Factored out of
 /// `insert_ger` so the caller can run it twice — once eagerly, then again
 /// after `reimport_account` if the first attempt failed with a recoverable
@@ -40,22 +109,12 @@ pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
 /// the UpdateGerNote. The main client's subsequent sync_nullifiers only
 /// queries [current_cursor, tip], so those consumption events were never
 /// discovered and `NoteFilter::Consumed` returned nothing in restore.
-/// Submit the `UpdateGerNote` to Miden and return the on-chain note's
-/// `details_commitment` (hex), encoded identically to how the projector keys
-/// consumed notes (`InputNoteRecord::details_commitment()`) — so `insert_ger`
-/// can tie the real `insertGlobalExitRoot` eth-tx to this note via
-/// `record_tx_note_link`. Returns `None` only when the submit closure did not
-/// execute (a stubbed MidenClient in unit tests).
 async fn submit_update_ger_note(
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
     ger_bytes: [u8; 32],
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<()> {
     let inner_accounts = accounts.0.clone();
-    // `MidenClient::with` closures resolve to `Result<()>`; surface the note
-    // commitment through a captured slot (same pattern as `publish_claim`).
-    let commitment_slot = Arc::new(std::sync::OnceLock::<String>::new());
-    let commitment_inner = commitment_slot.clone();
     miden_client
         .with(move |client| {
             Box::new(async move {
@@ -68,14 +127,6 @@ async fn submit_update_ger_note(
                 let bridge_id = inner_accounts.bridge.0;
                 let ger = ExitRoot::new(ger_bytes);
                 let note = UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
-                // Commitment of the on-chain note, matching the projector's
-                // consumed-note key (`InputNoteRecord::details_commitment()`).
-                let note_commitment = hex::encode(
-                    miden_protocol::note::NoteDetails::from(&note)
-                        .commitment()
-                        .as_bytes(),
-                );
-                let _ = commitment_inner.set(note_commitment);
                 tracing::info!(
                     note_id = %note.id(),
                     ger = %hex::encode(ger_bytes),
@@ -109,21 +160,20 @@ async fn submit_update_ger_note(
                 Ok(())
             })
         })
-        .await?;
-    Ok(commitment_slot.get().cloned())
+        .await
 }
 
-/// Submit a GER injection to Miden. Returns `true` if a new `UpdateGerNote` was
-/// submitted (and the real eth-tx ↔ note link recorded so the projector finalises
-/// the receipt + emits the GER log on consumption), `false` if the GER was already
-/// injected (a duplicate — the caller completes its receipt immediately).
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
+    mainnet_exit_root: Option<[u8; 32]>,
+    rollup_exit_root: Option<[u8; 32]>,
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: &Arc<dyn crate::store::Store>,
+    block_state: &Arc<crate::block_state::BlockState>,
     txn_hash: TxHash,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<GerInsertResult> {
     // Check dedup before doing any work.
     //
     // Use `is_ger_injected` (not `has_seen_ger`) because the L1InfoTreeIndexer
@@ -135,6 +185,8 @@ pub async fn insert_ger(
     // reflects "have we already submitted the Miden tx and committed the
     // synthetic event for this GER?".
     let is_new = !store.is_ger_injected(&ger_bytes).await?;
+
+    let mut block_number = 0u64; // assigned by store.advance_block_number() after Miden commit
 
     if is_new {
         tracing::info!(
@@ -148,14 +200,8 @@ pub async fn insert_ger(
         // the node's view), reimport the ger_manager account from the
         // live Miden node and retry once. See `src/account_recovery.rs`
         // for the analysis — this is the actual bali production cure.
-        let note_commitment = match submit_update_ger_note(
-            miden_client,
-            accounts.clone(),
-            ger_bytes,
-        )
-        .await
-        {
-            Ok(commitment) => commitment,
+        match submit_update_ger_note(miden_client, accounts.clone(), ger_bytes).await {
+            Ok(()) => {}
             Err(err) if crate::account_recovery::is_recoverable_account_error(&err) => {
                 tracing::warn!(
                     err = %err,
@@ -174,22 +220,47 @@ pub async fn insert_ger(
                     "ger_manager",
                 )
                 .await?;
-                submit_update_ger_note(miden_client, accounts.clone(), ger_bytes).await?
+                submit_update_ger_note(miden_client, accounts.clone(), ger_bytes).await?;
             }
             Err(err) => return Err(err),
-        };
-
-        // Tie the real `insertGlobalExitRoot` eth-tx to the on-chain UpdateGerNote so
-        // the SyntheticProjector finalises THIS receipt (and emits the GER log) under
-        // the real tx hash when it observes the note consumed — making the receipt
-        // block == the GER-log block. No synthetic log / tip advance / receipt
-        // completion happens in this path. (`note_commitment` is `None` only under a
-        // stubbed test client; the projector then falls back to the derived hash.)
-        if let Some(note_commitment) = note_commitment {
-            store
-                .record_tx_note_link(&format!("{txn_hash:#x}"), &note_commitment)
-                .await?;
         }
+
+        // Race-safe ordering: write the log at (current_latest + 1) BEFORE
+        // bumping `latest_block_number`. See the matching comment in
+        // `bridge_out.rs::on_post_sync`: if we advance the counter first,
+        // aggsender / bridge-service can poll `eth_blockNumber` in the window
+        // where `latest == N` but the log at block `N` hasn't been written yet,
+        // permanently skipping the GER event.
+        block_number = store.get_latest_block_number().await? + 1;
+        let block_hash = block_state.get_block_hash(block_number);
+        let timestamp = block_state.get_block_timestamp(block_number);
+
+        // Miden submission succeeded — now record the event.
+        //
+        // G5 — single atomic store transaction. Replaces the previous
+        // three sequential calls (add_ger_update_event,
+        // mark_ger_injected, set_latest_block_number) which were not
+        // atomic: a process crash between any two left aggkit in a
+        // split state. The PgStore override folds all five writes
+        // (ger_entries upsert, hash_chain UPDATE, synthetic_logs
+        // INSERT, is_injected UPDATE, latest_block_number UPDATE) into
+        // one SERIALIZABLE postgres transaction. InMemoryStore uses the
+        // default trait impl that just calls the primitives in sequence
+        // (safe in-process; no crash window for tests).
+        //
+        // Supersedes G4's narrowing of the gap.
+        let tx_hash_str = format!("{txn_hash:#x}");
+        store
+            .commit_ger_event_atomic(
+                block_number,
+                block_hash,
+                &tx_hash_str,
+                &ger_bytes,
+                mainnet_exit_root,
+                rollup_exit_root,
+                timestamp,
+            )
+            .await?;
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),
@@ -197,7 +268,14 @@ pub async fn insert_ger(
         );
     }
 
-    Ok(is_new)
+    let event = UpdateHashChainValue::new(FixedBytes::from(ger_bytes), FixedBytes::default());
+    let log_data = event.encode_log_data();
+
+    Ok(GerInsertResult {
+        log_data,
+        block_number,
+        is_new,
+    })
 }
 
 #[cfg(test)]

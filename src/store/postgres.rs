@@ -123,85 +123,6 @@ impl Store for PgStore {
         Ok(())
     }
 
-    // ── Synthetic projector cursor (Phase 2a) ────────────────────
-    //
-    // Persisted as a column on the single-row service_state table, mirroring
-    // latest_block_number / log_counter (migration 009).
-
-    async fn get_projector_cursor(&self) -> anyhow::Result<u64> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_one(
-                "SELECT projector_cursor FROM service_state WHERE id = 1",
-                &[],
-            )
-            .await?;
-        let val: i64 = row.get(0);
-        Ok(val as u64)
-    }
-
-    async fn set_projector_cursor(&self, block: u64) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "UPDATE service_state SET projector_cursor = $1, updated_at = now() WHERE id = 1",
-                &[&(block as i64)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    // ── Receipts map (Phase 2b substrate; unused in 2a) ──────────
-    //
-    // First-write-wins evm_tx_hash -> note_commitment (migration 009). The
-    // PRIMARY KEY on tx_hash plus ON CONFLICT DO NOTHING enforces first-write
-    // semantics; the reverse lookup is served by idx_tx_note_links_note_commitment.
-
-    async fn record_tx_note_link(
-        &self,
-        tx_hash: &str,
-        note_commitment: &str,
-    ) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO tx_note_links (tx_hash, note_commitment) VALUES ($1, $2)
-                 ON CONFLICT (tx_hash) DO NOTHING",
-                &[&tx_hash, &note_commitment],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn get_note_link_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<String>> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT note_commitment FROM tx_note_links WHERE tx_hash = $1",
-                &[&tx_hash],
-            )
-            .await?;
-        Ok(row.map(|r| r.get::<_, String>(0)))
-    }
-
-    async fn get_tx_for_note(&self, note_commitment: &str) -> anyhow::Result<Option<String>> {
-        // First-associated tx for a note: order by created_at so a stable
-        // (first) row is returned even if the reverse direction ever has
-        // multiple tx_hash rows for one commitment.
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                // Secondary `tx_hash` key makes "first associated tx" stable even
-                // when two rows share a `created_at` (possible under load) — a bare
-                // `created_at` order leaves the winner up to Postgres.
-                "SELECT tx_hash FROM tx_note_links WHERE note_commitment = $1
-                 ORDER BY created_at ASC, tx_hash ASC LIMIT 1",
-                &[&note_commitment],
-            )
-            .await?;
-        Ok(row.map(|r| r.get::<_, String>(0)))
-    }
-
     // ── Logs ─────────────────────────────────────────────────────
 
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {
@@ -548,6 +469,117 @@ impl Store for PgStore {
                 &0_i64,
                 &false,
             ],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// G5: atomic GER commit. The default Store-trait impl runs three
+    /// separate calls; this override folds all four writes (ger_entries
+    /// upsert, hash chain update, synthetic_logs insert, is_injected
+    /// flag, latest_block_number bump) into ONE postgres transaction so
+    /// a process crash anywhere mid-sequence either leaves nothing or
+    /// leaves the full GER commit visible.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
+        &self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // Pre-existing add_ger_update_event sequence — duplicated here
+        // so the whole bundle is one transaction.
+        let mainnet: Option<Vec<u8>> = mainnet_exit_root.map(|root| root.to_vec());
+        let rollup: Option<Vec<u8>> = rollup_exit_root.map(|root| root.to_vec());
+        txn.execute(
+            "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (ger_hash) DO NOTHING",
+            &[
+                &global_exit_root.as_slice(),
+                &mainnet as &(dyn ToSql + Sync),
+                &rollup as &(dyn ToSql + Sync),
+                &(block_number as i64),
+                &(timestamp as i64),
+            ],
+        )
+        .await?;
+
+        let row = txn
+            .query_one(
+                "SELECT hash_chain_value FROM service_state WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await?;
+        let old_chain = bytes_to_array_32(row.get(0));
+
+        let mut hasher = Keccak256::new();
+        hasher.update(old_chain);
+        hasher.update(global_exit_root);
+        let new_chain: [u8; 32] = hasher.finalize().into();
+
+        txn.execute(
+            "UPDATE service_state SET hash_chain_value = $1, updated_at = now() WHERE id = 1",
+            &[&new_chain.as_slice()],
+        )
+        .await?;
+
+        let row = txn
+            .query_one(
+                "UPDATE service_state
+                 SET log_counter = log_counter + 1, updated_at = now()
+                 WHERE id = 1
+                 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+        let topics = [
+            UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+            format!("0x{}", hex::encode(global_exit_root)),
+            format!("0x{}", hex::encode(new_chain)),
+        ];
+        let topic_refs: Vec<&str> = topics.iter().map(|topic| topic.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &L2_GLOBAL_EXIT_ROOT_ADDRESS,
+                &topic_refs,
+                &"0x",
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
+            ],
+        )
+        .await?;
+
+        // mark_ger_injected, fused into the same transaction. The original
+        // out-of-band call did `INSERT … ON CONFLICT … DO UPDATE`. Here the
+        // row from the ger_entries insert above MUST exist, so we just flip
+        // the flag.
+        txn.execute(
+            "UPDATE ger_entries SET is_injected = TRUE WHERE ger_hash = $1",
+            &[&global_exit_root.as_slice()],
+        )
+        .await?;
+
+        // set_latest_block_number, fused.
+        txn.execute(
+            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
+            &[&(block_number as i64)],
         )
         .await?;
 
@@ -1207,6 +1239,102 @@ impl Store for PgStore {
         Ok(row.get::<_, i32>(0) as u32)
     }
 
+    /// B1: atomic B2AGG bridge-out commit. Folds five writes into one txn:
+    ///   1. service_state.deposit_counter UPDATE → new count
+    ///   2. bridge_out_processed INSERT (with the count)
+    ///   3. service_state.log_counter UPDATE → new log_index
+    ///   4. synthetic_logs INSERT (BridgeEvent)
+    ///   5. service_state.latest_block_number UPDATE
+    /// Either all visible or none — closes the gap where a crash between
+    /// mark_note_processed and add_bridge_event would consume a deposit_count
+    /// without ever emitting the synthetic log, causing aggsender to skip
+    /// the BridgeEvent permanently.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // 1+2: allocate deposit_count, INSERT processed-note row.
+        let row = txn
+            .query_one(
+                "WITH counter AS (
+                    UPDATE service_state SET deposit_counter = deposit_counter + 1, updated_at = now() WHERE id = 1
+                    RETURNING deposit_counter - 1 AS val
+                 )
+                 INSERT INTO bridge_out_processed (note_id, deposit_count)
+                 SELECT $1, val FROM counter
+                 RETURNING deposit_count",
+                &[&note_id],
+            )
+            .await?;
+        let deposit_count: u32 = row.get::<_, i32>(0) as u32;
+
+        // 3: allocate log_index.
+        let row = txn
+            .query_one(
+                "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
+                &[],
+            )
+            .await?;
+        let log_index: i64 = row.get(0);
+
+        // 4: encode + insert the synthetic log. Encoding is identical to
+        // `add_bridge_event`'s default impl — keeping it inline here keeps
+        // the whole bundle in one connection / transaction.
+        let data = crate::bridge_out::encode_bridge_event_data(
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        );
+        let topics_owned: [String; 1] = [crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()];
+        let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
+        txn.execute(
+            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &log_index,
+                &bridge_address,
+                &topics,
+                &data,
+                &(block_number as i64),
+                &block_hash.as_slice(),
+                &tx_hash,
+                &0_i64,
+                &false,
+            ],
+        )
+        .await?;
+
+        // 5: advance the cursor.
+        txn.execute(
+            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
+            &[&(block_number as i64)],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(deposit_count)
+    }
+
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
@@ -1284,7 +1412,7 @@ impl Store for PgStore {
 
     /// Atomic commit for a watcher-synthesised ClaimEvent. Single PG txn folding
     /// the three writes the default impl chains separately. Mirrors the design
-    /// of `the projector B2AGG commit` and `the projector GER commit`.
+    /// of `commit_b2agg_event_atomic` and `commit_ger_event_atomic`.
     #[allow(clippy::too_many_arguments)]
     async fn commit_manual_claim_event_atomic(
         &self,

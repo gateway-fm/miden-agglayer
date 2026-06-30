@@ -109,17 +109,7 @@ step "Part 2: Wiping all PostgreSQL tables (simulating data loss)..."
 # NOTE: keep this list in lockstep with migrations/*.sql. `block_transactions` was
 # removed from the schema but stuck around in this script until 0.14.x migration;
 # `faucet_registry` was added later.
-#
-# We wipe only the MIDEN-DERIVED synthetic state — `--restore` reconstructs exactly
-# that (synthetic_logs, ger_entries, bridge_out_processed, the tip) by replaying the
-# Miden chain. The eth-side `transactions` / `transaction_logs` (the proxy's record
-# of `eth_sendRawTransaction` calldata + receipts) and `tx_note_links` are DURABLE:
-# they never existed on Miden, restore cannot rebuild them, and a real restart keeps
-# the Postgres volume. Wiping `transactions` would discard the `claimAsset` calldata
-# aggkit decodes to resolve a claim's GER boundary — unrecoverable from Miden (the
-# CLAIM note storage keeps only the metadata HASH) — so the post-restore certificate
-# could never settle. (`tx_note_links` was already preserved for the same reason.)
-pgquery "TRUNCATE service_state, synthetic_logs, ger_entries, nonces, claimed_indices, address_mappings, bridge_out_processed, faucet_registry CASCADE"
+pgquery "TRUNCATE service_state, synthetic_logs, ger_entries, transactions, transaction_logs, nonces, claimed_indices, address_mappings, bridge_out_processed, faucet_registry CASCADE"
 # Re-insert the singleton service_state row
 pgquery "INSERT INTO service_state (id) VALUES (1)"
 

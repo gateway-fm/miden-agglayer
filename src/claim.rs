@@ -2,7 +2,8 @@ use crate::accounts_config::AccountsConfig;
 use crate::faucet_ops;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::{FaucetEntry, Store};
-use alloy::primitives::{BlockNumber, Bytes, FixedBytes};
+use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
+use alloy::sol_types::SolEvent;
 use miden_base_agglayer::{
     ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
     ProofData, SmtNode,
@@ -378,10 +379,9 @@ async fn create_claim(
 pub struct PublishClaimTxn {
     pub txn_id: TransactionId,
     pub expires_at: BlockNumber,
-    /// Hex `details_commitment()` of the on-chain CLAIM note — the key the
-    /// SyntheticProjector uses to recover the real claim eth-tx for the
-    /// consumed note (see `record_tx_note_link` / `get_tx_for_note`).
-    pub note_commitment: String,
+    pub log: LogData,
+    /// CLAIM note ID for consumption tracking (deferred receipts).
+    pub claim_note_id: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -435,17 +435,6 @@ async fn publish_claim_internal(
     )
     .await?;
     let claim_note_id = claim_note.id().to_string();
-    // The note's details-commitment, encoded identically to how the projector
-    // keys consumed notes (`InputNoteRecord::details_commitment()`). This ties
-    // the real claim eth-tx to the on-chain CLAIM note so the SyntheticProjector
-    // can emit the ClaimEvent under the REAL tx hash (which carries the
-    // `claimAsset` calldata aggkit decodes for the claim's GER boundary) instead
-    // of a derived hash whose synthetic tx has empty calldata.
-    let note_commitment = hex::encode(
-        miden_protocol::note::NoteDetails::from(&claim_note)
-            .commitment()
-            .as_bytes(),
-    );
 
     const EXPIRATION_DELTA: u16 = 10;
     let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
@@ -649,10 +638,14 @@ async fn publish_claim_internal(
         anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
 
+    let event = ClaimEvent::from(params);
+    let log = event.encode_log_data();
+
     Ok(PublishClaimTxn {
         txn_id,
         expires_at,
-        note_commitment,
+        log,
+        claim_note_id: Some(claim_note_id),
     })
 }
 
@@ -685,18 +678,22 @@ async fn publish_claim_internal(
 ///     check inside `publish_claim_internal` rely on the surrounding
 ///     `with()` mutex, as documented at `find_or_create_faucet`.
 ///
-/// Recording the PENDING claim receipt (`txn_begin`) + the note↔tx link happens
-/// inside the same closure, before the caller receives a response, so they are
-/// durable even if the HTTP client disconnects (cancellation-safe). The
-/// SyntheticProjector emits the `ClaimEvent` and finalises this receipt (at the
-/// Miden consumption block) when it observes the CLAIM note consumed — no
-/// synthetic log, tip advance, or receipt completion happens in this path.
+/// Recording of the `ClaimEvent` happens inside the same closure, before the
+/// caller receives a response, so the event is durable in the store even if
+/// the HTTP client disconnects (cancellation-safe).
+///
+/// Race-safe ordering: write the txn+log at `latest_block + 1` BEFORE bumping
+/// `latest_block_number`. See the matching comment in `bridge_out.rs::on_post_sync`:
+/// advancing the counter first leaves a window where `eth_blockNumber` returns
+/// N but no log exists at block N yet, so aggsender / bridge-service skip the
+/// event entirely.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: Arc<dyn Store>,
+    block_state: std::sync::Arc<crate::block_state::BlockState>,
     latest_block_num: BlockNumber,
     txn_hash: alloy::primitives::TxHash,
     txn_envelope: alloy::consensus::TxEnvelope,
@@ -725,6 +722,7 @@ pub async fn publish_claim(
         client,
         accounts.clone(),
         store.clone(),
+        block_state.clone(),
         latest_block_num,
         txn_hash,
         txn_envelope.clone(),
@@ -748,6 +746,7 @@ pub async fn publish_claim(
                 client,
                 accounts,
                 store,
+                block_state,
                 latest_block_num,
                 txn_hash,
                 txn_envelope,
@@ -768,6 +767,7 @@ async fn attempt_publish_claim(
     client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: Arc<dyn Store>,
+    block_state: std::sync::Arc<crate::block_state::BlockState>,
     latest_block_num: BlockNumber,
     txn_hash: alloy::primitives::TxHash,
     txn_envelope: alloy::consensus::TxEnvelope,
@@ -801,40 +801,28 @@ async fn attempt_publish_claim(
                     local_prover_fallback,
                 )
                 .await?;
-                // The SyntheticProjector is the sole synthetic-event producer AND the
-                // sole finaliser of this receipt: when it observes the CLAIM note
-                // consumed it emits the ClaimEvent AND `txn_commit`s this tx at that
-                // Miden block — so the receipt block == the log block. This path
-                // records ONLY a PENDING receipt (txn_begin) + the tx↔note link below.
+                let block_num = store.get_latest_block_number().await? + 1;
+                let block_hash = block_state.get_block_hash(block_num);
                 store
                     .txn_begin(
                         txn_hash,
                         crate::store::TxnEntry {
-                            // id: None hides this tx from the StoreSyncListener's
-                            // commit-pending sweep (which finalises by Miden tx id at
-                            // the note's CREATION block); the projector finalises it
-                            // at the CONSUMPTION block instead.
-                            id: None,
+                            id: Some(value.txn_id),
                             envelope: txn_envelope,
                             signer,
                             expires_at: Some(value.expires_at),
-                            logs: vec![],
+                            logs: vec![value.log.clone()],
                         },
                     )
                     .await?;
-                // Tie the real claim eth-tx to the on-chain CLAIM note so the
-                // SyntheticProjector emits the ClaimEvent under THIS tx hash —
-                // whose tx carries the `claimAsset` calldata aggkit decodes for the
-                // claim's GER boundary — instead of a derived hash with empty
-                // calldata (which made aggkit's L2BridgeSyncer fail
-                // "input too short: 0 bytes" and stall certificate settlement).
                 store
-                    .record_tx_note_link(&format!("{txn_hash:#x}"), &value.note_commitment)
+                    .txn_commit(txn_hash, Ok(()), block_num, block_hash)
                     .await?;
+                store.set_latest_block_number(block_num).await?;
                 tracing::info!(
                     eth_tx = %txn_hash,
-                    "claim tx recorded pending + note↔tx link; projector finalises \
-                     receipt + ClaimEvent on consumption (cancellation-safe)"
+                    block_num,
+                    "ClaimEvent recorded (cancellation-safe)"
                 );
                 let _ = result_inner.set(value);
                 Ok(())

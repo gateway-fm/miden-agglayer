@@ -129,7 +129,7 @@ pub struct UnbridgeableBridgeOut {
 
 /// Why an observed-consumed B2AGG could not be translated into a
 /// synthetic BridgeEvent. Each variant maps 1:1 to a skip-return path in
-/// `project_b2agg_note`.
+/// `process_consumed_note`.
 ///
 /// Variant set is closed today; future skip paths must add their own
 /// variant + map back via `as_str()` so the Postgres column value remains
@@ -242,55 +242,6 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
-    // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
-    /// Last fully-projected Miden block height owned by the `SyntheticProjector`
-    /// (`docs/SYNTHETIC-INDEXER-REDESIGN.md`). Returns 0 if the projector has
-    /// never persisted a cursor on this deployment (fresh chain). The projector
-    /// is the single in-process owner of this cursor (SINGLE-PROCESS ONLY).
-    async fn get_projector_cursor(&self) -> anyhow::Result<u64> {
-        Ok(0)
-    }
-    /// Persist the last fully-projected Miden block height. Called by the
-    /// projector after each block so a restart resumes catch-up from here
-    /// instead of re-scanning the whole chain.
-    async fn set_projector_cursor(&self, _block: u64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    // === Receipts map (synthetic-indexer redesign, Phase 2b substrate) ===
-    //
-    // See the "Receipts — the submit ⟂ project handoff" section of
-    // `docs/SYNTHETIC-INDEXER-REDESIGN.md`. The map is the ONLY state the two
-    // workers share, and it is a *first-write associative map, not a shared
-    // counter*, so it carries none of Finding #5's race. UNUSED in Phase 2a —
-    // it is the substrate the Phase-2b receipts lifecycle is built on.
-    /// First-write-wins association `evm_tx_hash -> note_commitment`. Worker 1
-    /// (submit) records this when it submits a CLAIM/GER note to Miden; worker 2
-    /// (the projector) looks it up when it observes the note consumed, to
-    /// complete the *right* receipt. A second write for an already-linked
-    /// `tx_hash` is a no-op (first-write-wins): the on-chain note is the real
-    /// handoff and this map only answers "which receipt does this note belong
-    /// to". UNUSED in Phase 2a.
-    async fn record_tx_note_link(
-        &self,
-        _tx_hash: &str,
-        _note_commitment: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-    /// Forward lookup: the note commitment first-associated with `tx_hash`, or
-    /// `None`. See [`Store::record_tx_note_link`]. UNUSED in Phase 2a.
-    async fn get_note_link_for_tx(&self, _tx_hash: &str) -> anyhow::Result<Option<String>> {
-        Ok(None)
-    }
-    /// Reverse lookup: the `evm_tx_hash` first-associated with `note_commitment`,
-    /// or `None`. The projector uses this direction when it holds the consumed
-    /// note and needs the caller's receipt key. See
-    /// [`Store::record_tx_note_link`]. UNUSED in Phase 2a.
-    async fn get_tx_for_note(&self, _note_commitment: &str) -> anyhow::Result<Option<String>> {
-        Ok(None)
-    }
-
     // === Synthetic logs ===
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;
     async fn get_logs(
@@ -336,6 +287,43 @@ pub trait Store: Send + Sync + 'static {
         rollup_exit_root: Option<[u8; 32]>,
         timestamp: u64,
     ) -> anyhow::Result<()>;
+
+    /// G5: commit a GER injection in one atomic store operation. Combines
+    /// `add_ger_update_event` (hash chain + UpdateHashChainValue log),
+    /// `mark_ger_injected` (idempotency flag), and `set_latest_block_number`
+    /// (cursor advance) so a process crash mid-sequence cannot leave aggkit
+    /// in a state where the on-chain GER consumption has happened but
+    /// aggkit's view is split (log written but `is_ger_injected` still
+    /// false, or cursor advanced past a block with no log).
+    ///
+    /// The default impl below calls the three primitives sequentially —
+    /// safe for InMemoryStore where everything is in-process. PgStore
+    /// overrides with a single SERIALIZABLE postgres transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
+        &self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        self.add_ger_update_event(
+            block_number,
+            block_hash,
+            tx_hash,
+            global_exit_root,
+            mainnet_exit_root,
+            rollup_exit_root,
+            timestamp,
+        )
+        .await?;
+        self.mark_ger_injected(*global_exit_root).await?;
+        self.set_latest_block_number(block_number).await?;
+        Ok(())
+    }
 
     // === Transactions ===
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()>;
@@ -532,7 +520,7 @@ pub trait Store: Send + Sync + 'static {
     /// impl below chains the three primitives sequentially, which is fine for
     /// `InMemoryStore` where every primitive is an in-process lock. The
     /// race-safe ordering (log THEN cursor) is the same invariant
-    /// `the projector B2AGG commit` and `the projector GER commit` enforce — see
+    /// `commit_b2agg_event_atomic` and `commit_ger_event_atomic` enforce — see
     /// the canonical comment at `src/bridge_out.rs::on_post_sync`.
     #[allow(clippy::too_many_arguments)]
     async fn commit_manual_claim_event_atomic(
@@ -622,6 +610,53 @@ pub trait Store: Send + Sync + 'static {
         self.add_log(log).await
     }
 
+    /// B1: commit a B2AGG bridge-out synthetic event in one atomic store
+    /// operation. Combines `mark_note_processed` (allocate deposit_count),
+    /// `add_bridge_event` (encode + insert synthetic log), and
+    /// `set_latest_block_number` (cursor advance) so that a crash mid-
+    /// sequence cannot leave aggkit in a state where the deposit_count
+    /// has been allocated for a note but no log was emitted (which would
+    /// cause aggsender to skip the BridgeEvent permanently).
+    ///
+    /// Default impl below runs the three primitives sequentially —
+    /// suitable for InMemoryStore. PgStore overrides with a single
+    /// SERIALIZABLE postgres transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let deposit_count = self.mark_note_processed(note_id).await?;
+        self.add_bridge_event(
+            bridge_address,
+            block_number,
+            block_hash,
+            tx_hash,
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        )
+        .await?;
+        self.set_latest_block_number(block_number).await?;
+        Ok(deposit_count)
+    }
+
     // === Convenience: bridge event log ===
     #[allow(clippy::too_many_arguments)]
     async fn add_bridge_event(
@@ -708,9 +743,7 @@ impl SyncListener for StoreSyncListener {
             .take();
         if let Some(data) = data {
             let block_hash = self.block_state.get_block_hash(data.block_num);
-            // The SyntheticProjector is the SOLE advancer of `latest_block_number`
-            // (Miden-1:1, Finding #5 eliminated by construction); this listener
-            // only finalises pending tx receipts.
+            self.store.set_latest_block_number(data.block_num).await?;
             self.store
                 .txn_commit_pending(&data.committed_ids, data.block_num, block_hash)
                 .await?;
