@@ -15,22 +15,22 @@ pub async fn service_get_txn_receipt(
     let (status, block_num) = match service.store.txn_receipt(txn_hash).await? {
         Some((result, block_num)) => (result.is_ok(), block_num),
         None => {
-            // Synthetic-log receipt fallback (receipts contract). A tx that emitted
-            // a synthetic log — a projected BridgeEvent / ClaimEvent / GER update —
-            // has NO real txn record: it was never an `eth_sendRawTransaction`; the
-            // SyntheticProjector DERIVES it from a consumed Miden note. But in EVM a
-            // tx that produced a log MUST have a receipt. aggkit's L2BridgeSyncer
-            // calls `eth_getTransactionReceipt` for every bridge/claim log it sees,
-            // and on a null receipt it fails to append the log ("input too short: 0
-            // bytes") and STALLS the entire L2 sync — so no certificate is ever
-            // built and bridge-outs never settle on L1. Tie the hashes together via
-            // `logs_by_tx`: if this tx_hash has synthetic logs, synthesise a success
-            // receipt at the log's block.
+            // Synthetic-log receipt fallback (receipts contract). A bridge-out
+            // `BridgeEvent` (and a projected GER `UpdateHashChain`) has NO real txn
+            // record: it was never an `eth_sendRawTransaction` — the
+            // SyntheticProjector DERIVES its tx hash from a consumed Miden note. But
+            // in EVM a tx that produced a log MUST have a receipt. aggkit's
+            // L2BridgeSyncer calls `eth_getTransactionReceipt` for every bridge/claim
+            // log it sees, and on a null receipt it fails to append the log ("input
+            // too short: 0 bytes") and STALLS the entire L2 sync — so no certificate
+            // is ever built and bridge-outs never settle on L1. Tie the hashes
+            // together via `logs_by_tx`: if this tx_hash has synthetic logs,
+            // synthesise a success receipt at the log's block.
             //
-            // Legacy served this implicitly — the live claim path emitted its
-            // ClaimEvent under the real `eth_sendRawTransaction` hash (which already
-            // had a receipt). The projector emits under a derived hash, so the proxy
-            // must serve the receipt for it directly.
+            // NB: a *live* `ClaimEvent` does NOT reach this branch — it rides the
+            // real `claimAsset` `eth_sendRawTransaction` hash (recovered via the
+            // note↔tx link), which already has a real txn record + receipt. Only a
+            // restore of claim history predating that link falls back here.
             let logs = service
                 .store
                 .get_logs_for_tx(&format!("{txn_hash:#x}"))
