@@ -34,3 +34,7 @@ docker-compose.override.yml
 
 # Per-host run evidence (reference baselines are *.json)
 tests/baselines/*.log
+fixtures/live-test.env
+fixtures/live-miden-home/
+cache/
+out/
