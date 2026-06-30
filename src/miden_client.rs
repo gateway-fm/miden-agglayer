@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use miden_client::RemoteTransactionProver;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
@@ -514,13 +514,17 @@ impl MidenClient {
         let mut client;
         let mut backoff = BACKOFF_MIN;
         loop {
+            let store_path = store_dir.join("store.sqlite3");
+            crate::sqlite_pragmas::open_store_connection(&store_path).with_context(|| {
+                format!("failed to configure sqlite store {}", store_path.display())
+            })?;
             let mut builder = ClientBuilder::new()
                 .rpc(build_rpc_client(
                     &node_endpoint,
                     node_timeout_ms,
                     api_key.as_deref(),
                 ))
-                .sqlite_store(store_dir.join("store.sqlite3"))
+                .sqlite_store(store_path)
                 .authenticator(keystore.clone())
                 .in_debug_mode(mode);
             if let Some(p) = tx_prover.clone() {

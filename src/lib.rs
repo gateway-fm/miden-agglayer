@@ -37,6 +37,7 @@ pub(crate) mod service_helpers;
 pub mod service_send_raw_txn;
 pub mod service_state;
 pub(crate) mod service_zkevm;
+pub mod sqlite_pragmas;
 pub mod store;
 pub mod synthetic_projector;
 #[cfg(test)]

@@ -14,13 +14,13 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use miden_base_agglayer::{B2AggNote, EthAddress};
-use miden_client::DebugMode;
 use miden_client::RemoteTransactionProver;
 use miden_client::asset::{Asset, AssetCallbackFlag, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;
 use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
+use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 
@@ -172,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
         10_000,
         args.miden_api_key.as_deref(),
     );
+    miden_agglayer_service::sqlite_pragmas::open_store_connection(&store_path)
+        .with_context(|| format!("failed to configure sqlite store {}", store_path.display()))?;
     let mut builder = ClientBuilder::new()
         .rpc(rpc)
         .sqlite_store(store_path)
@@ -326,8 +328,8 @@ async fn main() -> anyhow::Result<()> {
     // network txs (bridge consumptions) at the same moment, our Prove request
     // can be rejected with RESOURCE_EXHAUSTED ("proof queue is full"), which
     // surfaces as "transaction proving failed". Proving happens BEFORE node
-    // submission, so retrying is clean; a fresh note (new serial) and request
-    // are built per attempt since both are consumed by the submission path.
+    // submission, so retrying is clean. If the node accepts the tx and only the
+    // local store update fails, never resubmit; retry the attached store update.
     const SUBMIT_ATTEMPTS: u32 = 4;
     let mut tx_id = None;
     for attempt in 1..=SUBMIT_ATTEMPTS {
@@ -364,6 +366,52 @@ async fn main() -> anyhow::Result<()> {
             Ok(id) => {
                 tx_id = Some(id);
                 break;
+            }
+            Err(ClientError::ApplyTransactionAfterSubmitFailed {
+                pending_update,
+                source,
+            }) => {
+                let accepted_tx = pending_update.executed_transaction().id();
+                let submission_height = pending_update.submission_height();
+                eprintln!(
+                    "[bridge-out] transaction {accepted_tx} was accepted at block \
+                     {submission_height}, but local store update failed: {source}; \
+                     re-applying the attached update"
+                );
+                let pending_update = *pending_update;
+                let mut last_reapply_err = None;
+                for recovery_attempt in 1..=SUBMIT_ATTEMPTS {
+                    match client
+                        .apply_transaction_update(pending_update.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            println!(
+                                "[bridge-out] recovered local store update for accepted transaction {accepted_tx}"
+                            );
+                            tx_id = Some(accepted_tx);
+                            break;
+                        }
+                        Err(reapply_err) => {
+                            eprintln!(
+                                "[bridge-out] recovery apply attempt {recovery_attempt}/{SUBMIT_ATTEMPTS} failed for transaction {accepted_tx}: {reapply_err}"
+                            );
+                            last_reapply_err = Some(reapply_err);
+                            if recovery_attempt < SUBMIT_ATTEMPTS {
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            }
+                        }
+                    }
+                }
+                if tx_id.is_some() {
+                    break;
+                }
+                let last_reapply_err = last_reapply_err
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "unknown recovery error".to_string());
+                return Err(anyhow!(
+                    "submit accepted transaction {accepted_tx} at block {submission_height}, but local store recovery failed after {SUBMIT_ATTEMPTS} attempts: {last_reapply_err}"
+                ));
             }
             Err(e) if attempt < SUBMIT_ATTEMPTS => {
                 eprintln!(
