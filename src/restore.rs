@@ -116,6 +116,8 @@ pub async fn restore(
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
+    node_url: Option<&str>,
+    api_key: Option<&str>,
 ) -> anyhow::Result<RestoreResult> {
     tracing::info!("=== RESTORE: starting state reconstruction ===");
 
@@ -157,6 +159,32 @@ pub async fn restore(
     // We'll assign synthetic logs to blocks starting after current
     let mut next_block = block_num + 1;
     let mut total_logs = 0usize;
+
+    // Phase 1.5 (PRST-4035): recover bridge-out notes the local store never
+    // recorded (consumed by the bridge via network txs). Tag-scan the node and
+    // import them so the Phase 2 NoteFilter::Consumed scan below can see them.
+    // Best-effort: a failure must not abort restore.
+    if let Some(url) = node_url {
+        let from_block: u32 = std::env::var("RECOVER_FROM_BLOCK")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        tracing::info!(
+            from_block,
+            "Phase 1.5: recovering missed bridge-out notes from the node..."
+        );
+        match recover_missed_bridge_outs(miden_client, url, api_key, accounts.bridge.0, from_block)
+            .await
+        {
+            Ok(n) => tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node"),
+            Err(e) => tracing::warn!(
+                err = %e,
+                "Phase 1.5 recovery scan failed; continuing with local-only restore"
+            ),
+        }
+    } else {
+        tracing::warn!("Phase 1.5 skipped: no --miden-node URL available to restore()");
+    }
 
     // Phase 2: Scan miden consumed B2AGG notes
     tracing::info!("Phase 2: scanning miden consumed B2AGG notes...");
@@ -231,6 +259,105 @@ async fn sync_miden_block(
 
 /// Phase 2: scan miden consumed B2AGG notes and rebuild bridge-out state.
 /// Returns (notes_processed, logs_created).
+/// PRST-4035 — recover bridge-out notes the local store never saw.
+///
+/// The bridge account consumes B2AGG bridge-out notes via NETWORK transactions
+/// (executed by the ntx-builder, not the proxy's client). Those consumptions are
+/// never recorded in the proxy's local miden-client store, so the
+/// `NoteFilter::Consumed` scan that both the live [`crate::bridge_out::BridgeOutScanner`]
+/// and [`restore_bridge_outs`] rely on cannot see them — the exit is invisible,
+/// aggsender never certifies it, and it can't be claimed on L1.
+///
+/// The notes are still on the node (public, nullifier committed). This
+/// re-discovers them by tag-scanning the node from `from_block` to the chain tip
+/// via `sync_notes_with_details` — which fetches the full body of EVERY public
+/// note in the range matching the bridge's note tag, regardless of local
+/// tracking — filters to the B2AGG script root, and imports them by id
+/// (`NoteFile::NoteId`, which fetches from the node and stores). A follow-up
+/// `sync_state()` marks each consumed, so they appear in `NoteFilter::Consumed`
+/// for [`restore_bridge_outs`] to rebuild the BridgeEvent from.
+///
+/// Returns the number of B2AGG notes imported. Best-effort: a scan/RPC failure is
+/// surfaced to the caller, which logs and continues with the local-only restore.
+async fn recover_missed_bridge_outs(
+    miden_client: &MidenClient,
+    node_url: &str,
+    api_key: Option<&str>,
+    bridge_id: AccountId,
+    from_block: u32,
+) -> anyhow::Result<usize> {
+    use miden_client::rpc::domain::note::SyncedNoteDetails;
+    use miden_protocol::block::BlockNumber;
+    use miden_protocol::note::{NoteDetails, NoteFile, NoteTag};
+    use std::collections::BTreeSet;
+
+    let endpoint = crate::miden_client::parse_node_url(node_url)?;
+    let rpc = crate::miden_client::build_rpc_client(&endpoint, 30_000, api_key);
+
+    let (tip_header, _) = rpc
+        .get_block_header_by_number(None, false)
+        .await
+        .map_err(|e| anyhow::anyhow!("recovery: get chain tip: {e}"))?;
+    let tip = tip_header.block_num();
+
+    // Notes the bridge consumes are tagged with the bridge as the target account
+    // (so the network/ntx-builder picks them up). `sync_notes` paginates the full
+    // [from_block, tip] range internally.
+    let mut tags = BTreeSet::new();
+    tags.insert(NoteTag::with_account_target(bridge_id));
+
+    let (_blocks, synced) = rpc
+        .sync_notes_with_details(BlockNumber::from(from_block), tip, &tags)
+        .await
+        .map_err(|e| anyhow::anyhow!("recovery: sync_notes_with_details: {e}"))?;
+
+    let mut b2agg_ids = Vec::new();
+    for (note_id, detail) in &synced {
+        if let SyncedNoteDetails::Public(note) = detail {
+            let details: NoteDetails = note.clone().into();
+            if is_b2agg_note(&details) {
+                b2agg_ids.push(*note_id);
+            }
+        }
+    }
+
+    tracing::info!(
+        bridge = %bridge_id,
+        from_block,
+        to_block = tip.as_u32(),
+        public_notes = synced.len(),
+        b2agg = b2agg_ids.len(),
+        "recovery scan: B2AGG notes targeting the bridge found on the node"
+    );
+
+    if b2agg_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let note_files: Vec<NoteFile> = b2agg_ids.iter().copied().map(NoteFile::NoteId).collect();
+    let imported = b2agg_ids.len();
+
+    miden_client
+        .with(move |client| {
+            Box::new(async move {
+                client
+                    .import_notes(&note_files)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("recovery: import_notes: {e}"))?;
+                // Mark the freshly-imported notes consumed (their nullifiers are
+                // committed) so they land in NoteFilter::Consumed for Phase 2.
+                client
+                    .sync_state()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("recovery: sync_state after import: {e}"))?;
+                Ok(())
+            })
+        })
+        .await?;
+
+    Ok(imported)
+}
+
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
