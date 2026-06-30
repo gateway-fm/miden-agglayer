@@ -45,6 +45,7 @@ pub async fn seed_test_faucets(store: &dyn Store) {
             origin_decimals: 18,
             miden_decimals: 8,
             scale: 10,
+            metadata: vec![],
         })
         .await
         .unwrap();

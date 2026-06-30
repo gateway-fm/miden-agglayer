@@ -422,6 +422,40 @@ async fn restore_one_b2agg_note(
         }
     };
 
+    // Cantina #13 follow-up — DoS guard. `origin.metadata` ultimately derives
+    // from untrusted L1 calldata and the BridgeEvent encoder does not cap it, so
+    // an oversized blob would drive a huge allocation. Refuse to encode it.
+    //
+    // Record the note as unbridgeable (Cantina MA#18 quarantine) — exactly as the
+    // live scanner does — so this permanent skip is not re-attempted on every
+    // restore run. The restore path has a clean `store` handle and the same
+    // `note` / `bridge_id` / block context the live path uses, so we can record
+    // the quarantine row directly via the shared helper.
+    if origin.metadata.len() > crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES {
+        ::metrics::counter!("bridge_out_b2agg_metadata_too_large_total").increment(1);
+        tracing::warn!(
+            note_id = %note_id_str,
+            metadata_len = origin.metadata.len(),
+            cap = crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES,
+            "restore: B2AGG faucet metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
+        );
+        crate::bridge_out::quarantine_unbridgeable_b2agg(
+            &**store,
+            bridge_id,
+            &note_id_str,
+            note,
+            restore_block,
+            crate::store::UnbridgeableBridgeOutReason::MetadataTooLarge,
+            format!(
+                "origin.metadata.len()={} exceeds MAX_BRIDGE_EVENT_METADATA_BYTES={}",
+                origin.metadata.len(),
+                crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES
+            ),
+        )
+        .await;
+        return Ok(B2AggRestoreOutcome::Skipped);
+    }
+
     // B5 — share the versioned domain-separated helper with bridge_out so the
     // tx_hash is byte-identical across first-observation and restore paths
     // (dedup-stable).
@@ -441,7 +475,7 @@ async fn restore_one_b2agg_note(
             destination_network,
             &destination_address,
             origin_amount,
-            &[],
+            &origin.metadata,
             deposit_count,
         )
         .await
@@ -1132,6 +1166,7 @@ mod tests {
                 origin_decimals: 18,
                 miden_decimals: 8,
                 scale: 10,
+                metadata: vec![],
             })
             .await
             .unwrap();
@@ -1304,6 +1339,46 @@ mod tests {
             outcome,
             B2AggRestoreOutcome::Skipped,
             "a correctly-processed bridge-out note must be a benign skip, not flagged",
+        );
+    }
+
+    /// Cantina #13 DoS guard: a faucet whose metadata exceeds the encoder cap
+    /// must gate the bridge-out (skip) — never feed an oversized blob (from
+    /// untrusted L1 calldata) into the BridgeEvent encoder.
+    #[tokio::test]
+    async fn ma3_restore_skips_b2agg_with_oversized_metadata() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        store
+            .register_faucet(crate::store::FaucetEntry {
+                faucet_id,
+                origin_address: [0x11u8; 20],
+                origin_network: 0,
+                symbol: "BIG".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![0u8; crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES + 1],
+            })
+            .await
+            .unwrap();
+
+        let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome =
+            restore_one_b2agg_note(&store, &note, bridge_id, 1, [7u8; 32], get_bridge_address())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "B2AGG with oversized faucet metadata must be gated (DoS guard), not emitted",
+        );
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "gated note must not be marked processed",
         );
     }
 }

@@ -12,6 +12,21 @@ use miden_protocol::account::AccountId;
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
 
+// Mirror of the upstream `miden-agglayer` `SolTokenMetadata` struct (its
+// `encode_token_metadata` is `pub(crate)` so we can't call it directly). Encoding
+// this with `abi_encode_params` reproduces Solidity's `abi.encode(string name,
+// string symbol, uint8 decimals)` byte-for-byte, so `keccak256(bytes)` equals the
+// faucet's `MetadataHash` (Cantina #13). A plain tuple `.abi_encode()` won't do —
+// `u8` doesn't implement `SolValue`, and a dynamic tuple's `abi_encode` would add an
+// extra offset word.
+alloy_core::sol! {
+    struct AdminTokenMetadata {
+        string name;
+        string symbol;
+        uint8 decimals;
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterFaucetParams {
     pub symbol: String,
@@ -60,12 +75,24 @@ pub async fn admin_register_faucet(
     let service_id = accounts.service.0;
     let bridge_id = accounts.bridge.0;
 
-    // Compute MetadataHash from (name, symbol, origin_decimals) — matches the L1 bridge
-    // contract's `keccak256(abi.encode(name, symbol, decimals))`. Callers that skip the
-    // `name` field get `name = symbol`.
+    // Compute the raw ABI metadata preimage `abi.encode(name, symbol, decimals)` ONCE and
+    // reuse it for both the on-Miden `MetadataHash` and the stored `FaucetEntry.metadata`
+    // (Cantina #13). Using `abi_encode_params` (not `abi_encode`) matches Solidity's
+    // `abi.encode(string, string, uint8)` exactly — a plain `abi_encode` of a dynamic tuple
+    // would prepend an extra 32-byte offset word and diverge from the L1 bridge's
+    // `getTokenMetadata` encoding. Deriving the hash via `from_abi_encoded(&metadata_bytes)`
+    // guarantees `keccak256(stored_metadata) == faucet MetadataHash`, so a later bridge-out
+    // emits metadata whose hash matches Miden's bridge state. Callers that skip the `name`
+    // field get `name = symbol`.
+    use alloy_core::sol_types::SolValue;
     let metadata_name = params.name.clone().unwrap_or_else(|| params.symbol.clone());
-    let metadata_hash =
-        MetadataHash::from_token_info(&metadata_name, &params.symbol, params.origin_decimals);
+    let metadata_bytes = AdminTokenMetadata {
+        name: metadata_name.clone(),
+        symbol: params.symbol.clone(),
+        decimals: params.origin_decimals,
+    }
+    .abi_encode_params();
+    let metadata_hash = MetadataHash::from_abi_encoded(&metadata_bytes);
 
     // Create, deploy, register in bridge (using OnceLock pattern like publish_claim)
     let result = Arc::new(OnceLock::<AccountId>::new());
@@ -111,6 +138,7 @@ pub async fn admin_register_faucet(
             origin_decimals: params.origin_decimals,
             miden_decimals: params.miden_decimals,
             scale,
+            metadata: metadata_bytes,
         })
         .await?;
 

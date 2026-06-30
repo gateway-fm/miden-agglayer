@@ -41,6 +41,14 @@ pub struct FaucetEntry {
     pub miden_decimals: u8,
     /// Decimal scaling factor: `origin_decimals - miden_decimals`.
     pub scale: u8,
+    /// Raw ABI-encoded token metadata preimage — `abi.encode(name, symbol,
+    /// decimals)` for ERC-20s, empty for native ETH. This is the exact byte
+    /// string whose keccak256 is the faucet's on-Miden `MetadataHash`, and the
+    /// `metadata` a bridge-out's synthetic `BridgeEvent` must carry so the
+    /// downstream exit leaf matches Miden's bridge state and a fresh-destination
+    /// `_deployWrappedToken(abi.decode(...))` succeeds (Cantina #13). Empty for
+    /// legacy rows written before this field existed.
+    pub metadata: Vec<u8>,
 }
 
 /// Data for registering a new transaction.
@@ -150,6 +158,12 @@ pub enum UnbridgeableBridgeOutReason {
     /// nothing persisted). Quarantine so a retry path or operator can
     /// re-attempt without missing the leaf.
     AtomicCommitFailed,
+    /// The faucet's stored metadata exceeds `MAX_BRIDGE_EVENT_METADATA_BYTES`
+    /// (Cantina #13 DoS guard). Encoding the synthetic BridgeEvent would drive
+    /// an oversized allocation, so we refuse to emit. Quarantined (rather than
+    /// silently skipped) so the note is recorded as a permanent skip and is not
+    /// re-attempted every sync tick / restore run.
+    MetadataTooLarge,
 }
 
 impl UnbridgeableBridgeOutReason {
@@ -160,6 +174,7 @@ impl UnbridgeableBridgeOutReason {
             Self::UnknownFaucet => "unknown_faucet",
             Self::AmountOverflow => "amount_overflow",
             Self::AtomicCommitFailed => "atomic_commit_failed",
+            Self::MetadataTooLarge => "metadata_too_large",
         }
     }
 }
