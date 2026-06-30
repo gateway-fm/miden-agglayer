@@ -810,9 +810,9 @@ pub(crate) async fn project_claim_note(
     // aggkit fails "input too short: 0 bytes" and never settles the certificate.
     // Fall back to the derived hash only for notes with no recorded link (e.g.
     // restore replaying history predating the link, or notes submitted out-of-band).
-    let tx_hash = match store.get_tx_for_note(&note_id_str).await? {
-        Some(real_tx) => real_tx,
-        None => derive_manual_claim_tx_hash(&note_id_str),
+    let (tx_hash, linked) = match store.get_tx_for_note(&note_id_str).await? {
+        Some(real_tx) => (real_tx, true),
+        None => (derive_manual_claim_tx_hash(&note_id_str), false),
     };
 
     store
@@ -829,6 +829,25 @@ pub(crate) async fn project_claim_note(
             decoded.amount,
         )
         .await?;
+
+    // The projector OWNS receipt completion: finalise the real claim tx's receipt
+    // at THIS (consumption) block — the same block the ClaimEvent is emitted — so the
+    // receipt block == the log block. `publish_claim` left it pending (`id: None`) for
+    // exactly this. Tolerate a missing pending entry (derived-hash fallback, which has
+    // no real `txn_begin`; or an expired/pruned tx, or restore predating the tx
+    // record): the receipt is then synthesised from the log by `service_get_txn_receipt`,
+    // so a missing entry must not abort the projection.
+    if let Some(h) = linked
+        .then(|| tx_hash.parse::<alloy::primitives::TxHash>().ok())
+        .flatten()
+    {
+        let _ = store
+            .txn_commit(h, Ok(()), block_number, block_hash)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(tx = %tx_hash, "claim receipt not finalised: {e}");
+            });
+    }
 
     ::metrics::counter!("claim_watcher_synthesised_total").increment(1);
     tracing::info!(

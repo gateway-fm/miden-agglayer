@@ -376,7 +376,6 @@ async fn publish_and_record_claim(
         &service.miden_client,
         service.accounts.clone(),
         service.store.clone(),
-        service.block_state.clone(),
         latest_block,
         txn_hash,
         txn_envelope,
@@ -389,7 +388,7 @@ async fn publish_and_record_claim(
     tracing::info!(
         eth_tx = %txn_hash,
         miden_tx = %claim_result.txn_id,
-        "claim published and ClaimEvent recorded"
+        "claim published; receipt pending until the projector finalises it on consumption"
     );
     Ok(())
 }
