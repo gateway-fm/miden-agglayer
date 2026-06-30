@@ -179,6 +179,20 @@ impl UnbridgeableBridgeOutReason {
     }
 }
 
+/// A transaction parked in the per-signer future-nonce queue ("mempool").
+///
+/// See `migrations/010_queued_txns.sql`. `signer` is the lowercased
+/// `"{addr:#x}"` key (the same key the `nonce_*` methods use); `expires_at`
+/// is a BLOCK NUMBER in the same denomination as `TxnData::expires_at`.
+#[derive(Debug, Clone)]
+pub struct QueuedTxn {
+    pub signer: String,
+    pub nonce: u64,
+    pub tx_hash: TxHash,
+    pub envelope: TxEnvelope,
+    pub expires_at: u64,
+}
+
 /// Full transaction data returned from the store.
 #[derive(Debug, Clone)]
 pub struct TxnData {
@@ -364,6 +378,44 @@ pub trait Store: Send + Sync + 'static {
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;
+
+    // === Future-nonce queue ("mempool") ===
+    //
+    // Persistent per-signer parking lot for txns whose nonce is ahead of the
+    // signer's next expected nonce. See `migrations/010_queued_txns.sql` and
+    // the accept/drain logic in `service_send_raw_txn`.
+
+    /// Park `envelope` at `(signer, nonce)` with a block-denominated TTL.
+    ///
+    /// Idempotency / safety: if a tx is already parked at `(signer, nonce)`
+    /// with the SAME `tx_hash`, this is a no-op `Ok(())`. If a DIFFERENT tx is
+    /// parked there, the existing one is kept and this returns an error — never
+    /// a silent overwrite (the "at most one tx per signer per nonce wins"
+    /// invariant).
+    async fn queue_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        envelope: &TxEnvelope,
+        expires_at: u64,
+    ) -> anyhow::Result<()>;
+
+    /// Remove and return the tx parked at exactly `(signer, nonce)`, if any.
+    async fn take_queued_txn(&self, signer: &str, nonce: u64) -> anyhow::Result<Option<QueuedTxn>>;
+
+    /// Smallest parked nonce for `signer`, or `None` if nothing is parked.
+    async fn peek_queued_min_nonce(&self, signer: &str) -> anyhow::Result<Option<u64>>;
+
+    /// Every signer with at least one parked tx (for startup resume).
+    async fn queued_signers(&self) -> anyhow::Result<Vec<String>>;
+
+    /// Look up a parked tx by its hash (for `eth_getTransactionByHash`).
+    async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>>;
+
+    /// Drop every parked tx whose `expires_at` block is `<= now`. Returns how
+    /// many rows were dropped.
+    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize>;
 
     // === Claims ===
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()>;
@@ -717,6 +769,16 @@ impl SyncListener for StoreSyncListener {
             self.store
                 .txn_expire_pending(data.block_num, block_hash)
                 .await?;
+            // Same sweep drops never-filled future-nonce gaps from the mempool
+            // queue (block-denominated TTL — see migration 010).
+            let dropped = self.store.expire_queued_txns(data.block_num).await?;
+            if dropped > 0 {
+                tracing::info!(
+                    dropped,
+                    block = data.block_num,
+                    "expired stale queued (future-nonce) txns"
+                );
+            }
         }
         Ok(())
     }

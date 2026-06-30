@@ -524,15 +524,34 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // until the function returns, and is dropped automatically on panic.
     let _lock = service.per_signer_locks.lock(signer).await;
 
-    // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce only on
-    // success and never compared the incoming `tx.nonce` against the expected next
-    // value. That allowed:
-    //   1. Replay: a tx replayed with its original nonce would re-execute (the
-    //      claim path's try_claim dedupes by globalIndex, but other paths don't).
-    //   2. Skipped sequencing: an out-of-order tx with an inflated nonce would
-    //      still be processed, leaving "holes" in the apparent sequence.
-    // Validate `tx.nonce == store.nonce_get(signer)` BEFORE running any handler.
+    // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
+    // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
+    // calldata. The proxy then runs Miden tx work on the service account's behalf
+    // (auto-creates faucets, advances LET, marks GERs injected), letting an
+    // attacker burn fees, poison registries, or feed fabricated GERs to
+    // bridge-service. Reject any signer not in the configured allow-list.
+    //
+    // Checked BEFORE the nonce branch so an unauthorised signer can never park a
+    // tx in the mempool queue either.
     let signer_str = format!("{signer:#x}");
+    if !is_signer_allowed(service.allowed_signers.as_deref(), &signer) {
+        ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
+        anyhow::bail!(
+            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or set ALLOWED_SIGNERS) to permit"
+        );
+    }
+
+    // R4 / mempool — nonce validation, node-like. Pre-fix the proxy required
+    // `tx.nonce == store.nonce_get(signer)` exactly and jammed on the first gap.
+    // Now it behaves like a real node:
+    //   - nonce <  next : reject (replay/stale) — unless the tx is already known
+    //                     (committed receipt or currently queued), in which case
+    //                     return its hash idempotently.
+    //   - nonce >  next : park in the persistent per-signer queue with a TTL and
+    //                     accept (the gap-filling predecessor may still arrive).
+    //   - nonce == next : process via the existing dispatch path, advance the
+    //                     nonce, then DRAIN the contiguous run of queued
+    //                     successors.
     let expected_nonce = service.store.nonce_get(&signer_str).await?;
     let tx_nonce = match &txn_envelope {
         TxEnvelope::Eip1559(s) => s.tx().nonce,
@@ -541,81 +560,113 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         TxEnvelope::Eip7702(s) => s.tx().nonce,
         TxEnvelope::Legacy(s) => s.tx().nonce,
     };
-    if tx_nonce != expected_nonce {
-        ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
-        anyhow::bail!(
-            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; \
-             this guards against replay and out-of-order submission (R4)"
-        );
-    }
 
-    // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
-    // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
-    // calldata. The proxy then runs Miden tx work on the service account's behalf
-    // (auto-creates faucets, advances LET, marks GERs injected), letting an
-    // attacker burn fees, poison registries, or feed fabricated GERs to
-    // bridge-service. Reject any signer not in the configured allow-list.
-    if !is_signer_allowed(service.allowed_signers.as_deref(), &signer) {
-        ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
-        anyhow::bail!(
-            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or set ALLOWED_SIGNERS) to permit"
-        );
-    }
-
-    // ── Method decode ───────────────────────────────────────────────────
-    //
-    // Decoding the selector + ABI on the request thread (rather than inside
-    // the worker) keeps malformed payloads from poisoning the queue and lets
-    // both the legacy sync path and the worker path share the same dispatch
-    // shape downstream. The `DecodedWriteCall` enum is defined in
-    // `writer_worker` so it can also serve as the wire shape for the v1.5
-    // durable-queue migration sketched in `docs/design/RD-940-async-writer.md`.
-    let params_encoded = &txn.input;
-    let decoded = if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
-        tracing::debug!("claimAsset call");
-        let params = claimAssetCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
-        crate::writer_worker::DecodedWriteCall::Claim {
-            params: Box::new(params),
+    match tx_nonce.cmp(&expected_nonce) {
+        std::cmp::Ordering::Less => {
+            // Stale nonce. If this exact tx already has a committed receipt or
+            // is currently parked, it's a harmless re-broadcast — return its
+            // hash idempotently (geth behaviour). Otherwise reject. NB: the
+            // pre-lock tx-hash dedup (above) already short-circuits anything
+            // with a stored `txn_get` row, so a same-nonce in-flight duplicate
+            // that races the lock still falls through to the mismatch reject
+            // (preserving the R4 double-submit guard).
+            let known = service.store.txn_receipt(txn_hash).await?.is_some()
+                || service.store.queued_txn_by_hash(txn_hash).await?.is_some();
+            if known {
+                return Ok(txn_hash);
+            }
+            ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+            anyhow::bail!(
+                "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; \
+                 nonce too low (replay/stale submission rejected) (R4)"
+            );
         }
+        std::cmp::Ordering::Greater => {
+            // Future nonce — park it and accept. The raw envelope is replayed
+            // verbatim once the gap fills. A block-denominated TTL drops a
+            // never-filled gap via the same sweep that expires pending receipts.
+            let latest_block = service.store.get_latest_block_number().await?;
+            let expires_at = latest_block + QUEUE_TTL_BLOCKS;
+            service
+                .store
+                .queue_txn(&signer_str, tx_nonce, txn_hash, &txn_envelope, expires_at)
+                .await?;
+            ::metrics::counter!("rpc_nonce_queued_total").increment(1);
+            tracing::info!(
+                signer = %signer_str,
+                tx_nonce,
+                expected_nonce,
+                %txn_hash,
+                "queued future-nonce tx (mempool); will process when the gap fills"
+            );
+            return Ok(txn_hash);
+        }
+        std::cmp::Ordering::Equal => {
+            // Fall through to in-order processing below.
+        }
+    }
+
+    // nonce == expected — decode the method and dispatch via the existing fork,
+    // then advance the nonce and drain any queued successors.
+    let decoded = decode_write_call(&txn.input)?;
+    dispatch_accepted(&service, decoded, txn_envelope, signer, txn_hash).await?;
+    service.store.nonce_increment(&signer_str).await?;
+    drain_queued(&service, &signer_str).await;
+    Ok(txn_hash)
+}
+
+/// Block-denominated TTL for a future-nonce tx parked in the mempool queue.
+///
+/// Mirrors the receipt-expiry style (`claim.rs::EXPIRATION_DELTA`): a parked tx
+/// whose predecessor nonce never arrives within this many blocks is dropped by
+/// the same expiry sweep that expires pending receipts (`expire_queued_txns`
+/// alongside `txn_expire_pending`), so the queue can't grow unbounded. Generous
+/// relative to the receipt delta because a legitimate gap (a delayed
+/// predecessor) can take longer to fill than a single receipt takes to finalise.
+pub const QUEUE_TTL_BLOCKS: u64 = 256;
+
+/// Decode the selector + ABI of a write call into the shared `DecodedWriteCall`
+/// shape. Factored out so both the in-order accept path and the queue drain
+/// decode identically (the drain replays a parked raw envelope).
+fn decode_write_call(
+    input: &alloy::primitives::Bytes,
+) -> anyhow::Result<crate::writer_worker::DecodedWriteCall> {
+    let params_encoded = input;
+    if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
+        let params = claimAssetCall::abi_decode(params_encoded)?;
+        Ok(crate::writer_worker::DecodedWriteCall::Claim {
+            params: Box::new(params),
+        })
     } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
-        tracing::debug!("insertGlobalExitRoot call");
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
-        let ger_bytes: [u8; 32] = params.root.0;
-        crate::writer_worker::DecodedWriteCall::Ger { ger_bytes }
+        Ok(crate::writer_worker::DecodedWriteCall::Ger {
+            ger_bytes: params.root.0,
+        })
     } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
-        tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
         let combined_ger =
             ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
-        crate::writer_worker::DecodedWriteCall::Ger {
+        Ok(crate::writer_worker::DecodedWriteCall::Ger {
             ger_bytes: combined_ger,
-        }
+        })
     } else {
-        tracing::error!("unhandled txn method {params_encoded:?}");
         anyhow::bail!("unhandled txn method {params_encoded:?}");
-    };
+    }
+}
 
-    // ── Dispatch fork (RD-940) ──────────────────────────────────────────
-    //
-    // `enable_writer_worker` defaults to false — the legacy synchronous
-    // branch below is byte-identical to pre-RD-940 behaviour for the
-    // claim and GER paths. When the flag is enabled and a writer handle
-    // is plumbed, requests are enqueued for asynchronous Miden submission
-    // and the HTTP future returns the tx-hash as soon as `try_enqueue`
-    // succeeds.
-    //
-    // Nonce-advance ordering matters under both branches:
-    //   - legacy: dispatch runs to completion → nonce_increment (current
-    //     behaviour preserved bit-for-bit)
-    //   - worker: try_enqueue → on Ok, nonce_increment; on QueueFull, the
-    //     nonce is intentionally **not** advanced so the caller retries
-    //     with the same nonce and -32005 doesn't burn a sequence slot
-    //
-    // Decision 3 (idempotent re-broadcast) and Decision 4
-    // (eth_getTransactionCount tag honouring) land in Phase 2.
+/// Dispatch one decoded, accepted (nonce == expected) tx through the existing
+/// fork: the async writer worker when enabled, else the legacy synchronous
+/// claim/GER handlers. **Does NOT advance the nonce** — the caller does that
+/// after this returns `Ok` (so a `QueueFull` from the worker leaves the nonce
+/// untouched and the caller retries). This is the reusable "process one decoded
+/// accepted tx" body the drain also calls.
+async fn dispatch_accepted(
+    service: &ServiceState,
+    decoded: crate::writer_worker::DecodedWriteCall,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    txn_hash: TxHash,
+) -> anyhow::Result<()> {
     if service.enable_writer_worker {
         let handle = service.writer_handle.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -625,40 +676,109 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         })?;
         let job = decoded.into_job(txn_envelope, signer, txn_hash);
         match handle.try_enqueue(job) {
-            Ok(()) => {
-                service.store.nonce_increment(&signer_str).await?;
-                Ok(txn_hash)
-            }
+            Ok(()) => Ok(()),
+            // The downcast on this typed error in `service.rs` promotes the
+            // JSON-RPC error code to -32005 (geth's LimitExceeded) so aggkit's
+            // ethtxmanager retries transparently.
             Err(crate::writer_worker::TryEnqueueError::QueueFull) => {
-                // The downcast on this typed error in `service.rs`
-                // promotes the JSON-RPC error code to -32005 (geth's
-                // LimitExceeded), letting aggkit's ethtxmanager retry
-                // transparently. The metric was already incremented in
-                // try_enqueue.
                 Err(crate::writer_worker::WriterQueueSaturatedError.into())
             }
             Err(crate::writer_worker::TryEnqueueError::ShutDown) => {
                 anyhow::bail!(
                     "writer worker has shut down — service is draining; retry against the next \
                      replica"
-                );
+                )
             }
         }
     } else {
         // Legacy synchronous dispatch — unchanged behaviour.
         match decoded {
             crate::writer_worker::DecodedWriteCall::Claim { params } => {
-                worker_handle_claim_asset(&service, *params, txn_hash, txn_envelope, signer)
-                    .await?;
+                worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer).await
             }
             crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
-                worker_handle_ger_insert(&service, ger_bytes, txn_hash, txn_envelope, signer)
-                    .await?;
+                worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer).await
             }
         }
-        service.store.nonce_increment(&signer_str).await?;
-        Ok(txn_hash)
     }
+}
+
+/// Process one tx pulled from the mempool queue: re-decode its raw envelope and
+/// dispatch it exactly as an in-order accept would.
+async fn process_queued(service: &ServiceState, q: crate::store::QueuedTxn) -> anyhow::Result<()> {
+    let envelope = q.envelope;
+    let txn = unwrap_txn_envelope(envelope.clone())?;
+    let signer = envelope.recover_signer()?;
+    let decoded = decode_write_call(&txn.input)?;
+    dispatch_accepted(service, decoded, envelope, signer, q.tx_hash).await
+}
+
+/// Drain the contiguous run of queued txns for `signer`, starting at the
+/// current next-expected nonce. Each successfully processed tx advances the
+/// nonce by one; the loop stops at the first missing nonce.
+///
+/// Miden submission is already serialised, so processing sequentially here is
+/// correct. On a processing failure the nonce is intentionally left unadvanced
+/// (same contract as a failed in-order tx) and the drain stops — aggkit
+/// re-broadcasts the dropped tx within `WaitTxToBeMined`, at which point its
+/// nonce == expected again and it is reprocessed.
+async fn drain_queued(service: &ServiceState, signer_str: &str) {
+    loop {
+        let next = match service.store.nonce_get(signer_str).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(signer = %signer_str, error = %e, "drain: nonce_get failed");
+                break;
+            }
+        };
+        let q = match service.store.take_queued_txn(signer_str, next).await {
+            Ok(Some(q)) => q,
+            Ok(None) => break, // gap: next nonce not queued
+            Err(e) => {
+                tracing::error!(signer = %signer_str, error = %e, "drain: take_queued_txn failed");
+                break;
+            }
+        };
+        let tx_hash = q.tx_hash;
+        match process_queued(service, q).await {
+            Ok(()) => {
+                if let Err(e) = service.store.nonce_increment(signer_str).await {
+                    tracing::error!(
+                        signer = %signer_str, %tx_hash, error = %e,
+                        "drain: nonce_increment failed after processing queued tx"
+                    );
+                    break;
+                }
+                ::metrics::counter!("rpc_nonce_drained_total").increment(1);
+                tracing::info!(
+                    signer = %signer_str, %tx_hash, nonce = next,
+                    "drained queued tx after gap filled"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    signer = %signer_str, %tx_hash, nonce = next, error = %e,
+                    "drain: processing queued tx failed; stopping (will recover on re-broadcast)"
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Startup resume: for every signer with parked txns whose smallest parked
+/// nonce already equals the signer's next-expected nonce, drain the contiguous
+/// run. This re-processes persisted queued txns whose gap was filled in a
+/// previous run (or by a restore) before the process restarted.
+pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
+    for signer in service.store.queued_signers().await? {
+        let next = service.store.nonce_get(&signer).await?;
+        if service.store.peek_queued_min_nonce(&signer).await? == Some(next) {
+            tracing::info!(signer = %signer, next, "resuming drain of persisted queued txns");
+            drain_queued(service, &signer).await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1324,6 +1444,234 @@ mod tests {
         assert!(
             msg.contains(&format!("{signer:#x}")),
             "must name the signer: {msg}"
+        );
+    }
+
+    // ── Mempool (future-nonce queue) tests ───────────────────────────
+
+    /// Encode a GER-insert legacy tx with an explicit nonce, signed by a FIXED
+    /// key so every tx in a test recovers to the SAME signer regardless of
+    /// nonce/calldata (a fixed signature over varying content would otherwise
+    /// recover to a different address each time). Distinct `marker` values give
+    /// distinct GER roots and therefore distinct tx hashes.
+    fn ger_tx(nonce: u64, marker: u8) -> (String, Address) {
+        use alloy::consensus::SignableTransaction;
+        use alloy::signers::SignerSync;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer_key: PrivateKeySigner =
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .parse()
+                .expect("fixed test key");
+        let from = signer_key.address();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([marker; 32]),
+        }
+        .abi_encode();
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 0,
+            gas_limit: 21_000,
+            to: alloy::primitives::TxKind::Call(from),
+            value: U256::ZERO,
+            input: calldata.into(),
+        };
+        let signature = signer_key.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let envelope: TxEnvelope = tx.into_signed(signature).into();
+        let mut encoded = Vec::new();
+        envelope.encode_2718(&mut encoded);
+        (format!("0x{}", ::hex::encode(encoded)), from)
+    }
+
+    /// Out-of-order accept: submit nonce 1 (queues), then nonce 0 (processes and
+    /// drains 1). Final nonce 2, queue empty.
+    #[tokio::test]
+    async fn mempool_out_of_order_accept_drains() {
+        let service = create_test_service();
+        let store = service.store.clone();
+
+        let (tx1, signer) = ger_tx(1, 0xA1);
+        let signer_str = format!("{signer:#x}");
+
+        // nonce 1 arrives first — expected is 0, so it parks.
+        let h1 = service_send_raw_txn(service.clone(), tx1).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "future-nonce tx must NOT advance the nonce"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1),
+            "future-nonce tx must be parked"
+        );
+        assert!(
+            store.queued_txn_by_hash(h1).await.unwrap().is_some(),
+            "parked tx must be findable by hash"
+        );
+
+        // nonce 0 fills the gap — processes, advances to 1, then drains nonce 1.
+        let (tx0, _) = ger_tx(0, 0xA0);
+        service_send_raw_txn(service.clone(), tx0).await.unwrap();
+
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "in-order tx must process AND drain the queued successor"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none(),
+            "queue must be empty after the drain"
+        );
+    }
+
+    /// Gap-then-fill: submit 0 (nonce→1), then 2 (parks), then 1 (processes and
+    /// drains 2). Final nonce 3.
+    #[tokio::test]
+    async fn mempool_gap_then_fill_drains() {
+        let service = create_test_service();
+        let store = service.store.clone();
+
+        let (tx0, signer) = ger_tx(0, 0xB0);
+        let signer_str = format!("{signer:#x}");
+
+        service_send_raw_txn(service.clone(), tx0).await.unwrap();
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+
+        // nonce 2 leaves a hole at 1 — parks.
+        let (tx2, _) = ger_tx(2, 0xB2);
+        service_send_raw_txn(service.clone(), tx2).await.unwrap();
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(2)
+        );
+
+        // nonce 1 fills the hole — processes, then drains nonce 2.
+        let (tx1, _) = ger_tx(1, 0xB1);
+        service_send_raw_txn(service.clone(), tx1).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            3,
+            "filling the hole must drain through nonce 2"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Idempotent resubmit of a parked tx returns the same hash and does not
+    /// duplicate the queue entry; a DIFFERENT tx at the same parked nonce is
+    /// rejected (the "at most one tx per signer per nonce" invariant).
+    #[tokio::test]
+    async fn mempool_idempotent_resubmit_of_queued_tx() {
+        let service = create_test_service();
+        let store = service.store.clone();
+
+        let (tx1, signer) = ger_tx(1, 0xC1);
+        let signer_str = format!("{signer:#x}");
+
+        let first = service_send_raw_txn(service.clone(), tx1.clone())
+            .await
+            .unwrap();
+        let second = service_send_raw_txn(service.clone(), tx1).await.unwrap();
+        assert_eq!(
+            first, second,
+            "idempotent resubmit must return the same hash"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1)
+        );
+
+        // A different tx (different root → different hash) at the SAME parked
+        // nonce must be refused — the first parked tx wins.
+        let (tx1_other, _) = ger_tx(1, 0xCC);
+        let err = service_send_raw_txn(service.clone(), tx1_other)
+            .await
+            .expect_err("a different tx at an occupied queue slot must be rejected");
+        assert!(
+            err.to_string().contains("already queued"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// Expiry drops a stale parked tx via the shared expiry sweep.
+    #[tokio::test]
+    async fn mempool_expiry_drops_stale_queued_tx() {
+        let service = create_test_service();
+        let store = service.store.clone();
+
+        let (tx1, signer) = ger_tx(1, 0xD1);
+        let signer_str = format!("{signer:#x}");
+        service_send_raw_txn(service.clone(), tx1).await.unwrap();
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1)
+        );
+
+        // latest_block is 0 in a fresh test service, so expires_at == QUEUE_TTL_BLOCKS.
+        let dropped = store.expire_queued_txns(QUEUE_TTL_BLOCKS).await.unwrap();
+        assert_eq!(dropped, 1, "the stale parked tx must be dropped");
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none(),
+            "queue must be empty after expiry"
+        );
+    }
+
+    /// Restart-resume: a tx persisted in the queue whose gap is already filled
+    /// (min parked nonce == next expected nonce) is drained at startup.
+    #[tokio::test]
+    async fn mempool_restart_resume_drains_filled_gap() {
+        use alloy::eips::Decodable2718;
+
+        let service = create_test_service();
+        let store = service.store.clone();
+
+        // Simulate a previous run that persisted a queued tx at nonce 0 (its gap
+        // is "already filled" because nonce_get is also 0).
+        let (tx0, signer) = ger_tx(0, 0xE0);
+        let signer_str = format!("{signer:#x}");
+        let payload = crate::hex::hex_decode_prefixed(&tx0).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut payload.as_slice()).unwrap();
+        let hash = unwrap_txn_envelope(envelope.clone()).unwrap().hash;
+        store
+            .queue_txn(&signer_str, 0, hash, &envelope, 9_999)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(0)
+        );
+
+        // Boot-time resume drains it.
+        resume_queued_drain(&service).await.unwrap();
+
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            1,
+            "resume must process the persisted queued tx and advance the nonce"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none(),
+            "queue must be empty after resume"
         );
     }
 }

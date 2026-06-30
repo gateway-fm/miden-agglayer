@@ -1,6 +1,8 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
-use super::{FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim};
+use super::{
+    FaucetEntry, QueuedTxn, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
+};
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
@@ -10,8 +12,15 @@ use miden_protocol::account::AccountId;
 use miden_protocol::transaction::TransactionId;
 use parking_lot::{Mutex, RwLock};
 use sha3::{Digest, Keccak256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
+
+/// One parked future-nonce tx in the in-memory mempool queue.
+struct QueuedRow {
+    tx_hash: TxHash,
+    envelope: alloy::consensus::TxEnvelope,
+    expires_at: u64,
+}
 
 struct TxnReceipt {
     id: Option<TransactionId>,
@@ -44,6 +53,10 @@ pub struct InMemoryStore {
 
     // Nonces
     nonces: RwLock<HashMap<String, u64>>,
+
+    // Future-nonce queue ("mempool") — per signer, ordered by nonce so the
+    // drain can pull the contiguous run cheaply. See migration 010.
+    queued_txns: RwLock<HashMap<String, BTreeMap<u64, QueuedRow>>>,
 
     // Claims
     claimed: RwLock<HashSet<U256>>,
@@ -113,6 +126,7 @@ impl InMemoryStore {
             injected_gers: RwLock::new(HashSet::new()),
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
+            queued_txns: RwLock::new(HashMap::new()),
             claimed: RwLock::new(HashSet::new()),
             unclaimable: RwLock::new(HashMap::new()),
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
@@ -560,6 +574,110 @@ impl Store for InMemoryStore {
         let prev = *nonce;
         *nonce += 1;
         Ok(prev)
+    }
+
+    // ── Future-nonce queue ("mempool") ───────────────────────────
+
+    async fn queue_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        envelope: &alloy::consensus::TxEnvelope,
+        expires_at: u64,
+    ) -> anyhow::Result<()> {
+        let key = signer.to_lowercase();
+        let mut map = self.queued_txns.write();
+        let per = map.entry(key).or_default();
+        if let Some(existing) = per.get(&nonce) {
+            if existing.tx_hash == tx_hash {
+                return Ok(()); // idempotent re-submit of the same parked tx
+            }
+            anyhow::bail!(
+                "a different transaction is already queued for {signer} at nonce {nonce} \
+                 (queued {}, incoming {tx_hash}); keeping the first",
+                existing.tx_hash
+            );
+        }
+        per.insert(
+            nonce,
+            QueuedRow {
+                tx_hash,
+                envelope: envelope.clone(),
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
+    async fn take_queued_txn(&self, signer: &str, nonce: u64) -> anyhow::Result<Option<QueuedTxn>> {
+        let key = signer.to_lowercase();
+        let mut map = self.queued_txns.write();
+        let Some(per) = map.get_mut(&key) else {
+            return Ok(None);
+        };
+        let Some(row) = per.remove(&nonce) else {
+            return Ok(None);
+        };
+        if per.is_empty() {
+            map.remove(&key);
+        }
+        Ok(Some(QueuedTxn {
+            signer: key,
+            nonce,
+            tx_hash: row.tx_hash,
+            envelope: row.envelope,
+            expires_at: row.expires_at,
+        }))
+    }
+
+    async fn peek_queued_min_nonce(&self, signer: &str) -> anyhow::Result<Option<u64>> {
+        let key = signer.to_lowercase();
+        let map = self.queued_txns.read();
+        Ok(map.get(&key).and_then(|per| per.keys().next().copied()))
+    }
+
+    async fn queued_signers(&self) -> anyhow::Result<Vec<String>> {
+        let map = self.queued_txns.read();
+        Ok(map
+            .iter()
+            .filter(|(_, per)| !per.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+
+    async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>> {
+        let map = self.queued_txns.read();
+        for (signer, per) in map.iter() {
+            for (nonce, row) in per.iter() {
+                if row.tx_hash == tx_hash {
+                    return Ok(Some(QueuedTxn {
+                        signer: signer.clone(),
+                        nonce: *nonce,
+                        tx_hash: row.tx_hash,
+                        envelope: row.envelope.clone(),
+                        expires_at: row.expires_at,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
+        let mut map = self.queued_txns.write();
+        let mut dropped = 0usize;
+        map.retain(|_, per| {
+            per.retain(|_, row| {
+                let keep = row.expires_at > now;
+                if !keep {
+                    dropped += 1;
+                }
+                keep
+            });
+            !per.is_empty()
+        });
+        Ok(dropped)
     }
 
     // ── Claims ───────────────────────────────────────────────────

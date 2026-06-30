@@ -4,8 +4,8 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason,
-    UnclaimableClaim, UnclaimableReason,
+    FaucetEntry, QueuedTxn, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
+    UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
@@ -46,6 +46,38 @@ impl PgStore {
 
         Ok(Self { pool })
     }
+}
+
+/// Decode a 2718-encoded signed envelope stored in `queued_txns.envelope`.
+fn decode_queued_envelope(bytes: &[u8]) -> anyhow::Result<TxEnvelope> {
+    use alloy::eips::Decodable2718;
+    TxEnvelope::decode_2718(&mut &bytes[..])
+        .map_err(|e| anyhow::anyhow!("stored queued envelope cannot be decoded ({e})"))
+}
+
+/// Parse a `queued_txns.tx_hash` text column back to a `TxHash`.
+fn parse_queued_hash(hash_str: &str) -> anyhow::Result<TxHash> {
+    hash_str
+        .parse::<TxHash>()
+        .map_err(|e| anyhow::anyhow!("stored queued tx_hash {hash_str} is invalid ({e})"))
+}
+
+/// Build a `QueuedTxn` from a `RETURNING tx_hash, envelope, expires_at` row.
+fn row_to_queued_txn(
+    signer: String,
+    nonce: u64,
+    row: &tokio_postgres::Row,
+) -> anyhow::Result<QueuedTxn> {
+    let tx_hash = parse_queued_hash(row.get(0))?;
+    let envelope = decode_queued_envelope(row.get(1))?;
+    let expires_at: i64 = row.get(2);
+    Ok(QueuedTxn {
+        signer,
+        nonce,
+        tx_hash,
+        envelope,
+        expires_at: expires_at as u64,
+    })
 }
 
 /// Parse a TransactionId hex string (from `TransactionId::to_hex()`) back to a
@@ -937,6 +969,137 @@ impl Store for PgStore {
             )
             .await?;
         Ok(row.get::<_, i64>(0) as u64)
+    }
+
+    // ── Future-nonce queue ("mempool") ───────────────────────────
+
+    async fn queue_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        envelope: &TxEnvelope,
+        expires_at: u64,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let key = signer.to_lowercase();
+        let hash_str = format!("{tx_hash:#x}");
+
+        // Conflict resolution mirrors the in-memory store: same hash → no-op;
+        // different hash → keep the first, error. The per-signer request lock
+        // serialises all writes for one signer, so the SELECT-then-INSERT is
+        // race-free in practice.
+        let existing = client
+            .query(
+                "SELECT tx_hash FROM queued_txns WHERE signer = $1 AND nonce = $2",
+                &[&key, &(nonce as i64)],
+            )
+            .await?;
+        if let Some(row) = existing.first() {
+            let existing_hash: &str = row.get(0);
+            if existing_hash.eq_ignore_ascii_case(&hash_str) {
+                return Ok(()); // idempotent re-submit of the same parked tx
+            }
+            anyhow::bail!(
+                "a different transaction is already queued for {signer} at nonce {nonce} \
+                 (queued {existing_hash}, incoming {hash_str}); keeping the first"
+            );
+        }
+
+        let mut envelope_bytes = Vec::new();
+        envelope.encode_2718(&mut envelope_bytes);
+        client
+            .execute(
+                "INSERT INTO queued_txns (signer, nonce, tx_hash, envelope, expires_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &key,
+                    &(nonce as i64),
+                    &hash_str,
+                    &envelope_bytes,
+                    &(expires_at as i64),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn take_queued_txn(&self, signer: &str, nonce: u64) -> anyhow::Result<Option<QueuedTxn>> {
+        let client = self.pool.get().await?;
+        let key = signer.to_lowercase();
+        let rows = client
+            .query(
+                "DELETE FROM queued_txns WHERE signer = $1 AND nonce = $2
+                 RETURNING tx_hash, envelope, expires_at",
+                &[&key, &(nonce as i64)],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(row_to_queued_txn(key, nonce, row)?))
+    }
+
+    async fn peek_queued_min_nonce(&self, signer: &str) -> anyhow::Result<Option<u64>> {
+        let client = self.pool.get().await?;
+        let key = signer.to_lowercase();
+        let rows = client
+            .query(
+                "SELECT MIN(nonce) FROM queued_txns WHERE signer = $1",
+                &[&key],
+            )
+            .await?;
+        // MIN over zero rows yields a single row with a NULL value.
+        let min: Option<i64> = rows.first().and_then(|r| r.get(0));
+        Ok(min.map(|n| n as u64))
+    }
+
+    async fn queued_signers(&self) -> anyhow::Result<Vec<String>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query("SELECT DISTINCT signer FROM queued_txns", &[])
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>> {
+        let client = self.pool.get().await?;
+        let hash_str = format!("{tx_hash:#x}");
+        let rows = client
+            .query(
+                "SELECT signer, nonce, tx_hash, envelope, expires_at
+                 FROM queued_txns WHERE tx_hash = $1 LIMIT 1",
+                &[&hash_str],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let signer: String = row.get(0);
+        let nonce: i64 = row.get(1);
+        // Reuse the (tx_hash, envelope, expires_at) decoder by shifting indices:
+        // build the QueuedTxn directly here since the column order differs.
+        let envelope = decode_queued_envelope(row.get(3))?;
+        let tx_hash = parse_queued_hash(row.get(2))?;
+        let expires_at: i64 = row.get(4);
+        Ok(Some(QueuedTxn {
+            signer,
+            nonce: nonce as u64,
+            tx_hash,
+            envelope,
+            expires_at: expires_at as u64,
+        }))
+    }
+
+    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
+        let client = self.pool.get().await?;
+        let n = client
+            .execute(
+                "DELETE FROM queued_txns WHERE expires_at <= $1",
+                &[&(now as i64)],
+            )
+            .await?;
+        Ok(n as usize)
     }
 
     // ── Claims ───────────────────────────────────────────────────

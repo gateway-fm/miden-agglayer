@@ -528,6 +528,35 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 ));
             }
 
+            // Future-nonce queued tx (mempool) — accepted but not yet
+            // processed (its predecessor nonce hasn't arrived). Surface the
+            // same geth "accepted, not yet mined" pending shape as an
+            // in-flight tx so aggkit treats it as accepted rather than
+            // dropped; the matching receipt stays null until the gap fills
+            // and the tx is processed.
+            if let Some(q) = service
+                .store
+                .queued_txn_by_hash(txn_hash)
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?
+                && let Ok(signer) = q.signer.parse::<alloy::primitives::Address>()
+            {
+                tracing::debug!(
+                    tx_hash = %txn_hash,
+                    nonce = q.nonce,
+                    "eth_getTransactionByHash: returning queued (future-nonce) pending shape"
+                );
+                let entry =
+                    crate::writer_worker::InFlightEntry::pending_for(q.envelope, q.tx_hash, signer);
+                return Ok(JsonRpcResponse::success(
+                    answer_id,
+                    crate::service_helpers::build_inflight_pending_tx_json(
+                        &entry,
+                        service.chain_id,
+                    ),
+                ));
+            }
+
             // Fallback: synthetic transactions (bridge-out events)
             let tx_hash_str = format!("{txn_hash:#x}");
             let logs = service

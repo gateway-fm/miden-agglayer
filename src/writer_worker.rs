@@ -280,6 +280,26 @@ pub struct InFlightEntry {
 }
 
 impl InFlightEntry {
+    /// Build a synthetic "accepted, not yet mined" entry for a tx that is NOT
+    /// going through the writer worker — specifically a future-nonce tx parked
+    /// in the mempool queue (`service_send_raw_txn`). Only `envelope`,
+    /// `eth_tx_hash`, and `signer` are load-bearing: `build_inflight_pending_tx_json`
+    /// reads exactly those three to emit the geth pending wire shape. The rest
+    /// are placeholders so `eth_getTransactionByHash` can reuse the same
+    /// pending-tx renderer instead of duplicating it.
+    pub fn pending_for(envelope: TxEnvelope, eth_tx_hash: TxHash, signer: Address) -> Self {
+        Self {
+            state: JobState::Queued,
+            eth_tx_hash,
+            signer,
+            kind: WriteJobKind::Claim,
+            job_id: Ulid::nil(),
+            envelope,
+            created_at: Instant::now(),
+            terminal_at: None,
+        }
+    }
+
     fn from_job(job: &WriteJob) -> Self {
         Self {
             state: JobState::Queued,
