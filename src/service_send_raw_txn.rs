@@ -42,7 +42,7 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
 }
 
 async fn handle_ger_result(
-    result: anyhow::Result<ger::GerInsertResult>,
+    result: anyhow::Result<u64>,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     signer: Address,
@@ -50,7 +50,7 @@ async fn handle_ger_result(
     ger_bytes: [u8; 32],
 ) -> anyhow::Result<()> {
     match result {
-        Ok(ger_result) => {
+        Ok(block_number) => {
             // G4 — mark_ger_injected has moved to live INSIDE insert_ger,
             // co-located with add_ger_update_event so a crash between them
             // can't leave is_ger_injected returning false after the event
@@ -63,7 +63,7 @@ async fn handle_ger_result(
                 txn_hash,
                 txn_envelope,
                 signer,
-                ger_result.block_number,
+                block_number,
                 vec![],
             )
             .await?;

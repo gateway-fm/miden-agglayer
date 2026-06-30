@@ -1,6 +1,5 @@
 use crate::miden_client::MidenClient;
-use alloy::primitives::{FixedBytes, LogData, TxHash};
-use alloy::sol_types::SolEvent;
+use alloy::primitives::TxHash;
 use alloy_rpc_types_eth::TransactionRequest;
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
 use miden_client::transaction::TransactionRequestBuilder;
@@ -67,31 +66,6 @@ pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
     hasher.update(mainnet);
     hasher.update(rollup);
     hasher.finalize().into()
-}
-
-alloy_core::sol! {
-    // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/sovereignChains/GlobalExitRootManagerL2SovereignChain.sol#L52
-    #[derive(Debug)]
-    event UpdateHashChainValue(
-        bytes32 indexed newGlobalExitRoot,
-        bytes32 indexed newHashChainValue
-    );
-}
-
-impl UpdateHashChainValue {
-    fn new(ger: FixedBytes<32>, chain_hash: FixedBytes<32>) -> Self {
-        UpdateHashChainValue {
-            newGlobalExitRoot: ger,
-            newHashChainValue: chain_hash,
-        }
-    }
-}
-
-/// Result of a GER insertion.
-pub struct GerInsertResult {
-    pub log_data: LogData,
-    pub block_number: u64,
-    pub is_new: bool,
 }
 
 /// Submit the actual UpdateGerNote Miden transaction. Factored out of
@@ -177,7 +151,7 @@ pub async fn insert_ger(
     store: &Arc<dyn crate::store::Store>,
     _block_state: &Arc<crate::block_state::BlockState>,
     _txn_hash: TxHash,
-) -> anyhow::Result<GerInsertResult> {
+) -> anyhow::Result<u64> {
     // Check dedup before doing any work.
     //
     // Use `is_ger_injected` (not `has_seen_ger`) because the L1InfoTreeIndexer
@@ -242,14 +216,7 @@ pub async fn insert_ger(
         );
     }
 
-    let event = UpdateHashChainValue::new(FixedBytes::from(ger_bytes), FixedBytes::default());
-    let log_data = event.encode_log_data();
-
-    Ok(GerInsertResult {
-        log_data,
-        block_number,
-        is_new,
-    })
+    Ok(block_number)
 }
 
 #[cfg(test)]

@@ -2,8 +2,7 @@ use crate::accounts_config::AccountsConfig;
 use crate::faucet_ops;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::{FaucetEntry, Store};
-use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
-use alloy::sol_types::SolEvent;
+use alloy::primitives::{BlockNumber, Bytes, FixedBytes};
 use miden_base_agglayer::{
     ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
     ProofData, SmtNode,
@@ -379,9 +378,6 @@ async fn create_claim(
 pub struct PublishClaimTxn {
     pub txn_id: TransactionId,
     pub expires_at: BlockNumber,
-    pub log: LogData,
-    /// CLAIM note ID for consumption tracking (deferred receipts).
-    pub claim_note_id: Option<String>,
     /// Hex `details_commitment()` of the on-chain CLAIM note — the key the
     /// SyntheticProjector uses to recover the real claim eth-tx for the
     /// consumed note (see `record_tx_note_link` / `get_tx_for_note`).
@@ -653,14 +649,9 @@ async fn publish_claim_internal(
         anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
 
-    let event = ClaimEvent::from(params);
-    let log = event.encode_log_data();
-
     Ok(PublishClaimTxn {
         txn_id,
         expires_at,
-        log,
-        claim_note_id: Some(claim_note_id),
         note_commitment,
     })
 }
