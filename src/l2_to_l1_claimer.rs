@@ -332,30 +332,8 @@ impl CursorStore {
 
 // ─── I/O ──────────────────────────────────────────────────────────────────
 
-/// Discover our rollup's L2→L1 asset exits from block `from` onward, from the
-/// proxy's synthetic `BridgeEvent` logs.
-///
-/// The upper bound is the `latest` tag, NOT `eth_blockNumber`: the proxy's
-/// `eth_blockNumber` mirror can lag the synthetic-log tip (it is advanced by
-/// some write paths but not the bridge-out synthetic-log path), while
-/// `eth_getLogs` with the `latest` tag is resolved against the true tip. Bounding
-/// by `eth_blockNumber` made `discover` miss every bridge-out whose
-/// (Miden-derived) block number exceeded the lagging head — so no exit was ever
-/// claimed.
-async fn discover<P: Provider>(
-    l2: &P,
-    bridge_address: Address,
-    from: u64,
-) -> anyhow::Result<Vec<PendingExit>> {
-    let filter = Filter::new()
-        .address(bridge_address)
-        .from_block(from)
-        .to_block(BlockNumberOrTag::Latest)
-        .event_signature(BridgeEvent::SIGNATURE_HASH);
-
-    let logs = l2.get_logs(&filter).await?;
-    tracing::debug!(from, %bridge_address, raw_logs = logs.len(), "discover: get_logs returned");
-    let mut out = Vec::new();
+/// Decode raw `BridgeEvent` logs into our L2→L1 (destination network 0) exits.
+fn collect_exits(logs: Vec<alloy::rpc::types::Log>, out: &mut Vec<PendingExit>) {
     for log in logs {
         let block = log.block_number.unwrap_or(0);
         match BridgeEvent::decode_log_data(log.data()) {
@@ -372,6 +350,83 @@ async fn discover<P: Provider>(
             }
         }
     }
+}
+
+/// Inclusive numeric `[from, to]` windows covering `[from, head]`, each spanning
+/// at most `max_range` blocks. The trailing `(head, latest]` window is handled
+/// separately by `discover` (it must use the `latest` tag, see below). Returns
+/// empty when `from > head` (cursor already at/after the numeric head).
+///
+/// Pure (no I/O) so the windowing — the part that has to respect the proxy's
+/// getLogs cap — is unit-tested.
+fn scan_windows(from: u64, head: u64, max_range: u64) -> Vec<(u64, u64)> {
+    let step = max_range.max(1);
+    let mut windows = Vec::new();
+    let mut cur = from;
+    while cur <= head {
+        // span (to - from) == step - 1, strictly below `max_range`.
+        let to = cur.saturating_add(step - 1).min(head);
+        windows.push((cur, to));
+        cur = to + 1;
+    }
+    windows
+}
+
+/// Discover our rollup's L2→L1 asset exits from block `from` onward, from the
+/// proxy's synthetic `BridgeEvent` logs.
+///
+/// The miden-agglayer proxy caps `eth_getLogs` at `MAX_GETLOGS_BLOCK_RANGE`
+/// (10_000 blocks) and rejects wider spans. A single `from -> latest` query (the
+/// previous behaviour) therefore failed whenever `(tip - from)` exceeded the cap
+/// — on a fresh cursor (`from = 0`) that was *every* poll (PRST-4030). We chunk
+/// the scan into `<= max_range` windows instead.
+///
+/// The upper bound is still the `latest` tag for the final window, NOT
+/// `eth_blockNumber`: the proxy's `eth_blockNumber` mirror can lag the
+/// synthetic-log tip (it is advanced by some write paths but not the bridge-out
+/// synthetic-log path). So we scan the bulk `[from, head]` in numeric windows,
+/// then finish with one `latest`-bounded window to capture logs beyond the
+/// numeric head. That trailing span is just the (small) lag; each numeric window
+/// is `< max_range`, which the caller keeps below the proxy cap.
+async fn discover<P: Provider>(
+    l2: &P,
+    bridge_address: Address,
+    from: u64,
+    max_range: u64,
+) -> anyhow::Result<Vec<PendingExit>> {
+    let head = l2.get_block_number().await?;
+    let mut out = Vec::new();
+
+    // Bulk catch-up: numeric windows up to the (possibly lagging) numeric head.
+    for (w_from, w_to) in scan_windows(from, head, max_range) {
+        let filter = Filter::new()
+            .address(bridge_address)
+            .from_block(w_from)
+            .to_block(w_to)
+            .event_signature(BridgeEvent::SIGNATURE_HASH);
+        let logs = l2.get_logs(&filter).await?;
+        tracing::debug!(
+            from = w_from,
+            to = w_to,
+            raw_logs = logs.len(),
+            "discover: numeric window"
+        );
+        collect_exits(logs, &mut out);
+    }
+
+    // Trailing window to the true tip via the `latest` tag, to catch synthetic
+    // logs the numeric head doesn't yet reflect. `tail_from` is `head + 1` after
+    // the loop, or `from` when `from > head` (loop produced no windows).
+    let tail_from = from.max(head.saturating_add(1));
+    let filter = Filter::new()
+        .address(bridge_address)
+        .from_block(tail_from)
+        .to_block(BlockNumberOrTag::Latest)
+        .event_signature(BridgeEvent::SIGNATURE_HASH);
+    let logs = l2.get_logs(&filter).await?;
+    tracing::debug!(from = tail_from, %bridge_address, raw_logs = logs.len(), "discover: latest tail");
+    collect_exits(logs, &mut out);
+
     Ok(out)
 }
 
@@ -605,9 +660,10 @@ async fn poll_once<P1: Provider, P2: Provider>(
     last_processed: &mut u64,
 ) -> anyhow::Result<()> {
     let from = *last_processed + 1;
-    // Scan to the `latest` tag (see `discover`): the proxy's `eth_blockNumber`
-    // can lag the synthetic-log tip, so a numeric head bound would skip exits.
-    let exits = discover(l2, cfg.bridge_address, from).await?;
+    // Chunked scan (see `discover`): numeric windows up to the head + a final
+    // `latest`-bounded window, each <= cfg.max_range to respect the proxy's
+    // eth_getLogs cap (PRST-4030).
+    let exits = discover(l2, cfg.bridge_address, from, cfg.max_range).await?;
     if !exits.is_empty() {
         tracing::info!(from, count = exits.len(), "discovered L2->L1 exits");
     }
@@ -654,6 +710,54 @@ async fn poll_once<P1: Provider, P2: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── scan_windows: the chunking that must respect the proxy getLogs cap ──
+
+    /// Every numeric window spans strictly less than `max_range` blocks, so each
+    /// `eth_getLogs` stays under the proxy's MAX_GETLOGS_BLOCK_RANGE cap. This is
+    /// the regression guard for PRST-4030 (a single `0 -> latest` query, span
+    /// ~196k, was rejected on every poll).
+    #[test]
+    fn scan_windows_each_under_max_range_and_contiguous() {
+        let from = 0;
+        let head = 196_476; // ~the L2 synthetic head that triggered the bug
+        let max_range = 10_000;
+        let ws = scan_windows(from, head, max_range);
+        assert_eq!(ws.first().unwrap().0, from);
+        assert_eq!(ws.last().unwrap().1, head, "windows must cover up to head");
+        let mut expected_next = from;
+        for (f, t) in &ws {
+            assert_eq!(*f, expected_next, "windows must be contiguous, no gaps");
+            assert!(t >= f);
+            assert!(
+                t - f < max_range,
+                "span {} must be < cap {max_range}",
+                t - f
+            );
+            expected_next = t + 1;
+        }
+    }
+
+    /// `from > head` (cursor at/after the numeric head) yields no numeric
+    /// windows — `discover` then does only the trailing `latest` query.
+    #[test]
+    fn scan_windows_empty_when_from_past_head() {
+        assert!(scan_windows(500, 499, 10_000).is_empty());
+        assert!(scan_windows(1, 0, 10_000).is_empty());
+    }
+
+    /// A span that fits in one window produces exactly one `[from, head]` window.
+    #[test]
+    fn scan_windows_single_small_span() {
+        assert_eq!(scan_windows(100, 600, 10_000), vec![(100, 600)]);
+    }
+
+    /// `max_range = 0` must not divide-by-zero / loop forever; clamps to 1.
+    #[test]
+    fn scan_windows_zero_max_range_is_safe() {
+        let ws = scan_windows(0, 3, 0);
+        assert_eq!(ws, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+    }
 
     #[test]
     fn global_index_layout_rollup() {

@@ -563,9 +563,15 @@ async fn main() -> anyhow::Result<()> {
     // their initial `submit_new_transaction` deploys them on-chain.
     // Run restore if requested
     if command.restore {
-        let result =
-            miden_agglayer_service::restore::restore(&store, &client, &accounts.0, &block_state)
-                .await?;
+        let result = miden_agglayer_service::restore::restore(
+            &store,
+            &client,
+            &accounts.0,
+            &block_state,
+            command.miden_node.as_deref(),
+            command.miden_api_key.as_deref(),
+        )
+        .await?;
 
         tracing::info!(
             "Restore complete: block={}, bridge_outs={}, claims={}, gers={}, logs={}",
