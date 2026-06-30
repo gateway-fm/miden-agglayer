@@ -190,16 +190,6 @@ struct Command {
     /// it lands in Phase 1.
     #[arg(long, env = "AGGLAYER_ENABLE_WRITER_WORKER", default_value_t = false)]
     enable_writer_worker: bool,
-
-    /// Synthetic-indexer redesign — enable the `SyntheticProjector` as the sole
-    /// owner of the synthetic EVM chain (`docs/SYNTHETIC-INDEXER-REDESIGN.md`).
-    /// DEFAULT-OFF. In Phase 2a the flag is only declared, parsed and logged at
-    /// startup; the running service does NOT branch on it yet (the projector is
-    /// not registered as a live sync listener, and the legacy writers keep
-    /// emitting), so `false` *and* `true` are currently identical at runtime.
-    /// The actual cut-over fork lands in Phase 2b.
-    #[arg(long, env = "SYNTHETIC_PROJECTOR", default_value_t = false)]
-    synthetic_projector_enabled: bool,
 }
 
 /// Validate the `--require-hardening` invariants. Returns a list of
@@ -310,10 +300,6 @@ impl std::fmt::Debug for Command {
                 &self.miden_prover_fallback_to_local,
             )
             .field("enable_writer_worker", &self.enable_writer_worker)
-            .field(
-                "synthetic_projector_enabled",
-                &self.synthetic_projector_enabled,
-            )
             .finish()
     }
 }
@@ -527,74 +513,54 @@ async fn main() -> anyhow::Result<()> {
     })?;
     let bridge_out_local_network_id = local_network_id_u32;
 
-    // Synthetic-indexer redesign (Phase 2b) — the cut-over flip. When
-    // `synthetic_projector_enabled` is ON, the `SyntheticProjector` becomes the
-    // SOLE synthetic-event producer: it is registered as a sync listener, and
-    // the legacy writers SUPPRESS their synthetic emission (bridge-out + claim
-    // here via constructor flags; ger + claim submit paths via
-    // `ServiceState::suppress_synthetic_emission` below). When OFF (default) the
-    // projector is not registered and every legacy path is byte-identical.
-    let projector_enabled = command.synthetic_projector_enabled;
+    // Synthetic-indexer redesign — the SyntheticProjector is the SOLE
+    // synthetic-event producer and the SINGLE owner of the synthetic tip
+    // (Finding #5 eliminated by construction). The legacy writer paths only
+    // submit to Miden; the projector re-derives every BridgeEvent / ClaimEvent /
+    // GER log from the consumed Miden notes and advances the tip itself
+    // (Miden-1:1). The BridgeOutScanner remains a sync listener purely for its
+    // Miden-facing monitors (Cantina #9 LET-divergence, ownership probe).
 
     let bridge_out_scanner = Arc::new(
         BridgeOutScanner::new(
             store.clone(),
-            block_state.clone(),
             bridge_out_local_network_id,
             accounts.0.bridge.0,
         )
         // Cantina #13 Layer 2 — wire the L1 RPC so legacy ERC-20 faucet rows with
         // empty metadata can be recovered + validated before a bridge-out emits.
-        .with_l1_rpc_url(command.l1_rpc_url.clone())
-        .with_suppress_synthetic_emission(projector_enabled),
+        .with_l1_rpc_url(command.l1_rpc_url.clone()),
     );
     // Cantina #7: clone the tracker handle now so we can plumb it into
     // ServiceState below — `bridge_out_scanner` is moved into the listener
     // vec a few lines down.
     let expected_mints_handle = bridge_out_scanner.expected_mints.clone();
 
-    // CLAIM-side chain-tail watcher: synthesises missing ClaimEvent logs for
-    // CLAIMs the normal eth_sendRawTransaction path didn't fully record
-    // (crash recovery + foreign CLAIM observations). Must run AFTER
-    // BridgeOutScanner so the two listeners don't both try to claim the same
-    // (latest + 1) slot in the same sync tick — BridgeOutScanner consumes
-    // the slot for any B2AGG it processes; ClaimWatcher takes the next slot.
-    let claim_watcher = Arc::new(
-        miden_agglayer_service::claim_watcher::ClaimWatcher::new(
+    let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
+
+    // Register the projector LAST so it observes the same consumed-note feed the
+    // monitors saw this tick, then advances the synthetic tip itself (no race —
+    // it is the only writer of `latest_block_number`, Finding #5).
+    let projector = Arc::new(
+        miden_agglayer_service::synthetic_projector::SyntheticProjector::new(
             store.clone(),
             block_state.clone(),
+            &accounts.0,
+            local_network_id_u32,
+            command.l1_rpc_url.clone(),
         )
-        .with_suppress_synthetic_emission(projector_enabled),
+        .await?,
     );
-
-    let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
-    let mut sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
+    tracing::info!(
+        "SyntheticProjector registered: the SOLE synthetic-event producer and the SINGLE owner of \
+         the synthetic tip. SINGLE-PROCESS ONLY — multiple replicas are NOT supported."
+    );
+    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
         sync_listener,
         block_state.clone(),
         bridge_out_scanner,
-        claim_watcher,
+        projector,
     ];
-
-    // Register the projector LAST so it observes the same consumed-note feed the
-    // legacy listeners saw this tick, then advances the synthetic tip itself
-    // (the suppressed legacy writers no longer touch it — no race, Finding #5).
-    if projector_enabled {
-        let projector = Arc::new(
-            miden_agglayer_service::synthetic_projector::SyntheticProjector::new(
-                store.clone(),
-                block_state.clone(),
-                &accounts.0,
-                command.l1_rpc_url.clone(),
-            )
-            .await?,
-        );
-        tracing::warn!(
-            "SYNTHETIC_PROJECTOR enabled: the SyntheticProjector is the SOLE synthetic-event \
-             producer and the SINGLE owner of the synthetic tip. SINGLE-PROCESS ONLY — multiple \
-             replicas are NOT supported."
-        );
-        sync_listeners.push(projector);
-    }
 
     let client = MidenClient::new(
         miden_store_dir.clone(),
@@ -621,6 +587,7 @@ async fn main() -> anyhow::Result<()> {
             &store,
             &client,
             &accounts.0,
+            local_network_id_u32,
             &block_state,
             command.l1_rpc_url.clone(),
         )
@@ -663,12 +630,6 @@ async fn main() -> anyhow::Result<()> {
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     state.miden_api_key = command.miden_api_key;
     state.enable_writer_worker = command.enable_writer_worker;
-    // Phase 2b cut-over: when the projector is enabled it is the sole synthetic-
-    // event producer, so the submit-path writers (`claim::publish_claim`,
-    // `ger::insert_ger`) suppress their synthetic emission + tip reservation
-    // while still submitting to Miden. Mirrors the bridge-out/claim-watcher
-    // listener suppression wired above.
-    state.suppress_synthetic_emission = projector_enabled;
 
     // RD-940 — spawn the writer worker if the flag is set. The worker is a
     // single tokio task with a bounded mpsc queue between it and
@@ -704,16 +665,6 @@ async fn main() -> anyhow::Result<()> {
         );
         None
     };
-
-    // Synthetic-indexer redesign (Phase 2a) — the flag is declared and logged
-    // but NOT acted on yet (default-off, zero production behaviour change). The
-    // projector is wired in as a live sync listener in Phase 2b; here we only
-    // surface the configured value so deployments can confirm it parses.
-    tracing::info!(
-        synthetic_projector_enabled = command.synthetic_projector_enabled,
-        "synthetic projector flag parsed (Phase 2a: declared only, not yet wired \
-         into the live service; no behaviour change regardless of value)"
-    );
 
     // L1 InfoTree indexer — eliminates the RD-862 GER decomposition race by
     // proactively indexing every (mainnet, rollup) pair as L1 emits it,
@@ -1018,7 +969,6 @@ mod hardening_tests {
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
             enable_writer_worker: false,
-            synthetic_projector_enabled: false,
         }
     }
 

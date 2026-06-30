@@ -24,8 +24,8 @@
 //!   `log_synthesis.rs` into a single `record(BlockEvent)` writer that
 //!   enforces the log-first/cursor-second ordering structurally rather than
 //!   via tribal-knowledge comments. The atomic-store helpers
-//!   (`commit_ger_event_atomic`, `commit_manual_claim_event_atomic`,
-//!   `commit_b2agg_event_atomic`) already enforce that ordering at the
+//!   (`the projector GER commit`, `commit_manual_claim_event_atomic`,
+//!   `the projector B2AGG commit`) already enforce that ordering at the
 //!   storage layer; centralising at the *call site* requires touching ~9
 //!   files and is the next PR's scope.
 //! - Deleting `StoreSyncListener` and `BlockState::on_sync`.

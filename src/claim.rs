@@ -382,6 +382,10 @@ pub struct PublishClaimTxn {
     pub log: LogData,
     /// CLAIM note ID for consumption tracking (deferred receipts).
     pub claim_note_id: Option<String>,
+    /// Hex `details_commitment()` of the on-chain CLAIM note — the key the
+    /// SyntheticProjector uses to recover the real claim eth-tx for the
+    /// consumed note (see `record_tx_note_link` / `get_tx_for_note`).
+    pub note_commitment: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -435,6 +439,17 @@ async fn publish_claim_internal(
     )
     .await?;
     let claim_note_id = claim_note.id().to_string();
+    // The note's details-commitment, encoded identically to how the projector
+    // keys consumed notes (`InputNoteRecord::details_commitment()`). This ties
+    // the real claim eth-tx to the on-chain CLAIM note so the SyntheticProjector
+    // can emit the ClaimEvent under the REAL tx hash (which carries the
+    // `claimAsset` calldata aggkit decodes for the claim's GER boundary) instead
+    // of a derived hash whose synthetic tx has empty calldata.
+    let note_commitment = hex::encode(
+        miden_protocol::note::NoteDetails::from(&claim_note)
+            .commitment()
+            .as_bytes(),
+    );
 
     const EXPIRATION_DELTA: u16 = 10;
     let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
@@ -646,6 +661,7 @@ async fn publish_claim_internal(
         expires_at,
         log,
         claim_note_id: Some(claim_note_id),
+        note_commitment,
     })
 }
 
@@ -701,11 +717,6 @@ pub async fn publish_claim(
     reject_zero_padding: bool,
     reject_hardhat_alias: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
-    // Phase 2b cut-over: when `true`, the SyntheticProjector is the sole
-    // synthetic-event producer, so skip writing the synthetic ClaimEvent log +
-    // tip reservation here. The CLAIM note submission to Miden (and the caller's
-    // receipt) are KEPT — only the synthetic ClaimEvent emission is suppressed.
-    suppress_synthetic_emission: bool,
 ) -> anyhow::Result<PublishClaimTxn> {
     // Submit with runtime self-heal, mirroring the pattern in
     // `src/ger.rs::insert_ger`. If the inner Miden submission rejects with
@@ -735,7 +746,6 @@ pub async fn publish_claim(
         reject_zero_padding,
         reject_hardhat_alias,
         expected_mints.clone(),
-        suppress_synthetic_emission,
     )
     .await
     {
@@ -760,7 +770,6 @@ pub async fn publish_claim(
                 reject_zero_padding,
                 reject_hardhat_alias,
                 expected_mints,
-                suppress_synthetic_emission,
             )
             .await
         }
@@ -782,7 +791,6 @@ async fn attempt_publish_claim(
     reject_zero_padding: bool,
     reject_hardhat_alias: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
-    suppress_synthetic_emission: bool,
 ) -> anyhow::Result<PublishClaimTxn> {
     // Snapshot the opt-in local-prover fallback BEFORE entering the
     // `client.with(...)` closure — the closure receives a
@@ -809,21 +817,14 @@ async fn attempt_publish_claim(
                     local_prover_fallback,
                 )
                 .await?;
-                // Phase 2b cut-over: when the SyntheticProjector is the sole
-                // synthetic-event producer, suppress the synthetic ClaimEvent
-                // emission + tip reservation. We STILL record the caller's
-                // receipt (`txn_begin`/`txn_commit`) so `eth_getTransactionReceipt`
-                // resolves — but with NO synthetic log and at the current tip
-                // (no `+1`, no `set_latest_block_number`). The projector emits the
-                // ClaimEvent when it observes the CLAIM note consumed.
-                let (block_num, logs) = if suppress_synthetic_emission {
-                    (store.get_latest_block_number().await?, vec![])
-                } else {
-                    (
-                        store.get_latest_block_number().await? + 1,
-                        vec![value.log.clone()],
-                    )
-                };
+                // The SyntheticProjector is the sole synthetic-event producer: it
+                // emits the ClaimEvent (under THIS claim tx hash, via the tx↔note
+                // link recorded below) + advances the synthetic tip when it
+                // observes the CLAIM note consumed. This path records ONLY the
+                // caller's receipt (txn_begin/txn_commit) so
+                // `eth_getTransactionReceipt` resolves — no synthetic log, no tip
+                // advance, at the current tip.
+                let block_num = store.get_latest_block_number().await?;
                 let block_hash = block_state.get_block_hash(block_num);
                 store
                     .txn_begin(
@@ -833,20 +834,25 @@ async fn attempt_publish_claim(
                             envelope: txn_envelope,
                             signer,
                             expires_at: Some(value.expires_at),
-                            logs,
+                            logs: vec![],
                         },
                     )
                     .await?;
                 store
                     .txn_commit(txn_hash, Ok(()), block_num, block_hash)
                     .await?;
-                if !suppress_synthetic_emission {
-                    store.set_latest_block_number(block_num).await?;
-                }
+                // Tie the real claim eth-tx to the on-chain CLAIM note so the
+                // SyntheticProjector emits the ClaimEvent under THIS tx hash —
+                // whose tx carries the `claimAsset` calldata aggkit decodes for the
+                // claim's GER boundary — instead of a derived hash with empty
+                // calldata (which made aggkit's L2BridgeSyncer fail
+                // "input too short: 0 bytes" and stall certificate settlement).
+                store
+                    .record_tx_note_link(&format!("{txn_hash:#x}"), &value.note_commitment)
+                    .await?;
                 tracing::info!(
                     eth_tx = %txn_hash,
                     block_num,
-                    suppress_synthetic_emission,
                     "ClaimEvent recorded (cancellation-safe)"
                 );
                 let _ = result_inner.set(value);

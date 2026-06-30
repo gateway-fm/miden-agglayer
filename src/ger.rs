@@ -166,18 +166,17 @@ async fn submit_update_ger_note(
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
-    mainnet_exit_root: Option<[u8; 32]>,
-    rollup_exit_root: Option<[u8; 32]>,
+    // Vestigial after the cut-over: the GER synthetic log (and the exit-root
+    // detail it carried) is now emitted by the SyntheticProjector from the
+    // consumed UpdateGerNote, not here. Kept in the signature so the GER-inject
+    // call chain stays unchanged; a follow-up can prune the exit-root threading.
+    _mainnet_exit_root: Option<[u8; 32]>,
+    _rollup_exit_root: Option<[u8; 32]>,
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: &Arc<dyn crate::store::Store>,
-    block_state: &Arc<crate::block_state::BlockState>,
-    txn_hash: TxHash,
-    // Phase 2b cut-over: when `true`, the SyntheticProjector is the sole
-    // synthetic-event producer, so skip the synthetic GER log emission + block
-    // reservation here. The Miden UpdateGerNote submission is KEPT — only the
-    // synthetic event and tip advance are suppressed.
-    suppress_synthetic_emission: bool,
+    _block_state: &Arc<crate::block_state::BlockState>,
+    _txn_hash: TxHash,
 ) -> anyhow::Result<GerInsertResult> {
     // Check dedup before doing any work.
     //
@@ -230,51 +229,12 @@ pub async fn insert_ger(
             Err(err) => return Err(err),
         }
 
-        if suppress_synthetic_emission {
-            // Phase 2b: the SyntheticProjector will emit the GER log + advance
-            // the tip when it observes the UpdateGerNote consumed. Do NOT
-            // reserve a block here (no race). Report the current tip so the
-            // caller's receipt records at a real block (mirrors
-            // `record_local_immediate_success`) rather than block 0.
-            block_number = store.get_latest_block_number().await?;
-        } else {
-            // Race-safe ordering: write the log at (current_latest + 1) BEFORE
-            // bumping `latest_block_number`. See the matching comment in
-            // `bridge_out.rs::on_post_sync`: if we advance the counter first,
-            // aggsender / bridge-service can poll `eth_blockNumber` in the window
-            // where `latest == N` but the log at block `N` hasn't been written yet,
-            // permanently skipping the GER event.
-            block_number = store.get_latest_block_number().await? + 1;
-            let block_hash = block_state.get_block_hash(block_number);
-            let timestamp = block_state.get_block_timestamp(block_number);
-
-            // Miden submission succeeded — now record the event.
-            //
-            // G5 — single atomic store transaction. Replaces the previous
-            // three sequential calls (add_ger_update_event,
-            // mark_ger_injected, set_latest_block_number) which were not
-            // atomic: a process crash between any two left aggkit in a
-            // split state. The PgStore override folds all five writes
-            // (ger_entries upsert, hash_chain UPDATE, synthetic_logs
-            // INSERT, is_injected UPDATE, latest_block_number UPDATE) into
-            // one SERIALIZABLE postgres transaction. InMemoryStore uses the
-            // default trait impl that just calls the primitives in sequence
-            // (safe in-process; no crash window for tests).
-            //
-            // Supersedes G4's narrowing of the gap.
-            let tx_hash_str = format!("{txn_hash:#x}");
-            store
-                .commit_ger_event_atomic(
-                    block_number,
-                    block_hash,
-                    &tx_hash_str,
-                    &ger_bytes,
-                    mainnet_exit_root,
-                    rollup_exit_root,
-                    timestamp,
-                )
-                .await?;
-        }
+        // The SyntheticProjector is the sole synthetic-event producer: it emits
+        // the GER log + advances the synthetic tip when it observes the
+        // UpdateGerNote consumed. This path only submits the note to Miden. Report
+        // the current tip so the caller's receipt records at a real block (mirrors
+        // `record_local_immediate_success`) rather than block 0.
+        block_number = store.get_latest_block_number().await?;
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),

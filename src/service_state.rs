@@ -141,13 +141,6 @@ pub struct ServiceState {
     /// `Arc` shares the underlying channel + in-flight DashMap across every
     /// `ServiceState::clone()` the dispatcher hands out.
     pub writer_handle: Option<Arc<crate::writer_worker::WriterWorkerHandle>>,
-    /// Synthetic-indexer redesign (Phase 2b). When `true`, the
-    /// `SyntheticProjector` is the sole synthetic-event producer, so the
-    /// submit-path writers (`claim::publish_claim`, `ger::insert_ger`) suppress
-    /// their synthetic ClaimEvent / GER-log emission + tip reservation while
-    /// still submitting to Miden. Mirrors the `synthetic_projector_enabled`
-    /// CLI flag; default `false` keeps the legacy behaviour byte-identical.
-    pub suppress_synthetic_emission: bool,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -195,7 +188,6 @@ impl ServiceState {
             miden_api_key: None,
             enable_writer_worker: false,
             writer_handle: None,
-            suppress_synthetic_emission: false,
         }
     }
 }

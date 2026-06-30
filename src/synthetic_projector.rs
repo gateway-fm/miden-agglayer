@@ -17,28 +17,32 @@
 //! instance; this is a hard invariant from the design doc, asserted loudly at
 //! the cut-over phase.
 //!
-//! ## Phase 2b status — the cut-over flip (feature-flag gated)
+//! ## The sole synthetic-event producer
 //!
-//! When `synthetic_projector_enabled` (env `SYNTHETIC_PROJECTOR`, default
-//! `false`) is ON, the projector is registered as a [`SyncListener`] and is the
-//! **sole** synthetic-event producer: the four legacy writer sites suppress
-//! their synthetic emission + tip reservation (but still submit to Miden). When
-//! OFF (default) the projector is not registered and behaviour is unchanged.
+//! The projector is ALWAYS registered as a [`SyncListener`] and is the **only**
+//! synthetic-event producer and the **only** advancer of `latest_block_number`.
+//! The legacy writer paths now only submit to Miden (the user's B2AGG note, the
+//! ger_manager UpdateGerNote, the CLAIM note); they emit no synthetic logs and
+//! never touch the tip. The projector re-derives every BridgeEvent / ClaimEvent /
+//! GER `UpdateHashChainValue` log from the consumed Miden notes.
 //!
 //! The projector writes into the store exactly the way `restore` does — through
 //! the shared `project_b2agg_note` / `project_claim_note` / `project_ger_note`
 //! derivations — and is idempotent via the existing `is_*_processed` /
 //! `is_ger_injected` dedup keys.
 //!
-//! ## Determinism + numbering contract
+//! ## Determinism + numbering contract (Miden-1:1)
 //!
-//! Synthetic blocks are assigned **sequentially, one per emitted log** (NOT one
-//! per Miden block), so the downstream numbering is identical to today (dense,
-//! one log per block). Within a Miden block, consumed notes are ordered by
-//! `(consumed_tx_order, note_id)` before deriving, so re-running the projector
-//! over the same chain yields byte-identical synthetic blocks (numbers, hashes,
-//! log order, log indices). The projector is the sole assigner of the synthetic
-//! tip, so there is no reservation race.
+//! Synthetic block N == Miden block N. Every synthetic log derived from notes
+//! consumed at Miden block N is written at synthetic block N, and the tip is
+//! advanced to N once, **after** the block (write-before-advance) — including for
+//! EMPTY Miden blocks, so the synthetic chain mirrors Miden block-for-block and
+//! `eth_blockNumber` tracks the Miden tip. Within a Miden block, consumed notes
+//! are ordered by `(consumed_tx_order, note_id)` before deriving, so re-running
+//! the projector over the same chain yields byte-identical synthetic blocks
+//! (numbers, hashes, log order, log indices). Because the projector is the sole
+//! assigner of the synthetic tip, there is no `get_latest()+1` reservation race —
+//! Finding #5 is eliminated by construction.
 
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
@@ -67,6 +71,10 @@ pub struct SyntheticProjector {
     /// Bridge account id — the sole legitimate consumer of a bridge-out B2AGG
     /// note (MA#3) and the expected GER target (MA#28).
     bridge_id: AccountId,
+    /// This rollup's AggLayer network id. Threaded into `project_b2agg_note` for
+    /// the Cantina #13 self-target poison-leaf gate: a B2AGG bridge-out whose
+    /// destination IS this network must NOT emit a synthetic BridgeEvent.
+    local_network_id: u32,
     /// Expected GER sender (ger_manager, or service for legacy deployments).
     expected_ger_sender: AccountId,
     /// L1 JSON-RPC endpoint for the Cantina #13 Layer-2 ERC-20 metadata
@@ -90,6 +98,7 @@ impl SyntheticProjector {
         store: Arc<dyn Store>,
         block_state: Arc<BlockState>,
         accounts: &AccountsConfig,
+        local_network_id: u32,
         l1_rpc_url: Option<String>,
     ) -> anyhow::Result<Self> {
         // MA#28 — same fallback as `restore_gers` / `submit_update_ger_note`:
@@ -105,6 +114,7 @@ impl SyntheticProjector {
             store,
             block_state,
             bridge_id: accounts.bridge.0,
+            local_network_id,
             expected_ger_sender,
             l1_rpc_url,
             cursor: AtomicU64::new(start_cursor),
@@ -116,14 +126,12 @@ impl SyntheticProjector {
         self.cursor.load(Ordering::Acquire)
     }
 
-    /// Project the notes consumed at one Miden block (`miden_block`) into
-    /// **sequential** synthetic blocks — one synthetic block per *emitted* log.
-    ///
-    /// This keeps today's downstream numbering exactly: the legacy writers each
-    /// reserve `latest_block_number + 1` and emit a single log there, so the
-    /// synthetic chain is dense with one log per block. The projector preserves
-    /// that by reserving the next synthetic block per emission rather than one
-    /// per Miden block (so an empty/all-skipped Miden block reserves nothing).
+    /// Project the notes consumed at one Miden block (`miden_block`) into the
+    /// single synthetic block `miden_block` (**Miden-1:1**): every synthetic log
+    /// derived from this block's notes is written at synthetic block == the Miden
+    /// block, and the tip is advanced to `miden_block` once, AFTER the block
+    /// (write-before-advance) — even when the block produced no logs, so the
+    /// synthetic chain mirrors Miden block-for-block.
     ///
     /// Determinism: within the Miden block, consumed notes are ordered by
     /// `(consumed_tx_order, note_id_hex)` before deriving, so re-running over the
@@ -168,28 +176,24 @@ impl SyntheticProjector {
 
         let bridge_address = get_bridge_address();
 
+        // Miden-1:1 numbering: synthetic block N == Miden block N. Every synthetic
+        // log for this Miden block is written AT block `miden_block`; the tip is
+        // advanced exactly ONCE, after the whole block (below). The projector is
+        // the SOLE advancer of `latest_block_number` — nothing else may touch it.
+        let block_hash = self.block_state.get_block_hash(miden_block);
+        let timestamp = self.block_state.get_block_timestamp(miden_block);
+
         let mut logs = 0usize;
         for note in notes {
-            // Reserve the next synthetic block for THIS note's potential log.
-            // The block number is an input to the `project_*` write, so it is
-            // reserved BEFORE the derivation runs; the tip is advanced only AFTER
-            // an emission (write-log-before-tip-advance, exactly like the legacy
-            // writers). A skipped derivation leaves `latest_block_number`
-            // untouched, so the same reserved number is re-used by the next note
-            // — keeping the synthetic chain dense (no phantom blocks).
-            let next = self.store.get_latest_block_number().await? + 1;
-            let block_hash = self.block_state.get_block_hash(next);
-            let timestamp = self.block_state.get_block_timestamp(next);
-
             // A consumed note matches at most one of the three script roots, so
             // trying all three derivations emits at most one synthetic log per
-            // note. This is exactly the unification the design doc calls for:
-            // the three restore derivations collapsed into one per-note loop.
+            // note — the three restore derivations unified into one per-note loop.
             if project_b2agg_note(
                 &self.store,
                 note,
                 self.bridge_id,
-                next,
+                self.local_network_id,
+                miden_block,
                 block_hash,
                 bridge_address,
                 // Cantina #13 recovery context: the live client + the projector's
@@ -200,18 +204,14 @@ impl SyntheticProjector {
             .await?
                 == B2AggRestoreOutcome::Emitted
             {
-                self.store.set_latest_block_number(next).await?;
                 logs += 1;
                 continue;
             }
 
-            if project_claim_note(&self.store, note, next, block_hash, bridge_address).await?
+            if project_claim_note(&self.store, note, miden_block, block_hash, bridge_address)
+                .await?
                 == ClaimProjectOutcome::Emitted
             {
-                // `commit_manual_claim_event_atomic` already advances the tip to
-                // `next` inside its transaction; setting it again is a harmless
-                // no-op and keeps the advance explicit at the call site.
-                self.store.set_latest_block_number(next).await?;
                 logs += 1;
                 continue;
             }
@@ -222,18 +222,23 @@ impl SyntheticProjector {
                 output_metadata,
                 self.expected_ger_sender,
                 self.bridge_id,
-                next,
+                miden_block,
                 block_hash,
                 timestamp,
             )
             .await?
                 == GerProjectOutcome::Emitted
             {
-                self.store.set_latest_block_number(next).await?;
                 logs += 1;
                 continue;
             }
         }
+
+        // Write-before-advance: every synthetic log for `miden_block` is now in the
+        // DB, so it is safe to advance the synthetic tip to == the Miden block.
+        // Runs for EMPTY Miden blocks too (advance the tip even with 0 logs), so the
+        // synthetic chain mirrors Miden block-for-block (eth_blockNumber == Miden tip).
+        self.store.set_latest_block_number(miden_block).await?;
 
         Ok(logs)
     }
@@ -289,9 +294,31 @@ impl SyntheticProjector {
             .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
             .as_u64();
         let mut cursor = self.cursor.load(Ordering::Acquire);
+        if cursor >= tip {
+            return Ok(cursor);
+        }
+        // Perf-critical: fetch the consumed-note feed + output-note metadata ONCE
+        // per tick, NOT once per block. There is no server-side block-range filter
+        // for notes, so a per-block fetch makes tick O(blocks × notes); the
+        // projector then never catches up to the Miden tip (observed in e2e as the
+        // bridge-in deposit never becoming claimable, because its GER injection
+        // never gets projected). The feeds are owned, so `project_notes` filters
+        // them per block by `nullifier_block_height` without re-fetching.
+        let consumed = client
+            .get_input_notes(NoteFilter::Consumed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+        let output_metadata: HashMap<[u8; 32], NoteMetadata> = client
+            .get_output_notes(NoteFilter::All)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
+            .into_iter()
+            .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
+            .collect();
         while cursor < tip {
             let next = cursor + 1;
-            self.project_block(client, next).await?;
+            self.project_notes(&consumed, &output_metadata, next, Some(client))
+                .await?;
             // Advance the cursor only after the block is fully projected, so a
             // crash mid-block re-projects (idempotently) rather than skipping.
             // Persist BEFORE updating the in-memory cache so the durable cursor
@@ -300,6 +327,17 @@ impl SyntheticProjector {
             self.cursor.store(next, Ordering::Release);
             cursor = next;
         }
+        // Observability: the projector follows the MIDEN chain, so its progress is
+        // measured against the Miden tip (NOT L1). `projector_cursor == miden_tip`
+        // means fully caught up; `synthetic_tip` is the actual synthetic L2 block
+        // number the chain is exposing. Logged once per tick that did work.
+        let synthetic_tip = self.store.get_latest_block_number().await?;
+        tracing::info!(
+            miden_tip = tip,
+            projector_cursor = cursor,
+            synthetic_tip,
+            "synthetic projector tick: caught up to Miden tip"
+        );
         Ok(cursor)
     }
 }
@@ -485,9 +523,15 @@ mod tests {
         store: &StdArc<dyn Store>,
         block_state: &StdArc<BlockState>,
     ) -> SyntheticProjector {
-        SyntheticProjector::new(store.clone(), block_state.clone(), &test_accounts(), None)
-            .await
-            .unwrap()
+        SyntheticProjector::new(
+            store.clone(),
+            block_state.clone(),
+            &test_accounts(),
+            7,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn register_faucet(store: &StdArc<dyn Store>) {
@@ -518,11 +562,11 @@ mod tests {
     }
 
     /// (i) A Miden block with a bridge-consumed B2AGG note + a CLAIM note + a
-    /// GER note projects to THREE *sequential* synthetic blocks (one per emitted
-    /// log), in the deterministic `(consumed_tx_order, note_id)` order. Numbering
-    /// is dense and starts at `latest_block_number + 1` (== 1 on a fresh store).
+    /// GER note projects THREE synthetic logs into the SAME synthetic block
+    /// (Miden-1:1: synthetic block N == Miden block N), in the deterministic
+    /// `(consumed_tx_order, note_id)` order, with sequential log indices.
     #[tokio::test]
-    async fn projects_three_derivations_into_sequential_blocks() {
+    async fn projects_three_derivations_into_one_miden_block() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         register_faucet(&store).await;
 
@@ -543,16 +587,16 @@ mod tests {
             .unwrap();
         assert_eq!(written, 3, "all three derivations must emit one log each");
 
-        // One log per synthetic block, sequential: 1, 2, 3.
-        let logs = logs_in_range(&store, 1, 3).await;
-        assert_eq!(logs.len(), 3, "three logs across three synthetic blocks");
+        // Miden-1:1: all three logs land in synthetic block 5 (== the Miden block).
+        let logs = logs_in_range(&store, 0, 5).await;
+        assert_eq!(logs.len(), 3, "three logs in the one synthetic block");
         assert_eq!(
             logs.iter().map(|l| l.block_number).collect::<Vec<_>>(),
-            vec![1, 2, 3],
-            "sequential one-log-per-block numbering",
+            vec![5, 5, 5],
+            "Miden-1:1: every log for Miden block 5 lands in synthetic block 5",
         );
-        // The synthetic tip is the last emitted block.
-        assert_eq!(store.get_latest_block_number().await.unwrap(), 3);
+        // The synthetic tip == the Miden block.
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 5);
         // Log indices are sequential in projection order.
         assert_eq!(
             logs.iter().map(|l| l.log_index).collect::<Vec<_>>(),
@@ -599,7 +643,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, 3);
-        assert_eq!(store.get_latest_block_number().await.unwrap(), 3);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 7);
 
         let second = projector
             .project_notes(&notes, &output_metadata, 7, None)
@@ -608,19 +652,19 @@ mod tests {
         assert_eq!(second, 0, "second projection must emit no new logs");
         assert_eq!(
             store.get_latest_block_number().await.unwrap(),
-            3,
-            "tip must not advance on a no-op re-projection",
+            7,
+            "tip stays at the Miden block on a no-op re-projection",
         );
 
-        let logs = logs_in_range(&store, 1, 3).await;
+        let logs = logs_in_range(&store, 0, 7).await;
         assert_eq!(logs.len(), 3, "no duplicate logs after re-projection");
     }
 
-    /// (iii) Notes consumed at different Miden blocks still project into a
-    /// single dense, sequential synthetic chain (numbering is per-emitted-log,
-    /// decoupled from the Miden block height).
+    /// (iii) Notes consumed at different Miden blocks project into the synthetic
+    /// blocks matching their Miden heights (Miden-1:1) — synthetic block N is
+    /// exactly Miden block N, including the gaps between them.
     #[tokio::test]
-    async fn distinct_nullifier_heights_project_into_sequential_blocks() {
+    async fn distinct_nullifier_heights_project_into_their_miden_blocks() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         register_faucet(&store).await;
 
@@ -631,7 +675,7 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
 
-        // Project Miden block 3: only the B2AGG note belongs here → synthetic 1.
+        // Project Miden block 3: only the B2AGG note belongs here → synthetic 3.
         assert_eq!(
             projector
                 .project_notes(&notes, &output_metadata, 3, None)
@@ -639,7 +683,8 @@ mod tests {
                 .unwrap(),
             1
         );
-        // Project Miden block 8: only the CLAIM note belongs here → synthetic 2.
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 3);
+        // Project Miden block 8: only the CLAIM note belongs here → synthetic 8.
         assert_eq!(
             projector
                 .project_notes(&notes, &output_metadata, 8, None)
@@ -647,13 +692,13 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 8);
 
-        let logs = logs_in_range(&store, 1, 2).await;
+        let logs = logs_in_range(&store, 0, 8).await;
         assert_eq!(logs.len(), 2);
-        // Dense + sequential: synthetic blocks 1 then 2, regardless of the
-        // (3, 8) Miden heights.
-        assert_eq!(logs[0].block_number, 1);
-        assert_eq!(logs[1].block_number, 2);
+        // Miden-1:1: synthetic blocks 3 and 8 (== the Miden heights), not 1 and 2.
+        assert_eq!(logs[0].block_number, 3);
+        assert_eq!(logs[1].block_number, 8);
         assert_eq!(
             logs[0].transaction_hash,
             crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
@@ -667,7 +712,7 @@ mod tests {
     }
 
     /// (iv) Two independent runs over the same consumed-note set produce
-    /// byte-identical synthetic logs: same (sequential) block numbers, block
+    /// byte-identical synthetic logs: same (Miden-1:1) block numbers, block
     /// hashes, log indices and ordering.
     #[tokio::test]
     async fn two_runs_are_byte_identical() {
@@ -686,7 +731,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(written, 3);
-            logs_in_range(&store, 1, 3).await
+            logs_in_range(&store, 0, 9).await
         }
 
         let run_a = run().await;
@@ -704,5 +749,51 @@ mod tests {
             assert_eq!(a.topics, b.topics, "topics must match");
             assert_eq!(a.data, b.data, "data must match");
         }
+    }
+
+    /// Certificate-settlement regression: when `publish_claim` has linked the
+    /// real claim eth-tx to the CLAIM note (`record_tx_note_link`), the projected
+    /// ClaimEvent MUST ride that real tx hash — not a derived one. aggkit's
+    /// L2BridgeSyncer fetches the claim tx by hash and decodes its `claimAsset`
+    /// calldata to resolve the GER boundary; a derived hash points at a synthetic
+    /// tx with EMPTY calldata, so aggkit fails "input too short: 0 bytes" and
+    /// never settles the certificate.
+    #[tokio::test]
+    async fn claim_event_rides_linked_real_tx_hash() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+
+        let n_claim = claim_note(5, Some(0));
+        let note_commitment = hex::encode(n_claim.details_commitment().as_bytes());
+        let real_tx = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        // publish_claim records this link when it submits the CLAIM note.
+        store
+            .record_tx_note_link(real_tx, &note_commitment)
+            .await
+            .unwrap();
+
+        let notes = vec![n_claim.clone()];
+        let output_metadata = HashMap::new();
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        assert_eq!(
+            projector
+                .project_notes(&notes, &output_metadata, 5, None)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let logs = logs_in_range(&store, 0, 5).await;
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].transaction_hash, real_tx,
+            "ClaimEvent must ride the linked real claim tx hash (carries claimAsset calldata)"
+        );
+        assert_ne!(
+            logs[0].transaction_hash,
+            derive_manual_claim_tx_hash(&note_commitment),
+            "must NOT fall back to the derived hash when a link exists"
+        );
     }
 }

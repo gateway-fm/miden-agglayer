@@ -12,11 +12,35 @@ pub async fn service_get_txn_receipt(
     txn_hash: String,
 ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<Log>>>> {
     let txn_hash = TxHash::from_str(&txn_hash)?;
-    let (result, block_num) = match service.store.txn_receipt(txn_hash).await? {
-        Some((result, block_num)) => (result, block_num),
-        None => return Ok(None),
+    let (status, block_num) = match service.store.txn_receipt(txn_hash).await? {
+        Some((result, block_num)) => (result.is_ok(), block_num),
+        None => {
+            // Synthetic-log receipt fallback (receipts contract). A tx that emitted
+            // a synthetic log — a projected BridgeEvent / ClaimEvent / GER update —
+            // has NO real txn record: it was never an `eth_sendRawTransaction`; the
+            // SyntheticProjector DERIVES it from a consumed Miden note. But in EVM a
+            // tx that produced a log MUST have a receipt. aggkit's L2BridgeSyncer
+            // calls `eth_getTransactionReceipt` for every bridge/claim log it sees,
+            // and on a null receipt it fails to append the log ("input too short: 0
+            // bytes") and STALLS the entire L2 sync — so no certificate is ever
+            // built and bridge-outs never settle on L1. Tie the hashes together via
+            // `logs_by_tx`: if this tx_hash has synthetic logs, synthesise a success
+            // receipt at the log's block.
+            //
+            // Legacy served this implicitly — the live claim path emitted its
+            // ClaimEvent under the real `eth_sendRawTransaction` hash (which already
+            // had a receipt). The projector emits under a derived hash, so the proxy
+            // must serve the receipt for it directly.
+            let logs = service
+                .store
+                .get_logs_for_tx(&format!("{txn_hash:#x}"))
+                .await?;
+            match logs.first() {
+                Some(log) => (true, log.block_number),
+                None => return Ok(None),
+            }
+        }
     };
-    let status = result.is_ok();
 
     let mut receipt_inner = ReceiptWithBloom::<Receipt<Log>>::default();
     receipt_inner.receipt.status = Eip658Value::Eip658(status);
@@ -177,6 +201,53 @@ mod tests {
         assert!(
             result.is_none(),
             "pre-commit receipt MUST be None — aggkit reads it as 'keep polling'"
+        );
+    }
+
+    /// Receipts contract — a tx that emitted a synthetic log (a projected
+    /// BridgeEvent / ClaimEvent / GER update) has NO real txn record, yet
+    /// `eth_getTransactionReceipt` MUST return a receipt, not null. aggkit's
+    /// L2BridgeSyncer fetches the receipt for every bridge/claim log; a null
+    /// receipt makes it fail to append the log ("input too short: 0 bytes") and
+    /// stalls the L2 sync so no certificate is ever built. Regression guard for
+    /// the SyntheticProjector cut-over (derived tx_hash, no `eth_sendRawTransaction`).
+    #[tokio::test]
+    async fn synthetic_log_tx_synthesises_a_receipt() {
+        use crate::log_synthesis::SyntheticLog;
+        let service = create_test_service();
+        // A derived synthetic tx_hash with NO txn_begin/commit — exactly what the
+        // projector emits for a consumed bridge-out / claim note.
+        let tx = "0x4b7cc79e914e4e8ab23640d2aa2e48cdd5627669f5d982e2c85e47e8c1d558eb";
+        service
+            .store
+            .add_log(SyntheticLog {
+                address: "0xc8cbebf950b9df44d987c8619f092bea980ff038".to_string(),
+                topics: vec![
+                    "0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
+                        .to_string(),
+                ],
+                data: "0x".to_string(),
+                block_number: 39,
+                block_hash: [0u8; 32],
+                transaction_hash: tx.to_string(),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            })
+            .await
+            .unwrap();
+
+        let receipt = service_get_txn_receipt(service, tx.to_string())
+            .await
+            .unwrap()
+            .expect("a tx that emitted a synthetic log MUST have a receipt, not null");
+        assert_eq!(receipt.block_number, Some(39), "receipt at the log's block");
+        assert!(
+            matches!(
+                receipt.inner.as_receipt().unwrap().status,
+                alloy::consensus::Eip658Value::Eip658(true)
+            ),
+            "synthetic-log receipt is a success"
         );
     }
 }

@@ -1,40 +1,22 @@
-//! Claim Watcher — synthesise missing ClaimEvent logs from on-chain CLAIM notes.
+//! CLAIM-note storage decoder — `ClaimNoteStorage` → `DecodedClaim` (the fields
+//! of a synthetic `ClaimEvent`), plus the deterministic synthetic claim tx-hash
+//! derivation (`derive_manual_claim_tx_hash`).
 //!
-//! The proxy's primary path emits a synthetic `ClaimEvent` log inside
-//! `eth_sendRawTransaction` (`claim::publish_claim_internal`): once the CLAIM
-//! note submission to Miden commits, the log is written to the store keyed by
-//! the inbound L1 tx-hash. Bridge-service / aggsender index those events to
-//! mark the L1 deposit as claimed.
+//! Shared by the [`SyntheticProjector`](crate::synthetic_projector)'s
+//! `restore::project_claim_note` and the startup restore replay: both observe a
+//! CLAIM note consumed on Miden, decode its on-chain `ClaimNoteStorage`, and emit
+//! a synthetic `ClaimEvent` via `Store::commit_manual_claim_event_atomic`.
+//! Keeping the decoder + tx-hash derivation here means the projector and restore
+//! produce byte-identical ClaimEvents.
 //!
-//! This module covers the failure modes where that primary path doesn't run to
-//! completion:
-//!
-//! 1. **Crash recovery** — the proxy submits the CLAIM tx but dies before
-//!    `txn_commit` writes the log. On restart the CLAIM exists on-chain but
-//!    the store has no record; bridge-service permanently misses the event.
-//! 2. **Foreign CLAIMs** — an operator submits a CLAIM note via a different
-//!    miden-client (recovery script, manual MASM tooling). The proxy never
-//!    sees the `eth_sendRawTransaction` call and so never writes the log.
-//!    Reachability for this case is bounded by miden-client's `Consumed`
-//!    filter — see the docstring on [`ClaimWatcher::on_post_sync`].
-//!
-//! The watcher runs as a [`SyncListener`] on every Miden sync tick. It
-//! enumerates consumed notes, filters by the CLAIM script root, decodes
-//! `ClaimNoteStorage` from the note's on-chain storage, dedups against any
-//! ClaimEvent already in the store (both watcher-emitted via
-//! [`Store::has_claim_event_for_global_index`] and normal-path-emitted via the
-//! same lookup), and atomically writes a synthetic ClaimEvent via
-//! [`Store::commit_manual_claim_event_atomic`].
+//! (Historically this module also hosted a live `ClaimWatcher` SyncListener that
+//! synthesised ClaimEvents on every tick. The SyntheticProjector is now the SOLE
+//! synthetic-event producer, so that watcher was removed in the cut-over; only
+//! the shared decoder remains.)
 
-use crate::block_state::BlockState;
-use crate::bridge_address::get_bridge_address;
-use crate::miden_client::{MidenClientLib, SyncListener};
-use anyhow::{Context, anyhow};
-use miden_client::store::{InputNoteRecord, NoteFilter};
-use miden_client::sync::SyncSummary;
+use anyhow::Context;
 use miden_protocol::note::NoteStorage;
 use sha3::{Digest, Keccak256};
-use std::sync::Arc;
 
 // CLAIMNOTESTORAGE FELT LAYOUT
 // ================================================================================================
@@ -196,253 +178,6 @@ pub fn derive_manual_claim_tx_hash(note_id_str: &str) -> String {
 // WATCHER
 // ================================================================================================
 
-/// Synchronises consumed CLAIM notes on the Miden chain into synthetic
-/// ClaimEvent logs in the proxy's store. See the module-level docstring for
-/// the failure modes this covers.
-pub struct ClaimWatcher {
-    store: Arc<dyn crate::store::Store>,
-    block_state: Arc<BlockState>,
-    /// Synthetic-indexer redesign (Phase 2b). When `true`, the
-    /// [`SyntheticProjector`](crate::synthetic_projector) is the sole
-    /// synthetic-event producer, so this watcher SUPPRESSES its own
-    /// `process_consumed_claim` emit loop in `on_post_sync`. Default `false`
-    /// (projector off) keeps the legacy behaviour byte-identical.
-    suppress_synthetic_emission: bool,
-}
-
-impl ClaimWatcher {
-    pub fn new(store: Arc<dyn crate::store::Store>, block_state: Arc<BlockState>) -> Self {
-        Self {
-            store,
-            block_state,
-            suppress_synthetic_emission: false,
-        }
-    }
-
-    /// Phase 2b cut-over: when `true`, suppress this watcher's synthetic
-    /// `ClaimEvent` emission (the `SyntheticProjector` owns it). Builder so
-    /// existing call sites and tests stay unchanged (default `false` = legacy
-    /// behaviour). See [`Self::suppress_synthetic_emission`].
-    pub fn with_suppress_synthetic_emission(mut self, suppress: bool) -> Self {
-        self.suppress_synthetic_emission = suppress;
-        self
-    }
-
-    /// Process a single consumed CLAIM note. Returns `true` if a synthetic
-    /// ClaimEvent was written and the caller must advance
-    /// `latest_block_number`; `false` if the note was skipped (already
-    /// processed, ClaimEvent already exists for this global_index, or storage
-    /// could not be decoded).
-    ///
-    /// The `bool` return type is load-bearing — mirrors the Cantina #13
-    /// follow-up contract in `bridge_out.rs::process_consumed_note`: never
-    /// advance the cursor without writing a log, or readers seeing `latest >=
-    /// N` won't find the log at N (aggsender skips, event lost forever).
-    async fn process_consumed_claim(&self, note: &InputNoteRecord, block_number: u64) -> bool {
-        let note_id_str = hex::encode(note.details_commitment().as_bytes());
-
-        // 1. Fast-path: have we already processed this CLAIM observation?
-        match self.store.is_claim_note_processed(&note_id_str).await {
-            Ok(true) => return false,
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(
-                    target: "claim_watcher",
-                    note_id = %note_id_str,
-                    error = ?e,
-                    "is_claim_note_processed failed; deferring to next sync tick"
-                );
-                return false;
-            }
-        }
-
-        // 2. Decode the CLAIM storage. Malformed storage gets quarantined the
-        //    same way `bridge_out.rs::B8` treats an unknown faucet — mark
-        //    processed so we don't burn cycles re-failing every sync tick.
-        let decoded = match parse_claim_event_from_storage(note.details().storage()) {
-            Ok(d) => d,
-            Err(e) => {
-                ::metrics::counter!("claim_watcher_storage_decode_total").increment(1);
-                tracing::warn!(
-                    target: "claim_watcher",
-                    note_id = %note_id_str,
-                    error = ?e,
-                    "CLAIM storage could not be decoded; quarantining note"
-                );
-                // Best-effort mark; if THIS fails the next tick re-tries —
-                // not ideal but not load-bearing for correctness either.
-                if let Err(mark_err) = self
-                    .store
-                    .mark_claim_note_processed(note_id_str.clone(), [0u8; 32], block_number)
-                    .await
-                {
-                    tracing::error!(
-                        target: "claim_watcher",
-                        note_id = %note_id_str,
-                        error = ?mark_err,
-                        "failed to mark undecodable CLAIM processed; will retry"
-                    );
-                }
-                ::metrics::counter!("claim_watcher_unrecoverable_total").increment(1);
-                return false;
-            }
-        };
-
-        // 3. Dedup against any ClaimEvent already in the store — either a
-        //    prior watcher emission or the normal-RPC path's emission. This
-        //    is the load-bearing check that prevents double-emitting when
-        //    the proxy's own `publish_claim` path already wrote the event
-        //    and we are observing the same note's consumption afterwards.
-        match self
-            .store
-            .has_claim_event_for_global_index(&decoded.global_index)
-            .await
-        {
-            Ok(true) => {
-                ::metrics::counter!("claim_watcher_already_recorded_total").increment(1);
-                tracing::debug!(
-                    target: "claim_watcher",
-                    note_id = %note_id_str,
-                    global_index = %hex::encode(decoded.global_index),
-                    "ClaimEvent already recorded for this global_index; marking note processed"
-                );
-                if let Err(e) = self
-                    .store
-                    .mark_claim_note_processed(
-                        note_id_str.clone(),
-                        decoded.global_index,
-                        block_number,
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        target: "claim_watcher",
-                        note_id = %note_id_str,
-                        error = ?e,
-                        "failed to mark already-recorded CLAIM processed"
-                    );
-                }
-                return false;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(
-                    target: "claim_watcher",
-                    note_id = %note_id_str,
-                    error = ?e,
-                    "has_claim_event_for_global_index failed; deferring"
-                );
-                return false;
-            }
-        }
-
-        // 4. Write the synthetic ClaimEvent atomically. Race-safe invariant
-        //    (per `bridge_out.rs::on_post_sync` line 555): the log lands at
-        //    `block_number` BEFORE `latest_block_number` is advanced to
-        //    `block_number`, so any reader who sees `latest >= N` is
-        //    guaranteed to also see the log at N. The atomic store method
-        //    enforces the ordering inside one transaction.
-        let tx_hash = derive_manual_claim_tx_hash(&note_id_str);
-        let block_hash = self.block_state.get_block_hash(block_number);
-        match self
-            .store
-            .commit_manual_claim_event_atomic(
-                note_id_str.clone(),
-                get_bridge_address(),
-                block_number,
-                block_hash,
-                &tx_hash,
-                decoded.global_index,
-                decoded.origin_network,
-                &decoded.origin_address,
-                &decoded.destination_address,
-                decoded.amount,
-            )
-            .await
-        {
-            Ok(()) => {
-                ::metrics::counter!("claim_watcher_synthesised_total").increment(1);
-                tracing::info!(
-                    target: "claim_watcher",
-                    note_id = %note_id_str,
-                    synthetic_tx_hash = %tx_hash,
-                    global_index = %hex::encode(decoded.global_index),
-                    origin_network = decoded.origin_network,
-                    amount = decoded.amount,
-                    block_number,
-                    "synthesised ClaimEvent from consumed CLAIM note"
-                );
-                true
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "claim_watcher",
-                    note_id = %note_id_str,
-                    error = ?e,
-                    "commit_manual_claim_event_atomic failed; will retry next tick"
-                );
-                false
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl SyncListener for ClaimWatcher {
-    fn on_sync(&self, _summary: &SyncSummary) {
-        // no-op — scanning happens in on_post_sync where we have client access
-    }
-
-    /// Reachability note: this scans `NoteFilter::Consumed`, which the
-    /// miden-client populates only for notes whose creator/consumer the
-    /// proxy's miden-client is tracking (the proxy's service account). It
-    /// reliably catches CLAIMs the proxy itself submitted (the crash-recovery
-    /// case) and any CLAIM that ends up associated with a tracked account.
-    /// Truly out-of-band CLAIMs created by a separate miden-client may not
-    /// appear here — the design is best-effort in that direction and the
-    /// `claim_watcher_unrecoverable_total` counter is the operator's escape
-    /// valve for that case.
-    async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
-        // Phase 2b cut-over: when the SyntheticProjector is the sole synthetic-
-        // event producer, suppress this watcher's ClaimEvent emit loop. The
-        // CLAIM note submission to Miden happens in `claim::publish_claim`, not
-        // here — this watcher only synthesises the log for already-on-chain
-        // CLAIMs — so nothing tx-facing is skipped; the projector re-derives the
-        // same ClaimEvent from the consumed CLAIM note.
-        if self.suppress_synthetic_emission {
-            return Ok(());
-        }
-
-        let consumed_notes = client
-            .get_input_notes(NoteFilter::Consumed)
-            .await
-            .map_err(|e| anyhow!("failed to get consumed notes: {e}"))?;
-
-        // Compute the CLAIM script root once per tick. `claim_script()` is
-        // a cheap accessor over a baked-in constant; same pattern
-        // `bridge_out.rs::on_post_sync` line 435 uses.
-        let claim_root = miden_base_agglayer::ClaimNote::script().root();
-
-        for note in &consumed_notes {
-            if note.details().script().root() != claim_root {
-                continue;
-            }
-            // Race-safe ordering: write the log at (current_latest + 1) and
-            // advance the cursor inside `commit_manual_claim_event_atomic`.
-            // Mirrors `bridge_out.rs::on_post_sync` line 555.
-            let block_number = self.store.get_latest_block_number().await? + 1;
-            let _wrote = self.process_consumed_claim(note, block_number).await;
-            // No additional set_latest_block_number here — the atomic commit
-            // does it inside the same transaction. `process_consumed_claim`
-            // returning false signals a skip path; the cursor was NOT
-            // advanced in that case, so re-using `(current_latest + 1)` on
-            // the next iteration is safe.
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,34 +319,13 @@ mod tests {
         );
     }
 
-    /// Pin the load-bearing return-type contract from the Cantina-#13 follow-up.
-    /// `process_consumed_claim` MUST return `bool` (not `()`); a forgotten
-    /// boolean is the compile-time signal that the cursor-advance invariant has
-    /// been broken. Mirrors `bridge_out.rs::cantina_13_followup_*` shape.
-    #[test]
-    fn process_consumed_claim_signature_pins_bool() {
-        fn assert_bool<F, Fut>(_: F)
-        where
-            F: Fn() -> Fut,
-            Fut: std::future::Future<Output = bool>,
-        {
-        }
-        assert_bool::<_, std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>>(|| {
-            Box::pin(async { true })
-        });
-    }
-
-    /// End-to-end of the watcher's idempotency contract: feeding the same
-    /// global_index twice through the store paths it uses must produce a
-    /// single ClaimEvent and a single cursor advance. The full
-    /// `process_consumed_claim` exercise requires an InputNoteRecord which
-    /// is expensive to fabricate; instead we drive the store-side primitives
+    /// The store-side dedup contract the projector's claim derivation relies on:
+    /// feeding the same global_index twice through the store paths must produce a
+    /// single ClaimEvent and a single cursor advance. Drives the store primitives
     /// directly to pin the dedup logic.
     #[tokio::test]
     async fn store_dedup_paths_are_idempotent() {
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
-        let block_state = StdArc::new(BlockState::new());
-        let _watcher = ClaimWatcher::new(store.clone(), block_state.clone());
 
         let gi = [0x42u8; 32];
         let note_id = "0xabcdef".to_string();

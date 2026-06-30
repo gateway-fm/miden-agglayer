@@ -1139,8 +1139,10 @@ mod tests {
             {
                 assert_eq!(
                     entry.state,
-                    JobState::Committed { block_number: 1 },
-                    "worker should have committed at block 1 (test store starts at 0)"
+                    JobState::Committed { block_number: 0 },
+                    "worker commits the GER-injection receipt at the current tip (test store \
+                     starts at 0); insert_ger no longer reserves +1 — the SyntheticProjector \
+                     owns the tip and emits the GER log when it observes the note consumed"
                 );
                 break;
             }
@@ -1153,13 +1155,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        // The SyntheticProjector — not the writer worker / insert_ger — marks the
+        // GER seen + injected and emits the synthetic log when it observes the
+        // UpdateGerNote consumed. The worker's job here is solely to submit the
+        // note and record the injection-tx receipt (asserted above).
         assert!(
-            store.has_seen_ger(&ger_bytes).await.unwrap(),
-            "GER must be recorded after worker dispatch"
-        );
-        assert!(
-            store.is_ger_injected(&ger_bytes).await.unwrap(),
-            "GER must be marked injected after worker dispatch"
+            !store.is_ger_injected(&ger_bytes).await.unwrap(),
+            "insert_ger must NOT mark injected — the projector does on consumption"
         );
     }
 

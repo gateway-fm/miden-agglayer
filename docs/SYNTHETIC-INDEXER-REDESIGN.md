@@ -130,3 +130,53 @@ At every phase boundary, run the **entire** regression matrix (all suites: `e2e-
 2. in shadow mode (Phase 1) the projected synthetic chain is byte-identical to the legacy output.
 
 No phase ships unless both hold.
+
+## Implementation outcome (landed)
+
+The migration is complete: the `SyntheticProjector` is the **sole** synthetic-event producer and
+the **sole** advancer of `latest_block_number`. The feature flag, the per-writer
+`suppress_synthetic_emission` gates, the `ClaimWatcher`, the `StoreSyncListener` tip-advance, and
+the non-atomic `commit_*_event_atomic` reservation primitives have all been deleted — Finding #5 is
+eliminated by construction (no `get_latest()+1` reservation exists anymore).
+
+### Numbering: Miden-1:1 (final)
+
+Synthetic block `N` == Miden block `N`. Every synthetic log derived from the notes consumed at
+Miden block `N` is written at synthetic block `N`; the tip is advanced to `N` exactly once, **after**
+the block (write-before-advance), **including for empty Miden blocks**, so the synthetic chain
+mirrors the Miden chain block-for-block and `eth_blockNumber` tracks the Miden tip. (An earlier
+"one synthetic block per emitted log" variant was rejected because it raced the legacy
+height-tracking and produced tip/log inconsistencies.)
+
+### Bugs found + fixed during the full-matrix validation (each unit-tested)
+
+1. **GER limb byte-order.** `project_ger_note` decoded the `UpdateGerNote` storage felts big-endian;
+   the convention is little-endian (matching `ExitRoot::to_elements` / bridge_out / claim_note), so
+   every emitted GER was byte-swapped and never matched the GER aggkit injected — bridge-in deposits
+   hung on `ready_for_claim`. Fixed to `to_le_bytes`; round-trip test against `ExitRoot::to_elements`.
+2. **Synthetic-log receipt fallback.** Synthetic logs carry derived tx hashes with no real txn
+   record, so `eth_getTransactionReceipt` returned `null`; aggkit's L2BridgeSyncer fails to append a
+   logged tx with a null receipt (`input too short: 0 bytes`) and stalls. `service_get_txn_receipt`
+   now synthesises a success receipt from `logs_by_tx` when there is no txn record.
+3. **Claim tx-hash linkage.** aggkit decodes the claim tx's `claimAsset` calldata to resolve the
+   claim's GER boundary. The projector emitted the ClaimEvent under a derived hash whose synthetic tx
+   has empty calldata → no boundary → no certificate. `publish_claim` now records
+   `record_tx_note_link(real_claim_tx_hash ↔ note.details_commitment)`; `project_claim_note` emits
+   the ClaimEvent under the **real** claim tx (calldata + receipt present), falling back to the
+   derived hash only for unlinked notes.
+4. **Cantina #13 self-target gate (cutover-extraction gap).** Extracting the B2AGG derivation into
+   the shared `project_b2agg_note` had silently dropped the legacy scanner's self-target poison-leaf
+   gate — refuse to emit a BridgeEvent for a B2AGG whose `destination_network == local_network_id`.
+   The e2e cannot catch this (a malicious-input case). Restored on the projector path (threading
+   `local_network_id`) with a regression test, *before* deleting the legacy `process_consumed_note`,
+   so the cutover does not ship a security regression.
+
+### Restore
+
+`restore_*` is the projector's catch-up over the same shared derivations. It reconstructs only the
+**Miden-derived** synthetic state (logs, GER hash-chain, bridge-out tracking, tip). The eth-side
+`transactions` / `transaction_logs` / `tx_note_links` (the proxy's record of `eth_sendRawTransaction`
+calldata + receipts) are **durable** — they never existed on Miden and a real restart preserves the
+Postgres volume — so the recovery suite preserves them rather than wiping them. (A true full-disk
+loss cannot recover the claim `claimAsset` calldata from Miden, since the CLAIM note storage keeps
+only the metadata *hash*; that is a documented recovery limitation, not something restore can close.)

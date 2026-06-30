@@ -102,13 +102,35 @@ fn decode_network_target(attachments: &NoteAttachments) -> Option<AccountId> {
         .map(|nat| nat.target_id())
 }
 
+/// Decode the 32-byte GER from an `UpdateGerNote`'s storage felts.
+///
+/// `UpdateGerNote` storage is `ExitRoot::to_elements()` — each 4-byte GER limb
+/// packed **little-endian** into a felt (the LE limb convention used across
+/// `bridge_out` / `claim_note` / `b2agg_note`). Decoding must therefore be
+/// little-endian: a big-endian decode byte-swaps every limb, producing the wrong
+/// GER (e.g. `2ae1a9b7…` → `b7a9e12a…`). That made the projector emit a GER that
+/// never matched the one aggkit injected, so bridge-in deposits hung forever on
+/// `ready_for_claim`. Unit-tested via a round-trip against `ExitRoot::to_elements`.
+///
+/// Returns `Err(limb_index)` if a felt exceeds `u32::MAX` (a malformed note; X6).
+pub(crate) fn ger_bytes_from_storage(items: &[miden_protocol::Felt]) -> Result<[u8; 32], usize> {
+    let mut ger_bytes = [0u8; 32];
+    for (i, felt) in items.iter().take(8).enumerate() {
+        match u32::try_from(felt.as_canonical_u64()) {
+            Ok(v) => ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes()),
+            Err(_) => return Err(i),
+        }
+    }
+    Ok(ger_bytes)
+}
+
 /// Result of a restore operation.
 pub struct RestoreResult {
     pub block_number: u64,
     pub bridge_outs_restored: usize,
     /// Cantina MA#27 — number of consumed CLAIM notes for which a synthetic
-    /// ClaimEvent was emitted by restore (the offline equivalent of what
-    /// [`crate::claim_watcher::ClaimWatcher`] does on every live sync tick).
+    /// ClaimEvent was emitted by restore (the offline equivalent of what the
+    /// live [`SyntheticProjector`](crate::synthetic_projector) does each tick).
     pub claims_restored: usize,
     pub gers_restored: usize,
     pub logs_created: usize,
@@ -119,6 +141,7 @@ pub async fn restore(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
+    local_network_id: u32,
     block_state: &Arc<BlockState>,
     l1_rpc_url: Option<String>,
 ) -> anyhow::Result<RestoreResult> {
@@ -169,6 +192,7 @@ pub async fn restore(
         store,
         miden_client,
         accounts,
+        local_network_id,
         block_state,
         next_block,
         l1_rpc_url.clone(),
@@ -247,6 +271,7 @@ async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
+    local_network_id: u32,
     block_state: &Arc<BlockState>,
     restore_block: u64,
     l1_rpc_url: Option<String>,
@@ -293,6 +318,7 @@ async fn restore_bridge_outs(
                         &store_clone,
                         note,
                         bridge_id,
+                        local_network_id,
                         restore_block,
                         block_hash,
                         bridge_address,
@@ -338,12 +364,13 @@ pub(crate) enum B2AggRestoreOutcome {
 /// it is a *bridge-out* B2AGG note consumed by the configured `bridge_id`.
 ///
 /// Extracted from `restore_bridge_outs` so the per-note decision is unit-testable
-/// without a live Miden client (mirrors `BridgeOutScanner::process_consumed_note`).
+/// without a live Miden client (mirrors `project_b2agg_note`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn project_b2agg_note(
     store: &Arc<dyn Store>,
     note: &InputNoteRecord,
     bridge_id: AccountId,
+    local_network_id: u32,
     restore_block: u64,
     block_hash: [u8; 32],
     bridge_address: &str,
@@ -361,7 +388,7 @@ pub(crate) async fn project_b2agg_note(
     // sender, asset stays on Miden) and a bridge branch (consumer == bridge, asset
     // leaves). Only the latter is a real bridge-out; rebuilding a synthetic
     // BridgeEvent for a reclaim would hand the user a claimable withdrawal for
-    // value that never left. Mirrors `BridgeOutScanner::process_consumed_note`.
+    // value that never left. Mirrors `project_b2agg_note`.
     let consumer = note.consumer_account();
     let class = classify_b2agg_consumer(consumer, bridge_id);
 
@@ -414,12 +441,62 @@ pub(crate) async fn project_b2agg_note(
     let (destination_network, destination_address) = match parse_b2agg_storage(details.storage()) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            // MA#18 — the bridge consumed this B2AGG (LET advanced) but its storage
+            // is unparseable, so we cannot reconstruct the destination. Quarantine
+            // (record unbridgeable) so it is surfaced for operator rescue instead of
+            // silently skipped. Ported from `project_b2agg_note`.
+            tracing::warn!(note_id = %note_id_str, "restore: B2AGG storage unparseable: {e:#}");
+            crate::bridge_out::quarantine_unbridgeable_b2agg(
+                &**store,
+                bridge_id,
+                &note_id_str,
+                note,
+                restore_block,
+                crate::store::UnbridgeableBridgeOutReason::StorageParseFailed,
+                format!("{e:#}"),
+            )
+            .await;
             return Ok(B2AggRestoreOutcome::Skipped);
         }
     };
 
+    // Cantina #13 — self-target poison-leaf gate (moved here from the now-deleted
+    // `project_b2agg_note` when the projector became the sole
+    // producer). A B2AGG bridge-out whose destination IS the local network advances
+    // the on-chain LET, but the agglayer certificate covering that leaf is rejected
+    // (InvalidExit), wedging every legitimate B2AGG in the same window. We can't
+    // unwind the LET, but we MUST refuse to emit the synthetic BridgeEvent so the
+    // bridge-service never tries to settle a doomed certificate. Skip WITHOUT
+    // marking the note processed (the mark happens only on the Emit path below), so
+    // the poison is re-logged whenever (re)observed and an operator can quarantine.
+    if destination_network == local_network_id {
+        ::metrics::counter!("bridge_out_self_targeted_total").increment(1);
+        tracing::error!(
+            note_id = %note_id_str,
+            destination_network,
+            local_network_id,
+            "POISON LEAF: B2AGG bridge-out targets the local network; the on-chain LET \
+             advanced but the aggsender certificate covering this leaf will be rejected \
+             (InvalidExit). Refusing to emit a synthetic BridgeEvent (Cantina #13). \
+             Operator action required: quarantine this note."
+        );
+        return Ok(B2AggRestoreOutcome::Skipped);
+    }
+
     let Some(fungible_asset) = details.assets().iter_fungible().next() else {
+        // MA#18 — bridge-consumed B2AGG with no fungible asset is malformed: the LET
+        // advanced but there is nothing to bridge out. Quarantine, don't silently drop.
+        tracing::warn!(note_id = %note_id_str, "restore: B2AGG has no fungible asset");
+        crate::bridge_out::quarantine_unbridgeable_b2agg(
+            &**store,
+            bridge_id,
+            &note_id_str,
+            note,
+            restore_block,
+            crate::store::UnbridgeableBridgeOutReason::NoFungibleAsset,
+            "consumed B2AGG note carries no fungible asset".to_string(),
+        )
+        .await;
         return Ok(B2AggRestoreOutcome::Skipped);
     };
     let faucet_id = fungible_asset.faucet_id();
@@ -427,14 +504,37 @@ pub(crate) async fn project_b2agg_note(
     let origin = match resolve_faucet_origin(faucet_id, &**store).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            // MA#18 — bridge consumed the B2AGG but its faucet is unknown to us, so
+            // we can't reconstruct the origin token. Quarantine for operator rescue.
+            tracing::warn!(note_id = %note_id_str, "restore: B2AGG unknown faucet: {e:#}");
+            crate::bridge_out::quarantine_unbridgeable_b2agg(
+                &**store,
+                bridge_id,
+                &note_id_str,
+                note,
+                restore_block,
+                crate::store::UnbridgeableBridgeOutReason::UnknownFaucet,
+                format!("{e:#}"),
+            )
+            .await;
             return Ok(B2AggRestoreOutcome::Skipped);
         }
     };
     let origin_amount = match crate::bridge_out::reverse_scale_amount(miden_amount, origin.scale) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(note_id = %note_id_str, "restore: skip B2AGG: {e:#}");
+            // MA#18 — the scaled L1 amount overflows. Quarantine, don't silently drop.
+            tracing::warn!(note_id = %note_id_str, "restore: B2AGG amount overflow: {e:#}");
+            crate::bridge_out::quarantine_unbridgeable_b2agg(
+                &**store,
+                bridge_id,
+                &note_id_str,
+                note,
+                restore_block,
+                crate::store::UnbridgeableBridgeOutReason::AmountOverflow,
+                format!("{e:#}"),
+            )
+            .await;
             return Ok(B2AggRestoreOutcome::Skipped);
         }
     };
@@ -566,10 +666,15 @@ pub(crate) async fn project_b2agg_note(
         return Err(err);
     }
 
+    // "emitted BridgeEvent" is the production signal a bridge-out was projected —
+    // both the live projector and the startup restore replay reach here, and both
+    // genuinely emit a synthetic BridgeEvent. (Was "restore: rebuilt BridgeEvent",
+    // which was misleading on the live path and which downstream tooling / e2e
+    // greps for under the legacy wording.)
     tracing::info!(
         note_id = %note_id_str,
         deposit_count,
-        "restore: rebuilt BridgeEvent"
+        "emitted BridgeEvent"
     );
 
     Ok(B2AggRestoreOutcome::Emitted)
@@ -591,8 +696,7 @@ pub(crate) enum ClaimProjectOutcome {
 ///
 /// Extracted from `restore_claims`' per-note loop body so the *same* derivation
 /// backs both the recovery `restore_*` phases and the cursor-driven
-/// [`crate::synthetic_projector`]. Mirrors
-/// [`crate::claim_watcher::ClaimWatcher::on_post_sync`] — same script-root
+/// [`crate::synthetic_projector`] — same script-root
 /// filter, same storage decoder, same dedup predicates, same atomic commit
 /// primitive — so the synthetic logs are byte-identical regardless of which
 /// path observes the CLAIM note.
@@ -659,7 +763,17 @@ pub(crate) async fn project_claim_note(
         return Ok(ClaimProjectOutcome::Skipped);
     }
 
-    let tx_hash = derive_manual_claim_tx_hash(&note_id_str);
+    // Prefer the REAL claim eth-tx hash (recorded by `publish_claim` via
+    // `record_tx_note_link`). aggkit's L2BridgeSyncer fetches the claim tx by
+    // hash and decodes its `claimAsset` calldata to resolve the claim's GER
+    // boundary; a derived hash points at a synthetic tx with EMPTY calldata, so
+    // aggkit fails "input too short: 0 bytes" and never settles the certificate.
+    // Fall back to the derived hash only for notes with no recorded link (e.g.
+    // restore replaying history predating the link, or notes submitted out-of-band).
+    let tx_hash = match store.get_tx_for_note(&note_id_str).await? {
+        Some(real_tx) => real_tx,
+        None => derive_manual_claim_tx_hash(&note_id_str),
+    };
 
     store
         .commit_manual_claim_event_atomic(
@@ -694,7 +808,7 @@ pub(crate) async fn project_claim_note(
 /// Phase 2.5: scan miden consumed CLAIM notes and replay any missing
 /// synthetic `ClaimEvent` log via [`Store::commit_manual_claim_event_atomic`].
 ///
-/// Mirrors [`crate::claim_watcher::ClaimWatcher::on_post_sync`] — same
+/// Mirrors the live [`SyntheticProjector`](crate::synthetic_projector) — same
 /// script-root filter, same storage decoder, same dedup predicates, same
 /// atomic commit primitive — but runs offline as a restore phase instead of
 /// inside the live sync loop. The synthetic tx_hash uses the shared
@@ -874,26 +988,17 @@ pub(crate) async fn project_ger_note(
         return Ok(GerProjectOutcome::Skipped);
     }
 
-    let mut ger_bytes = [0u8; 32];
-    for (i, felt) in items.iter().take(8).enumerate() {
-        // X6 — Felt values can be anywhere in [0, GOLDILOCKS). The previous
-        // `as u32` silently truncated values exceeding u32::MAX, producing a
-        // corrupted GER that wouldn't match the L1-side keccak. Use try_from so
-        // a malformed UpdateGerNote is rejected instead of silently restoring
-        // the wrong root.
-        match u32::try_from(felt.as_canonical_u64()) {
-            Ok(v) => ger_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes()),
-            Err(_) => {
-                tracing::error!(
-                    note_id = %hex::encode(note.details_commitment().as_bytes()),
-                    limb_index = i,
-                    felt_value = felt.as_canonical_u64(),
-                    "restore: UpdateGerNote limb exceeds u32::MAX, skipping (X6)"
-                );
-                return Ok(GerProjectOutcome::Skipped);
-            }
+    let ger_bytes = match ger_bytes_from_storage(items) {
+        Ok(g) => g,
+        Err(i) => {
+            tracing::error!(
+                note_id = %hex::encode(note.details_commitment().as_bytes()),
+                limb_index = i,
+                "restore: UpdateGerNote limb exceeds u32::MAX, skipping (X6)"
+            );
+            return Ok(GerProjectOutcome::Skipped);
         }
-    }
+    };
 
     // `is_ger_injected` (not `has_seen_ger`): with the L1InfoTreeIndexer
     // running, ger_entries rows can exist for pairs the indexer observed on L1
@@ -1108,6 +1213,38 @@ mod tests {
         );
     }
 
+    /// GER byte-order regression: `ger_bytes_from_storage` must little-endian-
+    /// decode an `UpdateGerNote`'s storage so it round-trips `ExitRoot::to_elements`
+    /// (the encoder the note actually uses). A big-endian decode byte-swaps each
+    /// 4-byte limb (`2ae1a9b7…` → `b7a9e12a…`) — the projector then emitted a GER
+    /// that never matched the one aggkit injected, hanging bridge-in deposits on
+    /// `ready_for_claim`.
+    #[test]
+    fn ger_bytes_from_storage_roundtrips_little_endian() {
+        use miden_base_agglayer::ExitRoot;
+        let ger: [u8; 32] =
+            hex::decode("2ae1a9b7e0d82a4412b675321c58b3336faca4b549b5d3dd5fdeea4304740f7c")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        // Encode exactly as UpdateGerNote storage does, then decode via the path.
+        let items = ExitRoot::from(ger).to_elements();
+        assert_eq!(items.len(), 8, "ExitRoot packs into 8 felts");
+        let decoded = ger_bytes_from_storage(&items).expect("valid GER decodes");
+        assert_eq!(
+            decoded, ger,
+            "GER must round-trip; a big-endian limb decode would byte-swap the root"
+        );
+        // Prove this pins endianness (not a tautology): a big-endian decode of the
+        // same felts must NOT equal the original GER.
+        let mut be = [0u8; 32];
+        for (i, f) in items.iter().take(8).enumerate() {
+            let v = u32::try_from(f.as_canonical_u64()).unwrap();
+            be[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+        }
+        assert_ne!(be, ger, "big-endian decode must differ — that was the bug");
+    }
+
     #[test]
     fn ma28_classify_ger_note_missing_metadata() {
         let sender = id(TEST_SENDER_MANAGER);
@@ -1240,7 +1377,7 @@ mod tests {
         let live_path = crate::claim_watcher::derive_manual_claim_tx_hash(&note_id);
         assert_eq!(
             restore_path, live_path,
-            "restore and live ClaimWatcher must derive identical synthetic tx-hashes"
+            "restore and the live projector must derive identical synthetic tx-hashes"
         );
     }
 
@@ -1348,6 +1485,7 @@ mod tests {
             &store,
             &note,
             bridge_id,
+            7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
             [7u8; 32],
             get_bridge_address(),
@@ -1385,6 +1523,7 @@ mod tests {
             &store,
             &note,
             bridge_id,
+            7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
             [7u8; 32],
             get_bridge_address(),
@@ -1405,6 +1544,50 @@ mod tests {
         );
     }
 
+    /// Cantina #13 — self-target poison-leaf gate, now enforced in the PRODUCTION
+    /// derivation `project_b2agg_note` (formerly only in the deleted
+    /// `project_b2agg_note`). A bridge-consumed B2AGG note
+    /// whose destination network EQUALS the local network advances the on-chain
+    /// LET but its agglayer certificate is rejected (InvalidExit); we MUST refuse
+    /// to emit the synthetic BridgeEvent. Reuses the dest-network-0 note from the
+    /// emit test (which DOES emit at local=7) and pins it at local=0 so the same
+    /// note is now self-targeted — proving the gate, not an unrelated skip.
+    #[tokio::test]
+    async fn cantina13_self_target_b2agg_is_gated_in_projection() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // Bridge-consumed (would otherwise emit), destination network 0.
+        let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        // local_network_id == 0 == the note's destination network → poison self-target.
+        let outcome = project_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            0, // local_network_id == dest-network 0 → self-target
+            1,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "Cantina #13: a B2AGG bridge-out targeting the LOCAL network must NOT emit a BridgeEvent",
+        );
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "self-target poison note must stay un-processed so it re-surfaces for an operator",
+        );
+    }
+
     /// Fail-closed: a consumed B2AGG note with no recorded consumer
     /// (`consumer_account == None`) is an anomaly and must be skipped, not
     /// emitted on an unverifiable basis.
@@ -1421,6 +1604,7 @@ mod tests {
             &store,
             &note,
             bridge_id,
+            7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
             [7u8; 32],
             get_bridge_address(),
@@ -1460,6 +1644,7 @@ mod tests {
             &store,
             &note,
             bridge_id,
+            7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
             [7u8; 32],
             get_bridge_address(),
@@ -1499,6 +1684,7 @@ mod tests {
             &store,
             &note,
             bridge_id,
+            7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
             [7u8; 32],
             get_bridge_address(),
@@ -1531,6 +1717,7 @@ mod tests {
             &store,
             &note,
             bridge_id,
+            7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
             [7u8; 32],
             get_bridge_address(),
@@ -1575,6 +1762,7 @@ mod tests {
             &store,
             &note,
             bridge_id,
+            7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
             [7u8; 32],
             get_bridge_address(),

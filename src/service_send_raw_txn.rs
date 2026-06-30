@@ -384,7 +384,6 @@ async fn publish_and_record_claim(
         service.reject_zero_padding_addresses,
         service.reject_hardhat_alias,
         Some(service.expected_mints.clone()),
-        service.suppress_synthetic_emission,
     )
     .await?;
     tracing::info!(
@@ -463,7 +462,6 @@ pub(crate) async fn worker_handle_ger_insert(
             &service.store,
             &service.block_state,
             txn_hash,
-            service.suppress_synthetic_emission,
         )
         .await,
         txn_hash,
@@ -791,7 +789,7 @@ mod tests {
     // ── Happy-path tests ────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_insert_global_exit_root_stores_ger_and_emits_log() {
+    async fn test_insert_global_exit_root_submits_without_emitting_log() {
         let service = create_test_service();
         let store = service.store.clone();
         let ger_bytes = [0xAA; 32];
@@ -808,9 +806,15 @@ mod tests {
             "insertGlobalExitRoot should succeed: {result:?}"
         );
 
-        assert!(store.has_seen_ger(&ger_bytes).await.unwrap());
-        assert!(store.is_ger_injected(&ger_bytes).await.unwrap());
-
+        // Post-cut-over contract: insert_ger SUBMITS the UpdateGerNote to Miden but
+        // does NOT emit the synthetic GER log or mark the GER injected — the
+        // SyntheticProjector does both when it observes the note consumed. So in
+        // this unit context (no projector tick over a consumed-note feed) neither
+        // the injection flag nor the synthetic log is present yet.
+        assert!(
+            !store.is_ger_injected(&ger_bytes).await.unwrap(),
+            "insert_ger must NOT mark injected — the projector does that on consumption"
+        );
         let filter = crate::log_synthesis::LogFilter {
             from_block: Some("0x0".to_string()),
             to_block: Some("0xFFFF".to_string()),
@@ -818,13 +822,9 @@ mod tests {
         };
         let logs = store.get_logs(&filter, 0xFFFF).await.unwrap();
         assert!(
-            !logs.is_empty(),
-            "expected at least one log from GER insertion"
-        );
-        assert!(
-            logs.iter().any(|l| l.topics.first().map(|t| t.as_str())
-                == Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)),
-            "expected UpdateHashChainValue log"
+            logs.iter().all(|l| l.topics.first().map(|t| t.as_str())
+                != Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)),
+            "insert_ger must NOT emit a GER log — the projector does that on consumption"
         );
     }
 
