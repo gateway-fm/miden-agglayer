@@ -42,7 +42,7 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
 }
 
 async fn handle_ger_result(
-    result: anyhow::Result<u64>,
+    result: anyhow::Result<bool>,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     signer: Address,
@@ -50,23 +50,24 @@ async fn handle_ger_result(
     ger_bytes: [u8; 32],
 ) -> anyhow::Result<()> {
     match result {
-        Ok(block_number) => {
-            // G4 — mark_ger_injected has moved to live INSIDE insert_ger,
-            // co-located with add_ger_update_event so a crash between them
-            // can't leave is_ger_injected returning false after the event
-            // has been logged. handle_ger_result no longer issues the
-            // mark separately.
+        Ok(is_new) => {
             let _ = ger_bytes; // kept for backward-compat; unused here.
             tracing::info!("inserted GER with eth txn: {txn_hash}");
-            record_local_success_at_block(
-                service,
-                txn_hash,
-                txn_envelope,
-                signer,
-                block_number,
-                vec![],
-            )
-            .await?;
+            if is_new {
+                // New GER: insert_ger recorded the eth-tx ↔ UpdateGerNote link. Record
+                // ONLY a pending receipt; the SyntheticProjector finalises it (txn_commit)
+                // at the Miden block where it consumes the note — receipt block == GER-log
+                // block. eth_getTransactionReceipt returns null until then (mined-when-
+                // consumed), which aggkit tolerates.
+                record_local_pending_tx(service, txn_hash, txn_envelope, signer, None, vec![])
+                    .await?;
+            } else {
+                // Duplicate GER (already injected): no new UpdateGerNote will be consumed,
+                // so the projector has nothing to finalise — complete the receipt now at
+                // the current tip so eth_getTransactionReceipt resolves.
+                record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![])
+                    .await?;
+            }
             Ok(())
         }
         Err(err) => {
@@ -414,7 +415,6 @@ pub(crate) async fn worker_handle_ger_insert(
             &service.miden_client,
             service.accounts.clone(),
             &service.store,
-            &service.block_state,
             txn_hash,
         )
         .await,

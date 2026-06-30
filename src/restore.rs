@@ -1060,11 +1060,19 @@ pub(crate) async fn project_ger_note(
         return Ok(GerProjectOutcome::Skipped);
     }
 
-    let tx_hash = {
-        let mut hasher = Keccak256::new();
-        hasher.update(b"restore-ger-miden-");
-        hasher.update(hex::encode(note.details_commitment().as_bytes()).as_bytes());
-        format!("0x{}", hex::encode(hasher.finalize()))
+    // Emit the GER log under the REAL `insertGlobalExitRoot` eth-tx (recovered via
+    // the note↔tx link `insert_ger` recorded), falling back to a derived hash only
+    // for notes with no recorded link (restore replaying history predating the link,
+    // or out-of-band injects).
+    let note_commitment = hex::encode(note.details_commitment().as_bytes());
+    let (tx_hash, linked) = match store.get_tx_for_note(&note_commitment).await? {
+        Some(real_tx) => (real_tx, true),
+        None => {
+            let mut hasher = Keccak256::new();
+            hasher.update(b"restore-ger-miden-");
+            hasher.update(note_commitment.as_bytes());
+            (format!("0x{}", hex::encode(hasher.finalize())), false)
+        }
     };
 
     store
@@ -1078,6 +1086,24 @@ pub(crate) async fn project_ger_note(
             timestamp,
         )
         .await?;
+
+    // The projector OWNS receipt completion: finalise the real insertGlobalExitRoot
+    // tx's receipt at THIS (consumption) block — the same block the GER log is emitted
+    // — so receipt block == log block. `insert_ger` left it pending (`id: None`).
+    // Tolerate a missing pending entry (derived-hash fallback, or restore predating the
+    // link): the receipt is then synthesised from the log by `service_get_txn_receipt`,
+    // so a missing entry must not abort the projection.
+    if let Some(h) = linked
+        .then(|| tx_hash.parse::<alloy::primitives::TxHash>().ok())
+        .flatten()
+    {
+        let _ = store
+            .txn_commit(h, Ok(()), block_number, block_hash)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(tx = %tx_hash, "GER receipt not finalised: {e}");
+            });
+    }
 
     store.mark_ger_injected(ger_bytes).await?;
 

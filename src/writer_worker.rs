@@ -1111,9 +1111,11 @@ mod tests {
                 assert_eq!(
                     entry.state,
                     JobState::Committed { block_number: 0 },
-                    "worker commits the GER-injection receipt at the current tip (test store \
-                     starts at 0); insert_ger no longer reserves +1 — the SyntheticProjector \
-                     owns the tip and emits the GER log when it observes the note consumed"
+                    "the worker JOB reaches Committed at the current tip (test store starts at \
+                     0) — a lifecycle marker, not a receipt write. The eth receipt itself is \
+                     recorded PENDING; the SyntheticProjector finalises it (and emits the GER \
+                     log) when it observes the UpdateGerNote consumed, so receipt-block == \
+                     log-block"
                 );
                 break;
             }
