@@ -176,7 +176,9 @@ pub async fn restore(
         match recover_missed_bridge_outs(miden_client, url, api_key, accounts.bridge.0, from_block)
             .await
         {
-            Ok(n) => tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node"),
+            Ok(n) => {
+                tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node")
+            }
             Err(e) => tracing::warn!(
                 err = %e,
                 "Phase 1.5 recovery scan failed; continuing with local-only restore"
@@ -269,13 +271,17 @@ async fn sync_miden_block(
 /// aggsender never certifies it, and it can't be claimed on L1.
 ///
 /// The notes are still on the node (public, nullifier committed). This
-/// re-discovers them by tag-scanning the node from `from_block` to the chain tip
-/// via `sync_notes_with_details` — which fetches the full body of EVERY public
-/// note in the range matching the bridge's note tag, regardless of local
-/// tracking — filters to the B2AGG script root, and imports them by id
-/// (`NoteFile::NoteId`, which fetches from the node and stores). A follow-up
-/// `sync_state()` marks each consumed, so they appear in `NoteFilter::Consumed`
-/// for [`restore_bridge_outs`] to rebuild the BridgeEvent from.
+/// re-discovers them by **block-scanning** the node from `from_block` to the
+/// chain tip: for every block it enumerates the notes created in it
+/// (`ProvenBlock::body().output_notes()`), fetches their full bodies via
+/// `get_notes_by_id` (public notes resolve to `FetchedNote::Public` even after
+/// they've been consumed), filters to the B2AGG script root with
+/// [`is_b2agg_note`], and imports the matches by id (`NoteFile::NoteId`, which
+/// fetches from the node and stores). A follow-up `sync_state()` marks each
+/// consumed, so they appear in `NoteFilter::Consumed` for [`restore_bridge_outs`]
+/// to rebuild the BridgeEvent from. (A tag-sync on `with_account_target(bridge)`
+/// returns zero — the bridge's B2AGG notes don't carry that tag — so the tag
+/// path is not usable here.)
 ///
 /// Returns the number of B2AGG notes imported. Best-effort: a scan/RPC failure is
 /// surfaced to the caller, which logs and continues with the local-only restore.
@@ -286,10 +292,9 @@ async fn recover_missed_bridge_outs(
     bridge_id: AccountId,
     from_block: u32,
 ) -> anyhow::Result<usize> {
-    use miden_client::rpc::domain::note::SyncedNoteDetails;
+    use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
-    use miden_protocol::note::{NoteDetails, NoteFile, NoteTag};
-    use std::collections::BTreeSet;
+    use miden_protocol::note::{NoteDetails, NoteFile, NoteId};
 
     let endpoint = crate::miden_client::parse_node_url(node_url)?;
     let rpc = crate::miden_client::build_rpc_client(&endpoint, 30_000, api_key);
@@ -298,36 +303,75 @@ async fn recover_missed_bridge_outs(
         .get_block_header_by_number(None, false)
         .await
         .map_err(|e| anyhow::anyhow!("recovery: get chain tip: {e}"))?;
-    let tip = tip_header.block_num();
+    let to_block = tip_header.block_num().as_u32();
+    if from_block > to_block {
+        tracing::warn!(
+            from_block,
+            to_block,
+            "recovery: from_block is past the chain tip; nothing to scan"
+        );
+        return Ok(0);
+    }
 
-    // Notes the bridge consumes are tagged with the bridge as the target account
-    // (so the network/ntx-builder picks them up). `sync_notes` paginates the full
-    // [from_block, tip] range internally.
-    let mut tags = BTreeSet::new();
-    tags.insert(NoteTag::with_account_target(bridge_id));
-
-    let (_blocks, synced) = rpc
-        .sync_notes_with_details(BlockNumber::from(from_block), tip, &tags)
-        .await
-        .map_err(|e| anyhow::anyhow!("recovery: sync_notes_with_details: {e}"))?;
-
-    let mut b2agg_ids = Vec::new();
-    for (note_id, detail) in &synced {
-        if let SyncedNoteDetails::Public(note) = detail {
-            let details: NoteDetails = note.clone().into();
-            if is_b2agg_note(&details) {
-                b2agg_ids.push(*note_id);
+    // Tag-independent block scan. The bridge's B2AGG notes are NOT tagged with the
+    // bridge as the target account (a tag-sync on `with_account_target(bridge)`
+    // returns zero), so walk every block in `[from_block, to_block]`, enumerate
+    // the notes it created (`body().output_notes()`), fetch their full bodies via
+    // `get_notes_by_id` (public notes come back as `FetchedNote::Public` even when
+    // already consumed), and keep the ones whose script root is the B2AGG script.
+    // This is the explorer-style "scan blocks, filter is-b2agg" path. The on-chain
+    // `consumer == bridge` gating is enforced downstream by `restore_bridge_outs`
+    // once the notes are imported and observed consumed.
+    let mut b2agg_ids: Vec<NoteId> = Vec::new();
+    let mut scanned = 0usize;
+    for b in from_block..=to_block {
+        let block = match rpc.get_block_by_number(BlockNumber::from(b), false).await {
+            Ok(block) => block,
+            Err(e) => {
+                tracing::warn!(block = b, err = %e, "recovery: get_block_by_number failed; skipping");
+                continue;
             }
+        };
+
+        // All notes created in this block (public + private), by id.
+        let ids: Vec<NoteId> = block.body().output_notes().map(|(_, n)| n.id()).collect();
+        if !ids.is_empty() {
+            match rpc.get_notes_by_id(&ids).await {
+                Ok(fetched) => {
+                    for f in fetched {
+                        if let FetchedNote::Public(note, _) = f {
+                            let details: NoteDetails = note.clone().into();
+                            if is_b2agg_note(&details) {
+                                b2agg_ids.push(note.id());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(block = b, err = %e, "recovery: get_notes_by_id failed; skipping block");
+                }
+            }
+        }
+
+        scanned += 1;
+        if scanned.is_multiple_of(200) {
+            tracing::info!(
+                at_block = b,
+                to_block,
+                scanned,
+                b2agg = b2agg_ids.len(),
+                "recovery scan: progress"
+            );
         }
     }
 
     tracing::info!(
         bridge = %bridge_id,
         from_block,
-        to_block = tip.as_u32(),
-        public_notes = synced.len(),
+        to_block,
+        blocks_scanned = scanned,
         b2agg = b2agg_ids.len(),
-        "recovery scan: B2AGG notes targeting the bridge found on the node"
+        "recovery scan complete: B2AGG bridge-out notes found on the node"
     );
 
     if b2agg_ids.is_empty() {
