@@ -129,6 +129,13 @@ count_for() {
         | awk -v k="$oa" -F'\t' '$1==k{print $2, $3, $4; found=1} END{if(!found) print "0 0 0"}'
 }
 
+# count_all <endpoint_addr> <want_net>  → "total ready claimed" summed over all tokens
+count_all() {
+    curl -sf "$BRIDGE_SERVICE_URL/bridges/$1" 2>/dev/null \
+        | python3 "$TMP/count_deposits.py" "$2" 2>/dev/null \
+        | awk -F'\t' '{t+=$2; r+=$3; c+=$4} END{print (t+0), (r+0), (c+0)}'
+}
+
 wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}" elapsed=0
     v "WAIT: $desc (timeout ${timeout}s)"
@@ -326,6 +333,12 @@ for k in $(seq 0 $((NUM_TOKENS - 1))); do
     read -r t rdy cl < <(count_for "$FUNDED_ADDR" 1 "$(echo "${T_ADDR[$k]}" | tr 'A-F' 'a-f')")
     BASE_L2_T[$k]=$t; BASE_L2_R[$k]=$rdy; BASE_L2_C[$k]=$cl
 done
+# aggregate baseline totals (subtracted in the live status line so it shows load-only)
+BASE_L1_R_TOT=0; BASE_L1_C_TOT=0; BASE_L2_R_TOT=0; BASE_L2_C_TOT=0
+for k in $(seq 0 $((NUM_TOKENS - 1))); do
+    BASE_L1_R_TOT=$((BASE_L1_R_TOT + BASE_L1_R[$k])); BASE_L1_C_TOT=$((BASE_L1_C_TOT + BASE_L1_C[$k]))
+    BASE_L2_R_TOT=$((BASE_L2_R_TOT + BASE_L2_R[$k])); BASE_L2_C_TOT=$((BASE_L2_C_TOT + BASE_L2_C[$k]))
+done
 v "baseline captured"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -351,7 +364,22 @@ declare -a L1BUF_OP L1BUF_TI
 L1BUF_OP=(); L1BUF_TI=()
 
 progress() {  # <op#> <label> <dir-str> <verb>
-    r "#$1 ${2} ${3} ${4} (running: L1→L2 ${DONE_L1}/${PLAN_L1}, L2→L1 ${DONE_L2}/${PLAN_L2})"
+    r "#$1 ${2} ${3} ${4}"
+}
+
+# status_line: the live picture both ways — submitted (our counters) / ready / claimed
+# (bridge-service, load-only via baseline subtraction) / failed. Printed each step.
+status_line() {
+    local s1=0 f1=0 s2=0 f2=0 k
+    for k in $(seq 0 $((NUM_TOKENS - 1))); do
+        s1=$((s1 + SUB_L1[$k])); f1=$((f1 + FAIL_L1[$k]))
+        s2=$((s2 + SUB_L2[$k])); f2=$((f2 + FAIL_L2[$k]))
+    done
+    local t1 r1 c1 t2 r2 c2
+    read -r t1 r1 c1 < <(count_all "$DEST_ADDR" 0)
+    read -r t2 r2 c2 < <(count_all "$FUNDED_ADDR" 1)
+    r "   ┊ L1→L2  submitted=$s1/$PLAN_L1  ready=$((r1 - BASE_L1_R_TOT))  claimed=$((c1 - BASE_L1_C_TOT))  failed=$f1"
+    r "   ┊ L2→L1  submitted=$s2/$PLAN_L2  ready=$((r2 - BASE_L2_R_TOT))  claimed=$((c2 - BASE_L2_C_TOT))  failed=$f2"
 }
 
 flush_l1_buf() {
@@ -379,6 +407,7 @@ flush_l1_buf() {
         fi
     done
     L1BUF_OP=(); L1BUF_TI=()
+    status_line
 }
 
 run_l2_out() {  # <op#> <token_idx>
@@ -399,6 +428,7 @@ run_l2_out() {  # <op#> <token_idx>
         v "OP $op L2→L1 ${T_LABEL[$ti]} BRIDGE-OUT FAILED (rc=$rc): $(echo "$out" | tail -2 | tr '\n' ' ')"
         progress "$op" "${T_LABEL[$ti]}" "L2→L1" "BRIDGE-OUT-FAILED"
     fi
+    status_line
 }
 
 LOAD_START=$(date +%s)
