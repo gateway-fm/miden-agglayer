@@ -558,3 +558,4 @@ no cascading effect.
 | `AGGLAYER_ENABLE_WRITER_WORKER` | `false` | Master toggle for the RD-940 async path. |
 | `AGGLAYER_WRITER_QUEUE_DEPTH` | `64` | mpsc capacity. At 64 + p50 commit ≈ 10 s, sustainable throughput tops near 6 jobs/s. Bump if `queue_full_rejections` rate climbs. |
 | `AGGLAYER_WRITER_TX_TTL` | `300` (5 min) | Seconds before the TTL sweeper forcibly transitions a stuck non-terminal hash to Failed + writes a `status:0x0` receipt. Sits inside aggkit's `WaitTxToBeMined = 2 m` with margin. |
+| `AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS` | `120` | Miden-block lifetime for pending claim receipts that wait for the projector to observe claim-note consumption. Increase if valid claims expire before projection under load. |

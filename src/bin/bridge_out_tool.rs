@@ -375,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
                 let submission_height = pending_update.submission_height();
                 eprintln!(
                     "[bridge-out] transaction {accepted_tx} was accepted at block \
-                     {submission_height}, but local store update failed: {source}; \
+                     {submission_height}, but local store update failed: {source:#}; \
                      re-applying the attached update"
                 );
                 let pending_update = *pending_update;
@@ -394,7 +394,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(reapply_err) => {
                             eprintln!(
-                                "[bridge-out] recovery apply attempt {recovery_attempt}/{SUBMIT_ATTEMPTS} failed for transaction {accepted_tx}: {reapply_err}"
+                                "[bridge-out] recovery apply attempt {recovery_attempt}/{SUBMIT_ATTEMPTS} failed for transaction {accepted_tx}: {reapply_err:#}"
                             );
                             last_reapply_err = Some(reapply_err);
                             if recovery_attempt < SUBMIT_ATTEMPTS {
@@ -407,7 +407,7 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
                 let last_reapply_err = last_reapply_err
-                    .map(|err| err.to_string())
+                    .map(|err| format!("{err:#}"))
                     .unwrap_or_else(|| "unknown recovery error".to_string());
                 return Err(anyhow!(
                     "submit accepted transaction {accepted_tx} at block {submission_height}, but local store recovery failed after {SUBMIT_ATTEMPTS} attempts: {last_reapply_err}"

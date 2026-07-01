@@ -15,6 +15,27 @@ struct TransactionData {
     pub input: alloy::primitives::Bytes,
 }
 
+fn envelope_nonce(txn_envelope: &TxEnvelope) -> u64 {
+    match txn_envelope {
+        TxEnvelope::Eip1559(s) => s.tx().nonce,
+        TxEnvelope::Eip2930(s) => s.tx().nonce,
+        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
+        TxEnvelope::Eip7702(s) => s.tx().nonce,
+        TxEnvelope::Legacy(s) => s.tx().nonce,
+    }
+}
+
+fn calldata_selector(input: &alloy::primitives::Bytes) -> String {
+    let bytes = input.as_ref();
+    if bytes.len() < 4 {
+        return "0x".to_string();
+    }
+    format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
 fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionData> {
     let data = match txn_envelope {
         TxEnvelope::Eip1559(txn_signed) => {
@@ -476,6 +497,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let txn = unwrap_txn_envelope(txn_envelope.clone())?;
     let txn_hash = txn.hash;
     let signer = txn_envelope.recover_signer()?;
+    let tx_nonce = envelope_nonce(&txn_envelope);
+    let selector = calldata_selector(&txn.input);
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
     // RD-940 Decision 3 — tx-hash dedup early-return, BEFORE the R4 nonce check.
@@ -498,9 +521,34 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     //
     // Runs BEFORE `per_signer_lock` so contention from re-broadcast bursts
     // doesn't pile up on the lock.
-    if let Some(handle) = service.writer_handle.as_ref()
-        && handle.is_inflight(&txn_hash)
-    {
+    let known_inflight = service
+        .writer_handle
+        .as_ref()
+        .is_some_and(|handle| handle.is_inflight(&txn_hash));
+    let known_store_tx = service
+        .store
+        .txn_get(txn_hash)
+        .await
+        .map(|entry| entry.is_some())
+        .unwrap_or(false);
+    tracing::info!(
+        target: "rpc::nonce_snoop",
+        "{}",
+        serde_json::json!({
+            "event": "eth_sendRawTransaction_received",
+            "signer": format!("{signer:#x}"),
+            "tx_hash": format!("{txn_hash:#x}"),
+            "tx_nonce": tx_nonce,
+            "calldata_selector": selector,
+            "calldata_len": txn.input.len(),
+            "known_inflight": known_inflight,
+            "known_store_tx": known_store_tx,
+            "writer_enabled": service.enable_writer_worker,
+            "writer_handle_present": service.writer_handle.is_some(),
+        })
+    );
+
+    if known_inflight {
         tracing::debug!(
             target: "rpc::dedup",
             %txn_hash,
@@ -508,7 +556,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         );
         return Ok(txn_hash);
     }
-    if matches!(service.store.txn_get(txn_hash).await, Ok(Some(_))) {
+    if known_store_tx {
         tracing::debug!(
             target: "rpc::dedup",
             %txn_hash,
@@ -534,13 +582,20 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // Validate `tx.nonce == store.nonce_get(signer)` BEFORE running any handler.
     let signer_str = format!("{signer:#x}");
     let expected_nonce = service.store.nonce_get(&signer_str).await?;
-    let tx_nonce = match &txn_envelope {
-        TxEnvelope::Eip1559(s) => s.tx().nonce,
-        TxEnvelope::Eip2930(s) => s.tx().nonce,
-        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
-        TxEnvelope::Eip7702(s) => s.tx().nonce,
-        TxEnvelope::Legacy(s) => s.tx().nonce,
-    };
+    tracing::info!(
+        target: "rpc::nonce_snoop",
+        "{}",
+        serde_json::json!({
+            "event": "eth_sendRawTransaction_nonce_check",
+            "signer": signer_str,
+            "tx_hash": format!("{txn_hash:#x}"),
+            "tx_nonce": tx_nonce,
+            "expected_nonce": expected_nonce,
+            "nonce_matches": tx_nonce == expected_nonce,
+            "writer_enabled": service.enable_writer_worker,
+            "writer_handle_present": service.writer_handle.is_some(),
+        })
+    );
     if tx_nonce != expected_nonce {
         ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
         anyhow::bail!(

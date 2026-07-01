@@ -384,11 +384,12 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             let params: (String, String) = request.parse_params()?;
             let addr = &params.0;
             let tag = params.1.as_str();
-            let mut nonce = service
+            let accepted_nonce = service
                 .store
                 .nonce_get(addr)
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?;
+            let mut returned_nonce = accepted_nonce;
 
             // RD-940 Decision 4 — honour the block tag.
             //
@@ -409,15 +410,35 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             // Empty / missing tag defaults to `latest` per the geth contract
             // (`eth_getTransactionCount` second-param convention).
             let treat_as_latest = matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest");
+            let mut inflight_non_terminal = 0usize;
             if treat_as_latest
                 && let Some(handle) = service.writer_handle.as_ref()
                 && let Ok(signer_addr) = addr.parse::<alloy::primitives::Address>()
             {
-                let inflight = handle.count_non_terminal_for_signer(&signer_addr);
-                nonce = nonce.saturating_sub(inflight as u64);
+                inflight_non_terminal = handle.count_non_terminal_for_signer(&signer_addr);
+                returned_nonce = returned_nonce.saturating_sub(inflight_non_terminal as u64);
             }
 
-            Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
+            tracing::info!(
+                target: "rpc::nonce_snoop",
+                "{}",
+                serde_json::json!({
+                    "event": "eth_getTransactionCount",
+                    "address": addr,
+                    "tag": tag,
+                    "treat_as_latest": treat_as_latest,
+                    "accepted_nonce": accepted_nonce,
+                    "inflight_non_terminal": inflight_non_terminal,
+                    "returned_nonce": returned_nonce,
+                    "writer_enabled": service.enable_writer_worker,
+                    "writer_handle_present": service.writer_handle.is_some(),
+                })
+            );
+
+            Ok(JsonRpcResponse::success(
+                answer_id,
+                format!("{returned_nonce:#x}"),
+            ))
         }
 
         "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),

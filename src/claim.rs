@@ -14,6 +14,35 @@ use miden_protocol::note::Note;
 use miden_protocol::transaction::TransactionId;
 use std::sync::{Arc, OnceLock};
 
+pub const CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV: &str = "AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS";
+pub const DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS: u64 = 120;
+
+pub fn claim_receipt_expiration_blocks() -> u64 {
+    match std::env::var(CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(blocks) if blocks >= 1 => blocks,
+            Ok(blocks) => {
+                tracing::warn!(
+                    env = CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV,
+                    value = blocks,
+                    "{CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV} must be >= 1 block; using default {DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS}"
+                );
+                DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS
+            }
+            Err(err) => {
+                tracing::warn!(
+                    env = CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV,
+                    value = %value,
+                    error = %err,
+                    "invalid {CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV}; using default {DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS}"
+                );
+                DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS
+            }
+        },
+        Err(_) => DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS,
+    }
+}
+
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L556
     #[derive(Debug)]
@@ -447,8 +476,7 @@ async fn publish_claim_internal(
             .as_bytes(),
     );
 
-    const EXPIRATION_DELTA: u16 = 10;
-    let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
+    let expires_at = latest_block_num + claim_receipt_expiration_blocks();
 
     // Wait for the NTX builder to consume the UpdateGerNote on the bridge account.
     // The CLAIM note's FPI calls assert_valid_ger which checks the bridge account's

@@ -247,6 +247,7 @@ services:
       AGGLAYER_ENABLE_WRITER_WORKER: "${AGGLAYER_ENABLE_WRITER_WORKER:-false}"
       AGGLAYER_WRITER_QUEUE_DEPTH: "${AGGLAYER_WRITER_QUEUE_DEPTH:-64}"
       AGGLAYER_WRITER_TX_TTL: "${AGGLAYER_WRITER_TX_TTL:-300}"
+      AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS: "${AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS:-120}"
     volumes:
       # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
       # shares the miden-client sqlite store + keystore + bridge_accounts.toml with
