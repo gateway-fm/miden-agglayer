@@ -340,7 +340,8 @@ services:
     command:
       - "--l2-rpc-url=http://miden-agglayer:8546"
       - "--l1-rpc-url=http://anvil:8545"
-      - "--bridge-address=${BRIDGE_ADDRESS}"
+      - "--l1-bridge-address=${BRIDGE_ADDRESS}"
+      - "--l2-bridge-address=${BRIDGE_ADDRESS}"
       - "--bridge-service-url=http://bridge-service:8080"
       - "--network-id=${NETWORK_ID:-1}"
       - "--poll-interval-secs=5"
