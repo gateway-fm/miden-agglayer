@@ -86,11 +86,13 @@ pub struct ClaimerConfig {
     pub l2_rpc_url: String,
     /// L1 JSON-RPC URL (isClaimed view-calls + claimAsset submission).
     pub l1_rpc_url: String,
-    /// Bridge contract address. Used both as the `eth_getLogs` address filter on
-    /// L2 (the proxy stamps synthetic BridgeEvent logs with this address) and as
-    /// the `claimAsset`/`isClaimed` target on L1. Assumes the canonical CDK
-    /// deterministic deploy where L1 and L2 share the bridge address.
-    pub bridge_address: Address,
+    /// L1 bridge contract address — the `claimAsset` / `isClaimed` target on L1.
+    pub l1_bridge_address: Address,
+    /// L2 bridge contract address — the `eth_getLogs` filter for the proxy's
+    /// synthetic `BridgeEvent` logs. On non-deterministic deploys (e.g. the Miden
+    /// outpost) this differs from the L1 address; on a canonical CDK
+    /// shared-address deploy the two are equal.
+    pub l2_bridge_address: Address,
     /// Bridge-service base URL (for `/merkle-proof`).
     pub bridge_service_url: String,
     /// Our rollup's agglayer network id (e.g. 1 in kurtosis, 76 on Bali).
@@ -405,7 +407,7 @@ fn scan_windows(from: u64, head: u64, max_range: u64) -> Vec<(u64, u64)> {
 /// is `< max_range`, which the caller keeps below the proxy cap.
 async fn discover<P: Provider>(
     l2: &P,
-    bridge_address: Address,
+    l2_bridge_address: Address,
     from: u64,
     max_range: u64,
 ) -> anyhow::Result<Vec<PendingExit>> {
@@ -415,7 +417,7 @@ async fn discover<P: Provider>(
     // Bulk catch-up: numeric windows up to the (possibly lagging) numeric head.
     for (w_from, w_to) in scan_windows(from, head, max_range) {
         let filter = Filter::new()
-            .address(bridge_address)
+            .address(l2_bridge_address)
             .from_block(w_from)
             .to_block(w_to)
             .event_signature(BridgeEvent::SIGNATURE_HASH);
@@ -434,12 +436,12 @@ async fn discover<P: Provider>(
     // the loop, or `from` when `from > head` (loop produced no windows).
     let tail_from = from.max(head.saturating_add(1));
     let filter = Filter::new()
-        .address(bridge_address)
+        .address(l2_bridge_address)
         .from_block(tail_from)
         .to_block(BlockNumberOrTag::Latest)
         .event_signature(BridgeEvent::SIGNATURE_HASH);
     let logs = l2.get_logs(&filter).await?;
-    tracing::debug!(from = tail_from, %bridge_address, raw_logs = logs.len(), "discover: latest tail");
+    tracing::debug!(from = tail_from, %l2_bridge_address, raw_logs = logs.len(), "discover: latest tail");
     collect_exits(logs, &mut out);
 
     Ok(out)
@@ -544,7 +546,7 @@ async fn process_exit<P1: Provider, P2: Provider>(
 ) -> anyhow::Result<bool> {
     let src_net = source_bridge_network(cfg.network_id);
 
-    if is_claimed(l1, cfg.bridge_address, exit.leaf_index, src_net).await? {
+    if is_claimed(l1, cfg.l1_bridge_address, exit.leaf_index, src_net).await? {
         tracing::debug!(leaf = exit.leaf_index, "already claimed on L1; skipping");
         return Ok(true);
     }
@@ -569,9 +571,9 @@ async fn process_exit<P1: Provider, P2: Provider>(
 
     let call = build_claim_call(exit, &proof, cfg.network_id);
 
-    let resolved = match simulate(l1, cfg.bridge_address, sponsor, &call).await {
+    let resolved = match simulate(l1, cfg.l1_bridge_address, sponsor, &call).await {
         Readiness::Ready => {
-            let tx = submit(l1, cfg.bridge_address, &call).await?;
+            let tx = submit(l1, cfg.l1_bridge_address, &call).await?;
             tracing::info!(
                 leaf = exit.leaf_index,
                 dest = %exit.destination_address,
@@ -627,7 +629,8 @@ pub async fn run(cfg: ClaimerConfig) -> anyhow::Result<()> {
     tracing::info!(
         l2_rpc = %cfg.l2_rpc_url,
         l1_rpc = %redact_rpc_url(&cfg.l1_rpc_url),
-        bridge = %cfg.bridge_address,
+        l1_bridge = %cfg.l1_bridge_address,
+        l2_bridge = %cfg.l2_bridge_address,
         network_id = cfg.network_id,
         sponsor = %sponsor,
         poll_interval_s = cfg.poll_interval.as_secs(),
@@ -678,7 +681,7 @@ async fn poll_once<P1: Provider, P2: Provider>(
     // Chunked scan (see `discover`): numeric windows up to the head + a final
     // `latest`-bounded window, each <= cfg.max_range to respect the proxy's
     // eth_getLogs cap (PRST-4030).
-    let exits = discover(l2, cfg.bridge_address, from, cfg.max_range).await?;
+    let exits = discover(l2, cfg.l2_bridge_address, from, cfg.max_range).await?;
     if !exits.is_empty() {
         tracing::info!(from, count = exits.len(), "discovered L2->L1 exits");
     }
