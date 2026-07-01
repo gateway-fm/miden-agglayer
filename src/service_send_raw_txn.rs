@@ -565,44 +565,75 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         return Ok(txn_hash);
     }
 
-    // R4 follow-up — serialise the entire nonce-check + handler critical section
-    // for this signer. Without the mutex, two concurrent same-nonce txs both
-    // pass the equality check before either calls `nonce_increment`. This guard
-    // is cheap (per-signer, no contention across distinct signers), is held
-    // until the function returns, and is dropped automatically on panic.
-    let _lock = service.per_signer_locks.lock(signer).await;
-
-    // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce only on
-    // success and never compared the incoming `tx.nonce` against the expected next
-    // value. That allowed:
-    //   1. Replay: a tx replayed with its original nonce would re-execute (the
-    //      claim path's try_claim dedupes by globalIndex, but other paths don't).
-    //   2. Skipped sequencing: an out-of-order tx with an inflated nonce would
-    //      still be processed, leaving "holes" in the apparent sequence.
-    // Validate `tx.nonce == store.nonce_get(signer)` BEFORE running any handler.
+    // R4 follow-up — serialise the entire nonce-check + enqueue/handler
+    // critical section for this signer. Without the mutex, two concurrent
+    // same-nonce txs both pass the equality check before either calls
+    // `nonce_increment`.
+    //
+    // With the writer worker enabled, also tolerate bounded future-nonce
+    // reordering from concurrent HTTP delivery: if nonce N+1 reaches us before
+    // nonce N, release the lock, wait briefly for N to be accepted, then
+    // re-check. This is a small in-process txpool behavior; stale/replay nonces
+    // still fail immediately, and missing gaps still fail after the bound.
     let signer_str = format!("{signer:#x}");
-    let expected_nonce = service.store.nonce_get(&signer_str).await?;
-    tracing::info!(
-        target: "rpc::nonce_snoop",
-        "{}",
-        serde_json::json!({
-            "event": "eth_sendRawTransaction_nonce_check",
-            "signer": signer_str,
-            "tx_hash": format!("{txn_hash:#x}"),
-            "tx_nonce": tx_nonce,
-            "expected_nonce": expected_nonce,
-            "nonce_matches": tx_nonce == expected_nonce,
-            "writer_enabled": service.enable_writer_worker,
-            "writer_handle_present": service.writer_handle.is_some(),
-        })
-    );
-    if tx_nonce != expected_nonce {
+    let future_nonce_wait_max = std::time::Duration::from_secs(30);
+    let future_nonce_poll = std::time::Duration::from_millis(50);
+    let future_nonce_wait_started = tokio::time::Instant::now();
+    let mut logged_future_nonce_wait = false;
+
+    let _lock = loop {
+        let lock = service.per_signer_locks.lock(signer).await;
+
+        // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce
+        // only on success and never compared the incoming `tx.nonce` against
+        // the expected next value. That allowed replay and skipped sequencing.
+        let expected_nonce = service.store.nonce_get(&signer_str).await?;
+        let can_wait_for_future_nonce = service.enable_writer_worker
+            && tx_nonce > expected_nonce
+            && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
+        let nonce_action = if tx_nonce == expected_nonce {
+            "accept"
+        } else if can_wait_for_future_nonce {
+            "wait_future"
+        } else {
+            "reject"
+        };
+        tracing::info!(
+            target: "rpc::nonce_snoop",
+            "{}",
+            serde_json::json!({
+                "event": "eth_sendRawTransaction_nonce_check",
+                "signer": signer_str,
+                "tx_hash": format!("{txn_hash:#x}"),
+                "tx_nonce": tx_nonce,
+                "expected_nonce": expected_nonce,
+                "nonce_matches": tx_nonce == expected_nonce,
+                "action": nonce_action,
+                "future_nonce_wait_ms": future_nonce_wait_started.elapsed().as_millis(),
+                "writer_enabled": service.enable_writer_worker,
+                "writer_handle_present": service.writer_handle.is_some(),
+            })
+        );
+
+        if tx_nonce == expected_nonce {
+            break lock;
+        }
+
+        if can_wait_for_future_nonce {
+            if !logged_future_nonce_wait {
+                ::metrics::counter!("rpc_future_nonce_wait_total").increment(1);
+                logged_future_nonce_wait = true;
+            }
+            drop(lock);
+            tokio::time::sleep(future_nonce_poll).await;
+            continue;
+        }
+
         ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
         anyhow::bail!(
-            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; \
-             this guards against replay and out-of-order submission (R4)"
+            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; this guards against replay and out-of-order submission (R4)"
         );
-    }
+    };
 
     // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
     // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
@@ -732,9 +763,14 @@ mod tests {
     /// pre-EIP-155 envelopes without a chain_id, which is the right production
     /// posture but means tests must opt in explicitly.
     fn encode_legacy_tx(input: Vec<u8>) -> (String, Address) {
+        encode_legacy_tx_with_nonce(input, 0)
+    }
+
+    fn encode_legacy_tx_with_nonce(input: Vec<u8>, nonce: u64) -> (String, Address) {
         let txn = TxLegacy {
             input: input.into(),
             chain_id: Some(1),
+            nonce,
             ..Default::default()
         };
         let signature = Signature::test_signature();
@@ -1273,6 +1309,54 @@ mod tests {
             result.is_ok(),
             "matching nonce must be accepted: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rd940_future_nonce_waits_for_missing_nonce_acceptance() {
+        let mut service = create_test_service();
+        let store = service.store.clone();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service.enable_writer_worker = true;
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xBBu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 1);
+
+        let svc = service.clone();
+        let pending = tokio::spawn(async move { service_send_raw_txn(svc, input_hex).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !pending.is_finished(),
+            "future nonce should wait for the missing nonce instead of failing immediately"
+        );
+
+        store
+            .nonce_increment(&format!("{signer:#x}"))
+            .await
+            .expect("simulate nonce 0 acceptance");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("future nonce waiter should complete")
+            .expect("task should not panic");
+        assert!(
+            result.is_ok(),
+            "future nonce should be accepted: {result:?}"
+        );
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            2,
+            "accepting nonce 1 should advance the next accepted nonce to 2"
+        );
+
+        let _ = shutdown.send(());
     }
 
     /// Self-review R2 — repro+regression. Pre-fix, every recovered signer was
