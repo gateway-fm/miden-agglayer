@@ -164,14 +164,21 @@ SPONSOR_PRIVATE_KEY=<from-secret-store> \
 bridge-autoclaim \
   --l2-rpc-url http://localhost:8546 \
   --l1-rpc-url http://localhost:8545 \
-  --bridge-address 0x<bridge> \
+  --l1-bridge-address 0x<l1-bridge> \
+  --l2-bridge-address 0x<l2-bridge> \
   --bridge-service-url http://localhost:18080 \
   --network-id 1
 ```
 
-All flags also read from env (`L2_RPC_URL`, `L1_RPC_URL`, `BRIDGE_ADDRESS`,
-`BRIDGE_SERVICE_URL`, `NETWORK_ID`, `POLL_INTERVAL_SECS`, `MAX_RANGE`,
-`START_BLOCK`, `CURSOR_DB`, `SPONSOR_KEY_ENV`).
+The L1 and L2 bridge addresses are separate: `--l1-bridge-address` is the
+`claimAsset`/`isClaimed` target on L1, `--l2-bridge-address` is the
+`eth_getLogs` BridgeEvent filter on the L2 proxy. They differ on
+non-deterministic deploys (e.g. the Miden outpost); set both the same on a
+canonical CDK shared-address deploy.
+
+All flags also read from env (`L2_RPC_URL`, `L1_RPC_URL`, `L1_BRIDGE_ADDRESS`,
+`L2_BRIDGE_ADDRESS`, `BRIDGE_SERVICE_URL`, `NETWORK_ID`, `POLL_INTERVAL_SECS`,
+`MAX_RANGE`, `START_BLOCK`, `CURSOR_DB`, `SPONSOR_KEY_ENV`).
 
 ## Prerequisites
 
