@@ -1442,7 +1442,7 @@
         <span class="hero-strip-sep"></span>
         <span class="hero-strip-pair"><span class="hero-strip-key">BRIDGE</span><span class="hero-strip-val">SEPOLIA ↔ MIDEN</span></span>
         <span class="hero-strip-sep"></span>
-        <span class="hero-strip-pair"><span class="hero-strip-key">LIVE SINCE</span><span class="hero-strip-val">20.05.2026</span></span>
+        <span class="hero-strip-pair"><span class="hero-strip-key">LIVE SINCE</span><span class="hero-strip-val">24.06.2026</span></span>
         <span class="hero-strip-sep"></span>
         <span class="hero-strip-pair"><span class="hero-strip-key">NEXT POLL</span><span class="hero-strip-val hero-strip-live"><span class="hero-strip-dot"></span><span id="pollCountdown">30S</span></span></span>
       </div>
@@ -1534,8 +1534,8 @@
       l1RpcUrl: "https://ethereum-sepolia-rpc.publicnode.com",
       bridgeServiceUrl: "https://miden-testnet-bridge.dev.eu-north-3.gateway.fm/api",
       bridgeContract: "0x1348947e282138d8f377b467f7d9c2eb0f335d1f",
-      midenNetworkId: 76,           // bali rollupId (per bali-l1-deposit.sh)
-      deploymentBlock: 10881795,    // bali rollup creation on Sepolia, 2026-05-20
+      midenNetworkId: 78,           // rollup id on the Bali rollup manager (replaced dropped rollup 76)
+      deploymentBlock: 11129934,    // rollup 78 creation on Sepolia, 2026-06-24
       windowDays: 10,               // rolling display window
       windowMs: 10 * 24 * 60 * 60 * 1000,
       pollIntervalMs: 30_000,
@@ -1546,10 +1546,9 @@
       // Without this we can only see CLAIMED outbounds via L1 logs. Add yours via
       // window.appendWatchedAddress("0x…"); persists in localStorage.
       watchedAddresses: [
-        "0xEFAD2016599b886A457Ffbf313dae2a7A4bfaa27",  // canonical bali test funder (per bridge-test-summary-r2-2026-05-20.md)
-        "0xC0fFCd2b7245D8B09E94f0526b92cDEDd292D19F",  // disposable bridge wallet from same summary
+        "0x9D865BC3034309095E4868f94b72b5F19919192e",  // rollup 78 L2->L1 withdrawal recipient (first relaunch exit)
       ],
-      storageKey: "bali-bridge:v5",
+      storageKey: "bali-bridge:v6-r78",
     };
 
     // Pre-baked watchedAddresses above + auto-discovery from L1 ClaimEvents
@@ -2499,9 +2498,9 @@
 
       const tag = (s) => s.done ? "DONE" : (s.active ? "IN FLIGHT" : "PENDING");
 
-      const direction = (Number(exit.network_id) === 76 && Number(exit.dest_net) === 0)
+      const direction = (Number(exit.network_id) === CONFIG.midenNetworkId && Number(exit.dest_net) === 0)
         ? { fromNet: "MIDEN · BALI · L2", fromAddr: "(L2 sender)", toNet: "SEPOLIA · L1", toAddr: exit.dest_addr, kind: "outbound" }
-        : (Number(exit.network_id) === 0 && Number(exit.dest_net) === 76)
+        : (Number(exit.network_id) === 0 && Number(exit.dest_net) === CONFIG.midenNetworkId)
           ? { fromNet: "SEPOLIA · L1", fromAddr: "(L1 sender)", toNet: "MIDEN · BALI · L2", toAddr: exit.dest_addr, kind: "inbound" }
           : { fromNet: "net " + exit.network_id, fromAddr: "·", toNet: "net " + exit.dest_net, toAddr: exit.dest_addr, kind: "other" };
 
