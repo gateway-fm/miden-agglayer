@@ -1525,6 +1525,42 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn replace_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let faucet_id = entry.faucet_id.to_hex();
+        // Atomically drop any existing route for this origin (which may carry a
+        // different, poisoned faucet_id) and insert the replacement. Done in a
+        // transaction so the (origin_address, origin_network) unique index never
+        // sees two rows for the same origin.
+        let tx = client.transaction().await?;
+        tx.execute(
+            "DELETE FROM faucet_registry WHERE origin_address = $1 AND origin_network = $2",
+            &[
+                &entry.origin_address.as_slice(),
+                &(entry.origin_network as i32),
+            ],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &faucet_id,
+                &entry.origin_address.as_slice(),
+                &(entry.origin_network as i32),
+                &entry.symbol,
+                &(entry.origin_decimals as i16),
+                &(entry.miden_decimals as i16),
+                &(entry.scale as i16),
+                &entry.metadata.as_slice(),
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::info!(faucet_id = %faucet_id, symbol = %entry.symbol, "PgStore: faucet route replaced");
+        Ok(())
+    }
+
     async fn get_faucet_by_origin(
         &self,
         origin_address: &[u8; 20],

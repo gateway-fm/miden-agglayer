@@ -253,12 +253,73 @@ pub async fn register_faucet_in_bridge(
     Ok(())
 }
 
-/// Maximum decimals an ERC-20 may legitimately declare. Real-world tokens use
-/// 0..30; values above 30 are pathological and would cause `10u256.pow(decimals)`
-/// to overflow during scaling. Self-review X3 — without this bound the
+/// Maximum decimals a local Miden faucet may declare. Mirrors
+/// [`miden_standards::account::faucets::FungibleFaucet::MAX_DECIMALS`], which the
+/// fungible-faucet builder enforces — `create_agglayer_faucet` panics/errors for
+/// any `decimals` above this. Used to bound the auto-derived `miden_decimals`.
+pub const MAX_MIDEN_DECIMALS: u8 = miden_standards::account::faucets::FungibleFaucet::MAX_DECIMALS;
+
+/// Maximum decimal downscaling factor `scale = origin_decimals - miden_decimals`
+/// supported by the bridge stack. This is `MAX_SCALING_FACTOR` in the agglayer
+/// `asset_conversion.masm`, enforced at runtime by
+/// [`miden_base_agglayer::EthAmount::scale_to_token_amount`], which returns
+/// `EthAmountError::ScaleTooLarge` for `scale > 18`. The upstream constant is
+/// not `pub`, so it is mirrored here; keep in sync with the MASM.
+pub const MAX_SCALING_FACTOR: u8 = 18;
+
+/// Maximum decimals an ERC-20 may legitimately declare AND still be supportable
+/// as a bridged token. A route for an origin token with `d` decimals is
+/// satisfiable iff there is a local decimal count `m` with `m <=
+/// MAX_MIDEN_DECIMALS` (12) and `d - m <= MAX_SCALING_FACTOR` (18); the largest
+/// such `d` is `12 + 18 = 30` (via `m = 12`, `scale = 18`). Values above 30 are
+/// genuinely unsupportable (and also pathological — `10u256.pow(decimals)` would
+/// overflow during scaling). Self-review X3 — without this bound the
 /// `parse_token_metadata` happy path accepts `decimals = 255` from a malicious
 /// or buggy ERC-20, which then overflows U256 arithmetic in the claim path.
-pub const MAX_TOKEN_DECIMALS: u8 = 30;
+///
+/// NB: 30 (not 26) is the correct hard cap under the *dynamic* decimal
+/// derivation in [`derive_miden_decimals`]. 26 was only correct under the older
+/// fixed `miden_decimals = min(origin, 8)` scheme, where `d = 27..30` yielded
+/// `scale = 19..22 > 18` and thus an unclaimable route. The dynamic derivation
+/// bumps `miden_decimals` up as needed so those tokens are supportable.
+pub const MAX_TOKEN_DECIMALS: u8 = MAX_MIDEN_DECIMALS + MAX_SCALING_FACTOR;
+
+/// Derive the local Miden faucet decimals for an origin token declaring
+/// `origin_decimals`, honouring BOTH bridge-stack limits:
+/// - the local faucet's decimals must be `<= MAX_MIDEN_DECIMALS` (12), and
+/// - the downscaling factor `scale = origin_decimals - miden_decimals` must be
+///   `<= MAX_SCALING_FACTOR` (18).
+///
+/// The formula keeps the historical default of 8 whenever that satisfies both
+/// limits, and only bumps `miden_decimals` up as far as needed to keep `scale
+/// <= 18`:
+///
+/// ```text
+/// miden_decimals = origin_decimals.min(8).max(origin_decimals.saturating_sub(18))
+/// ```
+///
+/// Worked examples: d=6→6 (scale 0), d=18→8 (scale 10), d=26→8 (scale 18),
+/// d=27→9 (scale 18), d=30→12 (scale 18), d=31→13 (would exceed
+/// MAX_MIDEN_DECIMALS → rejected).
+///
+/// Returns an error when the token is genuinely unsupportable — i.e. the
+/// smallest `miden_decimals` that keeps `scale <= 18` still exceeds
+/// `MAX_MIDEN_DECIMALS` (equivalently `origin_decimals > 30`). Callers MUST
+/// reject up-front rather than persist an unclaimable route (finding #17).
+pub fn derive_miden_decimals(origin_decimals: u8) -> anyhow::Result<u8> {
+    let miden_decimals = origin_decimals
+        .min(8)
+        .max(origin_decimals.saturating_sub(MAX_SCALING_FACTOR));
+    if miden_decimals > MAX_MIDEN_DECIMALS {
+        anyhow::bail!(
+            "origin token with {origin_decimals} decimals is unsupportable: the smallest local \
+             faucet decimals that keeps scale <= {MAX_SCALING_FACTOR} is {miden_decimals}, which \
+             exceeds the faucet limit of {MAX_MIDEN_DECIMALS} (max supportable origin decimals is \
+             {MAX_TOKEN_DECIMALS})"
+        );
+    }
+    Ok(miden_decimals)
+}
 
 /// Maximum byte length for an ABI-decoded token symbol/name. Token symbols are
 /// always short (1-12 chars in practice). Cap at 64 bytes so a malicious
@@ -297,12 +358,16 @@ pub fn parse_token_metadata(
 
     // Read decimals from the third 32-byte word
     let decimals = data[95]; // last byte of third word
-    // X3 — reject pathological decimals that would overflow `10^decimals` in
-    // U256 amount scaling. The bridge contract's own metadata typically caps
-    // at 18 (ETH); 30 is generous headroom for any future variant.
+    // X3 / finding #17 — reject decimals no local route can satisfy. Above
+    // MAX_TOKEN_DECIMALS (= MAX_MIDEN_DECIMALS + MAX_SCALING_FACTOR = 30) there is
+    // no `miden_decimals <= 12` with `scale <= 18`, so the token is
+    // unsupportable; such values would also overflow `10^decimals` in U256 amount
+    // scaling. Tokens with 27..30 decimals ARE supportable via the dynamic
+    // derivation in `derive_miden_decimals` and are accepted here.
     if decimals > MAX_TOKEN_DECIMALS {
         anyhow::bail!(
-            "token decimals out of range: {decimals} > {MAX_TOKEN_DECIMALS} (would overflow U256 scaling)"
+            "token decimals out of range: {decimals} > {MAX_TOKEN_DECIMALS} (no local faucet route \
+             with miden_decimals <= {MAX_MIDEN_DECIMALS} and scale <= {MAX_SCALING_FACTOR} exists)"
         );
     }
     // The decimals field is u8 in the ABI; the high 31 bytes of the word must be

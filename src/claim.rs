@@ -214,7 +214,13 @@ async fn find_or_create_faucet(
 
     // 3. Auto-create: parse token metadata from claimAsset call
     let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
-    let miden_decimals: u8 = origin_decimals.min(8);
+    // Finding #17 — derive `miden_decimals` so BOTH the local faucet limit
+    // (`<= MAX_MIDEN_DECIMALS`) and the shared downscaling limit (`scale <=
+    // MAX_SCALING_FACTOR`) hold. This rejects genuinely-unsupportable tokens
+    // (origin_decimals > 30) up-front rather than persisting an unclaimable
+    // route, while still supporting 27..30-decimal tokens by bumping
+    // `miden_decimals` above the historical default of 8 as needed.
+    let miden_decimals: u8 = faucet_ops::derive_miden_decimals(origin_decimals)?;
     let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
         anyhow::anyhow!(
             "origin decimals {origin_decimals} < miden decimals {miden_decimals} for token {token_address}"
@@ -1506,6 +1512,82 @@ mod tests {
             // Flag = 2 is technically out of spec but our decoder must only treat 1 as mainnet.
             gi[23] = 2;
             assert!(!is_mainnet_global_index(&gi), "flag must be exactly 1");
+        }
+    }
+
+    /// Finding #17 — first-claim auto-creation used a fixed
+    /// `miden_decimals = origin_decimals.min(8)`, which for 27..30-decimal tokens
+    /// yielded `scale = 19..22`, crossing the shared `MAX_SCALING_FACTOR` (18)
+    /// limit and persisting an UNCLAIMABLE route. The fix derives `miden_decimals`
+    /// dynamically so both limits hold.
+    mod finding_17_decimal_derivation {
+        use crate::faucet_ops::{MAX_MIDEN_DECIMALS, MAX_SCALING_FACTOR, derive_miden_decimals};
+        use alloy::primitives::U256;
+        use miden_base_agglayer::{EthAmount, EthAmountError};
+
+        fn eth_amount(wei: U256) -> EthAmount {
+            EthAmount::new(wei.to_be_bytes::<32>())
+        }
+
+        /// Documents the boundary the bug crossed: the OLD service derivation of a
+        /// 27-decimal token (`27 → miden 8 → scale 19`) is rejected by the shared
+        /// scale gate (`EthAmount::scale_to_token_amount`), whereas the FIXED
+        /// derivation (`27 → miden 9 → scale 18`) is accepted.
+        #[test]
+        fn service_scale_19_crosses_limit_while_18_is_valid() {
+            // 10^27 fits in U256 and scales to 10^9 at scale 18 — well within
+            // FungibleAsset::MAX_AMOUNT — so the only failure under test is the gate.
+            let amount = eth_amount(U256::from(10u64).pow(U256::from(27u64)));
+
+            // Old fixed service derivation: 27 - 8 = 19 → ScaleTooLarge.
+            let service_scale = 27u32 - 8;
+            assert_eq!(service_scale, 19);
+            assert!(matches!(
+                amount.scale_to_token_amount(service_scale),
+                Err(EthAmountError::ScaleTooLarge)
+            ));
+
+            // Fixed derivation: 27 - 9 = 18 → valid.
+            let valid_scale = 27u32 - 9;
+            assert_eq!(valid_scale, 18);
+            assert!(amount.scale_to_token_amount(valid_scale).is_ok());
+        }
+
+        /// The fixed derivation yields a VALID route (miden_decimals ≤ 12 AND
+        /// scale ≤ 18) for every supportable origin decimal count, including the
+        /// previously-poisoned 27..30 range, and rejects the unsupportable 31.
+        #[test]
+        fn derivation_supports_up_to_30_and_rejects_31() {
+            // (origin_decimals, expected_miden_decimals)
+            for (d, expected_m) in [
+                (6u8, 6u8),
+                (8, 8),
+                (18, 8),
+                (26, 8),
+                (27, 9),
+                (28, 10),
+                (29, 11),
+                (30, 12),
+            ] {
+                let m = derive_miden_decimals(d)
+                    .unwrap_or_else(|e| panic!("d={d} must be supportable: {e}"));
+                assert_eq!(m, expected_m, "unexpected miden_decimals for d={d}");
+                let scale = d - m;
+                assert!(m <= MAX_MIDEN_DECIMALS, "d={d}: miden_decimals {m} > cap");
+                assert!(scale <= MAX_SCALING_FACTOR, "d={d}: scale {scale} > cap");
+                // Cross-check the derived scale against the runtime gate.
+                assert!(
+                    eth_amount(U256::from(1u64))
+                        .scale_to_token_amount(u32::from(scale))
+                        .is_ok(),
+                    "d={d}: scale {scale} rejected by EthAmount gate"
+                );
+            }
+
+            // d = 31 needs miden_decimals = 13 > MAX_MIDEN_DECIMALS → rejected
+            // up-front rather than persisting an unclaimable route.
+            assert!(derive_miden_decimals(31).is_err());
+            assert!(derive_miden_decimals(255).is_err());
         }
     }
 }

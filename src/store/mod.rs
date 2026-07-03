@@ -648,6 +648,13 @@ pub trait Store: Send + Sync + 'static {
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()>;
+    /// Replace the faucet route for `(origin_address, origin_network)` with
+    /// `entry`, removing any existing row for that origin first. Unlike
+    /// [`Store::register_faucet`] (which upserts by `faucet_id` and would collide
+    /// with the `(origin_address, origin_network)` unique index when a *new*
+    /// faucet is deployed for the same origin), this lets admin repair a poisoned
+    /// / unclaimable route by swapping in a freshly-deployed faucet (finding #17).
+    async fn replace_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()>;
     /// Look up a faucet by its L1 origin token address and network.
     async fn get_faucet_by_origin(
         &self,

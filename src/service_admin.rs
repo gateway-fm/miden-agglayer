@@ -38,6 +38,14 @@ pub struct RegisterFaucetParams {
     /// defaults to the symbol if not provided.
     #[serde(default)]
     pub name: Option<String>,
+    /// When `true`, an existing route for this `(origin_address, origin_network)`
+    /// is REPAIRED: a fresh faucet is deployed on Miden and the registry row is
+    /// replaced (finding #17 — poisoned/unclaimable routes can otherwise never be
+    /// fixed because the first-match path returns the stale `faucet_id`). Defaults
+    /// to `false`, so a normal call is still idempotent and never silently
+    /// redeploys.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 pub async fn admin_register_faucet(
@@ -55,20 +63,52 @@ pub async fn admin_register_faucet(
             )
         })?;
 
+    // Finding #17 — reject unclaimable routes up-front so a poisoned entry is
+    // never persisted. Both bridge-stack limits must hold: the local faucet
+    // decimals must fit MAX_MIDEN_DECIMALS and the downscaling factor must fit
+    // MAX_SCALING_FACTOR (enforced by `EthAmount::scale_to_token_amount`).
+    if params.miden_decimals > faucet_ops::MAX_MIDEN_DECIMALS {
+        anyhow::bail!(
+            "miden_decimals ({}) exceeds the faucet limit of {} decimals",
+            params.miden_decimals,
+            faucet_ops::MAX_MIDEN_DECIMALS,
+        );
+    }
+    if scale > faucet_ops::MAX_SCALING_FACTOR {
+        anyhow::bail!(
+            "scale ({scale} = origin_decimals {} - miden_decimals {}) exceeds the shared limit of \
+             {} (route would be unclaimable). Raise miden_decimals so scale <= {}.",
+            params.origin_decimals,
+            params.miden_decimals,
+            faucet_ops::MAX_SCALING_FACTOR,
+            faucet_ops::MAX_SCALING_FACTOR,
+        );
+    }
+
     let origin_address = parse_eth_address(&params.origin_token_address)?;
 
-    // Check if already registered
+    // Check if already registered. Without `replace`, stay idempotent and return
+    // the existing faucet_id. With `replace = true`, fall through to deploy a
+    // fresh faucet and swap the registry row (repairs a poisoned route).
     if let Some(existing) = state
         .store
         .get_faucet_by_origin(&origin_address, params.origin_network)
         .await?
     {
-        let id = existing.faucet_id.to_hex();
-        tracing::info!(
-            faucet_id = %id,
-            "admin_registerFaucet: faucet already exists for this origin"
+        if !params.replace {
+            let id = existing.faucet_id.to_hex();
+            tracing::info!(
+                faucet_id = %id,
+                "admin_registerFaucet: faucet already exists for this origin"
+            );
+            return Ok(id);
+        }
+        tracing::warn!(
+            existing_faucet_id = %existing.faucet_id.to_hex(),
+            existing_scale = existing.scale,
+            "admin_registerFaucet: replace=true — deploying a fresh faucet and replacing the \
+             existing route for this origin"
         );
-        return Ok(id);
     }
 
     let accounts = &state.accounts.0;
@@ -188,19 +228,24 @@ pub async fn admin_register_faucet(
     // Save to store — UNLESS the closure already recovered + persisted an existing
     // faucet identity (Cantina #6), in which case the row is already written.
     if recovered.get().is_none() {
-        state
-            .store
-            .register_faucet(FaucetEntry {
-                faucet_id,
-                origin_address,
-                origin_network: params.origin_network,
-                symbol: params.symbol,
-                origin_decimals: params.origin_decimals,
-                miden_decimals: params.miden_decimals,
-                scale,
-                metadata: metadata_bytes,
-            })
-            .await?;
+        // On repair (`replace`), swap the row for this origin — the freshly-deployed
+        // faucet has a new faucet_id, so a plain upsert-by-faucet_id would collide
+        // with the (origin_address, origin_network) unique index.
+        let entry = FaucetEntry {
+            faucet_id,
+            origin_address,
+            origin_network: params.origin_network,
+            symbol: params.symbol,
+            origin_decimals: params.origin_decimals,
+            miden_decimals: params.miden_decimals,
+            scale,
+            metadata: metadata_bytes,
+        };
+        if params.replace {
+            state.store.replace_faucet(entry).await?;
+        } else {
+            state.store.register_faucet(entry).await?;
+        }
     }
 
     let id_hex = faucet_id.to_hex();
@@ -223,4 +268,118 @@ fn parse_eth_address(s: &str) -> anyhow::Result<[u8; 20]> {
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&bytes);
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::FaucetEntry;
+    use crate::test_helpers::create_test_service;
+    use miden_protocol::account::AccountId;
+
+    const ORIGIN_HEX: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+    // A valid protocol-0.15 account id, reused as the poisoned faucet's id.
+    const POISON_FAUCET_HEX: &str = "0xac0000000000dd110000ee000000fc";
+
+    /// Seed a poisoned route: a 27-decimal token registered under the OLD fixed
+    /// scheme (`miden = 8`, `scale = 19 > MAX_SCALING_FACTOR`) — unclaimable.
+    async fn seed_poisoned_route(service: &ServiceState) {
+        let origin = parse_eth_address(ORIGIN_HEX).unwrap();
+        service
+            .store
+            .register_faucet(FaucetEntry {
+                faucet_id: AccountId::from_hex(POISON_FAUCET_HEX).unwrap(),
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 27,
+                miden_decimals: 8,
+                scale: 19,
+                metadata: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn repair_params(replace: bool) -> RegisterFaucetParams {
+        RegisterFaucetParams {
+            symbol: "TKN".into(),
+            origin_token_address: ORIGIN_HEX.into(),
+            origin_network: 0,
+            origin_decimals: 27,
+            // Fixed derivation for d=27 → scale 18 (valid route).
+            miden_decimals: 9,
+            name: None,
+            replace,
+        }
+    }
+
+    /// Finding #17 — WITHOUT `replace`, an existing route short-circuits:
+    /// `admin_registerFaucet` returns the stale faucet_id and never touches Miden.
+    /// This is the pre-fix "cannot be repaired" behaviour, retained as the default
+    /// idempotent path.
+    #[tokio::test]
+    async fn existing_route_is_idempotent_without_replace() {
+        let service = create_test_service();
+        seed_poisoned_route(&service).await;
+
+        let id = admin_register_faucet(service.clone(), repair_params(false))
+            .await
+            .unwrap();
+        assert_eq!(id, AccountId::from_hex(POISON_FAUCET_HEX).unwrap().to_hex());
+        // No faucet deploy attempted — the stale route was returned as-is.
+        assert_eq!(service.miden_client.test_call_count(), 0);
+    }
+
+    /// Finding #17 (fixed) — WITH `replace = true`, the poisoned route NO LONGER
+    /// short-circuits: the repair path reaches the Miden deploy step, proving the
+    /// route can now be repaired. (The in-test Miden stub does not run the deploy
+    /// closure, so the call itself does not complete a real redeploy; the
+    /// observable is that the deploy path is now reachable — the pre-fix code
+    /// returned the stale id here with zero Miden calls.)
+    #[tokio::test]
+    async fn poisoned_route_can_be_repaired_with_replace() {
+        let service = create_test_service();
+        seed_poisoned_route(&service).await;
+
+        let _ = admin_register_faucet(service.clone(), repair_params(true)).await;
+        assert!(
+            service.miden_client.test_call_count() >= 1,
+            "replace=true must reach the Miden deploy path (pre-fix: 0 calls)"
+        );
+    }
+
+    /// Finding #17 — an unsatisfiable route is rejected up-front and never
+    /// persisted, whether or not `replace` is set. Here `scale = 27 - 7 = 20 >
+    /// MAX_SCALING_FACTOR`.
+    #[tokio::test]
+    async fn rejects_route_exceeding_scaling_factor() {
+        let service = create_test_service();
+        let params = RegisterFaucetParams {
+            symbol: "TKN".into(),
+            origin_token_address: ORIGIN_HEX.into(),
+            origin_network: 0,
+            origin_decimals: 27,
+            miden_decimals: 7, // scale 20 > 18
+            name: None,
+            replace: false,
+        };
+        let err = admin_register_faucet(service.clone(), params)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the shared limit"),
+            "unexpected error: {err}"
+        );
+        // Nothing persisted.
+        let origin = parse_eth_address(ORIGIN_HEX).unwrap();
+        assert!(
+            service
+                .store
+                .get_faucet_by_origin(&origin, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
