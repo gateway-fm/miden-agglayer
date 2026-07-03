@@ -12,7 +12,44 @@ use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::note::Note;
 use miden_protocol::transaction::TransactionId;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+
+/// Per-origin-token async locks that serialise first-claim faucet auto-creation
+/// (finding #10). Keyed by the 20-byte L1 origin token address.
+///
+/// The service is single-process (multiple replicas are unsupported — see
+/// `main.rs`/the synthetic projector), and every `Store` is a single shared
+/// `Arc<dyn Store>`, so a process-global keyed async mutex is a sound
+/// synchronisation primitive: two concurrent first-claims for the same token
+/// take the same `tokio::sync::Mutex` and run the entire
+/// check→deploy→bridge-register→persist sequence one at a time. The loser
+/// re-checks `get_faucet_by_origin` under the lock, finds the winner's faucet,
+/// and reuses it — so a second live faucet is never deployed or bridge-registered.
+///
+/// Keyed by origin **address alone** (not `(address, network)`): the on-chain
+/// bridge registry keys faucets by `hash(origin_token_address)` only, so
+/// serialising per address also makes the Cantina #1 cross-network refusal
+/// TOCTOU-safe (two colliding-network first-claims for the same address can no
+/// longer both pass the refusal check).
+/// Registry of per-origin async mutexes, guarded by a short std-mutex.
+type FaucetCreateLockMap = Mutex<HashMap<[u8; 20], Arc<tokio::sync::Mutex<()>>>>;
+
+static FAUCET_CREATE_LOCKS: LazyLock<FaucetCreateLockMap> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Fetch (or create) the per-origin-address async mutex. The registry map is
+/// guarded by a short std-mutex with no await-points held; the returned tokio
+/// mutex carries the actual critical section. Mirrors
+/// `service_state::PerSignerLocks`.
+fn faucet_create_lock(origin_address: &[u8; 20]) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = FAUCET_CREATE_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.entry(*origin_address)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 pub const CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV: &str = "AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS";
 pub const DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS: u64 = 120;
@@ -97,15 +134,23 @@ struct Faucet {
 /// On the first bridge of a new ERC-20 token, the faucet is created on Miden,
 /// registered in the bridge, and saved to the Store — all automatically.
 ///
-/// Concurrency: this function is always called inside a
-/// `MidenClient::with(|client| ...)` closure, which holds the global Miden
-/// client mutex for its duration. Two concurrent first-bridge claims for the
-/// same token therefore serialise on that lock — the second call sees the
-/// faucet already registered by the first and takes the fast `get_faucet_by_origin`
-/// path. The Cantina #1 colliding-network refusal predicate (added in `e6a33ae`)
-/// is consequently TOCTOU-safe by virtue of the surrounding lock; a future
-/// refactor that moves auto-create outside the client mutex must add an
-/// explicit per-token-address mutex (analogous to `PerSignerLocks` for R4).
+/// Concurrency (finding #10): the check→deploy→bridge-register→persist sequence
+/// below must be atomic per origin token. Two concurrent first-bridge claims for
+/// the same ERC-20 previously both passed the empty-local check, both deployed a
+/// faucet and both registered in the bridge (whose address-keyed route ends on
+/// the *second* faucet), while the local write for the second faucet failed on
+/// the `(origin_address, origin_network)` unique index — leaving the local
+/// registry pinned to faucet A and the bridge routing by faucet B, so later
+/// bridge-outs of B-minted assets could not be resolved and emitted no synthetic
+/// BridgeEvent.
+///
+/// The `MidenClient::with(...)` channel-of-1 serialises Miden *submissions*, but
+/// does NOT bracket this whole read-modify-write across its many `await`s, so it
+/// is not sufficient synchronisation. We therefore take an explicit per-origin
+/// async lock ([`faucet_create_lock`]) around the create path and RE-CHECK
+/// `get_faucet_by_origin` under it: the loser reuses the winner's faucet instead
+/// of deploying a second one. `PgStore::register_faucet` additionally converges
+/// on the origin unique key as defense-in-depth (see `store::postgres`).
 async fn find_or_create_faucet(
     token_address: alloy::primitives::Address,
     origin_network: u32,
@@ -114,11 +159,39 @@ async fn find_or_create_faucet(
     client: &mut MidenClientLib,
     accounts: &AccountsConfig,
 ) -> anyhow::Result<Faucet> {
-    // 1. Try store lookup first
+    // 1. Fast path — a read-only lookup that avoids taking the per-origin lock
+    //    for the overwhelmingly-common already-registered case.
     if let Some(entry) = store
         .get_faucet_by_origin(&token_address.0.0, origin_network)
         .await?
     {
+        return Ok(Faucet {
+            id: entry.faucet_id,
+            decimals: entry.miden_decimals,
+            origin_token_decimals: entry.origin_decimals,
+        });
+    }
+
+    // Finding #10 — enter the per-origin critical section. Everything from the
+    // re-check through deploy+bridge-register+persist runs while this guard is
+    // held, so a concurrent first-claim for the same token address serialises
+    // here and cannot deploy a second live faucet.
+    let create_lock = faucet_create_lock(&token_address.0.0);
+    let _create_guard = create_lock.lock().await;
+
+    // 1b. Re-check under the lock. If a racing first-claim registered the faucet
+    //     while we waited for the guard, reuse it — this is what prevents a
+    //     second faucet from ever being deployed or bridge-registered.
+    if let Some(entry) = store
+        .get_faucet_by_origin(&token_address.0.0, origin_network)
+        .await?
+    {
+        tracing::info!(
+            token_address = %token_address,
+            origin_network,
+            faucet_id = %crate::accounts_config::AccountIdBech32(entry.faucet_id),
+            "finding #10: faucet was created by a concurrent first-claim; reusing it"
+        );
         return Ok(Faucet {
             id: entry.faucet_id,
             decimals: entry.miden_decimals,
@@ -811,9 +884,12 @@ async fn publish_claim_internal(
 ///     cache entirely.
 ///
 ///   - **TOCTOU safety for first-bridge faucet creation** (Cantina #1
-///     colliding-network refusal, `e6a33ae`) and any future per-resource
-///     check inside `publish_claim_internal` rely on the surrounding
-///     `with()` mutex, as documented at `find_or_create_faucet`.
+///     colliding-network refusal, `e6a33ae`; finding #10 non-atomic
+///     registration) is provided by the explicit per-origin async lock taken
+///     inside `find_or_create_faucet` — NOT by the surrounding `with()` mutex,
+///     which serialises Miden submissions but does not bracket the whole
+///     check→deploy→register→persist read-modify-write. See the
+///     `find_or_create_faucet` docstring and `FAUCET_CREATE_LOCKS`.
 ///
 /// Recording the PENDING claim receipt (`txn_begin`) + the note↔tx link happens
 /// inside the same closure, before the caller receives a response, so they are
@@ -1002,6 +1078,77 @@ mod tests {
         assert_eq!(entry.origin_decimals, 18);
         assert_eq!(entry.miden_decimals, 8);
         assert_eq!(entry.symbol, "ETH");
+    }
+
+    /// Finding #10 — concurrency repro+regression. Two concurrent first-claims
+    /// for the SAME origin token must deploy+register exactly one faucet. This
+    /// drives the real synchronisation primitive `find_or_create_faucet` uses —
+    /// [`faucet_create_lock`] + a re-check of `get_faucet_by_origin` under the
+    /// guard — without a live Miden node: the "deploy" step is stubbed by a
+    /// short sleep + `register_faucet`. Pre-fix (no lock / no re-check) both
+    /// workers passed the empty-local check and both registered, stranding one
+    /// faucet; post-fix the loser reuses the winner's route.
+    #[tokio::test]
+    async fn finding_10_concurrent_first_claims_deploy_single_faucet() {
+        use crate::store::memory::InMemoryStore;
+
+        let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::new());
+        // Unique origin so the process-global FAUCET_CREATE_LOCKS map can't be
+        // perturbed by another test using the same key.
+        let origin = [0x9Au8; 20];
+        let network = 0u32;
+
+        let id_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let id_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+
+        fn entry(faucet_id: AccountId, origin: [u8; 20], network: u32) -> FaucetEntry {
+            FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: network,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: Vec::new(),
+            }
+        }
+
+        // Mirrors find_or_create_faucet's critical section: take the per-origin
+        // lock, re-check under it, and only "deploy" (stub) + register if absent.
+        async fn worker(store: Arc<InMemoryStore>, faucet_id: AccountId, origin: [u8; 20], net: u32) {
+            let lock = super::faucet_create_lock(&origin);
+            let _guard = lock.lock().await;
+            if store
+                .get_faucet_by_origin(&origin, net)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                // Reuse — the concurrent worker already deployed+registered.
+                return;
+            }
+            // Simulate deploy+bridge-register latency so the peer is guaranteed
+            // to contend on the guard.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            store.register_faucet(entry(faucet_id, origin, net)).await.unwrap();
+        }
+
+        tokio::join!(
+            worker(store.clone(), id_a, origin, network),
+            worker(store.clone(), id_b, origin, network),
+        );
+
+        // Exactly one faucet deployed+registered for this origin.
+        let all = store.list_faucets().await.unwrap();
+        assert_eq!(all.len(), 1, "only one faucet must be created for the origin");
+        // The first worker to acquire the guard (A) is the survivor; B reused it
+        // and never registered, so it is not stranded.
+        assert_eq!(all[0].faucet_id, id_a);
+        assert!(store.get_faucet_by_id(id_b).await.unwrap().is_none());
+        // The bridge-out resolve path finds the canonical faucet.
+        let resolved = store.get_faucet_by_origin(&origin, network).await.unwrap();
+        assert_eq!(resolved.unwrap().faucet_id, id_a);
     }
 
     #[tokio::test]

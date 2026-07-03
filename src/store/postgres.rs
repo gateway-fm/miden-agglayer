@@ -1489,14 +1489,26 @@ impl Store for PgStore {
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         let faucet_id = entry.faucet_id.to_hex();
+        // Finding #10 — converge on the (origin_address, origin_network) unique
+        // key (`idx_faucet_origin`), not only on the faucet_id primary key. A
+        // second first-claim worker that raced past the local miss and deployed
+        // its own faucet must NOT error into the split state where the local
+        // registry keeps faucet A while the bridge routes by faucet B; instead
+        // it converges to the route already persisted.
+        //
+        // The `WHERE faucet_registry.faucet_id = EXCLUDED.faucet_id` guard keeps
+        // the historical faucet_id-idempotent metadata refresh (same faucet
+        // re-registering updates symbol/decimals) while making a *different*
+        // faucet for the same origin a no-op (first-write wins). Admin route
+        // repair (DR tooling) swaps the origin row out-of-band; the
+        // two are complementary — register = converge/idempotent, replace =
+        // explicit swap.
         client
             .execute(
                 "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 ON CONFLICT (faucet_id) DO UPDATE
-                 SET origin_address = EXCLUDED.origin_address,
-                     origin_network = EXCLUDED.origin_network,
-                     symbol = EXCLUDED.symbol,
+                 ON CONFLICT (origin_address, origin_network) DO UPDATE
+                 SET symbol = EXCLUDED.symbol,
                      origin_decimals = EXCLUDED.origin_decimals,
                      miden_decimals = EXCLUDED.miden_decimals,
                      scale = EXCLUDED.scale,
@@ -1508,7 +1520,8 @@ impl Store for PgStore {
                      metadata = CASE
                          WHEN EXCLUDED.metadata = ''::bytea THEN faucet_registry.metadata
                          ELSE EXCLUDED.metadata
-                     END",
+                     END
+                 WHERE faucet_registry.faucet_id = EXCLUDED.faucet_id",
                 &[
                     &faucet_id,
                     &entry.origin_address.as_slice(),

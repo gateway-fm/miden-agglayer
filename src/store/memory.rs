@@ -749,11 +749,32 @@ impl Store for InMemoryStore {
 
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
         let mut faucets = self.faucets.write();
+        // Idempotent by faucet_id: the same faucet re-registering (e.g. startup
+        // re-init) refreshes its metadata.
         if let Some(existing) = faucets.iter_mut().find(|f| f.faucet_id == entry.faucet_id) {
             *existing = entry;
-        } else {
-            faucets.push(entry);
+            return Ok(());
         }
+        // Finding #10 — converge on the (origin_address, origin_network) key.
+        // A *different* faucet already owning this origin route means a
+        // concurrent first-claim (or admin register) won the race; first-write
+        // wins so we do NOT strand a second faucet by pushing a colliding row.
+        // This mirrors `PgStore::register_faucet`'s
+        // `ON CONFLICT (origin_address, origin_network)` convergence and the
+        // real `idx_faucet_origin` unique index. Admin route *repair* uses the
+        // dedicated repair tooling instead.
+        if faucets.iter().any(|f| {
+            f.origin_address == entry.origin_address && f.origin_network == entry.origin_network
+        }) {
+            tracing::warn!(
+                origin_network = entry.origin_network,
+                new_faucet_id = %entry.faucet_id,
+                "finding #10: register_faucet origin already owned by another faucet; \
+                 keeping the existing route (first-write wins)"
+            );
+            return Ok(());
+        }
+        faucets.push(entry);
         Ok(())
     }
 
@@ -1563,5 +1584,88 @@ mod tests {
             .await
             .unwrap();
         assert!(other.is_empty());
+    }
+
+    /// Finding #10 — repro+regression. A second `register_faucet` for an origin
+    /// already owned by a *different* faucet must CONVERGE (first-write wins)
+    /// rather than strand a second row. Pre-fix InMemoryStore silently pushed a
+    /// colliding row (split state, mirroring PgStore's unique-index error), so
+    /// the bridge could route by a faucet the local registry never resolved,
+    /// hiding later bridge-outs.
+    #[tokio::test]
+    async fn finding_10_register_faucet_converges_on_origin_collision() {
+        let store = InMemoryStore::new();
+        let origin = [0xC0u8; 20];
+
+        let faucet_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let faucet_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+
+        // Worker A wins the race and registers first.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_a,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Worker B loses: a DIFFERENT faucet for the SAME (origin, network).
+        // Post-fix this converges — no error, no second row.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_b,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Exactly one row survives — the first-writer's faucet.
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
+        let by_origin = store
+            .get_faucet_by_origin(&origin, 0)
+            .await
+            .unwrap()
+            .expect("origin route must resolve");
+        assert_eq!(by_origin.faucet_id, faucet_a, "first-write must win");
+
+        // The losing faucet is NOT stranded in the registry (it was never
+        // deployed on Miden in the real flow because the re-check under the
+        // per-origin lock would have reused faucet A). resolve-by-id for the
+        // canonical faucet works; the loser resolves to nothing.
+        assert!(store.get_faucet_by_id(faucet_a).await.unwrap().is_some());
+        assert!(store.get_faucet_by_id(faucet_b).await.unwrap().is_none());
+
+        // Same faucet re-registering still refreshes its metadata (idempotent
+        // by faucet_id) — the convergence must not regress this.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_a,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "WTKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_faucet_by_id(faucet_a).await.unwrap().unwrap().symbol,
+            "WTKN"
+        );
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
     }
 }
