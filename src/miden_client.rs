@@ -25,6 +25,18 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// Maximum backoff delay for retries.
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// Process-wide guard enforcing that at most ONE production `MidenClient` is
+/// live at a time — the single owner of the miden `store.sqlite3`.
+///
+/// `MidenClient::new` enters this critical section, checks the flag, and
+/// refuses to build a second concurrent instance; the flag is released when the
+/// client's background thread exits on clean shutdown (so the init → runtime
+/// handoff in `main` still works). This makes the "single sqlite-store owner"
+/// invariant explicit and loud: any accidental second in-process client now
+/// fails fast instead of silently opening the store a second time. Test stubs
+/// (`new_test*`) deliberately bypass this guard.
+static LIVE_CLIENT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(BACKOFF_MAX)
 }
@@ -151,6 +163,22 @@ impl MidenClient {
         sync_listeners: Vec<Arc<dyn SyncListener>>,
         debug_mode: bool,
     ) -> anyhow::Result<Self> {
+        // Critical section: enforce a single live production MidenClient. The
+        // flag is cleared by the background thread on clean shutdown (see the
+        // `Ok(())` arm of the run loop below).
+        {
+            let mut live = LIVE_CLIENT
+                .lock()
+                .expect("MidenClient singleton guard poisoned");
+            if *live {
+                return Err(anyhow!(
+                    "a MidenClient is already live — MidenClient must be a process-wide \
+                     singleton (the single owner of the sqlite store); refusing to open \
+                     store.sqlite3 from a second in-process client"
+                ));
+            }
+            *live = true;
+        }
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
         let node_endpoint = node_url
             .map(Self::parse_node_url)
@@ -204,8 +232,13 @@ impl MidenClient {
 
                 match result {
                     Ok(()) => {
-                        // Clean shutdown (done_receiver signalled)
+                        // Clean shutdown (done_receiver signalled). Release the
+                        // singleton guard so a subsequent MidenClient::new (e.g.
+                        // the init → runtime handoff in main) can build.
                         alive_for_run.store(false, Ordering::Release);
+                        *LIVE_CLIENT
+                            .lock()
+                            .expect("MidenClient singleton guard poisoned") = false;
                         return Ok(());
                     }
                     Err(err) => {

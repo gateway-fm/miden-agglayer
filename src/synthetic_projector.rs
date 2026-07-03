@@ -53,13 +53,18 @@ use crate::restore::{
     project_claim_note, project_ger_note,
 };
 use crate::store::Store;
+use miden_client::rpc::NodeRpcClient;
 use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
-use miden_protocol::note::NoteMetadata;
-use std::collections::HashMap;
+use miden_protocol::note::{NoteFile, NoteId, NoteMetadata, NoteTag};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Blocks swept per tick by the note-visibility reconciler. Bounds the
+/// per-tick RPC work; catch-up from genesis proceeds at CHUNK blocks/tick.
+const RECONCILE_CHUNK: u64 = 200;
 
 /// The synthetic projector. Owns the cursor (last projected Miden block height)
 /// and, when registered as the live [`SyncListener`], is the **sole** assigner
@@ -87,6 +92,24 @@ pub struct SyntheticProjector {
     /// `Store::get_projector_cursor`. The projector is the single owner of this
     /// cursor (SINGLE-PROCESS ONLY) and persists every advance in `tick`.
     cursor: AtomicU64,
+    /// Node RPC handle for the note-visibility reconciler. Externally-created
+    /// public network notes (tag 0, e.g. B2AGG bridge-outs from an independent
+    /// wallet) that are committed AND consumed between two of our sync points
+    /// are NEVER delivered by tag/interest-based `sync_state` — the exits then
+    /// silently vanish from the synthetic event stream (observed live: 15/26
+    /// bridge-outs missing under load; the LET-divergence watchdog's exact
+    /// signature). The reconciler walks blocks via `sync_notes` and imports
+    /// unknown notes so consumption is re-discovered and projected. `None`
+    /// disables reconciliation (unit tests).
+    node_rpc: Option<Arc<dyn NodeRpcClient>>,
+    /// Last Miden block swept by the reconciler. In-memory only: a restart
+    /// re-sweeps from genesis, which is idempotent (known ids are skipped) and
+    /// doubles as gap-healing for pre-fix history.
+    reconcile_cursor: AtomicU64,
+    /// Note ids already projected (or attempted) by the late-consumption sweep,
+    /// so the per-tick sweep doesn't re-issue `is_note_processed` store queries
+    /// for the whole consumed set every 5s.
+    swept: std::sync::Mutex<HashSet<[u8; 32]>>,
 }
 
 impl SyntheticProjector {
@@ -100,7 +123,23 @@ impl SyntheticProjector {
         accounts: &AccountsConfig,
         local_network_id: u32,
         l1_rpc_url: Option<String>,
+        node_url: Option<String>,
+        node_api_key: Option<String>,
     ) -> anyhow::Result<Self> {
+        // Build a dedicated RPC handle for the note reconciler (the live
+        // MidenClientLib does not expose its RPC client). Same URL resolution
+        // as MidenClient itself.
+        let node_rpc = match node_url.as_deref() {
+            Some(url) => {
+                let endpoint = crate::miden_client::parse_node_url(url)?;
+                Some(crate::miden_client::build_rpc_client(
+                    &endpoint,
+                    10_000,
+                    node_api_key.as_deref(),
+                ))
+            }
+            None => None,
+        };
         // MA#28 — same fallback as `restore_gers` / `submit_update_ger_note`:
         // legacy deployments without a dedicated ger_manager mint GER notes
         // from the service account.
@@ -118,7 +157,70 @@ impl SyntheticProjector {
             expected_ger_sender,
             l1_rpc_url,
             cursor: AtomicU64::new(start_cursor),
+            node_rpc,
+            reconcile_cursor: AtomicU64::new(0),
+            swept: std::sync::Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Note-visibility reconciler (completeness guarantee for externally-created
+    /// network notes). Walks `sync_notes` over the next `RECONCILE_CHUNK` blocks
+    /// and imports any tag-0 note the local store doesn't know. The next
+    /// `sync_state` then discovers the (possibly historical) consumption via the
+    /// nullifier check, and the late-consumption sweep in `tick` projects it.
+    /// Non-B2AGG imports (MINTs to external wallets, etc.) are harmless: every
+    /// `project_*` derivation gates on script root + consumer.
+    async fn reconcile_notes(
+        &self,
+        client: &mut MidenClientLib,
+        rpc: &dyn NodeRpcClient,
+        tip: u64,
+    ) -> anyhow::Result<()> {
+        let from = self.reconcile_cursor.load(Ordering::Acquire) + 1;
+        if from > tip {
+            return Ok(());
+        }
+        let to = (from + RECONCILE_CHUNK - 1).min(tip);
+        let tags: BTreeSet<NoteTag> = BTreeSet::from([NoteTag::from(0u32)]);
+        let blocks = rpc
+            .sync_notes((from as u32).into(), (to as u32).into(), &tags)
+            .await
+            .map_err(|e| anyhow::anyhow!("sync_notes({from}..{to}): {e}"))?;
+        let candidates: Vec<NoteId> = blocks
+            .iter()
+            .flat_map(|b| b.notes.keys().copied())
+            .collect();
+        if !candidates.is_empty() {
+            let known: HashSet<NoteId> = client
+                .get_input_notes(NoteFilter::List(candidates.clone()))
+                .await
+                .map_err(|e| anyhow::anyhow!("get_input_notes(List): {e}"))?
+                .into_iter()
+                .filter_map(|rec| rec.id())
+                .collect();
+            let unknown: Vec<NoteFile> = candidates
+                .iter()
+                .filter(|id| !known.contains(id))
+                .map(|id| NoteFile::NoteId(*id))
+                .collect();
+            if !unknown.is_empty() {
+                let n = unknown.len();
+                client
+                    .import_notes(&unknown)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("import_notes({n}): {e}"))?;
+                metrics::counter!("synthetic_reconciler_notes_imported_total")
+                    .increment(n as u64);
+                tracing::info!(
+                    imported = n,
+                    from,
+                    to,
+                    "note reconciler: imported network notes missed by sync"
+                );
+            }
+        }
+        self.reconcile_cursor.store(to, Ordering::Release);
+        Ok(())
     }
 
     /// The current cursor (last projected Miden block height).
@@ -310,6 +412,18 @@ impl SyntheticProjector {
             .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
             .as_u64();
         let mut cursor = self.cursor.load(Ordering::Acquire);
+        // Reconcile BEFORE the early-return: the reconciler must run even on
+        // ticks where the projector is already at the tip, or imports stall
+        // whenever Miden block production pauses. Failures are transient —
+        // warn and retry next tick, never block projection.
+        if let Some(rpc) = self.node_rpc.clone()
+            && let Err(e) = self.reconcile_notes(client, rpc.as_ref(), tip).await
+        {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "note reconciler failed (transient — will retry next tick)"
+            );
+        }
         if cursor >= tip {
             return Ok(cursor);
         }
@@ -340,6 +454,40 @@ impl SyntheticProjector {
                 by_block.entry(h).or_default().push(note);
             }
         }
+        // Late-consumption sweep (completeness): notes whose consumption block
+        // the cursor already passed — discovered late (imported by the
+        // reconciler, or delivered late by sync). Their original synthetic
+        // block is sealed and downstream getLogs consumers only read forward,
+        // so project them into the FIRST block of this tick's window. The
+        // `swept` cache keeps this O(new notes); `project_*`'s own
+        // `is_note_processed` dedup keeps it idempotent (a note that was
+        // projected on time is attempted once here, then cached).
+        let late_ids: Vec<[u8; 32]> = {
+            let swept = self.swept.lock().expect("swept cache poisoned");
+            let late: Vec<&InputNoteRecord> = consumed
+                .iter()
+                .filter(|n| {
+                    n.state()
+                        .consumed_block_height()
+                        .map(|h| h.as_u64() <= cursor)
+                        .unwrap_or(false)
+                })
+                .filter(|n| !swept.contains(&n.details_commitment().as_bytes()))
+                .collect();
+            let ids = late
+                .iter()
+                .map(|n| n.details_commitment().as_bytes())
+                .collect();
+            if !late.is_empty() {
+                tracing::info!(
+                    late = late.len(),
+                    first_block = cursor + 1,
+                    "late-consumption sweep: projecting notes discovered after their block"
+                );
+                by_block.entry(cursor + 1).or_default().extend(late);
+            }
+            ids
+        };
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
@@ -353,6 +501,14 @@ impl SyntheticProjector {
             self.store.set_projector_cursor(next).await?;
             self.cursor.store(next, Ordering::Release);
             cursor = next;
+        }
+        // The tick completed — only NOW mark the late-swept notes as handled, so
+        // a mid-tick failure retries them next tick instead of dropping them.
+        if !late_ids.is_empty() {
+            self.swept
+                .lock()
+                .expect("swept cache poisoned")
+                .extend(late_ids);
         }
         // Observability: the projector follows the MIDEN chain, so its progress is
         // measured against the Miden tip (NOT L1). `projector_cursor == miden_tip`
@@ -555,6 +711,8 @@ mod tests {
             block_state.clone(),
             &test_accounts(),
             7,
+            None,
+            None,
             None,
         )
         .await

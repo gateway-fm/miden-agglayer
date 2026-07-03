@@ -171,6 +171,43 @@ async fn add_wallet(
     Ok(account)
 }
 
+/// Register the P2ID note tag for `wallet_id` so `sync_state` discovers incoming
+/// P2ID (bridged-in) notes. The faucet's MASM `note_tag::create_account_target`
+/// takes the top 14 bits of the account_id_prefix's high 32 bits:
+/// `(prefix >> 32) & 0xFFFC0000`.
+pub(crate) async fn register_wallet_p2id_tag(
+    client: &mut MidenClientLib,
+    wallet_id: AccountId,
+) -> anyhow::Result<()> {
+    use miden_protocol::note::NoteTag;
+    let prefix_u64 = wallet_id.prefix().as_felt().as_canonical_u64();
+    let hi32 = (prefix_u64 >> 32) as u32;
+    let p2id_tag_value = hi32 & 0xFFFC0000u32; // top 14 bits
+    let raw_tag = NoteTag::from(p2id_tag_value);
+    tracing::info!(
+        raw_tag = %u32::from(raw_tag),
+        wallet = %AccountIdBech32(wallet_id),
+        "registering P2ID note tag for wallet"
+    );
+    client.add_note_tag(raw_tag).await?;
+    Ok(())
+}
+
+/// Create a standalone `Public` `BasicWallet` in `client`'s store and register
+/// its P2ID note tag. Used by `bridge-out-tool --create-wallet` to stand up a
+/// fully INDEPENDENT bridge-out wallet whose sqlite store is SEPARATE from the
+/// proxy's — mirroring production, where the B2AGG (bridge-out) wallet is an
+/// independent wallet the proxy never shares `store.sqlite3` with. The caller
+/// is responsible for syncing afterwards to settle the account on the node.
+pub async fn create_standalone_wallet(
+    client: &mut MidenClientLib,
+    keystore: Arc<FilesystemKeyStore>,
+) -> anyhow::Result<Account> {
+    let account = add_wallet(client, keystore).await?;
+    register_wallet_p2id_tag(client, account.id()).await?;
+    Ok(account)
+}
+
 async fn add_accounts(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
@@ -260,22 +297,7 @@ async fn init_internal(
     tracing::info!("account settlement complete");
 
     // Register the P2ID note tag for wallet_hardhat so sync discovers incoming P2ID notes.
-    // The faucet's MASM `note_tag::create_account_target` takes the top 14 bits of the
-    // account_id_prefix's high 32 bits: (prefix >> 32) & 0xFFFC0000
-    {
-        use miden_protocol::note::NoteTag;
-        let wallet_id = accounts.wallet_hardhat.id();
-        let prefix_u64 = wallet_id.prefix().as_felt().as_canonical_u64();
-        let hi32 = (prefix_u64 >> 32) as u32;
-        let p2id_tag_value = hi32 & 0xFFFC0000u32; // top 14 bits
-        let raw_tag = NoteTag::from(p2id_tag_value);
-        tracing::info!(
-            raw_tag = %u32::from(raw_tag),
-            wallet = %AccountIdBech32(wallet_id),
-            "registering P2ID note tag for wallet"
-        );
-        client.add_note_tag(raw_tag).await?;
-    }
+    register_wallet_p2id_tag(client, accounts.wallet_hardhat.id()).await?;
 
     // Faucet bridge registration is handled in create_and_register_faucet (via add_faucet)
 

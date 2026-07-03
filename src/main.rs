@@ -548,6 +548,8 @@ async fn main() -> anyhow::Result<()> {
             &accounts.0,
             local_network_id_u32,
             command.l1_rpc_url.clone(),
+            command.miden_node.clone(),
+            command.miden_api_key.clone(),
         )
         .await?,
     );
