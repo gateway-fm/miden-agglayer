@@ -63,12 +63,16 @@ flowchart TD
 
     classDef proxyBox fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px
     classDef proxyNode fill:#eff6ff,stroke:#1d4ed8
-    classDef externalBox fill:#fef3c7,stroke:#b45309
-    classDef externalNode fill:#fffbeb,stroke:#b45309
+    classDef aggBox fill:#e9d5ff,stroke:#7e22ce
+    classDef aggNode fill:#f3e8ff,stroke:#7e22ce
+    classDef midenBox fill:#ffedd5,stroke:#ea580c
+    classDef midenNode fill:#fff7ed,stroke:#ea580c
     class PROXY,LISTENERS proxyBox
     class RPC,CLAIM,GER,WW,MC,SP,BOS,STORE,SQLITE proxyNode
-    class L1,AGG,MIDEN externalBox
-    class BRIDGE_L1,GERM_L1,AGGORACLE,AGGSENDER,AGL,BSVC,AUTOCLAIM,NODE,NTX,PROVER,BACC,EXTW externalNode
+    class L1,AGG aggBox
+    class BRIDGE_L1,GERM_L1,AGGORACLE,AGGSENDER,AGL,BSVC,AUTOCLAIM aggNode
+    class MIDEN midenBox
+    class NODE,NTX,PROVER,BACC,EXTW midenNode
 ```
 
 Key invariants:
@@ -87,7 +91,7 @@ Key invariants:
 
 ```mermaid
 sequenceDiagram
-    box rgb(254,243,199) AggLayer / L1
+    box rgb(233,213,255) AggLayer / L1
         participant L1 as L1 (GER manager)
         participant AO as aggoracle
     end
@@ -97,7 +101,7 @@ sequenceDiagram
         participant SP as SyntheticProjector
         participant ST as Store
     end
-    box rgb(254,243,199) Miden
+    box rgb(255,237,213) Miden
         participant N as miden-node / ntx-builder
     end
 
@@ -118,7 +122,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    box rgb(254,243,199) AggLayer / L1
+    box rgb(233,213,255) AggLayer / L1
         participant U as user / autoclaim
         participant BS as bridge-service
     end
@@ -127,7 +131,7 @@ sequenceDiagram
         participant MC as MidenClient actor
         participant SP as SyntheticProjector
     end
-    box rgb(254,243,199) Miden
+    box rgb(255,237,213) Miden
         participant P as tx-prover
         participant N as miden-node / ntx-builder
         participant W as recipient wallet
@@ -150,7 +154,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    box rgb(254,243,199) Miden side
+    box rgb(255,237,213) Miden side
         participant EW as external wallet client
         participant N as miden-node / ntx-builder
     end
@@ -158,7 +162,7 @@ sequenceDiagram
         participant MC as MidenClient actor
         participant SP as SyntheticProjector
     end
-    box rgb(254,243,199) AggLayer / L1
+    box rgb(233,213,255) AggLayer / L1
         participant AS as aggsender / agglayer
         participant AC as bridge-autoclaim
         participant L1 as L1 bridge
@@ -208,7 +212,7 @@ minutes. Three escalating catchers:
 
 ```mermaid
 sequenceDiagram
-    box rgb(254,243,199) Miden
+    box rgb(255,237,213) Miden
         participant N as miden-node
     end
     box rgb(219,234,254) proxy
@@ -244,7 +248,7 @@ make the replay idempotent):
 
 ```mermaid
 sequenceDiagram
-    box rgb(254,243,199) operator
+    box rgb(229,231,235) operator
         participant OP as operator
     end
     box rgb(219,234,254) proxy
@@ -252,7 +256,7 @@ sequenceDiagram
         participant MC as MidenClient
         participant ST as Store
     end
-    box rgb(254,243,199) Miden
+    box rgb(255,237,213) Miden
         participant N as miden-node
     end
 
@@ -275,7 +279,7 @@ sequenceDiagram
         participant CP as claim / GER path
         participant MC as MidenClient
     end
-    box rgb(254,243,199) Miden
+    box rgb(255,237,213) Miden
         participant N as miden-node
     end
 
