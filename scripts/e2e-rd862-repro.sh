@@ -80,25 +80,23 @@ curl -sf "$BRIDGE_SERVICE_URL/" >/dev/null 2>&1 \
 docker inspect "$AGGLAYER_CONTAINER" >/dev/null 2>&1 \
     || { fail "agglayer container '$AGGLAYER_CONTAINER' not running"; exit 2; }
 
-# Resolve destination address the same way e2e-fuzz-bridge.sh does.
+# Resolve the deposit destination via the ISOLATED-wallet pattern (the proxy's
+# sqlite store has a single owner; e2e clients never touch it). The bridge +
+# eth-faucet ids from the toml (a config file, not the store) are only used to
+# validate a reused store.
 ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || { fail "Could not read bridge_accounts.toml"; exit 2; }
-WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ID=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
-[[ -z "$WALLET_ID" || -z "$BRIDGE_ID" || -z "$FAUCET_ID" ]] \
+[[ -z "$BRIDGE_ID" || -z "$FAUCET_ID" ]] \
     && { fail "Could not parse bridge_accounts.toml"; exit 2; }
 
-WALLET_HEX=$(docker exec "$AGGLAYER_CONTAINER" bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url "${MIDEN_NODE_URL:-http://miden-node:57291}" \
-    --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
-    --amount 1 --dest-address 0xdead --dest-network 0 2>&1 \
-    | grep "wallet:" | awk '{print $NF}' || true)
-[[ -z "$WALLET_HEX" ]] && { fail "Could not resolve wallet hex"; exit 2; }
-INNER="${WALLET_HEX#0x}"
-DEST_ADDR="0x00000000${INNER:0:16}${INNER:16:14}00"
+B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-rd862-repro}"
+ISO_NODE_URL="${ISO_NODE_URL:-${MIDEN_NODE_URL:-http://miden-node:57291}}"  # keep MIDEN_NODE_URL override working
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+provision_isolated_wallet "$BRIDGE_ID" "$FAUCET_ID" \
+    || { fail "Could not provision isolated bridge-out wallet"; exit 2; }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 bridge_eth_tx() {

@@ -48,6 +48,13 @@ COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
 AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 
+# ── ISOLATED bridge-out client (single-owner store policy) ────────────────────
+# bridge-out-tool runs in its own throwaway container against its OWN store —
+# the proxy's sqlite store has no external accessor. Fresh wallet per run.
+B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-bridge-loadtest}"
+B2AGG_FRESH="${B2AGG_FRESH:-1}"
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+
 FUNDED_KEY="${FUNDED_KEY:-0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625}"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
 DEST_NETWORK=1  # Miden network id — local topology patch pins MIDEN_NETWORK_ID=1
@@ -231,18 +238,16 @@ done
 ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || die "miden-agglayer not initialized"
-WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
+# The bridge + ETH faucet are the proxy's global accounts (shared on the node);
+# the bridge-out WALLET, however, is a fresh INDEPENDENT wallet provisioned in
+# the isolated store below (never a proxy-store wallet).
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ETH=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
-[[ -n "$WALLET_ID" && -n "$BRIDGE_ID" && -n "$FAUCET_ETH" ]] || die "could not parse bridge_accounts.toml"
+[[ -n "$BRIDGE_ID" && -n "$FAUCET_ETH" ]] || die "could not parse bridge_accounts.toml"
 
-WALLET_HEX=$(docker exec "$AGGLAYER_CONTAINER" bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service --node-url http://miden-node:57291 \
-    --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ETH" \
-    --amount 1 --dest-address 0xdead --dest-network 0 2>&1 | grep "wallet:" | awk '{print $NF}' || true)
-[[ -n "$WALLET_HEX" ]] || die "could not resolve wallet hex"
-INNER="${WALLET_HEX#0x}"
-DEST_ADDR="0x00000000${INNER:0:16}${INNER:16:14}00"
+r "Provisioning INDEPENDENT bridge-out wallet (isolated store: $B2AGG_STORE_DIR)..."
+provision_isolated_wallet || die "wallet provisioning failed"
+r "  independent wallet: $WALLET_ID"
 
 # ── Token tables (index 0 = native ETH) ───────────────────────────────────────
 declare -a T_ADDR T_LABEL T_FAUCET T_NATIVE
@@ -374,8 +379,7 @@ done
 for k in $(seq 0 $((NUM_TOKENS - 1))); do
     bal=0
     for attempt in $(seq 1 18); do
-        out=$(docker exec "$AGGLAYER_CONTAINER" bridge-out-tool \
-            --store-dir /var/lib/miden-agglayer-service --node-url http://miden-node:57291 \
+        out=$(iso_tool \
             --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "${T_FAUCET[$k]}" \
             --amount 999999999 --dest-address 0xdead --dest-network 0 2>&1 || true)
         echo "$out" >> "$VERBOSE_LOG"
@@ -476,8 +480,7 @@ run_l2_out() {  # <op#> <token_idx>
     local op="$1" ti="$2"
     DONE_L2=$((DONE_L2+1))
     local out rc
-    out=$(docker exec "$AGGLAYER_CONTAINER" bridge-out-tool \
-        --store-dir /var/lib/miden-agglayer-service --node-url http://miden-node:57291 \
+    out=$(iso_tool \
         --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "${T_FAUCET[$ti]}" \
         --amount "$AMT_L2_UNITS" --dest-address "$FUNDED_ADDR" --dest-network 0 2>&1)
     rc=$?

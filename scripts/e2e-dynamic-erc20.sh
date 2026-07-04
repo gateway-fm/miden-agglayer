@@ -85,29 +85,25 @@ wait_for "L2 proxy healthy" \
     "curl -sf '$L2_RPC' -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}' >/dev/null" \
     60 3
 
+# Infrastructure account ids from the config file (NOT the sqlite store).
 ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || fail "miden-agglayer not initialized yet"
-WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
-
-# Get wallet's zero-padded Ethereum address
 FAUCET_ETH=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
-WALLET_HEX=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url http://miden-node:57291 \
-    --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ETH" \
-    --amount 1 --dest-address 0xdead --dest-network 0 2>&1 | grep "wallet:" | awk '{print $NF}' || true)
-[[ -z "$WALLET_HEX" ]] && fail "Could not get wallet hex"
-INNER="${WALLET_HEX#0x}"
-PREFIX="${INNER:0:16}"
-SUFFIX="${INNER:16:14}00"
-DEST_ADDR="0x00000000${PREFIX}${SUFFIX}"
+
+# ── Isolated bridge wallet (single-owner store policy) ───────────────────────
+# This test is self-funding (it bridges the fresh TT token to its own wallet),
+# so it gets its own store subdir and never touches the proxy's sqlite store.
+B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-dynamic-erc20}"
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+provision_isolated_wallet "$BRIDGE_ID" "$FAUCET_ETH" \
+    || fail "could not provision isolated bridge-out wallet"
 
 log "======================================================================"
 log "  Dynamic ERC-20 Bridge E2E Test"
 log "======================================================================"
-log "Wallet:  $WALLET_ID ($WALLET_HEX)"
+log "Wallet:  $WALLET_ID (isolated store: $B2AGG_STORE_DIR)"
 log "Dest:    $DEST_ADDR (zero-padded, network $DEST_NETWORK)"
 log "Amount:  $BRIDGE_AMOUNT base units (expect $EXPECTED_L2_BALANCE Miden units)"
 
@@ -209,17 +205,11 @@ pass "Faucet auto-created: $NEW_FAUCET_ID (symbol=TT)"
 # ── Step 5: Verify L2 wallet balance ──────────────────────────────────────────
 # Convert faucet_id hex to bech32 for bridge-out-tool (it expects bech32)
 # Actually, bridge-out-tool should accept the ID from admin_listFaucets
-log "Step 5/7: Checking L2 wallet balance with new faucet..."
+log "Step 5/7: Checking L2 wallet balance with new faucet (isolated store)..."
 BALANCE=0
 for attempt in $(seq 1 15); do
     sleep 10
-    BAL_OUT=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-        --store-dir /var/lib/miden-agglayer-service \
-        --node-url http://miden-node:57291 \
-        --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$NEW_FAUCET_ID" \
-        --amount 999999999 \
-        --dest-address 0xdead --dest-network 0 2>&1 || true)
-    BALANCE=$(echo "$BAL_OUT" | grep "wallet balance:" | head -1 | awk '{print $NF}')
+    BALANCE=$(iso_wallet_balance "$BRIDGE_ID" "$NEW_FAUCET_ID")
     log "Attempt $attempt/15: balance = ${BALANCE:-0}"
     if [[ -n "$BALANCE" && "$BALANCE" != "0" ]]; then
         break
@@ -248,9 +238,7 @@ log "Step 6/7: Bridging $BRIDGE_OUT_AMOUNT Miden units back to L1..."
 L1_TOKEN_BAL_BEFORE=$(cast call --rpc-url "$L1_RPC" "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$L1_DEST")
 log "L1 TestToken balance before bridge-out: $L1_TOKEN_BAL_BEFORE"
 
-docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url http://miden-node:57291 \
+iso_tool \
     --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$NEW_FAUCET_ID" \
     --amount "$BRIDGE_OUT_AMOUNT" --dest-address "$L1_DEST" --dest-network 0 2>&1 \
     || fail "bridge-out-tool failed"

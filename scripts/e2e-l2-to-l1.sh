@@ -49,29 +49,33 @@ wait_for() {
 command -v cast >/dev/null || fail "cast (foundry) not found"
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 not reachable"
 
+# Infrastructure account ids from the config file (NOT the sqlite store).
 ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || fail "miden-agglayer not initialized yet"
-WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ID=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
+
+# ── Isolated bridge wallet (single-owner store policy) ───────────────────────
+# The bridge-out spends the ISOLATED wallet funded by e2e-l1-to-l2.sh — both
+# scripts default to the shared "e2e-suite" store subdir. Never touches the
+# proxy's sqlite store.
+B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-suite}"
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+provision_isolated_wallet "$BRIDGE_ID" "$FAUCET_ID" \
+    || fail "could not provision isolated bridge-out wallet"
 
 log "======================================================================"
 log "  L2→L1 Bridge-Out"
 log "======================================================================"
-log "Wallet:  $WALLET_ID"
+log "Wallet:  $WALLET_ID (isolated store: $B2AGG_STORE_DIR)"
 log "Bridge:  $BRIDGE_ID"
 log "Faucet:  $FAUCET_ID"
 log "L1 dest: $L1_DEST"
 
 # ── Check wallet balance ──────────────────────────────────────────────────────
 log "Checking wallet balance..."
-BAL_OUT=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url http://miden-node:57291 \
-    --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
-    --amount 999999999999 --dest-address "$L1_DEST" --dest-network 0 2>&1 || true)
-BALANCE=$(echo "$BAL_OUT" | grep "wallet balance:" | head -1 | awk '{print $NF}')
+BALANCE=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
 log "Wallet balance: ${BALANCE:-0}"
 
 if [[ -z "$BALANCE" || "$BALANCE" == "0" ]]; then
@@ -91,10 +95,8 @@ L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
 log "L1 balance before bridge-out: $L1_BAL_BEFORE"
 
 # ── Step 1: Create B2AGG note (bridge-out) ────────────────────────────────────
-log "Step 1/4: Creating B2AGG bridge-out note..."
-docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url http://miden-node:57291 \
+log "Step 1/4: Creating B2AGG bridge-out note (isolated client)..."
+iso_tool \
     --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
     --amount "$BRIDGE_AMOUNT" --dest-address "$L1_DEST" --dest-network 0 2>&1 \
     || fail "bridge-out-tool failed"

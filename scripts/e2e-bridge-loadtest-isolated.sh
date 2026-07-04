@@ -56,25 +56,14 @@ AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 # "database is locked" in the proxy logs during this run is genuinely INTERNAL
 # (miden-client's own connection pool), not the loadtest tool contending on the
 # shared file.
-ISO_IMAGE="${ISO_IMAGE:-miden-agglayer-e2e:latest}"
-ISO_NETWORK="${ISO_NETWORK:-miden-e2e}"
-ISO_NODE_URL="${ISO_NODE_URL:-http://miden-node:57291}"
-ISO_PROVER_URL="${ISO_PROVER_URL:-http://tx-prover:50051}"
-ISO_STORE_DIR="${ISO_STORE_DIR:-$PROJECT_DIR/.b2agg-store}"   # host bind → /store
-
-# iso_tool <args...> : run bridge-out-tool in a throwaway container against the
-# ISOLATED store. TMPDIR is kept on the same bind-mounted device as the store to
-# avoid rusqlite's "Invalid cross-device link" on atomic rename.
-iso_tool() {
-    docker run --rm --network "$ISO_NETWORK" \
-        -v "$ISO_STORE_DIR:/store" \
-        -e "MIDEN_PROVER_URL=$ISO_PROVER_URL" \
-        -e "TMPDIR=/store/tmp" \
-        --entrypoint bridge-out-tool \
-        "$ISO_IMAGE" \
-        --store-dir /store --node-url "$ISO_NODE_URL" \
-        --miden-prover-url "$ISO_PROVER_URL" "$@"
-}
+# iso_tool(), provisioning etc. come from the shared helper. ISO_STORE_DIR is
+# kept as a back-compat alias for this script's historical env knob; a fresh
+# wallet is provisioned each run (B2AGG_FRESH=1) so the experiment always
+# measures a clean, fully independent client.
+B2AGG_STORE_DIR="${ISO_STORE_DIR:-${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-bridge-loadtest-isolated}}"
+B2AGG_FRESH="${B2AGG_FRESH:-1}"
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+ISO_STORE_DIR="$B2AGG_STORE_DIR"
 
 FUNDED_KEY="${FUNDED_KEY:-0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625}"
 FUNDED_ADDR=$(cast wallet address --private-key "$FUNDED_KEY")
@@ -266,17 +255,10 @@ BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ETH=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
 [[ -n "$BRIDGE_ID" && -n "$FAUCET_ETH" ]] || die "could not parse bridge_accounts.toml"
 
-# Provision a fully independent bridge-out wallet in its own isolated store.
+# Provision a fully independent bridge-out wallet in its own isolated store
+# (B2AGG_FRESH=1 above wipes any previous run's store first).
 r "Provisioning INDEPENDENT bridge-out wallet (isolated store: $ISO_STORE_DIR)..."
-rm -rf "$ISO_STORE_DIR" 2>/dev/null || docker run --rm -v "$PROJECT_DIR:/work" busybox rm -rf "/work/$(basename "$ISO_STORE_DIR")"
-mkdir -p "$ISO_STORE_DIR/tmp"
-PROVISION_OUT=$(iso_tool --create-wallet 2>&1) || { echo "$PROVISION_OUT" | tee -a "$VERBOSE_LOG" | tail -20; die "wallet provisioning failed"; }
-echo "$PROVISION_OUT" >> "$VERBOSE_LOG"
-WALLET_ID=$(echo "$PROVISION_OUT" | grep "wallet-id:" | awk '{print $NF}')
-[[ -n "$WALLET_ID" ]] || { echo "$PROVISION_OUT" | tail -20; die "could not parse provisioned wallet id"; }
-WALLET_HEX="$WALLET_ID"
-INNER="${WALLET_HEX#0x}"
-DEST_ADDR="0x00000000${INNER:0:16}${INNER:16:14}00"
+provision_isolated_wallet 2>>"$VERBOSE_LOG" || die "wallet provisioning failed"
 r "  independent wallet: $WALLET_ID"
 
 # ── Token tables (index 0 = native ETH) ───────────────────────────────────────
