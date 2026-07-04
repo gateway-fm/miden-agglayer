@@ -47,6 +47,7 @@
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
+use crate::bridge_out::is_b2agg_note;
 use crate::miden_client::{MidenClientLib, SyncListener};
 use crate::restore::{
     B2AggRestoreOutcome, ClaimProjectOutcome, GerProjectOutcome, project_b2agg_note,
@@ -54,10 +55,16 @@ use crate::restore::{
 };
 use crate::store::Store;
 use miden_client::rpc::NodeRpcClient;
-use miden_client::store::{InputNoteRecord, NoteFilter};
+use miden_client::rpc::domain::note::FetchedNote;
+use miden_client::rpc::domain::transaction::TransactionRecord;
+use miden_client::store::input_note_states::ConsumedExternalNoteState;
+use miden_client::store::{InputNoteRecord, InputNoteState, NoteFilter};
 use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
-use miden_protocol::note::{NoteFile, NoteId, NoteMetadata, NoteTag};
+use miden_protocol::block::BlockNumber;
+use miden_protocol::note::{
+    NoteAttachments, NoteDetails, NoteFile, NoteId, NoteMetadata, NoteTag, Nullifier,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,6 +117,19 @@ pub struct SyntheticProjector {
     /// so the per-tick sweep doesn't re-issue `is_note_processed` store queries
     /// for the whole consumed set every 5s.
     swept: std::sync::Mutex<HashSet<[u8; 32]>>,
+    /// Spent-before-import recovery queue. External B2AGG notes that were
+    /// ALREADY CONSUMED when the reconciler imported them are silently dropped
+    /// by miden-client 0.15 (`import_note_records_by_proof` applies
+    /// `consumed_externally` to a fresh Expected-state record; the transition
+    /// fails and the record is never persisted — observed live: import returns
+    /// Ok, note absent from store, zero errors). Their BridgeEvents then never
+    /// materialize. [`Self::recover_spent_before_import`] rebuilds such notes
+    /// in-memory (full body via `get_notes_by_id`, spend block via the
+    /// nullifier feed, consumer attribution via the bridge's transaction feed —
+    /// the MA#3 gate) and queues them here; `tick` projects them through the
+    /// SAME `project_b2agg_note` derivation and removes them only after the
+    /// tick completes (mid-tick failure retries; `is_note_processed` dedups).
+    direct_recovered: std::sync::Mutex<Vec<InputNoteRecord>>,
 }
 
 impl SyntheticProjector {
@@ -160,6 +180,7 @@ impl SyntheticProjector {
             node_rpc,
             reconcile_cursor: AtomicU64::new(0),
             swept: std::sync::Mutex::new(HashSet::new()),
+            direct_recovered: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -198,15 +219,17 @@ impl SyntheticProjector {
                 .into_iter()
                 .filter_map(|rec| rec.id())
                 .collect();
-            let unknown: Vec<NoteFile> = candidates
+            let unknown_ids: Vec<NoteId> = candidates
                 .iter()
                 .filter(|id| !known.contains(id))
-                .map(|id| NoteFile::NoteId(*id))
+                .copied()
                 .collect();
-            if !unknown.is_empty() {
-                let n = unknown.len();
+            if !unknown_ids.is_empty() {
+                let n = unknown_ids.len();
+                let files: Vec<NoteFile> =
+                    unknown_ids.iter().map(|id| NoteFile::NoteId(*id)).collect();
                 client
-                    .import_notes(&unknown)
+                    .import_notes(&files)
                     .await
                     .map_err(|e| anyhow::anyhow!("import_notes({n}): {e}"))?;
                 metrics::counter!("synthetic_reconciler_notes_imported_total")
@@ -217,10 +240,272 @@ impl SyntheticProjector {
                     to,
                     "note reconciler: imported network notes missed by sync"
                 );
+                // Spent-before-import recovery: `import_notes` returns Ok even
+                // for notes it silently DROPPED because they were already
+                // consumed at import time (miden-client 0.15 bug — see the
+                // `direct_recovered` field docs). Re-query which of the
+                // unknown ids actually landed; the rest must be projected
+                // directly from node data or their BridgeEvents are lost.
+                let landed: HashSet<NoteId> = client
+                    .get_input_notes(NoteFilter::List(unknown_ids.clone()))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?
+                    .into_iter()
+                    .filter_map(|rec| rec.id())
+                    .collect();
+                let missing: Vec<NoteId> = unknown_ids
+                    .into_iter()
+                    .filter(|id| !landed.contains(id))
+                    .collect();
+                if !missing.is_empty() {
+                    metrics::counter!("synthetic_reconciler_import_dropped_total")
+                        .increment(missing.len() as u64);
+                    tracing::warn!(
+                        dropped = missing.len(),
+                        from,
+                        to,
+                        "note reconciler: import silently dropped consumed notes; \
+                         attempting direct projection recovery"
+                    );
+                    self.recover_spent_before_import(rpc, &missing).await?;
+                }
             }
         }
         self.reconcile_cursor.store(to, Ordering::Release);
         Ok(())
+    }
+
+    /// Direct-projection recovery for notes that were already CONSUMED when the
+    /// reconciler imported them (and were therefore silently dropped by
+    /// miden-client's import — see the [`Self::direct_recovered`] field docs).
+    /// The node still serves everything needed (`sync_notes` / `get_notes_by_id`
+    /// both return consumed notes), so bypass the client store:
+    ///
+    /// 1. Fetch the full public note bodies via `get_notes_by_id`. Private notes
+    ///    cannot be reconstructed and B2AGG bridge-outs are public network
+    ///    notes; non-B2AGG public notes (e.g. MINTs to external wallets) derive
+    ///    no synthetic event, and CLAIM/GER notes are created by our own
+    ///    service so they always reach the store through the normal path.
+    /// 2. Resolve each note's spend block from the node's nullifier feed.
+    /// 3. **MA#3 reclaim gate** — a B2AGG can be consumed by the bridge (real
+    ///    exit → must emit) or reclaimed by its sender (asset stayed → must NOT
+    ///    emit), and the nullifier alone doesn't say who consumed. The bridge's
+    ///    LET frontier map stores only the O(log n) Merkle frontier nodes
+    ///    (overwritten as leaves append), so a direct "leaf present in LET"
+    ///    check is not implementable. Instead we use a strictly precise gate:
+    ///    the node's per-account `sync_transactions` feed for the BRIDGE
+    ///    account, whose transaction headers commit to the nullifiers of the
+    ///    notes each transaction consumed. "A bridge-executed transaction
+    ///    consumed this nullifier" is exactly the condition
+    ///    `classify_b2agg_consumer == Emit` encodes (consumer == bridge), from
+    ///    the same trust root as every other projector input (the node RPC).
+    ///    Anything else is treated as reclaim/unknown and skipped fail-closed
+    ///    with a WARN + metric.
+    /// 4. Queue an in-memory `ConsumedExternal` record (consumer = bridge) that
+    ///    `tick` runs through the SAME `project_b2agg_note` derivation as every
+    ///    other note (store dedup via `is_note_processed` keeps it idempotent).
+    async fn recover_spent_before_import(
+        &self,
+        rpc: &dyn NodeRpcClient,
+        missing: &[NoteId],
+    ) -> anyhow::Result<()> {
+        struct Candidate {
+            id: NoteId,
+            details: NoteDetails,
+            attachments: NoteAttachments,
+            nullifier: Nullifier,
+        }
+
+        let fetched = rpc
+            .get_notes_by_id(missing)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_notes_by_id({}): {e}", missing.len()))?;
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut min_inclusion = BlockNumber::from(u32::MAX);
+        for f in fetched {
+            let id = f.id();
+            let FetchedNote::Public(note, inclusion_proof) = f else {
+                tracing::debug!(
+                    note_id = %id.to_hex(),
+                    "spent-before-import recovery: skipping private note (not reconstructable)"
+                );
+                continue;
+            };
+            let inclusion = inclusion_proof.location().block_num();
+            let nullifier = note.nullifier();
+            let attachments = note.attachments().clone();
+            let details: NoteDetails = note.into();
+            if !is_b2agg_note(&details) {
+                tracing::debug!(
+                    note_id = %id.to_hex(),
+                    "spent-before-import recovery: skipping non-B2AGG note (no synthetic event)"
+                );
+                continue;
+            }
+            min_inclusion = min_inclusion.min(inclusion);
+            candidates.push(Candidate {
+                id,
+                details,
+                attachments,
+                nullifier,
+            });
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // Spend blocks: nullifier consumption can only happen at or after the
+        // note's inclusion block, so search from the batch minimum.
+        let nullifiers: BTreeSet<Nullifier> = candidates.iter().map(|c| c.nullifier).collect();
+        let heights = rpc
+            .get_nullifier_commit_heights(nullifiers, min_inclusion)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_nullifier_commit_heights: {e}"))?;
+
+        // MA#3 gate data: every transaction the BRIDGE executed across the
+        // spend-block range, with the nullifiers each one consumed.
+        let spend_blocks: Vec<BlockNumber> = heights.values().flatten().copied().collect();
+        let consumed_by_bridge: HashMap<Nullifier, (u64, u32)> =
+            match (spend_blocks.iter().min(), spend_blocks.iter().max()) {
+                (Some(min_h), Some(max_h)) => {
+                    let txs = rpc
+                        .sync_transactions(*min_h, *max_h, vec![self.bridge_id])
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("sync_transactions({min_h}..{max_h}): {e}")
+                        })?;
+                    bridge_consumed_nullifiers(&txs, self.bridge_id)
+                }
+                _ => HashMap::new(),
+            };
+
+        let mut recovered: Vec<InputNoteRecord> = Vec::new();
+        for c in candidates {
+            let Some(spend_block) = heights.get(&c.nullifier).copied().flatten() else {
+                // Import dropped the note but its nullifier is NOT consumed —
+                // outside the known drop mode (unconsumed notes persist fine).
+                // Surface loudly; a restart re-sweeps from genesis and retries.
+                metrics::counter!("synthetic_reconciler_missing_not_consumed_total").increment(1);
+                tracing::error!(
+                    note_id = %c.id.to_hex(),
+                    "spent-before-import recovery: note missing from store but its \
+                     nullifier is unspent — unexpected import drop mode; skipping \
+                     (restart re-sweeps and retries)"
+                );
+                continue;
+            };
+            match consumed_by_bridge.get(&c.nullifier) {
+                Some((block, tx_order)) => {
+                    debug_assert_eq!(*block, spend_block.as_u64());
+                    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+                        nullifier_block_height: spend_block,
+                        consumer_account: Some(self.bridge_id),
+                        consumed_tx_order: Some(*tx_order),
+                    });
+                    let record = InputNoteRecord::new(c.details, c.attachments, None, state);
+                    metrics::counter!("synthetic_reconciler_direct_recovered_total").increment(1);
+                    tracing::info!(
+                        note_id = %c.id.to_hex(),
+                        spend_block = spend_block.as_u64(),
+                        tx_order,
+                        "spent-before-import recovery: bridge-consumed B2AGG verified via \
+                         bridge transaction feed; queued for direct projection"
+                    );
+                    recovered.push(record);
+                }
+                None => {
+                    // Fail-closed (MA#3): the note IS consumed, but no
+                    // bridge-executed transaction at the spend block consumed
+                    // its nullifier — sender reclaim or unknown consumer.
+                    // Emitting would hand out a withdrawal for value that
+                    // never left Miden, so skip and surface.
+                    metrics::counter!("synthetic_reconciler_unverified_consumption_total")
+                        .increment(1);
+                    tracing::warn!(
+                        note_id = %c.id.to_hex(),
+                        spend_block = spend_block.as_u64(),
+                        bridge = %self.bridge_id,
+                        "spent-before-import recovery: consumed B2AGG was NOT consumed by \
+                         any bridge transaction at its spend block — treating as \
+                         reclaim/unknown consumer; skipping BridgeEvent (fail-closed, MA#3)"
+                    );
+                }
+            }
+        }
+        if !recovered.is_empty() {
+            let mut queue = self
+                .direct_recovered
+                .lock()
+                .expect("direct-recovered queue poisoned");
+            // Defensive dedup: a record already queued (not yet drained by
+            // `tick`) must not be double-projected in one block.
+            let queued: HashSet<[u8; 32]> = queue
+                .iter()
+                .map(|n| n.details_commitment().as_bytes())
+                .collect();
+            queue.extend(
+                recovered
+                    .into_iter()
+                    .filter(|n| !queued.contains(&n.details_commitment().as_bytes())),
+            );
+        }
+        Ok(())
+    }
+
+    /// Merge the spent-before-import recovery queue snapshot into `tick`'s
+    /// per-block projection buckets. A note whose spend block is still ahead of
+    /// the cursor projects at its real Miden block (Miden-1:1); a note whose
+    /// spend block the cursor already passed projects into the FIRST block of
+    /// this tick's window, exactly like the late-consumption sweep (sealed
+    /// blocks + forward-only getLogs consumers). Notes whose spend block is
+    /// beyond `tip` stay queued for a future tick. Returns the ids that were
+    /// bucketed (to be removed from the queue once the tick completes).
+    fn bucket_direct_notes<'a>(
+        direct: &'a [InputNoteRecord],
+        by_block: &mut HashMap<u64, Vec<&'a InputNoteRecord>>,
+        cursor: u64,
+        tip: u64,
+    ) -> Vec<[u8; 32]> {
+        let mut done = Vec::new();
+        for note in direct {
+            let Some(h) = note.state().consumed_block_height().map(|h| h.as_u64()) else {
+                // Defensive: the queue only ever holds ConsumedExternal records.
+                continue;
+            };
+            let target = h.max(cursor + 1);
+            if target > tip {
+                tracing::debug!(
+                    spend_block = h,
+                    tip,
+                    "direct projection: spend block ahead of sync tip — deferring to next tick"
+                );
+                continue;
+            }
+            by_block.entry(target).or_default().push(note);
+            done.push(note.details_commitment().as_bytes());
+        }
+        if !done.is_empty() {
+            tracing::info!(
+                recovered = done.len(),
+                "direct projection: projecting spent-before-import notes this tick"
+            );
+        }
+        done
+    }
+
+    /// Remove successfully-bucketed direct-recovery records from the queue —
+    /// called only AFTER the tick completed, so a mid-tick failure retries them
+    /// (idempotently, via `is_note_processed`) instead of dropping them.
+    fn complete_direct_notes(&self, done: &[[u8; 32]]) {
+        if done.is_empty() {
+            return;
+        }
+        let done: HashSet<[u8; 32]> = done.iter().copied().collect();
+        self.direct_recovered
+            .lock()
+            .expect("direct-recovered queue poisoned")
+            .retain(|n| !done.contains(&n.details_commitment().as_bytes()));
     }
 
     /// The current cursor (last projected Miden block height).
@@ -445,6 +730,16 @@ impl SyntheticProjector {
             .into_iter()
             .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
             .collect();
+        // Spent-before-import recovery queue snapshot: records fabricated by
+        // `recover_spent_before_import` are NOT in the client store, so they
+        // never appear in the `consumed` feed above — merge them into the
+        // buckets below. The queue itself is only pruned after the tick
+        // completes (`complete_direct_notes`), so a mid-tick failure retries.
+        let direct_notes: Vec<InputNoteRecord> = self
+            .direct_recovered
+            .lock()
+            .expect("direct-recovered queue poisoned")
+            .clone();
         // Pre-group the consumed feed by Miden block ONCE (not once per block): a
         // per-block re-scan of the full feed makes catch-up O(blocks_behind ×
         // total_consumed). Each block then projects from its precomputed bucket.
@@ -488,6 +783,9 @@ impl SyntheticProjector {
             }
             ids
         };
+        // Direct projection of spent-before-import recoveries (same sealed-block
+        // rules as the late sweep; see `bucket_direct_notes`).
+        let direct_done = Self::bucket_direct_notes(&direct_notes, &mut by_block, cursor, tip);
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
@@ -510,6 +808,9 @@ impl SyntheticProjector {
                 .expect("swept cache poisoned")
                 .extend(late_ids);
         }
+        // Same contract for the direct-recovery queue: prune only after the
+        // whole tick succeeded (retries are idempotent via `is_note_processed`).
+        self.complete_direct_notes(&direct_done);
         // Observability: the projector follows the MIDEN chain, so its progress is
         // measured against the Miden tip (NOT L1). `projector_cursor == miden_tip`
         // means fully caught up; `synthetic_tip` is the actual synthetic L2 block
@@ -523,6 +824,39 @@ impl SyntheticProjector {
         );
         Ok(cursor)
     }
+}
+
+/// MA#3 reclaim gate for the spent-before-import recovery path: map every
+/// nullifier consumed by a BRIDGE-executed transaction to `(spend_block,
+/// per-block bridge-tx order)`.
+///
+/// The node's `sync_transactions` feed is filtered per account and each
+/// transaction header commits to the nullifiers of the notes that transaction
+/// consumed, so membership here is exact on-chain attribution of the consumer —
+/// the same condition [`crate::bridge_out::classify_b2agg_consumer`] gates on
+/// (`consumer == bridge`). The account-id re-check is fail-closed defense in
+/// depth against a node that ignores the server-side filter. Pure (no I/O) so
+/// it is unit-testable directly.
+pub(crate) fn bridge_consumed_nullifiers(
+    txs: &[TransactionRecord],
+    bridge_id: AccountId,
+) -> HashMap<Nullifier, (u64, u32)> {
+    let mut per_block_order: HashMap<u64, u32> = HashMap::new();
+    let mut out = HashMap::new();
+    for tx in txs {
+        if tx.transaction_header.account_id() != bridge_id {
+            continue;
+        }
+        let block = tx.block_num.as_u64();
+        let order = *per_block_order
+            .entry(block)
+            .and_modify(|i| *i += 1)
+            .or_insert(0u32);
+        for input in tx.transaction_header.input_notes().iter() {
+            out.insert(input.nullifier(), (block, order));
+        }
+    }
+    out
 }
 
 #[async_trait::async_trait]
@@ -610,10 +944,17 @@ mod tests {
     /// Build a bridge-consumed B2AGG note carrying a fungible asset from
     /// `FAUCET`, consumed by the bridge at `block` with `tx_order`.
     fn b2agg_note(block: u32, tx_order: Option<u32>) -> InputNoteRecord {
+        b2agg_note_with_amount(block, tx_order, 50)
+    }
+
+    /// Like [`b2agg_note`] but with a caller-chosen asset amount, so tests
+    /// needing several DISTINCT B2AGG notes (distinct details commitments) can
+    /// vary the amount.
+    fn b2agg_note_with_amount(block: u32, tx_order: Option<u32>, amount: u64) -> InputNoteRecord {
         // B2AGG storage: 6 felts (network + 5 address limbs); zeros parse fine.
         let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
         let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
-        let asset: Asset = FungibleAsset::new(aid(FAUCET), 50).unwrap().into();
+        let asset: Asset = FungibleAsset::new(aid(FAUCET), amount).unwrap().into();
         let assets = NoteAssets::new(vec![asset]).unwrap();
         let details = NoteDetails::new(assets, recipient);
         consumed_note(
@@ -979,6 +1320,132 @@ mod tests {
             logs[0].transaction_hash,
             derive_manual_claim_tx_hash(&note_commitment),
             "must NOT fall back to the derived hash when a link exists"
+        );
+    }
+
+    /// Direct-projection recovery (spent-before-import): consumed-external
+    /// B2AGG records fabricated by the reconciler bypass the client store —
+    /// verify they bucket per the sealed-block rules (late → first window
+    /// block, in-window → own Miden block, beyond-tip → deferred), emit a
+    /// BridgeEvent through the SAME `project_b2agg_note` derivation, and are
+    /// pruned from the queue only once projected.
+    #[tokio::test]
+    async fn direct_recovery_projects_bridge_consumed_note() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Spend block already passed by the cursor (3), inside this tick's
+        // window (8), and beyond the tip (12). Distinct amounts → distinct
+        // details commitments.
+        let n_late = b2agg_note_with_amount(3, Some(0), 51);
+        let n_exact = b2agg_note_with_amount(8, Some(0), 52);
+        let n_future = b2agg_note_with_amount(12, Some(0), 53);
+        projector
+            .direct_recovered
+            .lock()
+            .unwrap()
+            .extend([n_late.clone(), n_exact.clone(), n_future.clone()]);
+
+        // Snapshot + bucket the way `tick` does, with cursor=5, tip=10.
+        let direct: Vec<InputNoteRecord> = projector.direct_recovered.lock().unwrap().clone();
+        let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
+        let done = SyntheticProjector::bucket_direct_notes(&direct, &mut by_block, 5, 10);
+
+        assert_eq!(done.len(), 2, "late + in-window notes bucket; beyond-tip defers");
+        assert_eq!(
+            by_block.get(&6).map(Vec::len),
+            Some(1),
+            "already-passed spend block projects into the first window block"
+        );
+        assert_eq!(
+            by_block.get(&8).map(Vec::len),
+            Some(1),
+            "in-window spend block projects Miden-1:1 at its own height"
+        );
+        assert!(
+            !by_block.contains_key(&12),
+            "spend block beyond the sync tip must not bucket this tick"
+        );
+
+        // Project the buckets exactly like the tick loop.
+        let empty = HashMap::new();
+        let logs6 = projector
+            .project_block_notes(&by_block[&6], &empty, 6, None)
+            .await
+            .unwrap();
+        let logs8 = projector
+            .project_block_notes(&by_block[&8], &empty, 8, None)
+            .await
+            .unwrap();
+        assert_eq!((logs6, logs8), (1, 1), "each recovered note emits one BridgeEvent");
+
+        let logs = logs_in_range(&store, 0, 10).await;
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].block_number, 6);
+        assert_eq!(logs[1].block_number, 8);
+        assert_eq!(
+            logs[0].transaction_hash,
+            crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
+                n_late.details_commitment().as_bytes()
+            )),
+            "direct projection derives the SAME tx hash as every other path (dedup-stable)"
+        );
+
+        // Completion prunes only the projected notes; the deferred one stays
+        // queued for a future tick.
+        projector.complete_direct_notes(&done);
+        let remaining = projector.direct_recovered.lock().unwrap().clone();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].details_commitment(),
+            n_future.details_commitment(),
+            "only the beyond-tip note remains queued"
+        );
+    }
+
+    /// The MA#3 gate for the spent-before-import recovery: only nullifiers
+    /// consumed by BRIDGE-executed transactions are attributed. A reclaim (or
+    /// any non-bridge consumption) stays out of the map, so the caller skips
+    /// it fail-closed instead of emitting a BridgeEvent for value that never
+    /// left Miden.
+    #[test]
+    fn bridge_consumed_nullifiers_gates_non_bridge_txs() {
+        use miden_protocol::note::Nullifier;
+        use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
+
+        fn nf(byte: u64) -> Nullifier {
+            Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
+        }
+        fn tx(account: AccountId, block: u32, nullifier: Nullifier) -> TransactionRecord {
+            TransactionRecord {
+                block_num: BlockNumber::from(block),
+                transaction_header: TransactionHeader::new(
+                    account,
+                    Word::empty(),
+                    Word::empty(),
+                    InputNotes::new(vec![InputNoteCommitment::from(nullifier)]).unwrap(),
+                    vec![],
+                    FungibleAsset::new(aid(FAUCET), 0).unwrap(),
+                ),
+                output_notes: vec![],
+                erased_output_notes: vec![],
+            }
+        }
+
+        let (a, b, c) = (nf(1), nf(2), nf(3));
+        let txs = vec![
+            tx(aid(BRIDGE), 9, a),  // bridge consumption → attributed, order 0
+            tx(aid(SERVICE), 9, b), // sender reclaim → NOT attributed
+            tx(aid(BRIDGE), 9, c),  // second bridge tx in the block → order 1
+        ];
+        let map = bridge_consumed_nullifiers(&txs, aid(BRIDGE));
+        assert_eq!(map.get(&a), Some(&(9, 0)));
+        assert_eq!(map.get(&c), Some(&(9, 1)), "per-block bridge-tx order increments");
+        assert!(
+            !map.contains_key(&b),
+            "non-bridge consumption must be gated out (MA#3 fail-closed)"
         );
     }
 }
