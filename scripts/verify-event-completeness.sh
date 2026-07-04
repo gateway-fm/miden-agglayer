@@ -82,6 +82,12 @@ def rpc_call(method, params):
     return resp["result"]
 
 tip = int(rpc_call("eth_blockNumber", []), 16)
+# Defense vs stale-tip bugs (postmortem 2026-07-04): never let a lagging
+# eth_blockNumber truncate the scan window below the node snapshot's tip.
+_n = sqlite3.connect(sys.argv[1])
+_cut = _n.execute("SELECT max(block_num) FROM block_headers").fetchone()[0] or 0
+_n.close()
+tip = max(tip, _cut)
 
 def get_logs(topic0):
     # Full range in one call; chunk on failure (range caps).

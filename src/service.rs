@@ -290,24 +290,23 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         "eth_blockNumber" => {
-            // RD-940 Phase 3 — hot read via the BlockMonitor AtomicU64
-            // tip mirror. Falls back to the store on cold boot (mirror
-            // is 0 until the first writer reports). Cuts a stable-state
-            // per-request store round-trip down to a relaxed-atomic load.
-            let mirrored = service.block_monitor.current_tip();
-            let block_num = if mirrored > 0 {
-                mirrored
-            } else {
-                let n = service
-                    .store
-                    .get_latest_block_number()
-                    .await
-                    .map_err(|e| store_error(answer_id.clone(), e))?;
-                if n > 0 {
-                    service.block_monitor.record_tip(n);
-                }
-                n
-            };
+            // POSTMORTEM 2026-07-04: the RD-940 Phase 3 hot-read (serve the
+            // BlockMonitor AtomicU64 mirror when non-zero) went STALE under the
+            // synthetic-indexer redesign: the projector became the SOLE tip
+            // advancer and never calls record_tip(), and with the writer
+            // worker disabled nothing else does — so the mirror froze at its
+            // cold-boot seed (observed: eth_blockNumber pinned at 659 while
+            // the synthetic tip reached 2702; verifier windows truncated).
+            // The store is the single source of truth for the tip — read it.
+            // record_tip() keeps the mirror fresh for writer-mode consumers.
+            let block_num = service
+                .store
+                .get_latest_block_number()
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?;
+            if block_num > 0 {
+                service.block_monitor.record_tip(block_num);
+            }
             let block_num_str = format!("{:#x}", block_num);
             Ok(JsonRpcResponse::success(answer_id, block_num_str))
         }
