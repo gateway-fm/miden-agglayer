@@ -56,6 +56,12 @@ case "$test_filter" in
         "$SCRIPT_DIR/e2e-reconciler-cursor-persistence.sh"
         echo ""
         "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
+        echo ""
+        # ABSOLUTELY LAST on purpose: its final phase leaves a self-targeted
+        # poison leaf in the LET (by design of the Cantina #13 circuit-break
+        # repro), which wedges any certificate settlement that would happen
+        # after it — so no settlement-dependent test may follow.
+        "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
@@ -68,6 +74,9 @@ case "$test_filter" in
         ;;
     dynamic-erc20)
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
+        ;;
+    cantina13)
+        "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
         ;;
     ger-decomposition)
         "$SCRIPT_DIR/e2e-ger-decomposition.sh"
@@ -95,7 +104,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
         exit 1
         ;;
 esac
