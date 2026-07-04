@@ -22,6 +22,10 @@ echo ""
 
 case "$test_filter" in
     all)
+        # First and cheapest: RPC tip coherence + liveness (postmortem
+        # 2026-07-04 frozen-eth_blockNumber regression). Quick-fails the suite.
+        "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-l1-to-l2.sh"
         echo ""
         "$SCRIPT_DIR/e2e-l2-to-l1.sh"
@@ -31,6 +35,9 @@ case "$test_filter" in
         "$SCRIPT_DIR/e2e-security.sh"
         echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
+        ;;
+    tip-consistency)
+        "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
         ;;
     l1-to-l2)
         "$SCRIPT_DIR/e2e-l1-to-l2.sh"
@@ -52,7 +59,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz]" >&2
         exit 1
         ;;
 esac
