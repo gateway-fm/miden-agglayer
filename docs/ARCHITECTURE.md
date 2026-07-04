@@ -87,13 +87,19 @@ Key invariants:
 
 ```mermaid
 sequenceDiagram
-    participant L1 as L1 (GER manager)
-    participant AO as aggoracle
-    participant RPC as proxy RPC
-    participant MC as MidenClient actor
-    participant N as miden-node / ntx-builder
-    participant SP as SyntheticProjector
-    participant ST as Store
+    box rgb(254,243,199) AggLayer / L1
+        participant L1 as L1 (GER manager)
+        participant AO as aggoracle
+    end
+    box rgb(219,234,254) proxy
+        participant RPC as proxy RPC
+        participant MC as MidenClient actor
+        participant SP as SyntheticProjector
+        participant ST as Store
+    end
+    box rgb(254,243,199) Miden
+        participant N as miden-node / ntx-builder
+    end
 
     L1->>AO: UpdateL1InfoTree (new GER)
     AO->>RPC: eth_sendRawTransaction (GER update tx)
@@ -112,14 +118,20 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant U as user / autoclaim
-    participant BS as bridge-service
-    participant RPC as proxy RPC
-    participant MC as MidenClient actor
-    participant P as tx-prover
-    participant N as miden-node / ntx-builder
-    participant SP as SyntheticProjector
-    participant W as recipient wallet
+    box rgb(254,243,199) AggLayer / L1
+        participant U as user / autoclaim
+        participant BS as bridge-service
+    end
+    box rgb(219,234,254) proxy
+        participant RPC as proxy RPC
+        participant MC as MidenClient actor
+        participant SP as SyntheticProjector
+    end
+    box rgb(254,243,199) Miden
+        participant P as tx-prover
+        participant N as miden-node / ntx-builder
+        participant W as recipient wallet
+    end
 
     U->>BS: (after L1 bridgeAsset) poll ready_for_claim
     Note over BS: deposit ready once its GER<br/>reached L2 via Flow 1
@@ -138,13 +150,19 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant EW as external wallet client
-    participant N as miden-node / ntx-builder
-    participant MC as MidenClient actor
-    participant SP as SyntheticProjector
-    participant AS as aggsender / agglayer
-    participant AC as bridge-autoclaim
-    participant L1 as L1 bridge
+    box rgb(254,243,199) Miden side
+        participant EW as external wallet client
+        participant N as miden-node / ntx-builder
+    end
+    box rgb(219,234,254) proxy
+        participant MC as MidenClient actor
+        participant SP as SyntheticProjector
+    end
+    box rgb(254,243,199) AggLayer / L1
+        participant AS as aggsender / agglayer
+        participant AC as bridge-autoclaim
+        participant L1 as L1 bridge
+    end
 
     EW->>N: submit B2AGG note (own store/keys,<br/>targets bridge, tag 0 network note)
     N->>N: ntx-builder consumes B2AGG (block B)<br/>bridge: burn asset, append LET leaf
@@ -190,9 +208,13 @@ minutes. Three escalating catchers:
 
 ```mermaid
 sequenceDiagram
-    participant N as miden-node
-    participant MC as MidenClient store
-    participant SP as SyntheticProjector (per tick)
+    box rgb(254,243,199) Miden
+        participant N as miden-node
+    end
+    box rgb(219,234,254) proxy
+        participant MC as MidenClient store
+        participant SP as SyntheticProjector (per tick)
+    end
 
     Note over SP: Catcher 1 — late-consumption sweep
     SP->>MC: get_input_notes(Consumed)
@@ -222,11 +244,17 @@ make the replay idempotent):
 
 ```mermaid
 sequenceDiagram
-    participant OP as operator
-    participant PX as proxy (startup)
-    participant MC as MidenClient
-    participant N as miden-node
-    participant ST as Store
+    box rgb(254,243,199) operator
+        participant OP as operator
+    end
+    box rgb(219,234,254) proxy
+        participant PX as proxy (startup)
+        participant MC as MidenClient
+        participant ST as Store
+    end
+    box rgb(254,243,199) Miden
+        participant N as miden-node
+    end
 
     OP->>PX: start with --restore [--reset-miden-store]
     PX->>PX: pause sync listeners (no live projection<br/>during replay)
@@ -243,9 +271,13 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant CP as claim / GER path
-    participant MC as MidenClient
-    participant N as miden-node
+    box rgb(219,234,254) proxy
+        participant CP as claim / GER path
+        participant MC as MidenClient
+    end
+    box rgb(254,243,199) Miden
+        participant N as miden-node
+    end
 
     CP->>MC: submit tx (insert_ger / publish_claim)
     MC-->>CP: AccountDataNotFound /<br/>IncorrectAccountInitialCommitment
