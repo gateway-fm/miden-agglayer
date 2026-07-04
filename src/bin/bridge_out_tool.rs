@@ -89,6 +89,12 @@ struct Args {
     #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
     miden_prover_timeout_secs: u64,
 
+    /// Print the canonical note script roots (b2agg/claim/ger) as ground truth
+    /// for external verifiers (e.g. scripts/verify-event-completeness.sh) and
+    /// exit. Pure print — needs no node, store, or accounts.
+    #[arg(long)]
+    print_script_roots: bool,
+
     /// After submitting the B2AGG, wait until the note is actually CONSUMED
     /// on-chain (polling sync), up to this many seconds. 0 disables the wait
     /// (legacy behaviour: 5 blind sync cycles). Load tests MUST wait: pacing on
@@ -137,6 +143,23 @@ fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.print_script_roots {
+        // Keep key=0x<hex> stable — verify-event-completeness.sh parses it.
+        println!(
+            "b2agg=0x{}",
+            hex::encode(miden_base_agglayer::B2AggNote::script_root().as_bytes())
+        );
+        println!(
+            "claim=0x{}",
+            hex::encode(miden_base_agglayer::ClaimNote::script().root().as_bytes())
+        );
+        println!(
+            "ger=0x{}",
+            hex::encode(miden_base_agglayer::UpdateGerNote::script_root().as_bytes())
+        );
+        return Ok(());
+    }
 
     let store_path = args.store_dir.join("store.sqlite3");
     let keystore_path = args.store_dir.join("keystore");

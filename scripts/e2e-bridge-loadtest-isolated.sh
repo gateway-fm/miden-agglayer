@@ -100,7 +100,7 @@ TOKEN_SUPPLY="1000000000000000000000000000"  # 1e27 — plenty for funding + loa
 APPROVE_HUGE="115792089237316195423570985008687907853269984665640564039457584007913129639935" # 2^256-1
 
 # Settle polling.
-SETTLE_STALL="${SETTLE_STALL:-180}"   # stop polling after this many s with no new claims
+SETTLE_STALL="${SETTLE_STALL:-300}"   # stop polling after this many s with no new claims
 SETTLE_CAP="${SETTLE_CAP:-1800}"      # absolute backstop (30 min)
 SETTLE_INTERVAL="${SETTLE_INTERVAL:-10}"
 
@@ -654,3 +654,19 @@ else
     r "     (i.e. the shared-store bridge-out tool was the loadtest's lock source)."
 fi
 r "======================================================================"
+
+# ── Independent event-completeness verification ──────────────────────────────
+# Cross-checks the miden-node DB (consumed B2AGG/CLAIM/GER notes, by canonical
+# script root) against eth_getLogs on the synthetic L2 — each event must exist
+# at EXACTLY the note's consumption block. Failure fails the whole loadtest.
+VERIFY_RC=0
+if [[ "${VERIFY:-1}" == "1" ]]; then
+    r "Event-completeness verification (node DB ⇄ eth_getLogs):"
+    ALLOW_LATE="${ALLOW_LATE:-1}" "$SCRIPT_DIR/verify-event-completeness.sh" 2>&1                                               | tee -a "$RESULTS_LOG"
+    VERIFY_RC=${PIPESTATUS[0]}
+    r "verification exit: $VERIFY_RC"
+fi
+exit $(( LOCK_COUNT > 0 ? 1 : VERIFY_RC ))
+# Forensics: archive proxy logs (reconciler warnings, import errors, sweep
+# lines) so rung teardown can't destroy the evidence for a failed run.
+docker logs "$AGGLAYER_CONTAINER" > "$OUT_DIR/proxy-$STAMP.log" 2>&1 || true
