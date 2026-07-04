@@ -26,7 +26,7 @@ flowchart TD
         CLAIM["claim path<br/>handle_claim_asset → publish_claim<br/>(per-origin faucet lock #10,<br/>dynamic decimals #17)"]
         GER["GER path<br/>insert_ger (ger_manager)"]
         WW["writer worker (RD-940, optional)<br/>future-nonce queue"]
-        MC["MidenClient ACTOR<br/>single thread, one select! loop:<br/>sync_state every ~5s ⊕ request queue (.with())<br/>process-wide singleton"]
+        MC["MidenClient ACTOR<br/>single thread, one select! loop:<br/>sync_state every ~5s + request queue<br/>process-wide singleton"]
         subgraph LISTENERS["on_post_sync listeners"]
             SP["SyntheticProjector — SOLE producer<br/>cursor: Miden block N → synthetic block N<br/>+ note reconciler (sync_notes → import)<br/>+ late-consumption sweep<br/>+ direct recovery (get_notes_by_id +<br/>sync_transactions consumer attribution)"]
             BOS["BridgeOutScanner — monitors only<br/>LET divergence #9, twin notes #6,<br/>faucet ownership #4, expected MINT #7"]
@@ -88,7 +88,7 @@ sequenceDiagram
 
     L1->>AO: UpdateL1InfoTree (new GER)
     AO->>RPC: eth_sendRawTransaction (GER update tx)
-    RPC->>MC: insert_ger — .with() request
+    RPC->>MC: insert_ger via actor request queue
     MC->>MC: ger_manager signs UpdateGerNote (targets bridge)
     MC->>N: submit proven tx (tx-prover)
     N->>N: ntx-builder consumes UpdateGerNote<br/>bridge account: GER hash-chain += GER (block B)
@@ -116,7 +116,7 @@ sequenceDiagram
     Note over BS: deposit ready once its GER<br/>reached L2 via Flow 1
     U->>RPC: claimAsset via eth_sendRawTransaction
     RPC->>RPC: verify SMT proof vs injected GER<br/>find_or_create_faucet (per-origin lock #10,<br/>dynamic miden decimals #17)
-    RPC->>MC: publish_claim — .with() request<br/>(nonce guard R4; writer worker queues future nonces)
+    RPC->>MC: publish_claim via actor request queue<br/>(nonce guard R4 — writer worker queues future nonces)
     MC->>P: prove CLAIM note tx (~30–60 s)
     MC->>N: submit CLAIM (targets bridge)
     N->>N: ntx-builder consumes CLAIM (block B)<br/>bridge mints → MINT note to wallet
