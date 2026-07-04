@@ -87,6 +87,45 @@ Key invariants:
 - The external wallet **never shares the proxy's sqlite** (prod topology; also
   the DB-lock isolation result).
 
+## The synthetic block engine (projector tick)
+
+How synthetic blocks come to exist at all: the proxy has no EVM execution — the
+projector *derives* an EVM-shaped chain from Miden, one synthetic block per
+Miden block (Miden-1:1), inside every sync tick:
+
+```mermaid
+sequenceDiagram
+    box rgb(255,237,213) Miden
+        participant N as miden-node
+    end
+    box rgb(219,234,254) proxy
+        participant MC as MidenClient actor
+        participant SP as SyntheticProjector
+        participant BS as BlockState
+        participant ST as Store (synthetic chain)
+    end
+
+    MC->>N: sync_state (~5s cadence)
+    N-->>MC: block headers, account deltas,<br/>tag-matched notes, spent nullifiers
+    MC->>SP: on_post_sync (exclusive client access)
+    SP->>N: reconciler: sync_notes + import missing<br/>+ direct recovery (R1 ladder)
+    SP->>MC: get_input_notes(Consumed) — ONCE per tick
+    SP->>SP: group consumed notes by consumption block<br/>merge late-swept + recovered notes into<br/>first unprojected block
+    loop for each Miden block B = cursor+1 … tip
+        SP->>BS: block hash + timestamp for B<br/>(derived from the Miden block)
+        SP->>SP: order block notes by<br/>(consumed_tx_order, note_id) — deterministic
+        SP->>ST: derive + write logs at synthetic block B:<br/>B2AGG→BridgeEvent, CLAIM→ClaimEvent,<br/>GER→UpdateHashChainValue<br/>(each gated + deduped — idempotent)
+        SP->>ST: persist projector cursor = B
+        SP->>ST: advance tip: latest_block_number = B<br/>(WRITE-BEFORE-ADVANCE — even for empty blocks)
+    end
+    Note over SP,ST: tip is the sole gate for eth_blockNumber /<br/>eth_getLogs readers: a block is never visible<br/>before all its events are written, so consumers<br/>cannot skip events — and re-running the projector<br/>over the same chain is byte-identical (deterministic)
+```
+
+Properties: **deterministic** (same Miden chain ⇒ byte-identical synthetic
+chain), **idempotent** (crash mid-block re-projects through dedup keys),
+**gap-free** (empty Miden blocks produce empty synthetic blocks, so the chain
+mirrors Miden block-for-block and `eth_blockNumber` tracks the Miden tip).
+
 ## Flow 1 — GER injection (L1 → L2 info propagation)
 
 ```mermaid
