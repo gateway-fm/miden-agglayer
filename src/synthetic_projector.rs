@@ -232,8 +232,7 @@ impl SyntheticProjector {
                     .import_notes(&files)
                     .await
                     .map_err(|e| anyhow::anyhow!("import_notes({n}): {e}"))?;
-                metrics::counter!("synthetic_reconciler_notes_imported_total")
-                    .increment(n as u64);
+                metrics::counter!("synthetic_reconciler_notes_imported_total").increment(n as u64);
                 tracing::info!(
                     imported = n,
                     from,
@@ -372,9 +371,7 @@ impl SyntheticProjector {
                     let txs = rpc
                         .sync_transactions(*min_h, *max_h, vec![self.bridge_id])
                         .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("sync_transactions({min_h}..{max_h}): {e}")
-                        })?;
+                        .map_err(|e| anyhow::anyhow!("sync_transactions({min_h}..{max_h}): {e}"))?;
                     bridge_consumed_nullifiers(&txs, self.bridge_id)
                 }
                 _ => HashMap::new(),
@@ -1342,18 +1339,22 @@ mod tests {
         let n_late = b2agg_note_with_amount(3, Some(0), 51);
         let n_exact = b2agg_note_with_amount(8, Some(0), 52);
         let n_future = b2agg_note_with_amount(12, Some(0), 53);
-        projector
-            .direct_recovered
-            .lock()
-            .unwrap()
-            .extend([n_late.clone(), n_exact.clone(), n_future.clone()]);
+        projector.direct_recovered.lock().unwrap().extend([
+            n_late.clone(),
+            n_exact.clone(),
+            n_future.clone(),
+        ]);
 
         // Snapshot + bucket the way `tick` does, with cursor=5, tip=10.
         let direct: Vec<InputNoteRecord> = projector.direct_recovered.lock().unwrap().clone();
         let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
         let done = SyntheticProjector::bucket_direct_notes(&direct, &mut by_block, 5, 10);
 
-        assert_eq!(done.len(), 2, "late + in-window notes bucket; beyond-tip defers");
+        assert_eq!(
+            done.len(),
+            2,
+            "late + in-window notes bucket; beyond-tip defers"
+        );
         assert_eq!(
             by_block.get(&6).map(Vec::len),
             Some(1),
@@ -1379,7 +1380,11 @@ mod tests {
             .project_block_notes(&by_block[&8], &empty, 8, None)
             .await
             .unwrap();
-        assert_eq!((logs6, logs8), (1, 1), "each recovered note emits one BridgeEvent");
+        assert_eq!(
+            (logs6, logs8),
+            (1, 1),
+            "each recovered note emits one BridgeEvent"
+        );
 
         let logs = logs_in_range(&store, 0, 10).await;
         assert_eq!(logs.len(), 2);
@@ -1403,6 +1408,53 @@ mod tests {
             n_future.details_commitment(),
             "only the beyond-tip note remains queued"
         );
+    }
+
+    /// Cantina MA#28 — the projector's `ConsumedExternal` provenance fallback,
+    /// fail-closed side. A GER-shaped consumed note whose details-commitment
+    /// has NO matching entry in our own output-note metadata map (i.e. a note
+    /// the proxy did not mint) must be skipped as `MissingMetadata`: zero
+    /// synthetic logs, GER not injected. Re-projecting the SAME notes with the
+    /// matching output record then emits — proving the skip was the metadata
+    /// gate, not an unrelated short-circuit, and that the fail-closed skip
+    /// stays retryable.
+    #[tokio::test]
+    async fn ma28_projector_ger_without_output_record_is_fail_closed_skip() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let (n_ger, ger_meta) = ger_note(4, Some(0), 0x77);
+        let notes = vec![n_ger];
+
+        // No own output record → fail-closed skip.
+        let written = projector
+            .project_notes(&notes, &HashMap::new(), 4, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            written, 0,
+            "GER-shaped note without an own output record must project NO log (MA#28)"
+        );
+        assert!(
+            !store.is_ger_injected(&[0x77u8; 32]).await.unwrap(),
+            "unverifiable GER must not be marked injected"
+        );
+        assert!(
+            logs_in_range(&store, 0, 4).await.is_empty(),
+            "fail-closed skip must leave the synthetic log stream empty"
+        );
+
+        // Same note, WITH the output-record metadata → verified and emitted.
+        let written = projector
+            .project_notes(&notes, &HashMap::from([ger_meta]), 4, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            written, 1,
+            "the same note must emit once the output record verifies its provenance"
+        );
+        assert!(store.is_ger_injected(&[0x77u8; 32]).await.unwrap());
     }
 
     /// The MA#3 gate for the spent-before-import recovery: only nullifiers
@@ -1442,7 +1494,11 @@ mod tests {
         ];
         let map = bridge_consumed_nullifiers(&txs, aid(BRIDGE));
         assert_eq!(map.get(&a), Some(&(9, 0)));
-        assert_eq!(map.get(&c), Some(&(9, 1)), "per-block bridge-tx order increments");
+        assert_eq!(
+            map.get(&c),
+            Some(&(9, 1)),
+            "per-block bridge-tx order increments"
+        );
         assert!(
             !map.contains_key(&b),
             "non-bridge consumption must be gated out (MA#3 fail-closed)"

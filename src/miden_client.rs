@@ -810,4 +810,91 @@ mod tests {
         );
         assert!(client.is_alive(), "test stub is alive");
     }
+
+    /// Cantina MA#23 — the actual dispatch gate, not just the flag. A
+    /// listener registered on the sync loop must have `on_post_sync`
+    /// SUPPRESSED while `listeners_paused` is set, while the cheap
+    /// `on_sync` summary hook keeps firing; after unpausing, the next
+    /// tick dispatches `on_post_sync` again.
+    ///
+    /// This drives [`MidenClient::on_sync`] — the exact function both the
+    /// initial-sync and the 5s-interval arms of the run loop call — with a
+    /// real (offline) `MidenClientLib` and a counting listener. Driving the
+    /// full run loop itself would need a live Miden node (`Self::sync`
+    /// retries forever against a dead endpoint), so this is the tightest
+    /// seam that exercises the real dispatch decision at the listener loop.
+    #[tokio::test]
+    async fn ma23_on_post_sync_dispatch_suppressed_while_paused() {
+        use miden_protocol::block::BlockNumber;
+
+        #[derive(Default)]
+        struct CountingListener {
+            on_sync_calls: AtomicUsize,
+            on_post_sync_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl SyncListener for CountingListener {
+            fn on_sync(&self, _summary: &SyncSummary) {
+                self.on_sync_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
+                self.on_post_sync_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let listener = Arc::new(CountingListener::default());
+        let listeners: Vec<Arc<dyn SyncListener>> = vec![listener.clone()];
+        let paused = AtomicBool::new(true);
+
+        // Tick 1: paused — on_sync fires, on_post_sync is suppressed.
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(1u32))),
+            &mut client,
+            &listeners,
+            &paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listener.on_sync_calls.load(Ordering::SeqCst),
+            1,
+            "the cheap on_sync summary hook must keep firing while paused"
+        );
+        assert_eq!(
+            listener.on_post_sync_calls.load(Ordering::SeqCst),
+            0,
+            "on_post_sync dispatch must be suppressed while listeners are paused"
+        );
+
+        // Tick 2: still paused — still suppressed (not a one-shot skip).
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(2u32))),
+            &mut client,
+            &listeners,
+            &paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(listener.on_post_sync_calls.load(Ordering::SeqCst), 0);
+
+        // Tick 3: unpaused (guard dropped in production) — dispatch resumes.
+        paused.store(false, Ordering::Release);
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(3u32))),
+            &mut client,
+            &listeners,
+            &paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(listener.on_sync_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            listener.on_post_sync_calls.load(Ordering::SeqCst),
+            1,
+            "on_post_sync must dispatch again once the pause is released"
+        );
+    }
 }

@@ -1858,4 +1858,323 @@ mod tests {
             "gated note must not be marked processed",
         );
     }
+
+    // ── Cantina MA#18 — restore-path quarantine branches ─────────────────────
+    //
+    // The live scanner's quarantine wiring is pinned in `bridge_out::tests`
+    // (`ma18_erased_b2agg_quarantined_on_storage_parse_failure` etc.). The
+    // restore path re-implements the same four skip sites inside
+    // `project_b2agg_note` (`restore.rs`); each must (a) record an
+    // `unbridgeable_bridge_out` row with the matching reason, (b) emit NO
+    // synthetic BridgeEvent, and (c) leave the note un-processed so a fixed
+    // parser / backfilled registry can re-attempt it.
+
+    /// Build a bridge-consumed B2AGG `InputNoteRecord` with caller-chosen
+    /// storage felts and assets — the malformed-shape generator for the MA#18
+    /// quarantine branches (`ma3_b2agg_input_note` always builds a WELL-formed
+    /// note).
+    fn ma18_b2agg_input_note(
+        storage_felts: Vec<miden_protocol::Felt>,
+        assets: Vec<miden_protocol::asset::Asset>,
+        consumer: AccountId,
+    ) -> InputNoteRecord {
+        use miden_base_agglayer::B2AggNote;
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::Word;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{
+            NoteAssets, NoteAttachments, NoteDetails, NoteRecipient, NoteStorage,
+        };
+
+        let storage = NoteStorage::new(storage_felts).unwrap();
+        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+        let assets = NoteAssets::new(assets).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: Some(consumer),
+            consumed_tx_order: None,
+        });
+        InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
+    /// Run one note through the restore derivation and assert the MA#18
+    /// quarantine contract: Skipped outcome, a quarantine row with `reason`,
+    /// no synthetic log, note not marked processed.
+    async fn assert_ma18_restore_quarantine(
+        store: &StdArc<dyn Store>,
+        note: &InputNoteRecord,
+        bridge_id: AccountId,
+        reason: crate::store::UnbridgeableBridgeOutReason,
+    ) {
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let outcome = project_b2agg_note(
+            store,
+            note,
+            bridge_id,
+            7, // local_network_id (well-formed test notes target dest-network 0)
+            42,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "untranslatable B2AGG must be a quarantine skip, not an emit",
+        );
+        let row = store
+            .get_unbridgeable_bridge_out(&note_id)
+            .await
+            .unwrap()
+            .expect("restore skip must write a quarantine row (MA#18)");
+        assert_eq!(row.note_id, note_id);
+        assert_eq!(row.bridge_account, bridge_id);
+        assert_eq!(row.reason, reason);
+        assert_eq!(row.observed_block, 42);
+        assert!(!row.detail.is_empty(), "detail must carry the skip cause");
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "quarantined note must stay un-processed for later rescue",
+        );
+        // No synthetic BridgeEvent was emitted for the quarantined note.
+        let logs = store
+            .get_logs(
+                &crate::log_synthesis::LogFilter {
+                    from_block: Some("0x0".into()),
+                    to_block: Some("0x64".into()),
+                    ..Default::default()
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            logs.is_empty(),
+            "quarantine path must emit NO BridgeEvent, got {} log(s)",
+            logs.len()
+        );
+    }
+
+    /// MA#18 (a) restore path — bridge-consumed B2AGG with malformed storage
+    /// (1 felt; `parse_b2agg_storage` needs ≥ 6) → `StorageParseFailed`.
+    #[tokio::test]
+    async fn ma18_restore_quarantines_b2agg_with_malformed_storage() {
+        use miden_protocol::Felt;
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (_faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        let note = ma18_b2agg_input_note(vec![Felt::from(0u32)], vec![], bridge_id);
+        assert_ma18_restore_quarantine(
+            &store,
+            &note,
+            bridge_id,
+            crate::store::UnbridgeableBridgeOutReason::StorageParseFailed,
+        )
+        .await;
+    }
+
+    /// MA#18 (b) restore path — bridge-consumed B2AGG with valid storage but
+    /// NO fungible asset (the bridge consumed an empty note) →
+    /// `NoFungibleAsset`.
+    #[tokio::test]
+    async fn ma18_restore_quarantines_b2agg_with_no_fungible_asset() {
+        use miden_protocol::Felt;
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (_faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        let note = ma18_b2agg_input_note(vec![Felt::from(0u32); 6], vec![], bridge_id);
+        assert_ma18_restore_quarantine(
+            &store,
+            &note,
+            bridge_id,
+            crate::store::UnbridgeableBridgeOutReason::NoFungibleAsset,
+        )
+        .await;
+    }
+
+    /// MA#18 (c) restore path — well-formed bridge-consumed B2AGG whose faucet
+    /// is NOT in the registry → `UnknownFaucet`. (Same note shape as the MA#3
+    /// emit test, minus the `ma3_register_faucet` step.)
+    #[tokio::test]
+    async fn ma18_restore_quarantines_b2agg_with_unknown_faucet() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        // Deliberately NOT registering the faucet.
+        let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
+        assert_ma18_restore_quarantine(
+            &store,
+            &note,
+            bridge_id,
+            crate::store::UnbridgeableBridgeOutReason::UnknownFaucet,
+        )
+        .await;
+    }
+
+    /// MA#18 (d) restore path — the faucet's registered scale makes
+    /// `reverse_scale_amount` overflow u128 (10^39 > u128::MAX) →
+    /// `AmountOverflow`.
+    #[tokio::test]
+    async fn ma18_restore_quarantines_b2agg_amount_overflow() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        store
+            .register_faucet(crate::store::FaucetEntry {
+                faucet_id,
+                origin_address: [0u8; 20],
+                origin_network: 0,
+                symbol: "OVF".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 39, // 10^39 overflows u128 in reverse_scale_amount
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+        let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
+        assert_ma18_restore_quarantine(
+            &store,
+            &note,
+            bridge_id,
+            crate::store::UnbridgeableBridgeOutReason::AmountOverflow,
+        )
+        .await;
+    }
+
+    // ── Cantina MA#28 — ConsumedExternal output-note-metadata fallback ───────
+    //
+    // Protocol 0.15 strips metadata from `ConsumedExternal` input-note
+    // records, so `project_ger_note` recovers provenance from OUR OWN
+    // output-note records (we minted every sanctioned UpdateGerNote). The
+    // classifier's four verdicts are pinned above (`ma28_classify_*`); these
+    // two tests pin the FALLBACK wiring itself, fail-closed and fail-open.
+
+    /// Build a GER-shaped consumed note in the metadata-less
+    /// `ConsumedExternal` state (mirrors `synthetic_projector::tests::ger_note`),
+    /// returning the record, its would-be output-record metadata entry, and
+    /// the GER bytes its storage encodes.
+    fn ma28_consumed_external_ger_note(
+        ger_byte: u8,
+    ) -> (InputNoteRecord, ([u8; 32], NoteMetadata), [u8; 32]) {
+        use miden_base_agglayer::UpdateGerNote;
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{
+            NoteAssets, NoteAttachment, NoteDetails, NoteRecipient, NoteStorage,
+        };
+        use miden_protocol::{Felt, Word};
+
+        // 8 u32 limbs, every byte equal → the decoded GER is [ger_byte; 32]
+        // regardless of limb endianness.
+        let limb = u32::from_be_bytes([ger_byte; 4]);
+        let storage = NoteStorage::new(vec![Felt::from(limb); 8]).unwrap();
+        let recipient = NoteRecipient::new(Word::default(), UpdateGerNote::script(), storage);
+        let details = NoteDetails::new(NoteAssets::new(vec![]).unwrap(), recipient);
+
+        // Provenance the fallback must recover: sender = ger manager,
+        // attachment = NetworkAccountTarget(bridge).
+        let bridge = id(TEST_TARGET_BRIDGE);
+        let attachment = NoteAttachment::from(
+            NetworkAccountTarget::new(bridge, NoteExecutionHint::Always).expect("nat"),
+        );
+        let attachments = NoteAttachments::from(attachment);
+        let partial = PartialNoteMetadata::new(id(TEST_SENDER_MANAGER), NoteType::Public);
+        let metadata = NoteMetadata::new(partial, &attachments);
+
+        // ConsumedExternal: NO metadata on the input-note record itself.
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: Some(bridge),
+            consumed_tx_order: None,
+        });
+        let record = InputNoteRecord::new(details, attachments, None, state);
+        let key = record.details_commitment().as_bytes();
+        (record, (key, metadata), [ger_byte; 32])
+    }
+
+    /// MA#28 fail-closed — a consumed-external GER-shaped note with NO
+    /// matching own-output-note record must be skipped as `MissingMetadata`:
+    /// no GER restored, no synthetic log. This is exactly the posture for a
+    /// same-script note the proxy did NOT mint.
+    #[tokio::test]
+    async fn ma28_consumed_external_ger_without_output_record_is_fail_closed_skip() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (note, _own_meta, ger_bytes) = ma28_consumed_external_ger_note(0x5A);
+
+        let outcome = project_ger_note(
+            &store,
+            &note,
+            &std::collections::HashMap::new(), // no own output record → fail closed
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            3,
+            [3u8; 32],
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            GerProjectOutcome::Skipped,
+            "GER-shaped note without an own output record must be skipped (MissingMetadata)",
+        );
+        assert!(
+            !store.is_ger_injected(&ger_bytes).await.unwrap(),
+            "the unverifiable GER must NOT be marked injected",
+        );
+        let logs = store
+            .get_logs(
+                &crate::log_synthesis::LogFilter {
+                    from_block: Some("0x0".into()),
+                    to_block: Some("0x64".into()),
+                    ..Default::default()
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            logs.is_empty(),
+            "fail-closed skip must emit NO synthetic log"
+        );
+    }
+
+    /// MA#28 fail-open counterpart — the SAME consumed-external note, when our
+    /// output-note records carry its metadata (we minted it), must verify via
+    /// the fallback and restore its GER. Proves the skip above is the metadata
+    /// gate and nothing else.
+    #[tokio::test]
+    async fn ma28_consumed_external_ger_with_output_record_restores() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (note, (key, metadata), ger_bytes) = ma28_consumed_external_ger_note(0x5B);
+        let output_metadata = std::collections::HashMap::from([(key, metadata)]);
+
+        let outcome = project_ger_note(
+            &store,
+            &note,
+            &output_metadata,
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            3,
+            [3u8; 32],
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            GerProjectOutcome::Emitted,
+            "sanctioned GER note must restore once the output-record metadata verifies it",
+        );
+        assert!(
+            store.is_ger_injected(&ger_bytes).await.unwrap(),
+            "restored GER must be marked injected",
+        );
+    }
 }

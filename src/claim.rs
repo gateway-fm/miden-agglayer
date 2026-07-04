@@ -916,6 +916,85 @@ mod tests {
         assert!(entry.is_none());
     }
 
+    /// Cantina #1 — the ACTUAL refusal branch in `find_or_create_faucet`
+    /// (the store query helper is pinned separately by
+    /// `cantina_1_find_faucets_by_origin_address_surfaces_cross_network_collision`).
+    /// A claim whose origin token address is already registered under a
+    /// DIFFERENT origin network must be refused before any faucet deploy is
+    /// attempted: the on-chain bridge registry keys faucets by
+    /// `hash(origin_token_address)` alone, so auto-creating would silently
+    /// overwrite the existing registration. Uses a real (offline)
+    /// `MidenClientLib` — the refusal fires before the client is ever touched,
+    /// which this test also proves (an RPC attempt against the dead localhost
+    /// endpoint would surface as a connection error, not the collision error).
+    #[tokio::test]
+    async fn cantina_1_find_or_create_faucet_refuses_cross_network_collision() {
+        use alloy::primitives::Address;
+
+        let store = InMemoryStore::new();
+        let token = [0xABu8; 20];
+        // The token is already registered under origin network 5.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap(),
+                origin_address: token,
+                origin_network: 5,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let accounts = crate::test_helpers::test_accounts_config();
+
+        // Same token address, DIFFERENT origin network (0) → refusal.
+        let err = find_or_create_faucet(
+            Address::from(token),
+            0,
+            &Bytes::new(),
+            &store,
+            &mut client,
+            &accounts.0,
+        )
+        .await
+        .expect_err("cross-network collision must refuse auto-create");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Cross-network token-address collision"),
+            "error must name the Cantina #1 conflict, got: {msg}"
+        );
+        assert!(
+            msg.contains("already registered under network 5"),
+            "error must surface the colliding network for the operator, got: {msg}"
+        );
+
+        // No new faucet was deployed or registered — the original route is
+        // untouched and remains the only one for this token address.
+        let routes = store.find_faucets_by_origin_address(&token).await.unwrap();
+        assert_eq!(routes.len(), 1, "refusal must not register a second faucet");
+        assert_eq!(routes[0].origin_network, 5);
+
+        // Control: the SAME (address, network) pair still resolves via the
+        // fast path — the refusal is scoped to cross-network collisions only.
+        let same = find_or_create_faucet(
+            Address::from(token),
+            5,
+            &Bytes::new(),
+            &store,
+            &mut client,
+            &accounts.0,
+        )
+        .await
+        .expect("same-network lookup must keep working");
+        assert_eq!(same.decimals, 8);
+        assert_eq!(same.origin_token_decimals, 18);
+    }
+
     #[test]
     fn test_metadata_hash_non_empty() {
         // Non-empty raw bytes → keccak256(bytes). Sanity check that

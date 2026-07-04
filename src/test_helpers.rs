@@ -60,3 +60,43 @@ pub fn create_test_service() -> ServiceState {
     let accounts = test_accounts_config();
     ServiceState::new(miden_client, accounts, 1, 1, store, block_state)
 }
+
+/// Build a REAL `MidenClientLib` backed by a throwaway sqlite store and an RPC
+/// handle pointing at the (unused) localhost endpoint. `ClientBuilder::build`
+/// performs no network I/O — it only initialises the sqlite store and reads the
+/// (absent) genesis header — so tests can exercise code paths that require a
+/// `&mut MidenClientLib` argument but return before issuing any RPC:
+///
+/// - the Cantina #1 cross-network refusal in `claim::find_or_create_faucet`
+///   (bails before the client is touched);
+/// - the Cantina MA#23 `on_post_sync` dispatch gate in
+///   `MidenClient::on_sync` (the listener decides whether to use the client).
+///
+/// Only available under `cfg(test)` — production code must never construct a
+/// second client next to the process-wide `MidenClient` singleton.
+#[cfg(test)]
+pub async fn offline_miden_client_lib() -> crate::miden_client::MidenClientLib {
+    use miden_client::DebugMode;
+    use miden_client::builder::ClientBuilder;
+    use miden_client::keystore::FilesystemKeyStore;
+    use miden_client::rpc::Endpoint;
+    use miden_client_sqlite_store::ClientBuilderSqliteExt;
+
+    let store_dir = tempfile::tempdir().expect("tempdir").keep();
+    let keystore_path = store_dir.join("keystore");
+    std::fs::create_dir_all(&keystore_path).expect("keystore dir");
+    let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).expect("keystore"));
+
+    ClientBuilder::new()
+        .rpc(crate::miden_client::build_rpc_client(
+            &Endpoint::localhost(),
+            1_000,
+            None,
+        ))
+        .sqlite_store(store_dir.join("store.sqlite3"))
+        .authenticator(keystore)
+        .in_debug_mode(DebugMode::Disabled)
+        .build()
+        .await
+        .expect("offline MidenClientLib must build without a node")
+}
