@@ -60,6 +60,15 @@ flowchart TD
     AGGSENDER --> AGL --> BRIDGE_L1
     AUTOCLAIM --> BRIDGE_L1
     GERM_L1 --> AGGORACLE
+
+    classDef proxyBox fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px
+    classDef proxyNode fill:#eff6ff,stroke:#1d4ed8
+    classDef externalBox fill:#fef3c7,stroke:#b45309
+    classDef externalNode fill:#fffbeb,stroke:#b45309
+    class PROXY,LISTENERS proxyBox
+    class RPC,CLAIM,GER,WW,MC,SP,BOS,STORE,SQLITE proxyNode
+    class L1,AGG,MIDEN externalBox
+    class BRIDGE_L1,GERM_L1,AGGORACLE,AGGSENDER,AGL,BSVC,AUTOCLAIM,NODE,NTX,PROVER,BACC,EXTW externalNode
 ```
 
 Key invariants:
