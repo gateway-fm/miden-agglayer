@@ -446,6 +446,17 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         // "not syncing" per the Ethereum JSON-RPC spec (boolean false).
         "eth_syncing" => Ok(JsonRpcResponse::success(answer_id, false)),
 
+        // Standard client-discovery stubs (block explorers / tooling probe
+        // these on startup; unimplemented they spam ERROR-level noise).
+        "web3_clientVersion" => Ok(JsonRpcResponse::success(
+            answer_id,
+            format!("miden-agglayer/{}", env!("CARGO_PKG_VERSION")),
+        )),
+        "net_version" => Ok(JsonRpcResponse::success(
+            answer_id,
+            service.chain_id.to_string(),
+        )),
+
         "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
@@ -663,7 +674,10 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         method => {
-            tracing::error!("JSON-RPC unsupported method: {}", method);
+            // WARN, not ERROR: internet scanners and explorer capability
+            // probes (debug_*, parity_*, trace_*) hit this constantly; an
+            // unknown method is a client-side condition, not a proxy fault.
+            tracing::warn!("JSON-RPC unsupported method: {}", method);
             Ok(request.method_not_found(method))
         }
     }
