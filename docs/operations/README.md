@@ -10,15 +10,20 @@ similarly-shaped deployment elsewhere.
 
 | Doc | Use it when… |
 |---|---|
-| [`monitoring.md`](./monitoring.md) | You want to know what to scrape, what to alert on, and what "healthy" vs "stuck" looks like end to end. |
-| [`runbook.md`](./runbook.md) | A specific failure mode is firing (IAIC, AccountDataNotFound, GER backlog, stuck claim, ClaimSettler dry, indexer drift) and you need step-by-step recovery. |
-| [`diagnostics.md`](./diagnostics.md) | You don't yet know what's wrong — you need the read-only inspection playbook (Loki queries, SQL snapshots, account introspection, single-deposit tracing). |
+| [`runbook.md`](./runbook.md) | You're deploying or recovering: the full startup surface (flags/env), the hard constraints (one replica, proxy-private store, loopback bind), the three recovery mechanisms (R1 automatic ladder / R2 `--restore` / R3 self-heal), and the step-by-step failure-mode catalogue (IAIC, AccountDataNotFound, GER backlog, stuck claim, ClaimSettler dry, indexer drift). |
+| [`monitoring.md`](./monitoring.md) | You want to know what to scrape, what to alert on, which log lines matter, and what "healthy" vs "stuck" looks like end to end (projector health line, reconciler chatter, LET convergence). |
+| [`diagnostics.md`](./diagnostics.md) | You don't yet know what's wrong — the read-only inspection playbook (Loki queries, SQL snapshots, single-deposit tracing, the event-integrity audit, node-DB vs proxy-store comparison). |
 
 ## What's already documented elsewhere
 
-These existing docs cover specific incidents and design notes — link out
-to them rather than re-stating their contents:
+These existing docs cover architecture, specific incidents, and design
+notes — link out to them rather than re-stating their contents:
 
+- [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — component architecture,
+  the synthetic block engine (SyntheticProjector), the three main flows
+  (GER / claim / B2AGG), and the recovery-flow diagrams that
+  `runbook.md` Part 2 references. Read this first when new to the
+  system.
 - [`../POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md`](../POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md) — the IAIC →
   AccountDataNotFound chain that ran the bali bridge for ~20 days. Anyone
   triaging "mempool conflict" or "account data wasn't found" symptoms
