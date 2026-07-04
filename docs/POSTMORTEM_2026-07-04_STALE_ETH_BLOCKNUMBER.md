@@ -55,3 +55,15 @@ log at `miden_tip == projector_cursor == synthetic_tip == 2702` while
 - [ ] ntx-builder crash-loop during the run (h2 `error reading a body from
       connection`, RestartCount=4) — node-side, tolerated by design (retries),
       upstream issue worth filing.
+
+## Addendum (same day): reproduced on v0.15.2 — production impact
+During the upgrade-path test's seed phase, the **unmodified v0.15.2 proxy**
+showed the same signature (`eth_blockNumber=25` vs `latest.number=446`). The
+redesign is NOT a necessary ingredient: any deployment running RD-940 Phase 3
+with the writer worker disabled (the default) has a frozen `eth_blockNumber`
+today, including production v0.15.2. Downstream impact is limited because
+aggkit and the bridge-service derive ranges from store-backed paths — but any
+client trusting `eth_blockNumber` (health checks, explorers, tooling) sees a
+frozen tip. The fix in this branch (store-backed read) plus the
+`e2e-rpc-tip-consistency.sh` liveness gate cover both eras; backporting the
+one-line fix to a 0.15.2 point release is recommended.
