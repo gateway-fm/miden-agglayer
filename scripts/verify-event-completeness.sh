@@ -43,8 +43,11 @@ CLAIM_ROOT=$(awk -F= '$1=="claim"{print $2}' "$TMP/roots")
 GER_ROOT=$(awk -F= '$1=="ger"{print $2}' "$TMP/roots")
 [[ -n "$B2AGG_ROOT" && -n "$CLAIM_ROOT" && -n "$GER_ROOT" ]] || { echo "FAIL: could not parse script roots"; exit 1; }
 
-# 2. Bridge account id (consumer gate) from the proxy's deploy log.
-BRIDGE_ID=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -oE "deploying bridge account 0x[0-9a-f]+" | head -1 | awk '{print $NF}')
+# 2. Bridge account id (consumer gate). Overridable: after an in-place
+#    upgrade the CURRENT container never deployed the bridge (its predecessor
+#    did), so the log grep comes up empty — pass BRIDGE_ID explicitly then
+#    (recover it from bridge_accounts.toml or the node DB).
+BRIDGE_ID="${BRIDGE_ID:-$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -oE "deploying bridge account 0x[0-9a-f]+" | head -1 | awk '{print $NF}')}"
 [[ -n "$BRIDGE_ID" ]] || { echo "FAIL: bridge account id not found in proxy logs"; exit 1; }
 
 # 3. Snapshot the node DB (truth), then give the projector's late-consumption
