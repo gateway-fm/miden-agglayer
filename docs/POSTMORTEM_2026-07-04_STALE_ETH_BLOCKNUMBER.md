@@ -5,7 +5,7 @@ During the N=250 strict loadtest, `eth_blockNumber` returned **659** while the
 synthetic tip was **2702**. Delivery was unaffected (250/250 claimed — aggkit
 derives its scan ranges from store-backed paths), but the event-completeness
 verifier used `eth_blockNumber` as its `eth_getLogs` scan bound, truncating the
-window to blocks 0–659 and mis-reporting ~83% of events as missing across all
+window to blocks 0–659 and misreporting ~83% of events as missing across all
 three types. Post-hoc verification with a corrected bound: **PASS — 127/127
 B2AGG, 133/133 CLAIM, 158/158 GER, all exact-block**.
 

@@ -1,5 +1,4 @@
 //! Empirical probe: do SyncNotes / GetNotesById return already-CONSUMED notes?
-use miden_client::rpc::NodeRpcClient;
 use miden_protocol::note::{NoteId, NoteTag};
 use std::collections::BTreeSet;
 
@@ -19,7 +18,11 @@ async fn main() -> anyhow::Result<()> {
     let blocks = rpc.sync_notes(from.into(), to.into(), &tags).await?;
     let listed = blocks.iter().any(|b| b.notes.contains_key(&id));
     let total: usize = blocks.iter().map(|b| b.notes.len()).sum();
-    println!("sync_notes {from}..{to}: blocks={} notes={} target_listed={listed}", blocks.len(), total);
+    println!(
+        "sync_notes {from}..{to}: blocks={} notes={} target_listed={listed}",
+        blocks.len(),
+        total
+    );
     match rpc.get_notes_by_id(&[id]).await {
         Ok(v) => println!("get_notes_by_id: returned {} note(s)", v.len()),
         Err(e) => println!("get_notes_by_id ERR: {e}"),

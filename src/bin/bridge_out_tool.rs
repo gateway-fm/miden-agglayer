@@ -264,12 +264,18 @@ async fn main() -> anyhow::Result<()> {
             .context("--wallet-id is required unless --create-wallet")?,
     )
     .context("wallet-id")?;
-    let bridge_id =
-        parse_account_id(args.bridge_id.as_deref().context("--bridge-id is required")?)
-            .context("bridge-id")?;
-    let faucet_id =
-        parse_account_id(args.faucet_id.as_deref().context("--faucet-id is required")?)
-            .context("faucet-id")?;
+    let bridge_id = parse_account_id(
+        args.bridge_id
+            .as_deref()
+            .context("--bridge-id is required")?,
+    )
+    .context("bridge-id")?;
+    let faucet_id = parse_account_id(
+        args.faucet_id
+            .as_deref()
+            .context("--faucet-id is required")?,
+    )
+    .context("faucet-id")?;
 
     println!("[bridge-out] wallet:  {wallet_id}");
     println!("[bridge-out] bridge:  {bridge_id}");

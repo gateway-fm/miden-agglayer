@@ -312,7 +312,7 @@ procedure).
 
 Step-by-step recovery procedures for the failure modes we know about,
 originally written for the bali cluster. Section A's *symptoms* are now
-largely pre-empted by R3 (self-heal) — reach for these procedures when
+largely pre-emptied by R3 (self-heal) — reach for these procedures when
 the automatic mechanisms have demonstrably failed.
 
 ## How to use this catalogue

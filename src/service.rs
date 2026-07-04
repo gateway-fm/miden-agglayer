@@ -605,7 +605,6 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         }
 
-
         "eth_getBlockTransactionCountByNumber" => {
             let _params: (String,) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
