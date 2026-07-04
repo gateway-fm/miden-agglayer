@@ -168,14 +168,19 @@ log "Deposit #$DEPOSIT_CNT: amount=$AMOUNT_CLAIM, globalIndex=$GLOBAL_INDEX"
 # may have already claimed this deposit on L1 — the deposit then carries a
 # claim_tx_hash. Re-claiming would revert (AlreadyClaimed), so verify the
 # autoclaim receipt + balance instead and finish successfully.
-CLAIM_TX_HASH=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
-if [[ -n "$CLAIM_TX_HASH" ]]; then
-    log "Deposit already claimed on L1 by the autoclaim service (tx $CLAIM_TX_HASH); verifying..."
-    RECEIPT_STATUS=$(cast receipt --rpc-url "$L1_RPC" "$CLAIM_TX_HASH" status 2>/dev/null || echo "")
+# The autoclaim service races the manual claim path below — a deposit can be
+# claimed by it at ANY point (before we query, while we fetch the proof, or
+# between proof and our claimAsset). Both finishes are equally valid; this
+# helper verifies the autoclaim receipt + balance and ends the test.
+finish_via_autoclaim() {
+    local tx="$1"
+    log "Deposit claimed on L1 by the autoclaim service (tx $tx); verifying..."
+    local status
+    status=$(cast receipt --rpc-url "$L1_RPC" "$tx" status 2>/dev/null || echo "")
     # cast prints the receipt status as "1", "0x1", "true" or "1 (success)"
     # depending on the foundry version — accept any success spelling.
-    [[ "$RECEIPT_STATUS" == *1* || "$RECEIPT_STATUS" == *true* ]] \
-        || fail "autoclaim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
+    [[ "$status" == *1* || "$status" == *true* ]] \
+        || fail "autoclaim tx $tx receipt status not success: ${status:-<none>}"
     pass "L1 claim transaction succeeded (via autoclaim service)!"
     L1_BAL_AFTER=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
     ACTUAL_L1_CHANGE=$((L1_BAL_AFTER - L1_BAL_BEFORE))
@@ -190,12 +195,40 @@ if [[ -n "$CLAIM_TX_HASH" ]]; then
     log "  L2→L1 TEST DONE"
     log "======================================================================"
     exit 0
-fi
+}
+
+# refresh_claim_tx: re-poll the deposit; echoes the claim_tx_hash if the
+# autoclaimer has landed it (empty otherwise). Never fails the script.
+refresh_claim_tx() {
+    curl -sf "$BRIDGE_SERVICE_URL/bridges/$L1_DEST?limit=100" 2>/dev/null | python3 -c "
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for dep in d.get('deposits', []):
+    if dep.get('network_id') == 1 and dep.get('deposit_cnt') == $DEPOSIT_CNT:
+        print(dep.get('claim_tx_hash') or '')
+        break
+" 2>/dev/null || true
+}
+
+CLAIM_TX_HASH=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
+[[ -n "$CLAIM_TX_HASH" ]] && finish_via_autoclaim "$CLAIM_TX_HASH"
 
 # Get merkle proof from bridge-service (net_id=1 for L2 deposits)
 NETWORK_ID_VAL=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['network_id'])")
-PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEPOSIT_CNT&net_id=$NETWORK_ID_VAL")
-[[ -z "$PROOF_JSON" ]] && fail "Could not get merkle proof"
+# The proof endpoint can transiently fail right after ready_for_claim flips
+# (tree not yet built) — a one-shot `curl -sf` under set -e died SILENTLY here
+# (2026-07-04). Retry up to 90s, and bail out to the autoclaim path if the
+# autoclaimer lands the claim while we wait.
+PROOF_JSON=""
+for _ in $(seq 1 18); do
+    PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEPOSIT_CNT&net_id=$NETWORK_ID_VAL" 2>/dev/null || true)
+    [[ -n "$PROOF_JSON" ]] && break
+    TX_NOW=$(refresh_claim_tx)
+    [[ -n "$TX_NOW" ]] && finish_via_autoclaim "$TX_NOW"
+    sleep 5
+done
+[[ -z "$PROOF_JSON" ]] && fail "Could not get merkle proof after 90s"
 
 MAINNET_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])")
 ROLLUP_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])")
@@ -226,12 +259,16 @@ CLAIM_TX=$(cast send --rpc-url "$L1_RPC" \
     "$ORIG_NET" "$ORIG_ADDR" \
     "$DEST_NET" "$DEST_ADDR_CLAIM" \
     "$AMOUNT_CLAIM" "$METADATA_CLAIM" \
-    2>&1)
+    2>&1) || true
 
 STATUS=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="status"{print $2; exit}')
 if [[ "$STATUS" == "1" ]]; then
     pass "L1 claim transaction succeeded!"
 else
+    # Revert here usually means the autoclaimer beat us between proof fetch
+    # and submission (AlreadyClaimed) — verify its claim instead of failing.
+    TX_NOW=$(refresh_claim_tx)
+    [[ -n "$TX_NOW" ]] && finish_via_autoclaim "$TX_NOW"
     warn "L1 claim tx output: $CLAIM_TX"
     fail "L1 claim transaction failed (status=$STATUS)"
 fi
