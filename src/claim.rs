@@ -1116,7 +1116,12 @@ mod tests {
 
         // Mirrors find_or_create_faucet's critical section: take the per-origin
         // lock, re-check under it, and only "deploy" (stub) + register if absent.
-        async fn worker(store: Arc<InMemoryStore>, faucet_id: AccountId, origin: [u8; 20], net: u32) {
+        async fn worker(
+            store: Arc<InMemoryStore>,
+            faucet_id: AccountId,
+            origin: [u8; 20],
+            net: u32,
+        ) {
             let lock = super::faucet_create_lock(&origin);
             let _guard = lock.lock().await;
             if store
@@ -1131,7 +1136,10 @@ mod tests {
             // Simulate deploy+bridge-register latency so the peer is guaranteed
             // to contend on the guard.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            store.register_faucet(entry(faucet_id, origin, net)).await.unwrap();
+            store
+                .register_faucet(entry(faucet_id, origin, net))
+                .await
+                .unwrap();
         }
 
         tokio::join!(
@@ -1141,7 +1149,11 @@ mod tests {
 
         // Exactly one faucet deployed+registered for this origin.
         let all = store.list_faucets().await.unwrap();
-        assert_eq!(all.len(), 1, "only one faucet must be created for the origin");
+        assert_eq!(
+            all.len(),
+            1,
+            "only one faucet must be created for the origin"
+        );
         // The first worker to acquire the guard (A) is the survivor; B reused it
         // and never registered, so it is not stranded.
         assert_eq!(all[0].faucet_id, id_a);
