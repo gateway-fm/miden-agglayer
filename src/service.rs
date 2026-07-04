@@ -135,6 +135,7 @@ fn bucket_method_label(method: &str) -> &'static str {
         "eth_getBlockTransactionCountByNumber" => "eth_getBlockTransactionCountByNumber",
         "eth_call" => "eth_call",
         "eth_estimateGas" => "eth_estimateGas",
+        "eth_syncing" => "eth_syncing",
         "eth_gasPrice" => "eth_gasPrice",
         "eth_sendRawTransaction" => "eth_sendRawTransaction",
         "net_version" => "net_version",
@@ -440,6 +441,11 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 format!("{returned_nonce:#x}"),
             ))
         }
+
+        // aggkit health-polls eth_syncing; the synthetic chain has no download
+        // phase (the projector holds the tip at the Miden tip), so report
+        // "not syncing" per the Ethereum JSON-RPC spec (boolean false).
+        "eth_syncing" => Ok(JsonRpcResponse::success(answer_id, false)),
 
         "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
