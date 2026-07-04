@@ -1514,7 +1514,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.get_faucet_by_id(faucet_a).await.unwrap().unwrap().symbol,
+            store
+                .get_faucet_by_id(faucet_a)
+                .await
+                .unwrap()
+                .unwrap()
+                .symbol,
             "WTKN"
         );
         assert_eq!(store.list_faucets().await.unwrap().len(), 1);
