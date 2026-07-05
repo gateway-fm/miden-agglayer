@@ -592,6 +592,8 @@ async fn main() -> anyhow::Result<()> {
             local_network_id_u32,
             &block_state,
             command.l1_rpc_url.clone(),
+            command.miden_node.as_deref(),
+            command.miden_api_key.as_deref(),
         )
         .await?;
 

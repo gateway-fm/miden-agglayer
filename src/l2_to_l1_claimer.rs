@@ -86,11 +86,13 @@ pub struct ClaimerConfig {
     pub l2_rpc_url: String,
     /// L1 JSON-RPC URL (isClaimed view-calls + claimAsset submission).
     pub l1_rpc_url: String,
-    /// Bridge contract address. Used both as the `eth_getLogs` address filter on
-    /// L2 (the proxy stamps synthetic BridgeEvent logs with this address) and as
-    /// the `claimAsset`/`isClaimed` target on L1. Assumes the canonical CDK
-    /// deterministic deploy where L1 and L2 share the bridge address.
-    pub bridge_address: Address,
+    /// L1 bridge contract address — the `claimAsset` / `isClaimed` target on L1.
+    pub l1_bridge_address: Address,
+    /// L2 bridge contract address — the `eth_getLogs` filter for the proxy's
+    /// synthetic `BridgeEvent` logs. On non-deterministic deploys (e.g. the Miden
+    /// outpost) this differs from the L1 address; on a canonical CDK
+    /// shared-address deploy the two are equal.
+    pub l2_bridge_address: Address,
     /// Bridge-service base URL (for `/merkle-proof`).
     pub bridge_service_url: String,
     /// Our rollup's agglayer network id (e.g. 1 in kurtosis, 76 on Bali).
@@ -137,6 +139,21 @@ pub fn our_global_index(network_id: u32, leaf_index: u32) -> U256 {
 /// origin network (which is 0 for native ETH).
 pub fn source_bridge_network(network_id: u32) -> u32 {
     network_id
+}
+
+/// Redact secrets from an RPC URL before logging it.
+///
+/// Our L1 endpoint carries the credential in the query string
+/// (`...sepolia?apiKey=<secret>`). Logging the raw URL leaks it to the SIEM —
+/// and the startup banner does so at INFO, so it leaks by default. Strip the
+/// entire query string (catches `apiKey` and any future secret param), keeping
+/// the scheme/host/path visible for operators. Mirrors the redaction the proxy
+/// applies to `l1_rpc_url` in `Command`'s `Debug` impl (`main.rs`).
+pub fn redact_rpc_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_string(),
+    }
 }
 
 /// Outcome of simulating (or attempting) a claim, used to decide retry vs skip.
@@ -332,30 +349,8 @@ impl CursorStore {
 
 // ─── I/O ──────────────────────────────────────────────────────────────────
 
-/// Discover our rollup's L2→L1 asset exits from block `from` onward, from the
-/// proxy's synthetic `BridgeEvent` logs.
-///
-/// The upper bound is the `latest` tag, NOT `eth_blockNumber`: the proxy's
-/// `eth_blockNumber` mirror can lag the synthetic-log tip (it is advanced by
-/// some write paths but not the bridge-out synthetic-log path), while
-/// `eth_getLogs` with the `latest` tag is resolved against the true tip. Bounding
-/// by `eth_blockNumber` made `discover` miss every bridge-out whose
-/// (Miden-derived) block number exceeded the lagging head — so no exit was ever
-/// claimed.
-async fn discover<P: Provider>(
-    l2: &P,
-    bridge_address: Address,
-    from: u64,
-) -> anyhow::Result<Vec<PendingExit>> {
-    let filter = Filter::new()
-        .address(bridge_address)
-        .from_block(from)
-        .to_block(BlockNumberOrTag::Latest)
-        .event_signature(BridgeEvent::SIGNATURE_HASH);
-
-    let logs = l2.get_logs(&filter).await?;
-    tracing::debug!(from, %bridge_address, raw_logs = logs.len(), "discover: get_logs returned");
-    let mut out = Vec::new();
+/// Decode raw `BridgeEvent` logs into our L2→L1 (destination network 0) exits.
+fn collect_exits(logs: Vec<alloy::rpc::types::Log>, out: &mut Vec<PendingExit>) {
     for log in logs {
         let block = log.block_number.unwrap_or(0);
         match BridgeEvent::decode_log_data(log.data()) {
@@ -372,6 +367,100 @@ async fn discover<P: Provider>(
             }
         }
     }
+}
+
+/// Inclusive numeric `[from, to]` windows covering `[from, head]`, each spanning
+/// at most `max_range` blocks. The trailing `(head, latest]` window is handled
+/// separately by `discover` (it must use the `latest` tag, see below). Returns
+/// empty when `from > head` (cursor already at/after the numeric head).
+///
+/// Pure (no I/O) so the windowing — the part that has to respect the proxy's
+/// getLogs cap — is unit-tested.
+fn scan_windows(from: u64, head: u64, max_range: u64) -> Vec<(u64, u64)> {
+    let step = max_range.max(1);
+    let mut windows = Vec::new();
+    let mut cur = from;
+    while cur <= head {
+        // span (to - from) == step - 1, strictly below `max_range`.
+        let to = cur.saturating_add(step - 1).min(head);
+        windows.push((cur, to));
+        cur = to + 1;
+    }
+    windows
+}
+
+/// Discover our rollup's L2→L1 asset exits from block `from` onward, from the
+/// proxy's synthetic `BridgeEvent` logs.
+///
+/// The miden-agglayer proxy caps `eth_getLogs` at `MAX_GETLOGS_BLOCK_RANGE`
+/// (10_000 blocks) and rejects wider spans. A single `from -> latest` query (the
+/// previous behaviour) therefore failed whenever `(tip - from)` exceeded the cap
+/// — on a fresh cursor (`from = 0`) that was *every* poll (PRST-4030). We chunk
+/// the scan into `<= max_range` windows instead.
+///
+/// The upper bound is the block the `latest` tag resolves to, NOT
+/// `eth_blockNumber`: the proxy's `eth_blockNumber` mirror can lag the
+/// synthetic-log tip (it is advanced by some write paths but not the bridge-out
+/// synthetic-log path), and that lag can grow large when there is no bridge/GER
+/// activity. So we scan the bulk `[from, head]` in numeric windows, then chunk
+/// the trailing `[head + 1, latest]` span by `max_range` as well — a single
+/// unbounded `latest`-tagged request would exceed the proxy cap once the lag
+/// tops `max_range` (PRST-4055). Every window stays `< max_range`.
+async fn discover<P: Provider>(
+    l2: &P,
+    l2_bridge_address: Address,
+    from: u64,
+    max_range: u64,
+) -> anyhow::Result<Vec<PendingExit>> {
+    let head = l2.get_block_number().await?;
+    let mut out = Vec::new();
+
+    // Bulk catch-up: numeric windows up to the (possibly lagging) numeric head.
+    for (w_from, w_to) in scan_windows(from, head, max_range) {
+        let filter = Filter::new()
+            .address(l2_bridge_address)
+            .from_block(w_from)
+            .to_block(w_to)
+            .event_signature(BridgeEvent::SIGNATURE_HASH);
+        let logs = l2.get_logs(&filter).await?;
+        tracing::debug!(
+            from = w_from,
+            to = w_to,
+            raw_logs = logs.len(),
+            "discover: numeric window"
+        );
+        collect_exits(logs, &mut out);
+    }
+
+    // Trailing windows to the true tip, to catch synthetic logs the numeric head
+    // doesn't yet reflect. `tail_from` is `head + 1` after the loop, or `from`
+    // when `from > head` (loop produced no windows). Resolve `latest` to a number
+    // and chunk `[tail_from, latest]` by `max_range` too: `eth_blockNumber` can
+    // lag `latest` by more than the proxy's getLogs cap, so a single unbounded
+    // `latest`-tagged request would be rejected (PRST-4055). Blocks that arrive
+    // after we resolve `latest` are picked up on the next poll.
+    let tail_from = from.max(head.saturating_add(1));
+    let latest = l2
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await?
+        .map(|b| b.header.number)
+        .unwrap_or(head);
+    for (w_from, w_to) in scan_windows(tail_from, latest, max_range) {
+        let filter = Filter::new()
+            .address(l2_bridge_address)
+            .from_block(w_from)
+            .to_block(w_to)
+            .event_signature(BridgeEvent::SIGNATURE_HASH);
+        let logs = l2.get_logs(&filter).await?;
+        tracing::debug!(
+            from = w_from,
+            to = w_to,
+            raw_logs = logs.len(),
+            "discover: tail window"
+        );
+        collect_exits(logs, &mut out);
+    }
+
     Ok(out)
 }
 
@@ -474,7 +563,7 @@ async fn process_exit<P1: Provider, P2: Provider>(
 ) -> anyhow::Result<bool> {
     let src_net = source_bridge_network(cfg.network_id);
 
-    if is_claimed(l1, cfg.bridge_address, exit.leaf_index, src_net).await? {
+    if is_claimed(l1, cfg.l1_bridge_address, exit.leaf_index, src_net).await? {
         tracing::debug!(leaf = exit.leaf_index, "already claimed on L1; skipping");
         return Ok(true);
     }
@@ -499,9 +588,9 @@ async fn process_exit<P1: Provider, P2: Provider>(
 
     let call = build_claim_call(exit, &proof, cfg.network_id);
 
-    let resolved = match simulate(l1, cfg.bridge_address, sponsor, &call).await {
+    let resolved = match simulate(l1, cfg.l1_bridge_address, sponsor, &call).await {
         Readiness::Ready => {
-            let tx = submit(l1, cfg.bridge_address, &call).await?;
+            let tx = submit(l1, cfg.l1_bridge_address, &call).await?;
             tracing::info!(
                 leaf = exit.leaf_index,
                 dest = %exit.destination_address,
@@ -556,8 +645,9 @@ pub async fn run(cfg: ClaimerConfig) -> anyhow::Result<()> {
 
     tracing::info!(
         l2_rpc = %cfg.l2_rpc_url,
-        l1_rpc = %cfg.l1_rpc_url,
-        bridge = %cfg.bridge_address,
+        l1_rpc = %redact_rpc_url(&cfg.l1_rpc_url),
+        l1_bridge = %cfg.l1_bridge_address,
+        l2_bridge = %cfg.l2_bridge_address,
         network_id = cfg.network_id,
         sponsor = %sponsor,
         poll_interval_s = cfg.poll_interval.as_secs(),
@@ -605,9 +695,10 @@ async fn poll_once<P1: Provider, P2: Provider>(
     last_processed: &mut u64,
 ) -> anyhow::Result<()> {
     let from = *last_processed + 1;
-    // Scan to the `latest` tag (see `discover`): the proxy's `eth_blockNumber`
-    // can lag the synthetic-log tip, so a numeric head bound would skip exits.
-    let exits = discover(l2, cfg.bridge_address, from).await?;
+    // Chunked scan (see `discover`): numeric windows up to the head + a final
+    // `latest`-bounded window, each <= cfg.max_range to respect the proxy's
+    // eth_getLogs cap (PRST-4030).
+    let exits = discover(l2, cfg.l2_bridge_address, from, cfg.max_range).await?;
     if !exits.is_empty() {
         tracing::info!(from, count = exits.len(), "discovered L2->L1 exits");
     }
@@ -654,6 +745,83 @@ async fn poll_once<P1: Provider, P2: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── scan_windows: the chunking that must respect the proxy getLogs cap ──
+
+    /// Every numeric window spans strictly less than `max_range` blocks, so each
+    /// `eth_getLogs` stays under the proxy's MAX_GETLOGS_BLOCK_RANGE cap. This is
+    /// the regression guard for PRST-4030 (a single `0 -> latest` query, span
+    /// ~196k, was rejected on every poll).
+    #[test]
+    fn scan_windows_each_under_max_range_and_contiguous() {
+        let from = 0;
+        let head = 196_476; // ~the L2 synthetic head that triggered the bug
+        let max_range = 10_000;
+        let ws = scan_windows(from, head, max_range);
+        assert_eq!(ws.first().unwrap().0, from);
+        assert_eq!(ws.last().unwrap().1, head, "windows must cover up to head");
+        let mut expected_next = from;
+        for (f, t) in &ws {
+            assert_eq!(*f, expected_next, "windows must be contiguous, no gaps");
+            assert!(t >= f);
+            assert!(
+                t - f < max_range,
+                "span {} must be < cap {max_range}",
+                t - f
+            );
+            expected_next = t + 1;
+        }
+    }
+
+    /// `from > head` (cursor at/after the numeric head) yields no numeric
+    /// windows — `discover` then does only the trailing `latest` query.
+    #[test]
+    fn scan_windows_empty_when_from_past_head() {
+        assert!(scan_windows(500, 499, 10_000).is_empty());
+        assert!(scan_windows(1, 0, 10_000).is_empty());
+    }
+
+    /// A span that fits in one window produces exactly one `[from, head]` window.
+    #[test]
+    fn scan_windows_single_small_span() {
+        assert_eq!(scan_windows(100, 600, 10_000), vec![(100, 600)]);
+    }
+
+    /// `max_range = 0` must not divide-by-zero / loop forever; clamps to 1.
+    #[test]
+    fn scan_windows_zero_max_range_is_safe() {
+        let ws = scan_windows(0, 3, 0);
+        assert_eq!(ws, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn redact_rpc_url_strips_apikey_query() {
+        // The exact shape of our leaking L1 endpoint.
+        assert_eq!(
+            redact_rpc_url(
+                "https://rpc.eu-central-1.gateway.fm/v4/ethereum/archival/sepolia?apiKey=SECRET123"
+            ),
+            "https://rpc.eu-central-1.gateway.fm/v4/ethereum/archival/sepolia?<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_rpc_url_strips_all_query_params() {
+        // Robust against any secret param, not just `apiKey`, and multi-param queries.
+        let r = redact_rpc_url("https://h/p?foo=1&apiKey=abc&token=xyz");
+        assert_eq!(r, "https://h/p?<redacted>");
+        assert!(!r.contains("abc"));
+        assert!(!r.contains("xyz"));
+    }
+
+    #[test]
+    fn redact_rpc_url_noop_without_query() {
+        // No query string (e.g. the in-cluster L2 RPC) is left untouched.
+        assert_eq!(
+            redact_rpc_url("http://miden-agglayer:8546"),
+            "http://miden-agglayer:8546"
+        );
+    }
 
     #[test]
     fn global_index_layout_rollup() {
