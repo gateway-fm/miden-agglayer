@@ -251,6 +251,11 @@ ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
 # The bridge + ETH faucet are the proxy's global accounts (shared on the node);
 # the bridge-out WALLET, however, is a fresh INDEPENDENT wallet we provision in
 # the isolated store below (NOT wallet_hardhat).
+# Preserve any caller-supplied hex bridge id BEFORE this internal overwrite
+# (the toml form is bech32, for iso_tool; the verifier needs hex — upgrade
+# scenarios pass it via env because the recreated proxy never logged the
+# bridge deployment).
+CALLER_BRIDGE_ID="${BRIDGE_ID:-}"
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ETH=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
 [[ -n "$BRIDGE_ID" && -n "$FAUCET_ETH" ]] || die "could not parse bridge_accounts.toml"
@@ -649,6 +654,7 @@ if [[ "${VERIFY:-1}" == "1" ]]; then
     # let the verifier resolve one itself.
     VERIFIER_BRIDGE_ID=""
     [[ "${BRIDGE_ID:-}" == 0x* ]] && VERIFIER_BRIDGE_ID="$BRIDGE_ID"
+    [[ "$CALLER_BRIDGE_ID" == 0x* ]] && VERIFIER_BRIDGE_ID="$CALLER_BRIDGE_ID"
     BRIDGE_ID="$VERIFIER_BRIDGE_ID" ALLOW_LATE="${ALLOW_LATE:-1}" "$SCRIPT_DIR/verify-event-completeness.sh" 2>&1 | tee -a "$RESULTS_LOG"
     VERIFY_RC=${PIPESTATUS[0]}
     r "verification exit: $VERIFY_RC"
