@@ -12,7 +12,8 @@
 //!   bridge-autoclaim \
 //!     --l2-rpc-url http://localhost:8546 \
 //!     --l1-rpc-url http://localhost:8545 \
-//!     --bridge-address 0x... \
+//!     --l1-bridge-address 0x... \
+//!     --l2-bridge-address 0x... \
 //!     --bridge-service-url http://localhost:18080 \
 //!     --network-id 1
 //!
@@ -36,10 +37,16 @@ struct Args {
     #[arg(long, env = "L1_RPC_URL")]
     l1_rpc_url: String,
 
-    /// Bridge contract address (L1 claim target + L2 BridgeEvent log filter;
-    /// assumes the canonical CDK shared bridge address).
-    #[arg(long, env = "BRIDGE_ADDRESS")]
-    bridge_address: String,
+    /// L1 bridge contract address — the `claimAsset` / `isClaimed` target on L1.
+    #[arg(long, env = "L1_BRIDGE_ADDRESS")]
+    l1_bridge_address: String,
+
+    /// L2 bridge contract address — the `eth_getLogs` BridgeEvent filter on the
+    /// L2 proxy. On non-deterministic deploys (e.g. the Miden outpost) this
+    /// differs from the L1 address; on a canonical CDK shared-address deploy,
+    /// set both to the same value.
+    #[arg(long, env = "L2_BRIDGE_ADDRESS")]
+    l2_bridge_address: String,
 
     /// Bridge-service base URL (for /merkle-proof).
     #[arg(long, env = "BRIDGE_SERVICE_URL")]
@@ -101,15 +108,24 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let bridge_address = args
-        .bridge_address
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid --bridge-address '{}': {e}", args.bridge_address))?;
+    let l1_bridge_address = args.l1_bridge_address.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid --l1-bridge-address '{}': {e}",
+            args.l1_bridge_address
+        )
+    })?;
+    let l2_bridge_address = args.l2_bridge_address.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid --l2-bridge-address '{}': {e}",
+            args.l2_bridge_address
+        )
+    })?;
 
     let cfg = ClaimerConfig {
         l2_rpc_url: args.l2_rpc_url,
         l1_rpc_url: args.l1_rpc_url,
-        bridge_address,
+        l1_bridge_address,
+        l2_bridge_address,
         bridge_service_url: args.bridge_service_url,
         network_id: args.network_id,
         sponsor_key,
