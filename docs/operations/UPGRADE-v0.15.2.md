@@ -139,6 +139,17 @@ and the proxy data dir together, then follow runbook §recovery R2.
 
 ## 6. Known post-upgrade behaviors (do not alarm)
 
+- **Pre-existing "ready-but-unclaimed" rows in the bridge-service may be
+  cosmetic.** Old-proxy versions could synthesize a ClaimEvent late into an
+  already-indexed block; the bridge-service cursor never sees it, so its API
+  shows the deposit unclaimed forever even though funds were delivered.
+  Before alarming, check on-chain truth: the proxy's `claimed_indices` for
+  the deposit's global index, and the ClaimEvent receipt. (Rehearsal case:
+  deposit "TT6" — delivered pre-upgrade, only the sync row missing.) The
+  upgraded proxy cannot create new instances of this class
+  (write-before-advance). Follow-up: a ready-unclaimed rescan in the
+  bridge-service indexer.
+
 - `note reconciler: import silently dropped consumed notes; attempting direct
   projection recovery` at WARN — this is the workaround for a miden-client
   0.15 defect doing its job (counted in
