@@ -109,6 +109,8 @@ n = sqlite3.connect(db); n.row_factory = sqlite3.Row
 # (later logs may belong to consumptions that happened after the snapshot).
 cut = n.execute("SELECT max(block_num) FROM block_headers").fetchone()[0] or 0
 overall_fail = False
+total_notes = 0
+total_logs = 0
 print(f"consistency cut: node snapshot tip = block {cut}")
 print(f"{'TYPE':<22} {'notes':>6} {'logs':>6} {'exact':>6} {'late':>5} {'missing':>8} {'extra':>6}  verdict")
 print("-" * 78)
@@ -136,6 +138,8 @@ for name, (topic, root) in TOPICS.items():
     missing = unmatched_notes - late
     extra = max(0, n_logs_cut - exact_cut - late)
 
+    total_notes += n_notes
+    total_logs += n_logs_cut
     ok = missing == 0 and extra == 0 and (late == 0 or allow_late == "1")
     overall_fail |= not ok
     if missing > 0:
@@ -149,6 +153,10 @@ for name, (topic, root) in TOPICS.items():
     print(f"{name:<22} {n_notes:>6} {n_logs_cut:>6} {exact:>6} {late:>5} {missing:>8} {extra:>6}  {'PASS' if ok else 'FAIL'}")
 
 print("-" * 78)
+if total_notes == 0 and total_logs > 0:
+    print("SANITY FAIL: node query matched ZERO consumed notes while logs exist —")
+    print(f"almost certainly a wrong/bech32 BRIDGE_ID ({bridge_id}); pass the HEX id.")
+    sys.exit(2)
 print("VERDICT:", "FAIL" if overall_fail else "PASS",
       "(exact = log at the note's consumption block; late = present but later block)")
 sys.exit(1 if overall_fail else 0)

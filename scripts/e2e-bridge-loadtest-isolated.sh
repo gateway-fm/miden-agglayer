@@ -644,7 +644,12 @@ r "======================================================================"
 VERIFY_RC=0
 if [[ "${VERIFY:-1}" == "1" ]]; then
     r "Event-completeness verification (node DB ⇄ eth_getLogs):"
-    ALLOW_LATE="${ALLOW_LATE:-1}" "$SCRIPT_DIR/verify-event-completeness.sh" 2>&1                                               | tee -a "$RESULTS_LOG"
+    # BRIDGE_ID above holds the toml's bech32 form (for iso_tool); the
+    # verifier's node-DB match needs HEX. Forward only a hex id — otherwise
+    # let the verifier resolve one itself.
+    VERIFIER_BRIDGE_ID=""
+    [[ "${BRIDGE_ID:-}" == 0x* ]] && VERIFIER_BRIDGE_ID="$BRIDGE_ID"
+    BRIDGE_ID="$VERIFIER_BRIDGE_ID" ALLOW_LATE="${ALLOW_LATE:-1}" "$SCRIPT_DIR/verify-event-completeness.sh" 2>&1 | tee -a "$RESULTS_LOG"
     VERIFY_RC=${PIPESTATUS[0]}
     r "verification exit: $VERIFY_RC"
 fi
