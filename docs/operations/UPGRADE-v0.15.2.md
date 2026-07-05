@@ -124,3 +124,13 @@ and the proxy data dir together, then follow runbook §recovery R2.
   RD-940 writer worker is enabled).
 - The LET-divergence watchdog fires transiently under load; it must converge
   to 0 when idle — sustained idle gap = page (see monitoring.md).
+- **A one-time burst of `Cantina MA#3` WARNs** ("no recorded consumer" /
+  legacy-emission review), roughly one per pre-upgrade bridge-out. Cause:
+  v0.15.2 stored externally-consumed notes WITHOUT consumer metadata, and the
+  new build's reclaim gate re-reviews already-processed notes during the
+  genesis re-sweep — it can't re-verify who consumed the legacy notes, so it
+  surfaces each for operator review instead of silently accepting. Benign
+  when (a) the count ≈ pre-upgrade bridge-out volume, (b) those exits have
+  settled L1 claims, and (c) the event audit shows `extra=0` (no phantom
+  exits). Rehearsal observed 24/24 matching the seed's bridge-outs. These do
+  NOT emit events and do not recur after the sweep completes.
