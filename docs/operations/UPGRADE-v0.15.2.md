@@ -104,6 +104,30 @@ being claimed within minutes of the swap, no redeploy).
 | Healing re-sweep (per ~1k Miden blocks of history) | a few minutes; scales with history — chunked 200 blocks/tick, non-blocking, normal traffic continues |
 | Full verification | ~10 min |
 
+## 4b. Recommended: enable the writer worker at upgrade time
+
+The large rehearsal surfaced a **pre-existing** (also-in-v0.15.2) race: a
+node hiccup can make aggkit's ethtxmanager emit GER txs out of nonce order;
+the proxy's R4 replay-guard rejects the early nonce and **aggkit's
+ethtxmanager wedges permanently** (observed: no self-recovery in 20 min —
+one rejected nonce and it stops sending). This build ships the fix — the
+future-nonce wait — but it is only active with the writer worker enabled:
+
+```
+AGGLAYER_ENABLE_WRITER_WORKER=true    # + AGGLAYER_WRITER_QUEUE_DEPTH / _TX_TTL defaults
+```
+
+Enable it as part of the upgrade (or immediately after verification). Also
+eliminates the benign nonce-mismatch log churn from autoclaim bursts.
+
+**If the wedge is hit anyway** (writer worker off): symptom is a deposit
+stuck `ready_for_claim=false` while aggkit logs show an R4 nonce rejection
+and no sends since. Remedy, in order of preference: (1) replay aggkit's own
+already-signed raw txs from its logs via `eth_sendRawTransaction` in nonce
+order (safe — identical hashes, no keys involved; rehearsal-verified:
+delivery completed within a minute), or (2) restart the aggkit container
+(restart ≠ redeploy; state is in its DB).
+
 ## 5. Rollback
 
 The upgrade is additive (no destructive schema change), but migrations 008/009
