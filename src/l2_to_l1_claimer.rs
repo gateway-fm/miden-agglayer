@@ -141,6 +141,21 @@ pub fn source_bridge_network(network_id: u32) -> u32 {
     network_id
 }
 
+/// Redact secrets from an RPC URL before logging it.
+///
+/// Our L1 endpoint carries the credential in the query string
+/// (`...sepolia?apiKey=<secret>`). Logging the raw URL leaks it to the SIEM —
+/// and the startup banner does so at INFO, so it leaks by default. Strip the
+/// entire query string (catches `apiKey` and any future secret param), keeping
+/// the scheme/host/path visible for operators. Mirrors the redaction the proxy
+/// applies to `l1_rpc_url` in `Command`'s `Debug` impl (`main.rs`).
+pub fn redact_rpc_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_string(),
+    }
+}
+
 /// Outcome of simulating (or attempting) a claim, used to decide retry vs skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Readiness {
@@ -613,7 +628,7 @@ pub async fn run(cfg: ClaimerConfig) -> anyhow::Result<()> {
 
     tracing::info!(
         l2_rpc = %cfg.l2_rpc_url,
-        l1_rpc = %cfg.l1_rpc_url,
+        l1_rpc = %redact_rpc_url(&cfg.l1_rpc_url),
         l1_bridge = %cfg.l1_bridge_address,
         l2_bridge = %cfg.l2_bridge_address,
         network_id = cfg.network_id,
@@ -760,6 +775,35 @@ mod tests {
     fn scan_windows_zero_max_range_is_safe() {
         let ws = scan_windows(0, 3, 0);
         assert_eq!(ws, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn redact_rpc_url_strips_apikey_query() {
+        // The exact shape of our leaking L1 endpoint.
+        assert_eq!(
+            redact_rpc_url(
+                "https://rpc.eu-central-1.gateway.fm/v4/ethereum/archival/sepolia?apiKey=SECRET123"
+            ),
+            "https://rpc.eu-central-1.gateway.fm/v4/ethereum/archival/sepolia?<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_rpc_url_strips_all_query_params() {
+        // Robust against any secret param, not just `apiKey`, and multi-param queries.
+        let r = redact_rpc_url("https://h/p?foo=1&apiKey=abc&token=xyz");
+        assert_eq!(r, "https://h/p?<redacted>");
+        assert!(!r.contains("abc"));
+        assert!(!r.contains("xyz"));
+    }
+
+    #[test]
+    fn redact_rpc_url_noop_without_query() {
+        // No query string (e.g. the in-cluster L2 RPC) is left untouched.
+        assert_eq!(
+            redact_rpc_url("http://miden-agglayer:8546"),
+            "http://miden-agglayer:8546"
+        );
     }
 
     #[test]
