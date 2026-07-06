@@ -34,6 +34,8 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-security.sh"
         echo ""
+        "$SCRIPT_DIR/e2e-cantina12-getlogs-truncation.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
         echo ""
         # Foreign-bridge claim provenance: deploys a SECOND agglayer deployment
@@ -71,6 +73,9 @@ case "$test_filter" in
     security)
         "$SCRIPT_DIR/e2e-security.sh"
         ;;
+    cantina12-getlogs-truncation)
+        "$SCRIPT_DIR/e2e-cantina12-getlogs-truncation.sh"
+        ;;
     fuzz)
         "$SCRIPT_DIR/e2e-fuzz-bridge.sh"
         ;;
@@ -85,7 +90,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|cantina12-getlogs-truncation|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
         exit 1
         ;;
 esac

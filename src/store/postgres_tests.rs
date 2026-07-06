@@ -873,6 +873,75 @@ async fn test_pgstore_s9_corrupt_envelope_row_surfaces_error() {
     );
 }
 
+/// Cantina finding #12 — `get_logs` must ERROR (not silently return a truncated
+/// prefix) when a block range holds more than `GETLOGS_ROW_CAP` synthetic logs.
+///
+/// Pre-fix the query ran `... LIMIT 1000` and handed back the first 1000 rows with
+/// no signal, so a restore replaying >1000 bridge-outs/GERs let a consumer ingest
+/// `0..999`, skip `1000`, and later reject `1001` — permanently stalling sync.
+///
+/// Post-fix we fetch CAP+1 and, when the range exceeds the cap, return an error
+/// shaped so aggkit/aggsender's `ParseMaxRangeFromError` re-chunks the request.
+/// This test inserts CAP+1 logs into ONE block and asserts:
+///   1. `get_logs` returns `Err` (not an `Ok` 1000-row slice), and
+///   2. the error string matches aggkit's `reMaxRange` regex verbatim.
+#[tokio::test]
+async fn finding_12_getlogs_over_cap_errors_not_truncates() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    // Per-run unique block so these rows are isolated from every other suite
+    // writing synthetic_logs into the shared database.
+    let block = 3_000_000 + (rand_u64() % 1_000_000);
+    let run = rand_u64();
+
+    // Insert exactly CAP+1 logs into the single block `block`. `add_log`
+    // assigns its own atomic `log_index`, so these are CAP+1 distinct rows.
+    for i in 0..=crate::store::GETLOGS_ROW_CAP {
+        store
+            .add_log(dummy_log(block, &format!("0xf12_{run}_{i}")))
+            .await
+            .expect("add_log must succeed");
+    }
+
+    let filter = LogFilter {
+        from_block: Some(format!("0x{block:x}")),
+        to_block: Some(format!("0x{block:x}")),
+        address: None,
+        topics: None,
+        block_hash: None,
+    };
+
+    let err = store
+        .get_logs(&filter, block)
+        .await
+        .expect_err("get_logs over the row cap MUST error, not return a silent 1000-row slice");
+    let msg = format!("{err}");
+
+    // Contract 1: it did not silently truncate — it errored with the row-cap signal.
+    assert!(
+        msg.contains("returned more than") && msg.contains("logs"),
+        "error must explain the row-cap breach, got: {msg}"
+    );
+
+    // Contract 2: the message matches aggkit's `reMaxRange` parser verbatim so the
+    // consumer's reactive block-range chunking fires (copied from
+    // aggkit/common/errors.go:12). Do NOT relax this regex here.
+    let re_max_range = regex::Regex::new(r"block range too large, max range:\s*(\d+)").unwrap();
+    let caps = re_max_range
+        .captures(&msg)
+        .unwrap_or_else(|| panic!("row-cap error not parseable by aggkit reMaxRange: {msg}"));
+    let suggested: u64 = caps[1].parse().unwrap();
+    // Single-block query: span==1, suggested==max(1/2,1)==1. The client can't
+    // shrink a single block further by range, but PR #94's 1:1 projection means
+    // no real single block ever approaches the cap — this is the synthetic worst case.
+    assert!(
+        suggested >= 1,
+        "suggested range must be a positive block count"
+    );
+}
+
 /// Cheap, dependency-free PRNG seed source — `std::time` is enough to
 /// produce a per-run unique 8-byte prefix for the test fixtures above.
 fn rand_u64() -> u64 {

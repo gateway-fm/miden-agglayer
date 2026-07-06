@@ -297,16 +297,26 @@ impl Store for PgStore {
         let from = filter.from_block_number(current_block) as i64;
         let to = filter.to_block_number(current_block) as i64;
 
+        // Cantina #12: fetch CAP+1 so we can DETECT (not silently truncate) a range
+        // that exceeds the row cap. If we get more than the cap back, the range is
+        // too dense — return an error the client can react to, never a lossy prefix.
         let rows = client
             .query(
-                "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
-                 FROM synthetic_logs
-                 WHERE block_number >= $1 AND block_number <= $2
-                 ORDER BY block_number, log_index
-                 LIMIT 1000",
+                &format!(
+                    "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
+                     FROM synthetic_logs
+                     WHERE block_number >= $1 AND block_number <= $2
+                     ORDER BY block_number, log_index
+                     LIMIT {}",
+                    crate::store::GETLOGS_ROW_CAP + 1
+                ),
                 &[&from, &to],
             )
             .await?;
+
+        if rows.len() > crate::store::GETLOGS_ROW_CAP {
+            return Err(crate::store::getlogs_row_cap_error(from as u64, to as u64));
+        }
 
         let logs: Vec<SyntheticLog> = rows
             .iter()
