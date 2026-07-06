@@ -82,7 +82,7 @@ const RECONCILE_CHUNK: u64 = 200;
 /// retroactive-heal sweep freezes. Safe to skip: bridge exits (B2AGG) are
 /// PUBLIC notes, so a private note is never a real exit. Matched on the
 /// rendered error text (the client surfaces this opaquely by the time it
-/// reaches us — same approach as `sqlite_pragmas::is_store_locked`, RD-1112).
+/// reaches us — matching on rendered text is the most reliable signal here).
 fn is_private_note_import_error<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
     format!("{e}").to_lowercase().contains("is private")
 }
