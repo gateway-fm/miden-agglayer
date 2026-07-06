@@ -257,6 +257,27 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    // === Note-reconciler sweep cursor (restart must not re-sweep from genesis) ===
+    /// Last Miden block fully swept by the note-visibility reconciler
+    /// (`SyntheticProjector::reconcile_notes`). Returns 0 if the reconciler has
+    /// never persisted a cursor on this deployment — the very first boot then
+    /// sweeps from genesis, which is the designed first-boot heal. Before this
+    /// cursor was persisted it was memory-only, so EVERY container restart
+    /// re-walked the sweep from genesis (~3h of resync + node load on prod
+    /// history per restart).
+    async fn get_reconcile_cursor(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    /// Persist the last reconciler-swept Miden block. Written write-behind
+    /// AFTER a sweep window completes, so the durable cursor never runs ahead
+    /// of work actually done (a crash mid-window redoes that window — safe,
+    /// the sweep is idempotent). Recovery flows (`--restore`,
+    /// `--reset-miden-store`) and the `--resweep-from-genesis` escape hatch
+    /// reset this to 0 so the full-history heal sweep runs again.
+    async fn set_reconcile_cursor(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // === Receipts map (synthetic-indexer redesign, Phase 2b substrate) ===
     //
     // See the "Receipts — the submit ⟂ project handoff" section of

@@ -1,0 +1,24 @@
+-- ============================================================================
+-- Note-reconciler sweep cursor — persist across restarts
+-- ============================================================================
+--
+-- The note-visibility reconciler (`SyntheticProjector::reconcile_notes`,
+-- src/synthetic_projector.rs) walks the Miden chain in RECONCILE_CHUNK-block
+-- windows via `sync_notes` and imports externally-created network notes that
+-- tag/interest-based `sync_state` never delivers. Its sweep cursor was
+-- memory-only (an AtomicU64 hardcoded to 0 at boot), so EVERY container
+-- restart — image update, crash, plain restart — re-walked the sweep from
+-- genesis. On prod history that was ~3h of resync and node load per restart.
+--
+-- This migration gives the sweep cursor the same durable substrate the
+-- projection cursor already has (migration 009 `projector_cursor`): a column
+-- on the existing single-row `service_state` table. Defaults to 0 — a fresh
+-- deployment (and the existing row, backfilled by the column DEFAULT) sweeps
+-- from genesis exactly once, which is the designed first-boot heal.
+--
+-- The reconciler persists the cursor write-behind AFTER each window completes,
+-- so the durable value never runs ahead of work actually done. Recovery flows
+-- (`--restore`, `--reset-miden-store`) and the `--resweep-from-genesis`
+-- escape hatch reset it to 0 to deliberately re-run the full-history sweep.
+ALTER TABLE service_state
+    ADD COLUMN IF NOT EXISTS reconcile_cursor BIGINT NOT NULL DEFAULT 0;

@@ -64,6 +64,19 @@ struct Command {
     #[arg(long)]
     unlock_miden_accounts: bool,
 
+    /// Escape hatch: reset the persisted note-reconciler sweep cursor to 0 at
+    /// boot so the reconciler re-walks the ENTIRE Miden history looking for
+    /// externally-created network notes that sync missed. Use for deliberate
+    /// full-history audits (e.g. after a proxy/node upgrade that may have
+    /// changed note visibility). Idempotent per boot but expensive: on a long
+    /// chain the sweep takes hours and loads the node — remove the flag after
+    /// the audit boot. Normal restarts resume from the persisted cursor and
+    /// do NOT need this. (`--restore` / `--reset-miden-store` already reset
+    /// the cursor themselves — the wiped miden store makes the genesis
+    /// re-sweep the healing pass.)
+    #[arg(long, env = "RESWEEP_FROM_GENESIS")]
+    resweep_from_genesis: bool,
+
     /// L1 bridge contract address used for synthetic log emission
     #[arg(
         long,
@@ -271,6 +284,7 @@ impl std::fmt::Debug for Command {
             .field("restore", &self.restore)
             .field("reset_miden_store", &self.reset_miden_store)
             .field("unlock_miden_accounts", &self.unlock_miden_accounts)
+            .field("resweep_from_genesis", &self.resweep_from_genesis)
             .field("bridge_address", &self.bridge_address)
             .field(
                 "l1_rpc_url",
@@ -467,6 +481,28 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(InMemoryStore::new())
     };
+
+    // Reset the persisted note-reconciler sweep cursor BEFORE the
+    // SyntheticProjector is constructed (it loads the cursor in `new()`):
+    //   * `--reset-miden-store` wiped the miden-client sqlite above — the
+    //     client has forgotten every imported note, so the genesis re-sweep
+    //     IS the healing pass and must not be skipped by a stale cursor.
+    //     (`--restore` resets it too, inside `restore()` Phase 4, and then
+    //     exits — the next boot picks up the 0.)
+    //   * `--resweep-from-genesis` is the operator escape hatch for
+    //     deliberate full-history audits (e.g. after upgrades).
+    if command.reset_miden_store || command.resweep_from_genesis {
+        let reason = if command.reset_miden_store {
+            "--reset-miden-store (miden store wiped; genesis sweep is the healing pass)"
+        } else {
+            "--resweep-from-genesis (operator-requested full-history audit)"
+        };
+        store.set_reconcile_cursor(0).await?;
+        tracing::warn!(
+            reason,
+            "reconcile cursor reset — full-history re-sweep will run"
+        );
+    }
 
     // Phase 3: Load config and create full client
     let block_state = Arc::new(BlockState::new());
@@ -950,6 +986,7 @@ mod hardening_tests {
             restore: false,
             reset_miden_store: false,
             unlock_miden_accounts: false,
+            resweep_from_genesis: false,
             bridge_address: miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS
                 .to_string(),
             l1_rpc_url: None,

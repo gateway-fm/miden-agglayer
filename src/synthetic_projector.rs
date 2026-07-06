@@ -123,9 +123,20 @@ pub struct SyntheticProjector {
     /// unknown notes so consumption is re-discovered and projected. `None`
     /// disables reconciliation (unit tests).
     node_rpc: Option<Arc<dyn NodeRpcClient>>,
-    /// Last Miden block swept by the reconciler. In-memory only: a restart
-    /// re-sweeps from genesis, which is idempotent (known ids are skipped) and
-    /// doubles as gap-healing for pre-fix history.
+    /// Last Miden block swept by the reconciler — an in-memory cache of the
+    /// persisted `Store::get_reconcile_cursor` (migration 010), mirroring the
+    /// projection `cursor` above. Loaded in `new()` and persisted write-behind
+    /// AFTER each sweep window completes, so the durable cursor never runs
+    /// ahead of work actually done (a crash mid-window redoes that window —
+    /// safe, the sweep is idempotent: known ids are skipped).
+    ///
+    /// History: this used to be memory-only (hardcoded to 0 at boot), so EVERY
+    /// container restart re-walked the sweep from genesis — ~3h of resync and
+    /// node load per restart on prod history. The very first boot (no
+    /// persisted value → 0) still sweeps from genesis: that is the designed
+    /// first-boot heal. Recovery flows (`--restore`, `--reset-miden-store`)
+    /// and the `--resweep-from-genesis` escape hatch reset the persisted
+    /// value to 0 deliberately.
     reconcile_cursor: AtomicU64,
     /// Note ids already projected (or attempted) by the late-consumption sweep,
     /// so the per-tick sweep doesn't re-issue `is_note_processed` store queries
@@ -183,6 +194,18 @@ impl SyntheticProjector {
             .map(|a| a.0)
             .unwrap_or(accounts.service.0);
         let start_cursor = store.get_projector_cursor().await?;
+        // Same pattern for the reconciler's sweep cursor (migration 010): a
+        // restart resumes the sweep after the last persisted window instead of
+        // re-walking from genesis (prod: ~3h resync per restart pre-fix). 0
+        // (fresh deployment or a recovery-flow reset) means the full-history
+        // heal sweep runs — grep target for the e2e restart regression check
+        // (scripts/e2e-reconciler-cursor-persistence.sh).
+        let start_reconcile = store.get_reconcile_cursor().await?;
+        tracing::info!(
+            reconcile_cursor = start_reconcile,
+            "note reconciler: sweep cursor loaded — next sweep window starts at block {}",
+            start_reconcile + 1
+        );
         Ok(Self {
             store,
             block_state,
@@ -192,10 +215,23 @@ impl SyntheticProjector {
             l1_rpc_url,
             cursor: AtomicU64::new(start_cursor),
             node_rpc,
-            reconcile_cursor: AtomicU64::new(0),
+            reconcile_cursor: AtomicU64::new(start_reconcile),
             swept: std::sync::Mutex::new(HashSet::new()),
             direct_recovered: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// The next sweep window `[from, to]` the note-visibility reconciler will
+    /// walk, or `None` when the sweep has caught up to `tip`. Factored out of
+    /// [`Self::reconcile_notes`] so the restart-resume contract is directly
+    /// unit-testable: `from` is `reconcile_cursor + 1` — persisted-cursor + 1
+    /// after a restart, NOT 1.
+    fn next_reconcile_window(&self, tip: u64) -> Option<(u64, u64)> {
+        let from = self.reconcile_cursor.load(Ordering::Acquire) + 1;
+        if from > tip {
+            return None;
+        }
+        Some((from, (from + RECONCILE_CHUNK - 1).min(tip)))
     }
 
     /// Note-visibility reconciler (completeness guarantee for externally-created
@@ -211,11 +247,9 @@ impl SyntheticProjector {
         rpc: &dyn NodeRpcClient,
         tip: u64,
     ) -> anyhow::Result<()> {
-        let from = self.reconcile_cursor.load(Ordering::Acquire) + 1;
-        if from > tip {
+        let Some((from, to)) = self.next_reconcile_window(tip) else {
             return Ok(());
-        }
-        let to = (from + RECONCILE_CHUNK - 1).min(tip);
+        };
         let tags: BTreeSet<NoteTag> = BTreeSet::from([NoteTag::from(0u32)]);
         let blocks = rpc
             .sync_notes((from as u32).into(), (to as u32).into(), &tags)
@@ -342,7 +376,16 @@ impl SyntheticProjector {
                 }
             }
         }
+        // Persist write-behind AFTER the window's work completed, and BEFORE
+        // updating the in-memory cache (same ordering guarantee as the
+        // projection cursor in `tick`): the durable cursor never runs ahead of
+        // work actually done. A crash between the work and this store redoes
+        // the window next boot — safe, the sweep is idempotent. A persist
+        // failure fails this tick (warn + retry in `tick`), leaving the
+        // in-memory cursor un-advanced so the window is re-swept.
+        self.store.set_reconcile_cursor(to).await?;
         self.reconcile_cursor.store(to, Ordering::Release);
+        metrics::gauge!("synthetic_reconciler_cursor").set(to as f64);
         Ok(())
     }
 
@@ -1149,6 +1192,44 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Regression lock for the prod restart-resync incident: the reconciler's
+    /// sweep cursor was a memory-only AtomicU64 hardcoded to 0 at boot, so
+    /// EVERY container restart (image update, crash, plain restart) re-walked
+    /// the sweep from genesis — ~3h of resync + node load per restart on prod
+    /// history. The cursor is now persisted (`Store::{get,set}_reconcile_cursor`,
+    /// migration 010) and loaded in `SyntheticProjector::new` exactly like the
+    /// projection cursor: a re-constructed projector must start its next
+    /// sweep window at persisted+1, NOT at 1.
+    #[tokio::test]
+    async fn restart_resumes_reconcile_sweep_from_persisted_cursor() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+
+        // First boot: nothing persisted → the sweep starts from genesis
+        // (block 1). This is the designed first-boot heal and must not change.
+        let projector = test_projector(&store, &block_state).await;
+        assert_eq!(
+            projector.next_reconcile_window(10_000),
+            Some((1, RECONCILE_CHUNK)),
+            "first boot (no persisted cursor) must sweep from genesis"
+        );
+
+        // Advance the sweep cursor via the persistence API — the same store
+        // write `reconcile_notes` performs after a window completes.
+        store.set_reconcile_cursor(4_200).await.unwrap();
+        drop(projector);
+
+        // "Container restart": re-construct the projector over the SAME store.
+        let projector = test_projector(&store, &block_state).await;
+        assert_eq!(
+            projector.next_reconcile_window(10_000),
+            Some((4_201, 4_200 + RECONCILE_CHUNK)),
+            "restart must resume the sweep at persisted+1, not re-walk from genesis"
+        );
+        // Caught-up case: no window when the persisted cursor is at the tip.
+        assert_eq!(projector.next_reconcile_window(4_200), None);
     }
 
     async fn register_faucet(store: &StdArc<dyn Store>) {

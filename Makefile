@@ -293,6 +293,10 @@ e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
 e2e-rd913-restart-burn-collision: e2e-up ## Spin up stack + verify monitor state survives proxy restart (RD-913)
 	$(COMPOSE_ENV) ./scripts/e2e-rd913-restart-burn-collision.sh
 
+.PHONY: e2e-reconciler-cursor-persistence
+e2e-reconciler-cursor-persistence: e2e-up ## Spin up stack + verify the reconciler sweep cursor survives proxy restart (no genesis re-sweep)
+	$(COMPOSE_ENV) ./scripts/e2e-reconciler-cursor-persistence.sh
+
 # --- RD-940 e2e -----------------------------------------------------------
 # All RD-940 e2e scripts require the writer worker active. The `e2e-rd940-up`
 # helper sets AGGLAYER_ENABLE_WRITER_WORKER=true before bringing up the stack.

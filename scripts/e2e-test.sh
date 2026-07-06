@@ -36,8 +36,15 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
         echo ""
-        # Last: it stops/restarts the proxy (reset-miden-store + restore), so
-        # it must not race the other scripts' steady-state assumptions.
+        # Proxy-restarting tests run LAST (they must not race the other
+        # scripts' steady-state assumptions), in this order: the cursor test
+        # does a plain restart and asserts the sweep RESUMES from the
+        # persisted cursor; the private-note test then ends with
+        # reset-miden-store + restore, which deliberately RESETS that cursor
+        # for a full re-sweep — so it must come after, or the cursor
+        # assertion races the restore's intentional genesis walk.
+        "$SCRIPT_DIR/e2e-reconciler-cursor-persistence.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
         ;;
     tip-consistency)
@@ -64,9 +71,12 @@ case "$test_filter" in
     reconciler-private-note)
         "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
         ;;
+    reconciler-cursor)
+        "$SCRIPT_DIR/e2e-reconciler-cursor-persistence.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz|reconciler-private-note]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz|reconciler-private-note|reconciler-cursor]" >&2
         exit 1
         ;;
 esac

@@ -297,14 +297,9 @@ pub async fn restore(
     total_logs += ger_logs;
     tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
 
-    // Phase 4: Miden-1:1 — the synthetic tip == the Miden tip, and the projector
-    // cursor is set to the Miden tip so the live projector resumes from there
-    // rather than re-scanning the blocks restore just replayed (idempotent dedup
-    // would skip them anyway). The restored events already sit at their own
-    // Miden blocks.
-    store.set_latest_block_number(miden_tip).await?;
-    store.set_projector_cursor(miden_tip).await?;
-    tracing::info!("Phase 4: synthetic tip + projector cursor set to Miden tip {miden_tip}");
+    // Phase 4: cursor finalization (factored into a helper so the reconcile-
+    // cursor reset is unit-testable — see `finalize_restore_cursors`).
+    finalize_restore_cursors(store, miden_tip).await?;
 
     // Phase 5: Verify
     tracing::info!("Phase 5: verification");
@@ -318,6 +313,34 @@ pub async fn restore(
         gers_restored: gers,
         logs_created: total_logs,
     })
+}
+
+/// Phase 4 of [`restore`]: finalize the persisted cursors.
+///
+/// Miden-1:1 — the synthetic tip == the Miden tip, and the projector cursor is
+/// set to the Miden tip so the live projector resumes from there rather than
+/// re-scanning the blocks restore just replayed (idempotent dedup would skip
+/// them anyway). The restored events already sit at their own Miden blocks.
+///
+/// The note-reconciler sweep cursor is the OPPOSITE: it is reset to 0. Restore
+/// runs against a wiped/rebuilt miden store (`--reset-miden-store --restore` is
+/// the canonical recovery invocation), so the client has forgotten every
+/// imported note — the genesis re-sweep IS the healing pass that re-discovers
+/// externally-created network notes, and it must not be skipped by a stale
+/// persisted cursor.
+pub(crate) async fn finalize_restore_cursors(
+    store: &Arc<dyn Store>,
+    miden_tip: u64,
+) -> anyhow::Result<()> {
+    store.set_latest_block_number(miden_tip).await?;
+    store.set_projector_cursor(miden_tip).await?;
+    tracing::info!("Phase 4: synthetic tip + projector cursor set to Miden tip {miden_tip}");
+    store.set_reconcile_cursor(0).await?;
+    tracing::info!(
+        "reconcile cursor reset — full-history re-sweep will run (restore rebuilds the miden \
+         store; the genesis sweep is the healing pass that re-discovers external notes)"
+    );
+    Ok(())
 }
 
 /// Phase 1: sync miden and return the current MIDEN tip (sync height) — the
@@ -1657,6 +1680,37 @@ mod tests {
     // a reclaim branch (consumer == sender, asset stays on Miden) and a bridge
     // branch (consumer == bridge, asset leaves). Rebuilding a BridgeEvent for a
     // reclaim hands the user a claimable withdrawal for value that never left.
+
+    /// Regression lock for the prod restart-resync incident: a restore run
+    /// rebuilds the miden store, so the client has forgotten every imported
+    /// note — the genesis re-sweep IS the healing pass. `restore`'s Phase 4
+    /// (`finalize_restore_cursors`) must therefore reset the persisted
+    /// note-reconciler sweep cursor to 0, even when a previous deployment
+    /// left it deep in history — while the projector cursor jumps to the tip.
+    #[tokio::test]
+    async fn restore_resets_reconcile_cursor_to_genesis() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+
+        // Simulate a long-running pre-restore deployment: both cursors deep
+        // into history.
+        store.set_reconcile_cursor(123_456).await.unwrap();
+        store.set_projector_cursor(100_000).await.unwrap();
+
+        // Phase 4 of restore() — the exact code path the real restore runs.
+        finalize_restore_cursors(&store, 130_000).await.unwrap();
+
+        assert_eq!(
+            store.get_reconcile_cursor().await.unwrap(),
+            0,
+            "restore must reset the reconcile cursor to genesis (full-history heal sweep)"
+        );
+        assert_eq!(
+            store.get_projector_cursor().await.unwrap(),
+            130_000,
+            "projector cursor resumes at the Miden tip (restore already replayed history)"
+        );
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 130_000);
+    }
 
     /// `(faucet_id, bridge_id, sender_id)` — valid protocol-0.15 ids. The faucet
     /// is a real fungible-faucet id (reused from the store tests) so

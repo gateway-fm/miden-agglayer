@@ -82,6 +82,12 @@ pub struct InMemoryStore {
     // Store::get_projector_cursor / docs/SYNTHETIC-INDEXER-REDESIGN.md.
     projector_cursor: RwLock<u64>,
 
+    // Note-reconciler sweep cursor — last Miden block fully swept by the
+    // note-visibility reconciler. Field-backed mirror of the PgStore
+    // `service_state.reconcile_cursor` column (migration 010). See
+    // Store::get_reconcile_cursor.
+    reconcile_cursor: RwLock<u64>,
+
     // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
     // first-write-wins evm_tx_hash -> note_commitment, with the reverse index
     // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
@@ -125,6 +131,7 @@ impl InMemoryStore {
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
             projector_cursor: RwLock::new(0),
+            reconcile_cursor: RwLock::new(0),
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
         }
@@ -164,6 +171,17 @@ impl Store for InMemoryStore {
 
     async fn set_projector_cursor(&self, block: u64) -> anyhow::Result<()> {
         *self.projector_cursor.write() = block;
+        Ok(())
+    }
+
+    // ── Note-reconciler sweep cursor ─────────────────────────────
+
+    async fn get_reconcile_cursor(&self) -> anyhow::Result<u64> {
+        Ok(*self.reconcile_cursor.read())
+    }
+
+    async fn set_reconcile_cursor(&self, block: u64) -> anyhow::Result<()> {
+        *self.reconcile_cursor.write() = block;
         Ok(())
     }
 
@@ -900,6 +918,28 @@ mod tests {
         // not enforce it — it just persists whatever the single owner writes).
         store.set_projector_cursor(42).await.unwrap();
         assert_eq!(store.get_projector_cursor().await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_cursor_round_trip() {
+        // Note-reconciler sweep cursor persistence (prod incident: the cursor
+        // was memory-only, so every container restart re-swept from genesis —
+        // ~3h of resync on prod history). Defaults to 0 on a fresh store (the
+        // designed first-boot heal sweep) and round-trips through set/get,
+        // including the reset-to-0 the recovery flows perform.
+        let store = InMemoryStore::new();
+        assert_eq!(
+            store.get_reconcile_cursor().await.unwrap(),
+            0,
+            "fresh store reconcile cursor must default to 0 (first-boot heal)"
+        );
+        store.set_reconcile_cursor(200).await.unwrap();
+        assert_eq!(store.get_reconcile_cursor().await.unwrap(), 200);
+        store.set_reconcile_cursor(400).await.unwrap();
+        assert_eq!(store.get_reconcile_cursor().await.unwrap(), 400);
+        // Reset-to-genesis (restore / --reset-miden-store / --resweep-from-genesis).
+        store.set_reconcile_cursor(0).await.unwrap();
+        assert_eq!(store.get_reconcile_cursor().await.unwrap(), 0);
     }
 
     #[tokio::test]

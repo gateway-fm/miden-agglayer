@@ -83,6 +83,33 @@ async fn test_pgstore_block_number() {
     assert_eq!(store.get_latest_block_number().await.unwrap(), 43);
 }
 
+// ── Note-reconciler sweep cursor (migration 010) ─────────────
+
+#[tokio::test]
+async fn test_pgstore_reconcile_cursor_round_trip() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    // Round-trip through the service_state.reconcile_cursor column, including
+    // the reset-to-0 the recovery flows (--restore / --reset-miden-store /
+    // --resweep-from-genesis) perform. Prod incident: the cursor was
+    // memory-only, so every container restart re-swept from genesis (~3h of
+    // resync on prod history).
+    store.set_reconcile_cursor(0).await.unwrap();
+    assert_eq!(store.get_reconcile_cursor().await.unwrap(), 0);
+
+    store.set_reconcile_cursor(200).await.unwrap();
+    assert_eq!(store.get_reconcile_cursor().await.unwrap(), 200);
+
+    store.set_reconcile_cursor(123_456).await.unwrap();
+    assert_eq!(store.get_reconcile_cursor().await.unwrap(), 123_456);
+
+    // Reset-to-genesis must persist too (recovery flows depend on it).
+    store.set_reconcile_cursor(0).await.unwrap();
+    assert_eq!(store.get_reconcile_cursor().await.unwrap(), 0);
+}
+
 // ── Logs ─────────────────────────────────────────────────────
 
 #[tokio::test]
