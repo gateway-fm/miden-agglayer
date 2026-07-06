@@ -35,6 +35,10 @@ case "$test_filter" in
         "$SCRIPT_DIR/e2e-security.sh"
         echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
+        echo ""
+        # Last: it stops/restarts the proxy (reset-miden-store + restore), so
+        # it must not race the other scripts' steady-state assumptions.
+        "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
@@ -57,9 +61,12 @@ case "$test_filter" in
     fuzz)
         "$SCRIPT_DIR/e2e-fuzz-bridge.sh"
         ;;
+    reconciler-private-note)
+        "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|fuzz|reconciler-private-note]" >&2
         exit 1
         ;;
 esac

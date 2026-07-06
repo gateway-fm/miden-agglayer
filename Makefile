@@ -273,6 +273,10 @@ e2e-l2-to-l1-autoclaim: ensure-sponsor-key e2e-l1-to-l2 ## Spin up stack + L1→
 e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test
 	$(COMPOSE_ENV) ./scripts/e2e-restore.sh
 
+.PHONY: e2e-reconciler-private-note
+e2e-reconciler-private-note: e2e-up ## Spin up stack + reconciler private-note wedge regression (0.15.5 hotfix, PR #110)
+	$(COMPOSE_ENV) ./scripts/e2e-reconciler-private-note.sh
+
 .PHONY: e2e-ger-decomposition
 e2e-ger-decomposition: e2e-up ## Spin up stack + run GER decomposition bug regression test
 	$(COMPOSE_ENV) ./scripts/e2e-ger-decomposition.sh

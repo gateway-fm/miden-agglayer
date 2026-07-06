@@ -95,6 +95,18 @@ struct Args {
     #[arg(long)]
     print_script_roots: bool,
 
+    /// Injection mode for the reconciler private-note e2e (0.15.5 hotfix):
+    /// create + submit a PRIVATE P2ID note from the isolated wallet to itself
+    /// (zero assets) with the DEFAULT note tag (0) — the same tag-0 family the
+    /// proxy's note-visibility reconciler sweeps via `sync_notes(tags={0})`.
+    /// Only the note id + metadata land on-chain (the details stay private),
+    /// so the reconciler's `import_notes(NoteFile::NoteId)` fails with
+    /// "Incomplete imported note is private" — pre-hotfix that wedged the whole
+    /// sweep window forever. Prints the note id + commit block and exits.
+    /// Requires --wallet-id.
+    #[arg(long)]
+    send_private_note: bool,
+
     /// After submitting the B2AGG, wait until the note is actually CONSUMED
     /// on-chain (polling sync), up to this many seconds. 0 disables the wait
     /// (legacy behaviour: 5 blind sync cycles). Load tests MUST wait: pacing on
@@ -124,6 +136,7 @@ impl std::fmt::Debug for Args {
                 &self.miden_prover_url.as_ref().map(|_| "[REDACTED]"),
             )
             .field("miden_prover_timeout_secs", &self.miden_prover_timeout_secs)
+            .field("send_private_note", &self.send_private_note)
             .finish()
     }
 }
@@ -254,6 +267,107 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("[create-wallet] wallet-id: {}", wallet.id().to_hex());
         println!("[create-wallet] done");
+        return Ok(());
+    }
+
+    // ── Private-note injection mode ───────────────────────────────────────────
+    // Reconciler private-note e2e (0.15.5 hotfix): submit a PRIVATE, tag-0,
+    // zero-asset P2ID note to the wallet itself. Its id lands on-chain in the
+    // tag-0 family the reconciler sweeps, but the details are never published,
+    // so the reconciler's import-by-id can never succeed — the exact prod shape
+    // that wedged the retroactive-heal sweep pre-hotfix.
+    if args.send_private_note {
+        use miden_client::crypto::FeltRng;
+        use miden_client::note::Note;
+        use miden_protocol::note::{NoteType, PartialNoteMetadata};
+        use miden_standards::note::P2idNoteStorage;
+
+        let wallet_id = parse_account_id(
+            args.wallet_id
+                .as_deref()
+                .context("--wallet-id is required with --send-private-note")?,
+        )
+        .context("wallet-id")?;
+        println!("[private-note] wallet: {wallet_id}");
+
+        println!("[private-note] syncing state...");
+        client
+            .sync_state()
+            .await
+            .map_err(|e| anyhow!("sync failed: {e}"))?;
+
+        // P2ID recipient targeting the wallet itself; PRIVATE note type; note
+        // tag left at the default (0) so `sync_notes(tags={0})` lists it — the
+        // same default tag B2AGG bridge-out notes carry (PartialNoteMetadata
+        // defaults the tag; B2AggNote::create never overrides it).
+        let serial_num = client.rng().draw_word();
+        let recipient = P2idNoteStorage::new(wallet_id).into_recipient(serial_num);
+        let metadata = PartialNoteMetadata::new(wallet_id, NoteType::Private);
+        let note = Note::new(
+            NoteAssets::new(vec![]).map_err(|e| anyhow!("note assets: {e}"))?,
+            metadata,
+            recipient,
+        );
+        let note_id = note.id();
+        let tag: u32 = note.metadata().tag().into();
+        println!("[private-note] note created: {note_id} (tag {tag}, type Private)");
+
+        let tx_request = TransactionRequestBuilder::new()
+            .own_output_notes(vec![note])
+            .build()
+            .map_err(|e| anyhow!("tx request build failed: {e}"))?;
+
+        // Bounded submit retry — same prover-backpressure rationale as the
+        // bridge-out path below.
+        const ATTEMPTS: u32 = 4;
+        let mut tx_id = None;
+        for attempt in 1..=ATTEMPTS {
+            println!("[private-note] submitting transaction (attempt {attempt}/{ATTEMPTS})...");
+            match client
+                .submit_new_transaction(wallet_id, tx_request.clone())
+                .await
+            {
+                Ok(id) => {
+                    tx_id = Some(id);
+                    break;
+                }
+                Err(e) if attempt < ATTEMPTS => {
+                    eprintln!(
+                        "[private-note] submit attempt {attempt} failed: {e}; retrying in 10s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+                Err(e) => return Err(anyhow!("submit failed after {ATTEMPTS} attempts: {e}")),
+            }
+        }
+        let tx_id = tx_id.expect("loop either sets tx_id or returns");
+        println!("[private-note] transaction submitted: {tx_id}");
+
+        // Wait until the note is COMMITTED on-chain and report its block.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut commit_block: Option<u32> = None;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            client.sync_state().await.ok();
+            let recs = client
+                .get_output_notes(miden_client::store::NoteFilter::Committed)
+                .await
+                .unwrap_or_default();
+            if let Some(rec) = recs.iter().find(|r| r.id() == note_id) {
+                commit_block = rec
+                    .inclusion_proof()
+                    .map(|p| p.location().block_num().as_u32());
+                break;
+            }
+        }
+        let commit_block =
+            commit_block.ok_or_else(|| anyhow!("private note {note_id} not committed in 180s"))?;
+
+        // Stable, machine-parseable output — the e2e script greps these.
+        println!("[private-note] note-id: {note_id}");
+        println!("[private-note] tag: {tag}");
+        println!("[private-note] commit-block: {commit_block}");
+        println!("[private-note] done");
         return Ok(());
     }
 
