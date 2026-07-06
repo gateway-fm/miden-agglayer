@@ -88,7 +88,7 @@ wait_for() {
     log "Waiting: $desc (timeout: ${timeout}s)..."
     # pipefail dropped inside the probe: `docker logs | grep -q` otherwise trips
     # on grep's early-exit SIGPIPE (see e2e-dynamic-erc20.sh for the full story).
-    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
+    while ! ( set +o pipefail; bash -c "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
         echo -n "."
