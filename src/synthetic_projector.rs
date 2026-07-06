@@ -1819,6 +1819,95 @@ mod tests {
         );
     }
 
+    /// Cantina #19 regression lock — the OLD `BridgeOutScanner` advanced
+    /// `latest_block_number` once PER consumed B2AGG note inside its loop
+    /// (`block = get_latest_block_number()+1; process; set_latest_block_number`),
+    /// so a single Miden tx carrying many B2AGG notes pushed later notes hundreds
+    /// or thousands of synthetic blocks into the future, shadowing legitimate
+    /// events. The redesign made the `SyntheticProjector` the SOLE tip-advancer
+    /// using Miden-1:1 (synthetic block N == Miden block N).
+    ///
+    /// This test fabricates:
+    ///   * FOUR distinct B2AGG notes all consumed at the SAME Miden block (100),
+    ///     and asserts every one lands at synthetic block 100 (NOT 1,2,3,4) with
+    ///     the tip advancing to exactly 100 (NOT 4); then
+    ///   * three more B2AGG notes at a FAR-LATER Miden block (250), asserting they
+    ///     land at 250 (NOT 5,6,7 — the per-note counter would ignore the height).
+    ///
+    /// The pre-fix per-note increment would have produced strictly-increasing
+    /// distinct block numbers detached from the Miden height, failing every
+    /// assertion below.
+    #[tokio::test]
+    async fn finding_19_projector_uses_miden_block_not_per_note_increment() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        let output_metadata = HashMap::new();
+
+        // FOUR distinct B2AGG notes (distinct amounts → distinct commitments) all
+        // consumed in ONE Miden tx at Miden block 100.
+        let same_block = vec![
+            b2agg_note_with_amount(100, Some(0), 11),
+            b2agg_note_with_amount(100, Some(1), 22),
+            b2agg_note_with_amount(100, Some(2), 33),
+            b2agg_note_with_amount(100, Some(3), 44),
+        ];
+        let written = projector
+            .project_notes(&same_block, &output_metadata, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(written, 4, "all four B2AGG notes must emit a log");
+
+        // Miden-1:1: the tip is the Miden block itself, NOT tip+4. The pre-fix
+        // per-note increment would have set it to 4.
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            100,
+            "tip must be the Miden block (100), not advanced once per note"
+        );
+
+        let logs = logs_in_range(&store, 0, 100).await;
+        assert_eq!(logs.len(), 4);
+        let blocks: Vec<u64> = logs.iter().map(|l| l.block_number).collect();
+        assert_eq!(
+            blocks,
+            vec![100, 100, 100, 100],
+            "every note consumed at Miden block 100 lands at synthetic block 100; \
+             the pre-fix loop would have scattered them across 1,2,3,4"
+        );
+        // Explicit: all notes share ONE block, i.e. no per-note advance happened.
+        assert_eq!(
+            blocks.iter().collect::<std::collections::HashSet<_>>().len(),
+            1,
+            "N notes at the same Miden block must occupy exactly ONE synthetic block"
+        );
+
+        // A FAR-LATER Miden block: notes land at 250 (Miden-1:1), not 5,6,7. A
+        // per-note counter continuing from the prior tip would ignore the height.
+        let later_block = vec![
+            b2agg_note_with_amount(250, Some(0), 55),
+            b2agg_note_with_amount(250, Some(1), 66),
+            b2agg_note_with_amount(250, Some(2), 77),
+        ];
+        let written_later = projector
+            .project_notes(&later_block, &output_metadata, 250, None)
+            .await
+            .unwrap();
+        assert_eq!(written_later, 3);
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            250,
+            "tip follows the Miden height (250), not a per-note counter (would be 7)"
+        );
+        let later_logs = logs_in_range(&store, 101, 250).await;
+        assert_eq!(later_logs.len(), 3);
+        assert!(
+            later_logs.iter().all(|l| l.block_number == 250),
+            "notes at Miden block 250 all land at synthetic block 250, not 5/6/7"
+        );
+    }
+
     /// (iv) Two independent runs over the same consumed-note set produce
     /// byte-identical synthetic logs: same (Miden-1:1) block numbers, block
     /// hashes, log indices and ordering.
