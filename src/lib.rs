@@ -21,6 +21,7 @@ pub mod l2_to_l1_claimer;
 pub mod let_divergence;
 pub mod log_synthesis;
 pub mod logging;
+pub mod metadata_recovery;
 pub mod metrics;
 pub mod miden_client;
 pub mod mint_target_monitor;
@@ -36,7 +37,9 @@ pub(crate) mod service_helpers;
 pub mod service_send_raw_txn;
 pub mod service_state;
 pub(crate) mod service_zkevm;
+pub mod sqlite_pragmas;
 pub mod store;
+pub mod synthetic_projector;
 #[cfg(test)]
 pub mod test_helpers;
 pub mod twin_note_detector;

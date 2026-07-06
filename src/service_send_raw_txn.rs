@@ -15,6 +15,27 @@ struct TransactionData {
     pub input: alloy::primitives::Bytes,
 }
 
+fn envelope_nonce(txn_envelope: &TxEnvelope) -> u64 {
+    match txn_envelope {
+        TxEnvelope::Eip1559(s) => s.tx().nonce,
+        TxEnvelope::Eip2930(s) => s.tx().nonce,
+        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
+        TxEnvelope::Eip7702(s) => s.tx().nonce,
+        TxEnvelope::Legacy(s) => s.tx().nonce,
+    }
+}
+
+fn calldata_selector(input: &alloy::primitives::Bytes) -> String {
+    let bytes = input.as_ref();
+    if bytes.len() < 4 {
+        return "0x".to_string();
+    }
+    format!(
+        "0x{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
 fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionData> {
     let data = match txn_envelope {
         TxEnvelope::Eip1559(txn_signed) => {
@@ -42,7 +63,7 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
 }
 
 async fn handle_ger_result(
-    result: anyhow::Result<ger::GerInsertResult>,
+    result: anyhow::Result<bool>,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     signer: Address,
@@ -50,23 +71,24 @@ async fn handle_ger_result(
     ger_bytes: [u8; 32],
 ) -> anyhow::Result<()> {
     match result {
-        Ok(ger_result) => {
-            // G4 — mark_ger_injected has moved to live INSIDE insert_ger,
-            // co-located with add_ger_update_event so a crash between them
-            // can't leave is_ger_injected returning false after the event
-            // has been logged. handle_ger_result no longer issues the
-            // mark separately.
+        Ok(is_new) => {
             let _ = ger_bytes; // kept for backward-compat; unused here.
             tracing::info!("inserted GER with eth txn: {txn_hash}");
-            record_local_success_at_block(
-                service,
-                txn_hash,
-                txn_envelope,
-                signer,
-                ger_result.block_number,
-                vec![],
-            )
-            .await?;
+            if is_new {
+                // New GER: insert_ger recorded the eth-tx ↔ UpdateGerNote link. Record
+                // ONLY a pending receipt; the SyntheticProjector finalises it (txn_commit)
+                // at the Miden block where it consumes the note — receipt block == GER-log
+                // block. eth_getTransactionReceipt returns null until then (mined-when-
+                // consumed), which aggkit tolerates.
+                record_local_pending_tx(service, txn_hash, txn_envelope, signer, None, vec![])
+                    .await?;
+            } else {
+                // Duplicate GER (already injected): no new UpdateGerNote will be consumed,
+                // so the projector has nothing to finalise — complete the receipt now at
+                // the current tip so eth_getTransactionReceipt resolves.
+                record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![])
+                    .await?;
+            }
             Ok(())
         }
         Err(err) => {
@@ -376,7 +398,6 @@ async fn publish_and_record_claim(
         &service.miden_client,
         service.accounts.clone(),
         service.store.clone(),
-        service.block_state.clone(),
         latest_block,
         txn_hash,
         txn_envelope,
@@ -389,65 +410,22 @@ async fn publish_and_record_claim(
     tracing::info!(
         eth_tx = %txn_hash,
         miden_tx = %claim_result.txn_id,
-        "claim published and ClaimEvent recorded"
+        "claim published; receipt pending until the projector finalises it on consumption"
     );
     Ok(())
-}
-
-/// Best-effort resolution of `(mainnet_exit_root, rollup_exit_root)` from the
-/// L1 GER contract for an `insertGlobalExitRoot` call.
-///
-/// RD-940 Phase 1 — extracted from the inline block previously living at the
-/// top of the `insertGlobalExitRoot` dispatch in `service_send_raw_txn` so
-/// both the legacy sync path and the writer-worker enqueue path resolve in
-/// exactly the same way. **Runs on the request thread** so the worker doesn't
-/// block on slow L1 view calls; the mainnet/rollup pair is materialised into
-/// the `DecodedWriteCall::Ger` payload before enqueue.
-///
-/// Under the RD-862 race-path L1 has usually advanced past the pair that
-/// produced the combined hash, so the keccak check fails and we return
-/// `(None, None)`. That's non-fatal — `L1InfoTreeIndexer` backfills the row
-/// via UPSERT on its own poll loop (`src/l1_info_tree_indexer.rs:124-223`),
-/// so bridge-service's subsequent `zkevm_getExitRootsByGER` poll converges.
-async fn resolve_l1_exit_roots(
-    service: &ServiceState,
-    ger_bytes: [u8; 32],
-) -> (Option<[u8; 32]>, Option<[u8; 32]>) {
-    match (&service.l1_rpc_url, &service.ger_l1_address) {
-        (Some(l1_rpc), Some(ger_addr)) => match ger::fetch_l1_exit_roots(l1_rpc, ger_addr).await {
-            Ok((m, r)) => {
-                let computed = ger::combined_ger(&m, &r);
-                if computed == ger_bytes {
-                    (Some(m), Some(r))
-                } else {
-                    tracing::debug!(
-                        "L1 exit roots don't match injected GER (L1 may have advanced); \
-                         indexer will backfill via set_ger_exit_roots"
-                    );
-                    (None, None)
-                }
-            }
-            Err(e) => {
-                tracing::debug!("failed to fetch L1 exit roots ({e:#}); indexer will backfill");
-                (None, None)
-            }
-        },
-        _ => (None, None),
-    }
 }
 
 /// Unified GER-insert / updateExitRoot dispatcher used by both the legacy sync
 /// path and the writer-worker path. **Does NOT advance the per-signer
 /// nonce** — see the matching note on `worker_handle_claim_asset`.
 ///
-/// `mainnet_root` / `rollup_root` are populated by `resolve_l1_exit_roots`
-/// (insertGlobalExitRoot) or by the call params directly (updateExitRoot), so
-/// the worker doesn't need to know which selector originated the call.
+/// The GER synthetic log (and the decomposed exit roots it carried) is now
+/// emitted by the `SyntheticProjector` from the consumed `UpdateGerNote`, so
+/// this path only needs the combined `ger_bytes` to submit to Miden — the
+/// decomposed mainnet/rollup roots are no longer threaded through.
 pub(crate) async fn worker_handle_ger_insert(
     service: &ServiceState,
     ger_bytes: [u8; 32],
-    mainnet_root: Option<[u8; 32]>,
-    rollup_root: Option<[u8; 32]>,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     signer: Address,
@@ -455,12 +433,9 @@ pub(crate) async fn worker_handle_ger_insert(
     handle_ger_result(
         ger::insert_ger(
             ger_bytes,
-            mainnet_root,
-            rollup_root,
             &service.miden_client,
             service.accounts.clone(),
             &service.store,
-            &service.block_state,
             txn_hash,
         )
         .await,
@@ -522,6 +497,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let txn = unwrap_txn_envelope(txn_envelope.clone())?;
     let txn_hash = txn.hash;
     let signer = txn_envelope.recover_signer()?;
+    let tx_nonce = envelope_nonce(&txn_envelope);
+    let selector = calldata_selector(&txn.input);
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
     // RD-940 Decision 3 — tx-hash dedup early-return, BEFORE the R4 nonce check.
@@ -544,9 +521,34 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     //
     // Runs BEFORE `per_signer_lock` so contention from re-broadcast bursts
     // doesn't pile up on the lock.
-    if let Some(handle) = service.writer_handle.as_ref()
-        && handle.is_inflight(&txn_hash)
-    {
+    let known_inflight = service
+        .writer_handle
+        .as_ref()
+        .is_some_and(|handle| handle.is_inflight(&txn_hash));
+    let known_store_tx = service
+        .store
+        .txn_get(txn_hash)
+        .await
+        .map(|entry| entry.is_some())
+        .unwrap_or(false);
+    tracing::info!(
+        target: "rpc::nonce_snoop",
+        "{}",
+        serde_json::json!({
+            "event": "eth_sendRawTransaction_received",
+            "signer": format!("{signer:#x}"),
+            "tx_hash": format!("{txn_hash:#x}"),
+            "tx_nonce": tx_nonce,
+            "calldata_selector": selector,
+            "calldata_len": txn.input.len(),
+            "known_inflight": known_inflight,
+            "known_store_tx": known_store_tx,
+            "writer_enabled": service.enable_writer_worker,
+            "writer_handle_present": service.writer_handle.is_some(),
+        })
+    );
+
+    if known_inflight {
         tracing::debug!(
             target: "rpc::dedup",
             %txn_hash,
@@ -554,7 +556,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         );
         return Ok(txn_hash);
     }
-    if matches!(service.store.txn_get(txn_hash).await, Ok(Some(_))) {
+    if known_store_tx {
         tracing::debug!(
             target: "rpc::dedup",
             %txn_hash,
@@ -563,37 +565,75 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         return Ok(txn_hash);
     }
 
-    // R4 follow-up — serialise the entire nonce-check + handler critical section
-    // for this signer. Without the mutex, two concurrent same-nonce txs both
-    // pass the equality check before either calls `nonce_increment`. This guard
-    // is cheap (per-signer, no contention across distinct signers), is held
-    // until the function returns, and is dropped automatically on panic.
-    let _lock = service.per_signer_locks.lock(signer).await;
-
-    // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce only on
-    // success and never compared the incoming `tx.nonce` against the expected next
-    // value. That allowed:
-    //   1. Replay: a tx replayed with its original nonce would re-execute (the
-    //      claim path's try_claim dedupes by globalIndex, but other paths don't).
-    //   2. Skipped sequencing: an out-of-order tx with an inflated nonce would
-    //      still be processed, leaving "holes" in the apparent sequence.
-    // Validate `tx.nonce == store.nonce_get(signer)` BEFORE running any handler.
+    // R4 follow-up — serialise the entire nonce-check + enqueue/handler
+    // critical section for this signer. Without the mutex, two concurrent
+    // same-nonce txs both pass the equality check before either calls
+    // `nonce_increment`.
+    //
+    // With the writer worker enabled, also tolerate bounded future-nonce
+    // reordering from concurrent HTTP delivery: if nonce N+1 reaches us before
+    // nonce N, release the lock, wait briefly for N to be accepted, then
+    // re-check. This is a small in-process txpool behavior; stale/replay nonces
+    // still fail immediately, and missing gaps still fail after the bound.
     let signer_str = format!("{signer:#x}");
-    let expected_nonce = service.store.nonce_get(&signer_str).await?;
-    let tx_nonce = match &txn_envelope {
-        TxEnvelope::Eip1559(s) => s.tx().nonce,
-        TxEnvelope::Eip2930(s) => s.tx().nonce,
-        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
-        TxEnvelope::Eip7702(s) => s.tx().nonce,
-        TxEnvelope::Legacy(s) => s.tx().nonce,
-    };
-    if tx_nonce != expected_nonce {
+    let future_nonce_wait_max = std::time::Duration::from_secs(30);
+    let future_nonce_poll = std::time::Duration::from_millis(50);
+    let future_nonce_wait_started = tokio::time::Instant::now();
+    let mut logged_future_nonce_wait = false;
+
+    let _lock = loop {
+        let lock = service.per_signer_locks.lock(signer).await;
+
+        // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce
+        // only on success and never compared the incoming `tx.nonce` against
+        // the expected next value. That allowed replay and skipped sequencing.
+        let expected_nonce = service.store.nonce_get(&signer_str).await?;
+        let can_wait_for_future_nonce = service.enable_writer_worker
+            && tx_nonce > expected_nonce
+            && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
+        let nonce_action = if tx_nonce == expected_nonce {
+            "accept"
+        } else if can_wait_for_future_nonce {
+            "wait_future"
+        } else {
+            "reject"
+        };
+        tracing::info!(
+            target: "rpc::nonce_snoop",
+            "{}",
+            serde_json::json!({
+                "event": "eth_sendRawTransaction_nonce_check",
+                "signer": signer_str,
+                "tx_hash": format!("{txn_hash:#x}"),
+                "tx_nonce": tx_nonce,
+                "expected_nonce": expected_nonce,
+                "nonce_matches": tx_nonce == expected_nonce,
+                "action": nonce_action,
+                "future_nonce_wait_ms": future_nonce_wait_started.elapsed().as_millis(),
+                "writer_enabled": service.enable_writer_worker,
+                "writer_handle_present": service.writer_handle.is_some(),
+            })
+        );
+
+        if tx_nonce == expected_nonce {
+            break lock;
+        }
+
+        if can_wait_for_future_nonce {
+            if !logged_future_nonce_wait {
+                ::metrics::counter!("rpc_future_nonce_wait_total").increment(1);
+                logged_future_nonce_wait = true;
+            }
+            drop(lock);
+            tokio::time::sleep(future_nonce_poll).await;
+            continue;
+        }
+
         ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
         anyhow::bail!(
-            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; \
-             this guards against replay and out-of-order submission (R4)"
+            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; this guards against replay and out-of-order submission (R4)"
         );
-    }
+    };
 
     // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
     // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
@@ -629,23 +669,15 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
         let ger_bytes: [u8; 32] = params.root.0;
-        let (mainnet_root, rollup_root) = resolve_l1_exit_roots(&service, ger_bytes).await;
-        crate::writer_worker::DecodedWriteCall::Ger {
-            ger_bytes,
-            mainnet_root,
-            rollup_root,
-        }
+        crate::writer_worker::DecodedWriteCall::Ger { ger_bytes }
     } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
         tracing::debug!("updateExitRoot call");
         let params = updateExitRootCall::abi_decode(params_encoded)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-        let mainnet_root = params.newMainnetExitRoot.0;
-        let rollup_root = params.newRollupExitRoot.0;
-        let combined_ger = ger::combined_ger(&mainnet_root, &rollup_root);
+        let combined_ger =
+            ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
         crate::writer_worker::DecodedWriteCall::Ger {
             ger_bytes: combined_ger,
-            mainnet_root: Some(mainnet_root),
-            rollup_root: Some(rollup_root),
         }
     } else {
         tracing::error!("unhandled txn method {params_encoded:?}");
@@ -705,21 +737,9 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 worker_handle_claim_asset(&service, *params, txn_hash, txn_envelope, signer)
                     .await?;
             }
-            crate::writer_worker::DecodedWriteCall::Ger {
-                ger_bytes,
-                mainnet_root,
-                rollup_root,
-            } => {
-                worker_handle_ger_insert(
-                    &service,
-                    ger_bytes,
-                    mainnet_root,
-                    rollup_root,
-                    txn_hash,
-                    txn_envelope,
-                    signer,
-                )
-                .await?;
+            crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
+                worker_handle_ger_insert(&service, ger_bytes, txn_hash, txn_envelope, signer)
+                    .await?;
             }
         }
         service.store.nonce_increment(&signer_str).await?;
@@ -743,9 +763,14 @@ mod tests {
     /// pre-EIP-155 envelopes without a chain_id, which is the right production
     /// posture but means tests must opt in explicitly.
     fn encode_legacy_tx(input: Vec<u8>) -> (String, Address) {
+        encode_legacy_tx_with_nonce(input, 0)
+    }
+
+    fn encode_legacy_tx_with_nonce(input: Vec<u8>, nonce: u64) -> (String, Address) {
         let txn = TxLegacy {
             input: input.into(),
             chain_id: Some(1),
+            nonce,
             ..Default::default()
         };
         let signature = Signature::test_signature();
@@ -823,7 +848,7 @@ mod tests {
     // ── Happy-path tests ────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_insert_global_exit_root_stores_ger_and_emits_log() {
+    async fn test_insert_global_exit_root_submits_without_emitting_log() {
         let service = create_test_service();
         let store = service.store.clone();
         let ger_bytes = [0xAA; 32];
@@ -840,9 +865,15 @@ mod tests {
             "insertGlobalExitRoot should succeed: {result:?}"
         );
 
-        assert!(store.has_seen_ger(&ger_bytes).await.unwrap());
-        assert!(store.is_ger_injected(&ger_bytes).await.unwrap());
-
+        // Post-cut-over contract: insert_ger SUBMITS the UpdateGerNote to Miden but
+        // does NOT emit the synthetic GER log or mark the GER injected — the
+        // SyntheticProjector does both when it observes the note consumed. So in
+        // this unit context (no projector tick over a consumed-note feed) neither
+        // the injection flag nor the synthetic log is present yet.
+        assert!(
+            !store.is_ger_injected(&ger_bytes).await.unwrap(),
+            "insert_ger must NOT mark injected — the projector does that on consumption"
+        );
         let filter = crate::log_synthesis::LogFilter {
             from_block: Some("0x0".to_string()),
             to_block: Some("0xFFFF".to_string()),
@@ -850,13 +881,9 @@ mod tests {
         };
         let logs = store.get_logs(&filter, 0xFFFF).await.unwrap();
         assert!(
-            !logs.is_empty(),
-            "expected at least one log from GER insertion"
-        );
-        assert!(
-            logs.iter().any(|l| l.topics.first().map(|t| t.as_str())
-                == Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)),
-            "expected UpdateHashChainValue log"
+            logs.iter().all(|l| l.topics.first().map(|t| t.as_str())
+                != Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)),
+            "insert_ger must NOT emit a GER log — the projector does that on consumption"
         );
     }
 
@@ -1322,6 +1349,54 @@ mod tests {
             result.is_ok(),
             "matching nonce must be accepted: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rd940_future_nonce_waits_for_missing_nonce_acceptance() {
+        let mut service = create_test_service();
+        let store = service.store.clone();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service.enable_writer_worker = true;
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xBBu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 1);
+
+        let svc = service.clone();
+        let pending = tokio::spawn(async move { service_send_raw_txn(svc, input_hex).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !pending.is_finished(),
+            "future nonce should wait for the missing nonce instead of failing immediately"
+        );
+
+        store
+            .nonce_increment(&format!("{signer:#x}"))
+            .await
+            .expect("simulate nonce 0 acceptance");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("future nonce waiter should complete")
+            .expect("task should not panic");
+        assert!(
+            result.is_ok(),
+            "future nonce should be accepted: {result:?}"
+        );
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            2,
+            "accepting nonce 1 should advance the next accepted nonce to 2"
+        );
+
+        let _ = shutdown.send(());
     }
 
     /// Self-review R2 — repro+regression. Pre-fix, every recovered signer was

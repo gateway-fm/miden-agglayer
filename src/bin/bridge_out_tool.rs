@@ -14,13 +14,13 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use miden_base_agglayer::{B2AggNote, EthAddress};
-use miden_client::DebugMode;
 use miden_client::RemoteTransactionProver;
 use miden_client::asset::{Asset, AssetCallbackFlag, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;
 use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
+use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 
@@ -35,21 +35,29 @@ struct Args {
     #[arg(long)]
     node_url: String,
 
-    /// Wallet account ID (hex, e.g. 0x...)
+    /// Wallet account ID (hex, e.g. 0x...). Required unless --create-wallet.
     #[arg(long)]
-    wallet_id: String,
+    wallet_id: Option<String>,
 
-    /// Bridge account ID (hex, e.g. 0x...)
+    /// Bridge account ID (hex, e.g. 0x...). Required unless --create-wallet.
     #[arg(long)]
-    bridge_id: String,
+    bridge_id: Option<String>,
 
-    /// Faucet account ID (hex, e.g. 0x...)
+    /// Faucet account ID (hex, e.g. 0x...). Required unless --create-wallet.
     #[arg(long)]
-    faucet_id: String,
+    faucet_id: Option<String>,
 
-    /// Amount to bridge out (in Miden token units)
-    #[arg(long)]
+    /// Amount to bridge out (in Miden token units). Ignored with --create-wallet.
+    #[arg(long, default_value_t = 0)]
     amount: u64,
+
+    /// Provision mode: create a fresh INDEPENDENT wallet in --store-dir (its own
+    /// store.sqlite3 + keystore, separate from the proxy), register its P2ID note
+    /// tag, print its id, and exit. Fund this wallet via L1→L2 to its address,
+    /// then run bridge-outs against the same --store-dir. This mirrors production,
+    /// where the B2AGG wallet is fully independent of the proxy's store.
+    #[arg(long)]
+    create_wallet: bool,
 
     /// L1 destination address (hex, e.g. 0xabcd...)
     #[arg(long, default_value = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd")]
@@ -80,6 +88,19 @@ struct Args {
     /// Has no effect when --miden-prover-url is unset.
     #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
     miden_prover_timeout_secs: u64,
+
+    /// Print the canonical note script roots (b2agg/claim/ger) as ground truth
+    /// for external verifiers (e.g. scripts/verify-event-completeness.sh) and
+    /// exit. Pure print — needs no node, store, or accounts.
+    #[arg(long)]
+    print_script_roots: bool,
+
+    /// After submitting the B2AGG, wait until the note is actually CONSUMED
+    /// on-chain (polling sync), up to this many seconds. 0 disables the wait
+    /// (legacy behaviour: 5 blind sync cycles). Load tests MUST wait: pacing on
+    /// tx acceptance alone floods the bridge with in-flight consumptions.
+    #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 180)]
+    wait_consumed_secs: u64,
 }
 
 impl std::fmt::Debug for Args {
@@ -123,27 +144,37 @@ fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let wallet_id = parse_account_id(&args.wallet_id).context("wallet-id")?;
-    let bridge_id = parse_account_id(&args.bridge_id).context("bridge-id")?;
-    let faucet_id = parse_account_id(&args.faucet_id).context("faucet-id")?;
-
-    println!("[bridge-out] wallet:  {wallet_id}");
-    println!("[bridge-out] bridge:  {bridge_id}");
-    println!("[bridge-out] faucet:  {faucet_id}");
-    println!("[bridge-out] amount:  {}", args.amount);
-    println!(
-        "[bridge-out] dest:    {} (network {})",
-        args.dest_address, args.dest_network
-    );
+    if args.print_script_roots {
+        // Keep key=0x<hex> stable — verify-event-completeness.sh parses it.
+        println!(
+            "b2agg=0x{}",
+            hex::encode(miden_base_agglayer::B2AggNote::script_root().as_bytes())
+        );
+        println!(
+            "claim=0x{}",
+            hex::encode(miden_base_agglayer::ClaimNote::script().root().as_bytes())
+        );
+        println!(
+            "ger=0x{}",
+            hex::encode(miden_base_agglayer::UpdateGerNote::script_root().as_bytes())
+        );
+        return Ok(());
+    }
 
     let store_path = args.store_dir.join("store.sqlite3");
     let keystore_path = args.store_dir.join("keystore");
 
-    if !store_path.exists() {
-        return Err(anyhow!("store not found at {}", store_path.display()));
-    }
-    if !keystore_path.exists() {
-        return Err(anyhow!("keystore not found at {}", keystore_path.display()));
+    if args.create_wallet {
+        // Provision mode: the store/keystore may not exist yet — create them.
+        std::fs::create_dir_all(&keystore_path)
+            .with_context(|| format!("creating keystore dir {}", keystore_path.display()))?;
+    } else {
+        if !store_path.exists() {
+            return Err(anyhow!("store not found at {}", store_path.display()));
+        }
+        if !keystore_path.exists() {
+            return Err(anyhow!("keystore not found at {}", keystore_path.display()));
+        }
     }
     #[cfg(unix)]
     {
@@ -165,17 +196,20 @@ async fn main() -> anyhow::Result<()> {
         DebugMode::Disabled
     };
 
-    // Build miden client from existing store
-    let keystore = FilesystemKeyStore::new(keystore_path)?;
+    // Build miden client from the store (existing for bridge-out, freshly
+    // created for --create-wallet).
+    let keystore = Arc::new(FilesystemKeyStore::new(keystore_path)?);
     let rpc = miden_agglayer_service::miden_client::build_rpc_client(
         &node_endpoint,
         10_000,
         args.miden_api_key.as_deref(),
     );
+    miden_agglayer_service::sqlite_pragmas::open_store_connection(&store_path)
+        .with_context(|| format!("failed to configure sqlite store {}", store_path.display()))?;
     let mut builder = ClientBuilder::new()
         .rpc(rpc)
-        .sqlite_store(store_path)
-        .authenticator(Arc::new(keystore))
+        .sqlite_store(store_path.clone())
+        .authenticator(keystore.clone())
         .in_debug_mode(mode);
     if let Some(prover_url) = args.miden_prover_url.as_deref() {
         // Mirrors the main service wiring: when a remote prover URL is set,
@@ -196,6 +230,61 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await
         .map_err(|e| anyhow!("failed to build miden client: {e}"))?;
+
+    // ── Provision mode ────────────────────────────────────────────────────────
+    // Create a fully independent bridge-out wallet in THIS store (separate from
+    // the proxy's store.sqlite3), print its id, and exit.
+    if args.create_wallet {
+        println!(
+            "[create-wallet] provisioning independent wallet in {}",
+            store_path.display()
+        );
+        client
+            .sync_state()
+            .await
+            .map_err(|e| anyhow!("initial sync failed: {e}"))?;
+        let wallet =
+            miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
+                .await
+                .map_err(|e| anyhow!("wallet creation failed: {e}"))?;
+        // Settle the new account on the node before it can receive deposits.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            client.sync_state().await.ok();
+        }
+        println!("[create-wallet] wallet-id: {}", wallet.id().to_hex());
+        println!("[create-wallet] done");
+        return Ok(());
+    }
+
+    // Bridge-out mode: the account ids are required.
+    let wallet_id = parse_account_id(
+        args.wallet_id
+            .as_deref()
+            .context("--wallet-id is required unless --create-wallet")?,
+    )
+    .context("wallet-id")?;
+    let bridge_id = parse_account_id(
+        args.bridge_id
+            .as_deref()
+            .context("--bridge-id is required")?,
+    )
+    .context("bridge-id")?;
+    let faucet_id = parse_account_id(
+        args.faucet_id
+            .as_deref()
+            .context("--faucet-id is required")?,
+    )
+    .context("faucet-id")?;
+
+    println!("[bridge-out] wallet:  {wallet_id}");
+    println!("[bridge-out] bridge:  {bridge_id}");
+    println!("[bridge-out] faucet:  {faucet_id}");
+    println!("[bridge-out] amount:  {}", args.amount);
+    println!(
+        "[bridge-out] dest:    {} (network {})",
+        args.dest_address, args.dest_network
+    );
 
     // Sync state — retry on transient errors (concurrent SQLite access with
     // the running service can cause "failed to convert note record" errors).
@@ -326,10 +415,11 @@ async fn main() -> anyhow::Result<()> {
     // network txs (bridge consumptions) at the same moment, our Prove request
     // can be rejected with RESOURCE_EXHAUSTED ("proof queue is full"), which
     // surfaces as "transaction proving failed". Proving happens BEFORE node
-    // submission, so retrying is clean; a fresh note (new serial) and request
-    // are built per attempt since both are consumed by the submission path.
+    // submission, so retrying is clean. If the node accepts the tx and only the
+    // local store update fails, never resubmit; retry the attached store update.
     const SUBMIT_ATTEMPTS: u32 = 4;
     let mut tx_id = None;
+    let mut submitted_note_id = None;
     for attempt in 1..=SUBMIT_ATTEMPTS {
         // Sync right before each attempt to minimize the window where the
         // service's background sync loop can change our shared SQLite state.
@@ -347,7 +437,8 @@ async fn main() -> anyhow::Result<()> {
             client.rng(),
         )
         .map_err(|e| anyhow!("B2AGG creation failed: {e}"))?;
-        println!("[bridge-out] B2AGG note created");
+        let b2agg_note_id = b2agg.id();
+        println!("[bridge-out] B2AGG note created: {b2agg_note_id}");
 
         let tx_request = TransactionRequestBuilder::new()
             .own_output_notes(vec![b2agg])
@@ -363,7 +454,55 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(id) => {
                 tx_id = Some(id);
+                submitted_note_id = Some(b2agg_note_id);
                 break;
+            }
+            Err(ClientError::ApplyTransactionAfterSubmitFailed {
+                pending_update,
+                source,
+            }) => {
+                let accepted_tx = pending_update.executed_transaction().id();
+                let submission_height = pending_update.submission_height();
+                eprintln!(
+                    "[bridge-out] transaction {accepted_tx} was accepted at block \
+                     {submission_height}, but local store update failed: {source:#}; \
+                     re-applying the attached update"
+                );
+                let pending_update = *pending_update;
+                let mut last_reapply_err = None;
+                for recovery_attempt in 1..=SUBMIT_ATTEMPTS {
+                    match client
+                        .apply_transaction_update(pending_update.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            println!(
+                                "[bridge-out] recovered local store update for accepted transaction {accepted_tx}"
+                            );
+                            tx_id = Some(accepted_tx);
+                            submitted_note_id = Some(b2agg_note_id);
+                            break;
+                        }
+                        Err(reapply_err) => {
+                            eprintln!(
+                                "[bridge-out] recovery apply attempt {recovery_attempt}/{SUBMIT_ATTEMPTS} failed for transaction {accepted_tx}: {reapply_err:#}"
+                            );
+                            last_reapply_err = Some(reapply_err);
+                            if recovery_attempt < SUBMIT_ATTEMPTS {
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            }
+                        }
+                    }
+                }
+                if tx_id.is_some() {
+                    break;
+                }
+                let last_reapply_err = last_reapply_err
+                    .map(|err| format!("{err:#}"))
+                    .unwrap_or_else(|| "unknown recovery error".to_string());
+                return Err(anyhow!(
+                    "submit accepted transaction {accepted_tx} at block {submission_height}, but local store recovery failed after {SUBMIT_ATTEMPTS} attempts: {last_reapply_err}"
+                ));
             }
             Err(e) if attempt < SUBMIT_ATTEMPTS => {
                 eprintln!(
@@ -383,12 +522,45 @@ async fn main() -> anyhow::Result<()> {
 
     println!("[bridge-out] transaction submitted: {tx_id}");
 
-    // Wait a couple of sync cycles for the note to propagate
-    println!("[bridge-out] waiting for confirmation...");
-    for i in 1..=5 {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        client.sync_state().await.ok();
-        println!("[bridge-out] sync cycle {i}/5");
+    // Wait for the B2AGG to be CONSUMED on-chain (not merely accepted). Pacing
+    // on tx acceptance alone lets a load test flood the bridge with in-flight
+    // consumptions faster than downstream indexing absorbs them.
+    if args.wait_consumed_secs > 0 {
+        let note_id = submitted_note_id.expect("tx_id set implies submitted_note_id set");
+        println!(
+            "[bridge-out] waiting for B2AGG consumption (note {note_id}, up to {}s)...",
+            args.wait_consumed_secs
+        );
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(args.wait_consumed_secs);
+        let mut consumed = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            client.sync_state().await.ok();
+            let recs = client
+                .get_output_notes(miden_client::store::NoteFilter::Consumed)
+                .await
+                .unwrap_or_default();
+            if recs.iter().any(|r| r.id() == note_id) {
+                consumed = true;
+                break;
+            }
+        }
+        if !consumed {
+            return Err(anyhow!(
+                "B2AGG note {note_id} not consumed within {}s",
+                args.wait_consumed_secs
+            ));
+        }
+        println!("[bridge-out] B2AGG consumed");
+    } else {
+        // Legacy behaviour: a few blind sync cycles.
+        println!("[bridge-out] waiting for confirmation...");
+        for i in 1..=5 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            client.sync_state().await.ok();
+            println!("[bridge-out] sync cycle {i}/5");
+        }
     }
 
     let new_balance = client

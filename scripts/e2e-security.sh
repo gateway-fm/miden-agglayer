@@ -669,11 +669,22 @@ if [[ "$METRICS_LEAK" == "false" ]]; then
     pass "10.2 /metrics contains no sensitive data"
 fi
 
-# 10.3 Metrics contain expected counters
+# 10.3 Metrics contain expected counters. Histograms materialise in the
+# exporter only after samples flush — on a fast suite run the first snapshot
+# can race that (observed 2026-07-04: 40/41 flake). Prime with an RPC call
+# and retry the snapshot briefly; a genuinely missing metric still fails.
 METRICS_OK=true
 for counter in "rpc_requests_total" "rpc_request_duration_seconds"; do
-    if ! echo "$METRICS" | grep -q "$counter"; then
-        fail "10.3 Missing expected metric: $counter"
+    FOUND=false
+    for _ in 1 2 3 4; do
+        if echo "$METRICS" | grep -q "$counter"; then FOUND=true; break; fi
+        curl -sf "$L2_RPC" -H 'Content-Type: application/json'             -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' >/dev/null 2>&1 || true
+        sleep 2
+        METRICS=$(curl -s "$L2_RPC/metrics" 2>/dev/null | tr -d '\0' || true)
+        [[ -n "$METRICS" ]] || METRICS=""
+    done
+    if [[ "$FOUND" != "true" ]]; then
+        fail "10.3 Missing expected metric: $counter (after priming + retries)"
         METRICS_OK=false
     fi
 done

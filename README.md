@@ -2,7 +2,13 @@
 
 Bridges Polygon AggLayer (EVM L1) to Miden (ZK rollup). Exposes a JSON-RPC interface mimicking an EVM node, translates EVM transactions into Miden notes (CLAIM, GER, B2AGG), and manages bidirectional bridging state.
 
+**[Architecture & main flows →](docs/ARCHITECTURE.md)** — component diagram plus
+Mermaid sequence diagrams for the three main flows (GER injection, Claim,
+B2AGG bridge-out) and the three recovery mechanisms (live note-recovery
+ladder, startup `--restore`, account self-heal).
+
 ![architecture](docs/architecture.png)
+*(legacy pre-redesign diagram — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current architecture)*
 
 ## How it works
 

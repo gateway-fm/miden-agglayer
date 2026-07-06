@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use miden_client::RemoteTransactionProver;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
@@ -24,6 +24,18 @@ use tokio::sync::oneshot;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// Maximum backoff delay for retries.
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Process-wide guard enforcing that at most ONE production `MidenClient` is
+/// live at a time — the single owner of the miden `store.sqlite3`.
+///
+/// `MidenClient::new` enters this critical section, checks the flag, and
+/// refuses to build a second concurrent instance; the flag is released when the
+/// client's background thread exits on clean shutdown (so the init → runtime
+/// handoff in `main` still works). This makes the "single sqlite-store owner"
+/// invariant explicit and loud: any accidental second in-process client now
+/// fails fast instead of silently opening the store a second time. Test stubs
+/// (`new_test*`) deliberately bypass this guard.
+static LIVE_CLIENT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(BACKOFF_MAX)
@@ -151,6 +163,22 @@ impl MidenClient {
         sync_listeners: Vec<Arc<dyn SyncListener>>,
         debug_mode: bool,
     ) -> anyhow::Result<Self> {
+        // Critical section: enforce a single live production MidenClient. The
+        // flag is cleared by the background thread on clean shutdown (see the
+        // `Ok(())` arm of the run loop below).
+        {
+            let mut live = LIVE_CLIENT
+                .lock()
+                .expect("MidenClient singleton guard poisoned");
+            if *live {
+                return Err(anyhow!(
+                    "a MidenClient is already live — MidenClient must be a process-wide \
+                     singleton (the single owner of the sqlite store); refusing to open \
+                     store.sqlite3 from a second in-process client"
+                ));
+            }
+            *live = true;
+        }
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
         let node_endpoint = node_url
             .map(Self::parse_node_url)
@@ -204,8 +232,13 @@ impl MidenClient {
 
                 match result {
                     Ok(()) => {
-                        // Clean shutdown (done_receiver signalled)
+                        // Clean shutdown (done_receiver signalled). Release the
+                        // singleton guard so a subsequent MidenClient::new (e.g.
+                        // the init → runtime handoff in main) can build.
                         alive_for_run.store(false, Ordering::Release);
+                        *LIVE_CLIENT
+                            .lock()
+                            .expect("MidenClient singleton guard poisoned") = false;
                         return Ok(());
                     }
                     Err(err) => {
@@ -514,13 +547,17 @@ impl MidenClient {
         let mut client;
         let mut backoff = BACKOFF_MIN;
         loop {
+            let store_path = store_dir.join("store.sqlite3");
+            crate::sqlite_pragmas::open_store_connection(&store_path).with_context(|| {
+                format!("failed to configure sqlite store {}", store_path.display())
+            })?;
             let mut builder = ClientBuilder::new()
                 .rpc(build_rpc_client(
                     &node_endpoint,
                     node_timeout_ms,
                     api_key.as_deref(),
                 ))
-                .sqlite_store(store_dir.join("store.sqlite3"))
+                .sqlite_store(store_path)
                 .authenticator(keystore.clone())
                 .in_debug_mode(mode);
             if let Some(p) = tx_prover.clone() {
@@ -772,5 +809,92 @@ mod tests {
             "pause works regardless of alive state"
         );
         assert!(client.is_alive(), "test stub is alive");
+    }
+
+    /// Cantina MA#23 — the actual dispatch gate, not just the flag. A
+    /// listener registered on the sync loop must have `on_post_sync`
+    /// SUPPRESSED while `listeners_paused` is set, while the cheap
+    /// `on_sync` summary hook keeps firing; after unpausing, the next
+    /// tick dispatches `on_post_sync` again.
+    ///
+    /// This drives [`MidenClient::on_sync`] — the exact function both the
+    /// initial-sync and the 5s-interval arms of the run loop call — with a
+    /// real (offline) `MidenClientLib` and a counting listener. Driving the
+    /// full run loop itself would need a live Miden node (`Self::sync`
+    /// retries forever against a dead endpoint), so this is the tightest
+    /// seam that exercises the real dispatch decision at the listener loop.
+    #[tokio::test]
+    async fn ma23_on_post_sync_dispatch_suppressed_while_paused() {
+        use miden_protocol::block::BlockNumber;
+
+        #[derive(Default)]
+        struct CountingListener {
+            on_sync_calls: AtomicUsize,
+            on_post_sync_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl SyncListener for CountingListener {
+            fn on_sync(&self, _summary: &SyncSummary) {
+                self.on_sync_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
+                self.on_post_sync_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let listener = Arc::new(CountingListener::default());
+        let listeners: Vec<Arc<dyn SyncListener>> = vec![listener.clone()];
+        let paused = AtomicBool::new(true);
+
+        // Tick 1: paused — on_sync fires, on_post_sync is suppressed.
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(1u32))),
+            &mut client,
+            &listeners,
+            &paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listener.on_sync_calls.load(Ordering::SeqCst),
+            1,
+            "the cheap on_sync summary hook must keep firing while paused"
+        );
+        assert_eq!(
+            listener.on_post_sync_calls.load(Ordering::SeqCst),
+            0,
+            "on_post_sync dispatch must be suppressed while listeners are paused"
+        );
+
+        // Tick 2: still paused — still suppressed (not a one-shot skip).
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(2u32))),
+            &mut client,
+            &listeners,
+            &paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(listener.on_post_sync_calls.load(Ordering::SeqCst), 0);
+
+        // Tick 3: unpaused (guard dropped in production) — dispatch resumes.
+        paused.store(false, Ordering::Release);
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(3u32))),
+            &mut client,
+            &listeners,
+            &paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(listener.on_sync_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            listener.on_post_sync_calls.load(Ordering::SeqCst),
+            1,
+            "on_post_sync must dispatch again once the pause is released"
+        );
     }
 }

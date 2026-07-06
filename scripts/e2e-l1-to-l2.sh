@@ -106,33 +106,36 @@ for _ in $(seq 1 30); do
 done
 [[ "$BRIDGE_UP" == "true" ]] || fail "Bridge service not reachable at $BRIDGE_SERVICE_URL after 60s"
 
-# ── Get account IDs ──────────────────────────────────────────────────────────
+# ── Get infrastructure account IDs (config file read — NOT the sqlite store) ─
 ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || fail "miden-agglayer not initialized yet"
-WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ID=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
 
-# Get wallet's zero-padded Ethereum address (required by MASM to_account_id)
-# bridge-out-tool prints "wallet: 0x<hex>" even if balance check fails
-WALLET_HEX=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url http://miden-node:57291 \
-    --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
-    --amount 1 --dest-address 0xdead --dest-network 0 2>&1 | grep "wallet:" | awk '{print $NF}' || true)
-[[ -z "$WALLET_HEX" ]] && fail "Could not get wallet hex"
-INNER="${WALLET_HEX#0x}"
-PREFIX="${INNER:0:16}"
-SUFFIX="${INNER:16:14}00"
-DEST_ADDR="0x00000000${PREFIX}${SUFFIX}"
+# ── Isolated bridge wallet (single-owner store policy) ───────────────────────
+# The deposit destination is an INDEPENDENT wallet in an isolated store — never
+# a proxy-store wallet. "e2e-suite" is shared with the e2e-l2-to-l1* scripts,
+# which spend the balance this script delivers.
+B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-suite}"
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+provision_isolated_wallet "$BRIDGE_ID" "$FAUCET_ID" \
+    || fail "could not provision isolated bridge-out wallet"
 
 log "======================================================================"
 log "  L1→L2 Deposit + Claim"
 log "======================================================================"
-log "Wallet:  $WALLET_ID ($WALLET_HEX)"
+log "Wallet:  $WALLET_ID (isolated store: $B2AGG_STORE_DIR)"
 log "Dest:    $DEST_ADDR (zero-padded, network $DEST_NETWORK)"
 log "Amount:  $DEPOSIT_AMOUNT wei (expect $EXPECTED_L2_BALANCE Miden units)"
+
+# Baseline balance BEFORE the deposit: the isolated wallet may be reused across
+# runs (and already funded), so the assertion below is on the DELTA, which on a
+# fresh wallet equals the old absolute check. The probe also consumes any
+# pending P2ID notes, so the baseline is clean.
+BAL_BEFORE=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
+BAL_BEFORE="${BAL_BEFORE:-0}"
+log "L2 balance before deposit: $BAL_BEFORE"
 
 # ── Step 1: Deposit on L1 ────────────────────────────────────────────────────
 log "Step 1/5: Depositing on L1..."
@@ -180,29 +183,25 @@ wait_for "claim tx committed" \
 pass "CLAIM committed — waiting for NTX builder to create P2ID..."
 
 # ── Step 5: Verify wallet balance ──────────────────────────────────────────────
-log "Step 5/5: Checking wallet balance (sync + consume P2ID notes)..."
-BALANCE=0
+log "Step 5/5: Checking wallet balance (sync + consume P2ID notes, isolated store)..."
+BALANCE="$BAL_BEFORE"
 for attempt in $(seq 1 15); do
     sleep 10
-    BAL_OUT=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-        --store-dir /var/lib/miden-agglayer-service \
-        --node-url http://miden-node:57291 \
-        --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
-        --amount 999999999 \
-        --dest-address 0xdead --dest-network 0 2>&1 || true)
-    BALANCE=$(echo "$BAL_OUT" | grep "wallet balance:" | head -1 | awk '{print $NF}')
-    log "Attempt $attempt/15: balance = ${BALANCE:-0}"
-    if [[ -n "$BALANCE" && "$BALANCE" != "0" ]]; then
+    BALANCE=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
+    BALANCE="${BALANCE:-0}"
+    log "Attempt $attempt/15: balance = $BALANCE (was $BAL_BEFORE)"
+    if [[ "$BALANCE" -gt "$BAL_BEFORE" ]]; then
         break
     fi
 done
 
-if [[ -z "$BALANCE" || "$BALANCE" == "0" ]]; then
-    fail "Wallet balance is still 0 after 2.5 minutes"
-elif [[ "$BALANCE" -ne "$EXPECTED_L2_BALANCE" ]]; then
-    fail "Balance mismatch: got $BALANCE, expected $EXPECTED_L2_BALANCE (from $DEPOSIT_AMOUNT wei / 10^10)"
+BAL_DELTA=$((BALANCE - BAL_BEFORE))
+if [[ "$BAL_DELTA" -eq 0 ]]; then
+    fail "Wallet balance did not increase after 2.5 minutes (still $BALANCE)"
+elif [[ "$BAL_DELTA" -ne "$EXPECTED_L2_BALANCE" ]]; then
+    fail "Balance change mismatch: got +$BAL_DELTA, expected +$EXPECTED_L2_BALANCE (from $DEPOSIT_AMOUNT wei / 10^10)"
 else
-    pass "L1→L2 COMPLETE! Wallet balance: $BALANCE (expected $EXPECTED_L2_BALANCE)"
+    pass "L1→L2 COMPLETE! Wallet balance: $BAL_BEFORE → $BALANCE (+$BAL_DELTA, expected +$EXPECTED_L2_BALANCE)"
 fi
 
 echo ""

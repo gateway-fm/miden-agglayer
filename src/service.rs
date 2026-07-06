@@ -135,6 +135,7 @@ fn bucket_method_label(method: &str) -> &'static str {
         "eth_getBlockTransactionCountByNumber" => "eth_getBlockTransactionCountByNumber",
         "eth_call" => "eth_call",
         "eth_estimateGas" => "eth_estimateGas",
+        "eth_syncing" => "eth_syncing",
         "eth_gasPrice" => "eth_gasPrice",
         "eth_sendRawTransaction" => "eth_sendRawTransaction",
         "net_version" => "net_version",
@@ -289,24 +290,23 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         "eth_blockNumber" => {
-            // RD-940 Phase 3 — hot read via the BlockMonitor AtomicU64
-            // tip mirror. Falls back to the store on cold boot (mirror
-            // is 0 until the first writer reports). Cuts a stable-state
-            // per-request store round-trip down to a relaxed-atomic load.
-            let mirrored = service.block_monitor.current_tip();
-            let block_num = if mirrored > 0 {
-                mirrored
-            } else {
-                let n = service
-                    .store
-                    .get_latest_block_number()
-                    .await
-                    .map_err(|e| store_error(answer_id.clone(), e))?;
-                if n > 0 {
-                    service.block_monitor.record_tip(n);
-                }
-                n
-            };
+            // POSTMORTEM 2026-07-04: the RD-940 Phase 3 hot-read (serve the
+            // BlockMonitor AtomicU64 mirror when non-zero) went STALE under the
+            // synthetic-indexer redesign: the projector became the SOLE tip
+            // advancer and never calls record_tip(), and with the writer
+            // worker disabled nothing else does — so the mirror froze at its
+            // cold-boot seed (observed: eth_blockNumber pinned at 659 while
+            // the synthetic tip reached 2702; verifier windows truncated).
+            // The store is the single source of truth for the tip — read it.
+            // record_tip() keeps the mirror fresh for writer-mode consumers.
+            let block_num = service
+                .store
+                .get_latest_block_number()
+                .await
+                .map_err(|e| store_error(answer_id.clone(), e))?;
+            if block_num > 0 {
+                service.block_monitor.record_tip(block_num);
+            }
             let block_num_str = format!("{:#x}", block_num);
             Ok(JsonRpcResponse::success(answer_id, block_num_str))
         }
@@ -384,11 +384,12 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             let params: (String, String) = request.parse_params()?;
             let addr = &params.0;
             let tag = params.1.as_str();
-            let mut nonce = service
+            let accepted_nonce = service
                 .store
                 .nonce_get(addr)
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?;
+            let mut returned_nonce = accepted_nonce;
 
             // RD-940 Decision 4 — honour the block tag.
             //
@@ -409,16 +410,52 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             // Empty / missing tag defaults to `latest` per the geth contract
             // (`eth_getTransactionCount` second-param convention).
             let treat_as_latest = matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest");
+            let mut inflight_non_terminal = 0usize;
             if treat_as_latest
                 && let Some(handle) = service.writer_handle.as_ref()
                 && let Ok(signer_addr) = addr.parse::<alloy::primitives::Address>()
             {
-                let inflight = handle.count_non_terminal_for_signer(&signer_addr);
-                nonce = nonce.saturating_sub(inflight as u64);
+                inflight_non_terminal = handle.count_non_terminal_for_signer(&signer_addr);
+                returned_nonce = returned_nonce.saturating_sub(inflight_non_terminal as u64);
             }
 
-            Ok(JsonRpcResponse::success(answer_id, format!("{nonce:#x}")))
+            tracing::info!(
+                target: "rpc::nonce_snoop",
+                "{}",
+                serde_json::json!({
+                    "event": "eth_getTransactionCount",
+                    "address": addr,
+                    "tag": tag,
+                    "treat_as_latest": treat_as_latest,
+                    "accepted_nonce": accepted_nonce,
+                    "inflight_non_terminal": inflight_non_terminal,
+                    "returned_nonce": returned_nonce,
+                    "writer_enabled": service.enable_writer_worker,
+                    "writer_handle_present": service.writer_handle.is_some(),
+                })
+            );
+
+            Ok(JsonRpcResponse::success(
+                answer_id,
+                format!("{returned_nonce:#x}"),
+            ))
         }
+
+        // aggkit health-polls eth_syncing; the synthetic chain has no download
+        // phase (the projector holds the tip at the Miden tip), so report
+        // "not syncing" per the Ethereum JSON-RPC spec (boolean false).
+        "eth_syncing" => Ok(JsonRpcResponse::success(answer_id, false)),
+
+        // Standard client-discovery stubs (block explorers / tooling probe
+        // these on startup; unimplemented they spam ERROR-level noise).
+        "web3_clientVersion" => Ok(JsonRpcResponse::success(
+            answer_id,
+            format!("miden-agglayer/{}", env!("CARGO_PKG_VERSION")),
+        )),
+        "net_version" => Ok(JsonRpcResponse::success(
+            answer_id,
+            service.chain_id.to_string(),
+        )),
 
         "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
@@ -568,11 +605,6 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
         }
 
-        "net_version" => Ok(JsonRpcResponse::success(
-            answer_id,
-            format!("{}", service.chain_id),
-        )),
-
         "eth_getBlockTransactionCountByNumber" => {
             let _params: (String,) = request.parse_params()?;
             Ok(JsonRpcResponse::success(answer_id, "0x0"))
@@ -637,7 +669,10 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         }
 
         method => {
-            tracing::error!("JSON-RPC unsupported method: {}", method);
+            // WARN, not ERROR: internet scanners and explorer capability
+            // probes (debug_*, parity_*, trace_*) hit this constantly; an
+            // unknown method is a client-side condition, not a proxy fault.
+            tracing::warn!("JSON-RPC unsupported method: {}", method);
             Ok(request.method_not_found(method))
         }
     }

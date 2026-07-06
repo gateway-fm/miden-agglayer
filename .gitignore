@@ -34,3 +34,8 @@ docker-compose.override.yml
 
 # Per-host run evidence (reference baselines are *.json)
 tests/baselines/*.log
+# local test artifacts
+.loadtest-results/
+.b2agg-store/
+cache/
+out/

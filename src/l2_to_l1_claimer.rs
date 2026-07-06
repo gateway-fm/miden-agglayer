@@ -398,13 +398,14 @@ fn scan_windows(from: u64, head: u64, max_range: u64) -> Vec<(u64, u64)> {
 /// — on a fresh cursor (`from = 0`) that was *every* poll (PRST-4030). We chunk
 /// the scan into `<= max_range` windows instead.
 ///
-/// The upper bound is still the `latest` tag for the final window, NOT
+/// The upper bound is the block the `latest` tag resolves to, NOT
 /// `eth_blockNumber`: the proxy's `eth_blockNumber` mirror can lag the
 /// synthetic-log tip (it is advanced by some write paths but not the bridge-out
-/// synthetic-log path). So we scan the bulk `[from, head]` in numeric windows,
-/// then finish with one `latest`-bounded window to capture logs beyond the
-/// numeric head. That trailing span is just the (small) lag; each numeric window
-/// is `< max_range`, which the caller keeps below the proxy cap.
+/// synthetic-log path), and that lag can grow large when there is no bridge/GER
+/// activity. So we scan the bulk `[from, head]` in numeric windows, then chunk
+/// the trailing `[head + 1, latest]` span by `max_range` as well — a single
+/// unbounded `latest`-tagged request would exceed the proxy cap once the lag
+/// tops `max_range` (PRST-4055). Every window stays `< max_range`.
 async fn discover<P: Provider>(
     l2: &P,
     l2_bridge_address: Address,
@@ -431,18 +432,34 @@ async fn discover<P: Provider>(
         collect_exits(logs, &mut out);
     }
 
-    // Trailing window to the true tip via the `latest` tag, to catch synthetic
-    // logs the numeric head doesn't yet reflect. `tail_from` is `head + 1` after
-    // the loop, or `from` when `from > head` (loop produced no windows).
+    // Trailing windows to the true tip, to catch synthetic logs the numeric head
+    // doesn't yet reflect. `tail_from` is `head + 1` after the loop, or `from`
+    // when `from > head` (loop produced no windows). Resolve `latest` to a number
+    // and chunk `[tail_from, latest]` by `max_range` too: `eth_blockNumber` can
+    // lag `latest` by more than the proxy's getLogs cap, so a single unbounded
+    // `latest`-tagged request would be rejected (PRST-4055). Blocks that arrive
+    // after we resolve `latest` are picked up on the next poll.
     let tail_from = from.max(head.saturating_add(1));
-    let filter = Filter::new()
-        .address(l2_bridge_address)
-        .from_block(tail_from)
-        .to_block(BlockNumberOrTag::Latest)
-        .event_signature(BridgeEvent::SIGNATURE_HASH);
-    let logs = l2.get_logs(&filter).await?;
-    tracing::debug!(from = tail_from, %l2_bridge_address, raw_logs = logs.len(), "discover: latest tail");
-    collect_exits(logs, &mut out);
+    let latest = l2
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await?
+        .map(|b| b.header.number)
+        .unwrap_or(head);
+    for (w_from, w_to) in scan_windows(tail_from, latest, max_range) {
+        let filter = Filter::new()
+            .address(l2_bridge_address)
+            .from_block(w_from)
+            .to_block(w_to)
+            .event_signature(BridgeEvent::SIGNATURE_HASH);
+        let logs = l2.get_logs(&filter).await?;
+        tracing::debug!(
+            from = w_from,
+            to = w_to,
+            raw_logs = logs.len(),
+            "discover: tail window"
+        );
+        collect_exits(logs, &mut out);
+    }
 
     Ok(out)
 }

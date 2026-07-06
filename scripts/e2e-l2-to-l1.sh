@@ -49,29 +49,33 @@ wait_for() {
 command -v cast >/dev/null || fail "cast (foundry) not found"
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 not reachable"
 
+# Infrastructure account ids from the config file (NOT the sqlite store).
 ACCOUNTS=$(docker exec $AGGLAYER_CONTAINER \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
     || fail "miden-agglayer not initialized yet"
-WALLET_ID=$(echo "$ACCOUNTS" | grep wallet_hardhat | sed 's/.*= "//;s/"//')
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ID=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
+
+# ── Isolated bridge wallet (single-owner store policy) ───────────────────────
+# The bridge-out spends the ISOLATED wallet funded by e2e-l1-to-l2.sh — both
+# scripts default to the shared "e2e-suite" store subdir. Never touches the
+# proxy's sqlite store.
+B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-suite}"
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+provision_isolated_wallet "$BRIDGE_ID" "$FAUCET_ID" \
+    || fail "could not provision isolated bridge-out wallet"
 
 log "======================================================================"
 log "  L2→L1 Bridge-Out"
 log "======================================================================"
-log "Wallet:  $WALLET_ID"
+log "Wallet:  $WALLET_ID (isolated store: $B2AGG_STORE_DIR)"
 log "Bridge:  $BRIDGE_ID"
 log "Faucet:  $FAUCET_ID"
 log "L1 dest: $L1_DEST"
 
 # ── Check wallet balance ──────────────────────────────────────────────────────
 log "Checking wallet balance..."
-BAL_OUT=$(docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url http://miden-node:57291 \
-    --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
-    --amount 999999999999 --dest-address "$L1_DEST" --dest-network 0 2>&1 || true)
-BALANCE=$(echo "$BAL_OUT" | grep "wallet balance:" | head -1 | awk '{print $NF}')
+BALANCE=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
 log "Wallet balance: ${BALANCE:-0}"
 
 if [[ -z "$BALANCE" || "$BALANCE" == "0" ]]; then
@@ -82,11 +86,17 @@ BRIDGE_AMOUNT=$((BALANCE / 2))
 EXPECTED_L1_CHANGE=$((BRIDGE_AMOUNT * WEI_PER_MIDEN_UNIT))
 log "Bridge-out amount: $BRIDGE_AMOUNT Miden units (expect +$EXPECTED_L1_CHANGE wei on L1)"
 
+# Capture the L1 baseline BEFORE the deposit exists. The bridge-autoclaim
+# service runs continuously and — now that the bridge-out→cert→claim path is
+# fast and reliable — can settle + claim on L1 before a baseline sampled later
+# (e.g. after the BridgeEvent wait) would run, which makes AFTER-BEFORE read 0.
+# Sampling here, before the bridge-out, makes the +amount delta race-free.
+L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
+log "L1 balance before bridge-out: $L1_BAL_BEFORE"
+
 # ── Step 1: Create B2AGG note (bridge-out) ────────────────────────────────────
-log "Step 1/4: Creating B2AGG bridge-out note..."
-docker exec $AGGLAYER_CONTAINER bridge-out-tool \
-    --store-dir /var/lib/miden-agglayer-service \
-    --node-url http://miden-node:57291 \
+log "Step 1/4: Creating B2AGG bridge-out note (isolated client)..."
+iso_tool \
     --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$FAUCET_ID" \
     --amount "$BRIDGE_AMOUNT" --dest-address "$L1_DEST" --dest-network 0 2>&1 \
     || fail "bridge-out-tool failed"
@@ -106,9 +116,8 @@ wait_for "BridgeEvent in eth_getLogs" \
 pass "BridgeEvent detected in L2"
 
 # ── Step 3: Wait for certificate settlement on L1 ────────────────────────────
-L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
-log "L1 balance before settlement: $L1_BAL_BEFORE"
-
+# (L1_BAL_BEFORE was captured above, before the bridge-out, to avoid racing the
+# autoclaim service.)
 log "Step 3/5: Waiting for certificate settlement on AggLayer..."
 # 900s, not 300s: cold-start agglayer prover can blow past 5 min on the first
 # proof of a fresh `make test-e2e` run (circuit compile + load). Warm reruns
@@ -159,14 +168,19 @@ log "Deposit #$DEPOSIT_CNT: amount=$AMOUNT_CLAIM, globalIndex=$GLOBAL_INDEX"
 # may have already claimed this deposit on L1 — the deposit then carries a
 # claim_tx_hash. Re-claiming would revert (AlreadyClaimed), so verify the
 # autoclaim receipt + balance instead and finish successfully.
-CLAIM_TX_HASH=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
-if [[ -n "$CLAIM_TX_HASH" ]]; then
-    log "Deposit already claimed on L1 by the autoclaim service (tx $CLAIM_TX_HASH); verifying..."
-    RECEIPT_STATUS=$(cast receipt --rpc-url "$L1_RPC" "$CLAIM_TX_HASH" status 2>/dev/null || echo "")
+# The autoclaim service races the manual claim path below — a deposit can be
+# claimed by it at ANY point (before we query, while we fetch the proof, or
+# between proof and our claimAsset). Both finishes are equally valid; this
+# helper verifies the autoclaim receipt + balance and ends the test.
+finish_via_autoclaim() {
+    local tx="$1"
+    log "Deposit claimed on L1 by the autoclaim service (tx $tx); verifying..."
+    local status
+    status=$(cast receipt --rpc-url "$L1_RPC" "$tx" status 2>/dev/null || echo "")
     # cast prints the receipt status as "1", "0x1", "true" or "1 (success)"
     # depending on the foundry version — accept any success spelling.
-    [[ "$RECEIPT_STATUS" == *1* || "$RECEIPT_STATUS" == *true* ]] \
-        || fail "autoclaim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
+    [[ "$status" == *1* || "$status" == *true* ]] \
+        || fail "autoclaim tx $tx receipt status not success: ${status:-<none>}"
     pass "L1 claim transaction succeeded (via autoclaim service)!"
     L1_BAL_AFTER=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
     ACTUAL_L1_CHANGE=$((L1_BAL_AFTER - L1_BAL_BEFORE))
@@ -181,12 +195,40 @@ if [[ -n "$CLAIM_TX_HASH" ]]; then
     log "  L2→L1 TEST DONE"
     log "======================================================================"
     exit 0
-fi
+}
+
+# refresh_claim_tx: re-poll the deposit; echoes the claim_tx_hash if the
+# autoclaimer has landed it (empty otherwise). Never fails the script.
+refresh_claim_tx() {
+    curl -sf "$BRIDGE_SERVICE_URL/bridges/$L1_DEST?limit=100" 2>/dev/null | python3 -c "
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for dep in d.get('deposits', []):
+    if dep.get('network_id') == 1 and dep.get('deposit_cnt') == $DEPOSIT_CNT:
+        print(dep.get('claim_tx_hash') or '')
+        break
+" 2>/dev/null || true
+}
+
+CLAIM_TX_HASH=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
+[[ -n "$CLAIM_TX_HASH" ]] && finish_via_autoclaim "$CLAIM_TX_HASH"
 
 # Get merkle proof from bridge-service (net_id=1 for L2 deposits)
 NETWORK_ID_VAL=$(echo "$DEPOSIT_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin)['network_id'])")
-PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEPOSIT_CNT&net_id=$NETWORK_ID_VAL")
-[[ -z "$PROOF_JSON" ]] && fail "Could not get merkle proof"
+# The proof endpoint can transiently fail right after ready_for_claim flips
+# (tree not yet built) — a one-shot `curl -sf` under set -e died SILENTLY here
+# (2026-07-04). Retry up to 90s, and bail out to the autoclaim path if the
+# autoclaimer lands the claim while we wait.
+PROOF_JSON=""
+for _ in $(seq 1 18); do
+    PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEPOSIT_CNT&net_id=$NETWORK_ID_VAL" 2>/dev/null || true)
+    [[ -n "$PROOF_JSON" ]] && break
+    TX_NOW=$(refresh_claim_tx)
+    [[ -n "$TX_NOW" ]] && finish_via_autoclaim "$TX_NOW"
+    sleep 5
+done
+[[ -z "$PROOF_JSON" ]] && fail "Could not get merkle proof after 90s"
 
 MAINNET_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])")
 ROLLUP_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])")
@@ -217,12 +259,16 @@ CLAIM_TX=$(cast send --rpc-url "$L1_RPC" \
     "$ORIG_NET" "$ORIG_ADDR" \
     "$DEST_NET" "$DEST_ADDR_CLAIM" \
     "$AMOUNT_CLAIM" "$METADATA_CLAIM" \
-    2>&1)
+    2>&1) || true
 
 STATUS=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="status"{print $2; exit}')
 if [[ "$STATUS" == "1" ]]; then
     pass "L1 claim transaction succeeded!"
 else
+    # Revert here usually means the autoclaimer beat us between proof fetch
+    # and submission (AlreadyClaimed) — verify its claim instead of failing.
+    TX_NOW=$(refresh_claim_tx)
+    [[ -n "$TX_NOW" ]] && finish_via_autoclaim "$TX_NOW"
     warn "L1 claim tx output: $CLAIM_TX"
     fail "L1 claim transaction failed (status=$STATUS)"
 fi

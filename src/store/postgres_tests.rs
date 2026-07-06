@@ -571,6 +571,281 @@ async fn test_pgstore_rd913_expected_mints() {
     assert!(rows.iter().all(|(g, _, _, _)| *g != gi));
 }
 
+// ── Cantina MA#18 — unbridgeable bridge-outs ─────────────────
+
+/// PgStore round-trip + first-write-wins idempotency for
+/// `record_unbridgeable_bridge_out` / `get_unbridgeable_bridge_out`
+/// (`postgres.rs`, migration 006). The InMemoryStore contract is pinned via
+/// the `bridge_out::tests::ma18_*` wiring tests; this is the PG twin.
+#[tokio::test]
+async fn test_pgstore_ma18_unbridgeable_bridge_out_roundtrip_first_write_wins() {
+    use super::{UnbridgeableBridgeOut, UnbridgeableBridgeOutReason};
+
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let note_id = format!("ma18_test_note_{}", rand_u64());
+    let bridge =
+        miden_protocol::account::AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+
+    // Unknown note → None (not an error).
+    assert!(
+        store
+            .get_unbridgeable_bridge_out(&note_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // First write lands and reports true (newly recorded).
+    let first = UnbridgeableBridgeOut {
+        note_id: note_id.clone(),
+        bridge_account: bridge,
+        reason: UnbridgeableBridgeOutReason::StorageParseFailed,
+        detail: "storage too short: 1 felt".to_string(),
+        note_dump: "{\"script_root\":\"0xabc\",\"storage_items\":[0]}".to_string(),
+        observed_block: 42,
+    };
+    assert!(
+        store.record_unbridgeable_bridge_out(first).await.unwrap(),
+        "first quarantine write must report newly-recorded"
+    );
+
+    let row = store
+        .get_unbridgeable_bridge_out(&note_id)
+        .await
+        .unwrap()
+        .expect("quarantine row must round-trip");
+    assert_eq!(row.note_id, note_id);
+    assert_eq!(row.bridge_account, bridge);
+    assert_eq!(row.reason, UnbridgeableBridgeOutReason::StorageParseFailed);
+    assert_eq!(row.detail, "storage too short: 1 felt");
+    assert!(row.note_dump.contains("storage_items"));
+    assert_eq!(row.observed_block, 42);
+
+    // Second write for the same note_id (later tick, different detail) must
+    // be a no-op: reports false, row keeps the FIRST observation.
+    let second = UnbridgeableBridgeOut {
+        note_id: note_id.clone(),
+        bridge_account: bridge,
+        reason: UnbridgeableBridgeOutReason::UnknownFaucet,
+        detail: "overwritten detail".to_string(),
+        note_dump: "{}".to_string(),
+        observed_block: 99,
+    };
+    assert!(
+        !store.record_unbridgeable_bridge_out(second).await.unwrap(),
+        "duplicate quarantine write must report already-recorded"
+    );
+    let row = store
+        .get_unbridgeable_bridge_out(&note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.reason,
+        UnbridgeableBridgeOutReason::StorageParseFailed,
+        "first-write-wins: reason must not be overwritten"
+    );
+    assert_eq!(row.observed_block, 42, "first-write-wins: block preserved");
+    assert_eq!(row.detail, "storage too short: 1 felt");
+}
+
+// ── S3 / S4 / S9 — atomicity + decode-failure hardening ─────
+
+/// S3 — `add_log`'s counter UPDATE + row INSERT run in ONE PG transaction.
+/// A storm of concurrent `add_log` calls must produce exactly one row per
+/// call with all `log_index` values distinct (no dupes) and none missing (no
+/// counter bump without a matching row — the pre-fix gap signature).
+#[tokio::test]
+async fn test_pgstore_s3_add_log_concurrent_storm_no_gaps_no_dupes() {
+    use std::sync::Arc;
+
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store = Arc::new(store);
+
+    const N: usize = 16;
+    // Per-run unique block so this test's rows are isolated from every other
+    // suite writing synthetic_logs into the shared database.
+    let block = 2_000_000 + (rand_u64() % 1_000_000);
+    let run = rand_u64();
+
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let store = store.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .add_log(dummy_log(block, &format!("0xs3_{run}_{i}")))
+                .await
+        }));
+    }
+    for h in handles {
+        h.await.unwrap().expect("concurrent add_log must succeed");
+    }
+
+    let filter = LogFilter {
+        from_block: Some(format!("0x{block:x}")),
+        to_block: Some(format!("0x{block:x}")),
+        address: None,
+        topics: None,
+        block_hash: None,
+    };
+    let logs = store.get_logs(&filter, block).await.unwrap();
+    assert_eq!(
+        logs.len(),
+        N,
+        "every add_log must have exactly one materialised row (no gaps)"
+    );
+    let mut indices: Vec<u64> = logs.iter().map(|l| l.log_index).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(
+        indices.len(),
+        N,
+        "log_index values must be globally unique (no dupes) — the atomic \
+         counter+INSERT must serialise correctly under concurrency"
+    );
+    // Every submitted tx hash landed (nothing silently dropped).
+    for i in 0..N {
+        let want = format!("0xs3_{run}_{i}");
+        assert!(
+            logs.iter().any(|l| l.transaction_hash == want),
+            "log for {want} missing — counter advanced without its row?"
+        );
+    }
+}
+
+/// S4 — `txn_commit` folds the status UPDATE and the materialisation of ALL
+/// attached logs into one PG transaction. Under a storm of concurrent
+/// commits, every committed txn must surface success + its FULL log set
+/// (never success-with-partial-logs), and the inlined per-log counter bumps
+/// must stay collision-free across the storm.
+#[tokio::test]
+async fn test_pgstore_s4_txn_commit_concurrent_storm_status_and_logs_atomic() {
+    use alloy::primitives::{B256, Bytes};
+    use std::sync::Arc;
+
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store = Arc::new(store);
+
+    const N: usize = 8;
+    const LOGS_PER_TXN: usize = 2;
+    let run = rand_u64();
+    let block = 3_000_000 + (run % 1_000_000);
+
+    let mut hashes = Vec::with_capacity(N);
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        // Per-run unique tx hash (transactions.tx_hash is the primary key).
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&run.to_be_bytes());
+        h[31] = i as u8;
+        let tx_hash = TxHash::from(h);
+        hashes.push(tx_hash);
+
+        let mut entry = dummy_txn_entry();
+        entry.logs = (0..LOGS_PER_TXN)
+            .map(|j| {
+                alloy::primitives::LogData::new_unchecked(
+                    vec![B256::from([(i * LOGS_PER_TXN + j) as u8; 32])],
+                    Bytes::from(vec![i as u8, j as u8]),
+                )
+            })
+            .collect();
+
+        let store = store.clone();
+        handles.push(tokio::spawn(async move {
+            store.txn_begin(tx_hash, entry).await?;
+            store.txn_commit(tx_hash, Ok(()), block, [0u8; 32]).await
+        }));
+    }
+    for h in handles {
+        h.await
+            .unwrap()
+            .expect("concurrent txn_commit must succeed");
+    }
+
+    let mut all_indices = Vec::new();
+    for tx_hash in &hashes {
+        let (result, committed_block) = store
+            .txn_receipt(*tx_hash)
+            .await
+            .unwrap()
+            .expect("committed txn must have a receipt");
+        assert!(result.is_ok(), "status must be success");
+        assert_eq!(committed_block, block);
+
+        let logs = store
+            .get_logs_for_tx(&format!("{tx_hash:#x}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            logs.len(),
+            LOGS_PER_TXN,
+            "success status must NEVER be visible with a partial log set (S4)"
+        );
+        all_indices.extend(logs.iter().map(|l| l.log_index));
+    }
+    let mut deduped = all_indices.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        N * LOGS_PER_TXN,
+        "inlined counter bumps inside txn_commit must not collide across \
+         concurrent commits"
+    );
+}
+
+/// S9 — a corrupted `envelope_bytes` row must surface as `Err` from
+/// `txn_get`, NOT as `Ok(None)` (which lied "tx not found" to
+/// `eth_getTransactionByHash` pre-fix). The garbage row is injected directly
+/// through a raw connection, bypassing the store's write path.
+#[tokio::test]
+async fn test_pgstore_s9_corrupt_envelope_row_surfaces_error() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    tokio::spawn(conn);
+
+    let mut h = [0u8; 32];
+    h[..8].copy_from_slice(&rand_u64().to_be_bytes());
+    h[31] = 0x59; // "S9" marker byte
+    let tx_hash = TxHash::from(h);
+    let hash_str = format!("{tx_hash:#x}");
+
+    // Garbage bytes that no TxEnvelope decoder accepts.
+    let garbage: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+    client
+        .execute(
+            "INSERT INTO transactions (tx_hash, envelope_bytes, signer, status, block_number) \
+             VALUES ($1, $2, $3, 'success', 1)",
+            &[&hash_str, &garbage, &format!("{:#x}", Address::ZERO)],
+        )
+        .await
+        .expect("garbage row insert");
+
+    let result = store.txn_get(tx_hash).await;
+    let err = result.expect_err(
+        "corrupt TxEnvelope row must surface Err — Ok(None) would mask \
+         corruption as tx-not-found (S9)",
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cannot be decoded"),
+        "error must say the envelope failed to decode, got: {msg}"
+    );
+}
+
 /// Cheap, dependency-free PRNG seed source — `std::time` is enough to
 /// produce a per-run unique 8-byte prefix for the test fixtures above.
 fn rand_u64() -> u64 {

@@ -75,6 +75,18 @@ pub struct InMemoryStore {
     monitor_burn_serials: RwLock<HashSet<[u8; 32]>>,
     monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
     monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
+
+    // Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) —
+    // last fully-projected Miden block height. Field-backed mirror of the
+    // PgStore `service_state.projector_cursor` column. See
+    // Store::get_projector_cursor / docs/SYNTHETIC-INDEXER-REDESIGN.md.
+    projector_cursor: RwLock<u64>,
+
+    // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
+    // first-write-wins evm_tx_hash -> note_commitment, with the reverse index
+    // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
+    tx_note_links: RwLock<HashMap<String, String>>,
+    note_tx_links: RwLock<HashMap<String, String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +124,9 @@ impl InMemoryStore {
             monitor_burn_serials: RwLock::new(HashSet::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
+            projector_cursor: RwLock::new(0),
+            tx_note_links: RwLock::new(HashMap::new()),
+            note_tx_links: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -139,6 +154,48 @@ impl Store for InMemoryStore {
         let mut num = self.latest_block_number.write();
         *num += 1;
         Ok(*num)
+    }
+
+    // ── Synthetic projector cursor (Phase 2a) ────────────────────
+
+    async fn get_projector_cursor(&self) -> anyhow::Result<u64> {
+        Ok(*self.projector_cursor.read())
+    }
+
+    async fn set_projector_cursor(&self, block: u64) -> anyhow::Result<()> {
+        *self.projector_cursor.write() = block;
+        Ok(())
+    }
+
+    // ── Receipts map (Phase 2b substrate; unused in 2a) ──────────
+
+    async fn record_tx_note_link(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<()> {
+        // First-write-wins on the forward map; a second write for an
+        // already-linked tx_hash is a no-op. The reverse index mirrors the
+        // same first association so note -> tx stays consistent.
+        let mut fwd = self.tx_note_links.write();
+        if fwd.contains_key(tx_hash) {
+            return Ok(());
+        }
+        fwd.insert(tx_hash.to_string(), note_commitment.to_string());
+        drop(fwd);
+        self.note_tx_links
+            .write()
+            .entry(note_commitment.to_string())
+            .or_insert_with(|| tx_hash.to_string());
+        Ok(())
+    }
+
+    async fn get_note_link_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.tx_note_links.read().get(tx_hash).cloned())
+    }
+
+    async fn get_tx_for_note(&self, note_commitment: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.note_tx_links.read().get(note_commitment).cloned())
     }
 
     // ── Logs ─────────────────────────────────────────────────────
@@ -825,6 +882,64 @@ mod tests {
         assert_eq!(store.get_latest_block_number().await.unwrap(), 42);
         assert_eq!(store.advance_block_number().await.unwrap(), 43);
         assert_eq!(store.get_latest_block_number().await.unwrap(), 43);
+    }
+
+    #[tokio::test]
+    async fn test_projector_cursor_round_trip() {
+        // Synthetic-indexer redesign (Phase 2a): the projector cursor defaults
+        // to 0 on a fresh store and round-trips through set/get.
+        let store = InMemoryStore::new();
+        assert_eq!(
+            store.get_projector_cursor().await.unwrap(),
+            0,
+            "fresh store cursor must default to 0"
+        );
+        store.set_projector_cursor(7).await.unwrap();
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 7);
+        // Overwrites (the projector advances monotonically but the store does
+        // not enforce it — it just persists whatever the single owner writes).
+        store.set_projector_cursor(42).await.unwrap();
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_tx_note_link_first_write_wins() {
+        // Receipts map (Phase 2b substrate): first-write-wins forward map plus a
+        // consistent reverse index.
+        let store = InMemoryStore::new();
+        assert_eq!(store.get_note_link_for_tx("0xtx1").await.unwrap(), None);
+        assert_eq!(store.get_tx_for_note("note_a").await.unwrap(), None);
+
+        store.record_tx_note_link("0xtx1", "note_a").await.unwrap();
+        assert_eq!(
+            store.get_note_link_for_tx("0xtx1").await.unwrap(),
+            Some("note_a".to_string())
+        );
+        assert_eq!(
+            store.get_tx_for_note("note_a").await.unwrap(),
+            Some("0xtx1".to_string())
+        );
+
+        // First-write-wins: a second link for the same tx_hash is a no-op.
+        store.record_tx_note_link("0xtx1", "note_b").await.unwrap();
+        assert_eq!(
+            store.get_note_link_for_tx("0xtx1").await.unwrap(),
+            Some("note_a".to_string()),
+            "second write for an existing tx_hash must not overwrite"
+        );
+        // The reverse index for the losing commitment was never created.
+        assert_eq!(store.get_tx_for_note("note_b").await.unwrap(), None);
+
+        // A distinct tx_hash links independently.
+        store.record_tx_note_link("0xtx2", "note_c").await.unwrap();
+        assert_eq!(
+            store.get_note_link_for_tx("0xtx2").await.unwrap(),
+            Some("note_c".to_string())
+        );
+        assert_eq!(
+            store.get_tx_for_note("note_c").await.unwrap(),
+            Some("0xtx2".to_string())
+        );
     }
 
     #[tokio::test]

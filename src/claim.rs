@@ -2,8 +2,7 @@ use crate::accounts_config::AccountsConfig;
 use crate::faucet_ops;
 use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::{FaucetEntry, Store};
-use alloy::primitives::{BlockNumber, Bytes, FixedBytes, LogData};
-use alloy::sol_types::SolEvent;
+use alloy::primitives::{BlockNumber, Bytes, FixedBytes};
 use miden_base_agglayer::{
     ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
     ProofData, SmtNode,
@@ -14,6 +13,35 @@ use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::note::Note;
 use miden_protocol::transaction::TransactionId;
 use std::sync::{Arc, OnceLock};
+
+pub const CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV: &str = "AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS";
+pub const DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS: u64 = 120;
+
+pub fn claim_receipt_expiration_blocks() -> u64 {
+    match std::env::var(CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(blocks) if blocks >= 1 => blocks,
+            Ok(blocks) => {
+                tracing::warn!(
+                    env = CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV,
+                    value = blocks,
+                    "{CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV} must be >= 1 block; using default {DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS}"
+                );
+                DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS
+            }
+            Err(err) => {
+                tracing::warn!(
+                    env = CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV,
+                    value = %value,
+                    error = %err,
+                    "invalid {CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV}; using default {DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS}"
+                );
+                DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS
+            }
+        },
+        Err(_) => DEFAULT_CLAIM_RECEIPT_EXPIRATION_BLOCKS,
+    }
+}
 
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L556
@@ -379,9 +407,10 @@ async fn create_claim(
 pub struct PublishClaimTxn {
     pub txn_id: TransactionId,
     pub expires_at: BlockNumber,
-    pub log: LogData,
-    /// CLAIM note ID for consumption tracking (deferred receipts).
-    pub claim_note_id: Option<String>,
+    /// Hex `details_commitment()` of the on-chain CLAIM note — the key the
+    /// SyntheticProjector uses to recover the real claim eth-tx for the
+    /// consumed note (see `record_tx_note_link` / `get_tx_for_note`).
+    pub note_commitment: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -435,9 +464,19 @@ async fn publish_claim_internal(
     )
     .await?;
     let claim_note_id = claim_note.id().to_string();
+    // The note's details-commitment, encoded identically to how the projector
+    // keys consumed notes (`InputNoteRecord::details_commitment()`). This ties
+    // the real claim eth-tx to the on-chain CLAIM note so the SyntheticProjector
+    // can emit the ClaimEvent under the REAL tx hash (which carries the
+    // `claimAsset` calldata aggkit decodes for the claim's GER boundary) instead
+    // of a derived hash whose synthetic tx has empty calldata.
+    let note_commitment = hex::encode(
+        miden_protocol::note::NoteDetails::from(&claim_note)
+            .commitment()
+            .as_bytes(),
+    );
 
-    const EXPIRATION_DELTA: u16 = 10;
-    let expires_at = latest_block_num + EXPIRATION_DELTA as u64;
+    let expires_at = latest_block_num + claim_receipt_expiration_blocks();
 
     // Wait for the NTX builder to consume the UpdateGerNote on the bridge account.
     // The CLAIM note's FPI calls assert_valid_ger which checks the bridge account's
@@ -638,14 +677,10 @@ async fn publish_claim_internal(
         anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
 
-    let event = ClaimEvent::from(params);
-    let log = event.encode_log_data();
-
     Ok(PublishClaimTxn {
         txn_id,
         expires_at,
-        log,
-        claim_note_id: Some(claim_note_id),
+        note_commitment,
     })
 }
 
@@ -678,22 +713,18 @@ async fn publish_claim_internal(
 ///     check inside `publish_claim_internal` rely on the surrounding
 ///     `with()` mutex, as documented at `find_or_create_faucet`.
 ///
-/// Recording of the `ClaimEvent` happens inside the same closure, before the
-/// caller receives a response, so the event is durable in the store even if
-/// the HTTP client disconnects (cancellation-safe).
-///
-/// Race-safe ordering: write the txn+log at `latest_block + 1` BEFORE bumping
-/// `latest_block_number`. See the matching comment in `bridge_out.rs::on_post_sync`:
-/// advancing the counter first leaves a window where `eth_blockNumber` returns
-/// N but no log exists at block N yet, so aggsender / bridge-service skip the
-/// event entirely.
+/// Recording the PENDING claim receipt (`txn_begin`) + the note↔tx link happens
+/// inside the same closure, before the caller receives a response, so they are
+/// durable even if the HTTP client disconnects (cancellation-safe). The
+/// SyntheticProjector emits the `ClaimEvent` and finalises this receipt (at the
+/// Miden consumption block) when it observes the CLAIM note consumed — no
+/// synthetic log, tip advance, or receipt completion happens in this path.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: Arc<dyn Store>,
-    block_state: std::sync::Arc<crate::block_state::BlockState>,
     latest_block_num: BlockNumber,
     txn_hash: alloy::primitives::TxHash,
     txn_envelope: alloy::consensus::TxEnvelope,
@@ -722,7 +753,6 @@ pub async fn publish_claim(
         client,
         accounts.clone(),
         store.clone(),
-        block_state.clone(),
         latest_block_num,
         txn_hash,
         txn_envelope.clone(),
@@ -746,7 +776,6 @@ pub async fn publish_claim(
                 client,
                 accounts,
                 store,
-                block_state,
                 latest_block_num,
                 txn_hash,
                 txn_envelope,
@@ -767,7 +796,6 @@ async fn attempt_publish_claim(
     client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: Arc<dyn Store>,
-    block_state: std::sync::Arc<crate::block_state::BlockState>,
     latest_block_num: BlockNumber,
     txn_hash: alloy::primitives::TxHash,
     txn_envelope: alloy::consensus::TxEnvelope,
@@ -801,28 +829,40 @@ async fn attempt_publish_claim(
                     local_prover_fallback,
                 )
                 .await?;
-                let block_num = store.get_latest_block_number().await? + 1;
-                let block_hash = block_state.get_block_hash(block_num);
+                // The SyntheticProjector is the sole synthetic-event producer AND the
+                // sole finaliser of this receipt: when it observes the CLAIM note
+                // consumed it emits the ClaimEvent AND `txn_commit`s this tx at that
+                // Miden block — so the receipt block == the log block. This path
+                // records ONLY a PENDING receipt (txn_begin) + the tx↔note link below.
                 store
                     .txn_begin(
                         txn_hash,
                         crate::store::TxnEntry {
-                            id: Some(value.txn_id),
+                            // id: None hides this tx from the StoreSyncListener's
+                            // commit-pending sweep (which finalises by Miden tx id at
+                            // the note's CREATION block); the projector finalises it
+                            // at the CONSUMPTION block instead.
+                            id: None,
                             envelope: txn_envelope,
                             signer,
                             expires_at: Some(value.expires_at),
-                            logs: vec![value.log.clone()],
+                            logs: vec![],
                         },
                     )
                     .await?;
+                // Tie the real claim eth-tx to the on-chain CLAIM note so the
+                // SyntheticProjector emits the ClaimEvent under THIS tx hash —
+                // whose tx carries the `claimAsset` calldata aggkit decodes for the
+                // claim's GER boundary — instead of a derived hash with empty
+                // calldata (which made aggkit's L2BridgeSyncer fail
+                // "input too short: 0 bytes" and stall certificate settlement).
                 store
-                    .txn_commit(txn_hash, Ok(()), block_num, block_hash)
+                    .record_tx_note_link(&format!("{txn_hash:#x}"), &value.note_commitment)
                     .await?;
-                store.set_latest_block_number(block_num).await?;
                 tracing::info!(
                     eth_tx = %txn_hash,
-                    block_num,
-                    "ClaimEvent recorded (cancellation-safe)"
+                    "claim tx recorded pending + note↔tx link; projector finalises \
+                     receipt + ClaimEvent on consumption (cancellation-safe)"
                 );
                 let _ = result_inner.set(value);
                 Ok(())
@@ -874,6 +914,85 @@ mod tests {
         // Address not registered in the test seed
         let entry = store.get_faucet_by_origin(&[0xBB; 20], 0).await.unwrap();
         assert!(entry.is_none());
+    }
+
+    /// Cantina #1 — the ACTUAL refusal branch in `find_or_create_faucet`
+    /// (the store query helper is pinned separately by
+    /// `cantina_1_find_faucets_by_origin_address_surfaces_cross_network_collision`).
+    /// A claim whose origin token address is already registered under a
+    /// DIFFERENT origin network must be refused before any faucet deploy is
+    /// attempted: the on-chain bridge registry keys faucets by
+    /// `hash(origin_token_address)` alone, so auto-creating would silently
+    /// overwrite the existing registration. Uses a real (offline)
+    /// `MidenClientLib` — the refusal fires before the client is ever touched,
+    /// which this test also proves (an RPC attempt against the dead localhost
+    /// endpoint would surface as a connection error, not the collision error).
+    #[tokio::test]
+    async fn cantina_1_find_or_create_faucet_refuses_cross_network_collision() {
+        use alloy::primitives::Address;
+
+        let store = InMemoryStore::new();
+        let token = [0xABu8; 20];
+        // The token is already registered under origin network 5.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap(),
+                origin_address: token,
+                origin_network: 5,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let accounts = crate::test_helpers::test_accounts_config();
+
+        // Same token address, DIFFERENT origin network (0) → refusal.
+        let err = find_or_create_faucet(
+            Address::from(token),
+            0,
+            &Bytes::new(),
+            &store,
+            &mut client,
+            &accounts.0,
+        )
+        .await
+        .expect_err("cross-network collision must refuse auto-create");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Cross-network token-address collision"),
+            "error must name the Cantina #1 conflict, got: {msg}"
+        );
+        assert!(
+            msg.contains("already registered under network 5"),
+            "error must surface the colliding network for the operator, got: {msg}"
+        );
+
+        // No new faucet was deployed or registered — the original route is
+        // untouched and remains the only one for this token address.
+        let routes = store.find_faucets_by_origin_address(&token).await.unwrap();
+        assert_eq!(routes.len(), 1, "refusal must not register a second faucet");
+        assert_eq!(routes[0].origin_network, 5);
+
+        // Control: the SAME (address, network) pair still resolves via the
+        // fast path — the refusal is scoped to cross-network collisions only.
+        let same = find_or_create_faucet(
+            Address::from(token),
+            5,
+            &Bytes::new(),
+            &store,
+            &mut client,
+            &accounts.0,
+        )
+        .await
+        .expect("same-network lookup must keep working");
+        assert_eq!(same.decimals, 8);
+        assert_eq!(same.origin_token_decimals, 18);
     }
 
     #[test]
