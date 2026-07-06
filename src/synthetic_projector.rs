@@ -283,7 +283,9 @@ impl SyntheticProjector {
                                 }
                                 // Any other per-note failure stays fatal.
                                 Err(e) => {
-                                    return Err(anyhow::anyhow!("import_notes(1): {e}"));
+                                    return Err(anyhow::anyhow!(
+                                        "import_notes(1, note_id={id}, window={from}..{to}): {e}"
+                                    ));
                                 }
                             }
                         }
