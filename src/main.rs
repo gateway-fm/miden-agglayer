@@ -333,6 +333,15 @@ impl std::fmt::Debug for Command {
 async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
+    // Install the process-wide Prometheus recorder FIRST — before any thread
+    // or runtime that can emit a metric exists. `metrics` resolves the global
+    // recorder per macro call, so this single install covers the MidenClient's
+    // dedicated second runtime/thread, the writer worker, and the L1 indexer;
+    // but anything emitted BEFORE this line would go to the no-op recorder and
+    // silently vanish from /metrics (which is exactly what happened when the
+    // install lived after client construction — init/restore/early-sync
+    // emissions never reached the served registry).
+    let metrics_handle = miden_agglayer_service::metrics::install_prometheus_recorder()?;
     miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
     // Install the read-only switch BEFORE any client / submit path exists so
     // the guarantee holds from the very first instruction that could mutate
@@ -780,39 +789,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Initialize metrics.
-    //
-    // Histograms registered with `metrics-exporter-prometheus` default to the
-    // Prometheus *summary* representation (a fixed set of quantiles), which
-    // loses p95/p99 fidelity for low-volume metrics and — more importantly —
-    // can't be aggregated across replicas in PromQL. For the two latency
-    // metrics we actually care about (proof generation, JSON-RPC requests)
-    // we install explicit bucket sets so they're emitted as real
-    // `*_bucket{le="…"}` series. The proof buckets span 100ms (local prover
-    // warm) → 5min (remote prover under load) because bali has empirically
-    // seen 60–120s p99 proves; the RPC buckets are typical hot-path latencies
-    // (1ms → 5s). Both metric names match the `histogram!()` call-site
-    // strings in `metrics.rs` / `service.rs` exactly — using `Matcher::Full`
-    // means a typo here silently falls back to summary, so add a test if
-    // either name changes.
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full("miden_proof_duration_seconds".to_string()),
-            &[
-                0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
-            ],
-        )
-        .context("set_buckets_for_metric (miden_proof_duration_seconds) failed")?
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full("rpc_request_duration_seconds".to_string()),
-            &[
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-            ],
-        )
-        .context("set_buckets_for_metric (rpc_request_duration_seconds) failed")?
-        .install_recorder()
-        .context("failed to install metrics recorder")?;
-    miden_agglayer_service::metrics::init_metrics();
+    // (Metrics recorder + `init_metrics` are installed at the very top of
+    // main, before any metric-emitting thread exists — see
+    // `metrics::install_prometheus_recorder`.)
 
     // RD-940 Phase 5 — read the previous process's graceful-shutdown
     // snapshot. A non-zero value means in-flight WriteJobs whose hashes

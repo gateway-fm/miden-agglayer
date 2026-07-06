@@ -67,7 +67,11 @@ clap = { features = ["derive", "env"], version = "4.5" }
 # read path that touches it on every aggkit poll).
 dashmap = { version = "6" }
 hex = { version = "0.4" }
-metrics = { version = "0.24" }
+# 0.24.6 minimum: 0.24.5 (since yanked) shipped a broken KeyHasher — registry
+# lookups missed on (almost) every emission, so /metrics rendered frozen gauges
+# and non-cumulative counters (live-observed; see
+# metrics::tests::metrics_from_second_runtime_render_cumulatively).
+metrics = { version = "0.24.6" }
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
