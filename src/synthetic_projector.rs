@@ -73,6 +73,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// per-tick RPC work; catch-up from genesis proceeds at CHUNK blocks/tick.
 const RECONCILE_CHUNK: u64 = 200;
 
+/// True iff `e` is miden-client's un-recoverable "note is private" import
+/// rejection. A private note imported by [`NoteId`] lacks the details the
+/// client needs, so `import_notes` fails (prod 0.15.5: "Incomplete imported
+/// note is private"); a private *historical* note never becomes importable.
+/// The note-visibility reconciler skips such notes instead of failing the
+/// whole batch — otherwise it retries the same block window forever and the
+/// retroactive-heal sweep freezes. Safe to skip: bridge exits (B2AGG) are
+/// PUBLIC notes, so a private note is never a real exit. Matched on the
+/// rendered error text (the client surfaces this opaquely by the time it
+/// reaches us — same approach as `sqlite_pragmas::is_store_locked`, RD-1112).
+fn is_private_note_import_error<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
+    format!("{e}").to_lowercase().contains("is private")
+}
+
 /// The synthetic projector. Owns the cursor (last projected Miden block height)
 /// and, when registered as the live [`SyncListener`], is the **sole** assigner
 /// of the synthetic tip (`Store::latest_block_number`) — so there is no
@@ -225,16 +239,70 @@ impl SyntheticProjector {
                 .copied()
                 .collect();
             if !unknown_ids.is_empty() {
-                let n = unknown_ids.len();
+                // HOTFIX (0.15.5 reconciler wedge): fast path is ONE atomic
+                // batch import; only fall back to the slower per-note import if
+                // the batch fails because a note is private. miden-client
+                // rejects an import with "Incomplete imported note is private",
+                // and a private *historical* note never becomes importable — so
+                // an atomic batch containing one private note fails on every
+                // tick and freezes the sweep on the same block window forever
+                // (the retry path treats it as transient, but it is not). The
+                // per-note retry skips just the private notes: bridge exits
+                // (B2AGG) are PUBLIC notes, so a private note is never a real
+                // exit — skipping it cannot drop an exit. The
+                // `synthetic_reconciler_private_skipped_total` metric keeps the
+                // skips auditable.
                 let files: Vec<NoteFile> =
                     unknown_ids.iter().map(|id| NoteFile::NoteId(*id)).collect();
-                client
+                let (attempted, skipped_private): (Vec<NoteId>, usize) = match client
                     .import_notes(&files)
                     .await
-                    .map_err(|e| anyhow::anyhow!("import_notes({n}): {e}"))?;
-                metrics::counter!("synthetic_reconciler_notes_imported_total").increment(n as u64);
+                {
+                    // Common case: whole batch imported in one call.
+                    Ok(_) => (unknown_ids.clone(), 0),
+                    // Batch poisoned by >=1 private note — retry per-note,
+                    // skipping the private ones so the sweep can advance.
+                    Err(e) if is_private_note_import_error(&e) => {
+                        let mut ok: Vec<NoteId> = Vec::with_capacity(unknown_ids.len());
+                        let mut skipped = 0usize;
+                        for id in &unknown_ids {
+                            let file = NoteFile::NoteId(*id);
+                            match client.import_notes(std::slice::from_ref(&file)).await {
+                                Ok(_) => ok.push(*id),
+                                Err(e) if is_private_note_import_error(&e) => {
+                                    skipped += 1;
+                                    metrics::counter!("synthetic_reconciler_private_skipped_total")
+                                        .increment(1);
+                                    tracing::warn!(
+                                        note_id = %id,
+                                        from,
+                                        to,
+                                        "note reconciler: skipping un-importable private \
+                                         network note"
+                                    );
+                                }
+                                // Any other per-note failure stays fatal.
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!("import_notes(1): {e}"));
+                                }
+                            }
+                        }
+                        (ok, skipped)
+                    }
+                    // Non-private batch failure is still fatal (stays loud).
+                    Err(e) => {
+                        let n = unknown_ids.len();
+                        return Err(anyhow::anyhow!("import_notes({n}): {e}"));
+                    }
+                };
+                let imported = attempted.len();
+                if imported > 0 {
+                    metrics::counter!("synthetic_reconciler_notes_imported_total")
+                        .increment(imported as u64);
+                }
                 tracing::info!(
-                    imported = n,
+                    imported,
+                    skipped_private,
                     from,
                     to,
                     "note reconciler: imported network notes missed by sync"
@@ -243,30 +311,32 @@ impl SyntheticProjector {
                 // for notes it silently DROPPED because they were already
                 // consumed at import time (miden-client 0.15 bug — see the
                 // `direct_recovered` field docs). Re-query which of the
-                // unknown ids actually landed; the rest must be projected
+                // attempted ids actually landed; the rest must be projected
                 // directly from node data or their BridgeEvents are lost.
-                let landed: HashSet<NoteId> = client
-                    .get_input_notes(NoteFilter::List(unknown_ids.clone()))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?
-                    .into_iter()
-                    .filter_map(|rec| rec.id())
-                    .collect();
-                let missing: Vec<NoteId> = unknown_ids
-                    .into_iter()
-                    .filter(|id| !landed.contains(id))
-                    .collect();
-                if !missing.is_empty() {
-                    metrics::counter!("synthetic_reconciler_import_dropped_total")
-                        .increment(missing.len() as u64);
-                    tracing::warn!(
-                        dropped = missing.len(),
-                        from,
-                        to,
-                        "note reconciler: import silently dropped consumed notes; \
-                         attempting direct projection recovery"
-                    );
-                    self.recover_spent_before_import(rpc, &missing).await?;
+                if !attempted.is_empty() {
+                    let landed: HashSet<NoteId> = client
+                        .get_input_notes(NoteFilter::List(attempted.clone()))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?
+                        .into_iter()
+                        .filter_map(|rec| rec.id())
+                        .collect();
+                    let missing: Vec<NoteId> = attempted
+                        .into_iter()
+                        .filter(|id| !landed.contains(id))
+                        .collect();
+                    if !missing.is_empty() {
+                        metrics::counter!("synthetic_reconciler_import_dropped_total")
+                            .increment(missing.len() as u64);
+                        tracing::warn!(
+                            dropped = missing.len(),
+                            from,
+                            to,
+                            "note reconciler: import silently dropped consumed notes; \
+                             attempting direct projection recovery"
+                        );
+                        self.recover_spent_before_import(rpc, &missing).await?;
+                    }
                 }
             }
         }
@@ -893,6 +963,28 @@ mod tests {
     };
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
+
+    /// Reconciler private-note wedge (0.15.5 hotfix): the exact miden-client
+    /// rejection that froze the retroactive-heal sweep must be classified as
+    /// skippable, so the reconciler drops just the private note and advances —
+    /// while unrelated errors still propagate and fail the tick (stay loud).
+    #[test]
+    fn private_note_import_error_is_recognized() {
+        // The literal error observed in prod (0.15.5).
+        assert!(is_private_note_import_error(
+            "Incomplete imported note is private"
+        ));
+        // Wrapped / prefixed in an error chain, and case-insensitive.
+        assert!(is_private_note_import_error(&anyhow::anyhow!(
+            "import_notes(20): Incomplete imported note is private"
+        )));
+        assert!(is_private_note_import_error("NOTE IS PRIVATE"));
+        // Unrelated failures must NOT be swallowed — they keep failing the tick.
+        assert!(!is_private_note_import_error("database is locked"));
+        assert!(!is_private_note_import_error(&anyhow::anyhow!(
+            "sync_notes(1..200): connection reset by peer"
+        )));
+    }
 
     // Four mutually-distinct, valid protocol-0.15 account ids reused from the
     // restore/bridge_out test fixtures. `FAUCET` is a real fungible-faucet id so
