@@ -992,4 +992,86 @@ mod tests {
             "on_post_sync must dispatch again once the pause is released"
         );
     }
+
+    /// Cantina #23 regression lock (invariant b: restore pauses the live
+    /// listeners). Complements
+    /// [`finding_23_scanner_is_monitor_only`](crate::bridge_out) (invariant a).
+    ///
+    /// The pre-fix `MidenClient::new` spawned the sync loop with the
+    /// `BridgeOutScanner` registered BEFORE `restore()` ran, so `on_post_sync`
+    /// fired against the same `NoteFilter::Consumed` set restore was replaying.
+    /// The fix gives restore a `pause_listeners()` guard (installed at
+    /// `restore.rs:203`) that gates `on_post_sync` dispatch off for the whole
+    /// restore window while the cheap sync keeps the local store fresh.
+    ///
+    /// Unlike `ma23_on_post_sync_dispatch_suppressed_while_paused` (which drives
+    /// the gate through a standalone `AtomicBool`), this pins the end-to-end
+    /// primitive restore actually uses: the guard returned by
+    /// `client.pause_listeners()` toggles the client's own `listeners_paused`
+    /// flag, and `MidenClient::on_sync` reads that same flag. While the guard is
+    /// held, `on_post_sync` is suppressed; once it drops (restore complete), the
+    /// next tick dispatches again. A pre-fix build with no such guard would
+    /// dispatch on tick 1, failing the first assertion.
+    #[tokio::test]
+    async fn finding_23_restore_pauses_listeners() {
+        use miden_protocol::block::BlockNumber;
+
+        #[derive(Default)]
+        struct CountingListener {
+            on_post_sync_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl SyncListener for CountingListener {
+            fn on_sync(&self, _summary: &SyncSummary) {}
+            async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
+                self.on_post_sync_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let client = MidenClient::new_test();
+        let mut lib = crate::test_helpers::offline_miden_client_lib().await;
+        let listener = Arc::new(CountingListener::default());
+        let listeners: Vec<Arc<dyn SyncListener>> = vec![listener.clone()];
+
+        // Install the EXACT guard restore installs (restore.rs:203). It toggles
+        // the client's own `listeners_paused` flag, which `on_sync` consults.
+        let guard = client.pause_listeners();
+        assert!(client.listeners_paused(), "restore's guard pauses dispatch");
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(1u32))),
+            &mut lib,
+            &listeners,
+            &client.listeners_paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listener.on_post_sync_calls.load(Ordering::SeqCst),
+            0,
+            "while restore holds the pause guard, on_post_sync must NOT dispatch — \
+             the live scanner cannot race the restore replay"
+        );
+
+        // Restore finished → guard dropped → the next tick dispatches again.
+        drop(guard);
+        assert!(
+            !client.listeners_paused(),
+            "dropping the guard resumes dispatch"
+        );
+        MidenClient::on_sync(
+            Ok(SyncSummary::new_empty(BlockNumber::from(2u32))),
+            &mut lib,
+            &listeners,
+            &client.listeners_paused,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listener.on_post_sync_calls.load(Ordering::SeqCst),
+            1,
+            "once restore releases the guard, on_post_sync dispatch resumes"
+        );
+    }
 }

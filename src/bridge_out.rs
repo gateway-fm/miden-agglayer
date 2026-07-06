@@ -406,18 +406,28 @@ pub(crate) fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
     out
 }
 
-#[async_trait::async_trait]
-impl SyncListener for BridgeOutScanner {
-    fn on_sync(&self, _summary: &SyncSummary) {
-        // no-op — scanning happens in on_post_sync where we have client access
-    }
-
-    async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
-        let consumed_notes = client
-            .get_input_notes(NoteFilter::Consumed)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
-
+impl BridgeOutScanner {
+    /// Cantina #23 / #19 — client-free, **MONITOR-ONLY** pass over the
+    /// consumed-note set. Records every observed note into the twin (#6),
+    /// burn-serial (#5) and forged-MINT (#2/#4) trackers and emits the matching
+    /// metrics/logs, and returns the set of CLAIM note-ids seen consumed this
+    /// tick (fed to the expected-MINT tracker, #7).
+    ///
+    /// It performs **NO** tip advance and writes **NO** BridgeEvent. The
+    /// pre-redesign `BridgeOutScanner` advanced `latest_block_number` and
+    /// inserted a BridgeEvent for *each* consumed B2AGG note inside this very
+    /// loop — which (a) raced the `restore()` replay writing the same events at a
+    /// different block height (Cantina #23) and (b) bumped the block once per
+    /// note, scattering a single Miden tx's notes across many synthetic blocks
+    /// (Cantina #19). Emission and tip-advance now belong solely to the
+    /// [`SyntheticProjector`](crate::synthetic_projector).
+    ///
+    /// Extracted as a testable seam so the monitor-only invariant is
+    /// regression-locked by `finding_23_scanner_is_monitor_only`.
+    async fn scan_consumed_notes_monitors(
+        &self,
+        consumed_notes: &[InputNoteRecord],
+    ) -> std::collections::HashSet<[u8; 32]> {
         // Cantina #6 — feed every observed note's NoteId + commitment into the
         // twin-detector. Same-NoteId-different-commitment is the B2AGG twin
         // attack signature.
@@ -445,7 +455,7 @@ impl SyncListener for BridgeOutScanner {
             .map(|v| v.into_iter().map(|f| f.faucet_id).collect())
             .unwrap_or_default();
 
-        for note in &consumed_notes {
+        for note in consumed_notes {
             let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
             let Some(commitment_word) = note.commitment() else {
                 // Notes without a commitment (incomplete InputNoteRecord)
@@ -598,6 +608,32 @@ impl SyncListener for BridgeOutScanner {
                 }
             }
         }
+
+        landed_claim_ids
+    }
+}
+
+#[async_trait::async_trait]
+impl SyncListener for BridgeOutScanner {
+    fn on_sync(&self, _summary: &SyncSummary) {
+        // no-op — scanning happens in on_post_sync where we have client access
+    }
+
+    async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
+        let consumed_notes = client
+            .get_input_notes(NoteFilter::Consumed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+
+        // Cantina #23 + #19 — the per-note pass is MONITOR-ONLY: it records into
+        // the twin (#6) / burn-serial (#5) / forged-MINT (#2/#4) trackers and
+        // emits metrics, and returns the CLAIM ids seen consumed (for the #7
+        // expected-MINT tracker). It NEVER advances `latest_block_number` nor
+        // writes a BridgeEvent — the pre-redesign scanner did both here, once per
+        // consumed B2AGG note, which raced `restore()` (#23) and misnumbered
+        // synthetic blocks (#19). The SyntheticProjector is now the sole
+        // emitter/tip-advancer.
+        let landed_claim_ids = self.scan_consumed_notes_monitors(&consumed_notes).await;
 
         // Cantina #9 — LET divergence monitor. After processing consumed
         // notes, FPI-query the bridge account's `let_num_leaves` slot and
@@ -1836,6 +1872,91 @@ mod tests {
         assert_eq!(
             classify_bridge_consumer_script(foreign, b2agg, claim),
             BridgeConsumerScript::Unknown
+        );
+    }
+
+    /// Cantina #23 regression lock (invariant a: the scanner is MONITOR-ONLY).
+    ///
+    /// The pre-redesign `BridgeOutScanner::on_post_sync` advanced
+    /// `latest_block_number` and inserted a `BridgeEvent` for each unprocessed
+    /// consumed B2AGG note, in the same `NoteFilter::Consumed` loop `restore()`
+    /// walks — the race in finding #23 (and the per-note block bump in #19). The
+    /// redesign made the scanner monitor-only: it records into the twin/burn/mint
+    /// trackers and emits metrics, but the `SyntheticProjector` is the sole
+    /// emitter/tip-advancer.
+    ///
+    /// This drives the exact per-note pass (`scan_consumed_notes_monitors`, the
+    /// client-free core of `on_post_sync`) over a fabricated bridge-consumed,
+    /// UNPROCESSED B2AGG note and asserts the scanner:
+    ///   * does NOT advance the store tip (`get_latest_block_number` unchanged),
+    ///   * writes NO synthetic log / BridgeEvent,
+    ///   * does NOT mark the note processed (that too belongs to the projector).
+    /// A pre-fix scanner given this same note advanced the tip and wrote an event
+    /// (its advance did not depend on the note's commitment), so every assertion
+    /// below would have failed. The complementary invariant (b) — that restore's
+    /// `pause_listeners()` guard suppresses `on_post_sync` dispatch — is locked by
+    /// `finding_23_restore_pauses_listeners` and
+    /// `ma23_on_post_sync_dispatch_suppressed_while_paused` in `miden_client`
+    /// (restore installs the guard at `restore.rs:203`).
+    #[tokio::test]
+    async fn finding_23_scanner_is_monitor_only() {
+        use crate::store::memory::InMemoryStore;
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
+        let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let faucet_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+
+        // Seed a distinctive, non-zero tip: any per-note advance would move it.
+        const TIP: u64 = 4242;
+        store.set_latest_block_number(TIP).await.unwrap();
+        store
+            .register_faucet(crate::store::FaucetEntry {
+                faucet_id,
+                origin_address: [0u8; 20],
+                origin_network: 0,
+                symbol: "ETH".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+
+        let scanner = BridgeOutScanner::new(store.clone(), 7, bridge_id);
+
+        // A real bridge-consumed B2AGG note — exactly the kind the pre-fix loop
+        // advanced the tip / emitted a BridgeEvent for.
+        let note = build_b2agg_bridge_out_note(faucet_id, bridge_id);
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let landed = scanner.scan_consumed_notes_monitors(&[note]).await;
+
+        assert!(
+            landed.is_empty(),
+            "a B2AGG note is not a CLAIM — the monitor pass reports no landed claims"
+        );
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            TIP,
+            "MONITOR-ONLY: the scanner must NOT advance the tip (pre-fix bumped it \
+             once per consumed B2AGG note — findings #23 and #19)"
+        );
+        let logs = store
+            .get_logs(&crate::log_synthesis::LogFilter::default(), TIP + 100)
+            .await
+            .unwrap_or_default();
+        assert!(
+            logs.is_empty(),
+            "MONITOR-ONLY: the scanner must emit NO synthetic BridgeEvent (that is \
+             the SyntheticProjector's sole responsibility), got {} log(s)",
+            logs.len()
+        );
+        assert!(
+            !store.is_note_processed(&note_id).await.unwrap(),
+            "MONITOR-ONLY: the scanner must NOT mark the note processed — else it \
+             would race restore's own replay (finding #23)"
         );
     }
 }
