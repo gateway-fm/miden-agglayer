@@ -250,6 +250,10 @@ e2e-claim-watcher: e2e-l1-to-l2 ## After L1→L2, assert the chain-tail CLAIM wa
 e2e-claim-watcher-synthesis: e2e-claim-watcher ## After watcher happy path, simulate desync and assert synthesis fires (RD-860/EFAD repro)
 	$(COMPOSE_ENV) ./scripts/e2e-claim-watcher-synthesis.sh
 
+.PHONY: e2e-claim-provenance
+e2e-claim-provenance: ## Deploy a FOREIGN bridge on the same chain, drive a claim through it, assert zero ClaimEvent leakage (stack must be up)
+	$(COMPOSE_ENV) ./scripts/e2e-claim-provenance.sh
+
 .PHONY: e2e-l2-to-l1
 e2e-l2-to-l1: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund wallet + run L2→L1 bridge-out test (strict)
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1.sh

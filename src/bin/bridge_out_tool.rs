@@ -113,6 +113,60 @@ struct Args {
     /// tx acceptance alone floods the bridge with in-flight consumptions.
     #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 180)]
     wait_consumed_secs: u64,
+
+    /// Foreign-deployment provision mode (claim-provenance e2e): stand up a
+    /// SECOND, fully independent miden-agglayer deployment on the SAME chain —
+    /// foreign service + ger_manager wallets, a foreign bridge account
+    /// (`create_bridge_account`, deployed via dummy txn like init.rs), and a
+    /// foreign ETH faucet registered in the FOREIGN bridge's token registry
+    /// (required for its MASM claim path). Keys live in THIS isolated store.
+    /// Prints the four account ids and exits. Mirrors the real-testnet
+    /// topology where a foreign deployment's claims leaked into our reindex.
+    #[arg(long)]
+    create_foreign_bridge: bool,
+
+    /// AggLayer network id the foreign bridge is created with (its MASM
+    /// rejects claims whose leaf destinationNetwork differs). Use an id our
+    /// own stack does NOT serve (default 2; ours is 1) so the foreign-destined
+    /// deposit is never auto-claimed by our aggkit.
+    #[arg(long, default_value_t = 2)]
+    foreign_network_id: u32,
+
+    /// Foreign-claim mode (claim-provenance e2e): read `claimAsset` calldata
+    /// from --claim-calldata-file, inject its GER (keccak(mainnetExitRoot ||
+    /// rollupExitRoot)) into the FOREIGN bridge via an UpdateGerNote from the
+    /// foreign ger_manager, then build the CLAIM note exactly like
+    /// `claim.rs::create_claim` (shared `claim_storage_from_call`) targeting
+    /// the FOREIGN bridge, submit it from the foreign service account, and
+    /// wait for the foreign bridge to consume it. Prints the note id,
+    /// details-commitment and canonical global index.
+    #[arg(long)]
+    submit_foreign_claim: bool,
+
+    /// Hex file (with or without 0x) containing full `claimAsset` calldata
+    /// (selector + ABI args). Required with --submit-foreign-claim.
+    #[arg(long)]
+    claim_calldata_file: Option<PathBuf>,
+
+    /// Foreign bridge account id. Required with --submit-foreign-claim.
+    #[arg(long)]
+    foreign_bridge_id: Option<String>,
+
+    /// Foreign service account id (mints the CLAIM — the foreign deployment's
+    /// `accounts.service` analogue). Required with --submit-foreign-claim.
+    #[arg(long)]
+    foreign_service_id: Option<String>,
+
+    /// Foreign ger_manager account id (mints the UpdateGerNote). Required
+    /// with --submit-foreign-claim.
+    #[arg(long)]
+    foreign_ger_manager_id: Option<String>,
+
+    /// `origin_token_decimals - miden_decimals` of the faucet the foreign
+    /// bridge has registered for the claimed token (10 for the standard
+    /// 18→8 ETH faucet created by --create-foreign-bridge).
+    #[arg(long, default_value_t = 10)]
+    scale_exp: u32,
 }
 
 impl std::fmt::Debug for Args {
@@ -177,8 +231,8 @@ async fn main() -> anyhow::Result<()> {
     let store_path = args.store_dir.join("store.sqlite3");
     let keystore_path = args.store_dir.join("keystore");
 
-    if args.create_wallet {
-        // Provision mode: the store/keystore may not exist yet — create them.
+    if args.create_wallet || args.create_foreign_bridge {
+        // Provision modes: the store/keystore may not exist yet — create them.
         std::fs::create_dir_all(&keystore_path)
             .with_context(|| format!("creating keystore dir {}", keystore_path.display()))?;
     } else {
@@ -267,6 +321,244 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("[create-wallet] wallet-id: {}", wallet.id().to_hex());
         println!("[create-wallet] done");
+        return Ok(());
+    }
+
+    // ── Foreign-deployment provision mode (claim-provenance e2e) ─────────────
+    // Stand up a SECOND independent miden-agglayer deployment on the same
+    // chain, mirroring init.rs::add_accounts: service + ger_manager wallets,
+    // bridge account, ETH faucet registered in the FOREIGN bridge. All keys
+    // live in this isolated store — the proxy's store is never touched.
+    if args.create_foreign_bridge {
+        use miden_agglayer_service::miden_client::{
+            submit_new_transaction, wait_for_transaction_commit,
+        };
+        use miden_base_agglayer::{MetadataHash, create_bridge_account};
+        use miden_client::crypto::FeltRng;
+
+        println!(
+            "[foreign-bridge] provisioning independent deployment in {} (network id {})",
+            store_path.display(),
+            args.foreign_network_id
+        );
+        client
+            .sync_state()
+            .await
+            .map_err(|e| anyhow!("initial sync failed: {e}"))?;
+
+        let service =
+            miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
+                .await
+                .map_err(|e| anyhow!("foreign service wallet creation failed: {e}"))?;
+        let ger_manager =
+            miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
+                .await
+                .map_err(|e| anyhow!("foreign ger_manager wallet creation failed: {e}"))?;
+
+        // Deploy ger_manager via dummy txn (mirrors init.rs::deploy_account).
+        let dummy = TransactionRequestBuilder::new().build()?;
+        let txn_id = submit_new_transaction(&mut client, ger_manager.id(), dummy)
+            .await
+            .map_err(|e| anyhow!("foreign ger_manager deploy failed: {e}"))?;
+        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e}"))?;
+
+        // Foreign bridge (mirrors init.rs::add_bridge).
+        let bridge = create_bridge_account(
+            client.rng().draw_word(),
+            service.id(),
+            ger_manager.id(),
+            args.foreign_network_id,
+        );
+        client
+            .add_account(&bridge, false)
+            .await
+            .map_err(|e| anyhow!("adding foreign bridge account failed: {e}"))?;
+        let dummy = TransactionRequestBuilder::new().build()?;
+        let txn_id = submit_new_transaction(&mut client, bridge.id(), dummy)
+            .await
+            .map_err(|e| anyhow!("foreign bridge deploy failed: {e}"))?;
+        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow!("foreign bridge deploy commit wait failed: {e}"))?;
+
+        // Settle accounts before the faucet registration note targets the bridge
+        // (mirrors init.rs's NTX-builder settlement wait).
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            client.sync_state().await.ok();
+        }
+
+        // Foreign ETH faucet, registered in the FOREIGN bridge's on-chain
+        // token registry — without it the foreign bridge's MASM claim path
+        // panics on the (origin_token, origin_network) registry lookup and the
+        // CLAIM is never consumed. Same parameters as init.rs (18→8, scale 10).
+        let faucet = miden_agglayer_service::faucet_ops::create_and_register_faucet(
+            &mut client,
+            "ETH",
+            8,
+            &[0u8; 20],
+            0,
+            10,
+            service.id(),
+            bridge.id(),
+            MetadataHash::from_abi_encoded(&[]),
+        )
+        .await
+        .map_err(|e| anyhow!("foreign faucet creation/registration failed: {e}"))?;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            client.sync_state().await.ok();
+        }
+
+        // Stable, machine-parseable output — e2e-claim-provenance.sh greps these.
+        println!("[foreign-bridge] service-id: {}", service.id().to_hex());
+        println!(
+            "[foreign-bridge] ger-manager-id: {}",
+            ger_manager.id().to_hex()
+        );
+        println!("[foreign-bridge] bridge-id: {}", bridge.id().to_hex());
+        println!("[foreign-bridge] faucet-id: {}", faucet.id().to_hex());
+        println!("[foreign-bridge] network-id: {}", args.foreign_network_id);
+        println!("[foreign-bridge] done");
+        return Ok(());
+    }
+
+    // ── Foreign-claim mode (claim-provenance e2e) ─────────────────────────────
+    // Drive ONE claim through the FOREIGN bridge: inject its GER, then submit a
+    // CLAIM note (built by the same `claim_storage_from_call` the proxy's claim
+    // path uses) targeting the foreign bridge, and wait for consumption.
+    if args.submit_foreign_claim {
+        use alloy_core::sol_types::SolCall;
+        use miden_agglayer_service::claim::{claim_storage_from_call, claimAssetCall};
+        use miden_agglayer_service::miden_client::submit_new_transaction;
+        use miden_base_agglayer::{ClaimNote, ExitRoot, UpdateGerNote};
+        use miden_client::store::NoteFilter;
+
+        let bridge_id = parse_account_id(
+            args.foreign_bridge_id
+                .as_deref()
+                .context("--foreign-bridge-id is required with --submit-foreign-claim")?,
+        )
+        .context("foreign-bridge-id")?;
+        let service_id = parse_account_id(
+            args.foreign_service_id
+                .as_deref()
+                .context("--foreign-service-id is required with --submit-foreign-claim")?,
+        )
+        .context("foreign-service-id")?;
+        let ger_manager_id = parse_account_id(
+            args.foreign_ger_manager_id
+                .as_deref()
+                .context("--foreign-ger-manager-id is required with --submit-foreign-claim")?,
+        )
+        .context("foreign-ger-manager-id")?;
+        let calldata_path = args
+            .claim_calldata_file
+            .as_ref()
+            .context("--claim-calldata-file is required with --submit-foreign-claim")?;
+
+        let calldata_hex = std::fs::read_to_string(calldata_path)
+            .with_context(|| format!("reading {}", calldata_path.display()))?;
+        let calldata = hex::decode(calldata_hex.trim().trim_start_matches("0x"))
+            .context("claim calldata is not valid hex")?;
+        let call = claimAssetCall::abi_decode(&calldata).context("decoding claimAsset calldata")?;
+        println!(
+            "[foreign-claim] decoded claimAsset: origin_network={} dest_network={} amount={}",
+            call.originNetwork, call.destinationNetwork, call.amount
+        );
+
+        client
+            .sync_state()
+            .await
+            .map_err(|e| anyhow!("initial sync failed: {e}"))?;
+
+        // Wait for an OUTPUT note (by id) to be consumed on-chain, mirroring
+        // the B2AGG wait_consumed loop below.
+        async fn wait_output_consumed(
+            client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+            note_id: miden_protocol::note::NoteId,
+            what: &str,
+            secs: u64,
+        ) -> anyhow::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                client.sync_state().await.ok();
+                let recs = client
+                    .get_output_notes(NoteFilter::Consumed)
+                    .await
+                    .unwrap_or_default();
+                if recs.iter().any(|r| r.id() == note_id) {
+                    return Ok(());
+                }
+            }
+            Err(anyhow!("{what} note {note_id} not consumed within {secs}s"))
+        }
+
+        // 1. Inject the claim's GER into the FOREIGN bridge (the foreign
+        //    ger_manager is its authorized GER sender). The bridge's MASM
+        //    claim path recomputes keccak(mainnetExitRoot || rollupExitRoot)
+        //    and requires it in the bridge's GER map.
+        let ger_bytes = miden_agglayer_service::ger::combined_ger(
+            &call.mainnetExitRoot.0,
+            &call.rollupExitRoot.0,
+        );
+        let ger_note = UpdateGerNote::create(
+            ExitRoot::new(ger_bytes),
+            ger_manager_id,
+            bridge_id,
+            client.rng(),
+        )?;
+        let ger_note_id = ger_note.id();
+        println!(
+            "[foreign-claim] injecting GER 0x{} into foreign bridge (note {ger_note_id})",
+            hex::encode(ger_bytes)
+        );
+        let tx_request = TransactionRequestBuilder::new()
+            .own_output_notes(vec![ger_note])
+            .build()?;
+        let txn_id = submit_new_transaction(&mut client, ger_manager_id, tx_request)
+            .await
+            .map_err(|e| anyhow!("foreign GER inject submit failed: {e}"))?;
+        println!("[foreign-claim] GER inject transaction submitted: {txn_id}");
+        wait_output_consumed(&mut client, ger_note_id, "foreign UpdateGer", 240).await?;
+        println!("[foreign-claim] GER injected (UpdateGerNote consumed by foreign bridge)");
+
+        // 2. Build + submit the CLAIM note against the FOREIGN bridge — the
+        //    same storage the proxy's create_claim would build, minted by the
+        //    FOREIGN service and targeting the FOREIGN bridge.
+        let storage = claim_storage_from_call(&call, args.scale_exp)?;
+        let note = ClaimNote::create(storage, bridge_id, service_id, client.rng())?;
+        let note_id = note.id();
+        let note_commitment = hex::encode(
+            miden_protocol::note::NoteDetails::from(&note)
+                .commitment()
+                .as_bytes(),
+        );
+        // Canonical global index — what a projector would record in a
+        // ClaimEvent for this note (mirrors build_canonical_proof_data:
+        // mainnet rollup-index bytes zeroed).
+        let mut gi = call.globalIndex.to_be_bytes::<32>();
+        let mainnet_flag = u32::from_be_bytes([gi[20], gi[21], gi[22], gi[23]]);
+        if mainnet_flag == 1 {
+            gi[24..28].fill(0);
+        }
+        let tx_request = TransactionRequestBuilder::new()
+            .own_output_notes(vec![note])
+            .build()?;
+        let txn_id = submit_new_transaction(&mut client, service_id, tx_request)
+            .await
+            .map_err(|e| anyhow!("foreign CLAIM submit failed: {e}"))?;
+        println!("[foreign-claim] CLAIM transaction submitted: {txn_id}");
+        wait_output_consumed(&mut client, note_id, "foreign CLAIM", 300).await?;
+
+        // Stable, machine-parseable output — e2e-claim-provenance.sh greps these.
+        println!("[foreign-claim] note-id: {note_id}");
+        println!("[foreign-claim] note-commitment: {note_commitment}");
+        println!("[foreign-claim] global-index: 0x{}", hex::encode(gi));
+        println!("[foreign-claim] done");
         return Ok(());
     }
 

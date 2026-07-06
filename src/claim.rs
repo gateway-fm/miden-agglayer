@@ -403,6 +403,41 @@ async fn create_claim(
     Ok(note)
 }
 
+/// Build the on-chain [`ClaimNoteStorage`] for a decoded `claimAsset` call —
+/// the exact storage `create_claim` puts on a CLAIM note (same
+/// [`build_canonical_proof_data`] canonicalisation, same [`LeafData`] mapping,
+/// same amount scaling), factored so `bridge-out-tool`'s foreign-bridge e2e
+/// mode (`--submit-foreign-claim`) can construct a byte-identical CLAIM
+/// against a SECOND agglayer deployment on the same chain.
+///
+/// `scale_exp` is `origin_token_decimals - miden_decimals` for the faucet the
+/// consuming bridge has registered for `(originTokenAddress, originNetwork)`
+/// (10 for the standard 18→8 ETH faucet). Errors if the amount does not scale
+/// to a representable Miden token amount.
+pub fn claim_storage_from_call(
+    params: &claimAssetCall,
+    scale_exp: u32,
+) -> anyhow::Result<ClaimNoteStorage> {
+    let proof_data = build_canonical_proof_data(params);
+    let leaf_data = LeafData {
+        origin_network: params.originNetwork,
+        origin_token_address: EthAddress::new(params.originTokenAddress.0.0),
+        destination_network: params.destinationNetwork,
+        destination_address: EthAddress::new(params.destinationAddress.0.0),
+        amount: EthAmount::new(params.amount.to_be_bytes::<32>()),
+        metadata_hash: MetadataHash::from_abi_encoded(params.metadata.as_ref()),
+    };
+    let miden_claim_amount = leaf_data
+        .amount
+        .scale_to_token_amount(scale_exp)
+        .map_err(|e| anyhow::anyhow!("claim amount is not representable on Miden: {e}"))?;
+    Ok(ClaimNoteStorage {
+        proof_data,
+        leaf_data,
+        miden_claim_amount,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct PublishClaimTxn {
     pub txn_id: TransactionId,
@@ -1074,6 +1109,54 @@ mod tests {
         assert_eq!(event.globalIndex, U256::from(42u64));
         assert_eq!(event.originNetwork, 1);
         assert_eq!(event.amount, U256::from(1000u64));
+    }
+
+    /// `claim_storage_from_call` (the foreign-bridge e2e's storage builder)
+    /// must produce storage that round-trips through the SAME decoders the
+    /// projector uses on consumed CLAIM notes — pinning it byte-compatible
+    /// with what `create_claim` puts on-chain.
+    #[test]
+    fn claim_storage_from_call_roundtrips_through_watcher_decoder() {
+        use alloy::primitives::{Address, U256};
+        use miden_protocol::note::NoteStorage;
+
+        // Mainnet deposit: globalIndex = 2^64 (mainnet flag) + leaf 7, with
+        // garbage in the rollup-index bytes that canonicalisation must zero.
+        let mut gi = U256::from(7u64) + (U256::from(1u64) << 64);
+        gi += U256::from(0xDEADu64) << 32; // rollup-index garbage (bytes 24..28)
+        let call = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::from([0x11; 32]); 32],
+            globalIndex: gi,
+            mainnetExitRoot: FixedBytes::from([0xAA; 32]),
+            rollupExitRoot: FixedBytes::from([0xBB; 32]),
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 2,
+            destinationAddress: address!("1234567890abcdef1234567890abcdef12345678"),
+            amount: U256::from(10_000_000_000_000u64), // 10^13 wei
+            metadata: Default::default(),
+        };
+
+        let storage = claim_storage_from_call(&call, 10).expect("storage builds");
+        // 18→8 scaling: 10^13 / 10^10 = 1000 Miden units.
+        assert_eq!(storage.miden_claim_amount.as_canonical_u64(), 1_000);
+
+        let note_storage = NoteStorage::try_from(storage).expect("valid CLAIM storage layout");
+        let decoded = crate::claim_watcher::parse_claim_event_from_storage(&note_storage)
+            .expect("projector decoder accepts the storage");
+
+        // Canonical global index: mainnet flag kept, rollup-index bytes zeroed.
+        let mut expected_gi = [0u8; 32];
+        expected_gi[23] = 1; // mainnet flag (limb 5)
+        expected_gi[31] = 7; // leaf index
+        assert_eq!(decoded.global_index, expected_gi);
+        assert_eq!(decoded.origin_network, 0);
+        assert_eq!(
+            decoded.destination_address, call.destinationAddress.0.0,
+            "leaf destination must round-trip"
+        );
+        assert_eq!(decoded.amount, 10_000_000_000_000u64);
     }
 
     #[test]
