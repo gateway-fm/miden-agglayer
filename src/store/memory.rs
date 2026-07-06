@@ -270,18 +270,23 @@ impl Store for InMemoryStore {
             *pending = remaining;
         }
 
+        // Cantina #12: mirror the PgStore contract — count RAW logs in range
+        // (pre address/topic filter, matching the SQL LIMIT semantics) and ERROR
+        // when the range exceeds the cap rather than silently returning a prefix.
         let mut result = Vec::new();
+        let mut raw_count = 0usize;
         let logs_by_block = self.logs_by_block.read();
         for block_num in from..=to {
             if let Some(logs) = logs_by_block.get(&block_num) {
+                raw_count += logs.len();
+                if raw_count > super::GETLOGS_ROW_CAP {
+                    return Err(super::getlogs_row_cap_error(from, to));
+                }
                 for log in logs {
                     if filter.matches(log, current_block) {
                         result.push(log.clone());
                     }
                 }
-            }
-            if result.len() >= 1000 {
-                break;
             }
         }
         Ok(result)
@@ -1139,6 +1144,50 @@ mod tests {
         let logs = store.get_logs(&filter, 500).await.unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].block_number, 100);
+    }
+
+    /// Cantina finding #12 (in-memory parity) — `get_logs` must ERROR, not return
+    /// a silently truncated prefix, when a range exceeds `GETLOGS_ROW_CAP`. The
+    /// PgStore is the production path (the PoC targets it) but InMemoryStore shared
+    /// the same 1000-row silent cap, so it gets the same contract to prevent the
+    /// default/test store from masking the regression. Error string matches
+    /// aggkit's `reMaxRange` parser so a real consumer would re-chunk.
+    #[tokio::test]
+    async fn finding_12_getlogs_over_cap_errors_not_truncates() {
+        let store = InMemoryStore::new();
+        let block = 4_242u64;
+        for i in 0..=super::super::GETLOGS_ROW_CAP {
+            let mut log = SyntheticLog {
+                log_index: 0,
+                address: "0xdead".to_string(),
+                topics: vec!["0xabcd".to_string()],
+                data: "0x".to_string(),
+                block_number: block,
+                block_hash: [0u8; 32],
+                transaction_hash: format!("0xf12_{i}"),
+                transaction_index: 0,
+                removed: false,
+            };
+            // add_log overwrites log_index with its own counter; explicit for clarity.
+            log.log_index = 0;
+            store.add_log(log).await.unwrap();
+        }
+
+        let filter = LogFilter {
+            from_block: Some(format!("0x{block:x}")),
+            to_block: Some(format!("0x{block:x}")),
+            ..Default::default()
+        };
+        let err = store
+            .get_logs(&filter, block)
+            .await
+            .expect_err("in-memory get_logs over the row cap MUST error, not truncate");
+        let msg = format!("{err}");
+        let re = regex::Regex::new(r"block range too large, max range:\s*(\d+)").unwrap();
+        assert!(
+            re.is_match(&msg),
+            "row-cap error must match aggkit reMaxRange, got: {msg}"
+        );
     }
 
     #[tokio::test]

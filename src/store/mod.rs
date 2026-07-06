@@ -23,6 +23,54 @@ use miden_protocol::account::AccountId;
 use miden_protocol::transaction::TransactionId;
 use std::sync::Arc;
 
+// ── eth_getLogs row cap (Cantina #12) ────────────────────────────────
+
+/// Maximum number of raw logs a single `eth_getLogs` block-range query may
+/// return before the store refuses to answer.
+///
+/// Cantina finding #12: `get_logs` previously issued `... LIMIT 1000` and
+/// returned the truncated slice with no signal. A restore (or any dense window)
+/// with more than 1000 `synthetic_logs` in range would hand a well-behaved
+/// consumer (aggkit/aggsender) a *successful* response missing the tail, so it
+/// would ingest `0..999`, silently skip `1000`, and later reject `1001` as out
+/// of sequence — permanently stalling withdrawal / GER sync.
+///
+/// A well-behaved `eth_getLogs` (Geth/Alchemy/Infura convention) must NOT drop
+/// the tail: when a range's result set exceeds the cap it returns an ERROR so
+/// the client narrows its range and retries. We keep the cap at 1000 (the old
+/// silent limit) but now surface it as [`getlogs_row_cap_error`].
+pub const GETLOGS_ROW_CAP: usize = 1000;
+
+/// Build the canonical over-cap error for a `[from, to]` block range whose raw
+/// `synthetic_logs` count exceeds [`GETLOGS_ROW_CAP`].
+///
+/// The message is deliberately shaped as `block range too large, max range: N`
+/// so aggkit/aggsender's `ParseMaxRangeFromError`
+/// (`aggkit/common/errors.go` regex `block range too large, max range:\s*(\d+)`)
+/// extracts `N` and re-chunks the request — the SAME reactive-chunking path the
+/// block-span cap (`MAX_GETLOGS_BLOCK_RANGE`, PRST-4030/4055) already relies on.
+/// Both the bridge reader (`bridgesync/agglayer_bridge_l2_reader.go`) and the
+/// GER reader (`l2gersync/l2_evm_ger_reader.go`) grep the error string only —
+/// they do not inspect the JSON-RPC error code — so routing this through
+/// `store_error` (InternalError) is fine as long as the substring survives
+/// scrubbing, which it does (no path/URL/ALL_CAPS token in the message).
+///
+/// `N` is HALF the queried span (min 1) so the hint is strictly smaller than the
+/// current window and the client provably narrows on each retry. aggkit's
+/// `ChunkedRangeQuery` recurses per chunk, so a still-too-dense sub-window shrinks
+/// again — convergence is guaranteed because PR #94's 1:1 Miden→block projection
+/// puts each event in its own block, so no single block approaches the cap.
+/// (The one unreachable degenerate case — a single block with >1000 logs — cannot
+/// be narrowed by block range; it is out of reach post-#94 and noted here honestly.)
+pub fn getlogs_row_cap_error(from: u64, to: u64) -> anyhow::Error {
+    let span = to.saturating_sub(from).saturating_add(1);
+    let suggested = (span / 2).max(1);
+    anyhow::anyhow!(
+        "eth_getLogs block range too large, max range: {suggested} — range [{from}, {to}] \
+         returned more than {GETLOGS_ROW_CAP} logs; retry with a smaller block range"
+    )
+}
+
 // ── Types ────────────────────────────────────────────────────────────
 
 /// Faucet registry entry — metadata for a bridged token's Miden faucet.
