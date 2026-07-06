@@ -13,7 +13,8 @@
 # Flow:
 #   1. Preflight: stack up, PG reachable, migration 010 applied.
 #   2. Wait for the reconciler to catch up near the Miden tip (the sweep
-#      advances RECONCILE_CHUNK=200 blocks per ~5s tick).
+#      processes multiple RECONCILE_CHUNK-block windows per ~5s tick, under
+#      the RECONCILE_TICK_BUDGET_MS budget).
 #   3. Snapshot the persisted cursor, restart the proxy container
 #      (same pattern as e2e-rd913-restart-burn-collision.sh: docker restart,
 #      PostgreSQL untouched).
@@ -54,8 +55,9 @@ PG_DB="agglayer_store"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
 AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 
-# Must match RECONCILE_CHUNK in src/synthetic_projector.rs.
-RECONCILE_CHUNK=200
+# Must match RECONCILE_CHUNK in src/synthetic_projector.rs (default; the
+# service may override via the RECONCILE_CHUNK env var).
+RECONCILE_CHUNK=1000
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
@@ -114,8 +116,9 @@ log "  Reconciler sweep-cursor persistence — restart-survival regression"
 log "======================================================================"
 
 # ── Step 1: let the sweep catch up near the tip. ─────────────────────────
-# The reconciler advances one RECONCILE_CHUNK window per ~5s projector tick,
-# so on a fresh e2e stack catch-up is quick; the timeout is generous for CI.
+# The reconciler processes multiple RECONCILE_CHUNK windows per ~5s projector
+# tick (budgeted concurrent catch-up), so on a fresh e2e stack catch-up is
+# near-instant; the timeout is generous for CI.
 step "Waiting for the reconciler sweep to catch up near the Miden tip..."
 wait_for "reconcile_cursor within one chunk of the tip" \
     '[[ "$(reconcile_cursor)" -ge $(( $(chain_tip) - RECONCILE_CHUNK )) ]]' \
