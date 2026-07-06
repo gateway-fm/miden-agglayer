@@ -97,14 +97,72 @@ pub async fn admin_register_faucet(
     // Create, deploy, register in bridge (using OnceLock pattern like publish_claim)
     let result = Arc::new(OnceLock::<AccountId>::new());
     let result_inner = result.clone();
+    // Cantina #6 — set once the closure RECOVERED an existing on-chain faucet
+    // (and already persisted its local row), so the post-closure create-path
+    // registration is skipped.
+    let recovered = Arc::new(OnceLock::<()>::new());
+    let recovered_inner = recovered.clone();
+    let store_for_closure = state.store.clone();
     let symbol_clone = params.symbol.clone();
     let miden_decimals = params.miden_decimals;
     let origin_network = params.origin_network;
+    // The admin-supplied metadata IS the authoritative preimage for this token;
+    // prefer it over on-chain recovery when importing an existing faucet.
+    let metadata_for_recovery = metadata_bytes.clone();
 
     state
         .miden_client
         .with(move |client| {
             Box::new(async move {
+                // Cantina #6 — recover an EXISTING on-chain faucet for this origin
+                // token before deploying a replacement generation. Mirrors the live
+                // claim path: the local row is missing but the faucet may still be
+                // registered on the bridge.
+                if let Some(bridge_account) = client.get_account(bridge_id).await.ok().flatten()
+                    && let Some((existing_id, conversion)) =
+                        crate::metadata_recovery::find_registered_faucet_for_origin(
+                            bridge_account.storage(),
+                            &origin_address,
+                            origin_network,
+                        )
+                {
+                    tracing::warn!(
+                        faucet_id = %existing_id,
+                        origin_network,
+                        "admin_registerFaucet: origin token already has a faucet registered on \
+                         the bridge but no local row — importing the existing identity instead \
+                         of deploying a replacement (Cantina #6)"
+                    );
+                    match faucet_ops::rebuild_faucet_entry_from_chain(
+                        client,
+                        &bridge_account,
+                        existing_id,
+                        &conversion,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(mut entry) => {
+                            entry.metadata = metadata_for_recovery;
+                            store_for_closure.register_faucet(entry).await?;
+                            ::metrics::counter!("faucet_recovered_existing_total").increment(1);
+                            let _ = result_inner.set(existing_id);
+                            let _ = recovered_inner.set(());
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            ::metrics::counter!("faucet_recover_existing_failed_total")
+                                .increment(1);
+                            tracing::warn!(
+                                faucet_id = %existing_id,
+                                error = ?e,
+                                "admin_registerFaucet: failed to import existing faucet identity; \
+                                 falling back to deploy (WARNING: may create a second generation)"
+                            );
+                        }
+                    }
+                }
+
                 let account = faucet_ops::create_and_register_faucet(
                     client,
                     &symbol_clone,
@@ -127,20 +185,23 @@ pub async fn admin_register_faucet(
         anyhow::anyhow!("admin_registerFaucet: closure completed but result not set")
     })?;
 
-    // Save to store
-    state
-        .store
-        .register_faucet(FaucetEntry {
-            faucet_id,
-            origin_address,
-            origin_network: params.origin_network,
-            symbol: params.symbol,
-            origin_decimals: params.origin_decimals,
-            miden_decimals: params.miden_decimals,
-            scale,
-            metadata: metadata_bytes,
-        })
-        .await?;
+    // Save to store — UNLESS the closure already recovered + persisted an existing
+    // faucet identity (Cantina #6), in which case the row is already written.
+    if recovered.get().is_none() {
+        state
+            .store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address,
+                origin_network: params.origin_network,
+                symbol: params.symbol,
+                origin_decimals: params.origin_decimals,
+                miden_decimals: params.miden_decimals,
+                scale,
+                metadata: metadata_bytes,
+            })
+            .await?;
+    }
 
     let id_hex = faucet_id.to_hex();
     tracing::info!(

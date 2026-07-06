@@ -1878,7 +1878,10 @@ mod tests {
         );
         // Explicit: all notes share ONE block, i.e. no per-note advance happened.
         assert_eq!(
-            blocks.iter().collect::<std::collections::HashSet<_>>().len(),
+            blocks
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
             1,
             "N notes at the same Miden block must occupy exactly ONE synthetic block"
         );

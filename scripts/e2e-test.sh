@@ -38,6 +38,8 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
         echo ""
+        "$SCRIPT_DIR/e2e-cantina6-faucet-identity-restore.sh"
+        echo ""
         # Foreign-bridge claim provenance: deploys a SECOND agglayer deployment
         # on the same chain and drives a claim through it — must not leak a
         # ClaimEvent into our synthetic_logs. Runs before the proxy-restarting
@@ -76,6 +78,9 @@ case "$test_filter" in
     cantina12-getlogs-truncation)
         "$SCRIPT_DIR/e2e-cantina12-getlogs-truncation.sh"
         ;;
+    cantina6-faucet-identity-restore)
+        "$SCRIPT_DIR/e2e-cantina6-faucet-identity-restore.sh"
+        ;;
     fuzz)
         "$SCRIPT_DIR/e2e-fuzz-bridge.sh"
         ;;
@@ -90,7 +95,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|cantina12-getlogs-truncation|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|cantina12-getlogs-truncation|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
         exit 1
         ;;
 esac

@@ -147,6 +147,71 @@ async fn find_or_create_faucet(
         );
     }
 
+    // 2b. Cantina #6 — recover an EXISTING on-chain faucet before deploying a
+    //     replacement. The local row is missing (fresh DB / lost identity), but the
+    //     faucet may still be registered on the bridge for this exact origin token.
+    //     Deploying a second faucet here would create the split-brain the finding
+    //     describes: two live generations for one (origin_address, origin_network),
+    //     with the old generation's exits invisible forever (its faucet stays
+    //     bridge-out-valid on Miden but unresolvable locally). Import the existing
+    //     identity instead. Coexists with the Cantina #1 cross-network refusal above
+    //     (which already rejected a different-network same-address collision).
+    if let Some(bridge_account) = client.get_account(accounts.bridge.0).await.ok().flatten()
+        && let Some((existing_id, conversion)) =
+            crate::metadata_recovery::find_registered_faucet_for_origin(
+                bridge_account.storage(),
+                &token_address.0.0,
+                origin_network,
+            )
+    {
+        tracing::warn!(
+            token_address = %token_address,
+            origin_network,
+            faucet_id = %existing_id,
+            "Cantina #6: origin token already has a faucet registered on the bridge but no local \
+             row — importing the existing faucet identity instead of deploying a replacement \
+             (prevents split-brain)"
+        );
+        match faucet_ops::rebuild_faucet_entry_from_chain(
+            client,
+            &bridge_account,
+            existing_id,
+            &conversion,
+            None,
+        )
+        .await
+        {
+            Ok(mut entry) => {
+                // The claimAsset metadata IS the authoritative preimage for this token
+                // (same abi.encode(name,symbol,decimals) whose keccak is the faucet's
+                // MetadataHash), so prefer it over the on-chain recovery result — capped
+                // exactly like the auto-create path (Cantina #13).
+                entry.metadata = cap_stored_faucet_metadata(metadata, &token_address);
+                let (miden_decimals, origin_token_decimals) =
+                    (entry.miden_decimals, entry.origin_decimals);
+                store.register_faucet(entry).await?;
+                ::metrics::counter!("faucet_recovered_existing_total").increment(1);
+                return Ok(Faucet {
+                    id: existing_id,
+                    decimals: miden_decimals,
+                    origin_token_decimals,
+                });
+            }
+            Err(e) => {
+                // Fail soft: if we cannot import the existing identity (e.g. the faucet
+                // account isn't fetchable), fall through to deploy rather than block the
+                // claim. This can re-introduce a second generation, so surface it loudly.
+                ::metrics::counter!("faucet_recover_existing_failed_total").increment(1);
+                tracing::warn!(
+                    faucet_id = %existing_id,
+                    error = ?e,
+                    "Cantina #6: failed to import existing faucet identity; falling back to deploy \
+                     (WARNING: may create a second generation)"
+                );
+            }
+        }
+    }
+
     // 3. Auto-create: parse token metadata from claimAsset call
     let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
     let miden_decimals: u8 = origin_decimals.min(8);
