@@ -1647,6 +1647,66 @@ mod tests {
         assert_ne!(be, ger, "big-endian decode must differ — that was the bug");
     }
 
+    /// Cantina #11 regression lock — sharper than the round-trip above: it uses a
+    /// deliberately *non-symmetric* GER (`0x0102…20`, every byte distinct) so that
+    /// the little-endian and big-endian decodes are provably different for EVERY
+    /// 4-byte limb. The finding described the pre-fix `restore_gers()` decoding the
+    /// eight storage felts with `to_be_bytes()`, byte-swapping each limb
+    /// (`[a0 a1 a2 a3] → [a3 a2 a1 a0]`) and republishing a GER that never existed
+    /// on L1 — hanging bridge-in claim readiness after `--restore`.
+    ///
+    /// Fixed by `ger_bytes_from_storage` decoding little-endian (matching the
+    /// `ExitRoot::to_elements()` packing `UpdateGerNote::create` writes to storage).
+    /// This test round-trips through that exact encoder and asserts the decode
+    /// returns the IDENTICAL 32 bytes, and that the buggy per-limb byte-swap would
+    /// have produced a different value — so a regression back to `to_be_bytes()`
+    /// fails here.
+    #[test]
+    fn finding_11_ger_restore_roundtrip_le_not_be() {
+        use miden_base_agglayer::ExitRoot;
+        // Non-symmetric bytes32: 0x0102030405...1e1f20 — LE≠BE in every limb.
+        let mut ger = [0u8; 32];
+        for (i, b) in ger.iter_mut().enumerate() {
+            *b = (i as u8) + 1;
+        }
+
+        // Encode exactly as `UpdateGerNote::create` stores it.
+        let items = ExitRoot::from(ger).to_elements();
+        assert_eq!(items.len(), 8, "ExitRoot packs the GER into 8 u32 limbs");
+
+        // The fix: little-endian decode round-trips the original bytes byte-for-byte.
+        let decoded = ger_bytes_from_storage(&items).expect("valid GER decodes");
+        assert_eq!(
+            decoded, ger,
+            "restore must return the IDENTICAL 32 GER bytes; a big-endian decode \
+             (the pre-fix bug) would byte-swap each limb"
+        );
+
+        // The pre-fix behaviour, reconstructed here to prove this test discriminates:
+        // decoding the SAME felts big-endian yields the per-limb byte-swap, which is
+        // NOT the original GER. A regression to `to_be_bytes()` would make
+        // `ger_bytes_from_storage` return exactly `buggy_be`, failing the assert above.
+        let mut buggy_be = [0u8; 32];
+        for (i, f) in items.iter().take(8).enumerate() {
+            let v = u32::try_from(f.as_canonical_u64()).unwrap();
+            buggy_be[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
+        }
+        let mut expected_swap = [0u8; 32];
+        for (i, chunk) in ger.chunks_exact(4).enumerate() {
+            expected_swap[i * 4..(i + 1) * 4]
+                .copy_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
+        }
+        assert_eq!(
+            buggy_be, expected_swap,
+            "the pre-fix big-endian decode byte-swaps each 4-byte limb",
+        );
+        assert_ne!(
+            buggy_be, ger,
+            "the pre-fix decode yields a GER different from the encoded one — \
+             that mismatch is exactly what this regression lock catches"
+        );
+    }
+
     #[test]
     fn ma28_classify_ger_note_missing_metadata() {
         let sender = id(TEST_SENDER_MANAGER);
