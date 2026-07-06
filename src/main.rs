@@ -203,6 +203,16 @@ struct Command {
     /// it lands in Phase 1.
     #[arg(long, env = "AGGLAYER_ENABLE_WRITER_WORKER", default_value_t = false)]
     enable_writer_worker: bool,
+
+    /// Hard read-only guarantee for recovery drills / cold reindexes against
+    /// production networks. When set, EVERY transaction submission is refused
+    /// at the single chokepoint all chain mutations funnel through
+    /// (`miden_client::submit_new_transaction` + the CLAIM hot path's
+    /// pre-submit check): the call returns an error, ERROR-logs, and
+    /// increments `readonly_submissions_refused_total`. The proxy reads
+    /// history (sync, sweep, reconcile) but can never send a transaction.
+    #[arg(long, env = "AGGLAYER_READ_ONLY", default_value_t = false)]
+    read_only: bool,
 }
 
 /// Validate the `--require-hardening` invariants. Returns a list of
@@ -314,6 +324,7 @@ impl std::fmt::Debug for Command {
                 &self.miden_prover_fallback_to_local,
             )
             .field("enable_writer_worker", &self.enable_writer_worker)
+            .field("read_only", &self.read_only)
             .finish()
     }
 }
@@ -323,6 +334,16 @@ async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
     miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
+    // Install the read-only switch BEFORE any client / submit path exists so
+    // the guarantee holds from the very first instruction that could mutate
+    // chain state (including the init phase's deploy transactions).
+    miden_agglayer_service::miden_client::init_read_only(command.read_only);
+    if command.read_only {
+        tracing::warn!(
+            "READ-ONLY mode active (--read-only / AGGLAYER_READ_ONLY): every transaction \
+             submission will be refused at the submit chokepoint"
+        );
+    }
     tracing::info!("{command:?}");
 
     // Hardening startup invariants — fail loud on fail-open production
@@ -1010,6 +1031,7 @@ mod hardening_tests {
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
             enable_writer_worker: false,
+            read_only: false,
         }
     }
 

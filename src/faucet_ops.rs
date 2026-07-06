@@ -59,7 +59,7 @@ pub async fn create_and_register_faucet(
     let dummy_txn = TransactionRequestBuilder::new().build()?;
     let txn_id = crate::metrics::meter_proof(
         crate::metrics::ProofKind::Faucet,
-        client.submit_new_transaction(account.id(), dummy_txn),
+        crate::miden_client::submit_new_transaction(client, account.id(), dummy_txn),
     )
     .await?;
     tracing::info!("deployed {symbol} faucet with txn_id {txn_id}");
@@ -143,7 +143,7 @@ pub async fn register_faucet_in_bridge(
 
     let txn_id = crate::metrics::meter_proof(
         crate::metrics::ProofKind::Faucet,
-        client.submit_new_transaction(service_id, txn),
+        crate::miden_client::submit_new_transaction(client, service_id, txn),
     )
     .await?;
     tracing::info!(

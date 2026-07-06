@@ -37,6 +37,69 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// (`new_test*`) deliberately bypass this guard.
 static LIVE_CLIENT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
+/// Process-wide read-only switch (`--read-only` / `AGGLAYER_READ_ONLY`).
+///
+/// When set, EVERY chain mutation is refused at the single chokepoint all
+/// submit sites funnel through — [`submit_new_transaction`] (and the CLAIM
+/// hot path's explicit [`ensure_writable`] call before
+/// `submit_proven_transaction`). This is a hard operational guarantee for
+/// recovery drills / cold reindexes against production networks: the proxy
+/// may read history but must never send a transaction.
+///
+/// Set once at startup via [`init_read_only`] (same pattern as
+/// `bridge_address::init_bridge_address`), before any submit path can run.
+static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable read-only mode. Called once from `main` at startup,
+/// before the runtime `MidenClient` (and therefore any submit path) exists.
+pub fn init_read_only(enabled: bool) {
+    READ_ONLY.store(enabled, Ordering::Release);
+}
+
+/// True when the proxy is running in read-only mode.
+pub fn is_read_only() -> bool {
+    READ_ONLY.load(Ordering::Acquire)
+}
+
+/// Refuse the mutation when read-only mode is active.
+///
+/// Increments `readonly_submissions_refused_total` and ERROR-logs so a
+/// refusal during a supposedly read-only drill is loud in both metrics and
+/// logs. Returns `Ok(())` when writable.
+pub fn ensure_writable(account_id: miden_protocol::account::AccountId) -> anyhow::Result<()> {
+    if !is_read_only() {
+        return Ok(());
+    }
+    metrics::counter!("readonly_submissions_refused_total").increment(1);
+    tracing::error!(
+        account_id = %account_id.to_hex(),
+        "read-only mode: transaction submission refused"
+    );
+    Err(anyhow!(
+        "read-only mode: transaction submission refused (account {})",
+        account_id.to_hex()
+    ))
+}
+
+/// Read-only-guarded wrapper around `MidenClientLib::submit_new_transaction`.
+///
+/// This is the single chokepoint every chain mutation in the service funnels
+/// through (init deploys, faucet ops, GER injection). Call sites MUST use
+/// this instead of the raw library method so `--read-only` is enforced
+/// uniformly. The guard fires BEFORE any node interaction: in read-only mode
+/// the transaction is neither executed, proven, nor submitted.
+pub async fn submit_new_transaction(
+    client: &mut MidenClientLib,
+    account_id: miden_protocol::account::AccountId,
+    tx_request: miden_client::transaction::TransactionRequest,
+) -> anyhow::Result<miden_protocol::transaction::TransactionId> {
+    ensure_writable(account_id)?;
+    client
+        .submit_new_transaction(account_id, tx_request)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(BACKOFF_MAX)
 }
@@ -750,6 +813,38 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("simulated failure"));
         assert_eq!(client.test_call_count(), 1);
+    }
+
+    /// `--read-only` mode — the submit chokepoint must refuse the mutation
+    /// BEFORE any node interaction. Uses the offline `MidenClientLib` (no
+    /// node behind it): if the guard failed to fire first, the call would
+    /// surface an execution/connection error instead of the read-only
+    /// refusal, so asserting on the error text proves ordering.
+    #[tokio::test]
+    async fn read_only_mode_refuses_submission() {
+        use miden_client::transaction::TransactionRequestBuilder;
+
+        // Valid protocol-0.15 (version-1) account id (same as the
+        // accounts_config tests).
+        let account_id =
+            miden_protocol::account::AccountId::from_hex("0xcc0000000000dd010000ee000000ff")
+                .unwrap();
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let tx_request = TransactionRequestBuilder::new().build().unwrap();
+
+        init_read_only(true);
+        let res = submit_new_transaction(&mut client, account_id, tx_request).await;
+        // Restore the process-global default before asserting so a failed
+        // assert can't leave other tests in read-only mode.
+        init_read_only(false);
+
+        let err = res.expect_err("read-only mode must refuse submission");
+        assert!(
+            err.to_string().contains("read-only mode"),
+            "expected the read-only refusal (fired before any node \
+             interaction), got: {err:#}"
+        );
+        assert!(err.to_string().contains(&account_id.to_hex()));
     }
 
     /// Cantina MA#23 — the listener pause flag flips on while a guard is

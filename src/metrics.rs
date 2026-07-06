@@ -17,6 +17,12 @@ pub fn init_metrics() {
     );
     describe_counter!("miden_sync_errors_total", "Sync errors by kind");
     describe_counter!(
+        "readonly_submissions_refused_total",
+        "Transaction submissions refused by --read-only mode at the submit \
+         chokepoint. Non-zero during a read-only drill means some code path \
+         ATTEMPTED a chain mutation (and was stopped)."
+    );
+    describe_counter!(
         "bridge_out_self_targeted_total",
         "B2AGG bridge-outs whose destination_network equals our local network_id; \
          each one is a poison leaf that wedges the bridge (Cantina #13)"

@@ -589,6 +589,12 @@ async fn publish_claim_internal(
     }
 
     let txn_id = tx_result.executed_transaction().id();
+    // `--read-only` guard: the CLAIM hot path is the one site that submits
+    // via `submit_proven_transaction` instead of the guarded
+    // `miden_client::submit_new_transaction` wrapper (it needs the explicit
+    // prove step for the remote→local prover fallback above), so it must
+    // call the chokepoint check itself before touching the node.
+    crate::miden_client::ensure_writable(accounts.service.0)?;
     let _submission_height = client
         .submit_proven_transaction(proven_tx, &tx_result)
         .await?;
