@@ -131,6 +131,16 @@ pub fn init_metrics() {
          (crash recovery or foreign-CLAIM observation)."
     );
     describe_counter!(
+        "claim_event_foreign_skipped_total",
+        "A consumed CLAIM-shaped note was NOT provably ours (consumer is not \
+         our bridge, and it was not minted by our service targeting our \
+         bridge) and was skipped instead of projected as a ClaimEvent. \
+         Expected on chains shared with a foreign miden-agglayer deployment \
+         (its claims share our ClaimNote script root); on a single-deployment \
+         chain any non-zero rate means unverifiable claim consumptions — \
+         investigate."
+    );
+    describe_counter!(
         "claim_watcher_already_recorded_total",
         "ClaimWatcher observed a consumed CLAIM whose ClaimEvent was \
          already in the store (either prior watcher emission or \

@@ -102,6 +102,62 @@ fn decode_network_target(attachments: &NoteAttachments) -> Option<AccountId> {
         .map(|nat| nat.target_id())
 }
 
+/// Provenance verdict for a `ClaimNote`-shaped consumed note — the ClaimEvent
+/// analogue of MA#28's [`GerNoteVerdict`] (GER path) and MA#3's
+/// [`crate::bridge_out::B2AggConsumerClass`] (B2AGG path).
+///
+/// Live-proven gap: a read-only reindex of a chain shared with a FOREIGN
+/// miden-agglayer deployment projected the foreign deployment's claims into
+/// our synthetic_logs, because `project_claim_note` gated only on the
+/// ClaimNote script root. The script root is deployment-independent — every
+/// agglayer instance on the chain mints notes with the identical script.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClaimNoteVerdict {
+    /// Provably OURS — safe to project a synthetic ClaimEvent.
+    Ours,
+    /// Not provably ours: consumed by some other account (a foreign
+    /// deployment's bridge) and not minted by our service targeting our
+    /// bridge. Fail-closed skip.
+    Foreign,
+}
+
+/// Pure provenance predicate for a `ClaimNote`-shaped consumed note. A claim
+/// is OURS iff at least one of two independent proofs holds:
+///
+/// 1. **Consumer proof (MA#3 trust root):** `consumer == our bridge`. Our
+///    bridge network account only consumes notes targeted at it, and its MASM
+///    validates the claim proof on consumption — so a bridge-consumed CLAIM is
+///    a sanctioned claim through OUR deployment regardless of who minted it.
+///    This is the same attribution the projector's spent-before-import
+///    recovery derives from the bridge's `sync_transactions` feed.
+/// 2. **Mint proof (MA#28 trust root):** the note's (own-output-record
+///    recovered) metadata shows `sender == our service` — `create_claim` mints
+///    every CLAIM from `accounts.service` — AND its `NetworkAccountTarget`
+///    attachment targets OUR bridge.
+///
+/// A foreign deployment's claim satisfies neither: it targets and is consumed
+/// by the FOREIGN bridge account, and its sender is the foreign service.
+/// Pure (no I/O, no metrics) so it is unit-testable directly; metric emission
+/// and tracing live at the call site in `project_claim_note`.
+pub fn classify_claim_note(
+    consumer: Option<AccountId>,
+    metadata: Option<&NoteMetadata>,
+    attachments: &NoteAttachments,
+    expected_sender: AccountId,
+    bridge_id: AccountId,
+) -> ClaimNoteVerdict {
+    if consumer == Some(bridge_id) {
+        return ClaimNoteVerdict::Ours;
+    }
+    if let Some(meta) = metadata
+        && meta.sender() == expected_sender
+        && decode_network_target(attachments) == Some(bridge_id)
+    {
+        return ClaimNoteVerdict::Ours;
+    }
+    ClaimNoteVerdict::Foreign
+}
+
 /// Decode the 32-byte GER from an `UpdateGerNote`'s storage felts.
 ///
 /// `UpdateGerNote` storage is `ExitRoot::to_elements()` — each 4-byte GER limb
@@ -286,7 +342,8 @@ pub async fn restore(
     // watcher uses so the synthetic logs are byte-identical (same tx-hash
     // derivation, same `commit_manual_claim_event_atomic` store path).
     tracing::info!("Phase 2.5: scanning miden consumed CLAIM notes (MA#27)...");
-    let (claims, claim_logs) = restore_claims(store, miden_client, block_state, miden_tip).await?;
+    let (claims, claim_logs) =
+        restore_claims(store, miden_client, accounts, block_state, miden_tip).await?;
     total_logs += claim_logs;
     tracing::info!("Phase 2.5 complete: {claims} claims, {claim_logs} logs");
 
@@ -939,9 +996,20 @@ pub(crate) enum ClaimProjectOutcome {
 /// filter, same storage decoder, same dedup predicates, same atomic commit
 /// primitive — so the synthetic logs are byte-identical regardless of which
 /// path observes the CLAIM note.
+///
+/// Provenance gate (live-proven): the note must be provably OURS — see
+/// [`classify_claim_note`]. `output_metadata` maps a note's details-commitment
+/// to the metadata of our own output-note record, the same MA#28 fallback the
+/// GER path uses for the metadata-less `ConsumedExternal` state.
+/// `expected_sender` is the account `create_claim` mints from
+/// (`accounts.service`); `bridge_id` is our bridge account.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn project_claim_note(
     store: &Arc<dyn Store>,
     note: &InputNoteRecord,
+    output_metadata: &std::collections::HashMap<[u8; 32], NoteMetadata>,
+    expected_sender: AccountId,
+    bridge_id: AccountId,
     block_number: u64,
     block_hash: [u8; 32],
     bridge_address: &str,
@@ -953,6 +1021,36 @@ pub(crate) async fn project_claim_note(
     }
 
     let note_id_str = hex::encode(note.details_commitment().as_bytes());
+
+    // Provenance gate — BEFORE any storage read, dedup mark, or emission
+    // (the MA#28 posture). On a chain shared with a foreign miden-agglayer
+    // deployment, foreign claims share our ClaimNote script root; projecting
+    // them poisons synthetic_logs with ClaimEvents our L1 never saw.
+    let effective_metadata = note
+        .metadata()
+        .or_else(|| output_metadata.get(&note.details_commitment().as_bytes()));
+    if classify_claim_note(
+        note.consumer_account(),
+        effective_metadata,
+        note.attachments(),
+        expected_sender,
+        bridge_id,
+    ) == ClaimNoteVerdict::Foreign
+    {
+        ::metrics::counter!("claim_event_foreign_skipped_total").increment(1);
+        tracing::warn!(
+            target: "restore::claims",
+            note_id = %note_id_str,
+            consumer = ?note.consumer_account(),
+            sender = ?effective_metadata.map(|m| m.sender()),
+            expected_sender = %expected_sender,
+            bridge = %bridge_id,
+            "CLAIM-shaped note is not provably ours (consumer != our bridge, and \
+             sender/target don't verify against our service/bridge) — foreign \
+             deployment's claim on a shared chain; skipping ClaimEvent (fail-closed)"
+        );
+        return Ok(ClaimProjectOutcome::Skipped);
+    }
 
     // Dedup 1: was this CLAIM already replayed by an earlier restore (or by the
     // live watcher)?
@@ -1078,11 +1176,17 @@ pub(crate) async fn project_claim_note(
 async fn restore_claims(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
+    accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
+    // Claim provenance gate: `create_claim` mints every CLAIM from the
+    // service account, targeting the bridge; the bridge is also the sole
+    // legitimate consumer. See `classify_claim_note`.
+    let expected_sender = accounts.service.0;
+    let bridge_id = accounts.bridge.0;
 
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
@@ -1094,6 +1198,20 @@ async fn restore_claims(
                     .get_input_notes(NoteFilter::Consumed)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+
+                // MA#28-style provenance fallback (same as `restore_gers`):
+                // protocol 0.15's `ConsumedExternal` state carries no metadata,
+                // but we MINTED our own CLAIM notes, so our output-note records
+                // retain the full metadata permanently. A claim-shaped note we
+                // did not mint has no output record and no bridge-consumer
+                // attribution → skipped as Foreign (fail-closed).
+                let own_output_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> = client
+                    .get_output_notes(NoteFilter::All)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
+                    .into_iter()
+                    .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
+                    .collect();
 
                 let bridge_address = get_bridge_address();
                 let mut claim_count = 0usize;
@@ -1111,8 +1229,17 @@ async fn restore_claims(
                     // Per-note CLAIM derivation lives in `project_claim_note` so
                     // the live cursor-driven projector and this recovery phase
                     // share one implementation.
-                    if project_claim_note(&store_clone, note, blk, block_hash, bridge_address)
-                        .await?
+                    if project_claim_note(
+                        &store_clone,
+                        note,
+                        &own_output_metadata,
+                        expected_sender,
+                        bridge_id,
+                        blk,
+                        block_hash,
+                        bridge_address,
+                    )
+                    .await?
                         == ClaimProjectOutcome::Emitted
                     {
                         claim_count += 1;
@@ -2371,6 +2498,273 @@ mod tests {
         assert!(
             logs.is_empty(),
             "fail-closed skip must emit NO synthetic log"
+        );
+    }
+
+    // ── ClaimEvent provenance gate — foreign-deployment claims (live-proven) ─
+    //
+    // A read-only reindex of the real testnet (which hosts a FOREIGN
+    // miden-agglayer deployment on the SAME Miden chain) projected 3
+    // ClaimEvents from the foreign deployment's claims into our
+    // synthetic_logs: `project_claim_note` gated only on the ClaimNote
+    // script root, unlike the GER path's MA#28 sender/target gate and the
+    // B2AGG path's MA#3 consumer gate. These tests pin the fix: a
+    // CLAIM-shaped consumed note must be provably OURS (consumed by OUR
+    // bridge, or minted by OUR service targeting OUR bridge) before a
+    // synthetic ClaimEvent is projected.
+
+    /// Build a consumed CLAIM note with a valid `ClaimNoteStorage` (so the
+    /// pre-fix pipeline would decode + emit — the test then fails on the
+    /// missing provenance gate, not an unrelated decode skip), consumed by
+    /// `consumer`, with a per-test `gi_byte` to keep global indexes distinct
+    /// across tests (Dedup 2 keys on global_index).
+    fn claim_input_note(consumer: Option<AccountId>, gi_byte: u8) -> InputNoteRecord {
+        use miden_base_agglayer::{
+            ClaimNote, ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData,
+            MetadataHash, ProofData, SmtNode,
+        };
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{NoteAssets, NoteDetails, NoteRecipient, NoteStorage};
+        use miden_protocol::{Felt, Word};
+
+        let mut gi_bytes = [0u8; 32];
+        gi_bytes[31] = gi_byte;
+        let mut amount_bytes = [0u8; 32];
+        amount_bytes[28..32].copy_from_slice(&1_000_000u32.to_be_bytes());
+
+        let claim_storage = ClaimNoteStorage {
+            proof_data: ProofData {
+                smt_proof_local_exit_root: [SmtNode::new([0u8; 32]); 32],
+                smt_proof_rollup_exit_root: [SmtNode::new([0u8; 32]); 32],
+                global_index: GlobalIndex::new(gi_bytes),
+                mainnet_exit_root: ExitRoot::new([0u8; 32]),
+                rollup_exit_root: ExitRoot::new([0u8; 32]),
+            },
+            leaf_data: LeafData {
+                origin_network: 7,
+                origin_token_address: EthAddress::new([0xAB; 20]),
+                destination_network: 1,
+                destination_address: EthAddress::new([0xCD; 20]),
+                amount: EthAmount::new(amount_bytes),
+                metadata_hash: MetadataHash::from_abi_encoded(&[]),
+            },
+            miden_claim_amount: Felt::ZERO,
+        };
+        let storage = NoteStorage::try_from(claim_storage).expect("claim storage round-trips");
+        let recipient = NoteRecipient::new(Word::default(), ClaimNote::script(), storage);
+        let details = NoteDetails::new(NoteAssets::new(vec![]).unwrap(), recipient);
+
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: consumer,
+            consumed_tx_order: None,
+        });
+        InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
+    /// RED→GREEN PoC for the live finding: a consumed claim-shaped note whose
+    /// consumer is NOT our bridge (a foreign deployment's bridge on the same
+    /// chain) and which we did not mint must NOT project a ClaimEvent.
+    /// Pre-fix this test fails: the note projects (`Emitted`) because
+    /// `project_claim_note` gated only on the ClaimNote script root.
+    #[tokio::test]
+    async fn finding_claim_provenance_foreign_claim_not_projected() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        // Foreign bridge consumed it; we never minted it (no output record).
+        let foreign_bridge = id(TEST_SENDER_ATTACKER);
+        let note = claim_input_note(Some(foreign_bridge), 0x71);
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome = project_claim_note(
+            &store,
+            &note,
+            &std::collections::HashMap::new(), // we did not mint it → no output record
+            id(TEST_SENDER_MANAGER),           // our service
+            id(TEST_TARGET_BRIDGE),            // our bridge
+            5,
+            [5u8; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ClaimProjectOutcome::Skipped,
+            "a claim-shaped note consumed by a FOREIGN bridge must not project a ClaimEvent",
+        );
+        assert!(
+            !store.is_claim_note_processed(&note_id).await.unwrap(),
+            "foreign claim must not be marked processed",
+        );
+        let mut gi = [0u8; 32];
+        gi[31] = 0x71;
+        assert!(
+            !store.has_claim_event_for_global_index(&gi).await.unwrap(),
+            "no ClaimEvent row may exist for the foreign claim's global index",
+        );
+    }
+
+    /// Positive counterpart — the SAME claim shape consumed by OUR bridge must
+    /// still project (consumer proof, MA#3 trust root). Proves the foreign
+    /// skip above is the provenance gate, not an over-eager claim kill-switch.
+    #[tokio::test]
+    async fn finding_claim_provenance_bridge_consumed_claim_projects() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let note = claim_input_note(Some(id(TEST_TARGET_BRIDGE)), 0x72);
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome = project_claim_note(
+            &store,
+            &note,
+            &std::collections::HashMap::new(),
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            5,
+            [5u8; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ClaimProjectOutcome::Emitted,
+            "a claim consumed by OUR bridge must still project a ClaimEvent",
+        );
+        assert!(store.is_claim_note_processed(&note_id).await.unwrap());
+        let mut gi = [0u8; 32];
+        gi[31] = 0x72;
+        assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+    }
+
+    /// Mint-proof fallback — a claim with NO consumer attribution but whose
+    /// own-output-record metadata shows OUR service minted it targeting OUR
+    /// bridge must project (MA#28 trust root: we created it). This is the
+    /// `ConsumedExternal` posture for our own claims when the consumer is
+    /// untracked.
+    #[tokio::test]
+    async fn finding_claim_provenance_minted_by_us_projects_via_output_record() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let note = claim_input_note(None, 0x73);
+
+        // Our own output-note record: sender = service, target = our bridge.
+        // The record's attachments must also carry the target — mirror what
+        // `ClaimNote::create` produces.
+        let (metadata, attachments) =
+            make_metadata(id(TEST_SENDER_MANAGER), Some(id(TEST_TARGET_BRIDGE)));
+        let note = InputNoteRecord::new(
+            note.details().clone(),
+            attachments,
+            None,
+            note.state().clone(),
+        );
+        let output_metadata =
+            std::collections::HashMap::from([(note.details_commitment().as_bytes(), metadata)]);
+
+        let outcome = project_claim_note(
+            &store,
+            &note,
+            &output_metadata,
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            5,
+            [5u8; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ClaimProjectOutcome::Emitted,
+            "our own minted claim (output-record metadata proof) must project",
+        );
+    }
+
+    /// Fail-closed floor — no consumer attribution AND no mint proof (we have
+    /// no output record for it) must skip, even though the storage decodes.
+    #[tokio::test]
+    async fn finding_claim_provenance_unattributed_claim_is_fail_closed_skip() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let note = claim_input_note(None, 0x74);
+
+        let outcome = project_claim_note(
+            &store,
+            &note,
+            &std::collections::HashMap::new(),
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            5,
+            [5u8; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ClaimProjectOutcome::Skipped);
+    }
+
+    /// Pure-classifier pins for `classify_claim_note` — both proofs and the
+    /// reject branches (mirrors the `ma28_classify_*` pin style).
+    #[test]
+    fn claim_provenance_classifier_branches() {
+        let service = id(TEST_SENDER_MANAGER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        let foreign = id(TEST_SENDER_ATTACKER);
+
+        // Consumer proof: consumed by our bridge → Ours (metadata irrelevant).
+        assert_eq!(
+            classify_claim_note(
+                Some(bridge),
+                None,
+                &NoteAttachments::default(),
+                service,
+                bridge
+            ),
+            ClaimNoteVerdict::Ours,
+        );
+        // Mint proof: sender == service AND target == bridge → Ours.
+        let (meta, attachments) = make_metadata(service, Some(bridge));
+        assert_eq!(
+            classify_claim_note(None, Some(&meta), &attachments, service, bridge),
+            ClaimNoteVerdict::Ours,
+        );
+        // Foreign consumer, no metadata → Foreign.
+        assert_eq!(
+            classify_claim_note(
+                Some(foreign),
+                None,
+                &NoteAttachments::default(),
+                service,
+                bridge
+            ),
+            ClaimNoteVerdict::Foreign,
+        );
+        // Foreign sender (their service minted it) → Foreign.
+        let (foreign_meta, foreign_attachments) = make_metadata(foreign, Some(bridge));
+        assert_eq!(
+            classify_claim_note(
+                None,
+                Some(&foreign_meta),
+                &foreign_attachments,
+                service,
+                bridge
+            ),
+            ClaimNoteVerdict::Foreign,
+        );
+        // Our sender but a DIFFERENT target (their bridge) → Foreign.
+        let (meta2, attachments2) = make_metadata(service, Some(id(TEST_TARGET_OTHER)));
+        assert_eq!(
+            classify_claim_note(None, Some(&meta2), &attachments2, service, bridge),
+            ClaimNoteVerdict::Foreign,
+        );
+        // No attribution at all → Foreign (fail-closed floor).
+        assert_eq!(
+            classify_claim_note(None, None, &NoteAttachments::default(), service, bridge),
+            ClaimNoteVerdict::Foreign,
         );
     }
 

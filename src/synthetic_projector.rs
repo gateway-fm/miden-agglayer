@@ -170,6 +170,12 @@ pub struct SyntheticProjector {
     local_network_id: u32,
     /// Expected GER sender (ger_manager, or service for legacy deployments).
     expected_ger_sender: AccountId,
+    /// Expected CLAIM minter (`accounts.service` — the account `create_claim`
+    /// mints every ClaimNote from). Together with `bridge_id` this backs the
+    /// claim provenance gate: on a chain shared with a FOREIGN miden-agglayer
+    /// deployment, foreign claims share our ClaimNote script root and must
+    /// not be projected (see `restore::classify_claim_note`).
+    expected_claim_sender: AccountId,
     /// L1 JSON-RPC endpoint for the Cantina #13 Layer-2 ERC-20 metadata
     /// recovery path (mirrors `BridgeOutScanner::l1_rpc_url`). Threaded into
     /// `project_b2agg_note` so legacy/DB-loss faucet rows with empty ERC-20
@@ -303,6 +309,7 @@ impl SyntheticProjector {
             bridge_id: accounts.bridge.0,
             local_network_id,
             expected_ger_sender,
+            expected_claim_sender: accounts.service.0,
             l1_rpc_url,
             cursor: AtomicU64::new(start_cursor),
             node_rpc,
@@ -941,8 +948,17 @@ impl SyntheticProjector {
                 continue;
             }
 
-            if project_claim_note(&self.store, note, miden_block, block_hash, bridge_address)
-                .await?
+            if project_claim_note(
+                &self.store,
+                note,
+                output_metadata,
+                self.expected_claim_sender,
+                self.bridge_id,
+                miden_block,
+                block_hash,
+                bridge_address,
+            )
+            .await?
                 == ClaimProjectOutcome::Emitted
             {
                 logs += 1;
