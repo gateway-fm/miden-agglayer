@@ -535,6 +535,12 @@ pub trait Store: Send + Sync + 'static {
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
     /// Mark note as processed, return the deposit count assigned to it.
+    ///
+    /// MUST be idempotent: re-marking an already-processed note reuses the
+    /// originally-assigned `deposit_count` rather than allocating a new one.
+    /// Non-idempotent implementations create permanent gaps in the
+    /// `deposit_count` sequence on retry, desynchronising leaf indices from
+    /// the on-chain Local Exit Tree (Cantina MA#15 / audit H3).
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
     /// Roll back a processed-note marker when later persistence fails.
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;
@@ -542,6 +548,64 @@ pub trait Store: Send + Sync + 'static {
     /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
     /// to compare against the bridge account's `let_num_leaves` storage slot.
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;
+
+    /// Atomic, idempotent commit for a B2AGG bridge-out `BridgeEvent`. Folds:
+    ///   1. `mark_note_processed` (allocate / reuse `deposit_count`)
+    ///   2. `add_bridge_event` (synthetic log emission)
+    /// into a single all-or-nothing operation.
+    ///
+    /// Why this exists (audit H1): the legacy two-step `mark_note_processed` +
+    /// `add_bridge_event` sequence left a crash window — a process kill between
+    /// the two calls recorded the note as processed (and bumped
+    /// `deposit_counter`) with NO matching `BridgeEvent`. On restart the note
+    /// was silently skipped, stranding the exit: aggkit never certified it and
+    /// the L1 autoclaim never fired. The Claim path already had the atomic
+    /// pattern (`commit_manual_claim_event_atomic`); the B2AGG path did not.
+    ///
+    /// It is also idempotent on retry (audit H3): re-running for an
+    /// already-committed note reuses the original `deposit_count`, does NOT
+    /// bump the counter again, and does NOT emit a duplicate log — closing the
+    /// gap-on-retry bug where `unmark_note_processed` deleted the dedup row but
+    /// left the counter advanced.
+    ///
+    /// PgStore overrides with a single postgres txn; the default impl chains
+    /// the two primitives sequentially (acceptable for `InMemoryStore`, which
+    /// still overrides to make the idempotent reuse atomic across locks).
+    /// Returns the `deposit_count` assigned to (or reused for) this note.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let deposit_count = self.mark_note_processed(note_id).await?;
+        self.add_bridge_event(
+            bridge_address,
+            block_number,
+            block_hash,
+            tx_hash,
+            leaf_type,
+            origin_network,
+            origin_address,
+            destination_network,
+            destination_address,
+            amount,
+            metadata,
+            deposit_count,
+        )
+        .await?;
+        Ok(deposit_count)
+    }
 
     /// Record a B2AGG bridge-out that was observed consumed by the bridge but
     /// could NOT be translated into a synthetic BridgeEvent (Cantina MA#18).

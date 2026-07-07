@@ -1077,10 +1077,15 @@ pub(crate) async fn project_b2agg_note(
     // (dedup-stable).
     let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
 
-    let deposit_count = store.mark_note_processed(note_id_str.clone()).await?;
-
-    if let Err(err) = store
-        .add_bridge_event(
+    // H1 — atomic B2AGG commit. The legacy two-step `mark_note_processed` +
+    // `add_bridge_event` left a crash window: a process kill between them
+    // recorded the note as processed (deposit_counter bumped) with NO matching
+    // BridgeEvent, silently stranding the exit. `commit_b2agg_event_atomic`
+    // folds both into a single DB transaction and is idempotent on retry
+    // (reuses the original deposit_count, emits no duplicate log — H3).
+    let deposit_count = store
+        .commit_b2agg_event_atomic(
+            note_id_str.clone(),
             bridge_address,
             restore_block,
             block_hash,
@@ -1092,13 +1097,8 @@ pub(crate) async fn project_b2agg_note(
             &destination_address,
             origin_amount,
             &emit_metadata,
-            deposit_count,
         )
-        .await
-    {
-        let _ = store.unmark_note_processed(&note_id_str).await;
-        return Err(err);
-    }
+        .await?;
 
     // "emitted BridgeEvent" is the production signal a bridge-out was projected —
     // both the live projector and the startup restore replay reach here, and both

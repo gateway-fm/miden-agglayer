@@ -58,7 +58,7 @@ pub struct InMemoryStore {
     address_mappings: RwLock<HashMap<Address, AccountId>>,
 
     // Bridge-out
-    processed_notes: RwLock<HashSet<String>>,
+    processed_notes: RwLock<HashMap<String, u32>>,
     deposit_counter: RwLock<u32>,
 
     // Claim watcher (independent from bridge-out so CLAIM observations do not
@@ -123,7 +123,7 @@ impl InMemoryStore {
             unclaimable: RwLock::new(HashMap::new()),
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
-            processed_notes: RwLock::new(HashSet::new()),
+            processed_notes: RwLock::new(HashMap::new()),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             faucets: RwLock::new(Vec::new()),
@@ -674,7 +674,7 @@ impl Store for InMemoryStore {
     // ── Bridge-out ───────────────────────────────────────────────
 
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
-        Ok(self.processed_notes.read().contains(note_id))
+        Ok(self.processed_notes.read().contains_key(note_id))
     }
 
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
@@ -682,16 +682,90 @@ impl Store for InMemoryStore {
     }
 
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
-        self.processed_notes.write().insert(note_id);
+        // Idempotent (audit H3): reuse the originally-assigned deposit_count
+        // instead of bumping the counter on every call. A retry after a
+        // partial commit must not advance the counter a second time — that
+        // would leave a permanent gap between the proxy's `deposit_counter`
+        // and the on-chain Local Exit Tree leaf count.
+        let mut processed = self.processed_notes.write();
+        if let Some(&existing) = processed.get(&note_id) {
+            return Ok(existing);
+        }
         let mut counter = self.deposit_counter.write();
         let deposit_count = *counter;
         *counter += 1;
+        processed.insert(note_id, deposit_count);
         Ok(deposit_count)
     }
 
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
         self.processed_notes.write().remove(note_id);
         Ok(())
+    }
+
+    /// Atomic, idempotent B2AGG commit (audit H1/H3). Holds the
+    /// `processed_notes` + `deposit_counter` writes across the whole op so a
+    /// concurrent reader cannot observe a half-committed state, and reuses the
+    /// original `deposit_count` (no gap on retry).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        // 1. Allocate / reuse deposit_count atomically.
+        let deposit_count = {
+            let mut processed = self.processed_notes.write();
+            if let Some(&existing) = processed.get(&note_id) {
+                existing
+            } else {
+                let mut counter = self.deposit_counter.write();
+                let dc = *counter;
+                *counter += 1;
+                processed.insert(note_id.clone(), dc);
+                dc
+            }
+        };
+
+        // 2. Emit the BridgeEvent. Idempotent on retry: the projector derives
+        //    tx_hash deterministically from note_id, so a second emit would
+        //    only duplicate the log. The InMemoryStore has no tx_hash unique
+        //    constraint, so guard by checking the existing logs_by_block entry
+        //    for the same tx_hash before emitting.
+        let already_emitted = self
+            .logs_by_block
+            .read()
+            .get(&block_number)
+            .map(|logs| logs.iter().any(|l| l.transaction_hash == tx_hash))
+            .unwrap_or(false);
+        if !already_emitted {
+            self.add_bridge_event(
+                bridge_address,
+                block_number,
+                block_hash,
+                tx_hash,
+                leaf_type,
+                origin_network,
+                origin_address,
+                destination_network,
+                destination_address,
+                amount,
+                metadata,
+                deposit_count,
+            )
+            .await?;
+        }
+        Ok(deposit_count)
     }
 
     // ── Claim watcher ────────────────────────────────────────────
@@ -1111,6 +1185,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c2, 1);
+    }
+
+    #[tokio::test]
+    // Audit H3 — `mark_note_processed` must be idempotent: re-marking the same
+    // note reuses the original deposit_count instead of advancing the counter
+    // (which would leave a gap vs. the on-chain Local Exit Tree leaf count).
+    async fn h3_mark_note_processed_is_idempotent_on_retry() {
+        let store = InMemoryStore::new();
+        let dc0 = store
+            .mark_note_processed("noteA".to_string())
+            .await
+            .unwrap();
+        // Simulate a retry after a partial commit (mark ran, emit did not).
+        let dc1 = store
+            .mark_note_processed("noteA".to_string())
+            .await
+            .unwrap();
+        assert_eq!(dc0, dc1, "retry must reuse the same deposit_count");
+        assert_eq!(
+            store.get_deposit_count().await.unwrap(),
+            1,
+            "counter must advance exactly once for one note"
+        );
+    }
+
+    #[tokio::test]
+    // Audit H1 — `commit_b2agg_event_atomic` must be a single all-or-nothing
+    // operation that is also idempotent on retry: re-running it for an
+    // already-committed note reuses the original deposit_count, does NOT bump
+    // the counter, and does NOT emit a duplicate BridgeEvent.
+    async fn h1_commit_b2agg_event_atomic_is_idempotent_on_retry() {
+        use crate::log_synthesis::{BRIDGE_EVENT_TOPIC, LogFilter};
+
+        let store = InMemoryStore::new();
+        let note = "0xb2agg-note-1".to_string();
+        let block = 10u64;
+
+        let dc1 = store
+            .commit_b2agg_event_atomic(
+                note.clone(),
+                "0xbridge",
+                block,
+                [0xaa; 32],
+                "0xtx1",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
+
+        // Retry — simulates a re-projection after a crash before the txn
+        // committed. The contract: same deposit_count, no duplicate event.
+        let dc2 = store
+            .commit_b2agg_event_atomic(
+                note.clone(),
+                "0xbridge",
+                block,
+                [0xaa; 32],
+                "0xtx1",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dc1, dc2, "retry must reuse the same deposit_count");
+        assert_eq!(
+            store.get_deposit_count().await.unwrap(),
+            1,
+            "counter must not advance on retry"
+        );
+        assert!(
+            store.is_note_processed(&note).await.unwrap(),
+            "note stays marked processed"
+        );
+
+        // Exactly one BridgeEvent log in the store.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let bridge_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| l.topics.first().is_some_and(|t| t == BRIDGE_EVENT_TOPIC))
+            .collect();
+        assert_eq!(
+            bridge_logs.len(),
+            1,
+            "retry must not emit a duplicate BridgeEvent"
+        );
     }
 
     #[tokio::test]
