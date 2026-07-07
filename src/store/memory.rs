@@ -757,18 +757,6 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn replace_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
-        let mut faucets = self.faucets.write();
-        // Drop any existing route for this origin (regardless of faucet_id) and
-        // insert the replacement — mirrors the unique index on
-        // (origin_address, origin_network).
-        faucets.retain(|f| {
-            !(f.origin_address == entry.origin_address && f.origin_network == entry.origin_network)
-        });
-        faucets.push(entry);
-        Ok(())
-    }
-
     async fn get_faucet_by_origin(
         &self,
         origin_address: &[u8; 20],
