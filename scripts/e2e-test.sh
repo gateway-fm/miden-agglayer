@@ -34,7 +34,7 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-security.sh"
         echo ""
-        "$SCRIPT_DIR/e2e-cantina12-getlogs-truncation.sh"
+        "$SCRIPT_DIR/e2e-cantina12-getlogs-returns-all.sh"
         echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
         echo ""
@@ -75,8 +75,8 @@ case "$test_filter" in
     security)
         "$SCRIPT_DIR/e2e-security.sh"
         ;;
-    cantina12-getlogs-truncation)
-        "$SCRIPT_DIR/e2e-cantina12-getlogs-truncation.sh"
+    cantina12-getlogs-returns-all)
+        "$SCRIPT_DIR/e2e-cantina12-getlogs-returns-all.sh"
         ;;
     cantina6-faucet-identity-restore)
         "$SCRIPT_DIR/e2e-cantina6-faucet-identity-restore.sh"
@@ -95,7 +95,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|cantina12-getlogs-truncation|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
         exit 1
         ;;
 esac

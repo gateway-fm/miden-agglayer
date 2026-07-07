@@ -270,25 +270,38 @@ impl Store for InMemoryStore {
             *pending = remaining;
         }
 
-        // Cantina #12: mirror the PgStore contract — count RAW logs in range
-        // (pre address/topic filter, matching the SQL LIMIT semantics) and ERROR
-        // when the range exceeds the cap rather than silently returning a prefix.
+        // Cantina #12 redesign — mirror the PgStore contract: NO row cap. Run the
+        // exact `matches()` over every candidate and return ALL matches (a sparse
+        // match in a dense range returns exactly the matches, never an error).
+        // When a block_hash is set, `matches()` IGNORES the block range and keys
+        // on the hash, so we must scan EVERY block — mirroring PgStore's
+        // range-independent block_hash superset; otherwise we scan the inclusive
+        // range. The only limit is the OOM ceiling on the matched count.
         let mut result = Vec::new();
-        let mut raw_count = 0usize;
         let logs_by_block = self.logs_by_block.read();
-        for block_num in from..=to {
-            if let Some(logs) = logs_by_block.get(&block_num) {
-                raw_count += logs.len();
-                if raw_count > super::GETLOGS_ROW_CAP {
-                    return Err(super::getlogs_row_cap_error(from, to));
-                }
-                for log in logs {
-                    if filter.matches(log, current_block) {
-                        result.push(log.clone());
+        let candidate_logs: Vec<&Vec<SyntheticLog>> = if filter.block_hash.is_some() {
+            logs_by_block.values().collect()
+        } else {
+            (from..=to).filter_map(|b| logs_by_block.get(&b)).collect()
+        };
+        for logs in candidate_logs {
+            for log in logs {
+                if filter.matches(log, current_block) {
+                    result.push(log.clone());
+                    // OOM backstop only — NOT a normal cap.
+                    if result.len() > super::GETLOGS_SAFETY_CEILING {
+                        return Err(super::getlogs_row_cap_error(from, to));
                     }
                 }
             }
         }
+        // eth_getLogs ordering contract: results MUST be ordered by
+        // (block_number, log_index), matching PgStore's `ORDER BY block_number,
+        // log_index`. The range path already yields this (ascending blocks; within
+        // a block, insertion order == log_index order), but the block_hash path
+        // scans `HashMap::values()` in ARBITRARY order — so sort unconditionally to
+        // pin the contract for both paths.
+        result.sort_by_key(|l| (l.block_number, l.log_index));
         Ok(result)
     }
 
@@ -1146,31 +1159,31 @@ mod tests {
         assert_eq!(logs[0].block_number, 100);
     }
 
-    /// Cantina finding #12 (in-memory parity) — `get_logs` must ERROR, not return
-    /// a silently truncated prefix, when a range exceeds `GETLOGS_ROW_CAP`. The
-    /// PgStore is the production path (the PoC targets it) but InMemoryStore shared
-    /// the same 1000-row silent cap, so it gets the same contract to prevent the
-    /// default/test store from masking the regression. Error string matches
-    /// aggkit's `reMaxRange` parser so a real consumer would re-chunk.
+    /// Cantina finding #12 (redesign) — `get_logs` returns ALL matches with NO
+    /// row cap. The ORIGINAL fix capped at 1000 raw rows and errored past it; the
+    /// redesign pushes filtering into a SAFE SUPERSET and reads the whole set, so
+    /// a dense block of matching logs comes back in full — not truncated, not
+    /// errored.
     #[tokio::test]
-    async fn finding_12_getlogs_over_cap_errors_not_truncates() {
+    async fn finding_12_getlogs_returns_all_no_row_cap() {
         let store = InMemoryStore::new();
         let block = 4_242u64;
-        for i in 0..=super::super::GETLOGS_ROW_CAP {
-            let mut log = SyntheticLog {
-                log_index: 0,
-                address: "0xdead".to_string(),
-                topics: vec!["0xabcd".to_string()],
-                data: "0x".to_string(),
-                block_number: block,
-                block_hash: [0u8; 32],
-                transaction_hash: format!("0xf12_{i}"),
-                transaction_index: 0,
-                removed: false,
-            };
-            // add_log overwrites log_index with its own counter; explicit for clarity.
-            log.log_index = 0;
-            store.add_log(log).await.unwrap();
+        let n = 2_500usize; // comfortably past the OLD 1000-row cap
+        for i in 0..n {
+            store
+                .add_log(SyntheticLog {
+                    log_index: 0,
+                    address: "0xdead".to_string(),
+                    topics: vec!["0xabcd".to_string()],
+                    data: "0x".to_string(),
+                    block_number: block,
+                    block_hash: [0u8; 32],
+                    transaction_hash: format!("0xf12_{i}"),
+                    transaction_index: 0,
+                    removed: false,
+                })
+                .await
+                .unwrap();
         }
 
         let filter = LogFilter {
@@ -1178,16 +1191,103 @@ mod tests {
             to_block: Some(format!("0x{block:x}")),
             ..Default::default()
         };
-        let err = store
+        let logs = store
             .get_logs(&filter, block)
             .await
-            .expect_err("in-memory get_logs over the row cap MUST error, not truncate");
-        let msg = format!("{err}");
-        let re = regex::Regex::new(r"block range too large, max range:\s*(\d+)").unwrap();
-        assert!(
-            re.is_match(&msg),
-            "row-cap error must match aggkit reMaxRange, got: {msg}"
-        );
+            .expect("no row cap: a dense range must return ALL matches, not error");
+        assert_eq!(logs.len(), n, "every matching log must be returned in full");
+    }
+
+    /// Cantina #12 GUARDRAIL — property-based equivalence. For a diverse
+    /// population of SyntheticLogs and a diverse set of LogFilters,
+    /// `InMemoryStore::get_logs` MUST equal the pure-Rust `matches()` oracle over
+    /// the whole population. This is the correctness proof independent of any
+    /// store internals. Explicit non-trivial cases asserted on top of the blanket
+    /// equivalence:
+    ///   (a) sparse match in a DENSE range — the old cap would have errored,
+    ///   (b) MA#26 UHCV passthrough BOTH ways (topic0 includes UHCV ⇒ returned;
+    ///       no topic0 / other topic0 ⇒ NOT returned),
+    ///   (c) positional topics with wildcards + multi-alternatives + a filter
+    ///       longer than the log's topics ⇒ reject.
+    #[tokio::test]
+    async fn getlogs_equivalence_matches_oracle_inmemory() {
+        use crate::log_synthesis::equiv_fixtures::{
+            DENSE_FILLER, SPARSE_MATCH_COUNT, Scenario, sorted_txs,
+        };
+
+        const {
+            assert!(
+                DENSE_FILLER > 1000,
+                "sparse-in-dense case must exceed the OLD 1000-row cap to be meaningful"
+            );
+        }
+
+        let store = InMemoryStore::new();
+        let scn = Scenario::new(0, 0x_A11CE);
+        for l in &scn.logs {
+            store.add_log(l.clone()).await.unwrap();
+        }
+
+        for (name, f) in &scn.filters {
+            let got = store
+                .get_logs(f, scn.current_block)
+                .await
+                .unwrap_or_else(|e| panic!("filter `{name}`: get_logs errored: {e}"));
+            let want = scn.reference_matches(f);
+            assert_eq!(
+                sorted_txs(&got),
+                sorted_txs(&want),
+                "filter `{name}`: store result diverged from matches() oracle"
+            );
+
+            // eth_getLogs ordering contract — results must be ordered by
+            // (block_number, log_index). Exercised especially by the block_hash
+            // filter, whose in-memory path scans an unordered HashMap.
+            assert!(
+                got.windows(2)
+                    .all(|w| (w[0].block_number, w[0].log_index)
+                        <= (w[1].block_number, w[1].log_index)),
+                "filter `{name}`: results must be ordered by (block_number, log_index)"
+            );
+
+            let got_txs = sorted_txs(&got);
+            let has = |tx: &str| got_txs.iter().any(|t| t == tx);
+            match *name {
+                "sparse_in_dense" => {
+                    assert_eq!(
+                        got.len(),
+                        SPARSE_MATCH_COUNT,
+                        "dense range must return exactly the sparse matches"
+                    );
+                    for tx in &scn.sparse_match_txs {
+                        assert!(has(tx), "sparse match {tx} missing");
+                    }
+                }
+                "passthrough_include" => assert!(
+                    has(&scn.tx_passthrough),
+                    "UHCV passthrough must be returned when the query's topic0 includes UHCV"
+                ),
+                "passthrough_exclude_no_topic" => assert!(
+                    !has(&scn.tx_passthrough),
+                    "no topic0 filter ⇒ passthrough must NOT leak the UHCV log"
+                ),
+                "passthrough_exclude_other_topic" => assert!(
+                    !has(&scn.tx_passthrough),
+                    "topic0 excludes UHCV ⇒ passthrough must NOT return the UHCV log"
+                ),
+                "positional_longer_than_log" => {
+                    assert!(
+                        !has(&scn.tx_positional_short),
+                        "filter constrains topic position 2 but the log has only 2 topics ⇒ reject"
+                    );
+                    assert!(
+                        has(&scn.tx_positional_long),
+                        "len-3 log with matching positional topics ⇒ accept"
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test]

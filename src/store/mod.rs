@@ -23,26 +23,35 @@ use miden_protocol::account::AccountId;
 use miden_protocol::transaction::TransactionId;
 use std::sync::Arc;
 
-// ── eth_getLogs row cap (Cantina #12) ────────────────────────────────
+// ── eth_getLogs safety ceiling (Cantina #12) ─────────────────────────
 
-/// Maximum number of raw logs a single `eth_getLogs` block-range query may
-/// return before the store refuses to answer.
+/// OOM backstop on the number of **matching** logs a single `eth_getLogs`
+/// query may return. This is NOT a normal-operation cap — under any realistic
+/// query the store returns the COMPLETE matching set.
 ///
-/// Cantina finding #12: `get_logs` previously issued `... LIMIT 1000` and
-/// returned the truncated slice with no signal. A restore (or any dense window)
-/// with more than 1000 `synthetic_logs` in range would hand a well-behaved
-/// consumer (aggkit/aggsender) a *successful* response missing the tail, so it
-/// would ingest `0..999`, silently skip `1000`, and later reject `1001` as out
-/// of sequence — permanently stalling withdrawal / GER sync.
+/// Cantina finding #12 (original): `get_logs` issued `... LIMIT 1000` and
+/// returned the truncated slice with no signal. Worse, the `LIMIT` was applied
+/// to the UNFILTERED block-range set — address/topic matching happened in Rust
+/// AFTER the fetch — so a range holding 5000 logs of which only 3 matched the
+/// queried address would error/truncate even though the true answer was 3 rows.
+/// A restore replaying a dense window handed a well-behaved consumer
+/// (aggkit/aggsender) a *successful* response missing the tail, so it ingested
+/// `0..999`, silently skipped `1000`, and later rejected `1001` as out of
+/// sequence — permanently stalling withdrawal / GER sync.
 ///
-/// A well-behaved `eth_getLogs` (Geth/Alchemy/Infura convention) must NOT drop
-/// the tail: when a range's result set exceeds the cap it returns an ERROR so
-/// the client narrows its range and retries. We keep the cap at 1000 (the old
-/// silent limit) but now surface it as [`getlogs_row_cap_error`].
-pub const GETLOGS_ROW_CAP: usize = 1000;
+/// Redesign (this change): the address/topic0 filter is pushed into a SAFE
+/// SUPERSET SQL `WHERE` (see `PgStore::get_logs`), the superset is read in FULL
+/// (streaming cursor on pg, whole-range scan in memory), and the UNCHANGED
+/// `LogFilter::matches` runs as the exact final filter. There is no
+/// normal-operation row cap: a sparse match in a dense range returns exactly
+/// the matches. The only remaining limit is this generous ceiling on the
+/// **post-`matches()`** count — a genuine "this query matched too much"
+/// signal (Geth/Alchemy/Infura convention) that guards against unbounded
+/// memory and, being shaped as [`getlogs_row_cap_error`], lets aggkit re-chunk.
+pub const GETLOGS_SAFETY_CEILING: usize = 500_000;
 
-/// Build the canonical over-cap error for a `[from, to]` block range whose raw
-/// `synthetic_logs` count exceeds [`GETLOGS_ROW_CAP`].
+/// Build the canonical over-ceiling error for a `[from, to]` block range whose
+/// **matching** `synthetic_logs` count exceeds [`GETLOGS_SAFETY_CEILING`].
 ///
 /// The message is deliberately shaped as `block range too large, max range: N`
 /// so aggkit/aggsender's `ParseMaxRangeFromError`
@@ -60,14 +69,15 @@ pub const GETLOGS_ROW_CAP: usize = 1000;
 /// `ChunkedRangeQuery` recurses per chunk, so a still-too-dense sub-window shrinks
 /// again — convergence is guaranteed because PR #94's 1:1 Miden→block projection
 /// puts each event in its own block, so no single block approaches the cap.
-/// (The one unreachable degenerate case — a single block with >1000 logs — cannot
-/// be narrowed by block range; it is out of reach post-#94 and noted here honestly.)
+/// (The one unreachable degenerate case — a single block matching >500k logs —
+/// cannot be narrowed by block range; it is out of reach post-#94 and noted here
+/// honestly.)
 pub fn getlogs_row_cap_error(from: u64, to: u64) -> anyhow::Error {
     let span = to.saturating_sub(from).saturating_add(1);
     let suggested = (span / 2).max(1);
     anyhow::anyhow!(
         "eth_getLogs block range too large, max range: {suggested} — range [{from}, {to}] \
-         returned more than {GETLOGS_ROW_CAP} logs; retry with a smaller block range"
+         matched more than {GETLOGS_SAFETY_CEILING} logs; retry with a smaller block range"
     )
 }
 
