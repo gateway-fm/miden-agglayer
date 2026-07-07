@@ -33,6 +33,16 @@ pub struct RegisterFaucetParams {
     pub origin_token_address: String,
     pub origin_network: u32,
     pub origin_decimals: u8,
+    /// DEPRECATED / IGNORED. The local faucet decimals are computed as
+    /// `min(origin_decimals, `[`faucet_ops::MIDEN_DECIMALS`]` (8))` — capped at 8
+    /// (finding #17). The field is retained only for request-shape compatibility;
+    /// whatever value a caller sends is discarded. Routability is decided purely
+    /// by `origin_decimals` (must be `<= MAX_ORIGIN_DECIMALS (26)`).
+    ///
+    /// Accepted (via `serde`) for request-shape compatibility but deliberately
+    /// never read — the value is discarded in favour of the fixed constant.
+    #[serde(default)]
+    #[allow(dead_code)]
     pub miden_decimals: u8,
     /// Token display name used when computing the `MetadataHash`. Optional —
     /// defaults to the symbol if not provided.
@@ -72,36 +82,39 @@ pub async fn admin_register_faucet(
         return Ok(id);
     }
 
-    // New-route creation path only. Compute the downscaling factor and reject
-    // unclaimable routes up-front so a poisoned entry is never persisted. Both
-    // bridge-stack limits must hold: the local faucet decimals must fit
-    // MAX_MIDEN_DECIMALS and the downscaling factor must fit MAX_SCALING_FACTOR
-    // (enforced by `EthAmount::scale_to_token_amount`).
+    // New-route creation path only. The faucet decimals are capped at
+    // `MIDEN_DECIMALS` (8): `miden_decimals = min(origin_decimals, 8)` (finding
+    // #17). The caller's `params.miden_decimals` is IGNORED (a route can never be
+    // created with a caller-chosen decimal count). A low-decimal origin token
+    // (e.g. 6-decimal USDC/USDT) routes 1:1 at scale 0; a high-decimal token pins
+    // to 8. Routability then reduces to a single check on the origin token: the
+    // downscaling factor `scale = origin_decimals - min(origin_decimals, 8)` must
+    // fit MAX_SCALING_FACTOR (18, enforced at runtime by
+    // `EthAmount::scale_to_token_amount`), i.e. `origin_decimals <= 26`. Reject
+    // unclaimable routes up-front so a poisoned entry is never persisted.
+    let miden_decimals = params.origin_decimals.min(faucet_ops::MIDEN_DECIMALS);
+    // `miden_decimals <= origin_decimals` by construction — this never underflows;
+    // it stays only as a defensive invariant guard.
     let scale = params
         .origin_decimals
-        .checked_sub(params.miden_decimals)
+        .checked_sub(miden_decimals)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "origin_decimals ({}) must be >= miden_decimals ({})",
+                "internal invariant violated: miden_decimals ({}) > origin_decimals ({})",
+                miden_decimals,
                 params.origin_decimals,
-                params.miden_decimals
             )
         })?;
 
-    if params.miden_decimals > faucet_ops::MAX_MIDEN_DECIMALS {
-        anyhow::bail!(
-            "miden_decimals ({}) exceeds the faucet limit of {} decimals",
-            params.miden_decimals,
-            faucet_ops::MAX_MIDEN_DECIMALS,
-        );
-    }
     if scale > faucet_ops::MAX_SCALING_FACTOR {
         anyhow::bail!(
-            "scale ({scale} = origin_decimals {} - miden_decimals {}) exceeds the shared limit of \
-             {} (route would be unclaimable). Raise miden_decimals so scale <= {}.",
+            "scale ({scale} = origin_decimals {} - capped miden_decimals {}) exceeds the shared limit \
+             of {} (route would be unclaimable). origin_decimals must be <= {} (= {} + {}).",
             params.origin_decimals,
-            params.miden_decimals,
+            miden_decimals,
             faucet_ops::MAX_SCALING_FACTOR,
+            faucet_ops::MAX_ORIGIN_DECIMALS,
+            faucet_ops::MIDEN_DECIMALS,
             faucet_ops::MAX_SCALING_FACTOR,
         );
     }
@@ -139,7 +152,8 @@ pub async fn admin_register_faucet(
     let recovered_inner = recovered.clone();
     let store_for_closure = state.store.clone();
     let symbol_clone = params.symbol.clone();
-    let miden_decimals = params.miden_decimals;
+    // `miden_decimals` was capped to min(origin_decimals, 8) above; reuse it (the
+    // caller's params value is deliberately ignored).
     let origin_network = params.origin_network;
     // The admin-supplied metadata IS the authoritative preimage for this token;
     // prefer it over on-chain recovery when importing an existing faucet.
@@ -224,7 +238,8 @@ pub async fn admin_register_faucet(
     // faucet identity (Cantina #6), in which case the row is already written. This
     // path is only reached when no route existed for the origin (existing routes
     // returned early above), so a plain insert is correct — there is deliberately no
-    // live "replace" path.
+    // live "replace" path. `miden_decimals` here is the capped local (finding #17),
+    // NOT the ignored `params.miden_decimals`.
     if recovered.get().is_none() {
         state
             .store
@@ -234,7 +249,7 @@ pub async fn admin_register_faucet(
                 origin_network: params.origin_network,
                 symbol: params.symbol,
                 origin_decimals: params.origin_decimals,
-                miden_decimals: params.miden_decimals,
+                miden_decimals,
                 scale,
                 metadata: metadata_bytes,
             })
@@ -300,7 +315,8 @@ mod tests {
             origin_token_address: ORIGIN_HEX.into(),
             origin_network: 0,
             origin_decimals: 27,
-            // Fixed derivation for d=27 → scale 18 (valid route).
+            // Ignored under the cap-at-8 scheme (faucet decimals = min(origin, 8));
+            // left non-8 here to prove the param has no effect.
             miden_decimals: 9,
             name: None,
         }
@@ -327,23 +343,25 @@ mod tests {
 
     /// Idempotency must win over validation: an existing route is ALWAYS returned,
     /// even when the re-register call carries params that would FAIL new-route
-    /// validation (here `scale = 27 - 7 = 20 > MAX_SCALING_FACTOR`). Because the
-    /// existence check runs before any validation, the poisoned-but-existing route
-    /// is returned as-is instead of surfacing a spurious validation error — which
-    /// would otherwise break the register-if-absent / return-existing contract.
+    /// validation (origin_decimals = 27 → capped scale `27 - min(27,8) = 19 >
+    /// MAX_SCALING_FACTOR`). Because the existence check runs before any
+    /// validation, the poisoned-but-existing route is returned as-is instead of
+    /// surfacing a spurious validation error — which would otherwise break the
+    /// register-if-absent / return-existing contract.
     #[tokio::test]
     async fn existing_route_returned_even_when_params_would_fail_validation() {
         let service = create_test_service();
         seed_poisoned_route(&service).await;
 
-        // These params would be rejected on a fresh origin (scale 20 > 18), but the
-        // origin already exists, so validation must never run.
+        // These params would be rejected on a fresh origin (capped scale 27 -
+        // min(27,8) = 19 > 18), but the origin already exists, so validation must
+        // never run.
         let bad_params = RegisterFaucetParams {
             symbol: "TKN".into(),
             origin_token_address: ORIGIN_HEX.into(),
             origin_network: 0,
-            origin_decimals: 27,
-            miden_decimals: 7, // scale 20 > MAX_SCALING_FACTOR
+            origin_decimals: 27, // capped scale 27 - min(27,8) = 19 > MAX_SCALING_FACTOR
+            miden_decimals: 7,   // ignored
             name: None,
         };
         let id = admin_register_faucet(service.clone(), bad_params)
@@ -355,7 +373,10 @@ mod tests {
     }
 
     /// Finding #17 — an unsatisfiable route is rejected up-front and never
-    /// persisted. Here `scale = 27 - 7 = 20 > MAX_SCALING_FACTOR`.
+    /// persisted. Under the cap-at-8 scheme `origin_decimals = 27` yields the
+    /// capped scale `27 - min(27,8) = 19 > MAX_SCALING_FACTOR` (18), i.e.
+    /// origin_decimals > MAX_ORIGIN_DECIMALS (26). The `miden_decimals` param is
+    /// ignored.
     #[tokio::test]
     async fn rejects_route_exceeding_scaling_factor() {
         let service = create_test_service();
@@ -363,8 +384,8 @@ mod tests {
             symbol: "TKN".into(),
             origin_token_address: ORIGIN_HEX.into(),
             origin_network: 0,
-            origin_decimals: 27,
-            miden_decimals: 7, // scale 20 > 18
+            origin_decimals: 27, // capped scale 27 - min(27,8) = 19 > 18
+            miden_decimals: 7,   // ignored
             name: None,
         };
         let err = admin_register_faucet(service.clone(), params)

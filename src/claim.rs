@@ -212,18 +212,25 @@ async fn find_or_create_faucet(
         }
     }
 
-    // 3. Auto-create: parse token metadata from claimAsset call
+    // 3. Auto-create: parse token metadata from claimAsset call.
+    //    `parse_token_metadata` already rejects `origin_decimals >
+    //    MAX_ORIGIN_DECIMALS` (26), so a > 26-decimal (poisoned) token never
+    //    reaches faucet creation — its route would be unclaimable (finding #17).
     let (symbol, origin_decimals) = faucet_ops::parse_token_metadata(metadata, &token_address)?;
-    // Finding #17 — derive `miden_decimals` so BOTH the local faucet limit
-    // (`<= MAX_MIDEN_DECIMALS`) and the shared downscaling limit (`scale <=
-    // MAX_SCALING_FACTOR`) hold. This rejects genuinely-unsupportable tokens
-    // (origin_decimals > 30) up-front rather than persisting an unclaimable
-    // route, while still supporting 27..30-decimal tokens by bumping
-    // `miden_decimals` above the historical default of 8 as needed.
-    let miden_decimals: u8 = faucet_ops::derive_miden_decimals(origin_decimals)?;
+    // Finding #17 — the local faucet decimals are `min(origin_decimals,
+    // MIDEN_DECIMALS)` — capped at 8, never derived higher (mirrors main's
+    // historical `min(origin, 8)` scheme). A low-decimal token (e.g. 6-decimal
+    // USDC/USDT) gets a faucet matching its own decimals (scale 0); a high-decimal
+    // token is pinned to 8 and downscaled. The factor `scale = origin_decimals -
+    // min(origin_decimals, 8)` fits MAX_SCALING_FACTOR (18) for every
+    // `origin_decimals <= 26`, which `parse_token_metadata` already guarantees.
+    // `miden_decimals <= origin_decimals` by construction, so the checked_sub can
+    // never underflow — it stays only as a defensive invariant guard.
+    let miden_decimals: u8 = origin_decimals.min(faucet_ops::MIDEN_DECIMALS);
     let scale = origin_decimals.checked_sub(miden_decimals).ok_or_else(|| {
         anyhow::anyhow!(
-            "origin decimals {origin_decimals} < miden decimals {miden_decimals} for token {token_address}"
+            "internal invariant violated: miden_decimals {miden_decimals} > origin_decimals \
+             {origin_decimals} for token {token_address} (finding #17)"
         )
     })?;
 
@@ -1515,101 +1522,132 @@ mod tests {
         }
     }
 
-    /// Finding #17 — first-claim auto-creation used a fixed
-    /// `miden_decimals = origin_decimals.min(8)`, which for 27..30-decimal tokens
-    /// yielded `scale = 19..22`, crossing the shared `MAX_SCALING_FACTOR` (18)
-    /// limit and persisting an UNCLAIMABLE route. The fix derives `miden_decimals`
-    /// dynamically so both limits hold.
+    /// Finding #17 — first-claim auto-creation derived `miden_decimals`
+    /// dynamically (bumping it above 8 for 27..30-decimal tokens), which let it
+    /// persist routes whose scale crossed the shared `MAX_SCALING_FACTOR` (18)
+    /// limit and were UNCLAIMABLE. The audit-aligned fix (auditor cergyk
+    /// recommended rejecting origin decimals above 26) caps faucet decimals at
+    /// `MIDEN_DECIMALS` (8) via `min(origin, 8)` — so low-decimal tokens
+    /// (6-decimal USDC/USDT) still route at scale 0 — and rejects any origin
+    /// token whose decimals exceed `MAX_ORIGIN_DECIMALS` (26).
     mod finding_17_decimal_derivation {
         use crate::faucet_ops::{
-            MAX_MIDEN_DECIMALS, MAX_SCALING_FACTOR, MAX_TOKEN_DECIMALS, derive_miden_decimals,
+            MAX_ORIGIN_DECIMALS, MAX_SCALING_FACTOR, MIDEN_DECIMALS, parse_token_metadata,
         };
-        use alloy::primitives::U256;
+        use alloy::primitives::{Address, Bytes, U256};
         use miden_base_agglayer::{EthAmount, EthAmountError};
 
         fn eth_amount(wei: U256) -> EthAmount {
             EthAmount::new(wei.to_be_bytes::<32>())
         }
 
-        /// Documents the boundary the bug crossed: the OLD service derivation of a
-        /// 27-decimal token (`27 → miden 8 → scale 19`) is rejected by the shared
-        /// scale gate (`EthAmount::scale_to_token_amount`), whereas the FIXED
-        /// derivation (`27 → miden 9 → scale 18`) is accepted.
-        #[test]
-        fn service_scale_19_crosses_limit_while_18_is_valid() {
-            // 10^27 fits in U256 and scales to 10^9 at scale 18 — well within
-            // FungibleAsset::MAX_AMOUNT — so the only failure under test is the gate.
-            let amount = eth_amount(U256::from(10u64).pow(U256::from(27u64)));
+        /// Build a minimal valid ABI metadata blob (`abi.encode(name, symbol,
+        /// decimals)`) carrying a chosen `decimals` byte — enough for
+        /// `parse_token_metadata` to reach (and either accept or reject at) the
+        /// decimals gate.
+        fn metadata_with_decimals(decimals: u8) -> Bytes {
+            let mut data = vec![0u8; 224];
+            data[31] = 0x60; // name offset
+            data[63] = 0xa0; // symbol offset
+            data[95] = decimals;
+            data[127] = 1; // name = "T"
+            data[128] = b'T';
+            data[191] = 3; // symbol = "TKN"
+            data[192..195].copy_from_slice(b"TKN");
+            Bytes::from(data)
+        }
 
-            // Old fixed service derivation: 27 - 8 = 19 → ScaleTooLarge.
-            let service_scale = 27u32 - 8;
+        /// Documents the boundary the bug crossed: a 27-decimal token routes at
+        /// `scale = 27 - min(27, 8) = 19`, which the shared scale gate
+        /// (`EthAmount::scale_to_token_amount`) rejects. Under the audit-aligned
+        /// fix such a token is refused up-front (27 > 26) instead of persisting an
+        /// unclaimable route.
+        #[test]
+        fn service_scale_19_crosses_limit() {
+            // 10^27 fits in U256; the only failure under test is the scale gate.
+            let amount = eth_amount(U256::from(10u64).pow(U256::from(27u64)));
+            let service_scale = 27u32 - u32::from(MIDEN_DECIMALS); // 27 - min(27,8) = 19
             assert_eq!(service_scale, 19);
             assert!(matches!(
                 amount.scale_to_token_amount(service_scale),
                 Err(EthAmountError::ScaleTooLarge)
             ));
-
-            // Fixed derivation: 27 - 9 = 18 → valid.
-            let valid_scale = 27u32 - 9;
-            assert_eq!(valid_scale, 18);
-            assert!(amount.scale_to_token_amount(valid_scale).is_ok());
         }
 
-        /// Full-domain coverage: the fixed derivation must yield a VALID route
-        /// (miden_decimals ≤ MAX_MIDEN_DECIMALS AND scale ≤ MAX_SCALING_FACTOR) for
-        /// EVERY supportable origin-decimal count `0..=MAX_TOKEN_DECIMALS` (30) — not
-        /// just the hand-picked few — and reject everything above it. We iterate the
-        /// whole domain and, at each `d`, assert both invariants hold and that the
-        /// derived scale round-trips through the runtime `EthAmount` gate at the
-        /// boundary preimage `10^d wei → 10^miden_decimals token units`.
+        /// Cap-at-`MIDEN_DECIMALS` (8) invariant, full-domain coverage. The local
+        /// faucet declares `min(origin_decimals, 8)` decimals, so EVERY origin
+        /// token in `0..=MAX_ORIGIN_DECIMALS (26)` gets a route, and each
+        /// round-trips `10^d wei -> 10^min(d,8) token units` through the runtime
+        /// `EthAmount` gate (no precision loss at the boundary):
+        ///
+        /// - `d in 0..=8`: faucet decimals = d, `scale = 0` — a 6-decimal
+        ///   USDC/USDT token routes 1:1 (the regression this fix restores);
+        /// - `d in 9..=26`: faucet decimals = 8, `scale = d - 8` fits
+        ///   MAX_SCALING_FACTOR (18);
+        /// - `d > 26`: `parse_token_metadata` rejects up-front (unclaimable /
+        ///   overflow-prone) — checked explicitly for d in {27, 30, 255}.
         #[test]
-        fn derivation_covers_full_domain_0_to_30_and_rejects_above() {
+        fn capped_miden_decimals_routes_0_to_26_and_rejects_above() {
             use miden_protocol::Felt;
 
-            for d in 0u8..=MAX_TOKEN_DECIMALS {
-                let m = derive_miden_decimals(d)
-                    .unwrap_or_else(|e| panic!("d={d} must be supportable: {e}"));
+            assert_eq!(MIDEN_DECIMALS, 8);
+            assert_eq!(MAX_ORIGIN_DECIMALS, 26);
+            let addr = Address::ZERO;
 
-                // Invariant 1: local faucet decimals fit the faucet cap.
-                assert!(m <= MAX_MIDEN_DECIMALS, "d={d}: miden_decimals {m} > cap");
+            for d in 0u8..=MAX_ORIGIN_DECIMALS {
+                // Faucet decimals are capped at 8, never derived higher.
+                let miden_decimals = d.min(MIDEN_DECIMALS);
+                // `miden_decimals <= d` by construction, so this never underflows.
+                let scale = d - miden_decimals;
 
-                // Invariant 2: the downscaling factor fits the shared scale cap.
-                // (m <= d by construction, so this subtraction never underflows.)
-                let scale = d - m;
+                // Cap semantics: <= 8 routes 1:1 (scale 0); > 8 pins to 8.
+                if d <= MIDEN_DECIMALS {
+                    assert_eq!(miden_decimals, d, "d={d}: low-decimal token must route 1:1");
+                    assert_eq!(scale, 0, "d={d}: scale must be 0");
+                } else {
+                    assert_eq!(
+                        miden_decimals, MIDEN_DECIMALS,
+                        "d={d}: high-decimal token pins to 8"
+                    );
+                    assert_eq!(scale, d - MIDEN_DECIMALS);
+                }
                 assert!(scale <= MAX_SCALING_FACTOR, "d={d}: scale {scale} > cap");
 
-                // Invariant 3 (boundary round-trip): the largest whole-unit preimage
-                // at this decimal count, 10^d wei, scales cleanly to exactly
-                // 10^miden_decimals token units through the runtime gate. This both
-                // proves the scale is accepted and that no precision is lost at the
-                // boundary. 10^d fits U256 (d <= 30) and 10^m fits FungibleAsset::
-                // MAX_AMOUNT (m <= 12 → <= 10^12 < 2^63 - 2^31).
+                // parse_token_metadata accepts the whole 0..=26 range and reports
+                // the origin decimals unchanged — i.e. a route IS created.
+                let (_symbol, parsed) = parse_token_metadata(&metadata_with_decimals(d), &addr)
+                    .unwrap_or_else(|e| panic!("d={d} must parse: {e}"));
+                assert_eq!(parsed, d);
+
+                // Boundary round-trip: 10^d wei scales cleanly to exactly
+                // 10^min(d,8) token units through the runtime gate. 10^d fits U256
+                // (d <= 26) and 10^8 fits FungibleAsset::MAX_AMOUNT.
                 let wei = U256::from(10u64).pow(U256::from(u64::from(d)));
                 let token = eth_amount(wei)
                     .scale_to_token_amount(u32::from(scale))
                     .unwrap_or_else(|e| {
                         panic!("d={d}: scale {scale} rejected by EthAmount gate: {e}")
                     });
-                let expected = 10u64.pow(u32::from(m));
+                let expected = 10u64.pow(u32::from(miden_decimals));
                 assert_eq!(
                     token,
                     Felt::try_from(expected).unwrap(),
-                    "d={d}: 10^{d} wei did not round-trip to 10^{m} token units"
+                    "d={d}: 10^{d} wei did not round-trip to 10^{miden_decimals} token units"
                 );
             }
 
-            // Above the supportable domain: derivation must reject rather than
-            // persist an unclaimable route. d=31 needs miden_decimals=13 >
-            // MAX_MIDEN_DECIMALS; 255 is the u8 extreme.
-            assert!(
-                derive_miden_decimals(MAX_TOKEN_DECIMALS + 1).is_err(),
-                "d={} must be rejected",
-                MAX_TOKEN_DECIMALS + 1
-            );
-            assert!(
-                derive_miden_decimals(255).is_err(),
-                "d=255 must be rejected"
-            );
+            // Above MAX_ORIGIN_DECIMALS the route would be unclaimable (scale > 18)
+            // and overflow-prone: parse_token_metadata must reject rather than
+            // persist a poisoned route. 27 = boundary, 30 = old dynamic cap, 255 =
+            // u8 extreme.
+            for d in [MAX_ORIGIN_DECIMALS + 1, 30, 255] {
+                let err = parse_token_metadata(&metadata_with_decimals(d), &addr)
+                    .expect_err(&format!("d={d} must be rejected"));
+                assert!(
+                    err.to_string().contains("decimals out of range"),
+                    "d={d}: unexpected error: {err}"
+                );
+            }
         }
     }
 }
