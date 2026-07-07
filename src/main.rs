@@ -19,6 +19,13 @@ struct Command {
     #[arg(long, default_value_t = 8546)]
     port: u16,
 
+    /// Bind address for the JSON-RPC HTTP service (audit H2/C2). Default
+    /// `0.0.0.0` (all interfaces) for backward compat. Set to `127.0.0.1` to
+    /// restrict to loopback — the recommended production posture when the
+    /// service sits behind a reverse proxy / sidecar that owns authn.
+    #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0")]
+    bind: String,
+
     /// Directory for miden-client data [default: $HOME/.miden]
     #[arg(long)]
     miden_store_dir: Option<PathBuf>,
@@ -124,10 +131,19 @@ struct Command {
 
     /// Allow-list of EVM signer addresses permitted to submit
     /// `eth_sendRawTransaction` (R2). Comma-separated 0x-prefixed addresses
-    /// (case-insensitive). When unset, every well-formed signer is accepted
-    /// (legacy open mode — only safe behind a private network boundary).
+    /// (case-insensitive). When unset, NO signer is accepted (audit C2 —
+    /// fail-closed default; previously the default was open to any signer).
+    /// To explicitly restore legacy open mode (ONLY safe behind a private
+    /// network boundary / loopback bind), set `--insecure-allow-any-signer`.
     #[arg(long, env = "ALLOWED_SIGNERS", value_delimiter = ',')]
     allowed_signers: Option<Vec<alloy::primitives::Address>>,
+
+    /// DANGEROUS: accept `eth_sendRawTransaction` from ANY signer (audit C2).
+    /// Explicit opt-in for the legacy open mode that was the pre-C2 default.
+    /// Refused by `--require-hardening`. Only safe with `--bind 127.0.0.1`
+    /// and/or a network-level boundary.
+    #[arg(long, env = "INSECURE_ALLOW_ANY_SIGNER", default_value_t = false)]
+    insecure_allow_any_signer: bool,
 
     /// Per-IP rate limit, sustained requests per second (R13). Default 500.
     #[arg(long, env = "RATE_LIMIT_PER_SECOND", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND)]
@@ -225,8 +241,17 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
         .is_none_or(|v| v.is_empty())
     {
         reasons.push(
-            "  - --allowed-signers is unset (eth_sendRawTransaction would accept \
-             any signer). Set ALLOWED_SIGNERS to a comma-separated allow-list."
+            "  - --allowed-signers is unset (eth_sendRawTransaction would reject \
+             every signer — audit C2 fail-closed default). Set ALLOWED_SIGNERS \
+             to a comma-separated allow-list."
+                .to_string(),
+        );
+    }
+    if command.insecure_allow_any_signer {
+        reasons.push(
+            "  - --insecure-allow-any-signer is set (eth_sendRawTransaction accepts \
+             ANY signer — audit C2 legacy open mode). This is incompatible with \
+             --require-hardening; remove it and use --allowed-signers instead."
                 .to_string(),
         );
     }
@@ -286,6 +311,7 @@ impl std::fmt::Debug for Command {
             )
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
+            .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
             .field("require_hardening", &self.require_hardening)
             .field(
                 "miden_api_key",
@@ -666,6 +692,7 @@ async fn main() -> anyhow::Result<()> {
     state.cors_allowed_origins = command.cors_allowed_origins;
     state.admin_api_key = command.admin_api_key;
     state.allowed_signers = command.allowed_signers;
+    state.allow_any_signer = command.insecure_allow_any_signer;
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
     state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
@@ -870,7 +897,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
+    let url = Url::from_str(format!("http://{}:{}", command.bind, command.port).as_str())?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
     // RD-940 Phase 5 — graceful drain. When `service::serve` returns
@@ -953,6 +980,7 @@ mod hardening_tests {
     ) -> Command {
         Command {
             port: 8546,
+            bind: "0.0.0.0".into(),
             miden_store_dir: None,
             miden_node: None,
             chain_id: 1,
@@ -972,6 +1000,7 @@ mod hardening_tests {
             cors_allowed_origins: cors,
             admin_api_key: admin,
             allowed_signers: signers,
+            insecure_allow_any_signer: false,
             rate_limit_per_second: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
