@@ -38,8 +38,9 @@
 //! advanced to N once, **after** the block (write-before-advance) — including for
 //! EMPTY Miden blocks, so the synthetic chain mirrors Miden block-for-block and
 //! `eth_blockNumber` tracks the Miden tip. Within a Miden block, consumed notes
-//! are ordered by `(consumed_tx_order, note_id)` before deriving, so re-running
-//! the projector over the same chain yields byte-identical synthetic blocks
+//! are ordered by `(consumed_block_height, consumed_tx_order, note_id)` before
+//! deriving, so re-running the projector over the same chain yields
+//! byte-identical synthetic blocks
 //! (numbers, hashes, log order, log indices). Because the projector is the sole
 //! assigner of the synthetic tip, there is no `get_latest()+1` reservation race —
 //! Finding #5 is eliminated by construction.
@@ -858,7 +859,8 @@ impl SyntheticProjector {
     /// synthetic chain mirrors Miden block-for-block.
     ///
     /// Determinism: within the Miden block, consumed notes are ordered by
-    /// `(consumed_tx_order, note_id_hex)` before deriving, so re-running over the
+    /// `(consumed_block_height, consumed_tx_order, note_id_hex)` before deriving,
+    /// so re-running over the
     /// same chain yields byte-identical synthetic blocks. Idempotent: the
     /// `project_*` derivations short-circuit on the existing dedup keys.
     ///
@@ -897,16 +899,47 @@ impl SyntheticProjector {
     ) -> anyhow::Result<usize> {
         let mut notes: Vec<&InputNoteRecord> = block_notes.to_vec();
 
-        // Determinism: order intra-block events by (consumed_tx_order, note-id).
+        // Determinism + on-chain order: order events by
+        // (consumed_block_height, consumed_tx_order, note-id).
+        //
+        // Audit H4 — pre-fix this sorted by (consumed_tx_order, note-id) alone.
+        // That was correct for a normal block (every note shares the same
+        // consumed_block_height), but the late-consumption sweep mixes notes
+        // from EARLIER (sealed) blocks into the current projection block. With
+        // tx_order as the primary key, a late note consumed at block 3 with
+        // tx_order 5 would sort AFTER an on-time note at block 6 with tx_order
+        // 0 — even though on-chain the block-3 note was consumed first and so
+        // must occupy the LOWER LET leaf / deposit_count. Making
+        // consumed_block_height the primary key preserves global on-chain
+        // consumption order across the mixed bucket, so the deposit_count the
+        // autoclaim reads as `leaf_index` matches the on-chain Local Exit Tree.
+        //
         // `consumed_tx_order` is the per-account position of the consuming
-        // transaction within the block; the 32-byte details-commitment is the
+        // transaction within its block; the 32-byte details-commitment is the
         // stable tie-breaker. Compare the commitment bytes directly — identical
         // ordering to the old hex-string compare, but no per-comparison
         // allocation (matters when many notes share a block).
+        let miden_block_height = miden_block;
         notes.sort_by(|a, b| {
-            a.state()
-                .consumed_tx_order()
-                .cmp(&b.state().consumed_tx_order())
+            // Late-swept notes carry their ORIGINAL (earlier) consumed_block_height;
+            // fall back to the projection block for notes without a recorded height
+            // (should not happen for Consumed state, but keeps the sort total).
+            let ha = a
+                .state()
+                .consumed_block_height()
+                .map(|h| h.as_u64())
+                .unwrap_or(miden_block_height);
+            let hb = b
+                .state()
+                .consumed_block_height()
+                .map(|h| h.as_u64())
+                .unwrap_or(miden_block_height);
+            ha.cmp(&hb)
+                .then_with(|| {
+                    a.state()
+                        .consumed_tx_order()
+                        .cmp(&b.state().consumed_tx_order())
+                })
                 .then_with(|| {
                     a.details_commitment()
                         .as_bytes()
@@ -1908,6 +1941,66 @@ mod tests {
         assert!(
             later_logs.iter().all(|l| l.block_number == 250),
             "notes at Miden block 250 all land at synthetic block 250, not 5/6/7"
+        );
+    }
+
+    /// Audit H4 — the late-consumption sweep mixes notes consumed at EARLIER
+    /// (sealed) Miden blocks into the current projection block. The intra-block
+    /// sort MUST preserve global on-chain consumption order so the `deposit_count`
+    /// (which the autoclaim reads as the on-chain LET `leaf_index`) matches the
+    /// bridge's actual leaf positions — otherwise the autoclaim builds an SMT
+    /// proof against the wrong leaf and the exit is unclaimable.
+    ///
+    /// Pre-fix the sort keyed on `(consumed_tx_order, note_id)` alone, so a late
+    /// note consumed at block 3 with tx_order 5 sorted AFTER an on-time note at
+    /// block 6 with tx_order 0 — even though on-chain the block-3 note was
+    /// consumed first. The fix adds `consumed_block_height` as the primary key.
+    #[tokio::test]
+    async fn h4_late_sweep_preserves_on_chain_consumption_order() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+
+        // Note A: consumed at Miden block 3 (discovered late, swept forward),
+        // tx_order 5. Distinct amount → distinct details commitment.
+        let note_a = b2agg_note_with_amount(3, Some(5), 50);
+        // Note B: consumed at Miden block 6 (on-time), tx_order 0.
+        // Lower tx_order so the OLD (tx_order-first) sort would put B first.
+        let note_b = b2agg_note_with_amount(6, Some(0), 60);
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Simulate the late-sweep: both projected into synthetic block 6 (note A
+        // was swept forward because its real block 3 is sealed behind the cursor).
+        // `tick()` calls `project_block_notes` directly with the mixed bucket, so
+        // we do the same (project_notes would re-filter by block height).
+        let notes_ref: Vec<&InputNoteRecord> = vec![&note_a, &note_b];
+        projector
+            .project_block_notes(&notes_ref, &HashMap::new(), 6, None)
+            .await
+            .unwrap();
+
+        let logs = logs_in_range(&store, 0, 6).await;
+        let tx_a = crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
+            note_a.details_commitment().as_bytes(),
+        ));
+        let tx_b = crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
+            note_b.details_commitment().as_bytes(),
+        ));
+        let idx_a = logs
+            .iter()
+            .position(|l| l.transaction_hash == tx_a)
+            .expect("note A emitted a BridgeEvent");
+        let idx_b = logs
+            .iter()
+            .position(|l| l.transaction_hash == tx_b)
+            .expect("note B emitted a BridgeEvent");
+
+        // A was consumed on-chain BEFORE B (block 3 < block 6), so A must get
+        // the LOWER deposit_count → it must project (log_index) first.
+        assert!(
+            idx_a < idx_b,
+            "late note consumed at block 3 must project before on-time note at block 6 \
+             (on-chain LET leaf order); got idx_a={idx_a} idx_b={idx_b}"
         );
     }
 
