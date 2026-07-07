@@ -99,6 +99,13 @@ pub struct ServiceState {
     /// of `allowed_signers`. ONLY safe behind a loopback bind / network
     /// boundary. Refused by `--require-hardening`.
     pub allow_any_signer: bool,
+    /// Audit H6 — refuse to inject a GER whose `(mainnet, rollup)`
+    /// decomposition was NOT corroborated by the independent L1 InfoTree
+    /// indexer. Defends against a compromised aggoracle key injecting a forged
+    /// GER onto Miden. Default false (allow through, but flag via the
+    /// `ger_injection_unverified_total` metric) to tolerate indexer lag;
+    /// `--require-hardening` implies true.
+    pub reject_unverified_ger: bool,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one
     /// signer cannot both pass the equality check before either increments.
@@ -177,6 +184,7 @@ impl ServiceState {
             admin_api_key: None,
             allowed_signers: None,
             allow_any_signer: false,
+            reject_unverified_ger: false,
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,

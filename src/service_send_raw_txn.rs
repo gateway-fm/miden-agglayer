@@ -436,6 +436,7 @@ pub(crate) async fn worker_handle_ger_insert(
             service.accounts.clone(),
             &service.store,
             txn_hash,
+            service.reject_unverified_ger,
         )
         .await,
         txn_hash,

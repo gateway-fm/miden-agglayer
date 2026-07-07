@@ -144,6 +144,14 @@ struct Command {
     /// and/or a network-level boundary.
     #[arg(long, env = "INSECURE_ALLOW_ANY_SIGNER", default_value_t = false)]
     insecure_allow_any_signer: bool,
+    /// Audit H6 — refuse to inject a GER whose `(mainnet, rollup)` decomposition
+    /// was NOT corroborated by the independent L1 InfoTree indexer (i.e. a GER
+    /// supplied only by the aggoracle with no matching on-chain observation).
+    /// Defends against a compromised aggoracle key forging a GER onto Miden.
+    /// Default false to tolerate indexer lag; `--require-hardening` implies
+    /// true. Unverified GERs always increment `ger_injection_unverified_total`.
+    #[arg(long, env = "REJECT_UNVERIFIED_GER_INJECTION", default_value_t = false)]
+    reject_unverified_ger: bool,
 
     /// Per-IP rate limit, sustained requests per second (R13). Default 500.
     #[arg(long, env = "RATE_LIMIT_PER_SECOND", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND)]
@@ -723,6 +731,8 @@ async fn main() -> anyhow::Result<()> {
     state.admin_api_key = command.admin_api_key;
     state.allowed_signers = command.allowed_signers;
     state.allow_any_signer = command.insecure_allow_any_signer;
+    // H6 — strict L1 GER corroboration is implied by --require-hardening.
+    state.reject_unverified_ger = command.reject_unverified_ger || command.require_hardening;
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
     state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
@@ -1031,6 +1041,7 @@ mod hardening_tests {
             admin_api_key: admin,
             allowed_signers: signers,
             insecure_allow_any_signer: false,
+            reject_unverified_ger: false,
             rate_limit_per_second: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,

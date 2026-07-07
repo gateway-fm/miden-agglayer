@@ -117,13 +117,50 @@ async fn submit_update_ger_note(
 /// submitted (and the real eth-tx ↔ note link recorded so the projector finalises
 /// the receipt + emits the GER log on consumption), `false` if the GER was already
 /// injected (a duplicate — the caller completes its receipt immediately).
+///
+/// Audit H6 — `require_l1_observed` cross-checks the injected GER against the
+/// L1 InfoTree the indexer independently observed. The aggoracle-supplied GER
+/// bytes are otherwise trusted verbatim: a compromised signer could inject a
+/// FORGED GER (one whose `(mainnet, rollup)` decomposition the indexer never saw
+/// on L1) onto Miden. The indexer writes the authoritative decomposition via
+/// `set_ger_exit_roots`, so a GER whose `mainnet_exit_root` is `None` was NOT
+/// observed on L1. When `require_l1_observed` is set, such a GER is refused
+/// before it reaches Miden; otherwise it is allowed through (to tolerate indexer
+/// lag) but flagged via the `ger_injection_unverified_total` metric + warn.
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: &Arc<dyn crate::store::Store>,
     txn_hash: TxHash,
+    require_l1_observed: bool,
 ) -> anyhow::Result<bool> {
+    // Audit H6 — verify the GER was observed on L1 by the independent
+    // L1InfoTreeIndexer (it writes the (mainnet, rollup) decomposition via
+    // set_ger_exit_roots). A GER with no recorded decomposition was supplied
+    // only by the aggoracle and never corroborated by an L1 observation — a
+    // forged-GER injection signal.
+    let l1_observed = store
+        .get_ger_entry(&ger_bytes)
+        .await?
+        .is_some_and(|e| e.mainnet_exit_root.is_some());
+    if !l1_observed {
+        ::metrics::counter!("ger_injection_unverified_total").increment(1);
+        tracing::warn!(
+            ger = %hex::encode(ger_bytes),
+            tx = %txn_hash,
+            "GER injection not yet corroborated by the L1 InfoTree indexer \
+             (mainnet_exit_root unset); allowing through but unverified"
+        );
+        if require_l1_observed {
+            anyhow::bail!(
+                "GER {} was not observed on L1 by the indexer (mainnet_exit_root unset); \
+                 refusing injection under --reject-unverified-ger-injection (audit H6)",
+                hex::encode(ger_bytes)
+            );
+        }
+    }
+
     // Check dedup before doing any work.
     //
     // Use `is_ger_injected` (not `has_seen_ger`) because the L1InfoTreeIndexer
@@ -203,6 +240,9 @@ pub async fn insert_ger(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::memory::InMemoryStore;
+    use std::str::FromStr;
+    use std::sync::Arc;
     #[test]
     fn test_combined_ger_keccak256() {
         let mainnet = [0x01u8; 32];
@@ -232,5 +272,58 @@ mod tests {
         let a = [0x01u8; 32];
         let b = [0x02u8; 32];
         assert_ne!(combined_ger(&a, &b), combined_ger(&b, &a));
+    }
+
+    /// Audit H6 — a GER whose `(mainnet, rollup)` decomposition was NOT
+    /// corroborated by the L1 InfoTree indexer MUST be refused when
+    /// `require_l1_observed` is set, BEFORE any Miden submission is attempted.
+    /// Pre-fix, aggoracle-supplied GER bytes were trusted verbatim — a
+    /// compromised signer could inject a forged GER onto Miden (state pollution,
+    /// gas burn, and — with a colluding claim — a mint against an L1 deposit
+    /// that never happened).
+    ///
+    /// The check fires at the top of `insert_ger`, so the MidenClient is never
+    /// reached; a stub client is sufficient.
+    #[tokio::test]
+    async fn h6_unverified_ger_refused_when_strict() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let miden_client = crate::test_helpers::create_test_service().miden_client;
+        let accounts = crate::test_helpers::test_accounts_config();
+        let tx_hash = alloy::primitives::TxHash::from_str(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let forged_ger = [0xCDu8; 32]; // no ger_entries row → mainnet_exit_root unset
+
+        // Strict mode: the unverified GER must be refused before Miden submission.
+        let err = insert_ger(
+            forged_ger,
+            &miden_client,
+            accounts.clone(),
+            &store,
+            tx_hash,
+            true, // require_l1_observed
+        )
+        .await
+        .expect_err("unverified GER must be refused under require_l1_observed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not observed on L1"),
+            "must cite L1 non-observation: {msg}"
+        );
+
+        // Lenient mode (default): the same GER is allowed through (returns false
+        // because the MidenClient stub can't really submit, but it must NOT bail
+        // at the H6 gate). The unverified metric still fires.
+        let _ = insert_ger(
+            forged_ger,
+            &miden_client,
+            accounts,
+            &store,
+            tx_hash,
+            false, // lenient
+        )
+        .await;
+        // No assertion on the return — the point is it did not return the H6 err.
     }
 }
