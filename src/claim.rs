@@ -1521,7 +1521,9 @@ mod tests {
     /// limit and persisting an UNCLAIMABLE route. The fix derives `miden_decimals`
     /// dynamically so both limits hold.
     mod finding_17_decimal_derivation {
-        use crate::faucet_ops::{MAX_MIDEN_DECIMALS, MAX_SCALING_FACTOR, derive_miden_decimals};
+        use crate::faucet_ops::{
+            MAX_MIDEN_DECIMALS, MAX_SCALING_FACTOR, MAX_TOKEN_DECIMALS, derive_miden_decimals,
+        };
         use alloy::primitives::U256;
         use miden_base_agglayer::{EthAmount, EthAmountError};
 
@@ -1553,41 +1555,61 @@ mod tests {
             assert!(amount.scale_to_token_amount(valid_scale).is_ok());
         }
 
-        /// The fixed derivation yields a VALID route (miden_decimals ≤ 12 AND
-        /// scale ≤ 18) for every supportable origin decimal count, including the
-        /// previously-poisoned 27..30 range, and rejects the unsupportable 31.
+        /// Full-domain coverage: the fixed derivation must yield a VALID route
+        /// (miden_decimals ≤ MAX_MIDEN_DECIMALS AND scale ≤ MAX_SCALING_FACTOR) for
+        /// EVERY supportable origin-decimal count `0..=MAX_TOKEN_DECIMALS` (30) — not
+        /// just the hand-picked few — and reject everything above it. We iterate the
+        /// whole domain and, at each `d`, assert both invariants hold and that the
+        /// derived scale round-trips through the runtime `EthAmount` gate at the
+        /// boundary preimage `10^d wei → 10^miden_decimals token units`.
         #[test]
-        fn derivation_supports_up_to_30_and_rejects_31() {
-            // (origin_decimals, expected_miden_decimals)
-            for (d, expected_m) in [
-                (6u8, 6u8),
-                (8, 8),
-                (18, 8),
-                (26, 8),
-                (27, 9),
-                (28, 10),
-                (29, 11),
-                (30, 12),
-            ] {
+        fn derivation_covers_full_domain_0_to_30_and_rejects_above() {
+            use miden_protocol::Felt;
+
+            for d in 0u8..=MAX_TOKEN_DECIMALS {
                 let m = derive_miden_decimals(d)
                     .unwrap_or_else(|e| panic!("d={d} must be supportable: {e}"));
-                assert_eq!(m, expected_m, "unexpected miden_decimals for d={d}");
-                let scale = d - m;
+
+                // Invariant 1: local faucet decimals fit the faucet cap.
                 assert!(m <= MAX_MIDEN_DECIMALS, "d={d}: miden_decimals {m} > cap");
+
+                // Invariant 2: the downscaling factor fits the shared scale cap.
+                // (m <= d by construction, so this subtraction never underflows.)
+                let scale = d - m;
                 assert!(scale <= MAX_SCALING_FACTOR, "d={d}: scale {scale} > cap");
-                // Cross-check the derived scale against the runtime gate.
-                assert!(
-                    eth_amount(U256::from(1u64))
-                        .scale_to_token_amount(u32::from(scale))
-                        .is_ok(),
-                    "d={d}: scale {scale} rejected by EthAmount gate"
+
+                // Invariant 3 (boundary round-trip): the largest whole-unit preimage
+                // at this decimal count, 10^d wei, scales cleanly to exactly
+                // 10^miden_decimals token units through the runtime gate. This both
+                // proves the scale is accepted and that no precision is lost at the
+                // boundary. 10^d fits U256 (d <= 30) and 10^m fits FungibleAsset::
+                // MAX_AMOUNT (m <= 12 → <= 10^12 < 2^63 - 2^31).
+                let wei = U256::from(10u64).pow(U256::from(u64::from(d)));
+                let token = eth_amount(wei)
+                    .scale_to_token_amount(u32::from(scale))
+                    .unwrap_or_else(|e| {
+                        panic!("d={d}: scale {scale} rejected by EthAmount gate: {e}")
+                    });
+                let expected = 10u64.pow(u32::from(m));
+                assert_eq!(
+                    token,
+                    Felt::try_from(expected).unwrap(),
+                    "d={d}: 10^{d} wei did not round-trip to 10^{m} token units"
                 );
             }
 
-            // d = 31 needs miden_decimals = 13 > MAX_MIDEN_DECIMALS → rejected
-            // up-front rather than persisting an unclaimable route.
-            assert!(derive_miden_decimals(31).is_err());
-            assert!(derive_miden_decimals(255).is_err());
+            // Above the supportable domain: derivation must reject rather than
+            // persist an unclaimable route. d=31 needs miden_decimals=13 >
+            // MAX_MIDEN_DECIMALS; 255 is the u8 extreme.
+            assert!(
+                derive_miden_decimals(MAX_TOKEN_DECIMALS + 1).is_err(),
+                "d={} must be rejected",
+                MAX_TOKEN_DECIMALS + 1
+            );
+            assert!(
+                derive_miden_decimals(255).is_err(),
+                "d=255 must be rejected"
+            );
         }
     }
 }

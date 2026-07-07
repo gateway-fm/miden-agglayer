@@ -44,45 +44,16 @@ pub async fn admin_register_faucet(
     state: ServiceState,
     params: RegisterFaucetParams,
 ) -> anyhow::Result<String> {
-    let scale = params
-        .origin_decimals
-        .checked_sub(params.miden_decimals)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "origin_decimals ({}) must be >= miden_decimals ({})",
-                params.origin_decimals,
-                params.miden_decimals
-            )
-        })?;
-
-    // Finding #17 — reject unclaimable routes up-front so a poisoned entry is
-    // never persisted. Both bridge-stack limits must hold: the local faucet
-    // decimals must fit MAX_MIDEN_DECIMALS and the downscaling factor must fit
-    // MAX_SCALING_FACTOR (enforced by `EthAmount::scale_to_token_amount`).
-    if params.miden_decimals > faucet_ops::MAX_MIDEN_DECIMALS {
-        anyhow::bail!(
-            "miden_decimals ({}) exceeds the faucet limit of {} decimals",
-            params.miden_decimals,
-            faucet_ops::MAX_MIDEN_DECIMALS,
-        );
-    }
-    if scale > faucet_ops::MAX_SCALING_FACTOR {
-        anyhow::bail!(
-            "scale ({scale} = origin_decimals {} - miden_decimals {}) exceeds the shared limit of \
-             {} (route would be unclaimable). Raise miden_decimals so scale <= {}.",
-            params.origin_decimals,
-            params.miden_decimals,
-            faucet_ops::MAX_SCALING_FACTOR,
-            faucet_ops::MAX_SCALING_FACTOR,
-        );
-    }
-
     let origin_address = parse_eth_address(&params.origin_token_address)?;
 
-    // Check if already registered. `admin_registerFaucet` is strictly
-    // register-if-absent / return-existing-if-present: an existing route for this
-    // `(origin_address, origin_network)` is ALWAYS returned idempotently. There is
-    // deliberately no live "replace" path — swapping a route would DELETE the old
+    // Check if already registered FIRST — before any parameter validation.
+    // `admin_registerFaucet` is strictly register-if-absent / return-existing-if-present:
+    // an existing route for this `(origin_address, origin_network)` is ALWAYS returned
+    // idempotently, regardless of the params supplied on the re-register call. Validating
+    // before this lookup would break idempotency — an idempotent re-register that happened
+    // to carry imperfect decimals would surface a validation error instead of the route
+    // that already exists. Validation therefore gates ONLY new-route creation (below).
+    // There is deliberately no live "replace" path — swapping a route would DELETE the old
     // (origin_address, origin_network) row and orphan any holder still carrying
     // balances in the old faucet, re-creating the Cantina finding #6 split-brain
     // (their bridge-outs would resolve to an "unknown faucet ID" and quarantine,
@@ -99,6 +70,40 @@ pub async fn admin_register_faucet(
             "admin_registerFaucet: faucet already exists for this origin"
         );
         return Ok(id);
+    }
+
+    // New-route creation path only. Compute the downscaling factor and reject
+    // unclaimable routes up-front so a poisoned entry is never persisted. Both
+    // bridge-stack limits must hold: the local faucet decimals must fit
+    // MAX_MIDEN_DECIMALS and the downscaling factor must fit MAX_SCALING_FACTOR
+    // (enforced by `EthAmount::scale_to_token_amount`).
+    let scale = params
+        .origin_decimals
+        .checked_sub(params.miden_decimals)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "origin_decimals ({}) must be >= miden_decimals ({})",
+                params.origin_decimals,
+                params.miden_decimals
+            )
+        })?;
+
+    if params.miden_decimals > faucet_ops::MAX_MIDEN_DECIMALS {
+        anyhow::bail!(
+            "miden_decimals ({}) exceeds the faucet limit of {} decimals",
+            params.miden_decimals,
+            faucet_ops::MAX_MIDEN_DECIMALS,
+        );
+    }
+    if scale > faucet_ops::MAX_SCALING_FACTOR {
+        anyhow::bail!(
+            "scale ({scale} = origin_decimals {} - miden_decimals {}) exceeds the shared limit of \
+             {} (route would be unclaimable). Raise miden_decimals so scale <= {}.",
+            params.origin_decimals,
+            params.miden_decimals,
+            faucet_ops::MAX_SCALING_FACTOR,
+            faucet_ops::MAX_SCALING_FACTOR,
+        );
     }
 
     let accounts = &state.accounts.0;
@@ -317,6 +322,35 @@ mod tests {
             .unwrap();
         assert_eq!(id, AccountId::from_hex(POISON_FAUCET_HEX).unwrap().to_hex());
         // No faucet deploy attempted — the existing route was returned as-is.
+        assert_eq!(service.miden_client.test_call_count(), 0);
+    }
+
+    /// Idempotency must win over validation: an existing route is ALWAYS returned,
+    /// even when the re-register call carries params that would FAIL new-route
+    /// validation (here `scale = 27 - 7 = 20 > MAX_SCALING_FACTOR`). Because the
+    /// existence check runs before any validation, the poisoned-but-existing route
+    /// is returned as-is instead of surfacing a spurious validation error — which
+    /// would otherwise break the register-if-absent / return-existing contract.
+    #[tokio::test]
+    async fn existing_route_returned_even_when_params_would_fail_validation() {
+        let service = create_test_service();
+        seed_poisoned_route(&service).await;
+
+        // These params would be rejected on a fresh origin (scale 20 > 18), but the
+        // origin already exists, so validation must never run.
+        let bad_params = RegisterFaucetParams {
+            symbol: "TKN".into(),
+            origin_token_address: ORIGIN_HEX.into(),
+            origin_network: 0,
+            origin_decimals: 27,
+            miden_decimals: 7, // scale 20 > MAX_SCALING_FACTOR
+            name: None,
+        };
+        let id = admin_register_faucet(service.clone(), bad_params)
+            .await
+            .expect("existing route must be returned without validation");
+        assert_eq!(id, AccountId::from_hex(POISON_FAUCET_HEX).unwrap().to_hex());
+        // Never touched Miden — no create/deploy on the existing-route path.
         assert_eq!(service.miden_client.test_call_count(), 0);
     }
 
