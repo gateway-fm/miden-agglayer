@@ -403,7 +403,6 @@ async fn publish_and_record_claim(
         txn_envelope,
         signer,
         service.reject_zero_padding_addresses,
-        service.reject_hardhat_alias,
         Some(service.expected_mints.clone()),
     )
     .await?;
