@@ -1,4 +1,63 @@
+use anyhow::Context;
 use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+/// Build and install the process-wide Prometheus recorder, returning the
+/// handle the `/metrics` endpoint renders.
+///
+/// MUST be called before ANY thread/runtime that can emit a metric is
+/// spawned — in particular before `MidenClient::new` (which spawns a
+/// dedicated thread + second Tokio runtime that starts syncing, running
+/// SyncListeners, and emitting immediately), the RD-940 writer worker, and
+/// the L1InfoTreeIndexer. `metrics` resolves the global recorder on every
+/// macro call (there is no per-thread caching), so a single global install
+/// covers every thread and runtime in the process — but every emission that
+/// happens BEFORE the install goes to the no-op recorder and is silently
+/// lost. Historically main.rs installed this recorder AFTER creating the
+/// MidenClient and spawning the writer worker / L1 indexer, so their early
+/// emissions (init deploys, first sync ticks, first reconciler windows,
+/// restore phases) never reached the registry served by `/metrics`.
+///
+/// NOTE the /metrics freeze observed on the live reindex had a second,
+/// independent cause: `metrics` 0.24.5's broken `KeyHasher` (yanked
+/// upstream, fixed in 0.24.6 — see
+/// `metrics_from_second_runtime_render_cumulatively` for the full
+/// mechanism and reproduction).
+///
+/// Histograms registered with `metrics-exporter-prometheus` default to the
+/// Prometheus *summary* representation (a fixed set of quantiles), which
+/// loses p95/p99 fidelity for low-volume metrics and — more importantly —
+/// can't be aggregated across replicas in PromQL. For the two latency
+/// metrics we actually care about (proof generation, JSON-RPC requests)
+/// we install explicit bucket sets so they're emitted as real
+/// `*_bucket{le="…"}` series. The proof buckets span 100ms (local prover
+/// warm) → 5min (remote prover under load) because bali has empirically
+/// seen 60–120s p99 proves; the RPC buckets are typical hot-path latencies
+/// (1ms → 5s). Both metric names match the `histogram!()` call-site
+/// strings in `metrics.rs` / `service.rs` exactly — using `Matcher::Full`
+/// means a typo here silently falls back to summary, so add a test if
+/// either name changes.
+pub fn install_prometheus_recorder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusHandle>
+{
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full("miden_proof_duration_seconds".to_string()),
+            &[
+                0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
+            ],
+        )
+        .context("set_buckets_for_metric (miden_proof_duration_seconds) failed")?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full("rpc_request_duration_seconds".to_string()),
+            &[
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ],
+        )
+        .context("set_buckets_for_metric (rpc_request_duration_seconds) failed")?
+        .install_recorder()
+        .context("failed to install metrics recorder")?;
+    init_metrics();
+    Ok(handle)
+}
 
 pub fn init_metrics() {
     describe_counter!("rpc_requests_total", "Total JSON-RPC requests by method");
@@ -16,6 +75,12 @@ pub fn init_metrics() {
         "Background thread restarts after crash"
     );
     describe_counter!("miden_sync_errors_total", "Sync errors by kind");
+    describe_counter!(
+        "readonly_submissions_refused_total",
+        "Transaction submissions refused by --read-only mode at the submit \
+         chokepoint. Non-zero during a read-only drill means some code path \
+         ATTEMPTED a chain mutation (and was stopped)."
+    );
     describe_counter!(
         "bridge_out_self_targeted_total",
         "B2AGG bridge-outs whose destination_network equals our local network_id; \
@@ -123,6 +188,16 @@ pub fn init_metrics() {
         "ClaimWatcher synthesised a ClaimEvent from a consumed CLAIM note \
          that the normal eth_sendRawTransaction path had not recorded \
          (crash recovery or foreign-CLAIM observation)."
+    );
+    describe_counter!(
+        "claim_event_foreign_skipped_total",
+        "A consumed CLAIM-shaped note was NOT provably ours (consumer is not \
+         our bridge, and it was not minted by our service targeting our \
+         bridge) and was skipped instead of projected as a ClaimEvent. \
+         Expected on chains shared with a foreign miden-agglayer deployment \
+         (its claims share our ClaimNote script root); on a single-deployment \
+         chain any non-zero rate means unverifiable claim consumptions — \
+         investigate."
     );
     describe_counter!(
         "claim_watcher_already_recorded_total",
@@ -497,6 +572,67 @@ pub fn record_fallback_attempt<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RED→GREEN regression for the live /metrics unreliability (reindex run:
+    /// gauge frozen at 2000 while the true value was 156000; counters
+    /// rendering per-window values instead of cumulative ones — all from code
+    /// on the MidenClient's dedicated second Tokio runtime).
+    ///
+    /// Root cause (reproduced deterministically, then fixed): `metrics`
+    /// 0.24.5 — since YANKED upstream — shipped a broken `KeyHasher` whose
+    /// hash of a `Key` was inconsistent between the registry's insert and
+    /// lookup paths, so (almost) every emission MISSED the existing registry
+    /// entry and created a fresh phantom entry holding only that emission's
+    /// delta. The Prometheus exporter's render dedups by (name, labels) via
+    /// overwrite, surfacing an arbitrary phantom per scrape: counters showed
+    /// small non-cumulative "windows", gauges showed stale early sets.
+    /// Fixed in `metrics` 0.24.6 (rewritten `KeyHasher`, Cargo.lock updated);
+    /// this test FAILED on 0.24.5 (rendered `..._events_total 1` and
+    /// `..._cursor 2000`) and passes on 0.24.6.
+    ///
+    /// Contract pinned: with the process-wide recorder installed via
+    /// `install_prometheus_recorder`, metrics emitted from a *separate thread
+    /// running its own Tokio runtime* — the exact construction
+    /// `MidenClient::new` uses — land in the ONE global registry the endpoint
+    /// handle renders: counters cumulative (increment twice → 2), gauges at
+    /// their LATEST set value.
+    #[test]
+    fn metrics_from_second_runtime_render_cumulatively() {
+        // Sole global-recorder install in the test binary (installing twice
+        // errors, so this test owns it; unique metric names keep concurrent
+        // tests' emissions from mattering).
+        let handle = install_prometheus_recorder().expect("install must succeed once");
+
+        // Mirror MidenClient::new: a dedicated OS thread driving its OWN
+        // multi-thread Tokio runtime, emitting both from the block_on future
+        // (the run loop) and from a spawned task (runtime worker thread).
+        let t = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Runtime::new().expect("second runtime");
+            runtime.block_on(async {
+                ::metrics::counter!("test_second_runtime_events_total").increment(1);
+                ::metrics::gauge!("test_second_runtime_cursor").set(2_000.0);
+                tokio::spawn(async {
+                    ::metrics::counter!("test_second_runtime_events_total").increment(1);
+                    ::metrics::gauge!("test_second_runtime_cursor").set(156_000.0);
+                })
+                .await
+                .expect("spawned emitter");
+            });
+        });
+        t.join().expect("second-runtime thread");
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("test_second_runtime_events_total 2"),
+            "counter emitted from the second runtime must render CUMULATIVELY \
+             (2 after two increments) on the endpoint handle; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("test_second_runtime_cursor 156000"),
+            "gauge emitted from the second runtime must render its LATEST value \
+             (156000), not a stale early one; got:\n{rendered}"
+        );
+    }
 
     #[test]
     fn proof_kind_label_stable() {

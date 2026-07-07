@@ -151,6 +151,36 @@ impl Store for PgStore {
         Ok(())
     }
 
+    // ── Note-reconciler sweep cursor ─────────────────────────────
+    //
+    // Persisted as a column on the single-row service_state table, mirroring
+    // projector_cursor (migration 010). Written write-behind AFTER a sweep
+    // window completes; reset to 0 by the recovery flows so the full-history
+    // heal sweep re-runs.
+
+    async fn get_reconcile_cursor(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT reconcile_cursor FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        let val: i64 = row.get(0);
+        Ok(val as u64)
+    }
+
+    async fn set_reconcile_cursor(&self, block: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET reconcile_cursor = $1, updated_at = now() WHERE id = 1",
+                &[&(block as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── Receipts map (Phase 2b substrate; unused in 2a) ──────────
     //
     // First-write-wins evm_tx_hash -> note_commitment (migration 009). The

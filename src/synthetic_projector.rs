@@ -68,10 +68,77 @@ use miden_protocol::note::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-/// Blocks swept per tick by the note-visibility reconciler. Bounds the
-/// per-tick RPC work; catch-up from genesis proceeds at CHUNK blocks/tick.
-const RECONCILE_CHUNK: u64 = 200;
+/// Blocks per `sync_notes` window walked by the note-visibility reconciler.
+/// Env-tunable via `RECONCILE_CHUNK`. Raised from the historical 200 with
+/// testnet evidence (see `note_probe --bench-sweep`): the node happily serves
+/// 1000- and 2000-block spans in near-constant time (~240ms for 200 blocks vs
+/// ~310ms for 1000 — the call is latency-dominated), so a 1000-block window is
+/// ~5x the blocks/s per request AND 5x fewer requests for the same sweep rate,
+/// which is what keeps the concurrent catch-up under the public node's rate
+/// limiter (sustained ~45 req/s of 200-block windows tripped it; 1000-block
+/// windows finish the same span in a fifth of the requests).
+const RECONCILE_CHUNK: u64 = 1_000;
+
+/// Concurrent in-flight `sync_notes` window fetches during catch-up.
+/// Env-tunable via `RECONCILE_CONCURRENCY`, hard-capped at
+/// [`RECONCILE_CONCURRENCY_MAX`] to stay a polite RPC citizen.
+const RECONCILE_CONCURRENCY_DEFAULT: usize = 8;
+const RECONCILE_CONCURRENCY_MAX: usize = 16;
+
+/// Per-tick time budget for the reconciler's catch-up loop, in milliseconds.
+/// Env-tunable via `RECONCILE_TICK_BUDGET_MS`. Projection runs AFTER the
+/// reconciler inside `tick`, so the budget bounds how long a deep catch-up can
+/// starve projection (and the 5s sync cadence): at least one window batch is
+/// always processed per tick (guaranteed progress), then the loop stops once
+/// the budget is spent. When the sweep is caught up the budget is irrelevant —
+/// the single near-tip window completes in one iteration exactly as before.
+const RECONCILE_TICK_BUDGET_MS_DEFAULT: u64 = 2_000;
+
+/// Parse a `u64` tuning knob from the environment, falling back to `default`
+/// on absence or garbage (never panics at boot for a bad env var).
+fn env_u64(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            tracing::warn!(var = name, value = %v, default, "unparsable env override — using default");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+/// Thin seam over the node's `sync_notes` window fetch, so the catch-up driver
+/// (window batching, concurrent fetch, strict-order low-water-mark cursor
+/// advancement, tick budget) is unit-testable without a live node. The live
+/// implementation is [`RpcReconcileFetcher`]; tests inject failing/slow fakes.
+#[async_trait::async_trait]
+pub(crate) trait ReconcileFetcher: Send + Sync {
+    /// Ids of every tag-0 note committed in Miden blocks `[from, to]`.
+    async fn sync_note_ids(&self, from: u64, to: u64) -> anyhow::Result<Vec<NoteId>>;
+}
+
+/// The live [`ReconcileFetcher`]: one `sync_notes` call over the window. The
+/// underlying tonic client takes `&self`, clones its multiplexed HTTP/2
+/// channel per call and is `Send + Sync`, so a single `Arc` handle is safe to
+/// share across the concurrent window-fetch tasks.
+struct RpcReconcileFetcher(Arc<dyn NodeRpcClient>);
+
+#[async_trait::async_trait]
+impl ReconcileFetcher for RpcReconcileFetcher {
+    async fn sync_note_ids(&self, from: u64, to: u64) -> anyhow::Result<Vec<NoteId>> {
+        let tags: BTreeSet<NoteTag> = BTreeSet::from([NoteTag::from(0u32)]);
+        let blocks = self
+            .0
+            .sync_notes((from as u32).into(), (to as u32).into(), &tags)
+            .await
+            .map_err(|e| anyhow::anyhow!("sync_notes({from}..{to}): {e}"))?;
+        Ok(blocks
+            .iter()
+            .flat_map(|b| b.notes.keys().copied())
+            .collect())
+    }
+}
 
 /// True iff `e` is miden-client's un-recoverable "note is private" import
 /// rejection. A private note imported by [`NoteId`] lacks the details the
@@ -103,6 +170,12 @@ pub struct SyntheticProjector {
     local_network_id: u32,
     /// Expected GER sender (ger_manager, or service for legacy deployments).
     expected_ger_sender: AccountId,
+    /// Expected CLAIM minter (`accounts.service` — the account `create_claim`
+    /// mints every ClaimNote from). Together with `bridge_id` this backs the
+    /// claim provenance gate: on a chain shared with a FOREIGN miden-agglayer
+    /// deployment, foreign claims share our ClaimNote script root and must
+    /// not be projected (see `restore::classify_claim_note`).
+    expected_claim_sender: AccountId,
     /// L1 JSON-RPC endpoint for the Cantina #13 Layer-2 ERC-20 metadata
     /// recovery path (mirrors `BridgeOutScanner::l1_rpc_url`). Threaded into
     /// `project_b2agg_note` so legacy/DB-loss faucet rows with empty ERC-20
@@ -123,10 +196,32 @@ pub struct SyntheticProjector {
     /// unknown notes so consumption is re-discovered and projected. `None`
     /// disables reconciliation (unit tests).
     node_rpc: Option<Arc<dyn NodeRpcClient>>,
-    /// Last Miden block swept by the reconciler. In-memory only: a restart
-    /// re-sweeps from genesis, which is idempotent (known ids are skipped) and
-    /// doubles as gap-healing for pre-fix history.
+    /// Last Miden block swept by the reconciler — an in-memory cache of the
+    /// persisted `Store::get_reconcile_cursor` (migration 010), mirroring the
+    /// projection `cursor` above. Loaded in `new()` and persisted write-behind
+    /// AFTER each sweep window completes, so the durable cursor never runs
+    /// ahead of work actually done (a crash mid-window redoes that window —
+    /// safe, the sweep is idempotent: known ids are skipped).
+    ///
+    /// History: this used to be memory-only (hardcoded to 0 at boot), so EVERY
+    /// container restart re-walked the sweep from genesis — ~3h of resync and
+    /// node load per restart on prod history. The very first boot (no
+    /// persisted value → 0) still sweeps from genesis: that is the designed
+    /// first-boot heal. Recovery flows (`--restore`, `--reset-miden-store`)
+    /// and the `--resweep-from-genesis` escape hatch reset the persisted
+    /// value to 0 deliberately.
     reconcile_cursor: AtomicU64,
+    /// Reconciler sweep-window size in blocks (`RECONCILE_CHUNK` env override,
+    /// default [`RECONCILE_CHUNK`]).
+    reconcile_chunk: u64,
+    /// Concurrent in-flight window fetches during catch-up
+    /// (`RECONCILE_CONCURRENCY` env override, default
+    /// [`RECONCILE_CONCURRENCY_DEFAULT`], capped at
+    /// [`RECONCILE_CONCURRENCY_MAX`]).
+    reconcile_concurrency: usize,
+    /// Per-tick catch-up time budget (`RECONCILE_TICK_BUDGET_MS` env override,
+    /// default [`RECONCILE_TICK_BUDGET_MS_DEFAULT`]).
+    reconcile_budget: Duration,
     /// Note ids already projected (or attempted) by the late-consumption sweep,
     /// so the per-tick sweep doesn't re-issue `is_note_processed` store queries
     /// for the whole consumed set every 5s.
@@ -183,51 +278,215 @@ impl SyntheticProjector {
             .map(|a| a.0)
             .unwrap_or(accounts.service.0);
         let start_cursor = store.get_projector_cursor().await?;
+        // Same pattern for the reconciler's sweep cursor (migration 010): a
+        // restart resumes the sweep after the last persisted window instead of
+        // re-walking from genesis (prod: ~3h resync per restart pre-fix). 0
+        // (fresh deployment or a recovery-flow reset) means the full-history
+        // heal sweep runs — grep target for the e2e restart regression check
+        // (scripts/e2e-reconciler-cursor-persistence.sh).
+        let start_reconcile = store.get_reconcile_cursor().await?;
+        let reconcile_chunk = env_u64("RECONCILE_CHUNK", RECONCILE_CHUNK).max(1);
+        let reconcile_concurrency = (env_u64(
+            "RECONCILE_CONCURRENCY",
+            RECONCILE_CONCURRENCY_DEFAULT as u64,
+        ) as usize)
+            .clamp(1, RECONCILE_CONCURRENCY_MAX);
+        let reconcile_budget = Duration::from_millis(env_u64(
+            "RECONCILE_TICK_BUDGET_MS",
+            RECONCILE_TICK_BUDGET_MS_DEFAULT,
+        ));
+        tracing::info!(
+            reconcile_cursor = start_reconcile,
+            chunk = reconcile_chunk,
+            concurrency = reconcile_concurrency,
+            budget_ms = reconcile_budget.as_millis() as u64,
+            "note reconciler: sweep cursor loaded — next sweep window starts at block {}",
+            start_reconcile + 1
+        );
         Ok(Self {
             store,
             block_state,
             bridge_id: accounts.bridge.0,
             local_network_id,
             expected_ger_sender,
+            expected_claim_sender: accounts.service.0,
             l1_rpc_url,
             cursor: AtomicU64::new(start_cursor),
             node_rpc,
-            reconcile_cursor: AtomicU64::new(0),
+            reconcile_cursor: AtomicU64::new(start_reconcile),
+            reconcile_chunk,
+            reconcile_concurrency,
+            reconcile_budget,
             swept: std::sync::Mutex::new(HashSet::new()),
             direct_recovered: std::sync::Mutex::new(Vec::new()),
         })
     }
 
+    /// The next sweep window `[from, to]` the note-visibility reconciler will
+    /// walk, or `None` when the sweep has caught up to `tip`. Factored out of
+    /// [`Self::reconcile_notes`] so the restart-resume contract is directly
+    /// unit-testable: `from` is `reconcile_cursor + 1` — persisted-cursor + 1
+    /// after a restart, NOT 1.
+    fn next_reconcile_window(&self, tip: u64) -> Option<(u64, u64)> {
+        let from = self.reconcile_cursor.load(Ordering::Acquire) + 1;
+        if from > tip {
+            return None;
+        }
+        Some((from, (from + self.reconcile_chunk - 1).min(tip)))
+    }
+
+    /// The next batch of up to `reconcile_concurrency` sweep windows —
+    /// [`Self::next_reconcile_window`] extended forward without moving the
+    /// cursor. Empty when the sweep has caught up to `tip`.
+    fn plan_reconcile_windows(&self, tip: u64) -> Vec<(u64, u64)> {
+        let mut windows = Vec::new();
+        let Some((mut from, mut to)) = self.next_reconcile_window(tip) else {
+            return windows;
+        };
+        loop {
+            windows.push((from, to));
+            if to >= tip || windows.len() >= self.reconcile_concurrency {
+                return windows;
+            }
+            from = to + 1;
+            to = (from + self.reconcile_chunk - 1).min(tip);
+        }
+    }
+
     /// Note-visibility reconciler (completeness guarantee for externally-created
-    /// network notes). Walks `sync_notes` over the next `RECONCILE_CHUNK` blocks
-    /// and imports any tag-0 note the local store doesn't know. The next
+    /// network notes). Walks `sync_notes` in `reconcile_chunk`-block windows and
+    /// imports any tag-0 note the local store doesn't know. The next
     /// `sync_state` then discovers the (possibly historical) consumption via the
     /// nullifier check, and the late-consumption sweep in `tick` projects it.
     /// Non-B2AGG imports (MINTs to external wallets, etc.) are harmless: every
     /// `project_*` derivation gates on script root + consumer.
+    ///
+    /// Catch-up throughput: when the sweep is behind the tip, this processes
+    /// MULTIPLE windows per tick — window fetches issued concurrently
+    /// (`RECONCILE_CONCURRENCY` in flight), batches repeated until the
+    /// `RECONCILE_TICK_BUDGET_MS` budget is spent — instead of the historical
+    /// one-window-per-5s-tick cadence (a hard ~40 blocks/s ceiling that made
+    /// full-history sweeps take 3+ hours regardless of node speed).
     async fn reconcile_notes(
         &self,
         client: &mut MidenClientLib,
-        rpc: &dyn NodeRpcClient,
+        rpc: &Arc<dyn NodeRpcClient>,
         tip: u64,
     ) -> anyhow::Result<()> {
-        let from = self.reconcile_cursor.load(Ordering::Acquire) + 1;
-        if from > tip {
-            return Ok(());
-        }
-        let to = (from + RECONCILE_CHUNK - 1).min(tip);
-        let tags: BTreeSet<NoteTag> = BTreeSet::from([NoteTag::from(0u32)]);
-        let blocks = rpc
-            .sync_notes((from as u32).into(), (to as u32).into(), &tags)
+        let fetcher: Arc<dyn ReconcileFetcher> = Arc::new(RpcReconcileFetcher(Arc::clone(rpc)));
+        self.reconcile_notes_with(Some(client), Some(rpc.as_ref()), &fetcher, tip)
             .await
-            .map_err(|e| anyhow::anyhow!("sync_notes({from}..{to}): {e}"))?;
-        let candidates: Vec<NoteId> = blocks
-            .iter()
-            .flat_map(|b| b.notes.keys().copied())
-            .collect();
-        if !candidates.is_empty() {
+    }
+
+    /// Catch-up driver behind [`Self::reconcile_notes`], with the window fetch
+    /// abstracted behind [`ReconcileFetcher`] so the ordering/budget contract is
+    /// unit-testable. `client`/`rpc` are only touched when a window actually
+    /// has candidate notes (tests drive empty/failed windows with `None`).
+    ///
+    /// ORDERING SAFETY (low-water mark): window results are processed strictly
+    /// in ascending block order, and the persisted cursor advances to a
+    /// window's `to` only after that window — and therefore every window below
+    /// it — completed successfully. A failed fetch aborts the batch at the
+    /// failed window: earlier windows keep their advancement, later (already
+    /// fetched) results are DISCARDED and re-fetched next tick, so the cursor
+    /// can never advance past a gap. Same write-behind persist-then-cache
+    /// ordering per window as before: the durable cursor never runs ahead of
+    /// work actually done, and a crash mid-window redoes that window (the
+    /// sweep is idempotent — known ids are skipped).
+    async fn reconcile_notes_with(
+        &self,
+        mut client: Option<&mut MidenClientLib>,
+        rpc: Option<&dyn NodeRpcClient>,
+        fetcher: &Arc<dyn ReconcileFetcher>,
+        tip: u64,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + self.reconcile_budget;
+        loop {
+            let windows = self.plan_reconcile_windows(tip);
+            if windows.is_empty() {
+                return Ok(());
+            }
+            // Caught-up fast path: a single (near-tip) window is fetched inline
+            // — identical behavior and cost to the historical per-tick sweep.
+            let mut results: Vec<(u64, u64, anyhow::Result<Vec<NoteId>>)> =
+                if let [(from, to)] = windows[..] {
+                    vec![(from, to, fetcher.sync_note_ids(from, to).await)]
+                } else {
+                    let mut set = tokio::task::JoinSet::new();
+                    for (from, to) in windows {
+                        let fetcher = Arc::clone(fetcher);
+                        set.spawn(async move { (from, to, fetcher.sync_note_ids(from, to).await) });
+                    }
+                    let mut out = Vec::with_capacity(set.len());
+                    while let Some(joined) = set.join_next().await {
+                        out.push(joined.map_err(|e| {
+                            anyhow::anyhow!("reconcile window-fetch task panicked: {e}")
+                        })?);
+                    }
+                    out
+                };
+            results.sort_unstable_by_key(|(from, _, _)| *from);
+            for (from, to, fetched) in results {
+                let candidates = fetched.map_err(|e| {
+                    // Low-water mark: never advance past a failed window. The
+                    // windows before this one already advanced the cursor;
+                    // everything from here on is re-fetched next tick.
+                    anyhow::anyhow!(
+                        "reconcile window {from}..{to} failed — cursor held at {} (retry next tick): {e:#}",
+                        self.reconcile_cursor.load(Ordering::Acquire)
+                    )
+                })?;
+                if !candidates.is_empty() {
+                    let client = client.as_deref_mut().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "reconcile window {from}..{to}: candidate notes but no client handle"
+                        )
+                    })?;
+                    let rpc = rpc.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "reconcile window {from}..{to}: candidate notes but no rpc handle"
+                        )
+                    })?;
+                    self.import_reconcile_window(client, rpc, from, to, &candidates)
+                        .await?;
+                }
+                // Persist write-behind AFTER the window's work completed, and
+                // BEFORE updating the in-memory cache (same ordering guarantee
+                // as the projection cursor in `tick`): the durable cursor never
+                // runs ahead of work actually done. A persist failure fails
+                // this tick (warn + retry in `tick`), leaving the in-memory
+                // cursor un-advanced so the window is re-swept.
+                self.store.set_reconcile_cursor(to).await?;
+                self.reconcile_cursor.store(to, Ordering::Release);
+                metrics::gauge!("synthetic_reconciler_cursor").set(to as f64);
+            }
+            // Budget check AFTER the batch: at least one batch always runs
+            // (guaranteed progress even under a zero/tiny budget), and
+            // projection — which runs after reconcile in `tick` — is never
+            // starved by a deep catch-up.
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Import the unknown notes of ONE sweep window `[from, to]` given the
+    /// window's candidate note ids. This is the historical per-window body of
+    /// `reconcile_notes`, moved verbatim: unknown-ids diff, atomic batch import
+    /// with the private-note per-note skip fallback (0.15.5 wedge hotfix), and
+    /// the spent-before-import recovery re-query. Runs SEQUENTIALLY per window
+    /// on the single client — only the window fetches are concurrent.
+    async fn import_reconcile_window(
+        &self,
+        client: &mut MidenClientLib,
+        rpc: &dyn NodeRpcClient,
+        from: u64,
+        to: u64,
+        candidates: &[NoteId],
+    ) -> anyhow::Result<()> {
+        {
             let known: HashSet<NoteId> = client
-                .get_input_notes(NoteFilter::List(candidates.clone()))
+                .get_input_notes(NoteFilter::List(candidates.to_vec()))
                 .await
                 .map_err(|e| anyhow::anyhow!("get_input_notes(List): {e}"))?
                 .into_iter()
@@ -342,7 +601,6 @@ impl SyntheticProjector {
                 }
             }
         }
-        self.reconcile_cursor.store(to, Ordering::Release);
         Ok(())
     }
 
@@ -582,6 +840,16 @@ impl SyntheticProjector {
         self.cursor.load(Ordering::Acquire)
     }
 
+    /// Test-only override of the reconciler catch-up knobs (the live values
+    /// come from the environment in [`Self::new`]).
+    #[cfg(test)]
+    fn with_reconcile_tuning(mut self, chunk: u64, concurrency: usize, budget: Duration) -> Self {
+        self.reconcile_chunk = chunk;
+        self.reconcile_concurrency = concurrency;
+        self.reconcile_budget = budget;
+        self
+    }
+
     /// Project the notes consumed at one Miden block (`miden_block`) into the
     /// single synthetic block `miden_block` (**Miden-1:1**): every synthetic log
     /// derived from this block's notes is written at synthetic block == the Miden
@@ -680,8 +948,17 @@ impl SyntheticProjector {
                 continue;
             }
 
-            if project_claim_note(&self.store, note, miden_block, block_hash, bridge_address)
-                .await?
+            if project_claim_note(
+                &self.store,
+                note,
+                output_metadata,
+                self.expected_claim_sender,
+                self.bridge_id,
+                miden_block,
+                block_hash,
+                bridge_address,
+            )
+            .await?
                 == ClaimProjectOutcome::Emitted
             {
                 logs += 1;
@@ -771,7 +1048,7 @@ impl SyntheticProjector {
         // whenever Miden block production pauses. Failures are transient —
         // warn and retry next tick, never block projection.
         if let Some(rpc) = self.node_rpc.clone()
-            && let Err(e) = self.reconcile_notes(client, rpc.as_ref(), tip).await
+            && let Err(e) = self.reconcile_notes(client, &rpc, tip).await
         {
             tracing::warn!(
                 error = %format!("{e:#}"),
@@ -1149,6 +1426,220 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Regression lock for the prod restart-resync incident: the reconciler's
+    /// sweep cursor was a memory-only AtomicU64 hardcoded to 0 at boot, so
+    /// EVERY container restart (image update, crash, plain restart) re-walked
+    /// the sweep from genesis — ~3h of resync + node load per restart on prod
+    /// history. The cursor is now persisted (`Store::{get,set}_reconcile_cursor`,
+    /// migration 010) and loaded in `SyntheticProjector::new` exactly like the
+    /// projection cursor: a re-constructed projector must start its next
+    /// sweep window at persisted+1, NOT at 1.
+    #[tokio::test]
+    async fn restart_resumes_reconcile_sweep_from_persisted_cursor() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+
+        // First boot: nothing persisted → the sweep starts from genesis
+        // (block 1). This is the designed first-boot heal and must not change.
+        let projector = test_projector(&store, &block_state).await;
+        assert_eq!(
+            projector.next_reconcile_window(10_000),
+            Some((1, RECONCILE_CHUNK)),
+            "first boot (no persisted cursor) must sweep from genesis"
+        );
+
+        // Advance the sweep cursor via the persistence API — the same store
+        // write `reconcile_notes` performs after a window completes.
+        store.set_reconcile_cursor(4_200).await.unwrap();
+        drop(projector);
+
+        // "Container restart": re-construct the projector over the SAME store.
+        let projector = test_projector(&store, &block_state).await;
+        assert_eq!(
+            projector.next_reconcile_window(10_000),
+            Some((4_201, 4_200 + RECONCILE_CHUNK)),
+            "restart must resume the sweep at persisted+1, not re-walk from genesis"
+        );
+        // Caught-up case: no window when the persisted cursor is at the tip.
+        assert_eq!(projector.next_reconcile_window(4_200), None);
+    }
+
+    /// [`ReconcileFetcher`] fake for the catch-up driver tests: records every
+    /// window it is asked for, optionally fails one window (by its `from`
+    /// block), and returns NO candidates — so the driver's window batching,
+    /// ordering, budget and cursor advancement run without a client handle
+    /// (the per-window import is only entered when candidates exist).
+    struct FakeFetcher {
+        calls: std::sync::Mutex<Vec<(u64, u64)>>,
+        fail_from: Option<u64>,
+    }
+
+    impl FakeFetcher {
+        fn new(fail_from: Option<u64>) -> StdArc<Self> {
+            StdArc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail_from,
+            })
+        }
+
+        fn calls(&self) -> Vec<(u64, u64)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReconcileFetcher for FakeFetcher {
+        async fn sync_note_ids(&self, from: u64, to: u64) -> anyhow::Result<Vec<NoteId>> {
+            self.calls.lock().unwrap().push((from, to));
+            if self.fail_from == Some(from) {
+                anyhow::bail!("injected window-fetch failure ({from}..{to})");
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// Catch-up throughput contract: when the sweep is behind the tip, ONE
+    /// `reconcile_notes` call processes MULTIPLE windows (batches of
+    /// `concurrency`, repeated until caught up) under a sufficient budget —
+    /// instead of the historical one-window-per-tick cadence. And the budget
+    /// actually bounds the work: with a zero budget exactly one batch runs
+    /// (guaranteed progress), leaving the rest for the next tick.
+    #[tokio::test]
+    async fn reconcile_catchup_processes_multiple_windows_per_tick_under_budget() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+
+        // Zero budget: exactly one batch (= `concurrency` windows) per tick.
+        let projector = test_projector(&store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 4, Duration::ZERO);
+        let fetcher = FakeFetcher::new(None);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
+        projector
+            .reconcile_notes_with(None, None, &f, 2_000)
+            .await
+            .unwrap();
+        // Fetch-task completion order is unspecified — compare as a set.
+        let mut calls = fetcher.calls();
+        calls.sort_unstable();
+        assert_eq!(
+            calls,
+            vec![(1, 200), (201, 400), (401, 600), (601, 800)],
+            "zero budget: one batch of `concurrency` windows, then stop"
+        );
+        assert_eq!(store.get_reconcile_cursor().await.unwrap(), 800);
+
+        // Ample budget: the same call catches all the way up in one tick.
+        let projector = test_projector(&store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 4, Duration::from_secs(60));
+        let fetcher = FakeFetcher::new(None);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
+        projector
+            .reconcile_notes_with(None, None, &f, 2_000)
+            .await
+            .unwrap();
+        let mut calls = fetcher.calls();
+        calls.sort_unstable();
+        assert_eq!(calls.len(), 6, "windows 801..2000 in batches of <=4");
+        assert_eq!(calls.first(), Some(&(801, 1_000)));
+        assert_eq!(calls.last(), Some(&(1_801, 2_000)));
+        assert_eq!(
+            store.get_reconcile_cursor().await.unwrap(),
+            2_000,
+            "multiple windows must advance the persisted cursor to the tip in ONE tick"
+        );
+    }
+
+    /// ORDERING SAFETY: the cursor may only advance to block X when ALL windows
+    /// <= X completed successfully. Inject a failure into the middle window of
+    /// a concurrent batch — the windows below it keep their advancement (the
+    /// low-water mark), the windows above it (already fetched) are discarded,
+    /// and the next tick retries FROM the failed window.
+    #[tokio::test]
+    async fn reconcile_cursor_never_advances_past_failed_window() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 8, Duration::from_secs(60));
+
+        // Window 3 of the batch (blocks 401..600) fails; 1,2 and 4..8 succeed.
+        let fetcher = FakeFetcher::new(Some(401));
+        let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
+        let err = projector
+            .reconcile_notes_with(None, None, &f, 2_000)
+            .await
+            .expect_err("a failed window must fail the tick (stays loud/transient)");
+        assert!(
+            format!("{err:#}").contains("401..600"),
+            "error must name the failed window: {err:#}"
+        );
+        assert_eq!(fetcher.calls().len(), 8, "the whole batch was fetched");
+        assert_eq!(
+            store.get_reconcile_cursor().await.unwrap(),
+            400,
+            "cursor must stop at the low-water mark (end of the last good window BELOW the failure)"
+        );
+        assert_eq!(
+            projector.reconcile_cursor.load(Ordering::Acquire),
+            400,
+            "in-memory cursor must match the persisted low-water mark"
+        );
+
+        // Next tick (failure cleared): the sweep resumes AT the failed window
+        // and catches up — nothing was skipped.
+        let fetcher = FakeFetcher::new(None);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
+        projector
+            .reconcile_notes_with(None, None, &f, 2_000)
+            .await
+            .unwrap();
+        let mut retry_calls = fetcher.calls();
+        retry_calls.sort_unstable();
+        assert_eq!(
+            retry_calls.first(),
+            Some(&(401, 600)),
+            "retry must re-fetch the failed window first"
+        );
+        assert_eq!(store.get_reconcile_cursor().await.unwrap(), 2_000);
+    }
+
+    /// Caught-up steady state must be unchanged from the historical behavior:
+    /// exactly ONE (small) window fetch per tick, no extra batches, and a tick
+    /// at the tip fetches nothing.
+    #[tokio::test]
+    async fn reconcile_caught_up_single_window_unchanged() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        store.set_reconcile_cursor(9_950).await.unwrap();
+        let projector = test_projector(&store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 8, Duration::from_secs(60));
+
+        let fetcher = FakeFetcher::new(None);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
+        projector
+            .reconcile_notes_with(None, None, &f, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetcher.calls(),
+            vec![(9_951, 10_000)],
+            "near the tip: exactly one partial window, same as the old per-tick sweep"
+        );
+        assert_eq!(store.get_reconcile_cursor().await.unwrap(), 10_000);
+
+        // At the tip: nothing to do, no fetches at all.
+        let fetcher = FakeFetcher::new(None);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
+        projector
+            .reconcile_notes_with(None, None, &f, 10_000)
+            .await
+            .unwrap();
+        assert!(fetcher.calls().is_empty(), "caught up: zero RPC work");
     }
 
     async fn register_faucet(store: &StdArc<dyn Store>) {

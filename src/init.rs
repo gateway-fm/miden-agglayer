@@ -67,7 +67,7 @@ async fn deploy_account(
     let dummy_txn = TransactionRequestBuilder::new().build()?;
     let txn_id = crate::metrics::meter_proof(
         crate::metrics::ProofKind::Init,
-        client.submit_new_transaction(account_id, dummy_txn),
+        crate::miden_client::submit_new_transaction(client, account_id, dummy_txn),
     )
     .await?;
     tracing::info!("deployed {name} account with txn_id {txn_id}");
@@ -270,7 +270,7 @@ async fn register_p2id_script(
 
     let txn_id = crate::metrics::meter_proof(
         crate::metrics::ProofKind::Init,
-        client.submit_new_transaction(sender, txn),
+        crate::miden_client::submit_new_transaction(client, sender, txn),
     )
     .await?;
     tracing::info!("registered P2ID script with txn_id {txn_id}");

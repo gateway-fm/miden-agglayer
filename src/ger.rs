@@ -86,7 +86,7 @@ async fn submit_update_ger_note(
                     .build()?;
                 let tx_id = crate::metrics::meter_proof(
                     crate::metrics::ProofKind::Ger,
-                    client.submit_new_transaction(ger_manager_id, tx_request),
+                    crate::miden_client::submit_new_transaction(client, ger_manager_id, tx_request),
                 )
                 .await?;
                 tracing::info!(

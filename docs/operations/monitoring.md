@@ -142,6 +142,7 @@ Treat each one as a hard-page criterion at any non-zero rate.
 |---|---|
 | `claim_watcher_synthesised_total` | Watcher synthesised a ClaimEvent for a consumed CLAIM the normal path didn't record. Normal during crash recovery; sustained in steady state = `eth_sendRawTransaction` path broken. |
 | `claim_watcher_already_recorded_total` | Dedup-rate monitor. |
+| `claim_event_foreign_skipped_total` | CLAIM-shaped consumed note NOT provably ours (consumer ≠ our bridge, not minted by our service targeting our bridge) — skipped fail-closed. Expected when the chain hosts a foreign miden-agglayer deployment; on a single-deployment chain any non-zero rate = unverifiable claim consumption, investigate. |
 | `claim_watcher_storage_decode_total` / `claim_watcher_unrecoverable_total` | On-chain CLAIM storage that won't decode → quarantined. Should be zero; page on spikes. |
 | `store_envelope_decode_errors_total` | Corrupt / schema-drifted `transactions` row. Investigate immediately. |
 | `rpc_claim_ger_not_seen_total` | Claim rejected because its GER isn't injected yet. Cheap, retry-friendly; sustained spike = aggoracle behind. |

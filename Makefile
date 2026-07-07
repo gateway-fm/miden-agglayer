@@ -250,6 +250,10 @@ e2e-claim-watcher: e2e-l1-to-l2 ## After L1→L2, assert the chain-tail CLAIM wa
 e2e-claim-watcher-synthesis: e2e-claim-watcher ## After watcher happy path, simulate desync and assert synthesis fires (RD-860/EFAD repro)
 	$(COMPOSE_ENV) ./scripts/e2e-claim-watcher-synthesis.sh
 
+.PHONY: e2e-claim-provenance
+e2e-claim-provenance: ## Deploy a FOREIGN bridge on the same chain, drive a claim through it, assert zero ClaimEvent leakage (stack must be up)
+	$(COMPOSE_ENV) ./scripts/e2e-claim-provenance.sh
+
 .PHONY: e2e-l2-to-l1
 e2e-l2-to-l1: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund wallet + run L2→L1 bridge-out test (strict)
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1.sh
@@ -273,6 +277,10 @@ e2e-l2-to-l1-autoclaim: ensure-sponsor-key e2e-l1-to-l2 ## Spin up stack + L1→
 e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test
 	$(COMPOSE_ENV) ./scripts/e2e-restore.sh
 
+.PHONY: e2e-reconciler-private-note
+e2e-reconciler-private-note: e2e-up ## Spin up stack + reconciler private-note wedge regression (0.15.5 hotfix, PR #110)
+	$(COMPOSE_ENV) ./scripts/e2e-reconciler-private-note.sh
+
 .PHONY: e2e-ger-decomposition
 e2e-ger-decomposition: e2e-up ## Spin up stack + run GER decomposition bug regression test
 	$(COMPOSE_ENV) ./scripts/e2e-ger-decomposition.sh
@@ -288,6 +296,10 @@ e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
 .PHONY: e2e-rd913-restart-burn-collision
 e2e-rd913-restart-burn-collision: e2e-up ## Spin up stack + verify monitor state survives proxy restart (RD-913)
 	$(COMPOSE_ENV) ./scripts/e2e-rd913-restart-burn-collision.sh
+
+.PHONY: e2e-reconciler-cursor-persistence
+e2e-reconciler-cursor-persistence: e2e-up ## Spin up stack + verify the reconciler sweep cursor survives proxy restart (no genesis re-sweep)
+	$(COMPOSE_ENV) ./scripts/e2e-reconciler-cursor-persistence.sh
 
 # --- RD-940 e2e -----------------------------------------------------------
 # All RD-940 e2e scripts require the writer worker active. The `e2e-rd940-up`

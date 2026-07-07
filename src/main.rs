@@ -64,6 +64,19 @@ struct Command {
     #[arg(long)]
     unlock_miden_accounts: bool,
 
+    /// Escape hatch: reset the persisted note-reconciler sweep cursor to 0 at
+    /// boot so the reconciler re-walks the ENTIRE Miden history looking for
+    /// externally-created network notes that sync missed. Use for deliberate
+    /// full-history audits (e.g. after a proxy/node upgrade that may have
+    /// changed note visibility). Idempotent per boot but expensive: on a long
+    /// chain the sweep takes hours and loads the node — remove the flag after
+    /// the audit boot. Normal restarts resume from the persisted cursor and
+    /// do NOT need this. (`--restore` / `--reset-miden-store` already reset
+    /// the cursor themselves — the wiped miden store makes the genesis
+    /// re-sweep the healing pass.)
+    #[arg(long, env = "RESWEEP_FROM_GENESIS")]
+    resweep_from_genesis: bool,
+
     /// L1 bridge contract address used for synthetic log emission
     #[arg(
         long,
@@ -190,6 +203,16 @@ struct Command {
     /// it lands in Phase 1.
     #[arg(long, env = "AGGLAYER_ENABLE_WRITER_WORKER", default_value_t = false)]
     enable_writer_worker: bool,
+
+    /// Hard read-only guarantee for recovery drills / cold reindexes against
+    /// production networks. When set, EVERY transaction submission is refused
+    /// at the single chokepoint all chain mutations funnel through
+    /// (`miden_client::submit_new_transaction` + the CLAIM hot path's
+    /// pre-submit check): the call returns an error, ERROR-logs, and
+    /// increments `readonly_submissions_refused_total`. The proxy reads
+    /// history (sync, sweep, reconcile) but can never send a transaction.
+    #[arg(long, env = "AGGLAYER_READ_ONLY", default_value_t = false)]
+    read_only: bool,
 }
 
 /// Validate the `--require-hardening` invariants. Returns a list of
@@ -271,6 +294,7 @@ impl std::fmt::Debug for Command {
             .field("restore", &self.restore)
             .field("reset_miden_store", &self.reset_miden_store)
             .field("unlock_miden_accounts", &self.unlock_miden_accounts)
+            .field("resweep_from_genesis", &self.resweep_from_genesis)
             .field("bridge_address", &self.bridge_address)
             .field(
                 "l1_rpc_url",
@@ -300,6 +324,7 @@ impl std::fmt::Debug for Command {
                 &self.miden_prover_fallback_to_local,
             )
             .field("enable_writer_worker", &self.enable_writer_worker)
+            .field("read_only", &self.read_only)
             .finish()
     }
 }
@@ -308,7 +333,26 @@ impl std::fmt::Debug for Command {
 async fn main() -> anyhow::Result<()> {
     let command = Command::parse();
     logging::setup_tracing()?;
+    // Install the process-wide Prometheus recorder FIRST — before any thread
+    // or runtime that can emit a metric exists. `metrics` resolves the global
+    // recorder per macro call, so this single install covers the MidenClient's
+    // dedicated second runtime/thread, the writer worker, and the L1 indexer;
+    // but anything emitted BEFORE this line would go to the no-op recorder and
+    // silently vanish from /metrics (which is exactly what happened when the
+    // install lived after client construction — init/restore/early-sync
+    // emissions never reached the served registry).
+    let metrics_handle = miden_agglayer_service::metrics::install_prometheus_recorder()?;
     miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
+    // Install the read-only switch BEFORE any client / submit path exists so
+    // the guarantee holds from the very first instruction that could mutate
+    // chain state (including the init phase's deploy transactions).
+    miden_agglayer_service::miden_client::init_read_only(command.read_only);
+    if command.read_only {
+        tracing::warn!(
+            "READ-ONLY mode active (--read-only / AGGLAYER_READ_ONLY): every transaction \
+             submission will be refused at the submit chokepoint"
+        );
+    }
     tracing::info!("{command:?}");
 
     // Hardening startup invariants — fail loud on fail-open production
@@ -467,6 +511,28 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(InMemoryStore::new())
     };
+
+    // Reset the persisted note-reconciler sweep cursor BEFORE the
+    // SyntheticProjector is constructed (it loads the cursor in `new()`):
+    //   * `--reset-miden-store` wiped the miden-client sqlite above — the
+    //     client has forgotten every imported note, so the genesis re-sweep
+    //     IS the healing pass and must not be skipped by a stale cursor.
+    //     (`--restore` resets it too, inside `restore()` Phase 4, and then
+    //     exits — the next boot picks up the 0.)
+    //   * `--resweep-from-genesis` is the operator escape hatch for
+    //     deliberate full-history audits (e.g. after upgrades).
+    if command.reset_miden_store || command.resweep_from_genesis {
+        let reason = if command.reset_miden_store {
+            "--reset-miden-store (miden store wiped; genesis sweep is the healing pass)"
+        } else {
+            "--resweep-from-genesis (operator-requested full-history audit)"
+        };
+        store.set_reconcile_cursor(0).await?;
+        tracing::warn!(
+            reason,
+            "reconcile cursor reset — full-history re-sweep will run"
+        );
+    }
 
     // Phase 3: Load config and create full client
     let block_state = Arc::new(BlockState::new());
@@ -723,39 +789,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Initialize metrics.
-    //
-    // Histograms registered with `metrics-exporter-prometheus` default to the
-    // Prometheus *summary* representation (a fixed set of quantiles), which
-    // loses p95/p99 fidelity for low-volume metrics and — more importantly —
-    // can't be aggregated across replicas in PromQL. For the two latency
-    // metrics we actually care about (proof generation, JSON-RPC requests)
-    // we install explicit bucket sets so they're emitted as real
-    // `*_bucket{le="…"}` series. The proof buckets span 100ms (local prover
-    // warm) → 5min (remote prover under load) because bali has empirically
-    // seen 60–120s p99 proves; the RPC buckets are typical hot-path latencies
-    // (1ms → 5s). Both metric names match the `histogram!()` call-site
-    // strings in `metrics.rs` / `service.rs` exactly — using `Matcher::Full`
-    // means a typo here silently falls back to summary, so add a test if
-    // either name changes.
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full("miden_proof_duration_seconds".to_string()),
-            &[
-                0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0,
-            ],
-        )
-        .context("set_buckets_for_metric (miden_proof_duration_seconds) failed")?
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full("rpc_request_duration_seconds".to_string()),
-            &[
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-            ],
-        )
-        .context("set_buckets_for_metric (rpc_request_duration_seconds) failed")?
-        .install_recorder()
-        .context("failed to install metrics recorder")?;
-    miden_agglayer_service::metrics::init_metrics();
+    // (Metrics recorder + `init_metrics` are installed at the very top of
+    // main, before any metric-emitting thread exists — see
+    // `metrics::install_prometheus_recorder`.)
 
     // RD-940 Phase 5 — read the previous process's graceful-shutdown
     // snapshot. A non-zero value means in-flight WriteJobs whose hashes
@@ -950,6 +986,7 @@ mod hardening_tests {
             restore: false,
             reset_miden_store: false,
             unlock_miden_accounts: false,
+            resweep_from_genesis: false,
             bridge_address: miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS
                 .to_string(),
             l1_rpc_url: None,
@@ -973,6 +1010,7 @@ mod hardening_tests {
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
             enable_writer_worker: false,
+            read_only: false,
         }
     }
 
