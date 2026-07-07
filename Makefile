@@ -339,6 +339,15 @@ e2e-rd940-claim-guard-cancellation: e2e-rd940-up ## 32 concurrent disconnects, n
 
 .PHONY: e2e-rd940
 e2e-rd940: e2e-rd940-up ## Run all 6 RD-940 e2e scripts in sequence
+	@# Seed the writer: the rd940 scripts (e.g. async-submit) probe writer
+	@# metrics that the metrics-exporter only renders AFTER the first
+	@# dispatch. On a cold stack nothing has gone through the writer yet
+	@# (init.rs never enqueues — only the runtime eth_sendRawTransaction
+	@# path does), so an L1->L2 flow is run first to route a claim through
+	@# the worker. This is the "L1->L2 path seeded" pre-req the scripts
+	@# document.
+	@echo ""; echo "── RD-940 seed: L1→L2 (routes a claim through the writer) ──"
+	$(COMPOSE_ENV) ./scripts/e2e-l1-to-l2.sh
 	@set -e; \
 	for s in async-submit pending-receipt queue-backpressure restart-inflight \
 	         worker-panic claim-guard-cancellation; do \

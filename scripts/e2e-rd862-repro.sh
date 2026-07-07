@@ -74,9 +74,17 @@ cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 \
 curl -sf "$L2_RPC" -X POST -H "Content-Type: application/json" \
     -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' >/dev/null 2>&1 \
     || { fail "L2 proxy not reachable at $L2_RPC"; exit 2; }
-curl -sf "$BRIDGE_SERVICE_URL/" >/dev/null 2>&1 \
-    || curl -sf "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000000000000000000000000000" >/dev/null 2>&1 \
-    || { fail "bridge-service not reachable at $BRIDGE_SERVICE_URL"; exit 2; }
+# Bridge-service reports compose-Healthy before its host-port endpoint is
+# reliably serving, so a single probe races and flakes. Retry up to 60s.
+bs_ok=false
+for _ in $(seq 1 30); do
+    if curl -sf "$BRIDGE_SERVICE_URL/" >/dev/null 2>&1 \
+        || curl -sf "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000000000000000000000000000" >/dev/null 2>&1; then
+        bs_ok=true; break
+    fi
+    sleep 2
+done
+[[ "$bs_ok" == true ]] || { fail "bridge-service not reachable at $BRIDGE_SERVICE_URL (after 60s)"; exit 2; }
 docker inspect "$AGGLAYER_CONTAINER" >/dev/null 2>&1 \
     || { fail "agglayer container '$AGGLAYER_CONTAINER' not running"; exit 2; }
 
