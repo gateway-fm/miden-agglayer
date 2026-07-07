@@ -1499,10 +1499,9 @@ impl Store for PgStore {
         // The `WHERE faucet_registry.faucet_id = EXCLUDED.faucet_id` guard keeps
         // the historical faucet_id-idempotent metadata refresh (same faucet
         // re-registering updates symbol/decimals) while making a *different*
-        // faucet for the same origin a no-op (first-write wins). Admin route
-        // repair (DR tooling) swaps the origin row out-of-band; the
-        // two are complementary — register = converge/idempotent, replace =
-        // explicit swap.
+        // faucet for the same origin a no-op (first-write wins). There is no
+        // live route-swap API; the only way to repoint an origin at a different
+        // faucet is out-of-band DR/repair tooling operating directly on the row.
         client
             .execute(
                 "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata)

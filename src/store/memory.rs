@@ -750,9 +750,34 @@ impl Store for InMemoryStore {
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
         let mut faucets = self.faucets.write();
         // Idempotent by faucet_id: the same faucet re-registering (e.g. startup
-        // re-init) refreshes its metadata.
+        // re-init) refreshes its mutable fields. Mirrors PgStore, whose faucet_id
+        // primary key + Cantina #13 metadata guard impose the same two rules:
+        //   (a) the origin is IMMUTABLE for a given faucet_id — PgStore would hit
+        //       a duplicate-key error on a re-register carrying a different
+        //       origin, so reject it here rather than silently rebinding;
+        //   (b) never clobber stored metadata with empty — a blank re-register
+        //       (`metadata = vec![]`) must not wipe good metadata persisted by an
+        //       earlier non-empty registration or the Layer-2 backfill.
         if let Some(existing) = faucets.iter_mut().find(|f| f.faucet_id == entry.faucet_id) {
-            *existing = entry;
+            if existing.origin_address != entry.origin_address
+                || existing.origin_network != entry.origin_network
+            {
+                anyhow::bail!(
+                    "register_faucet: faucet {} is already registered for origin \
+                     (network {}); refusing to rebind it to a different origin (network {})",
+                    entry.faucet_id,
+                    existing.origin_network,
+                    entry.origin_network,
+                );
+            }
+            existing.symbol = entry.symbol;
+            existing.origin_decimals = entry.origin_decimals;
+            existing.miden_decimals = entry.miden_decimals;
+            existing.scale = entry.scale;
+            // Cantina #13 — only overwrite when the new metadata is non-empty.
+            if !entry.metadata.is_empty() {
+                existing.metadata = entry.metadata;
+            }
             return Ok(());
         }
         // Finding #10 — converge on the (origin_address, origin_network) key.
@@ -1671,6 +1696,118 @@ mod tests {
                 .symbol,
             "WTKN"
         );
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
+    }
+
+    /// InMemoryStore::register_faucet must match PgStore's faucet_id-idempotent
+    /// guards (Copilot review): a re-register by the same faucet_id must
+    ///   (a) NEVER wipe existing non-empty metadata with an empty vec (Cantina
+    ///       #13 — the preimage a later bridge-out needs), and
+    ///   (b) REJECT an attempt to rebind the faucet_id to a different origin
+    ///       (PgStore hits a duplicate faucet_id primary-key error there).
+    #[tokio::test]
+    async fn register_faucet_faucet_id_reregister_matches_pgstore_guards() {
+        let store = InMemoryStore::new();
+        let origin = [0xD1u8; 20];
+        let faucet_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+
+        // Initial registration carries real (non-empty) metadata.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![0xAB, 0xCD, 0xEF],
+            })
+            .await
+            .unwrap();
+
+        // (a) A blank re-register (empty metadata) refreshes symbol but must
+        //     PRESERVE the stored metadata preimage.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "WTKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+        let after = store.get_faucet_by_id(faucet_id).await.unwrap().unwrap();
+        assert_eq!(after.symbol, "WTKN", "mutable fields refresh");
+        assert_eq!(
+            after.metadata,
+            vec![0xAB, 0xCD, 0xEF],
+            "empty re-register must NOT wipe stored metadata (Cantina #13)"
+        );
+
+        // A non-empty re-register DOES overwrite the metadata.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "WTKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![0x11, 0x22],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_faucet_by_id(faucet_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            vec![0x11, 0x22],
+            "non-empty re-register overwrites metadata"
+        );
+
+        // (b) Rebinding the same faucet_id to a DIFFERENT origin is rejected.
+        let err = store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: [0xD2u8; 20],
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .expect_err("rebinding a faucet_id to a new origin must be rejected");
+        assert!(
+            format!("{err:#}").contains("refusing to rebind"),
+            "error must name the origin-rebind refusal, got: {err:#}"
+        );
+        // A different origin_network for the same faucet_id is likewise rejected.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 7,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .expect_err("rebinding to a new origin_network must be rejected");
+
+        // Nothing leaked a second row.
         assert_eq!(store.list_faucets().await.unwrap().len(), 1);
     }
 }

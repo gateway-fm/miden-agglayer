@@ -15,40 +15,148 @@ use miden_protocol::transaction::TransactionId;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-/// Per-origin-token async locks that serialise first-claim faucet auto-creation
-/// (finding #10). Keyed by the 20-byte L1 origin token address.
+/// In-flight faucet-provisioning registry for **single-flight** first-claim
+/// auto-creation (finding #10 / Cantina #10). Keyed by the 20-byte L1 origin
+/// token address.
 ///
 /// The service is single-process (multiple replicas are unsupported — see
 /// `main.rs`/the synthetic projector), and every `Store` is a single shared
-/// `Arc<dyn Store>`, so a process-global keyed async mutex is a sound
-/// synchronisation primitive: two concurrent first-claims for the same token
-/// take the same `tokio::sync::Mutex` and run the entire
-/// check→deploy→bridge-register→persist sequence one at a time. The loser
-/// re-checks `get_faucet_by_origin` under the lock, finds the winner's faucet,
-/// and reuses it — so a second live faucet is never deployed or bridge-registered.
+/// `Arc<dyn Store>`, so a process-global registry is a sound coordination
+/// primitive. Unlike the previous per-origin mutex — where the loser still
+/// ENTERED the critical section and re-read the store — this registry makes a
+/// concurrent second first-claim STRUCTURALLY unable to reach the provisioning
+/// path: it clones a `watch::Receiver` and AWAITS the winner's result. The
+/// awaiter can never call [`provision_faucet`], never deploys a faucet, and
+/// never touches the Miden client.
 ///
 /// Keyed by origin **address alone** (not `(address, network)`): the on-chain
 /// bridge registry keys faucets by `hash(origin_token_address)` only, so
-/// serialising per address also makes the Cantina #1 cross-network refusal
-/// TOCTOU-safe (two colliding-network first-claims for the same address can no
-/// longer both pass the refusal check).
-/// Registry of per-origin async mutexes, guarded by a short std-mutex.
-type FaucetCreateLockMap = Mutex<HashMap<[u8; 20], Arc<tokio::sync::Mutex<()>>>>;
+/// single-flighting per address also makes the Cantina #1 cross-network refusal
+/// TOCTOU-safe (two colliding-network first-claims for the same address cannot
+/// both reach the refusal check — only the single provisioner runs it).
+///
+/// The map value is a `watch::Receiver` seeded with `None`; the sole provisioner
+/// holds the matching `Sender` and publishes `Some(Ok(summary))` on success or
+/// `Some(Err(msg))` on failure. Awaiters clone the receiver and wait for the
+/// first `Some(..)`. Concurrency invariant: the guarding `std::sync::Mutex` is
+/// only ever held for the O(1) lookup/insert/remove — NEVER across an `.await`.
+///
+/// Bounded memory: the provisioner's [`FaucetInflightGuard`] REMOVES the entry
+/// as soon as provisioning settles, so the map only ever holds *currently
+/// in-flight* origins — never the full history of every origin seen. This is
+/// unlike a per-origin lock registry, which would accrue one never-evicted entry
+/// per attacker-controllable origin address (an unbounded-growth / memory-DoS
+/// vector).
+type FaucetInflightMap =
+    Mutex<HashMap<[u8; 20], tokio::sync::watch::Receiver<Option<Result<Faucet, String>>>>>;
 
-static FAUCET_CREATE_LOCKS: LazyLock<FaucetCreateLockMap> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static FAUCET_INFLIGHT: LazyLock<FaucetInflightMap> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Fetch (or create) the per-origin-address async mutex. The registry map is
-/// guarded by a short std-mutex with no await-points held; the returned tokio
-/// mutex carries the actual critical section. Mirrors
-/// `service_state::PerSignerLocks`.
-fn faucet_create_lock(origin_address: &[u8; 20]) -> Arc<tokio::sync::Mutex<()>> {
-    let mut map = FAUCET_CREATE_LOCKS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    map.entry(*origin_address)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+/// RAII guard that clears a provisioner's in-flight registry entry on drop —
+/// including on panic. If the provisioner future panics mid-flight its
+/// `watch::Sender` is dropped (closing the channel) and this guard removes the
+/// map key, so awaiters observe a closed channel and retry into a fresh cohort
+/// rather than wedging the origin forever.
+struct FaucetInflightGuard {
+    origin_address: [u8; 20],
+}
+
+impl Drop for FaucetInflightGuard {
+    fn drop(&mut self) {
+        FAUCET_INFLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.origin_address);
+    }
+}
+
+/// Outcome of one single-flight coordination attempt for an origin address.
+enum FaucetProvisionOutcome {
+    /// This task either ran provisioning itself (as the sole provisioner) or
+    /// awaited the winner's SUCCESSFUL result. Either way the value is terminal.
+    Settled(anyhow::Result<Faucet>),
+    /// This task awaited a peer provisioner that FAILED (published `Err`) or
+    /// panicked (closed the channel without publishing). The in-flight entry has
+    /// since been cleared, so the caller may retry from the top and become the
+    /// new provisioner. Never returned to the provisioner itself.
+    PeerFailedRetry,
+}
+
+/// Single-flight coordinator: for a given `origin_address`, run `provision`
+/// **exactly once** across all concurrent callers. The first caller inserts a
+/// `watch` channel and becomes the sole PROVISIONER; every concurrent caller
+/// clones the receiver and becomes an AWAITER that NEVER calls `provision`.
+///
+/// This is the structural guarantee the finding-#10 fix now rests on: an
+/// awaiter cannot reach `provision` — it only holds a `watch::Receiver` and
+/// awaits — so a concurrent first-claim can never deploy a second faucet or
+/// touch the Miden client. (The previous mutex design could not express this at
+/// the type level: the loser still entered the critical section.)
+async fn coordinate_faucet_provision<F, Fut>(
+    origin_address: [u8; 20],
+    provision: F,
+) -> FaucetProvisionOutcome
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Faucet>>,
+{
+    enum Role {
+        Provisioner(tokio::sync::watch::Sender<Option<Result<Faucet, String>>>),
+        Awaiter(tokio::sync::watch::Receiver<Option<Result<Faucet, String>>>),
+    }
+
+    // Briefly hold the std-mutex to look up or insert. No `.await` under it.
+    let role = {
+        let mut map = FAUCET_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rx) = map.get(&origin_address) {
+            Role::Awaiter(rx.clone())
+        } else {
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            map.insert(origin_address, rx);
+            Role::Provisioner(tx)
+        }
+    };
+
+    match role {
+        Role::Provisioner(tx) => {
+            // Clear the in-flight entry on ALL exits (success, error, panic).
+            let _guard = FaucetInflightGuard { origin_address };
+            let result = provision().await;
+            // Publish a Clone-able summary to awaiters. On error, forward the
+            // rendered message; awaiters map any `Err` to a retry.
+            let published = match &result {
+                Ok(faucet) => Ok(*faucet),
+                Err(err) => Err(format!("{err:#}")),
+            };
+            // Awaiters hold cloned receivers, so this reaches them even though
+            // `_guard` removes the map key immediately afterwards.
+            let _ = tx.send(Some(published));
+            FaucetProvisionOutcome::Settled(result)
+        }
+        Role::Awaiter(mut rx) => {
+            // The AWAITER never provisions. Drop the unused closure now so it is
+            // *impossible* for this path to reach `provision`, and so any borrows
+            // it captured (e.g. the `&mut MidenClientLib`) are released before we
+            // await.
+            drop(provision);
+            loop {
+                // `borrow_and_update` returns the current value and marks it
+                // seen; if the provisioner already published, return here.
+                if let Some(published) = rx.borrow_and_update().clone() {
+                    return match published {
+                        Ok(faucet) => FaucetProvisionOutcome::Settled(Ok(faucet)),
+                        Err(_) => FaucetProvisionOutcome::PeerFailedRetry,
+                    };
+                }
+                // Wait for the provisioner to publish. `changed()` errors iff the
+                // Sender was dropped without publishing (provisioner panicked):
+                // treat as failure + retry rather than hang forever.
+                if rx.changed().await.is_err() {
+                    return FaucetProvisionOutcome::PeerFailedRetry;
+                }
+            }
+        }
+    }
 }
 
 pub const CLAIM_RECEIPT_EXPIRATION_BLOCKS_ENV: &str = "AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS";
@@ -134,23 +242,36 @@ struct Faucet {
 /// On the first bridge of a new ERC-20 token, the faucet is created on Miden,
 /// registered in the bridge, and saved to the Store — all automatically.
 ///
-/// Concurrency (finding #10): the check→deploy→bridge-register→persist sequence
-/// below must be atomic per origin token. Two concurrent first-bridge claims for
-/// the same ERC-20 previously both passed the empty-local check, both deployed a
-/// faucet and both registered in the bridge (whose address-keyed route ends on
-/// the *second* faucet), while the local write for the second faucet failed on
-/// the `(origin_address, origin_network)` unique index — leaving the local
-/// registry pinned to faucet A and the bridge routing by faucet B, so later
-/// bridge-outs of B-minted assets could not be resolved and emitted no synthetic
-/// BridgeEvent.
+/// Concurrency (finding #10 / Cantina #10) — **single-flight**: the
+/// check→deploy→bridge-register→persist sequence must run at most once per
+/// origin token. Two concurrent first-bridge claims for the same ERC-20
+/// previously both passed the empty-local check, both deployed a faucet and both
+/// registered in the bridge (whose address-keyed route ends on the *second*
+/// faucet), while the local write for the second faucet failed on the
+/// `(origin_address, origin_network)` unique index — leaving the local registry
+/// pinned to faucet A and the bridge routing by faucet B, so later bridge-outs
+/// of B-minted assets could not be resolved and emitted no synthetic BridgeEvent.
 ///
-/// The `MidenClient::with(...)` channel-of-1 serialises Miden *submissions*, but
-/// does NOT bracket this whole read-modify-write across its many `await`s, so it
-/// is not sufficient synchronisation. We therefore take an explicit per-origin
-/// async lock ([`faucet_create_lock`]) around the create path and RE-CHECK
-/// `get_faucet_by_origin` under it: the loser reuses the winner's faucet instead
-/// of deploying a second one. `PgStore::register_faucet` additionally converges
-/// on the origin unique key as defense-in-depth (see `store::postgres`).
+/// `MidenClient::with(...)` queues each request on a size-1 channel and the
+/// single client task awaits the WHOLE closure before taking the next, so today
+/// this entire check→deploy→register→persist sequence already runs serialised
+/// against every other claim on that task — in the current call graph two
+/// first-claims cannot actually interleave here. The single-flight coordinator
+/// ([`coordinate_faucet_provision`]) is therefore defense-in-depth: it does NOT
+/// rely on that incidental full-closure serialisation but makes the per-origin
+/// dedup EXPLICIT and structural, so the guarantee survives any refactor that
+/// moves part of the check→provision path off the single client task (a store
+/// fast-path read outside `.with()`, a second client, or concurrent
+/// provisioning) — where two first-claims could otherwise each pass the
+/// empty-store fast path and both reach provisioning. The first concurrent claim
+/// becomes the sole PROVISIONER (runs [`provision_faucet`]); every other becomes
+/// an AWAITER that clones a `watch::Receiver` and awaits the winner's result —
+/// it can never reach [`provision_faucet`], so it structurally cannot deploy a
+/// second faucet or touch the Miden client. If the provisioner fails, awaiters
+/// get one retry (the in-flight entry is cleared, so a retrying awaiter can
+/// become the new provisioner) before the error bubbles. `Store::register_faucet`'s
+/// first-write-wins on the origin unique key remains the durable backstop (see
+/// `store::postgres`/`store::memory`).
 async fn find_or_create_faucet(
     token_address: alloy::primitives::Address,
     origin_network: u32,
@@ -159,29 +280,86 @@ async fn find_or_create_faucet(
     client: &mut MidenClientLib,
     accounts: &AccountsConfig,
 ) -> anyhow::Result<Faucet> {
-    // 1. Fast path — a read-only lookup that avoids taking the per-origin lock
-    //    for the overwhelmingly-common already-registered case.
-    if let Some(entry) = store
-        .get_faucet_by_origin(&token_address.0.0, origin_network)
-        .await?
-    {
-        return Ok(Faucet {
-            id: entry.faucet_id,
-            decimals: entry.miden_decimals,
-            origin_token_decimals: entry.origin_decimals,
-        });
+    let origin_address = token_address.0.0;
+    // One retry is permitted: if the single-flight provisioner fails, an awaiter
+    // may loop once and become the new provisioner (the entry has been cleared).
+    let mut allow_retry = true;
+    loop {
+        // Fast path — a read-only lookup for the overwhelmingly-common
+        // already-registered case. Re-run at the head of the loop so a retrying
+        // awaiter also notices a peer cohort that succeeded before it looped.
+        if let Some(entry) = store
+            .get_faucet_by_origin(&origin_address, origin_network)
+            .await?
+        {
+            return Ok(Faucet {
+                id: entry.faucet_id,
+                decimals: entry.miden_decimals,
+                origin_token_decimals: entry.origin_decimals,
+            });
+        }
+
+        // Single-flight: exactly one concurrent first-claim runs `provision_faucet`.
+        // The `&mut *client` reborrow is captured only by the PROVISIONER path;
+        // an AWAITER drops the closure unused (see `coordinate_faucet_provision`).
+        let outcome = coordinate_faucet_provision(origin_address, || {
+            provision_faucet(
+                token_address,
+                origin_network,
+                metadata,
+                store,
+                &mut *client,
+                accounts,
+            )
+        })
+        .await;
+
+        match outcome {
+            FaucetProvisionOutcome::Settled(result) => return result,
+            FaucetProvisionOutcome::PeerFailedRetry => {
+                if !allow_retry {
+                    anyhow::bail!(
+                        "faucet provisioning for token {token_address} (origin network \
+                         {origin_network}) failed in a concurrent first-claim and the single \
+                         retry was exhausted; refusing to loop"
+                    );
+                }
+                allow_retry = false;
+                tracing::warn!(
+                    token_address = %token_address,
+                    origin_network,
+                    "finding #10: peer provisioner failed; retrying as the new provisioner"
+                );
+                continue;
+            }
+        }
     }
+}
 
-    // Finding #10 — enter the per-origin critical section. Everything from the
-    // re-check through deploy+bridge-register+persist runs while this guard is
-    // held, so a concurrent first-claim for the same token address serialises
-    // here and cannot deploy a second live faucet.
-    let create_lock = faucet_create_lock(&token_address.0.0);
-    let _create_guard = create_lock.lock().await;
-
-    // 1b. Re-check under the lock. If a racing first-claim registered the faucet
-    //     while we waited for the guard, reuse it — this is what prevents a
-    //     second faucet from ever being deployed or bridge-registered.
+/// Provision a brand-new faucet for `token_address` — the single-flight
+/// PROVISIONER body, run at most once per concurrent cohort by
+/// [`coordinate_faucet_provision`]. AWAITERS never call this and never touch the
+/// Miden client.
+///
+/// Ordering is load-bearing:
+/// 1. Re-check the store — a cheap safety net (a prior cohort or the retry path
+///    may already have persisted). The durable backstop remains
+///    `Store::register_faucet`'s first-write-wins on the origin unique key.
+/// 2. Cantina #1 — refuse a cross-network origin-address collision BEFORE any
+///    deploy (the on-chain registry keys faucets by `hash(origin_token_address)`
+///    alone, so auto-creating would silently overwrite the existing route).
+/// 3. Parse metadata, deploy + bridge-register, persist.
+async fn provision_faucet(
+    token_address: alloy::primitives::Address,
+    origin_network: u32,
+    metadata: &Bytes,
+    store: &dyn Store,
+    client: &mut MidenClientLib,
+    accounts: &AccountsConfig,
+) -> anyhow::Result<Faucet> {
+    // 1. Re-check the store. If a racing first-claim already registered the
+    //    faucet (or a prior failed cohort's retry did), reuse it rather than
+    //    deploying a second one.
     if let Some(entry) = store
         .get_faucet_by_origin(&token_address.0.0, origin_network)
         .await?
@@ -190,7 +368,7 @@ async fn find_or_create_faucet(
             token_address = %token_address,
             origin_network,
             faucet_id = %crate::accounts_config::AccountIdBech32(entry.faucet_id),
-            "finding #10: faucet was created by a concurrent first-claim; reusing it"
+            "finding #10: faucet already registered; reusing it (single-flight provisioner)"
         );
         return Ok(Faucet {
             id: entry.faucet_id,
@@ -885,11 +1063,14 @@ async fn publish_claim_internal(
 ///
 ///   - **TOCTOU safety for first-bridge faucet creation** (Cantina #1
 ///     colliding-network refusal, `e6a33ae`; finding #10 non-atomic
-///     registration) is provided by the explicit per-origin async lock taken
-///     inside `find_or_create_faucet` — NOT by the surrounding `with()` mutex,
-///     which serialises Miden submissions but does not bracket the whole
-///     check→deploy→register→persist read-modify-write. See the
-///     `find_or_create_faucet` docstring and `FAUCET_CREATE_LOCKS`.
+///     registration). Today `with()` awaits the whole closure on the single
+///     client task, so the check→deploy→register→persist sequence is already
+///     serialised — but that is incidental. The single-flight coordinator
+///     ([`coordinate_faucet_provision`]) around `find_or_create_faucet` makes the
+///     per-origin dedup EXPLICIT and refactor-proof: a concurrent second
+///     first-claim awaits the winner's result and never reaches the provisioning
+///     path, even if faucet creation is ever moved off this serialised task. See
+///     the `find_or_create_faucet` docstring and `FAUCET_INFLIGHT`.
 ///
 /// Recording the PENDING claim receipt (`txn_begin`) + the note↔tx link happens
 /// inside the same closure, before the caller receives a response, so they are
@@ -1080,73 +1261,95 @@ mod tests {
         assert_eq!(entry.symbol, "ETH");
     }
 
-    /// Finding #10 — concurrency repro+regression. Two concurrent first-claims
-    /// for the SAME origin token must deploy+register exactly one faucet. This
-    /// drives the real synchronisation primitive `find_or_create_faucet` uses —
-    /// [`faucet_create_lock`] + a re-check of `get_faucet_by_origin` under the
-    /// guard — without a live Miden node: the "deploy" step is stubbed by a
-    /// short sleep + `register_faucet`. Pre-fix (no lock / no re-check) both
-    /// workers passed the empty-local check and both registered, stranding one
-    /// faucet; post-fix the loser reuses the winner's route.
+    fn faucet_entry(faucet_id: AccountId, origin: [u8; 20], network: u32) -> FaucetEntry {
+        FaucetEntry {
+            faucet_id,
+            origin_address: origin,
+            origin_network: network,
+            symbol: "TKN".into(),
+            origin_decimals: 18,
+            miden_decimals: 8,
+            scale: 10,
+            metadata: Vec::new(),
+        }
+    }
+
+    /// Finding #10 / Cantina #10 — **single-flight** regression. N concurrent
+    /// first-claims for the SAME origin token must run the provisioning path
+    /// EXACTLY ONCE. This drives the real coordinator
+    /// [`coordinate_faucet_provision`] with a counting fake provisioner (no live
+    /// Miden node): the "deploy" is stubbed by a short yield + `register_faucet`.
+    ///
+    /// The mutex design could not make this guarantee at the type level — the
+    /// loser still ENTERED the critical section and re-read the store. Under
+    /// single-flight, exactly one caller becomes the PROVISIONER (its closure
+    /// runs once, `provision_calls == 1`); every other caller is an AWAITER that
+    /// never runs the closure and resolves to the winner's published faucet.
     #[tokio::test]
     async fn finding_10_concurrent_first_claims_deploy_single_faucet() {
         use crate::store::memory::InMemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::new());
-        // Unique origin so the process-global FAUCET_CREATE_LOCKS map can't be
+        // Unique origin so the process-global FAUCET_INFLIGHT map can't be
         // perturbed by another test using the same key.
         let origin = [0x9Au8; 20];
         let network = 0u32;
+        let provision_calls = Arc::new(AtomicUsize::new(0));
 
+        // Two DISTINCT faucet ids, alternated across the N concurrent claims: an
+        // awaiter that (wrongly) returned its OWN id instead of the winner's
+        // would then diverge from the single persisted faucet and trip the
+        // final assertion.
         let id_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
         let id_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
-        fn entry(faucet_id: AccountId, origin: [u8; 20], network: u32) -> FaucetEntry {
-            FaucetEntry {
-                faucet_id,
-                origin_address: origin,
-                origin_network: network,
-                symbol: "TKN".into(),
-                origin_decimals: 18,
-                miden_decimals: 8,
-                scale: 10,
-                metadata: Vec::new(),
+        const N: usize = 8;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let store = store.clone();
+            let calls = provision_calls.clone();
+            let my_id = if i % 2 == 0 { id_a } else { id_b };
+            handles.push(tokio::spawn(async move {
+                coordinate_faucet_provision(origin, move || async move {
+                    // The PROVISIONING path — recorded exactly once by single-flight.
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Yield long enough for the other first-claims to register as
+                    // awaiters and contend, guaranteeing the race is exercised.
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    store
+                        .register_faucet(faucet_entry(my_id, origin, network))
+                        .await
+                        .unwrap();
+                    Ok(Faucet {
+                        id: my_id,
+                        decimals: 8,
+                        origin_token_decimals: 18,
+                    })
+                })
+                .await
+            }));
+        }
+
+        let mut resolved_ids = Vec::with_capacity(N);
+        for h in handles {
+            match h.await.unwrap() {
+                FaucetProvisionOutcome::Settled(Ok(f)) => resolved_ids.push(f.id),
+                FaucetProvisionOutcome::Settled(Err(e)) => {
+                    panic!("no first-claim should fail here: {e:#}")
+                }
+                FaucetProvisionOutcome::PeerFailedRetry => {
+                    panic!("no provisioner failed, so no caller should be told to retry")
+                }
             }
         }
 
-        // Mirrors find_or_create_faucet's critical section: take the per-origin
-        // lock, re-check under it, and only "deploy" (stub) + register if absent.
-        async fn worker(
-            store: Arc<InMemoryStore>,
-            faucet_id: AccountId,
-            origin: [u8; 20],
-            net: u32,
-        ) {
-            let lock = super::faucet_create_lock(&origin);
-            let _guard = lock.lock().await;
-            if store
-                .get_faucet_by_origin(&origin, net)
-                .await
-                .unwrap()
-                .is_some()
-            {
-                // Reuse — the concurrent worker already deployed+registered.
-                return;
-            }
-            // Simulate deploy+bridge-register latency so the peer is guaranteed
-            // to contend on the guard.
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            store
-                .register_faucet(entry(faucet_id, origin, net))
-                .await
-                .unwrap();
-        }
-
-        tokio::join!(
-            worker(store.clone(), id_a, origin, network),
-            worker(store.clone(), id_b, origin, network),
+        // EXACTLY ONE provisioning attempt across all N concurrent first-claims.
+        assert_eq!(
+            provision_calls.load(Ordering::SeqCst),
+            1,
+            "the provisioning path must run exactly once (single-flight)"
         );
-
         // Exactly one faucet deployed+registered for this origin.
         let all = store.list_faucets().await.unwrap();
         assert_eq!(
@@ -1154,13 +1357,96 @@ mod tests {
             1,
             "only one faucet must be created for the origin"
         );
-        // The first worker to acquire the guard (A) is the survivor; B reused it
-        // and never registered, so it is not stranded.
-        assert_eq!(all[0].faucet_id, id_a);
-        assert!(store.get_faucet_by_id(id_b).await.unwrap().is_none());
+        let winner = all[0].faucet_id;
+        // Every concurrent claim resolved to the SAME winning faucet — awaiters
+        // got the winner's published summary, not their own id.
+        assert_eq!(resolved_ids.len(), N);
+        assert!(
+            resolved_ids.iter().all(|id| *id == winner),
+            "all awaiters must resolve to the single winning faucet {winner}, got {resolved_ids:?}"
+        );
         // The bridge-out resolve path finds the canonical faucet.
         let resolved = store.get_faucet_by_origin(&origin, network).await.unwrap();
-        assert_eq!(resolved.unwrap().faucet_id, id_a);
+        assert_eq!(resolved.unwrap().faucet_id, winner);
+    }
+
+    /// Finding #10 — PROVISIONER-FAILS case. When the sole provisioner fails,
+    /// concurrent awaiters must NOT hang: they observe [`FaucetProvisionOutcome::PeerFailedRetry`]
+    /// (a sound, terminal signal). The in-flight entry is then cleared, so a
+    /// subsequent provisioner — the retry `find_or_create_faucet` performs on
+    /// `PeerFailedRetry` — can run and succeed.
+    #[tokio::test]
+    async fn finding_10_provisioner_failure_awaiters_retry_no_hang() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Unique origin (distinct from the exactly-once test) for isolation.
+        let origin = [0x9Bu8; 20];
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        // Cohort 1: the sole provisioner FAILS.
+        const N: usize = 6;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let attempts = attempts.clone();
+            handles.push(tokio::spawn(async move {
+                coordinate_faucet_provision(origin, move || async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    // Yield so the peers register as awaiters before we fail.
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    Err::<Faucet, _>(anyhow::anyhow!("simulated deploy/bridge-register failure"))
+                })
+                .await
+            }));
+        }
+
+        let mut settled_err = 0usize;
+        let mut retry = 0usize;
+        for h in handles {
+            // Each handle resolving at all proves no awaiter hung.
+            match h.await.unwrap() {
+                FaucetProvisionOutcome::Settled(Ok(_)) => panic!("provision was rigged to fail"),
+                FaucetProvisionOutcome::Settled(Err(_)) => settled_err += 1,
+                FaucetProvisionOutcome::PeerFailedRetry => retry += 1,
+            }
+        }
+
+        // Exactly one provisioner ran (and surfaced its own error); every awaiter
+        // got a retry signal rather than blocking forever.
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "only one provisioner runs"
+        );
+        assert_eq!(
+            settled_err, 1,
+            "the sole provisioner surfaces its own error"
+        );
+        assert_eq!(
+            retry,
+            N - 1,
+            "every awaiter gets a retry signal, not a hang"
+        );
+
+        // The in-flight entry was cleared, so a fresh provisioner can now run and
+        // succeed — this is exactly the retry `find_or_create_faucet` takes.
+        let ok_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let outcome = coordinate_faucet_provision(origin, || async move {
+            Ok(Faucet {
+                id: ok_id,
+                decimals: 8,
+                origin_token_decimals: 18,
+            })
+        })
+        .await;
+        match outcome {
+            FaucetProvisionOutcome::Settled(Ok(f)) => assert_eq!(f.id, ok_id),
+            FaucetProvisionOutcome::Settled(Err(e)) => {
+                panic!("retry provisioner must succeed, got error: {e:#}")
+            }
+            FaucetProvisionOutcome::PeerFailedRetry => {
+                panic!("in-flight entry was not cleared after provisioner failure")
+            }
+        }
     }
 
     #[tokio::test]

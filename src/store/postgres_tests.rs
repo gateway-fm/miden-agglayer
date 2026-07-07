@@ -1133,7 +1133,6 @@ async fn test_pgstore_finding_10_register_faucet_origin_convergence() {
         store.get_faucet_by_id(id_a).await.unwrap().unwrap().symbol,
         "WTKN"
     );
-
 }
 
 /// Cheap, dependency-free PRNG seed source — `std::time` is enough to

@@ -13,8 +13,10 @@
 # become ready_for_claim before either first-claim finishes deploying a faucet).
 # The DETERMINISTIC proof of the fix is the unit test
 #   claim::tests::finding_10_concurrent_first_claims_deploy_single_faucet
-# (two real workers, shared store, asserts a single faucet is deployed). This
-# e2e adds real-wiring + real-store + stranded-route coverage the unit test
+# (N concurrent first-claims through the single-flight coordinator, shared store,
+# asserts the provisioning path runs EXACTLY ONCE and every awaiter resolves to
+# the one winning faucet — a concurrent second claim never reaches provisioning).
+# This e2e adds real-wiring + real-store + stranded-route coverage the unit test
 # cannot: it drives actual L1 bridgeAsset txs, the live autoclaim/mint path, and
 # a real bridge-OUT to prove the converged route is NOT stranded.
 #
