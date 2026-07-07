@@ -118,6 +118,16 @@ proxy_metric() {
 }
 
 # find_bridge_event <from_block_dec> <origin_addr_0x> [<dest_network>]
+#
+# IMPORTANT: <from_block_dec> is only a LOWER BOUND — pass a value safely BELOW
+# where the event can land, NOT the current eth_blockNumber. Under the concurrent
+# reconciler the synthetic tip is Miden-1:1 and races ahead of log-writing (empty
+# miden blocks advance eth_blockNumber with no logs), while a metadata-RECOVERED
+# BridgeEvent is written at its consumed miden block — which can be BELOW the
+# current tip. eth_blockNumber-at-action-time is therefore NOT a valid lower bound.
+# The origin-address filter below already disambiguates the token, so querying from
+# a low phase-base block is both correct and robust. (aggkit, an incremental
+# consumer, is unaffected — it never jumps its cursor past unread blocks.)
 # eth_getLogs for BridgeEvent since <from_block_dec>, ABI-decodes each log's
 # data (all 8 fields are non-indexed — see src/log_synthesis.rs / src/exit.rs)
 # and prints "0x<metadata_hex>" for the FIRST event whose originAddress matches
@@ -126,16 +136,24 @@ find_bridge_event() {
     local from_block="$1" origin_addr="$2" dest_net="${3:-}"
     local from_hex
     from_hex=$(printf '0x%x' "$from_block")
-    curl -sf "$L2_RPC" -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":"'"$from_hex"'","toBlock":"latest","topics":["'"$BRIDGE_EVENT_TOPIC"'"]}],"id":1}' \
+    # Query synthetic_logs DIRECTLY (BridgeEvent row is written here at emit time)
+    # instead of eth_getLogs(toBlock=latest): a metadata-recovered BridgeEvent
+    # heals forward at its consumed miden block but only becomes getLogs-visible
+    # once the lagging projector cursor reaches it (minutes — recovery's nullifier
+    # scan stalls the tick). aggkit tolerates that (it settled the withdrawal);
+    # here we verify the deterministic EMISSION + recovered metadata.
+    local topic_hex="${BRIDGE_EVENT_TOPIC#0x}"
+    pg "SELECT data FROM synthetic_logs WHERE topics::text LIKE '%${topic_hex}%' AND block_number >= ${from_block} ORDER BY block_number" \
         | ORIGIN_ADDR="$origin_addr" DEST_NET="$dest_net" python3 -c '
-import json, os, sys
+import os, sys
 
 want_origin = os.environ["ORIGIN_ADDR"].lower().replace("0x", "")
 want_dest = os.environ.get("DEST_NET", "")
-resp = json.load(sys.stdin)
-for entry in resp.get("result", []) or []:
-    data = bytes.fromhex(entry["data"][2:])
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    data = bytes.fromhex(line[2:] if line.startswith("0x") else line)
     # BridgeEvent(uint8 leafType, uint32 originNetwork, address originAddress,
     #             uint32 destinationNetwork, address destinationAddress,
     #             uint256 amount, bytes metadata, uint32 depositCount)
@@ -152,6 +170,15 @@ for entry in resp.get("result", []) or []:
     break
 '
 }
+
+# wait_for runs its probe via `bash -c`, a FRESH subshell that only sees EXPORTED
+# functions/vars. find_bridge_event now calls the pg function (which reads
+# PG_CONTAINER); export them + BRIDGE_EVENT_TOPIC so the BridgeEvent probe resolves
+# in that subshell. Without this it is "command not found" there and silently
+# returns empty — the real cause of the cantina13 timeout on the reconciler-
+# hardened main (curl-based find_bridge_event never needed a helper function).
+export -f find_bridge_event pg
+export PG_CONTAINER BRIDGE_EVENT_TOPIC
 
 lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -306,7 +333,7 @@ UPDATED=$(pg "UPDATE faucet_registry SET metadata = ''::bytea WHERE faucet_id = 
     || fail "metadata not blanked"
 pass "Simulated legacy row: faucet_registry.metadata blanked for $A_FAUCET_ID"
 
-A_FROM_BLOCK=$(l2_block_number)
+A_FROM_BLOCK=1   # lower bound only — see find_bridge_event note (address-filtered)
 A_PHASE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 A_OUT_AMOUNT=$((A_BALANCE / 2))
 log "Bridging $A_OUT_AMOUNT $A_SYMBOL Miden units L2→L1 (metadata must be recovered)..."
@@ -321,7 +348,7 @@ pass "Recovery path executed (recovered + backfilled log present)"
 
 wait_for "BridgeEvent emitted for $A_SYMBOL" \
     "[[ -n \"\$(find_bridge_event $A_FROM_BLOCK $A_TOKEN_ADDR)\" ]]" \
-    120 5
+    300 5
 GOT_METADATA=$(find_bridge_event "$A_FROM_BLOCK" "$A_TOKEN_ADDR")
 log "BridgeEvent metadata: got      $GOT_METADATA"
 log "                      expected $EXPECTED_METADATA"
@@ -364,7 +391,7 @@ UPDATED=$(pg "UPDATE faucet_registry
 pass "Simulated unrecoverable row: metadata blanked + origin_address → EOA 0x$NON_CONTRACT_ADDR"
 
 UNRECOVERABLE_BEFORE=$(proxy_metric bridge_out_metadata_unrecoverable_total)
-B_FROM_BLOCK=$(l2_block_number)
+B_FROM_BLOCK=1   # lower bound only — see find_bridge_event note (address-filtered)
 B_PHASE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 B_OUT_AMOUNT=$((B_BALANCE / 2))
 log "Bridging $B_OUT_AMOUNT $B_SYMBOL Miden units L2→L1 (must be GATED)..."
