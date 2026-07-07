@@ -1555,23 +1555,6 @@ impl Store for PgStore {
         Ok(rows.first().and_then(pg_row_to_faucet_entry))
     }
 
-    async fn find_faucets_by_origin_address(
-        &self,
-        origin_address: &[u8; 20],
-    ) -> anyhow::Result<Vec<FaucetEntry>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata
-                 FROM faucet_registry
-                 WHERE origin_address = $1",
-                &[&origin_address.as_slice()],
-            )
-            .await?;
-
-        Ok(rows.iter().filter_map(pg_row_to_faucet_entry).collect())
-    }
-
     async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>> {
         let client = self.pool.get().await?;
         let id_str = faucet_id.to_hex();

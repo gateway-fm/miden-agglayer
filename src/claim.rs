@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 /// In-flight faucet-provisioning registry for **single-flight** first-claim
-/// auto-creation (finding #10 / Cantina #10). Keyed by the 20-byte L1 origin
-/// token address.
+/// auto-creation (finding #10 / Cantina #10). Keyed by the canonical asset
+/// identity `(origin_token_address, origin_network)`.
 ///
 /// The service is single-process (multiple replicas are unsupported — see
 /// `main.rs`/the synthetic projector), and every `Store` is a single shared
@@ -29,11 +29,15 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 /// awaiter can never call [`provision_faucet`], never deploys a faucet, and
 /// never touches the Miden client.
 ///
-/// Keyed by origin **address alone** (not `(address, network)`): the on-chain
-/// bridge registry keys faucets by `hash(origin_token_address)` only, so
-/// single-flighting per address also makes the Cantina #1 cross-network refusal
-/// TOCTOU-safe (two colliding-network first-claims for the same address cannot
-/// both reach the refusal check — only the single provisioner runs it).
+/// Keyed by the **`(address, network)` pair**, not the address alone: per
+/// `bridge_config.masm`'s `store_faucet_registration` (agglayer #2860), the
+/// on-chain `token_registry_map` is keyed on `hash(tokenAddress || origin_network)`,
+/// so the `(origin_network, origin_token_address)` pair is the canonical asset
+/// identity. The same address on two networks is TWO distinct assets with TWO
+/// distinct on-chain registry leaves and no collision — they must therefore
+/// single-flight independently (an address-only key would wrongly route a
+/// concurrent claim for `(T, net=1)` awaiting a provisioner for `(T, net=0)` to
+/// net-0's faucet).
 ///
 /// The map value is a `watch::Receiver` seeded with `None`; the sole provisioner
 /// holds the matching `Sender` and publishes `Some(Ok(summary))` on success or
@@ -43,12 +47,11 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 ///
 /// Bounded memory: the provisioner's [`FaucetInflightGuard`] REMOVES the entry
 /// as soon as provisioning settles, so the map only ever holds *currently
-/// in-flight* origins — never the full history of every origin seen. This is
-/// unlike a per-origin lock registry, which would accrue one never-evicted entry
-/// per attacker-controllable origin address (an unbounded-growth / memory-DoS
-/// vector).
+/// in-flight* keys — never the full history of every asset seen. This is unlike
+/// a per-origin lock registry, which would accrue one never-evicted entry per
+/// attacker-controllable origin (an unbounded-growth / memory-DoS vector).
 type FaucetInflightMap =
-    Mutex<HashMap<[u8; 20], tokio::sync::watch::Receiver<Option<Result<Faucet, String>>>>>;
+    Mutex<HashMap<([u8; 20], u32), tokio::sync::watch::Receiver<Option<Result<Faucet, String>>>>>;
 
 static FAUCET_INFLIGHT: LazyLock<FaucetInflightMap> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -58,7 +61,7 @@ static FAUCET_INFLIGHT: LazyLock<FaucetInflightMap> = LazyLock::new(|| Mutex::ne
 /// map key, so awaiters observe a closed channel and retry into a fresh cohort
 /// rather than wedging the origin forever.
 struct FaucetInflightGuard {
-    origin_address: [u8; 20],
+    key: ([u8; 20], u32),
 }
 
 impl Drop for FaucetInflightGuard {
@@ -66,7 +69,7 @@ impl Drop for FaucetInflightGuard {
         FAUCET_INFLIGHT
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.origin_address);
+            .remove(&self.key);
     }
 }
 
@@ -82,10 +85,11 @@ enum FaucetProvisionOutcome {
     PeerFailedRetry,
 }
 
-/// Single-flight coordinator: for a given `origin_address`, run `provision`
-/// **exactly once** across all concurrent callers. The first caller inserts a
-/// `watch` channel and becomes the sole PROVISIONER; every concurrent caller
-/// clones the receiver and becomes an AWAITER that NEVER calls `provision`.
+/// Single-flight coordinator: for a given asset `key`
+/// (`(origin_token_address, origin_network)`), run `provision` **exactly once**
+/// across all concurrent callers. The first caller inserts a `watch` channel and
+/// becomes the sole PROVISIONER; every concurrent caller clones the receiver and
+/// becomes an AWAITER that NEVER calls `provision`.
 ///
 /// This is the structural guarantee the finding-#10 fix now rests on: an
 /// awaiter cannot reach `provision` — it only holds a `watch::Receiver` and
@@ -93,7 +97,7 @@ enum FaucetProvisionOutcome {
 /// touch the Miden client. (The previous mutex design could not express this at
 /// the type level: the loser still entered the critical section.)
 async fn coordinate_faucet_provision<F, Fut>(
-    origin_address: [u8; 20],
+    key: ([u8; 20], u32),
     provision: F,
 ) -> FaucetProvisionOutcome
 where
@@ -108,11 +112,11 @@ where
     // Briefly hold the std-mutex to look up or insert. No `.await` under it.
     let role = {
         let mut map = FAUCET_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rx) = map.get(&origin_address) {
+        if let Some(rx) = map.get(&key) {
             Role::Awaiter(rx.clone())
         } else {
             let (tx, rx) = tokio::sync::watch::channel(None);
-            map.insert(origin_address, rx);
+            map.insert(key, rx);
             Role::Provisioner(tx)
         }
     };
@@ -120,7 +124,7 @@ where
     match role {
         Role::Provisioner(tx) => {
             // Clear the in-flight entry on ALL exits (success, error, panic).
-            let _guard = FaucetInflightGuard { origin_address };
+            let _guard = FaucetInflightGuard { key };
             let result = provision().await;
             // Publish a Clone-able summary to awaiters. On error, forward the
             // rendered message; awaiters map any `Err` to a retry.
@@ -244,13 +248,14 @@ struct Faucet {
 ///
 /// Concurrency (finding #10 / Cantina #10) — **single-flight**: the
 /// check→deploy→bridge-register→persist sequence must run at most once per
-/// origin token. Two concurrent first-bridge claims for the same ERC-20
-/// previously both passed the empty-local check, both deployed a faucet and both
-/// registered in the bridge (whose address-keyed route ends on the *second*
-/// faucet), while the local write for the second faucet failed on the
-/// `(origin_address, origin_network)` unique index — leaving the local registry
-/// pinned to faucet A and the bridge routing by faucet B, so later bridge-outs
-/// of B-minted assets could not be resolved and emitted no synthetic BridgeEvent.
+/// `(origin_token_address, origin_network)` asset. Two concurrent first-bridge
+/// claims for the same ERC-20 previously both passed the empty-local check, both
+/// deployed a faucet and both registered in the bridge (whose
+/// `(address, network)`-keyed route ends on the *second* faucet), while the local
+/// write for the second faucet failed on the `(origin_address, origin_network)`
+/// unique index — leaving the local registry pinned to faucet A and the bridge
+/// routing by faucet B, so later bridge-outs of B-minted assets could not be
+/// resolved and emitted no synthetic BridgeEvent.
 ///
 /// `MidenClient::with(...)` queues each request on a size-1 channel and the
 /// single client task awaits the WHOLE closure before taking the next, so today
@@ -258,7 +263,7 @@ struct Faucet {
 /// against every other claim on that task — in the current call graph two
 /// first-claims cannot actually interleave here. The single-flight coordinator
 /// ([`coordinate_faucet_provision`]) is therefore defense-in-depth: it does NOT
-/// rely on that incidental full-closure serialisation but makes the per-origin
+/// rely on that incidental full-closure serialisation but makes the per-asset
 /// dedup EXPLICIT and structural, so the guarantee survives any refactor that
 /// moves part of the check→provision path off the single client task (a store
 /// fast-path read outside `.with()`, a second client, or concurrent
@@ -300,9 +305,12 @@ async fn find_or_create_faucet(
         }
 
         // Single-flight: exactly one concurrent first-claim runs `provision_faucet`.
+        // Keyed by the `(origin_address, origin_network)` asset identity so the
+        // same address on two networks single-flights independently (two distinct
+        // on-chain registry leaves — see `FaucetInflightMap` / agglayer #2860).
         // The `&mut *client` reborrow is captured only by the PROVISIONER path;
         // an AWAITER drops the closure unused (see `coordinate_faucet_provision`).
-        let outcome = coordinate_faucet_provision(origin_address, || {
+        let outcome = coordinate_faucet_provision((origin_address, origin_network), || {
             provision_faucet(
                 token_address,
                 origin_network,
@@ -344,11 +352,13 @@ async fn find_or_create_faucet(
 /// Ordering is load-bearing:
 /// 1. Re-check the store — a cheap safety net (a prior cohort or the retry path
 ///    may already have persisted). The durable backstop remains
-///    `Store::register_faucet`'s first-write-wins on the origin unique key.
-/// 2. Cantina #1 — refuse a cross-network origin-address collision BEFORE any
-///    deploy (the on-chain registry keys faucets by `hash(origin_token_address)`
-///    alone, so auto-creating would silently overwrite the existing route).
-/// 3. Parse metadata, deploy + bridge-register, persist.
+///    `Store::register_faucet`'s first-write-wins on the `(origin_address,
+///    origin_network)` unique key.
+/// 2. Parse metadata, deploy + bridge-register, persist. Note there is NO
+///    cross-network refusal: per `bridge_config.masm`'s `store_faucet_registration`
+///    (agglayer #2860) the on-chain `token_registry_map` is keyed on
+///    `hash(tokenAddress || origin_network)`, so the same address on a different
+///    network is a DISTINCT asset with its own registry leaf — no collision.
 async fn provision_faucet(
     token_address: alloy::primitives::Address,
     origin_network: u32,
@@ -377,26 +387,15 @@ async fn provision_faucet(
         });
     }
 
-    // 2. Cantina #1 — refuse colliding-network auto-create. The on-chain bridge registry
-    //    keys faucets by `hash(origin_token_address)` ALONE, so registering a second faucet
-    //    for the same token address under a different `origin_network` will silently
-    //    overwrite the first registration on-chain. Reject before we reach that path.
-    let same_address_faucets = store
-        .find_faucets_by_origin_address(&token_address.0.0)
-        .await?;
-    if let Some(existing) = same_address_faucets
-        .iter()
-        .find(|f| f.origin_network != origin_network)
-    {
-        anyhow::bail!(
-            "refusing to auto-create faucet for token {token_address} on network {origin_network}: \
-             a faucet for the same token address is already registered under network {} \
-             (faucet_id {}). Cross-network token-address collision (Cantina #1) — auto-creating \
-             would overwrite the existing on-chain registration. Investigate and resolve manually.",
-            existing.origin_network,
-            existing.faucet_id,
-        );
-    }
+    // 2. No cross-network refusal. Per `bridge_config.masm`'s
+    //    `store_faucet_registration` (agglayer #2860), the on-chain
+    //    `token_registry_map` is keyed on `hash(tokenAddress || origin_network)` —
+    //    the `(origin_network, origin_token_address)` pair is the canonical asset
+    //    identity. The same token address on a different `origin_network` is a
+    //    DISTINCT asset that gets its own registry leaf, so auto-creating a second
+    //    faucet cannot overwrite the first registration on-chain. (The pre-#2860
+    //    premise that the registry keyed by `hash(origin_token_address)` alone —
+    //    and the "Cantina #1" refusal built on it — is stale and removed.)
 
     // 2b. Cantina #6 — recover an EXISTING on-chain faucet before deploying a
     //     replacement. The local row is missing (fresh DB / lost identity), but the
@@ -1061,16 +1060,16 @@ async fn publish_claim_internal(
 ///     later). Routing through the long-lived client eliminates the second
 ///     cache entirely.
 ///
-///   - **TOCTOU safety for first-bridge faucet creation** (Cantina #1
-///     colliding-network refusal, `e6a33ae`; finding #10 non-atomic
-///     registration). Today `with()` awaits the whole closure on the single
-///     client task, so the check→deploy→register→persist sequence is already
-///     serialised — but that is incidental. The single-flight coordinator
+///   - **TOCTOU safety for first-bridge faucet creation** (finding #10
+///     non-atomic registration). Today `with()` awaits the whole closure on the
+///     single client task, so the check→deploy→register→persist sequence is
+///     already serialised — but that is incidental. The single-flight coordinator
 ///     ([`coordinate_faucet_provision`]) around `find_or_create_faucet` makes the
-///     per-origin dedup EXPLICIT and refactor-proof: a concurrent second
-///     first-claim awaits the winner's result and never reaches the provisioning
-///     path, even if faucet creation is ever moved off this serialised task. See
-///     the `find_or_create_faucet` docstring and `FAUCET_INFLIGHT`.
+///     per-`(address, network)` dedup EXPLICIT and refactor-proof: a concurrent
+///     second first-claim awaits the winner's result and never reaches the
+///     provisioning path, even if faucet creation is ever moved off this
+///     serialised task. See the `find_or_create_faucet` docstring and
+///     `FAUCET_INFLIGHT`.
 ///
 /// Recording the PENDING claim receipt (`txn_begin`) + the note↔tx link happens
 /// inside the same closure, before the caller receives a response, so they are
@@ -1311,7 +1310,7 @@ mod tests {
             let calls = provision_calls.clone();
             let my_id = if i % 2 == 0 { id_a } else { id_b };
             handles.push(tokio::spawn(async move {
-                coordinate_faucet_provision(origin, move || async move {
+                coordinate_faucet_provision((origin, network), move || async move {
                     // The PROVISIONING path — recorded exactly once by single-flight.
                     calls.fetch_add(1, Ordering::SeqCst);
                     // Yield long enough for the other first-claims to register as
@@ -1389,7 +1388,7 @@ mod tests {
         for _ in 0..N {
             let attempts = attempts.clone();
             handles.push(tokio::spawn(async move {
-                coordinate_faucet_provision(origin, move || async move {
+                coordinate_faucet_provision((origin, 0u32), move || async move {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     // Yield so the peers register as awaiters before we fail.
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1430,7 +1429,7 @@ mod tests {
         // The in-flight entry was cleared, so a fresh provisioner can now run and
         // succeed — this is exactly the retry `find_or_create_faucet` takes.
         let ok_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let outcome = coordinate_faucet_provision(origin, || async move {
+        let outcome = coordinate_faucet_provision((origin, 0u32), || async move {
             Ok(Faucet {
                 id: ok_id,
                 decimals: 8,
@@ -1458,83 +1457,144 @@ mod tests {
         assert!(entry.is_none());
     }
 
-    /// Cantina #1 — the ACTUAL refusal branch in `find_or_create_faucet`
-    /// (the store query helper is pinned separately by
-    /// `cantina_1_find_faucets_by_origin_address_surfaces_cross_network_collision`).
-    /// A claim whose origin token address is already registered under a
-    /// DIFFERENT origin network must be refused before any faucet deploy is
-    /// attempted: the on-chain bridge registry keys faucets by
-    /// `hash(origin_token_address)` alone, so auto-creating would silently
-    /// overwrite the existing registration. Uses a real (offline)
-    /// `MidenClientLib` — the refusal fires before the client is ever touched,
-    /// which this test also proves (an RPC attempt against the dead localhost
-    /// endpoint would surface as a connection error, not the collision error).
+    /// Finding #10 (post-agglayer #2860) — the single-flight coordinator keys by
+    /// the `(origin_address, origin_network)` asset identity, NOT the address
+    /// alone. Concurrent first-claims for the SAME 20-byte token address on TWO
+    /// different origin networks are TWO DISTINCT assets: per
+    /// `bridge_config.masm`'s `store_faucet_registration`, the on-chain
+    /// `token_registry_map` is keyed on `hash(tokenAddress || origin_network)`
+    /// (the agglayer #2860 fix). So each network must run its OWN provisioner and
+    /// deploy its OWN faucet — no cross-network leakage, and NO refusal (the
+    /// obsolete pre-#2860 "Cantina #1" refusal, which assumed address-only
+    /// keying, is removed).
+    ///
+    /// This inverts the old `cantina_1_*_refuses_cross_network_collision` test
+    /// (which asserted a bail!): an address-only single-flight key would let a
+    /// net-1 caller awaiting the net-0 provisioner receive net-0's faucet (the
+    /// wrong network's faucet). Here we assert the provision closure runs EXACTLY TWICE (once
+    /// per network), two distinct faucet_ids persist, and every caller resolves
+    /// to its own network's faucet.
     #[tokio::test]
-    async fn cantina_1_find_or_create_faucet_refuses_cross_network_collision() {
-        use alloy::primitives::Address;
+    async fn finding_10_concurrent_same_address_different_network_two_distinct_faucets() {
+        use crate::store::memory::InMemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let store = InMemoryStore::new();
-        let token = [0xABu8; 20];
-        // The token is already registered under origin network 5.
-        store
-            .register_faucet(FaucetEntry {
-                faucet_id: AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap(),
-                origin_address: token,
-                origin_network: 5,
-                symbol: "TKN".into(),
-                origin_decimals: 18,
-                miden_decimals: 8,
-                scale: 10,
-                metadata: vec![],
-            })
-            .await
-            .unwrap();
+        let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::new());
+        // Unique origin so the process-global FAUCET_INFLIGHT map can't be
+        // perturbed by another test using the same address.
+        let origin = [0x9Cu8; 20];
+        let provision_calls = Arc::new(AtomicUsize::new(0));
 
-        let mut client = crate::test_helpers::offline_miden_client_lib().await;
-        let accounts = crate::test_helpers::test_accounts_config();
+        // One distinct faucet id per origin network — the two assets the
+        // `(address, network)`-keyed registry keeps apart on-chain (#2860).
+        let id_net0 = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let id_net1 = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
-        // Same token address, DIFFERENT origin network (0) → refusal.
-        let err = find_or_create_faucet(
-            Address::from(token),
-            0,
-            &Bytes::new(),
-            &store,
-            &mut client,
-            &accounts.0,
-        )
-        .await
-        .expect_err("cross-network collision must refuse auto-create");
+        const PER_NET: usize = 4;
+        let mut handles = Vec::with_capacity(PER_NET * 2);
+        // Interleave the two networks' callers so both cohorts contend on the map.
+        for i in 0..(PER_NET * 2) {
+            let network = (i % 2) as u32; // 0, 1, 0, 1, ...
+            let my_id = if network == 0 { id_net0 } else { id_net1 };
+            let store = store.clone();
+            let calls = provision_calls.clone();
+            handles.push(tokio::spawn(async move {
+                let outcome = coordinate_faucet_provision((origin, network), move || async move {
+                    // PROVISIONING path — must run once PER NETWORK (twice total).
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Yield so the peer callers register as awaiters and contend.
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    store
+                        .register_faucet(faucet_entry(my_id, origin, network))
+                        .await
+                        .unwrap();
+                    Ok(Faucet {
+                        id: my_id,
+                        decimals: 8,
+                        origin_token_decimals: 18,
+                    })
+                })
+                .await;
+                (network, outcome)
+            }));
+        }
 
-        let msg = format!("{err:#}");
+        let mut net0_ids = Vec::new();
+        let mut net1_ids = Vec::new();
+        for h in handles {
+            let (network, outcome) = h.await.unwrap();
+            match outcome {
+                FaucetProvisionOutcome::Settled(Ok(f)) => {
+                    if network == 0 {
+                        net0_ids.push(f.id)
+                    } else {
+                        net1_ids.push(f.id)
+                    }
+                }
+                FaucetProvisionOutcome::Settled(Err(e)) => {
+                    panic!("no first-claim should fail here: {e:#}")
+                }
+                FaucetProvisionOutcome::PeerFailedRetry => {
+                    panic!("no provisioner failed, so no caller should be told to retry")
+                }
+            }
+        }
+
+        // EXACTLY TWO provisioning attempts — one per (address, network) asset.
+        // The address-only key of the pre-#2860 design would have run it once and
+        // routed the second network's callers to the wrong faucet.
+        assert_eq!(
+            provision_calls.load(Ordering::SeqCst),
+            2,
+            "provisioning must run once per origin network (two distinct assets)"
+        );
+
+        // Two distinct faucets persisted, one per network.
+        let all = store.list_faucets().await.unwrap();
+        assert_eq!(all.len(), 2, "one faucet per (address, network) asset");
+        let by_network: std::collections::BTreeMap<u32, AccountId> = all
+            .iter()
+            .map(|f| (f.origin_network, f.faucet_id))
+            .collect();
+        assert_eq!(by_network.get(&0), Some(&id_net0));
+        assert_eq!(by_network.get(&1), Some(&id_net1));
+        assert_ne!(
+            id_net0, id_net1,
+            "the two networks must get distinct faucets"
+        );
+
+        // No cross-network leakage: every net-0 caller resolved to net-0's faucet,
+        // every net-1 caller to net-1's — awaiters got THEIR network's winner.
+        assert_eq!(net0_ids.len(), PER_NET);
+        assert_eq!(net1_ids.len(), PER_NET);
         assert!(
-            msg.contains("Cross-network token-address collision"),
-            "error must name the Cantina #1 conflict, got: {msg}"
+            net0_ids.iter().all(|id| *id == id_net0),
+            "net-0 callers must all resolve to the net-0 faucet, got {net0_ids:?}"
         );
         assert!(
-            msg.contains("already registered under network 5"),
-            "error must surface the colliding network for the operator, got: {msg}"
+            net1_ids.iter().all(|id| *id == id_net1),
+            "net-1 callers must all resolve to the net-1 faucet, got {net1_ids:?}"
         );
 
-        // No new faucet was deployed or registered — the original route is
-        // untouched and remains the only one for this token address.
-        let routes = store.find_faucets_by_origin_address(&token).await.unwrap();
-        assert_eq!(routes.len(), 1, "refusal must not register a second faucet");
-        assert_eq!(routes[0].origin_network, 5);
-
-        // Control: the SAME (address, network) pair still resolves via the
-        // fast path — the refusal is scoped to cross-network collisions only.
-        let same = find_or_create_faucet(
-            Address::from(token),
-            5,
-            &Bytes::new(),
-            &store,
-            &mut client,
-            &accounts.0,
-        )
-        .await
-        .expect("same-network lookup must keep working");
-        assert_eq!(same.decimals, 8);
-        assert_eq!(same.origin_token_decimals, 18);
+        // The bridge-out resolve path returns each network's own faucet.
+        assert_eq!(
+            store
+                .get_faucet_by_origin(&origin, 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .faucet_id,
+            id_net0
+        );
+        assert_eq!(
+            store
+                .get_faucet_by_origin(&origin, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .faucet_id,
+            id_net1
+        );
     }
 
     #[test]

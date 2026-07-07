@@ -67,8 +67,6 @@ pub fn create_test_service() -> ServiceState {
 /// (absent) genesis header — so tests can exercise code paths that require a
 /// `&mut MidenClientLib` argument but return before issuing any RPC:
 ///
-/// - the Cantina #1 cross-network refusal in `claim::find_or_create_faucet`
-///   (bails before the client is touched);
 /// - the Cantina MA#23 `on_post_sync` dispatch gate in
 ///   `MidenClient::on_sync` (the listener decides whether to use the client).
 ///
