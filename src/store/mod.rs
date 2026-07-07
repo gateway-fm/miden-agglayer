@@ -404,6 +404,12 @@ pub trait Store: Send + Sync + 'static {
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
     async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()>;
     /// Atomically: mark GER seen, update hash chain, emit UpdateHashChainValue log.
+    ///
+    /// MUST be idempotent on the hash-chain roll + log emission: re-running it
+    /// for a GER whose log was already emitted (e.g. a retry after a crash
+    /// between this call and `mark_ger_injected`) must NOT roll the chain a
+    /// second time or insert a duplicate log (audit H2). Implementations gate
+    /// the roll on whether a synthetic log with `tx_hash` already exists.
     #[allow(clippy::too_many_arguments)]
     async fn add_ger_update_event(
         &self,
@@ -415,6 +421,48 @@ pub trait Store: Send + Sync + 'static {
         rollup_exit_root: Option<[u8; 32]>,
         timestamp: u64,
     ) -> anyhow::Result<()>;
+
+    /// Atomic GER commit for the projector path (audit H2). Folds:
+    ///   1. `add_ger_update_event` (idempotent chain roll + log emission)
+    ///   2. `mark_ger_injected` (set `is_injected = TRUE`)
+    /// into a single all-or-nothing operation.
+    ///
+    /// Why this exists: the legacy two-step `add_ger_update_event` then
+    /// `mark_ger_injected` left a crash window — if the process died between
+    /// them, `add_ger_update_event` had ALREADY committed (rolling the hash
+    /// chain and emitting a synthetic log) while `is_ger_injected` was still
+    /// FALSE. On restart the projector re-entered, re-ran
+    /// `add_ger_update_event`, and rolled the hash chain + emitted a duplicate
+    /// log a SECOND time — diverging the proxy's `hash_chain_value` from
+    /// aggkit's view (settlement stall or poisoned certificate).
+    ///
+    /// The default impl chains the two primitives; PgStore overrides with a
+    /// single postgres txn and gates the chain roll on the log's prior
+    /// existence so the whole thing is atomic AND idempotent.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
+        &self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_exit_root: &[u8; 32],
+        mainnet_exit_root: Option<[u8; 32]>,
+        rollup_exit_root: Option<[u8; 32]>,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        self.add_ger_update_event(
+            block_number,
+            block_hash,
+            tx_hash,
+            global_exit_root,
+            mainnet_exit_root,
+            rollup_exit_root,
+            timestamp,
+        )
+        .await?;
+        self.mark_ger_injected(*global_exit_root).await?;
+        Ok(())
+    }
 
     // === Transactions ===
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()>;

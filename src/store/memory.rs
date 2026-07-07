@@ -400,6 +400,16 @@ impl Store for InMemoryStore {
         )
         .await?;
 
+        // Audit H2 — idempotent chain roll + log emission. A retry after a
+        // crash between add_ger_update_event and mark_ger_injected used to roll
+        // the hash chain and emit a duplicate synthetic log a SECOND time,
+        // diverging the proxy's chain from aggkit. Gate on whether a log with
+        // this deterministic tx_hash was already emitted.
+        let already_emitted = self.logs_by_tx.read().contains_key(&tx_hash.to_lowercase());
+        if already_emitted {
+            return Ok(());
+        }
+
         let new_hash_chain = {
             let mut hash_chain = self.hash_chain_value.write();
             let mut hasher = Keccak256::new();
@@ -1417,6 +1427,56 @@ mod tests {
         assert!(!store.is_ger_injected(&ger).await.unwrap());
         store.mark_ger_injected(ger).await.unwrap();
         assert!(store.is_ger_injected(&ger).await.unwrap());
+    }
+
+    #[tokio::test]
+    // Audit H2 — `commit_ger_event_atomic` (and `add_ger_update_event`) must be
+    // idempotent: re-running them for an already-emitted GER must NOT roll the
+    // hash chain a second time or emit a duplicate UpdateHashChainValue log.
+    // A crash between add_ger_update_event and mark_ger_injected used to leave
+    // is_injected=FALSE, so the projector re-rolled the chain on retry,
+    // diverging the proxy's hash_chain_value from aggkit.
+    async fn h2_commit_ger_event_atomic_is_idempotent_on_retry() {
+        let store = InMemoryStore::new();
+        let ger = [0x55u8; 32];
+
+        store
+            .commit_ger_event_atomic(10, [0xaa; 32], "0xger-tx-1", &ger, None, None, 1000)
+            .await
+            .unwrap();
+        let chain_after_first = *store.hash_chain_value.read();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+
+        // Retry — simulates a re-projection after a crash before the txn
+        // committed. The contract: same hash_chain_value, no duplicate log,
+        // GER stays injected.
+        store
+            .commit_ger_event_atomic(10, [0xaa; 32], "0xger-tx-1", &ger, None, None, 1000)
+            .await
+            .unwrap();
+
+        let chain_after_retry = *store.hash_chain_value.read();
+        assert_eq!(
+            chain_after_first, chain_after_retry,
+            "retry must NOT roll the hash chain a second time"
+        );
+
+        // Exactly one UpdateHashChainValue log emitted.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let ger_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| {
+                l.topics
+                    .first()
+                    .is_some_and(|t| t == UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .collect();
+        assert_eq!(ger_logs.len(), 1, "retry must NOT emit a duplicate GER log");
     }
 
     #[tokio::test]
