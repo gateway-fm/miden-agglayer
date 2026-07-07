@@ -126,6 +126,30 @@ pub fn init_metrics() {
          note authorship. Page critical, freeze claim processing."
     );
     describe_counter!(
+        "bridge_mint_foreign_skipped_total",
+        "MINT note observed consumed that is NOT attributable to our \
+         deployment — neither consumed by our bridge/registered faucet nor \
+         targeting a registered faucet. It belongs to a FOREIGN agglayer \
+         deployment sharing the chain (the note scripts are \
+         deployment-independent). Skipped by the #2/#4 provenance gate \
+         instead of raising a false cross-faucet/forged alert. Do NOT page; \
+         informational/audit only."
+    );
+    describe_counter!(
+        "bridge_twin_note_foreign_skipped_total",
+        "Consumed note skipped by the twin-detector (Cantina #6) because it \
+         was consumed by a KNOWN account that is neither our bridge nor a \
+         registered faucet — a foreign deployment's note. Keeps another \
+         deployment's note-graph out of our twin tracker. Informational/audit."
+    );
+    describe_counter!(
+        "bridge_burn_foreign_skipped_total",
+        "BURN note skipped by the serial-collision tracker (Cantina #5) \
+         because it was consumed by a KNOWN non-ours account — a foreign \
+         deployment's BURN. Keeps another deployment's serials out of our \
+         collision tracker. Informational/audit."
+    );
+    describe_counter!(
         "bridge_expected_mint_stale_total",
         "Expected MINT NoteId did not land within the configured retry \
          threshold (Cantina #7). Indicates batch-dedup censorship via a \
