@@ -23,7 +23,7 @@ flowchart TD
 
     subgraph PROXY["miden-agglayer proxy (single process)"]
         RPC["JSON-RPC service<br/>eth_* / zkevm_* / admin_*"]
-        CLAIM["claim path<br/>handle_claim_asset → publish_claim<br/>(per-origin faucet lock #10,<br/>dynamic decimals #17)"]
+        CLAIM["claim path<br/>handle_claim_asset → publish_claim<br/>(per-origin faucet lock #10,<br/>miden decimals=min(origin,8), reject &gt;26 #17)"]
         GER["GER path<br/>insert_ger (ger_manager)"]
         WW["writer worker (RD-940, optional)<br/>future-nonce queue"]
         MC["MidenClient ACTOR<br/>single thread, one select! loop:<br/>sync_state every ~5s + request queue<br/>process-wide singleton"]
@@ -179,7 +179,7 @@ sequenceDiagram
     U->>BS: (after L1 bridgeAsset) poll ready_for_claim
     Note over BS: deposit ready once its GER<br/>reached L2 via Flow 1
     U->>RPC: claimAsset via eth_sendRawTransaction
-    RPC->>RPC: verify SMT proof vs injected GER<br/>find_or_create_faucet (per-origin lock #10,<br/>dynamic miden decimals #17)
+    RPC->>RPC: verify SMT proof vs injected GER<br/>find_or_create_faucet (per-origin lock #10,<br/>miden decimals=min(origin,8), reject &gt;26 #17)
     RPC->>MC: publish_claim via actor request queue<br/>(nonce guard R4 — writer worker queues future nonces)
     MC->>P: prove CLAIM note tx (~30–60 s)
     MC->>N: submit CLAIM (targets bridge)

@@ -189,12 +189,15 @@ TSAN_OPTIONS="halt_on_error=0 exitcode=0 log_path=./tsan" \
 ```rust
 proptest! {
     #[test]
-    fn faucet_route_is_always_satisfiable(d in 0u8..=30) {
-        let m = d.min(8).max(d.saturating_sub(18)); // dynamic miden decimals
-        prop_assert!(m <= 12);            // TokenMetadata::MAX_DECIMALS
-        prop_assert!(d - m <= 18);        // MAX_SCALING_FACTOR
+    fn faucet_route_is_always_satisfiable(d in 0u8..=26) {
+        let m = d.min(8);                 // cap-at-8: miden_decimals = min(origin, 8)
+        prop_assert!(m <= 12);            // MAX_MIDEN_DECIMALS (faucet builder cap)
+        prop_assert!(d - m <= 18);        // MAX_SCALING_FACTOR ⇒ origin_decimals <= 26
     }
 }
+// Every d <= 26 routes (d <= 8 at scale 0, so 6-decimal USDC/USDT work); only
+// d > 26 (scale > 18) has no route and is rejected up-front (finding #17,
+// audit-aligned "reject >26").
 ```
 
 ---
