@@ -136,6 +136,50 @@ impl InMemoryStore {
             note_tx_links: RwLock::new(HashMap::new()),
         }
     }
+
+    /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
+    /// commit — it used to be a `Store` trait convenience method, but the only
+    /// remaining caller is `commit_b2agg_event_atomic` below (PgStore inlines
+    /// its own INSERT), so it lives here as a plain inherent method rather than
+    /// widening the trait surface.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_bridge_event(
+        &self,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+        deposit_count: u32,
+    ) -> anyhow::Result<()> {
+        let log = SyntheticLog {
+            address: bridge_address.to_string(),
+            topics: vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()],
+            data: crate::bridge_out::encode_bridge_event_data(
+                leaf_type,
+                origin_network,
+                origin_address,
+                destination_network,
+                destination_address,
+                amount,
+                metadata,
+                deposit_count,
+            ),
+            block_number,
+            block_hash,
+            transaction_hash: tx_hash.to_string(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+        self.add_log(log).await
+    }
 }
 
 impl Default for InMemoryStore {
@@ -757,6 +801,17 @@ impl Store for InMemoryStore {
         //    for the same tx_hash before emitting. This read-then-insert is race
         //    free under the single-writer serial invariant documented above (the
         //    projector is the only, strictly-serial caller).
+        //
+        //    Per-block scope is sufficient — this check only inspects
+        //    `logs_by_block[block_number]`, NOT every block. That is not a
+        //    cross-block dedup hole: a given note only ever projects to one
+        //    block, and cross-block RE-projection is already fenced off upstream
+        //    by the GLOBAL processed-note set. The projector consults
+        //    `is_note_processed(note_id)` before it ever calls this method, so
+        //    once a note is committed at block A it can never re-enter here for a
+        //    later block B. The only way we reach this point twice for the same
+        //    note is a same-block retry (same `block_number`, same derived
+        //    `tx_hash`), which this per-block scan catches exactly.
         let already_emitted = self
             .logs_by_block
             .read()

@@ -560,12 +560,12 @@ pub trait Store: Send + Sync + 'static {
 
     /// Atomic, idempotent commit for a B2AGG bridge-out `BridgeEvent`. Folds:
     ///   1. `mark_note_processed` (allocate / reuse `deposit_count`)
-    ///   2. `add_bridge_event` (synthetic log emission)
+    ///   2. the BridgeEvent synthetic-log emission
     /// into a single all-or-nothing operation.
     ///
     /// Why this exists (audit H1): the legacy two-step `mark_note_processed` +
-    /// `add_bridge_event` sequence left a crash window — a process kill between
-    /// the two calls recorded the note as processed (and bumped
+    /// bridge-event emission sequence left a crash window — a process kill
+    /// between the two calls recorded the note as processed (and bumped
     /// `deposit_counter`) with NO matching `BridgeEvent`. On restart the note
     /// was silently skipped, stranding the exit: aggkit never certified it and
     /// the L1 autoclaim never fired. The Claim path already had the atomic
@@ -577,9 +577,13 @@ pub trait Store: Send + Sync + 'static {
     /// gap-on-retry bug where `unmark_note_processed` deleted the dedup row but
     /// left the counter advanced.
     ///
-    /// PgStore overrides with a single postgres txn; the default impl chains
-    /// the two primitives sequentially (acceptable for `InMemoryStore`, which
-    /// still overrides to make the idempotent reuse atomic across locks).
+    /// REQUIRED — there is deliberately no default impl. A default that chained
+    /// the two primitives sequentially would NOT be all-or-nothing (a failure
+    /// after `mark_note_processed` but before the event emission reopens exactly
+    /// the Cantina MA#15 crash window this method exists to close). Each backend
+    /// MUST provide a genuine single-transaction implementation: `PgStore` uses
+    /// one postgres txn; `InMemoryStore` folds the reuse-or-allocate and the
+    /// at-most-once emission under its in-process locks.
     /// Returns the `deposit_count` assigned to (or reused for) this note.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
@@ -596,25 +600,7 @@ pub trait Store: Send + Sync + 'static {
         destination_address: &[u8; 20],
         amount: u128,
         metadata: &[u8],
-    ) -> anyhow::Result<u32> {
-        let deposit_count = self.mark_note_processed(note_id).await?;
-        self.add_bridge_event(
-            bridge_address,
-            block_number,
-            block_hash,
-            tx_hash,
-            leaf_type,
-            origin_network,
-            origin_address,
-            destination_network,
-            destination_address,
-            amount,
-            metadata,
-            deposit_count,
-        )
-        .await?;
-        Ok(deposit_count)
-    }
+    ) -> anyhow::Result<u32>;
 
     /// Record a B2AGG bridge-out that was observed consumed by the bridge but
     /// could NOT be translated into a synthetic BridgeEvent (Cantina MA#18).
@@ -755,46 +741,6 @@ pub trait Store: Send + Sync + 'static {
                 origin_address,
                 destination_address,
                 amount,
-            ),
-            block_number,
-            block_hash,
-            transaction_hash: tx_hash.to_string(),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-        self.add_log(log).await
-    }
-
-    // === Convenience: bridge event log ===
-    #[allow(clippy::too_many_arguments)]
-    async fn add_bridge_event(
-        &self,
-        bridge_address: &str,
-        block_number: u64,
-        block_hash: [u8; 32],
-        tx_hash: &str,
-        leaf_type: u8,
-        origin_network: u32,
-        origin_address: &[u8; 20],
-        destination_network: u32,
-        destination_address: &[u8; 20],
-        amount: u128,
-        metadata: &[u8],
-        deposit_count: u32,
-    ) -> anyhow::Result<()> {
-        let log = SyntheticLog {
-            address: bridge_address.to_string(),
-            topics: vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()],
-            data: crate::bridge_out::encode_bridge_event_data(
-                leaf_type,
-                origin_network,
-                origin_address,
-                destination_network,
-                destination_address,
-                amount,
-                metadata,
-                deposit_count,
             ),
             block_number,
             block_hash,
