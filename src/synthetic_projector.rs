@@ -37,10 +37,14 @@
 //! consumed at Miden block N is written at synthetic block N, and the tip is
 //! advanced to N once, **after** the block (write-before-advance) — including for
 //! EMPTY Miden blocks, so the synthetic chain mirrors Miden block-for-block and
-//! `eth_blockNumber` tracks the Miden tip. Within a Miden block, consumed notes
-//! are ordered by `(consumed_block_height, consumed_tx_order, note_id)` before
-//! deriving, so re-running the projector over the same chain yields
-//! byte-identical synthetic blocks
+//! `eth_blockNumber` tracks the Miden tip. Consumed notes are ordered by
+//! `(consumed_block_height, consumed_tx_order, details_commitment)` before
+//! deriving — the late-consumption sweep can fold notes from earlier (sealed)
+//! Miden blocks into one projection block, so the primary key is each note's
+//! on-chain `consumed_block_height` (not the projection block), preserving
+//! global on-chain consumption order; `consumed_tx_order` then the 32-byte
+//! details-commitment are the deterministic tie-breakers. Re-running the
+//! projector over the same chain therefore yields byte-identical synthetic blocks
 //! (numbers, hashes, log order, log indices). Because the projector is the sole
 //! assigner of the synthetic tip, there is no `get_latest()+1` reservation race —
 //! Finding #5 is eliminated by construction.
@@ -858,9 +862,13 @@ impl SyntheticProjector {
     /// (write-before-advance) — even when the block produced no logs, so the
     /// synthetic chain mirrors Miden block-for-block.
     ///
-    /// Determinism: within the Miden block, consumed notes are ordered by
-    /// `(consumed_block_height, consumed_tx_order, note_id_hex)` before deriving,
-    /// so re-running over the
+    /// Determinism: consumed notes are ordered by
+    /// `(consumed_block_height, consumed_tx_order, details_commitment)` before
+    /// deriving. The primary key is each note's on-chain `consumed_block_height`
+    /// (not the projection block) so the late-consumption sweep — which can fold
+    /// notes from earlier sealed blocks into this projection block — preserves
+    /// global on-chain consumption order; `consumed_tx_order` then the 32-byte
+    /// details-commitment are the deterministic tie-breakers. Re-running over the
     /// same chain yields byte-identical synthetic blocks. Idempotent: the
     /// `project_*` derivations short-circuit on the existing dedup keys.
     ///
