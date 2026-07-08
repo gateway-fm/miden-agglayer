@@ -150,7 +150,16 @@ struct Command {
     /// Defends against a compromised aggoracle key forging a GER onto Miden.
     /// Default false to tolerate indexer lag; `--require-hardening` implies
     /// true. Unverified GERs always increment `ger_injection_unverified_total`.
-    #[arg(long, env = "REJECT_UNVERIFIED_GER_INJECTION", default_value_t = false)]
+    ///
+    /// The long flag is spelled `--reject-unverified-ger-injection` (matching
+    /// the bail message in `ger.rs`, the e2e script, and the env var) rather
+    /// than clap's field-derived `--reject-unverified-ger`, so operators
+    /// following the docs can actually enable strict mode.
+    #[arg(
+        long = "reject-unverified-ger-injection",
+        env = "REJECT_UNVERIFIED_GER_INJECTION",
+        default_value_t = false
+    )]
     reject_unverified_ger: bool,
 
     /// Per-IP rate limit, sustained requests per second (R13). Default 500.
@@ -1134,6 +1143,22 @@ mod hardening_tests {
         let reasons = check_hardening_invariants(&c).unwrap_err();
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("--miden-prover-url"));
+    }
+
+    /// Regression: the H6 strict-mode flag must be spelled
+    /// `--reject-unverified-ger-injection` (matching the bail message, the e2e
+    /// script, and the env var). Before the explicit `long = ...`, clap derived
+    /// `--reject-unverified-ger` from the field name and this exact invocation
+    /// would fail with "unexpected argument", so operators following the docs
+    /// could never enable strict mode.
+    #[test]
+    fn reject_unverified_ger_injection_flag_parses() {
+        let c = Command::try_parse_from(["miden-agglayer", "--reject-unverified-ger-injection"])
+            .expect("--reject-unverified-ger-injection must be an accepted flag");
+        assert!(
+            c.reject_unverified_ger,
+            "the documented long flag must set reject_unverified_ger"
+        );
     }
 }
 

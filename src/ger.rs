@@ -312,10 +312,12 @@ mod tests {
             "must cite L1 non-observation: {msg}"
         );
 
-        // Lenient mode (default): the same GER is allowed through (returns false
-        // because the MidenClient stub can't really submit, but it must NOT bail
-        // at the H6 gate). The unverified metric still fires.
-        let _ = insert_ger(
+        // Lenient mode (default): the same GER is allowed through (it may still
+        // Err downstream because the MidenClient stub can't really submit, but
+        // it must NOT bail at the H6 gate). Assert the result is NOT the H6
+        // "not observed on L1" refusal — a bare `let _ =` would pass even if
+        // lenient mode wrongly refused, defeating the point of this test.
+        let lenient = insert_ger(
             forged_ger,
             &miden_client,
             accounts,
@@ -324,6 +326,11 @@ mod tests {
             false, // lenient
         )
         .await;
-        // No assertion on the return — the point is it did not return the H6 err.
+        if let Err(err) = lenient {
+            assert!(
+                !err.to_string().contains("not observed on L1"),
+                "lenient mode must NOT refuse an unverified GER at the H6 gate: {err}"
+            );
+        }
     }
 }
