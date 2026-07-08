@@ -456,9 +456,17 @@ pub(crate) async fn worker_handle_ger_insert(
 /// Self-review R2 — pre-fix the proxy accepted any well-formed signed tx, even
 /// though only aggsender / aggoracle / operator-rescue signers have a legitimate
 /// reason to submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`.
+/// Whether `signer` is permitted to submit `eth_sendRawTransaction`.
+///
+/// Audit C2 — pre-fix, `None` (the default) meant OPEN to any signer, which
+/// combined with the `0.0.0.0` bind made the service accept anonymous claims /
+/// GER injections from anyone who could reach the port. `None` now means CLOSED
+/// (fail-closed). Legacy open mode is an explicit opt-in via
+/// `ServiceState::allow_any_signer` (`--insecure-allow-any-signer`), checked at
+/// the call site.
 pub fn is_signer_allowed(allowed: Option<&[Address]>, signer: &Address) -> bool {
     match allowed {
-        None => true,
+        None => false,
         Some(list) => list.iter().any(|a| a == signer),
     }
 }
@@ -640,10 +648,14 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // (auto-creates faucets, advances LET, marks GERs injected), letting an
     // attacker burn fees, poison registries, or feed fabricated GERs to
     // bridge-service. Reject any signer not in the configured allow-list.
-    if !is_signer_allowed(service.allowed_signers.as_deref(), &signer) {
+    // Audit C2 — `None` is fail-closed (no signer accepted); legacy open mode
+    // requires the explicit `allow_any_signer` opt-in.
+    if !service.allow_any_signer && !is_signer_allowed(service.allowed_signers.as_deref(), &signer)
+    {
         ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
         anyhow::bail!(
-            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or set ALLOWED_SIGNERS) to permit"
+            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or ALLOWED_SIGNERS), \
+             or set --insecure-allow-any-signer to explicitly opt into open mode"
         );
     }
 
@@ -1398,9 +1410,11 @@ mod tests {
         let _ = shutdown.send(());
     }
 
-    /// Self-review R2 — repro+regression. Pre-fix, every recovered signer was
-    /// accepted unconditionally. Post-fix the predicate must:
-    /// - return true when no allow-list is configured (legacy open mode)
+    /// Self-review R2 + audit C2 — repro+regression. Pre-fix, every recovered
+    /// signer was accepted unconditionally; the allow-list then additionally
+    /// failed OPEN (None => true). Post-C2 the predicate must:
+    /// - return FALSE when no allow-list is configured (fail-closed default —
+    ///   legacy open mode now requires the explicit `allow_any_signer` opt-in)
     /// - return true when the signer is in the allow-list
     /// - return false when an allow-list is configured but the signer isn't in it
     /// - return false for an empty allow-list (explicit refuse-all)
@@ -1416,9 +1430,9 @@ mod tests {
             .parse()
             .unwrap();
 
-        // None = open
-        assert!(is_signer_allowed(None, &alice));
-        assert!(is_signer_allowed(None, &bob));
+        // None = CLOSED (audit C2 — was OPEN pre-fix)
+        assert!(!is_signer_allowed(None, &alice));
+        assert!(!is_signer_allowed(None, &bob));
 
         // Empty list = explicit refuse-all
         assert!(!is_signer_allowed(Some(&[]), &alice));
@@ -1480,6 +1494,9 @@ mod tests {
     #[tokio::test]
     async fn r2_unauthorised_signer_rejected_with_descriptive_error() {
         let mut service = create_test_service();
+        // Audit C2 — disable the test-helper's open mode so the allow-list is
+        // actually enforced here.
+        service.allow_any_signer = false;
         // Configure a non-empty allow-list that does NOT include the test signer.
         let foreign: Address = "0xdeAddeaDdEadDeaDDEaDDeadDEADDeaDDEAdDEaD"
             .parse()
@@ -1502,6 +1519,37 @@ mod tests {
         assert!(
             msg.contains(&format!("{signer:#x}")),
             "must name the signer: {msg}"
+        );
+    }
+
+    /// Audit C2 — the fail-closed default. With NO allow-list configured AND
+    /// `allow_any_signer = false` (the production default), a well-formed signed
+    /// tx MUST be rejected. Pre-fix, `None` meant open and this tx would be
+    /// accepted — letting anyone who could reach the port inject claims / GERs.
+    #[tokio::test]
+    async fn c2_default_fail_closed_rejects_signer_without_allow_list() {
+        let mut service = create_test_service();
+        // Production default: no allow-list, no open-mode opt-in.
+        service.allow_any_signer = false;
+        service.allowed_signers = None;
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xBBu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, _signer) = encode_legacy_tx(calldata);
+
+        let err = service_send_raw_txn(service, input_hex)
+            .await
+            .expect_err("C2: signer must be rejected under the fail-closed default");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not on the allow-list"),
+            "must cite the allow-list: {msg}"
+        );
+        assert!(
+            msg.contains("--insecure-allow-any-signer"),
+            "must point the operator at the explicit opt-in: {msg}"
         );
     }
 }

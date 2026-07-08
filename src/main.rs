@@ -19,6 +19,13 @@ struct Command {
     #[arg(long, default_value_t = 8546)]
     port: u16,
 
+    /// Bind address for the JSON-RPC HTTP service (audit H2/C2). Default
+    /// `0.0.0.0` (all interfaces) for backward compat. Set to `127.0.0.1` to
+    /// restrict to loopback — the recommended production posture when the
+    /// service sits behind a reverse proxy / sidecar that owns authn.
+    #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0", value_parser = parse_bind_addr)]
+    bind: String,
+
     /// Directory for miden-client data [default: $HOME/.miden]
     #[arg(long)]
     miden_store_dir: Option<PathBuf>,
@@ -124,10 +131,19 @@ struct Command {
 
     /// Allow-list of EVM signer addresses permitted to submit
     /// `eth_sendRawTransaction` (R2). Comma-separated 0x-prefixed addresses
-    /// (case-insensitive). When unset, every well-formed signer is accepted
-    /// (legacy open mode — only safe behind a private network boundary).
+    /// (case-insensitive). When unset, NO signer is accepted (audit C2 —
+    /// fail-closed default; previously the default was open to any signer).
+    /// To explicitly restore legacy open mode (ONLY safe behind a private
+    /// network boundary / loopback bind), set `--insecure-allow-any-signer`.
     #[arg(long, env = "ALLOWED_SIGNERS", value_delimiter = ',')]
     allowed_signers: Option<Vec<alloy::primitives::Address>>,
+
+    /// DANGEROUS: accept `eth_sendRawTransaction` from ANY signer (audit C2).
+    /// Explicit opt-in for the legacy open mode that was the pre-C2 default.
+    /// Refused by `--require-hardening`. Only safe with `--bind 127.0.0.1`
+    /// and/or a network-level boundary.
+    #[arg(long, env = "INSECURE_ALLOW_ANY_SIGNER", default_value_t = false)]
+    insecure_allow_any_signer: bool,
 
     /// Per-IP rate limit, sustained requests per second (R13). Default 500.
     #[arg(long, env = "RATE_LIMIT_PER_SECOND", default_value_t = miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND)]
@@ -225,8 +241,17 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
         .is_none_or(|v| v.is_empty())
     {
         reasons.push(
-            "  - --allowed-signers is unset (eth_sendRawTransaction would accept \
-             any signer). Set ALLOWED_SIGNERS to a comma-separated allow-list."
+            "  - --allowed-signers is unset (eth_sendRawTransaction would reject \
+             every signer — audit C2 fail-closed default). Set ALLOWED_SIGNERS \
+             to a comma-separated allow-list."
+                .to_string(),
+        );
+    }
+    if command.insecure_allow_any_signer {
+        reasons.push(
+            "  - --insecure-allow-any-signer is set (eth_sendRawTransaction accepts \
+             ANY signer — audit C2 legacy open mode). This is incompatible with \
+             --require-hardening; remove it and use --allowed-signers instead."
                 .to_string(),
         );
     }
@@ -256,10 +281,40 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
     }
 }
 
+/// clap value parser for `--bind`: validate the value as a bare IP address
+/// (`0.0.0.0`, `127.0.0.1`, `::1`, …) at the CLI boundary. The service port is
+/// a *separate* `--port` arg, so a `host:port` form (`127.0.0.1:8546`) or a
+/// bare IPv6 literal that only fails later at URL construction is rejected here
+/// with a clear message instead of blowing up deep in startup.
+fn parse_bind_addr(s: &str) -> Result<String, String> {
+    s.parse::<std::net::IpAddr>()
+        .map(|_| s.to_string())
+        .map_err(|_| {
+            format!(
+                "`{s}` is not a valid IP address (expected e.g. `0.0.0.0`, `127.0.0.1`, or `::1`; \
+             the listening port is set separately via --port, not appended here)"
+            )
+        })
+}
+
+/// Build the JSON-RPC service URL from a validated bind host + port. IPv6
+/// literals are bracketed (`::1` → `http://[::1]:8546`); without brackets the
+/// colons in the address collide with the port separator and the URL is
+/// invalid (`http://::1:8546`).
+fn build_service_url(bind: &str, port: u16) -> Result<Url, url::ParseError> {
+    let host = if bind.contains(':') {
+        format!("[{bind}]")
+    } else {
+        bind.to_string()
+    };
+    Url::from_str(&format!("http://{host}:{port}"))
+}
+
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Command")
             .field("port", &self.port)
+            .field("bind", &self.bind)
             .field("miden_store_dir", &self.miden_store_dir)
             .field("miden_node", &self.miden_node)
             .field("chain_id", &self.chain_id)
@@ -286,6 +341,7 @@ impl std::fmt::Debug for Command {
             )
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
+            .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
             .field("require_hardening", &self.require_hardening)
             .field(
                 "miden_api_key",
@@ -666,6 +722,7 @@ async fn main() -> anyhow::Result<()> {
     state.cors_allowed_origins = command.cors_allowed_origins;
     state.admin_api_key = command.admin_api_key;
     state.allowed_signers = command.allowed_signers;
+    state.allow_any_signer = command.insecure_allow_any_signer;
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
     state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
@@ -870,7 +927,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let url = Url::from_str(format!("http://0.0.0.0:{}", command.port).as_str())?;
+    let url = build_service_url(&command.bind, command.port)?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
     // RD-940 Phase 5 — graceful drain. When `service::serve` returns
@@ -953,6 +1010,7 @@ mod hardening_tests {
     ) -> Command {
         Command {
             port: 8546,
+            bind: "0.0.0.0".into(),
             miden_store_dir: None,
             miden_node: None,
             chain_id: 1,
@@ -972,6 +1030,7 @@ mod hardening_tests {
             cors_allowed_origins: cors,
             admin_api_key: admin,
             allowed_signers: signers,
+            insecure_allow_any_signer: false,
             rate_limit_per_second: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: miden_agglayer_service::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
@@ -1028,6 +1087,28 @@ mod hardening_tests {
         assert!(check_hardening_invariants(&c).is_ok());
     }
 
+    /// Audit C2 — `--insecure-allow-any-signer` (the legacy open-mode opt-in)
+    /// is refused under `--require-hardening`. Starting from the all-set config
+    /// that otherwise passes, flipping only the insecure opt-in must trip the
+    /// gate with exactly one reason naming the flag.
+    #[test]
+    fn hardening_refuses_insecure_allow_any_signer() {
+        let mut c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        c.insecure_allow_any_signer = true;
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "only the insecure opt-in should trip the gate: {reasons:?}"
+        );
+        assert!(reasons[0].contains("--insecure-allow-any-signer"));
+    }
+
     /// When hardening is enabled and the remote prover is unset, the gate
     /// must reject — local proving is the documented bali OOM cause.
     #[test]
@@ -1042,5 +1123,53 @@ mod hardening_tests {
         let reasons = check_hardening_invariants(&c).unwrap_err();
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("--miden-prover-url"));
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// A bad `--bind` value (host:port form, not a bare IP) is rejected at the
+    /// CLI by the value parser instead of failing late at URL construction.
+    #[test]
+    fn bad_bind_value_rejected_at_cli() {
+        // host:port is not a bare IpAddr → clap error.
+        let err = Command::try_parse_from(["prog", "--bind", "127.0.0.1:8546"]);
+        assert!(err.is_err(), "host:port bind must be rejected at the CLI");
+
+        // Outright garbage is rejected too.
+        assert!(
+            Command::try_parse_from(["prog", "--bind", "not-an-ip"]).is_err(),
+            "non-IP bind must be rejected at the CLI"
+        );
+    }
+
+    /// The value parser accepts the valid bare-IP forms it documents.
+    #[test]
+    fn good_bind_values_accepted() {
+        assert_eq!(parse_bind_addr("0.0.0.0").unwrap(), "0.0.0.0");
+        assert_eq!(parse_bind_addr("127.0.0.1").unwrap(), "127.0.0.1");
+        assert_eq!(parse_bind_addr("::1").unwrap(), "::1");
+        assert!(parse_bind_addr("127.0.0.1:8546").is_err());
+    }
+
+    /// An IPv6 bind (`::1`) produces a valid, bracketed URL — the unbracketed
+    /// `http://::1:8546` would be an invalid URL.
+    #[test]
+    fn ipv6_bind_builds_valid_bracketed_url() {
+        let url = build_service_url("::1", 8546).expect("::1 must build a valid URL");
+        assert_eq!(url.as_str(), "http://[::1]:8546/");
+        assert_eq!(url.host_str(), Some("::1"));
+        assert_eq!(url.port(), Some(8546));
+    }
+
+    /// IPv4 bind is left unbracketed.
+    #[test]
+    fn ipv4_bind_builds_plain_url() {
+        let url = build_service_url("127.0.0.1", 8546).expect("valid IPv4 URL");
+        assert_eq!(url.as_str(), "http://127.0.0.1:8546/");
+        assert_eq!(url.port(), Some(8546));
     }
 }

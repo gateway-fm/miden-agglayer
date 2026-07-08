@@ -88,12 +88,17 @@ pub struct ServiceState {
     /// entirely (the safe production default — fail closed). `Some(token)` =
     /// admin requests must carry `Authorization: Bearer <token>`.
     pub admin_api_key: Option<String>,
-    /// Allow-list of EVM signer addresses (R2). `None` = `eth_sendRawTransaction`
-    /// is OPEN to any signer (legacy default; only safe behind a private
-    /// network-level boundary). `Some(list)` = inbound txs must be signed by an
-    /// address in the list. Production must always set this — aggsender,
-    /// aggoracle, and any operator-rescue tool are the only legitimate signers.
+    /// Allow-list of EVM signer addresses (R2). Audit C2 — `None` now means
+    /// CLOSED (fail-closed: no signer is accepted). `Some(list)` = inbound txs
+    /// must be signed by an address in the list. To explicitly enable legacy
+    /// open mode, set `allow_any_signer = true` via `--insecure-allow-any-signer`
+    /// (refused by `--require-hardening`).
     pub allowed_signers: Option<Vec<alloy::primitives::Address>>,
+    /// Audit C2 — explicit opt-in for legacy "accept any signer" mode. When
+    /// true, `eth_sendRawTransaction` accepts any well-formed signer regardless
+    /// of `allowed_signers`. ONLY safe behind a loopback bind / network
+    /// boundary. Refused by `--require-hardening`.
+    pub allow_any_signer: bool,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one
     /// signer cannot both pass the equality check before either increments.
@@ -171,6 +176,7 @@ impl ServiceState {
             cors_allowed_origins: None,
             admin_api_key: None,
             allowed_signers: None,
+            allow_any_signer: false,
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
