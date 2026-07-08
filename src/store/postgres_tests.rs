@@ -284,6 +284,71 @@ async fn test_pgstore_h2_commit_ger_event_atomic_is_idempotent_on_retry() {
     );
 }
 
+/// Audit H2 (case-insensitivity). The idempotency gate keys on `transaction_hash`,
+/// which is canonically lowercase hex everywhere else in the store
+/// (`get_logs_for_tx` queries `lower(transaction_hash)`, `memory.rs` stores
+/// lowercase). A case-SENSITIVE gate would miss an already-stored lowercase row
+/// when a retry arrives with a mixed/upper-case form of the SAME hash → the
+/// chain would re-roll and a DUPLICATE UpdateHashChainValue log would be emitted.
+/// Committing with an UPPER-case `tx_hash` and retrying with its lowercase form
+/// must emit exactly ONE log and leave `hash_chain_value` unchanged.
+///
+/// PG-gated: skips when `DATABASE_URL` is unset; runs in the postgres-feature CI.
+#[tokio::test]
+async fn test_pgstore_h2_commit_ger_event_atomic_is_idempotent_case_insensitive() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let nonce = rand_u64();
+    // Upper/mixed-case hex tx_hash for the first commit.
+    let tx_hash_upper = format!("0xH2CASE_{nonce:016X}");
+    let tx_hash_lower = tx_hash_upper.to_lowercase();
+    let mut ger = [0x77u8; 32];
+    ger[..8].copy_from_slice(&nonce.to_be_bytes());
+
+    assert!(!store.is_ger_injected(&ger).await.unwrap());
+
+    // First commit with the UPPER-case tx_hash.
+    store
+        .commit_ger_event_atomic(10, [0xbb; 32], &tx_hash_upper, &ger, None, None, 1000)
+        .await
+        .unwrap();
+    assert!(store.is_ger_injected(&ger).await.unwrap());
+
+    // Canonical lowercase lookup must find the emitted log (stored lowercase).
+    let logs_first = store.get_logs_for_tx(&tx_hash_lower).await.unwrap();
+    assert_eq!(
+        logs_first.len(),
+        1,
+        "first commit must emit exactly one UpdateHashChainValue log (found by lowercase key)"
+    );
+    let chain_after_first = logs_first[0].topics[2].clone();
+
+    // Retry with the DIFFERENTLY-CASED form of the SAME hash (lowercase). The
+    // case-insensitive gate must recognize it as already-emitted and skip.
+    store
+        .commit_ger_event_atomic(10, [0xbb; 32], &tx_hash_lower, &ger, None, None, 1000)
+        .await
+        .unwrap();
+
+    let logs_after = store.get_logs_for_tx(&tx_hash_lower).await.unwrap();
+    assert_eq!(
+        logs_after.len(),
+        1,
+        "differently-cased retry must NOT emit a duplicate UpdateHashChainValue log"
+    );
+    assert_eq!(
+        logs_after[0].topics[2], chain_after_first,
+        "differently-cased retry must NOT roll the hash chain a second time"
+    );
+    assert!(
+        store.is_ger_injected(&ger).await.unwrap(),
+        "GER must remain injected after the idempotent case-insensitive retry"
+    );
+}
+
 // ── Transactions ─────────────────────────────────────────────
 
 #[tokio::test]

@@ -626,10 +626,17 @@ impl Store for PgStore {
         // the hash chain and emit a duplicate synthetic log a SECOND time,
         // diverging the proxy's chain from aggkit. Gate on whether a log with
         // this deterministic tx_hash already exists.
+        //
+        // transaction_hash is canonically lowercase hex across the store
+        // (get_logs_for_tx queries `lower(transaction_hash)`, memory.rs stores
+        // lowercase). Canonicalize here too so a mixed/upper-case tx_hash still
+        // matches an already-stored lowercase row — otherwise the gate misses
+        // and we double-emit, exactly the idempotency violation this guards.
+        let tx_hash_key = tx_hash.to_lowercase();
         let already_emitted = txn
             .query_opt(
-                "SELECT 1 FROM synthetic_logs WHERE transaction_hash = $1 LIMIT 1",
-                &[&tx_hash],
+                "SELECT 1 FROM synthetic_logs WHERE lower(transaction_hash) = $1 LIMIT 1",
+                &[&tx_hash_key],
             )
             .await?
             .is_some();
@@ -679,7 +686,7 @@ impl Store for PgStore {
                     &"0x",
                     &(block_number as i64),
                     &block_hash.as_slice(),
-                    &tx_hash,
+                    &tx_hash_key,
                     &0_i64,
                     &false,
                 ],
@@ -726,10 +733,14 @@ impl Store for PgStore {
         .await?;
 
         // Idempotent chain roll + log emission (H2): skip if already emitted.
+        // Canonicalize tx_hash to lowercase to match the store's convention
+        // (get_logs_for_tx / memory.rs) so a mixed-case retry still matches the
+        // stored lowercase row instead of double-emitting.
+        let tx_hash_key = tx_hash.to_lowercase();
         let already_emitted = txn
             .query_opt(
-                "SELECT 1 FROM synthetic_logs WHERE transaction_hash = $1 LIMIT 1",
-                &[&tx_hash],
+                "SELECT 1 FROM synthetic_logs WHERE lower(transaction_hash) = $1 LIMIT 1",
+                &[&tx_hash_key],
             )
             .await?
             .is_some();
@@ -779,7 +790,7 @@ impl Store for PgStore {
                     &"0x",
                     &(block_number as i64),
                     &block_hash.as_slice(),
-                    &tx_hash,
+                    &tx_hash_key,
                     &0_i64,
                     &false,
                 ],

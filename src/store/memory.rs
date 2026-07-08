@@ -430,7 +430,10 @@ impl Store for InMemoryStore {
             data: "0x".to_string(),
             block_number,
             block_hash,
-            transaction_hash: tx_hash.to_string(),
+            // Canonical lowercase, consistent with the gate above (line ~408),
+            // add_log's lowercase keying, and get_logs_for_tx — and with the
+            // postgres store, which persists the lowercase transaction_hash.
+            transaction_hash: tx_hash.to_lowercase(),
             transaction_index: 0,
             log_index: 0,
             removed: false,
@@ -1477,6 +1480,58 @@ mod tests {
             })
             .collect();
         assert_eq!(ger_logs.len(), 1, "retry must NOT emit a duplicate GER log");
+    }
+
+    #[tokio::test]
+    // Audit H2 — the idempotency gate must be CASE-INSENSITIVE on tx_hash.
+    // transaction_hash is canonically lowercase hex across the store, so a
+    // retry that arrives with a differently-cased form of the SAME hash must
+    // still be recognized as already-emitted — otherwise the chain re-rolls
+    // and a duplicate UpdateHashChainValue log is emitted (double-emit).
+    async fn h2_commit_ger_event_atomic_is_idempotent_case_insensitive() {
+        let store = InMemoryStore::new();
+        let ger = [0x66u8; 32];
+
+        // First commit with an UPPER/mixed-case tx_hash.
+        store
+            .commit_ger_event_atomic(10, [0xbb; 32], "0xDeadBEEF01", &ger, None, None, 1000)
+            .await
+            .unwrap();
+        let chain_after_first = *store.hash_chain_value.read();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+
+        // Retry with the SAME hash in a different case (all lowercase).
+        store
+            .commit_ger_event_atomic(10, [0xbb; 32], "0xdeadbeef01", &ger, None, None, 1000)
+            .await
+            .unwrap();
+
+        let chain_after_retry = *store.hash_chain_value.read();
+        assert_eq!(
+            chain_after_first, chain_after_retry,
+            "differently-cased retry must NOT roll the hash chain a second time"
+        );
+
+        // Exactly one UpdateHashChainValue log across both casings.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let ger_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| {
+                l.topics
+                    .first()
+                    .is_some_and(|t| t == UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .collect();
+        assert_eq!(
+            ger_logs.len(),
+            1,
+            "differently-cased retry must NOT emit a duplicate GER log"
+        );
     }
 
     #[tokio::test]
