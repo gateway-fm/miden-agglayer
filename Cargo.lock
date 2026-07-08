@@ -3407,6 +3407,7 @@ dependencies = [
  "clap",
  "dashmap",
  "deadpool-postgres",
+ "futures-util",
  "hex",
  "http",
  "lru",

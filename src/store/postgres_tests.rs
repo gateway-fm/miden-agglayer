@@ -10,7 +10,7 @@
 
 use super::postgres::PgStore;
 use super::{Store, TxnEntry};
-use crate::log_synthesis::{GerEntry, LogFilter, SyntheticLog};
+use crate::log_synthesis::{AddressFilter, GerEntry, LogFilter, SyntheticLog};
 use alloy::consensus::{TxEip1559, TxEnvelope};
 use alloy::primitives::{Address, Signature, TxHash, U256};
 
@@ -871,6 +871,188 @@ async fn test_pgstore_s9_corrupt_envelope_row_surfaces_error() {
         msg.contains("cannot be decoded"),
         "error must say the envelope failed to decode, got: {msg}"
     );
+}
+
+/// Cantina finding #12 (redesign) — PgStore `get_logs` returns ALL matches with
+/// NO normal-operation row cap. The ORIGINAL fix fetched `CAP+1` and errored once
+/// a range held more than 1000 raw rows (even when few matched the queried
+/// address); the redesign pushes a SAFE SUPERSET into SQL and STREAMS the whole
+/// matching set. This inserts >1000 matching logs into one block under a per-run
+/// unique address and asserts every one comes back — no truncation, no error.
+#[tokio::test]
+async fn finding_12_getlogs_returns_all_no_row_cap() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    // Per-run unique block + address so these rows are isolated from every other
+    // suite writing synthetic_logs into the shared database.
+    let block = 3_000_000 + (rand_u64() % 1_000_000);
+    let run = rand_u64();
+    let addr = format!("0x{run:x}dead");
+    let n = 1_200usize; // comfortably past the OLD 1000-row cap
+
+    for i in 0..n {
+        let mut l = dummy_log(block, &format!("0xf12_{run}_{i}"));
+        l.address = addr.clone();
+        store.add_log(l).await.expect("add_log must succeed");
+    }
+
+    let filter = LogFilter {
+        from_block: Some(format!("0x{block:x}")),
+        to_block: Some(format!("0x{block:x}")),
+        address: Some(AddressFilter::Single(addr.clone())),
+        topics: None,
+        block_hash: None,
+    };
+
+    let logs = store
+        .get_logs(&filter, block)
+        .await
+        .expect("no row cap: a dense range must return ALL matches, not error");
+    assert_eq!(logs.len(), n, "every matching log must be returned in full");
+}
+
+/// Cantina #12 (Copilot review) — a huge `toBlock` (u64 above i64::MAX) must NOT
+/// wrap negative and silently return zero rows. `synthetic_logs.block_number` is
+/// i64; the pre-fix `to = to_u64 as i64` made `toBlock ≈ u64::MAX` go negative, so
+/// `block_number <= $to` rejected every row (confirmed live: a near-max toBlock
+/// returned `[]`). The fix clamps `toBlock > i64::MAX` to i64::MAX ("query up to
+/// the top") and returns empty only when `fromBlock` itself exceeds i64::MAX.
+#[tokio::test]
+async fn finding_12_getlogs_huge_toblock_does_not_wrap() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let block = 5_000_000 + (rand_u64() % 1_000_000);
+    let run = rand_u64();
+    let addr = format!("0x{run:x}beef");
+    let n = 5usize;
+    for i in 0..n {
+        let mut l = dummy_log(block, &format!("0xhuge_{run}_{i}"));
+        l.address = addr.clone();
+        store.add_log(l).await.expect("add_log must succeed");
+    }
+
+    // toBlock ≈ u64::MAX — pre-fix this wrapped to a negative i64 and returned [].
+    let huge_to = LogFilter {
+        from_block: Some("0x0".to_string()),
+        to_block: Some(format!("0x{:x}", u64::MAX)),
+        address: Some(AddressFilter::Single(addr.clone())),
+        topics: None,
+        block_hash: None,
+    };
+    let logs = store
+        .get_logs(&huge_to, block)
+        .await
+        .expect("huge toBlock must not error");
+    assert_eq!(
+        logs.len(),
+        n,
+        "toBlock above i64::MAX must clamp (query up to the top), not wrap to empty"
+    );
+
+    // fromBlock above i64::MAX is an absurd range (starts beyond every storable
+    // block) — must return empty, not wrap.
+    let huge_from = LogFilter {
+        from_block: Some(format!("0x{:x}", u64::MAX)),
+        to_block: Some(format!("0x{:x}", u64::MAX)),
+        address: Some(AddressFilter::Single(addr)),
+        topics: None,
+        block_hash: None,
+    };
+    let empty = store
+        .get_logs(&huge_from, block)
+        .await
+        .expect("huge fromBlock must not error");
+    assert!(
+        empty.is_empty(),
+        "fromBlock above i64::MAX must return empty (absurd range)"
+    );
+}
+
+/// Cantina #12 GUARDRAIL (PgStore twin) — the same property-based equivalence the
+/// InMemoryStore test runs, now against the production SQL path: for a diverse
+/// population + diverse filters, `PgStore::get_logs` MUST equal the pure-Rust
+/// `matches()` oracle. This is what proves the SAFE SUPERSET `WHERE` + streaming
+/// read reproduce `matches()` exactly (incl. MA#26 passthrough BOTH directions,
+/// positional topics longer than a log's topics, and a sparse match in a dense
+/// range that the old cap would have errored). Gated on DATABASE_URL.
+///
+/// `Scenario::new(base, run)` offsets blocks into a high window unused by other
+/// suites and salts every block_hash with `run`, so the shared DB stays isolated
+/// (the block_hash filter is range-independent, hence the hash salt).
+#[tokio::test]
+async fn getlogs_equivalence_matches_oracle_pgstore() {
+    use crate::log_synthesis::equiv_fixtures::{SPARSE_MATCH_COUNT, Scenario, sorted_txs};
+
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let run = rand_u64();
+    let base = 100_000_000 + (run % 50_000_000); // window no other suite writes to
+    let scn = Scenario::new(base, run);
+    for l in &scn.logs {
+        store
+            .add_log(l.clone())
+            .await
+            .expect("add_log must succeed");
+    }
+
+    for (name, f) in &scn.filters {
+        let got = store
+            .get_logs(f, scn.current_block)
+            .await
+            .unwrap_or_else(|e| panic!("filter `{name}`: get_logs errored: {e}"));
+        let want = scn.reference_matches(f);
+        assert_eq!(
+            sorted_txs(&got),
+            sorted_txs(&want),
+            "filter `{name}`: PgStore result diverged from matches() oracle"
+        );
+
+        // eth_getLogs ordering contract — `ORDER BY block_number, log_index`.
+        assert!(
+            got.windows(2).all(|w| (w[0].block_number, w[0].log_index)
+                <= (w[1].block_number, w[1].log_index)),
+            "filter `{name}`: results must be ordered by (block_number, log_index)"
+        );
+
+        let got_txs = sorted_txs(&got);
+        let has = |tx: &str| got_txs.iter().any(|t| t == tx);
+        match *name {
+            "sparse_in_dense" => assert_eq!(
+                got.len(),
+                SPARSE_MATCH_COUNT,
+                "dense range must return exactly the sparse matches"
+            ),
+            "passthrough_include" => assert!(
+                has(&scn.tx_passthrough),
+                "UHCV passthrough must be returned when the query's topic0 includes UHCV"
+            ),
+            "passthrough_exclude_no_topic" => assert!(
+                !has(&scn.tx_passthrough),
+                "no topic0 filter ⇒ passthrough must NOT leak the UHCV log"
+            ),
+            "passthrough_exclude_other_topic" => assert!(
+                !has(&scn.tx_passthrough),
+                "topic0 excludes UHCV ⇒ passthrough must NOT return the UHCV log"
+            ),
+            "positional_longer_than_log" => {
+                assert!(
+                    !has(&scn.tx_positional_short),
+                    "filter constrains topic position 2 but the log has only 2 topics ⇒ reject"
+                );
+                assert!(
+                    has(&scn.tx_positional_long),
+                    "len-3 log with matching positional topics ⇒ accept"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Cheap, dependency-free PRNG seed source — `std::time` is enough to

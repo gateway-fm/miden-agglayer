@@ -288,49 +288,141 @@ impl Store for PgStore {
         Ok(())
     }
 
+    /// Cantina #12 redesign — filter in SQL (SAFE SUPERSET) + stream ALL matches.
+    ///
+    /// The old query filtered ONLY by block range in SQL, applied a `LIMIT 1000`
+    /// to that UNFILTERED set, and matched address/topics in Rust afterward — so
+    /// a dense range with few address matches errored on rows that weren't even
+    /// answers. This pushes a PROVABLE SUPERSET of `matches()` into the `WHERE`
+    /// (block + address-OR-UHCV + topic0; proof lives on the `LogFilter`
+    /// superset helpers), streams the WHOLE superset over a portal via
+    /// `query_raw` (NOT the buffering `query()`), and runs the UNCHANGED
+    /// `filter.matches()` as the exact final filter row-by-row.
+    ///
+    /// There is NO normal-operation row cap: stream-exhaust ⇒ we returned every
+    /// match. The only limit is [`crate::store::GETLOGS_SAFETY_CEILING`] on the
+    /// **post-`matches()`** count — an OOM/aggkit-rechunk backstop, so a sparse
+    /// match in a dense range never errors.
     async fn get_logs(
         &self,
         filter: &LogFilter,
         current_block: u64,
     ) -> anyhow::Result<Vec<SyntheticLog>> {
+        use futures_util::TryStreamExt;
+        use tokio_postgres::types::ToSql;
+
         let client = self.pool.get().await?;
-        let from = filter.from_block_number(current_block) as i64;
-        let to = filter.to_block_number(current_block) as i64;
+        // Keep the ORIGINAL u64s for the ceiling error message. The range params
+        // need a GUARDED u64 → i64 conversion (the `block_number` column is i64):
+        // a bare `as i64` WRAPS negative for values above i64::MAX (e.g. a client
+        // passing toBlock ≈ u64::MAX), which turned `block_number <= $to` into an
+        // always-false predicate and silently returned zero rows. See the block
+        // predicate below.
+        let from_block = filter.from_block_number(current_block);
+        let to_block = filter.to_block_number(current_block);
 
-        let rows = client
-            .query(
-                "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
-                 FROM synthetic_logs
-                 WHERE block_number >= $1 AND block_number <= $2
-                 ORDER BY block_number, log_index
-                 LIMIT 1000",
-                &[&from, &to],
-            )
-            .await?;
+        // ── Build the SAFE-SUPERSET WHERE (numbered params in push order) ──
+        let mut conds: Vec<String> = Vec::new();
+        // `+ Send`: this Vec is held across the `query_raw(...).await` below, so the
+        // async fn's future must be `Send` (async_trait Store contract). A bare
+        // `Box<dyn ToSql + Sync>` is not `Send`; `param_refs` casts back down to the
+        // `&(dyn ToSql + Sync)` that `query_raw` expects.
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
 
-        let logs: Vec<SyntheticLog> = rows
+        // Block predicate. When block_hash is set, `matches()` keys on the hash
+        // string and IGNORES the range, so we mirror it as an EXACT string
+        // comparison — `encode()` yields lowercase hex, so no decode is needed
+        // and malformed input compares identically to `matches()`.
+        if let Some(bh) = filter.block_hash.as_ref() {
+            params.push(Box::new(bh.to_lowercase()));
+            conds.push(format!(
+                "('0x' || encode(block_hash, 'hex')) = ${}",
+                params.len()
+            ));
+        } else {
+            // Guarded u64 → i64 (block_number is an i64 column):
+            //   fromBlock > i64::MAX ⇒ the range starts ABOVE every storable
+            //     block_number ⇒ no row can match ⇒ return empty (absurd range).
+            //   toBlock  > i64::MAX ⇒ clamp to i64::MAX ("up to the top"); every
+            //     stored block_number is ≤ i64::MAX, so this includes all of them.
+            if from_block > i64::MAX as u64 {
+                return Ok(Vec::new());
+            }
+            let from = i64::try_from(from_block).expect("checked ≤ i64::MAX above");
+            let to = i64::try_from(to_block).unwrap_or(i64::MAX);
+            params.push(Box::new(from));
+            let p_from = params.len();
+            params.push(Box::new(to));
+            let p_to = params.len();
+            conds.push(format!(
+                "block_number >= ${p_from} AND block_number <= ${p_to}"
+            ));
+        }
+
+        // Address predicate (superset incl. MA#26 passthrough): the second
+        // disjunct `lower(topics[1]) = UHCV` covers ALL possible passthrough rows
+        // regardless of the query's topic0 filter; `matches()` applies the exact
+        // passthrough + topic0-inclusion check afterward.
+        if let Some(addrs_lower) = filter.address_alternatives_lower() {
+            params.push(Box::new(addrs_lower));
+            let p_addrs = params.len();
+            params.push(Box::new(UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()));
+            let p_uhcv = params.len();
+            conds.push(format!(
+                "(lower(address) = ANY(${p_addrs}) OR lower(topics[1]) = ${p_uhcv})"
+            ));
+        }
+
+        // topic0 predicate (only when position 0 is constrained). Postgres arrays
+        // are 1-indexed → topic0 = topics[1]. Positions 1..3 stay in `matches()`.
+        if let Some(topic0_lower) = filter.topic0_alternatives_lower() {
+            params.push(Box::new(topic0_lower));
+            let p_t0 = params.len();
+            conds.push(format!("lower(topics[1]) = ANY(${p_t0})"));
+        }
+
+        let sql = format!(
+            "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
+             FROM synthetic_logs
+             WHERE {}
+             ORDER BY block_number, log_index",
+            conds.join(" AND ")
+        );
+
+        // Stream incrementally over a portal. The pooled connection is held for
+        // the stream's lifetime — bounded: we stop at the ceiling or on exhaust.
+        let param_refs: Vec<&(dyn ToSql + Sync)> = params
             .iter()
-            .map(|r| {
-                let bh = bytes_to_array_32(r.get(5));
-                let topics: Vec<String> = r.get(2);
-                SyntheticLog {
-                    log_index: r.get::<_, i64>(0) as u64,
-                    address: r.get(1),
-                    topics,
-                    data: r.get(3),
-                    block_number: r.get::<_, i64>(4) as u64,
-                    block_hash: bh,
-                    transaction_hash: r.get(6),
-                    transaction_index: r.get::<_, i64>(7) as u64,
-                    removed: r.get(8),
-                }
-            })
+            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
             .collect();
+        let mut stream = Box::pin(client.query_raw(&sql, param_refs).await?);
 
-        Ok(logs
-            .into_iter()
-            .filter(|l| filter.matches(l, current_block))
-            .collect())
+        let mut out: Vec<SyntheticLog> = Vec::new();
+        while let Some(r) = stream.try_next().await? {
+            let bh = bytes_to_array_32(r.get(5));
+            let topics: Vec<String> = r.get(2);
+            let log = SyntheticLog {
+                log_index: r.get::<_, i64>(0) as u64,
+                address: r.get(1),
+                topics,
+                data: r.get(3),
+                block_number: r.get::<_, i64>(4) as u64,
+                block_hash: bh,
+                transaction_hash: r.get(6),
+                transaction_index: r.get::<_, i64>(7) as u64,
+                removed: r.get(8),
+            };
+            if filter.matches(&log, current_block) {
+                out.push(log);
+                // OOM backstop only — NOT a normal cap. Exhausting the stream
+                // without tripping this means we returned ALL matches.
+                if out.len() > crate::store::GETLOGS_SAFETY_CEILING {
+                    return Err(crate::store::getlogs_row_cap_error(from_block, to_block));
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     async fn get_logs_for_tx(&self, tx_hash: &str) -> anyhow::Result<Vec<SyntheticLog>> {

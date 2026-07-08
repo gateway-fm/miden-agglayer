@@ -22,7 +22,7 @@
 //! [`AggLayerBridge::faucet_metadata_map_slot_name`]: miden_base_agglayer::AggLayerBridge
 
 use miden_base_agglayer::{AggLayerBridge, AggLayerFaucet, MetadataHash};
-use miden_protocol::account::{Account, AccountId};
+use miden_protocol::account::{Account, AccountId, AccountStorage, StorageSlotContent};
 use miden_protocol::{Felt, Word};
 
 /// Metric incremented whenever an ERC-20 bridge-out is gated because its
@@ -203,6 +203,141 @@ pub fn read_faucet_metadata_hash(
     Some(bytes)
 }
 
+// CANTINA #6 — NON-ETH FAUCET IDENTITY READBACK
+// ================================================================================================
+//
+// The bridge's `faucet_metadata_map` is the authoritative on-chain record of
+// every registered faucet's origin-chain identity. On a `--restore` / fresh-DB
+// bootstrap the local `faucet_registry` may be missing a faucet's row entirely
+// (Cantina #6); the account still exists on Miden and is still bridge-out-valid,
+// so we rebuild the local POINTER from this map rather than (re)deploying a
+// second generation the registry cannot model.
+//
+// The map is written by `bridge_config.masm::store_faucet_metadata` with a
+// per-faucet 4-felt sub-key `[subkey, 0, faucet_suffix, faucet_prefix]`:
+//   - sub-key 0 → VALUE `[addr0, addr1, addr2, addr3]`        (origin address bytes 0..16)
+//   - sub-key 1 → VALUE `[addr4, origin_network, scale, 0]`   (bytes 16..20 + network + scale)
+//   - sub-key 2/3 → the keccak metadata hash (see `read_faucet_metadata_hash`).
+// `origin_network` is stored RAW (no byte-swap); each address limb is a
+// little-endian-packed u32 (`bytes_to_packed_u32_elements`), decoded exactly as
+// `read_faucet_metadata_hash` decodes the hash limbs.
+
+/// A faucet's origin-chain identity, read back from the bridge's
+/// `faucet_metadata_map` — the authoritative source used to rebuild a missing
+/// local `faucet_registry` row on restore, and to recover an existing faucet on
+/// the live claim/admin path instead of deploying a replacement generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaucetConversion {
+    pub origin_address: [u8; 20],
+    pub origin_network: u32,
+    pub scale: u8,
+}
+
+/// Read a single faucet's conversion metadata (origin token address, origin
+/// network, decimal scale) from the bridge account's `faucet_metadata_map`,
+/// keyed by `faucet_id` (sub-keys 0 and 1).
+///
+/// Returns `None` when the readback is the default all-zero word (the faucet is
+/// not registered on the bridge — native ETH is never rebuilt via this path) or
+/// a limb is out of `u32`/`u8` range.
+pub fn read_faucet_conversion_metadata(
+    bridge_storage: &AccountStorage,
+    faucet_id: AccountId,
+) -> Option<FaucetConversion> {
+    let slot = AggLayerBridge::faucet_metadata_map_slot_name();
+    let suffix = faucet_id.suffix();
+    let prefix = faucet_id.prefix().as_felt();
+    let zero = Felt::from(0u32);
+
+    // sub-key 0 → origin address bytes 0..16; sub-key 1 → bytes 16..20 + network + scale
+    let key_lo = Word::new([Felt::from(0u32), zero, suffix, prefix]);
+    let key_hi = Word::new([Felt::from(1u32), zero, suffix, prefix]);
+
+    let lo = bridge_storage.get_map_item(slot, key_lo).ok()?;
+    let hi = bridge_storage.get_map_item(slot, key_hi).ok()?;
+    let lo_elems = lo.as_elements();
+    let hi_elems = hi.as_elements();
+
+    let mut origin_address = [0u8; 20];
+    // limbs 0..4 (sub-key 0) → bytes 0..16
+    for (i, felt) in lo_elems.iter().enumerate() {
+        let limb = u32::try_from(felt.as_canonical_u64()).ok()?;
+        origin_address[i * 4..i * 4 + 4].copy_from_slice(&limb.to_le_bytes());
+    }
+    // limb 4 (sub-key 1, element 0) → bytes 16..20
+    let addr4 = u32::try_from(hi_elems[0].as_canonical_u64()).ok()?;
+    origin_address[16..20].copy_from_slice(&addr4.to_le_bytes());
+
+    let origin_network = u32::try_from(hi_elems[1].as_canonical_u64()).ok()?;
+    let scale = u8::try_from(hi_elems[2].as_canonical_u64()).ok()?;
+
+    // An absent map key defaults to the zero word; an all-zero readback means the
+    // faucet is not registered (or is the native-ETH sentinel, which is
+    // pre-seeded and never rebuilt from chain).
+    if origin_address == [0u8; 20] && origin_network == 0 && scale == 0 {
+        return None;
+    }
+    Some(FaucetConversion {
+        origin_address,
+        origin_network,
+        scale,
+    })
+}
+
+/// Enumerate every faucet_id registered in the bridge's `faucet_metadata_map`.
+///
+/// Each registered faucet has exactly one sub-key-`0` entry keyed
+/// `[0,0,suffix,prefix]`; we recover the `AccountId` from the `(suffix, prefix)`
+/// limbs of those keys. Relies on the bridge account being fully synced locally
+/// (restore Phase 0 reimports it) so the map leaves are present — the same
+/// assumption `read_faucet_metadata_hash` already makes for Cantina #13.
+pub fn enumerate_registered_faucet_ids(bridge_storage: &AccountStorage) -> Vec<AccountId> {
+    let slot = AggLayerBridge::faucet_metadata_map_slot_name();
+    let Some(storage_slot) = bridge_storage.get(slot) else {
+        return Vec::new();
+    };
+    let StorageSlotContent::Map(map) = storage_slot.content() else {
+        return Vec::new();
+    };
+    let zero = Felt::from(0u32);
+    let mut ids = Vec::new();
+    for (key, _value) in map.entries() {
+        let elems = Word::from(*key);
+        let e = elems.as_elements();
+        // One sub-key-0 row per faucet; the other sub-keys (1/2/3) would yield the
+        // same (suffix, prefix), so filter to sub-key 0 to enumerate each once.
+        if e[0] != zero {
+            continue;
+        }
+        let (suffix, prefix) = (e[2], e[3]);
+        if let Ok(id) = AccountId::try_from_elements(suffix, prefix) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Find the faucet already registered on the bridge for a given origin token
+/// `(address, network)` pair, if any (Cantina #6 recover-existing). Used by the
+/// live claim/admin path to import an existing faucet identity instead of
+/// deploying a replacement generation the `(origin_address, origin_network)`
+/// unique registry can't model.
+pub fn find_registered_faucet_for_origin(
+    bridge_storage: &AccountStorage,
+    origin_address: &[u8; 20],
+    origin_network: u32,
+) -> Option<(AccountId, FaucetConversion)> {
+    for faucet_id in enumerate_registered_faucet_ids(bridge_storage) {
+        if let Some(conv) = read_faucet_conversion_metadata(bridge_storage, faucet_id)
+            && &conv.origin_address == origin_address
+            && conv.origin_network == origin_network
+        {
+            return Some((faucet_id, conv));
+        }
+    }
+    None
+}
+
 /// Build the all-Miden recovery candidate from the faucet account.
 ///
 /// NOTE: the AggLayer faucet sets its token name == symbol and stores a
@@ -357,6 +492,156 @@ mod tests {
 
     fn hash_of(name: &str, symbol: &str, decimals: u8) -> [u8; 32] {
         keccak_metadata(&rederive_token_metadata(name, symbol, decimals))
+    }
+
+    // ── Cantina #6 — non-ETH faucet identity readback ────────────────────────
+    //
+    // These tests prove the on-chain read mechanism the restore-rebuild and
+    // live recover-existing paths depend on: given a bridge account whose
+    // `faucet_metadata_map` is populated exactly as `bridge_config.masm`
+    // writes it, we can read a faucet's origin (address/network/scale) back and
+    // enumerate/match registered faucets — WITHOUT a Miden node. The full
+    // rebuild (importing the faucet account for symbol/decimals) is exercised
+    // by `scripts/e2e-cantina6-faucet-identity-restore.sh`.
+    mod finding_6 {
+        use super::*;
+        use crate::bridge_out::resolve_faucet_origin;
+        use crate::store::memory::InMemoryStore;
+        use crate::store::{FaucetEntry, Store};
+        use miden_base_agglayer::EthAddress;
+        use miden_protocol::account::{
+            AccountId, AccountStorage, StorageMap, StorageMapKey, StorageSlot,
+        };
+        use std::sync::Arc as StdArc;
+
+        // A valid v1 public account id used as the faucet id under test. The
+        // readback/enumeration logic is agnostic to account TYPE — it only
+        // round-trips the (suffix, prefix) felts — so a regular id suffices.
+        const FAUCET_HEX: &str = "0xac0000000000dd110000ee000000fc";
+
+        fn faucet_id() -> AccountId {
+            AccountId::from_hex(FAUCET_HEX).unwrap()
+        }
+
+        /// Fabricate a bridge `AccountStorage` whose `faucet_metadata_map` holds
+        /// the sub-key-0 / sub-key-1 rows for one faucet, byte-identical to how
+        /// `bridge_config.masm::store_faucet_metadata` writes them:
+        ///   sub-key 0 → `[addr0, addr1, addr2, addr3]`
+        ///   sub-key 1 → `[addr4, origin_network, scale, 0]`
+        fn fabricate_bridge_storage(
+            faucet: AccountId,
+            origin_address: [u8; 20],
+            origin_network: u32,
+            scale: u8,
+        ) -> AccountStorage {
+            let suffix = faucet.suffix();
+            let prefix = faucet.prefix().as_felt();
+            let zero = Felt::from(0u32);
+
+            let addr = EthAddress::new(origin_address).to_elements(); // 5 felts
+            let key0 = StorageMapKey::new(Word::new([Felt::from(0u32), zero, suffix, prefix]));
+            let val0 = Word::new([addr[0], addr[1], addr[2], addr[3]]);
+            let key1 = StorageMapKey::new(Word::new([Felt::from(1u32), zero, suffix, prefix]));
+            let val1 = Word::new([addr[4], Felt::from(origin_network), Felt::from(scale), zero]);
+
+            let mut map = StorageMap::new();
+            map.insert(key0, val0).unwrap();
+            map.insert(key1, val1).unwrap();
+
+            let slot =
+                StorageSlot::with_map(AggLayerBridge::faucet_metadata_map_slot_name().clone(), map);
+            AccountStorage::new(vec![slot]).unwrap()
+        }
+
+        /// Reads origin address / network / scale back from the bridge map for a
+        /// known faucet id (the exact decode the restore-rebuild relies on).
+        #[test]
+        fn finding_6_reads_conversion_metadata_from_bridge_map() {
+            let faucet = faucet_id();
+            let storage = fabricate_bridge_storage(faucet, USDC, 3, 10);
+
+            let conv = read_faucet_conversion_metadata(&storage, faucet)
+                .expect("faucet is registered on the bridge — must decode");
+            assert_eq!(conv.origin_address, USDC);
+            assert_eq!(conv.origin_network, 3);
+            assert_eq!(conv.scale, 10);
+
+            // A faucet NOT in the map decodes to None (absent → zero word).
+            let other = AccountId::from_hex("0xaa0000000000bb110000cc000000fd").unwrap();
+            assert!(read_faucet_conversion_metadata(&storage, other).is_none());
+        }
+
+        /// Enumerate + match: the recover-existing lookup finds the faucet for an
+        /// origin (address, network) pair, and returns None for an unregistered
+        /// origin (the case where the live path WOULD deploy).
+        #[test]
+        fn finding_6_find_registered_faucet_for_origin_recovers_existing_generation() {
+            let faucet = faucet_id();
+            let storage = fabricate_bridge_storage(faucet, USDC, 0, 8);
+
+            assert_eq!(enumerate_registered_faucet_ids(&storage), vec![faucet]);
+
+            let (found, conv) = find_registered_faucet_for_origin(&storage, &USDC, 0)
+                .expect("existing on-chain faucet must be recovered, not re-deployed");
+            assert_eq!(found, faucet);
+            assert_eq!(conv.scale, 8);
+
+            // Same address, DIFFERENT network → not a match (no recovery).
+            assert!(find_registered_faucet_for_origin(&storage, &USDC, 1).is_none());
+            // Unknown token → not a match.
+            assert!(find_registered_faucet_for_origin(&storage, &[0x22u8; 20], 0).is_none());
+        }
+
+        /// End-to-end PoC of the restore-rebuild gap-closure at the store +
+        /// decode layer: with the local row REMOVED, `resolve_faucet_origin`
+        /// errors (pre-fix: the historical bridge-out is quarantined as
+        /// UnknownFaucet). After rebuilding the row from the authoritative
+        /// bridge `faucet_metadata_map`, it succeeds with the correct origin —
+        /// so the historical exit replays instead of being skipped.
+        #[tokio::test]
+        async fn finding_6_restore_rebuild_makes_resolve_faucet_origin_succeed() {
+            let faucet = faucet_id();
+            let bridge_storage = fabricate_bridge_storage(faucet, USDC, 6, 10);
+            let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+
+            // Pre-fix: local row missing → resolve errors (this is exactly what
+            // makes `restore_bridge_outs` / `BridgeOutScanner` skip the exit).
+            let err = resolve_faucet_origin(faucet, &*store)
+                .await
+                .err()
+                .expect("missing local row must error before rebuild");
+            assert!(
+                format!("{err:#}").contains("unknown faucet"),
+                "unexpected error: {err:#}"
+            );
+
+            // Rebuild the row from authoritative bridge state (the address /
+            // network / scale come straight from the on-chain map; symbol /
+            // decimals would come from the faucet account on the live path).
+            let conv = read_faucet_conversion_metadata(&bridge_storage, faucet).unwrap();
+            let miden_decimals = 8u8;
+            store
+                .register_faucet(FaucetEntry {
+                    faucet_id: faucet,
+                    origin_address: conv.origin_address,
+                    origin_network: conv.origin_network,
+                    symbol: "USDC".into(),
+                    origin_decimals: miden_decimals + conv.scale,
+                    miden_decimals,
+                    scale: conv.scale,
+                    metadata: vec![],
+                })
+                .await
+                .unwrap();
+
+            // Post-fix: resolve succeeds with the reconstructed origin.
+            let origin = resolve_faucet_origin(faucet, &*store)
+                .await
+                .expect("rebuilt row must resolve");
+            assert_eq!(origin.origin_address, USDC);
+            assert_eq!(origin.origin_network, 6);
+            assert_eq!(origin.scale, 10);
+        }
     }
 
     /// (i) RED→GREEN: a faucet row with EMPTY metadata for an ERC-20, plus a

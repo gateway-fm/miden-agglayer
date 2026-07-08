@@ -4,10 +4,13 @@
 //! and `service_admin.rs` (admin RPC endpoint).
 
 use crate::accounts_config::AccountIdBech32;
+use crate::metadata_recovery::{EmitMetadata, FaucetConversion, recover_bridge_out_metadata};
 use crate::miden_client::MidenClientLib;
+use crate::store::FaucetEntry;
 use alloy::primitives::{Address, Bytes};
 use miden_base_agglayer::{
-    ConfigAggBridgeNote, ConversionMetadata, EthAddress, MetadataHash, create_agglayer_faucet,
+    AggLayerFaucet, ConfigAggBridgeNote, ConversionMetadata, EthAddress, MetadataHash,
+    create_agglayer_faucet,
 };
 use miden_client::Felt;
 use miden_client::asset::FungibleAsset;
@@ -90,6 +93,87 @@ pub async fn create_and_register_faucet(
     .await?;
 
     Ok(account)
+}
+
+/// Cantina #6 — rebuild a local [`FaucetEntry`] for an EXISTING on-chain faucet
+/// whose local `faucet_registry` row is missing (a `--restore` / fresh-DB
+/// bootstrap, or a live claim/admin for a token whose row was lost).
+///
+/// The faucet account still lives on Miden — its origin identity is in the
+/// bridge's `faucet_metadata_map` (`conversion`, already read by the caller) and
+/// its symbol + Miden decimals in the faucet account's own storage. We therefore
+/// rebuild only the local POINTER; we NEVER re-deploy the account. Its seed is a
+/// random word (`create_agglayer_faucet(client.rng().draw_word(), ..)`) and is
+/// unrecoverable, so a re-deploy would mint a *second* generation for the same
+/// `(origin_address, origin_network)` — exactly the split-brain Cantina #6
+/// describes, with the old generation's exits invisible forever.
+///
+/// Imports the faucet account from the node if it isn't tracked locally, reads
+/// its symbol + Miden decimals, derives `origin_decimals = miden_decimals +
+/// scale`, and recovers the ABI metadata preimage via the existing Cantina #13
+/// L2 helper (empty for native ETH / when unrecoverable — the bridge-out emit
+/// path re-recovers + backfills it later).
+pub async fn rebuild_faucet_entry_from_chain(
+    client: &mut MidenClientLib,
+    bridge_account: &Account,
+    faucet_id: AccountId,
+    conversion: &FaucetConversion,
+    l1_rpc_url: Option<&str>,
+) -> anyhow::Result<FaucetEntry> {
+    // Ensure the faucet account is available locally (best-effort import; if it is
+    // already tracked this is a refresh). A prior process's dynamically-created
+    // faucets are NOT in `bridge_accounts.toml`, so Phase 0 doesn't reimport them.
+    if client.get_account(faucet_id).await.ok().flatten().is_none()
+        && let Err(e) = client.import_account_by_id(faucet_id).await
+    {
+        anyhow::bail!("Cantina #6: cannot import faucet account {faucet_id} from node: {e}");
+    }
+    let faucet_account = client
+        .get_account(faucet_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("get_account({faucet_id}): {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("faucet account {faucet_id} not found after import"))?;
+
+    let faucet = AggLayerFaucet::try_faucet_from_account(&faucet_account)
+        .map_err(|e| anyhow::anyhow!("account {faucet_id} is not an AggLayer faucet: {e}"))?;
+    let miden_decimals = faucet.decimals();
+    let symbol = faucet.symbol().to_string();
+    let scale = conversion.scale;
+    let origin_decimals = miden_decimals.checked_add(scale).ok_or_else(|| {
+        anyhow::anyhow!(
+            "faucet {faucet_id}: miden_decimals {miden_decimals} + scale {scale} overflows u8"
+        )
+    })?;
+
+    // Recover the ABI metadata preimage from authoritative on-chain state (bridge
+    // metadata hash + Miden faucet name/symbol, and L1 name()/symbol()/decimals()
+    // if an RPC is wired). Empty for native ETH or when unrecoverable — safe: the
+    // bridge-out emit site re-recovers or gates (Cantina #13 L2).
+    let metadata = match recover_bridge_out_metadata(
+        &conversion.origin_address,
+        &[],
+        origin_decimals,
+        faucet_id,
+        Some(bridge_account),
+        Some(&faucet_account),
+        l1_rpc_url,
+    )
+    .await
+    {
+        EmitMetadata::Ready(bytes) | EmitMetadata::Recovered(bytes) => bytes,
+        EmitMetadata::Unrecoverable => Vec::new(),
+    };
+
+    Ok(FaucetEntry {
+        faucet_id,
+        origin_address: conversion.origin_address,
+        origin_network: conversion.origin_network,
+        symbol,
+        origin_decimals,
+        miden_decimals,
+        scale,
+        metadata,
+    })
 }
 
 /// Register a faucet in the bridge's faucet and token registries via ConfigAggBridgeNote.

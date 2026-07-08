@@ -122,6 +122,10 @@ url = { features = ["serde"], version = "2.5" }
 # postgres (optional)
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
+# Streaming cursor for eth_getLogs (Cantina #12): PgStore::get_logs streams the
+# superset RowStream via query_raw + TryStreamExt rather than buffering LIMIT'd
+# pages, so it returns ALL matches with bounded memory. Only used on the pg path.
+futures-util = { version = "0.3", optional = true }
 
 # Protocol 0.15.x migration. The conversion metadata moved off the faucet onto
 # the bridge's `faucet_metadata_map` (CONFIG_AGG_BRIDGE note), `AccountStorageMode`
@@ -161,7 +165,7 @@ miden-client-sqlite-store = { version = "=0.15.0" }
 
 [features]
 default = []
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 
 # NOTE (0.15.3): the previous `[patch.crates-io] miden-agglayer = vendor-...`
 # override carried a MASM patch setting MIDEN_NETWORK_ID = 1 (upstream baked 77

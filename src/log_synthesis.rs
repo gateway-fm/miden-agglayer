@@ -226,6 +226,60 @@ impl LogFilter {
 
         true
     }
+
+    // ── SAFE-SUPERSET pushdown helpers (Cantina #12) ─────────────────────
+    //
+    // `get_logs` no longer applies a row cap to the raw block-range set. It
+    // pushes a PROVABLE SUPERSET of the address + topic0 predicates into the
+    // store query, reads the whole superset, then runs the UNCHANGED `matches()`
+    // above as the exact final filter. These two helpers derive the exact
+    // lowercase alternative sets `matches()` compares against, so the pushed-down
+    // SQL/in-memory predicate can never be narrower than the Rust filter.
+    //
+    // SUPERSET SAFETY PROOF (every input for which `matches()==true` satisfies
+    // the pushed-down predicate):
+    //   * Block: if `block_hash` is set, `matches()` requires
+    //     `'0x'||hex(log.block_hash) == block_hash` (case-insensitive) and
+    //     IGNORES the range, so the superset keys on the block_hash string only;
+    //     otherwise it requires `from <= block_number <= to`, matched verbatim.
+    //   * Address (when present): `matches()` requires `matches_addr` OR MA#26
+    //     passthrough. `matches_addr` ⟹ `lower(address) ∈ address_alternatives`.
+    //     Passthrough ⟹ `log.topics[0] == UHCV` ⟹ `lower(topics[1]) == UHCV`.
+    //     So `(lower(address) = ANY(alts) OR lower(topics[1]) = UHCV)` holds —
+    //     a superset of passthrough regardless of the query's topic0 filter.
+    //   * topic0 (when constrained): `matches()` requires
+    //     `lower(log.topics[0]) ∈ topic0_alternatives`, i.e.
+    //     `lower(topics[1]) = ANY(alts)`. This is SAFE combined with the address
+    //     clause: passthrough is only possible when the query's topic0 filter
+    //     INCLUDES UHCV (`query_includes_topic`), so when a passthrough row can
+    //     match, UHCV ∈ topic0_alternatives and the row survives the topic0
+    //     clause; when passthrough cannot match, the extra `OR topics[1]=UHCV`
+    //     rows are rejected by `matches()` anyway.
+    // Positions 1..3 are deliberately NOT pushed down — left to `matches()`,
+    // cheap on the reduced set. When in doubt we push LESS (broader superset).
+
+    /// Lowercased address alternatives for the SAFE-SUPERSET address predicate —
+    /// the exact set `matches()` compares `log.address.to_lowercase()` against.
+    /// `None` = no address filter (⇒ no address predicate is pushed down).
+    pub fn address_alternatives_lower(&self) -> Option<Vec<String>> {
+        self.address.as_ref().map(|a| match a {
+            AddressFilter::Single(s) => vec![s.to_lowercase()],
+            AddressFilter::Multiple(v) => v.iter().map(|s| s.to_lowercase()).collect(),
+        })
+    }
+
+    /// Lowercased topic0 alternatives IFF topic position 0 is constrained
+    /// (`Some`) — the exact set `matches()` compares `log.topics[0].to_lowercase()`
+    /// against at position 0. `None` = topic0 is a wildcard, or there is no
+    /// topics array ⇒ no topic0 predicate is pushed down. (Postgres arrays are
+    /// 1-indexed, so topic0 is `topics[1]` in SQL.)
+    pub fn topic0_alternatives_lower(&self) -> Option<Vec<String>> {
+        match self.topics.as_ref()?.first()? {
+            Some(TopicFilter::Single(s)) => Some(vec![s.to_lowercase()]),
+            Some(TopicFilter::Multiple(v)) => Some(v.iter().map(|s| s.to_lowercase()).collect()),
+            None => None,
+        }
+    }
 }
 
 /// Metadata stored for each seen GER (used by zkevm_getExitRootsByGER)
@@ -301,6 +355,346 @@ pub fn encode_claim_event_data_u64(
         destination_address,
         &amount_be,
     )
+}
+
+/// Cantina #12 equivalence guardrail — shared fixtures.
+///
+/// A single, deterministic source of truth for the property-based test that
+/// proves `store.get_logs(filter) == { log : matches(log) }` for BOTH stores.
+/// `matches()` (unchanged) is the ORACLE; the stores must reproduce it exactly
+/// — InMemoryStore by construction, PgStore via the SAFE SUPERSET SQL + stream.
+///
+/// `Scenario::new(base, run)` offsets every block by `base` and salts every
+/// block_hash with `run`, so the SAME population can be inserted into a shared
+/// Postgres DB (each test run isolated to its own block window / hash salt)
+/// without colliding with other suites. InMemoryStore uses `base = 0`.
+#[cfg(test)]
+pub mod equiv_fixtures {
+    use super::*;
+
+    /// Mixed-CASE bridge address — exercises case-insensitive address matching.
+    pub const ADDR_BRIDGE: &str = "0x000000000000000000000000000000000000bEE5";
+    /// Mixed-case non-bridge address (the passthrough log lives here).
+    pub const ADDR_OTHER: &str = "0x000000000000000000000000000000000000DeAd";
+    /// Indexed-arg topics (topic positions 1+).
+    pub const ARG_A: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+    pub const ARG_B: &str = "0x00000000000000000000000000000000000000000000000000000000000000b2";
+
+    /// Non-matching filler logs planted in the dense block (case a). > 1000, so
+    /// the ORIGINAL row cap would have ERRORED this range; the redesign returns
+    /// exactly the sparse matches.
+    pub const DENSE_FILLER: usize = 1_200;
+    /// Matching bridge+claim logs in the dense block (the sparse answer).
+    pub const SPARSE_MATCH_COUNT: usize = 3;
+
+    fn block_hash_bytes(run: u64, variant: u8) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[0..8].copy_from_slice(&run.to_be_bytes());
+        h[8] = variant;
+        h
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+    }
+
+    pub struct Scenario {
+        pub logs: Vec<SyntheticLog>,
+        pub current_block: u64,
+        pub filters: Vec<(&'static str, LogFilter)>,
+        pub tx_passthrough: String,
+        pub tx_positional_short: String,
+        pub tx_positional_long: String,
+        pub sparse_match_txs: Vec<String>,
+    }
+
+    impl Scenario {
+        pub fn new(base: u64, run: u64) -> Self {
+            let mk = |tx: String, address: &str, topics: Vec<String>, block: u64, variant: u8| {
+                SyntheticLog {
+                    address: address.to_string(),
+                    topics,
+                    data: "0x".to_string(),
+                    block_number: block,
+                    block_hash: block_hash_bytes(run, variant),
+                    transaction_hash: tx,
+                    transaction_index: 0,
+                    log_index: 0,
+                    removed: false,
+                }
+            };
+
+            let dense_block = base + 5_000;
+            let current_block = base + 10_000;
+            let mut logs = Vec::new();
+
+            // (b) MA#26 passthrough target: a UHCV log at a NON-bridge address.
+            let tx_passthrough = format!("0x{run:x}_passthrough");
+            logs.push(mk(
+                tx_passthrough.clone(),
+                ADDR_OTHER,
+                vec![UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(), ARG_A.to_string()],
+                base + 42,
+                1,
+            ));
+
+            // (c) positional: a short-topics (len 2) log a position-2 constraint
+            //     must REJECT, and a len-3 log the same filter must ACCEPT.
+            let tx_positional_short = format!("0x{run:x}_pos_short");
+            logs.push(mk(
+                tx_positional_short.clone(),
+                ADDR_BRIDGE,
+                vec![CLAIM_EVENT_TOPIC.to_string(), ARG_A.to_string()],
+                base + 60,
+                1,
+            ));
+            let tx_positional_long = format!("0x{run:x}_pos_long");
+            logs.push(mk(
+                tx_positional_long.clone(),
+                ADDR_BRIDGE,
+                vec![
+                    CLAIM_EVENT_TOPIC.to_string(),
+                    ARG_A.to_string(),
+                    ARG_B.to_string(),
+                ],
+                base + 61,
+                1,
+            ));
+
+            // (a) sparse-in-dense: DENSE_FILLER non-matching + SPARSE_MATCH_COUNT
+            //     matching logs in ONE block. Old raw-row cap would error here.
+            for i in 0..DENSE_FILLER {
+                logs.push(mk(
+                    format!("0x{run:x}_dense_{i}"),
+                    ADDR_OTHER,
+                    vec![CLAIM_EVENT_TOPIC.to_string()],
+                    dense_block,
+                    2,
+                ));
+            }
+            let mut sparse_match_txs = Vec::new();
+            for i in 0..SPARSE_MATCH_COUNT {
+                let tx = format!("0x{run:x}_sparse_{i}");
+                sparse_match_txs.push(tx.clone());
+                logs.push(mk(
+                    tx,
+                    ADDR_BRIDGE,
+                    vec![CLAIM_EVENT_TOPIC.to_string(), ARG_A.to_string()],
+                    dense_block,
+                    2,
+                ));
+            }
+
+            // Diverse randomised bulk: varied addresses (incl. UPPERCASE bridge,
+            // GER addr), topic arrays of length 0..=3 (incl. UHCV/CLAIM/BRIDGE as
+            // topic0), varied blocks and block-hash variants.
+            let bridge_upper = ADDR_BRIDGE.to_uppercase();
+            let addrs: [&str; 6] = [
+                ADDR_BRIDGE,
+                &bridge_upper,
+                ADDR_OTHER,
+                L2_GLOBAL_EXIT_ROOT_ADDRESS,
+                "0xCAFE",
+                "0xcafe",
+            ];
+            let topic0s = [
+                UPDATE_HASH_CHAIN_VALUE_TOPIC,
+                CLAIM_EVENT_TOPIC,
+                BRIDGE_EVENT_TOPIC,
+                ARG_A,
+            ];
+            let mut rng = Lcg(0x1234_5678 ^ run);
+            for i in 0..300 {
+                let addr = addrs[(rng.next() % addrs.len() as u64) as usize];
+                let tlen = (rng.next() % 4) as usize; // 0..=3
+                let mut topics = Vec::new();
+                if tlen >= 1 {
+                    topics.push(topic0s[(rng.next() % topic0s.len() as u64) as usize].to_string());
+                }
+                for _ in 1..tlen {
+                    topics.push(
+                        if rng.next().is_multiple_of(2) {
+                            ARG_A
+                        } else {
+                            ARG_B
+                        }
+                        .to_string(),
+                    );
+                }
+                let block = base + (rng.next() % 6_001); // base..=base+6000
+                let variant = (rng.next() % 4) as u8;
+                logs.push(mk(
+                    format!("0x{run:x}_rand_{i}"),
+                    addr,
+                    topics,
+                    block,
+                    variant,
+                ));
+            }
+
+            // ── Filters (name, filter). Ranges are bounded to THIS run's window
+            //    [base, base+7000] so a shared Postgres DB stays isolated. The
+            //    block_hash filter ignores range, so it isolates via the salt. ──
+            let wfrom = format!("0x{base:x}");
+            let wto = format!("0x{:x}", base + 7_000);
+            let win = |f: LogFilter| LogFilter {
+                from_block: Some(wfrom.clone()),
+                to_block: Some(wto.clone()),
+                ..f
+            };
+            let addr_bridge = AddressFilter::Single(ADDR_BRIDGE.to_string());
+            let t0 = |t: &str| Some(vec![Some(TopicFilter::Single(t.to_string()))]);
+
+            let filters: Vec<(&'static str, LogFilter)> = vec![
+                ("all_in_window", win(LogFilter::default())),
+                (
+                    "addr_bridge_single",
+                    win(LogFilter {
+                        address: Some(addr_bridge.clone()),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "addr_bridge_upper_single",
+                    win(LogFilter {
+                        address: Some(AddressFilter::Single(bridge_upper.clone())),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "addr_multiple",
+                    win(LogFilter {
+                        address: Some(AddressFilter::Multiple(vec![
+                            ADDR_BRIDGE.to_string(),
+                            ADDR_OTHER.to_string(),
+                        ])),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "topic0_claim_no_addr",
+                    win(LogFilter {
+                        topics: t0(CLAIM_EVENT_TOPIC),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "topic0_multi",
+                    win(LogFilter {
+                        topics: Some(vec![Some(TopicFilter::Multiple(vec![
+                            CLAIM_EVENT_TOPIC.to_string(),
+                            BRIDGE_EVENT_TOPIC.to_string(),
+                        ]))]),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "topic0_wildcard_topic1_arg",
+                    win(LogFilter {
+                        topics: Some(vec![None, Some(TopicFilter::Single(ARG_A.to_string()))]),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "sparse_in_dense",
+                    LogFilter {
+                        from_block: Some(format!("0x{:x}", dense_block - 10)),
+                        to_block: Some(format!("0x{:x}", dense_block + 10)),
+                        address: Some(addr_bridge.clone()),
+                        topics: t0(CLAIM_EVENT_TOPIC),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "passthrough_include",
+                    win(LogFilter {
+                        address: Some(addr_bridge.clone()),
+                        topics: t0(UPDATE_HASH_CHAIN_VALUE_TOPIC),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "passthrough_exclude_no_topic",
+                    win(LogFilter {
+                        address: Some(addr_bridge.clone()),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "passthrough_exclude_other_topic",
+                    win(LogFilter {
+                        address: Some(addr_bridge.clone()),
+                        topics: t0(CLAIM_EVENT_TOPIC),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "positional_longer_than_log",
+                    win(LogFilter {
+                        address: Some(addr_bridge.clone()),
+                        topics: Some(vec![
+                            Some(TopicFilter::Multiple(vec![
+                                CLAIM_EVENT_TOPIC.to_string(),
+                                BRIDGE_EVENT_TOPIC.to_string(),
+                            ])),
+                            None,
+                            Some(TopicFilter::Single(ARG_B.to_string())),
+                        ]),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "block_hash_variant1",
+                    LogFilter {
+                        block_hash: Some(format!("0x{}", hex::encode(block_hash_bytes(run, 1)))),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "empty_addr",
+                    win(LogFilter {
+                        address: Some(AddressFilter::Single(format!("0x{run:x}_no_such_addr"))),
+                        ..Default::default()
+                    }),
+                ),
+            ];
+
+            Scenario {
+                logs,
+                current_block,
+                filters,
+                tx_passthrough,
+                tx_positional_short,
+                tx_positional_long,
+                sparse_match_txs,
+            }
+        }
+
+        /// The ORACLE: the pure-Rust `matches()` applied to the whole population.
+        pub fn reference_matches(&self, f: &LogFilter) -> Vec<SyntheticLog> {
+            self.logs
+                .iter()
+                .filter(|l| f.matches(l, self.current_block))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// Order-independent comparison key. Stores reassign `log_index` on insert,
+    /// so we key on `transaction_hash` (unique per population log, preserved by
+    /// `add_log`, and irrelevant to `matches()`).
+    pub fn sorted_txs(logs: &[SyntheticLog]) -> Vec<String> {
+        let mut v: Vec<String> = logs.iter().map(|l| l.transaction_hash.clone()).collect();
+        v.sort();
+        v
+    }
 }
 
 #[cfg(test)]

@@ -23,6 +23,64 @@ use miden_protocol::account::AccountId;
 use miden_protocol::transaction::TransactionId;
 use std::sync::Arc;
 
+// ── eth_getLogs safety ceiling (Cantina #12) ─────────────────────────
+
+/// OOM backstop on the number of **matching** logs a single `eth_getLogs`
+/// query may return. This is NOT a normal-operation cap — under any realistic
+/// query the store returns the COMPLETE matching set.
+///
+/// Cantina finding #12 (original): `get_logs` issued `... LIMIT 1000` and
+/// returned the truncated slice with no signal. Worse, the `LIMIT` was applied
+/// to the UNFILTERED block-range set — address/topic matching happened in Rust
+/// AFTER the fetch — so a range holding 5000 logs of which only 3 matched the
+/// queried address would error/truncate even though the true answer was 3 rows.
+/// A restore replaying a dense window handed a well-behaved consumer
+/// (aggkit/aggsender) a *successful* response missing the tail, so it ingested
+/// `0..999`, silently skipped `1000`, and later rejected `1001` as out of
+/// sequence — permanently stalling withdrawal / GER sync.
+///
+/// Redesign (this change): the address/topic0 filter is pushed into a SAFE
+/// SUPERSET SQL `WHERE` (see `PgStore::get_logs`), the superset is read in FULL
+/// (streaming cursor on pg, whole-range scan in memory), and the UNCHANGED
+/// `LogFilter::matches` runs as the exact final filter. There is no
+/// normal-operation row cap: a sparse match in a dense range returns exactly
+/// the matches. The only remaining limit is this generous ceiling on the
+/// **post-`matches()`** count — a genuine "this query matched too much"
+/// signal (Geth/Alchemy/Infura convention) that guards against unbounded
+/// memory and, being shaped as [`getlogs_row_cap_error`], lets aggkit re-chunk.
+pub const GETLOGS_SAFETY_CEILING: usize = 500_000;
+
+/// Build the canonical over-ceiling error for a `[from, to]` block range whose
+/// **matching** `synthetic_logs` count exceeds [`GETLOGS_SAFETY_CEILING`].
+///
+/// The message is deliberately shaped as `block range too large, max range: N`
+/// so aggkit/aggsender's `ParseMaxRangeFromError`
+/// (`aggkit/common/errors.go` regex `block range too large, max range:\s*(\d+)`)
+/// extracts `N` and re-chunks the request — the SAME reactive-chunking path the
+/// block-span cap (`MAX_GETLOGS_BLOCK_RANGE`, PRST-4030/4055) already relies on.
+/// Both the bridge reader (`bridgesync/agglayer_bridge_l2_reader.go`) and the
+/// GER reader (`l2gersync/l2_evm_ger_reader.go`) grep the error string only —
+/// they do not inspect the JSON-RPC error code — so routing this through
+/// `store_error` (InternalError) is fine as long as the substring survives
+/// scrubbing, which it does (no path/URL/ALL_CAPS token in the message).
+///
+/// `N` is HALF the queried span (min 1) so the hint is strictly smaller than the
+/// current window and the client provably narrows on each retry. aggkit's
+/// `ChunkedRangeQuery` recurses per chunk, so a still-too-dense sub-window shrinks
+/// again — convergence is guaranteed because PR #94's 1:1 Miden→block projection
+/// puts each event in its own block, so no single block approaches the cap.
+/// (The one unreachable degenerate case — a single block matching >500k logs —
+/// cannot be narrowed by block range; it is out of reach post-#94 and noted here
+/// honestly.)
+pub fn getlogs_row_cap_error(from: u64, to: u64) -> anyhow::Error {
+    let span = to.saturating_sub(from).saturating_add(1);
+    let suggested = (span / 2).max(1);
+    anyhow::anyhow!(
+        "eth_getLogs block range too large, max range: {suggested} — range [{from}, {to}] \
+         matched more than {GETLOGS_SAFETY_CEILING} logs; retry with a smaller block range"
+    )
+}
+
 // ── Types ────────────────────────────────────────────────────────────
 
 /// Faucet registry entry — metadata for a bridged token's Miden faucet.

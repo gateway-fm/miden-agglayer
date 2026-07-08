@@ -293,6 +293,14 @@ e2e-security: e2e-up ## Spin up stack + run security E2E tests
 e2e-fuzz: e2e-up ## Spin up stack + run bridge fuzz/stress tests
 	$(COMPOSE_ENV) ./scripts/e2e-fuzz-bridge.sh
 
+.PHONY: e2e-cantina12-getlogs-returns-all
+e2e-cantina12-getlogs-returns-all: e2e-up ## Spin up stack + assert eth_getLogs returns ALL matches, never truncates (Cantina #12)
+	$(COMPOSE_ENV) ./scripts/e2e-cantina12-getlogs-returns-all.sh
+
+.PHONY: e2e-cantina6-faucet-identity-restore
+e2e-cantina6-faucet-identity-restore: e2e-up ## Spin up stack + assert --restore rebuilds a lost non-ETH faucet identity row (Cantina #6)
+	$(COMPOSE_ENV) ./scripts/e2e-cantina6-faucet-identity-restore.sh
+
 .PHONY: e2e-rd913-restart-burn-collision
 e2e-rd913-restart-burn-collision: e2e-up ## Spin up stack + verify monitor state survives proxy restart (RD-913)
 	$(COMPOSE_ENV) ./scripts/e2e-rd913-restart-burn-collision.sh
