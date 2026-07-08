@@ -24,14 +24,18 @@
 # Requires the full E2E stack up (`make e2e-up`).
 set -euo pipefail
 
-BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"
+# These are JSON-RPC methods (zkevm_getLatestGlobalExitRoot, eth_getLogs) served
+# by the miden-agglayer proxy on :8546 — NOT the bridge-service REST API on
+# :18080 (which 404s all JSON-RPC, aborting the suite under set -e). Use the
+# same L2_RPC endpoint the other e2e scripts use.
+L2_RPC="${L2_RPC:-http://localhost:8546}"
 
 log() { echo "[e2e-ger-atomic] $*"; }
 fail() { echo "[e2e-ger-atomic] FAIL: $*" >&2; exit 1; }
 
 log "Phase A — drive a GER injection + capture chain state"
 chain_before=$(
-    curl -sf "$BRIDGE_SERVICE_URL" -H 'Content-Type: application/json' \
+    curl -sf "$L2_RPC" -H 'Content-Type: application/json' \
         -d '{"jsonrpc":"2.0","id":1,"method":"zkevm_getLatestGlobalExitRoot","params":[]}' \
         | jq -r '.result'
 )
@@ -44,7 +48,7 @@ log "hash_chain_value (before retry): $chain_before"
 UPDATE_HASH_TOPIC="0x65d3bf36615f1f02a134d12dfa9ea6b1d4a52386e825973cd27ddb70895c2319"
 log "Querying UpdateHashChainValue log count..."
 logs_before=$(
-    curl -sf "$BRIDGE_SERVICE_URL" -H 'Content-Type: application/json' \
+    curl -sf "$L2_RPC" -H 'Content-Type: application/json' \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getLogs\",\"params\":[{\"fromBlock\":\"earliest\",\"toBlock\":\"latest\",\"topics\":[\"$UPDATE_HASH_TOPIC\"]}]}" \
         | jq '.result | length'
 )
@@ -61,12 +65,12 @@ docker compose -f docker-compose.e2e.yml restart miden-agglayer >/dev/null 2>&1 
 sleep 20  # let the projector tick re-run + re-project any in-flight GER
 
 chain_after=$(
-    curl -sf "$BRIDGE_SERVICE_URL" -H 'Content-Type: application/json' \
+    curl -sf "$L2_RPC" -H 'Content-Type: application/json' \
         -d '{"jsonrpc":"2.0","id":1,"method":"zkevm_getLatestGlobalExitRoot","params":[]}' \
         | jq -r '.result'
 )
 logs_after=$(
-    curl -sf "$BRIDGE_SERVICE_URL" -H 'Content-Type: application/json' \
+    curl -sf "$L2_RPC" -H 'Content-Type: application/json' \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getLogs\",\"params\":[{\"fromBlock\":\"earliest\",\"toBlock\":\"latest\",\"topics\":[\"$UPDATE_HASH_TOPIC\"]}]}" \
         | jq '.result | length'
 )
