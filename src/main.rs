@@ -1057,6 +1057,28 @@ mod hardening_tests {
         assert!(check_hardening_invariants(&c).is_ok());
     }
 
+    /// Audit C2 — `--insecure-allow-any-signer` (the legacy open-mode opt-in)
+    /// is refused under `--require-hardening`. Starting from the all-set config
+    /// that otherwise passes, flipping only the insecure opt-in must trip the
+    /// gate with exactly one reason naming the flag.
+    #[test]
+    fn hardening_refuses_insecure_allow_any_signer() {
+        let mut c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        c.insecure_allow_any_signer = true;
+        let reasons = check_hardening_invariants(&c).unwrap_err();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "only the insecure opt-in should trip the gate: {reasons:?}"
+        );
+        assert!(reasons[0].contains("--insecure-allow-any-signer"));
+    }
+
     /// When hardening is enabled and the remote prover is unset, the gate
     /// must reject — local proving is the documented bali OOM cause.
     #[test]
