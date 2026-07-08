@@ -30,24 +30,32 @@
 set -euo pipefail
 set -o pipefail
 
-BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"
+# The proxy's synthetic eth-JSON-RPC (serves eth_getLogs over synthetic_logs);
+# 18080 is the aggkit bridge-service REST API and does NOT speak eth_getLogs.
+L2_RPC_URL="${L2_RPC_URL:-http://localhost:8546}"
 L1_RPC_URL="${L1_RPC_URL:-http://localhost:8545}"
+
+# keccak256("BridgeEvent(uint8,uint32,address,uint32,address,uint256,bytes,uint32)")
+# — must match src/log_synthesis.rs::BRIDGE_EVENT_TOPIC.
+BRIDGE_EVENT_TOPIC="0x501781209a1f8899323b96b4ef08b168df93e0a90c673d1e4cce39366cb62f9b"
 
 log() { echo "[e2e-b2agg-atomic] $*"; }
 fail() { echo "[e2e-b2agg-atomic] FAIL: $*" >&2; exit 1; }
+
+# Count BridgeEvent logs the proxy currently serves over eth_getLogs.
+bridge_event_count() {
+  curl -s "$L2_RPC_URL" -X POST -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getLogs\",\"params\":[{\"fromBlock\":\"0x0\",\"toBlock\":\"latest\",\"topics\":[\"$BRIDGE_EVENT_TOPIC\"]}]}" \
+    | jq '.result | length' 2>/dev/null || echo 0
+}
 
 log "Phase A — L2→L1 bridge-out + capture deposit_count"
 # Fund + bridge out (reuses the canonical harness).
 "$(dirname "$0")/e2e-l1-to-l2.sh" >/dev/null
 "$(dirname "$0")/e2e-l2-to-l1.sh" >/dev/null
 
-# Find the most recent BridgeEvent and read its depositCount field.
-bridge_event_sig="0x$(node -e 'process.stdout.write(require("./scripts/lib_topics").BRIDGE_EVENT)')" 2>/dev/null || bridge_event_sig="0x4e13b1c0d1f3e2a8b9c4d5e6f7081920a1b2c3d4e5f60718293a4b5c6d7e8f90"
-
 log "Querying eth_getLogs for BridgeEvent..."
-events_before=$(curl -sf "$BRIDGE_SERVICE_URL" -H 'Content-Type: application/json' \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getLogs\",\"params\":[{\"fromBlock\":\"earliest\",\"toBlock\":\"latest\",\"topics\":[\"$bridge_event_sig\"]}]}" \
-  | jq '.result | length')
+events_before=$(bridge_event_count)
 log "BridgeEvents observed: $events_before"
 [ "$events_before" -ge 1 ] || fail "expected >= 1 BridgeEvent after L2→L1"
 
@@ -63,9 +71,7 @@ docker compose -f docker-compose.e2e.yml restart miden-agglayer >/dev/null 2>&1 
 sleep 15  # let the projector tick re-run + re-project any in-flight note
 
 log "Re-querying BridgeEvent count (must be unchanged)..."
-events_after=$(curl -sf "$BRIDGE_SERVICE_URL" -H 'Content-Type: application/json' \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getLogs\",\"params\":[{\"fromBlock\":\"earliest\",\"toBlock\":\"latest\",\"topics\":[\"$bridge_event_sig\"]}]}" \
-  | jq '.result | length')
+events_after=$(bridge_event_count)
 
 leaves_after=$(cast call --rpc-url "$L1_RPC_URL" "$(cat .miden-agglayer-data/bridge_address.txt 2>/dev/null || echo 0x0)" "letNumLeaves()(uint256)" 2>/dev/null || echo "unknown")
 
