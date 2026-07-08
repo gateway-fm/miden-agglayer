@@ -536,11 +536,20 @@ pub trait Store: Send + Sync + 'static {
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
     /// Mark note as processed, return the deposit count assigned to it.
     ///
-    /// MUST be idempotent: re-marking an already-processed note reuses the
-    /// originally-assigned `deposit_count` rather than allocating a new one.
-    /// Non-idempotent implementations create permanent gaps in the
-    /// `deposit_count` sequence on retry, desynchronising leaf indices from
-    /// the on-chain Local Exit Tree (Cantina MA#15 / audit H3).
+    /// Idempotency is NOT uniform across implementations, so callers on the
+    /// retry path MUST NOT lean on this primitive alone — use
+    /// `commit_b2agg_event_atomic`, which guarantees reuse-on-retry on every
+    /// backend. Specifically:
+    ///   - `InMemoryStore` IS idempotent: re-marking an already-processed note
+    ///     reuses the originally-assigned `deposit_count`.
+    ///   - `PgStore` is NOT: this method unconditionally bumps `deposit_counter`
+    ///     and inserts a row, so a second call for the same `note_id` errors on
+    ///     the primary key rather than reusing. The idempotent reuse-or-allocate
+    ///     lives in `commit_b2agg_event_atomic`'s single txn instead.
+    /// The reason idempotent reuse matters at all: allocating a fresh
+    /// `deposit_count` on retry creates a permanent gap in the sequence,
+    /// desynchronising leaf indices from the on-chain Local Exit Tree
+    /// (Cantina MA#15 / audit H3).
     async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
     /// Roll back a processed-note marker when later persistence fails.
     async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;

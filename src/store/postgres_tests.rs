@@ -590,6 +590,88 @@ async fn test_pgstore_commit_b2agg_event_atomic_idempotent() {
     );
 }
 
+/// Audit H1/H3 — PG-layer log-once idempotency. Calling
+/// `commit_b2agg_event_atomic` TWICE with the same deterministic `tx_hash`
+/// (the projector re-derives it from the note, so a re-projection produces the
+/// identical hash) must emit the synthetic BridgeEvent EXACTLY ONCE and leave
+/// store state unchanged on the second call. Complements
+/// `test_pgstore_commit_b2agg_event_atomic_idempotent`, which covers the
+/// deposit_count reuse; this asserts the log-count invariant directly via
+/// `get_logs_for_tx`. Only the InMemoryStore equivalent existed before. DB-gated
+/// (skipped without `DATABASE_URL`).
+#[tokio::test]
+async fn test_pgstore_commit_b2agg_event_atomic_emits_log_once() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let note_id = format!("b2agg_logonce_test_{now_ns}");
+    let block = (now_ns % 1_000_000) as u64 + 30_000;
+    let tx_hash = format!("0xb2agg_logonce_{now_ns}");
+
+    // First commit emits the BridgeEvent.
+    store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let logs_after_first = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after_first.len(),
+        1,
+        "first commit must emit exactly one BridgeEvent"
+    );
+    let dc_after_first = store.get_deposit_count().await.unwrap();
+
+    // Retry with the SAME tx_hash — must be a no-op for the log and the counter.
+    store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let logs_after_retry = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after_retry.len(),
+        1,
+        "retry must NOT emit a duplicate BridgeEvent — log emitted exactly once"
+    );
+    assert_eq!(
+        store.get_deposit_count().await.unwrap(),
+        dc_after_first,
+        "retry must not advance the deposit_counter — store state unchanged"
+    );
+}
+
 // ── RD-913 monitor trackers ─────────────────────────────────
 
 /// PgStore round-trip for monitor_burn_serials. INSERT … ON CONFLICT

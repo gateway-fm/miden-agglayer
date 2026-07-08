@@ -79,6 +79,15 @@ log "BridgeEvents after retry: $events_after (was $events_before)"
 log "let_num_leaves after retry: $leaves_after (was $leaves_before)"
 
 [ "$events_after" -eq "$events_before" ] || fail "duplicate BridgeEvent emitted on retry (H1 regression)"
-[ "$leaves_after" = "$leaves_after" ] || true  # on-chain leaf count is informational
+# Idempotent-retry invariant (H3): the restart re-projects the SAME note, so the
+# on-chain Local Exit Tree must not gain a leaf — the leaf count is unchanged
+# across the retry. Only assert when both reads returned a real value; an
+# "unknown" means the on-chain LET was unreadable in this environment (no
+# bridge_address / no cast), which is informational, not a test failure.
+if [ "$leaves_before" != "unknown" ] && [ "$leaves_after" != "unknown" ]; then
+  [ "$leaves_after" = "$leaves_before" ] || fail "on-chain let_num_leaves advanced on idempotent retry ($leaves_before -> $leaves_after) — a second leaf was added (H1/H3 regression)"
+else
+  log "on-chain let_num_leaves unavailable (before=$leaves_before after=$leaves_after) — skipping leaf-count assertion"
+fi
 
 log "PASS — B2AGG atomic commit survived the restart with no duplicate event"

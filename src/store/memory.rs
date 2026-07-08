@@ -703,10 +703,23 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    /// Atomic, idempotent B2AGG commit (audit H1/H3). Holds the
-    /// `processed_notes` + `deposit_counter` writes across the whole op so a
-    /// concurrent reader cannot observe a half-committed state, and reuses the
-    /// original `deposit_count` (no gap on retry).
+    /// Atomic, idempotent B2AGG commit (audit H1/H3). Reuses the original
+    /// `deposit_count` (no gap on retry) and emits the BridgeEvent at most once.
+    ///
+    /// Locking note: the `processed_notes` + `deposit_counter` write guards are
+    /// held ONLY for the step-1 allocation block below, then dropped at the end
+    /// of that scope; step 2 (the already-emitted check + `add_bridge_event`)
+    /// runs without them held. That is sound because of the SINGLE-WRITER SERIAL
+    /// INVARIANT: `commit_b2agg_event_atomic` is called ONLY from the projector
+    /// path, which is strictly serial. The projector `tick()` borrows
+    /// `&mut MidenClientLib` (one non-reentrant client) and commits one block at
+    /// a time, write-before-advance:
+    ///     while cursor < tip { project_block_notes(next).await?; set_projector_cursor(next).await? }
+    /// so at most one commit is ever in flight for a given store. The
+    /// `RECONCILE_CONCURRENCY` fan-out is FETCH-only (`sync_note_ids`), never the
+    /// commit. No concurrent writer can therefore slip between the read and the
+    /// insert here — the "TOCTOU" a reviewer might flag is not reachable, which
+    /// is why no coarser lock (or tx_hash UNIQUE constraint) is needed.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
         &self,
@@ -741,7 +754,9 @@ impl Store for InMemoryStore {
         //    tx_hash deterministically from note_id, so a second emit would
         //    only duplicate the log. The InMemoryStore has no tx_hash unique
         //    constraint, so guard by checking the existing logs_by_block entry
-        //    for the same tx_hash before emitting.
+        //    for the same tx_hash before emitting. This read-then-insert is race
+        //    free under the single-writer serial invariant documented above (the
+        //    projector is the only, strictly-serial caller).
         let already_emitted = self
             .logs_by_block
             .read()

@@ -1346,6 +1346,24 @@ impl Store for PgStore {
     ///      a log with this deterministic tx_hash already exists)
     /// A crash at any point rolls the whole txn back, so the note can never be
     /// left marked-processed without a matching BridgeEvent.
+    ///
+    /// SINGLE-WRITER SERIAL INVARIANT — why the `SELECT 1 FROM synthetic_logs`
+    /// read-then-INSERT in step 2 (and the analogous read-then-INSERT in step 1)
+    /// is NOT a reachable TOCTOU race, and why no row lock / UNIQUE constraint /
+    /// `ON CONFLICT` is required:
+    ///
+    /// This method is called ONLY from the projector path, which is strictly
+    /// serial. The projector `tick()` borrows `&mut MidenClientLib` — one
+    /// non-reentrant client instance — and drives the commit loop one block at a
+    /// time, writing before advancing the cursor:
+    ///     while cursor < tip { project_block_notes(next).await?; set_projector_cursor(next).await? }
+    /// There is exactly one in-flight `commit_b2agg_event_atomic` at any moment
+    /// for a given store, so no concurrent writer can slip an insert between this
+    /// transaction's SELECT and its INSERT. The `RECONCILE_CONCURRENCY` fan-out
+    /// is FETCH-only (parallel `sync_note_ids`), never the commit — it never
+    /// touches `service_state`, `bridge_out_processed`, or `synthetic_logs`.
+    /// A Copilot reviewer flagged the read/insert gap as a TOCTOU; it reads as
+    /// intentional under this single-writer serial invariant.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
         &self,
