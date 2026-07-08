@@ -749,11 +749,57 @@ impl Store for InMemoryStore {
 
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
         let mut faucets = self.faucets.write();
+        // Idempotent by faucet_id: the same faucet re-registering (e.g. startup
+        // re-init) refreshes its mutable fields. Mirrors PgStore, whose faucet_id
+        // primary key + Cantina #13 metadata guard impose the same two rules:
+        //   (a) the origin is IMMUTABLE for a given faucet_id — PgStore would hit
+        //       a duplicate-key error on a re-register carrying a different
+        //       origin, so reject it here rather than silently rebinding;
+        //   (b) never clobber stored metadata with empty — a blank re-register
+        //       (`metadata = vec![]`) must not wipe good metadata persisted by an
+        //       earlier non-empty registration or the Layer-2 backfill.
         if let Some(existing) = faucets.iter_mut().find(|f| f.faucet_id == entry.faucet_id) {
-            *existing = entry;
-        } else {
-            faucets.push(entry);
+            if existing.origin_address != entry.origin_address
+                || existing.origin_network != entry.origin_network
+            {
+                anyhow::bail!(
+                    "register_faucet: faucet {} is already registered for origin \
+                     (network {}); refusing to rebind it to a different origin (network {})",
+                    entry.faucet_id,
+                    existing.origin_network,
+                    entry.origin_network,
+                );
+            }
+            existing.symbol = entry.symbol;
+            existing.origin_decimals = entry.origin_decimals;
+            existing.miden_decimals = entry.miden_decimals;
+            existing.scale = entry.scale;
+            // Cantina #13 — only overwrite when the new metadata is non-empty.
+            if !entry.metadata.is_empty() {
+                existing.metadata = entry.metadata;
+            }
+            return Ok(());
         }
+        // Finding #10 — converge on the (origin_address, origin_network) key.
+        // A *different* faucet already owning this origin route means a
+        // concurrent first-claim (or admin register) won the race; first-write
+        // wins so we do NOT strand a second faucet by pushing a colliding row.
+        // This mirrors `PgStore::register_faucet`'s
+        // `ON CONFLICT (origin_address, origin_network)` convergence and the
+        // real `idx_faucet_origin` unique index. Admin route *repair* uses the
+        // dedicated repair tooling instead.
+        if faucets.iter().any(|f| {
+            f.origin_address == entry.origin_address && f.origin_network == entry.origin_network
+        }) {
+            tracing::warn!(
+                origin_network = entry.origin_network,
+                new_faucet_id = %entry.faucet_id,
+                "finding #10: register_faucet origin already owned by another faucet; \
+                 keeping the existing route (first-write wins)"
+            );
+            return Ok(());
+        }
+        faucets.push(entry);
         Ok(())
     }
 
@@ -767,18 +813,6 @@ impl Store for InMemoryStore {
             .iter()
             .find(|f| f.origin_address == *origin_address && f.origin_network == origin_network)
             .cloned())
-    }
-
-    async fn find_faucets_by_origin_address(
-        &self,
-        origin_address: &[u8; 20],
-    ) -> anyhow::Result<Vec<FaucetEntry>> {
-        let faucets = self.faucets.read();
-        Ok(faucets
-            .iter()
-            .filter(|f| f.origin_address == *origin_address)
-            .cloned()
-            .collect())
     }
 
     async fn get_faucet_by_id(&self, faucet_id: AccountId) -> anyhow::Result<Option<FaucetEntry>> {
@@ -1499,24 +1533,25 @@ mod tests {
         assert_eq!(origin_amount, 1000);
     }
 
-    /// Cantina #1 — repro+regression. Two faucets registered for the same origin token
-    /// address under different `origin_network` values must both surface from the new
-    /// `find_faucets_by_origin_address` lookup so `find_or_create_faucet` can refuse a
-    /// colliding auto-create. Without this method, aggkit only had the
-    /// `(token, network)` pair lookup which always misses the existing entry under a
-    /// different network — letting auto-create silently overwrite the on-chain registry.
+    /// Finding #10 — repro+regression. A second `register_faucet` for an origin
+    /// already owned by a *different* faucet must CONVERGE (first-write wins)
+    /// rather than strand a second row. Pre-fix InMemoryStore silently pushed a
+    /// colliding row (split state, mirroring PgStore's unique-index error), so
+    /// the bridge could route by a faucet the local registry never resolved,
+    /// hiding later bridge-outs.
     #[tokio::test]
-    async fn cantina_1_find_faucets_by_origin_address_surfaces_cross_network_collision() {
+    async fn finding_10_register_faucet_converges_on_origin_collision() {
         let store = InMemoryStore::new();
-        let token_addr = [0xA0u8; 20]; // shared origin token address (e.g. CREATE2-cloned)
+        let origin = [0xC0u8; 20];
 
-        let faucet_n0 = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let faucet_n1 = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+        let faucet_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let faucet_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
+        // Worker A wins the race and registers first.
         store
             .register_faucet(FaucetEntry {
-                faucet_id: faucet_n0,
-                origin_address: token_addr,
+                faucet_id: faucet_a,
+                origin_address: origin,
                 origin_network: 0,
                 symbol: "TKN".into(),
                 origin_decimals: 18,
@@ -1526,11 +1561,14 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // Worker B loses: a DIFFERENT faucet for the SAME (origin, network).
+        // Post-fix this converges — no error, no second row.
         store
             .register_faucet(FaucetEntry {
-                faucet_id: faucet_n1,
-                origin_address: token_addr,
-                origin_network: 7,
+                faucet_id: faucet_b,
+                origin_address: origin,
+                origin_network: 0,
                 symbol: "TKN".into(),
                 origin_decimals: 18,
                 miden_decimals: 8,
@@ -1540,28 +1578,159 @@ mod tests {
             .await
             .unwrap();
 
-        // Per-pair lookup correctly returns each network's own entry.
-        let only_n0 = store.get_faucet_by_origin(&token_addr, 0).await.unwrap();
-        assert_eq!(only_n0.unwrap().origin_network, 0);
+        // Exactly one row survives — the first-writer's faucet.
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
+        let by_origin = store
+            .get_faucet_by_origin(&origin, 0)
+            .await
+            .unwrap()
+            .expect("origin route must resolve");
+        assert_eq!(by_origin.faucet_id, faucet_a, "first-write must win");
 
-        // The new method surfaces BOTH — this is what `find_or_create_faucet` uses to
-        // detect that a same-address-different-network entry already exists and refuse
-        // to auto-create a second one (which would silently overwrite the on-chain
-        // address-keyed registry, Cantina #1).
-        let all = store
-            .find_faucets_by_origin_address(&token_addr)
+        // The losing faucet is NOT stranded in the registry (it was never
+        // deployed on Miden in the real flow because the single-flight coordinator
+        // makes a concurrent first-claim an AWAITER that reuses faucet A instead of
+        // provisioning a second). resolve-by-id for the canonical faucet works; the
+        // loser resolves to nothing.
+        assert!(store.get_faucet_by_id(faucet_a).await.unwrap().is_some());
+        assert!(store.get_faucet_by_id(faucet_b).await.unwrap().is_none());
+
+        // Same faucet re-registering still refreshes its metadata (idempotent
+        // by faucet_id) — the convergence must not regress this.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id: faucet_a,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "WTKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
             .await
             .unwrap();
-        assert_eq!(all.len(), 2, "should surface every faucet for this token");
-        let networks: std::collections::BTreeSet<u32> =
-            all.iter().map(|f| f.origin_network).collect();
-        assert_eq!(networks, [0u32, 7].iter().copied().collect());
+        assert_eq!(
+            store
+                .get_faucet_by_id(faucet_a)
+                .await
+                .unwrap()
+                .unwrap()
+                .symbol,
+            "WTKN"
+        );
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
+    }
 
-        // Other origin addresses are unaffected.
-        let other = store
-            .find_faucets_by_origin_address(&[0u8; 20])
+    /// InMemoryStore::register_faucet must match PgStore's faucet_id-idempotent
+    /// guards (Copilot review): a re-register by the same faucet_id must
+    ///   (a) NEVER wipe existing non-empty metadata with an empty vec (Cantina
+    ///       #13 — the preimage a later bridge-out needs), and
+    ///   (b) REJECT an attempt to rebind the faucet_id to a different origin
+    ///       (PgStore hits a duplicate faucet_id primary-key error there).
+    #[tokio::test]
+    async fn register_faucet_faucet_id_reregister_matches_pgstore_guards() {
+        let store = InMemoryStore::new();
+        let origin = [0xD1u8; 20];
+        let faucet_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+
+        // Initial registration carries real (non-empty) metadata.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![0xAB, 0xCD, 0xEF],
+            })
             .await
             .unwrap();
-        assert!(other.is_empty());
+
+        // (a) A blank re-register (empty metadata) refreshes symbol but must
+        //     PRESERVE the stored metadata preimage.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "WTKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .unwrap();
+        let after = store.get_faucet_by_id(faucet_id).await.unwrap().unwrap();
+        assert_eq!(after.symbol, "WTKN", "mutable fields refresh");
+        assert_eq!(
+            after.metadata,
+            vec![0xAB, 0xCD, 0xEF],
+            "empty re-register must NOT wipe stored metadata (Cantina #13)"
+        );
+
+        // A non-empty re-register DOES overwrite the metadata.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 0,
+                symbol: "WTKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![0x11, 0x22],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_faucet_by_id(faucet_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata,
+            vec![0x11, 0x22],
+            "non-empty re-register overwrites metadata"
+        );
+
+        // (b) Rebinding the same faucet_id to a DIFFERENT origin is rejected.
+        let err = store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: [0xD2u8; 20],
+                origin_network: 0,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .expect_err("rebinding a faucet_id to a new origin must be rejected");
+        assert!(
+            format!("{err:#}").contains("refusing to rebind"),
+            "error must name the origin-rebind refusal, got: {err:#}"
+        );
+        // A different origin_network for the same faucet_id is likewise rejected.
+        store
+            .register_faucet(FaucetEntry {
+                faucet_id,
+                origin_address: origin,
+                origin_network: 7,
+                symbol: "TKN".into(),
+                origin_decimals: 18,
+                miden_decimals: 8,
+                scale: 10,
+                metadata: vec![],
+            })
+            .await
+            .expect_err("rebinding to a new origin_network must be rejected");
+
+        // Nothing leaked a second row.
+        assert_eq!(store.list_faucets().await.unwrap().len(), 1);
     }
 }

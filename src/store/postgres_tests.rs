@@ -1055,6 +1055,86 @@ async fn getlogs_equivalence_matches_oracle_pgstore() {
     }
 }
 
+// ── Faucet registry (finding #10) ────────────────────────────
+
+/// Finding #10 — PoC + regression. A second `register_faucet` for an origin
+/// already owned by a *different* faucet must CONVERGE on the
+/// `(origin_address, origin_network)` unique key (`idx_faucet_origin`) instead
+/// of erroring on it. Pre-fix `register_faucet` only handled
+/// `ON CONFLICT (faucet_id)`, so the losing first-claim worker's INSERT hit the
+/// origin unique index and errored — leaving the local registry pinned to
+/// faucet A while the bridge routed by faucet B, hiding later bridge-outs.
+///
+/// Uses a per-run-unique origin so the test is safe to re-run against a
+/// persistent dev DB (no truncation needed). No-ops without
+/// `DATABASE_URL`.
+#[tokio::test]
+async fn test_pgstore_finding_10_register_faucet_origin_convergence() {
+    use super::FaucetEntry;
+    use miden_protocol::account::AccountId;
+
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    // Origin unique per RUN (not just per test) so it never collides with a
+    // prior run's rows on a persistent dev DB — no reset/truncation needed.
+    let mut origin = [0xF1u8; 20];
+    origin[..8].copy_from_slice(&rand_u64().to_be_bytes());
+    let network = 0u32;
+    let id_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+    let id_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+
+    let entry = |faucet_id: AccountId, symbol: &str| FaucetEntry {
+        faucet_id,
+        origin_address: origin,
+        origin_network: network,
+        symbol: symbol.to_string(),
+        origin_decimals: 18,
+        miden_decimals: 8,
+        scale: 10,
+        metadata: Vec::new(),
+    };
+
+    // First claim registers faucet A for this origin.
+    store.register_faucet(entry(id_a, "TKN")).await.unwrap();
+    assert_eq!(
+        store
+            .get_faucet_by_origin(&origin, network)
+            .await
+            .unwrap()
+            .unwrap()
+            .faucet_id,
+        id_a
+    );
+
+    // Losing first-claim worker: a DIFFERENT faucet for the SAME origin.
+    // Post-fix this converges (first-write wins) — no error, no split state.
+    store.register_faucet(entry(id_b, "TKN")).await.unwrap();
+    assert_eq!(
+        store
+            .get_faucet_by_origin(&origin, network)
+            .await
+            .unwrap()
+            .unwrap()
+            .faucet_id,
+        id_a,
+        "first-write must win the origin route"
+    );
+    assert!(
+        store.get_faucet_by_id(id_b).await.unwrap().is_none(),
+        "losing faucet must not be stranded in the registry"
+    );
+    assert!(store.get_faucet_by_id(id_a).await.unwrap().is_some());
+
+    // Same faucet re-registering still refreshes metadata (idempotent by id).
+    store.register_faucet(entry(id_a, "WTKN")).await.unwrap();
+    assert_eq!(
+        store.get_faucet_by_id(id_a).await.unwrap().unwrap().symbol,
+        "WTKN"
+    );
+}
+
 /// Cheap, dependency-free PRNG seed source — `std::time` is enough to
 /// produce a per-run unique 8-byte prefix for the test fixtures above.
 fn rand_u64() -> u64 {

@@ -36,6 +36,8 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-cantina12-getlogs-returns-all.sh"
         echo ""
+        "$SCRIPT_DIR/e2e-cantina10-concurrent-faucet.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
         echo ""
         "$SCRIPT_DIR/e2e-cantina6-faucet-identity-restore.sh"
@@ -78,6 +80,9 @@ case "$test_filter" in
     cantina13)
         "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
         ;;
+    cantina10)
+        "$SCRIPT_DIR/e2e-cantina10-concurrent-faucet.sh"
+        ;;
     ger-decomposition)
         "$SCRIPT_DIR/e2e-ger-decomposition.sh"
         ;;
@@ -104,7 +109,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
         exit 1
         ;;
 esac
