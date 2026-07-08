@@ -295,18 +295,29 @@ pub fn mint_forged_alert(
 
 /// Pure provenance predicate for the consumer-keyed monitors (Cantina #5
 /// burn-serial and #6 twin-note). Returns `true` iff the note was consumed by a
-/// KNOWN account that is neither our bridge nor a registered faucet — i.e. it
-/// provably belongs to another deployment sharing the chain (foreign tag-0 notes
-/// the reconciler imports). Biased fail-CLOSED: an unobserved consumer (`None`)
-/// is NOT positively foreign, so our own notes whose consumer attribution the
-/// client has not yet recorded keep being monitored (never miss a real
-/// twin/burn-collision on our own flow).
+/// KNOWN account that is none of OUR accounts — neither the bridge, nor a
+/// registered faucet, nor one of the known-LOCAL non-faucet accounts
+/// (`local_accounts`: the service account, `ger_manager`, `wallet_hardhat`, all
+/// created in `init.rs`). Only then does it provably belong to another
+/// deployment sharing the chain (foreign tag-0 notes the reconciler imports).
+///
+/// The `local_accounts` exclusion is what makes this fail-CLOSED: `init.rs`
+/// creates LOCAL non-faucet accounts, and a real twin/burn/mint note that one
+/// of those local flows consumes is OURS — dropping it from the alert would be
+/// a MISSED alert (fail-open), unacceptable for a security monitor. Also biased
+/// fail-CLOSED on attribution: an unobserved consumer (`None`) is NOT positively
+/// foreign, so our own notes whose consumer the client has not yet recorded keep
+/// being monitored (never miss a real twin/burn-collision on our own flow).
 pub fn note_positively_foreign(
     consumer: Option<AccountId>,
     registered_faucets: &std::collections::HashSet<AccountId>,
+    local_accounts: &std::collections::HashSet<AccountId>,
     bridge_id: AccountId,
 ) -> bool {
-    matches!(consumer, Some(c) if c != bridge_id && !registered_faucets.contains(&c))
+    matches!(consumer, Some(c)
+        if c != bridge_id
+            && !registered_faucets.contains(&c)
+            && !local_accounts.contains(&c))
 }
 
 // BRIDGE OUT SCANNER
@@ -341,6 +352,16 @@ pub struct BridgeOutScanner {
     /// fallback (recovery then relies solely on the all-Miden candidate, and
     /// gates if that does not validate).
     l1_rpc_url: Option<String>,
+    /// KNOWN-LOCAL non-faucet accounts this deployment creates in `init.rs`
+    /// (the service account, the `ger_manager`, and `wallet_hardhat`). These
+    /// are OURS but are neither the bridge nor a registered faucet, so without
+    /// this set the consumer-keyed provenance predicate
+    /// ([`note_positively_foreign`]) would mislabel a real twin/burn note that
+    /// one of these local flows consumed as "foreign" and SUPPRESS the alert
+    /// (fail-open — wrong for a security monitor). Wired via
+    /// [`Self::with_local_accounts`]; empty by default so tests and call sites
+    /// that don't supply it keep the pre-fix (bridge+faucets-only) behaviour.
+    local_accounts: std::collections::HashSet<AccountId>,
 }
 
 impl BridgeOutScanner {
@@ -370,6 +391,7 @@ impl BridgeOutScanner {
             ownership_probe_every_n_ticks: 5, // every 5 sync ticks (~30s at 6s/tick)
             tick_counter: std::sync::atomic::AtomicU32::new(0),
             l1_rpc_url: None,
+            local_accounts: std::collections::HashSet::new(),
         }
     }
 
@@ -378,6 +400,21 @@ impl BridgeOutScanner {
     /// tests that don't need recovery stay unchanged.
     pub fn with_l1_rpc_url(mut self, l1_rpc_url: Option<String>) -> Self {
         self.l1_rpc_url = l1_rpc_url;
+        self
+    }
+
+    /// Register the KNOWN-LOCAL non-faucet accounts (service, `ger_manager`,
+    /// `wallet_hardhat`) so the consumer-keyed provenance predicate
+    /// ([`note_positively_foreign`]) does NOT mislabel a note one of these local
+    /// flows consumed as foreign and suppress its #5/#6 alert (fail-closed).
+    /// Builder so existing call sites and tests stay unchanged. Accepts any
+    /// iterator of ids; `None` entries (unconfigured optional accounts like
+    /// `ger_manager`) should be filtered by the caller.
+    pub fn with_local_accounts(
+        mut self,
+        local_accounts: impl IntoIterator<Item = AccountId>,
+    ) -> Self {
+        self.local_accounts = local_accounts.into_iter().collect();
         self
     }
 
@@ -568,8 +605,12 @@ impl BridgeOutScanner {
             // (#5 burn-serial, #6 twin); `None` consumer stays monitored
             // (fail-closed). See `note_positively_foreign` docs.
             let consumer = note.consumer_account();
-            let foreign =
-                note_positively_foreign(consumer, &registered_faucets, self.bridge_account_id);
+            let foreign = note_positively_foreign(
+                consumer,
+                &registered_faucets,
+                &self.local_accounts,
+                self.bridge_account_id,
+            );
             // RD-913: tracker is now store-backed + async; a transient store
             // failure must NOT panic the sync — log and continue so the rest
             // of the post-sync work still runs.
@@ -1587,13 +1628,78 @@ mod tests {
     fn positively_foreign_consumer_gate() {
         let (bridge, our_faucet, _unregistered, foreign_faucet) = prov_ids();
         let reg = registry(&[our_faucet]);
+        let no_locals = std::collections::HashSet::new();
         // Foreign consumer → positively foreign (skip #5/#6).
-        assert!(note_positively_foreign(Some(foreign_faucet), &reg, bridge));
+        assert!(note_positively_foreign(
+            Some(foreign_faucet),
+            &reg,
+            &no_locals,
+            bridge
+        ));
         // Our faucet / our bridge → not foreign (monitored).
-        assert!(!note_positively_foreign(Some(our_faucet), &reg, bridge));
-        assert!(!note_positively_foreign(Some(bridge), &reg, bridge));
+        assert!(!note_positively_foreign(
+            Some(our_faucet),
+            &reg,
+            &no_locals,
+            bridge
+        ));
+        assert!(!note_positively_foreign(
+            Some(bridge),
+            &reg,
+            &no_locals,
+            bridge
+        ));
         // Unobserved consumer → NOT positively foreign (fail-closed: monitored).
-        assert!(!note_positively_foreign(None, &reg, bridge));
+        assert!(!note_positively_foreign(None, &reg, &no_locals, bridge));
+    }
+
+    /// Fail-CLOSED regression (Copilot #16): `init.rs` creates LOCAL non-faucet
+    /// accounts (service, `ger_manager`, `wallet_hardhat`) that are neither the
+    /// bridge nor a registered faucet. A real twin/burn/mint note consumed by
+    /// one of those LOCAL flows is OURS and MUST stay monitored (surfaced) — the
+    /// pre-fix predicate mislabeled it "foreign" and SUPPRESSED the #5/#6 alert
+    /// (a missed alert = fail-OPEN). A genuinely-foreign consumer must still be
+    /// treated foreign.
+    #[test]
+    fn positively_foreign_excludes_local_nonfaucet_accounts() {
+        let (bridge, our_faucet, _unregistered, foreign_faucet) = prov_ids();
+        let reg = registry(&[our_faucet]);
+        // Two known-LOCAL non-faucet accounts (stand in for e.g. the service
+        // account and ger_manager): distinct from bridge, faucet, and foreign.
+        let local_service = AccountId::from_hex("0xad0000000000ef110000ef000000ad").unwrap();
+        let local_ger_manager = AccountId::from_hex("0xae0000000000ba110000ba000000ae").unwrap();
+        let locals = registry(&[local_service, local_ger_manager]);
+
+        // A note consumed by a LOCAL non-faucet account is NOT positively
+        // foreign → it is still surfaced/monitored (the alert is NOT suppressed).
+        assert!(
+            !note_positively_foreign(Some(local_service), &reg, &locals, bridge),
+            "service-account consumer must stay monitored, not be skipped as foreign"
+        );
+        assert!(
+            !note_positively_foreign(Some(local_ger_manager), &reg, &locals, bridge),
+            "ger_manager consumer must stay monitored, not be skipped as foreign"
+        );
+        // A genuinely-foreign consumer (none of bridge / faucet / local) is
+        // STILL treated as positively foreign even with locals configured.
+        assert!(
+            note_positively_foreign(Some(foreign_faucet), &reg, &locals, bridge),
+            "a truly foreign consumer must still be treated foreign"
+        );
+        // Sanity: bridge / faucet still not foreign; None still fail-closed.
+        assert!(!note_positively_foreign(
+            Some(our_faucet),
+            &reg,
+            &locals,
+            bridge
+        ));
+        assert!(!note_positively_foreign(
+            Some(bridge),
+            &reg,
+            &locals,
+            bridge
+        ));
+        assert!(!note_positively_foreign(None, &reg, &locals, bridge));
     }
 
     /// Build a minimal B2AGG `InputNoteRecord` in a chosen consumed state for
