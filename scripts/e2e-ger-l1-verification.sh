@@ -29,9 +29,11 @@ log() { echo "[e2e-ger-l1-verify] $*"; }
 fail() { echo "[e2e-ger-l1-verify] FAIL: $*" >&2; exit 1; }
 
 # JSON-RPC endpoint of the miden-agglayer proxy (where eth_sendRawTransaction
-# lands and the /metrics scrape lives). L2_RPC_URL is the canonical name (see
-# one-shot-ger-inject.sh); BRIDGE_SERVICE_URL is kept as a back-compat alias.
-BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-${L2_RPC_URL:-http://localhost:18080}}"
+# lands and the /metrics scrape lives) — the PROXY on :8546, NOT the
+# bridge-service REST on :18080 (which 404s JSON-RPC → curl exit 22 → set -e
+# aborts). L2_RPC_URL is the canonical name (see one-shot-ger-inject.sh);
+# BRIDGE_SERVICE_URL is kept as a back-compat alias.
+BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-${L2_RPC_URL:-http://localhost:8546}}"
 L2_RPC_URL="${L2_RPC_URL:-$BRIDGE_SERVICE_URL}"
 
 # Signer of the forged insertGlobalExitRoot tx. Must be permitted by the
