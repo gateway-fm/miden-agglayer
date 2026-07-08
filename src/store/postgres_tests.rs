@@ -178,8 +178,11 @@ async fn test_pgstore_ger_lifecycle() {
     // Not injected yet
     assert!(!store.is_ger_injected(&ger).await.unwrap());
 
-    // Mark injected
-    store.mark_ger_injected(ger).await.unwrap();
+    // Mark injected (via the atomic commit, which folds in injection)
+    store
+        .commit_ger_event_atomic(100, [0u8; 32], "0xger_inject_tx", &ger, None, None, 999)
+        .await
+        .unwrap();
     assert!(store.is_ger_injected(&ger).await.unwrap());
 }
 
@@ -195,7 +198,7 @@ async fn test_pgstore_ger_update_event() {
 
     let ger = [0x55u8; 32];
     store
-        .add_ger_update_event(50, [0u8; 32], "0xger_tx", &ger, None, None, 999)
+        .commit_ger_event_atomic(50, [0u8; 32], "0xger_tx", &ger, None, None, 999)
         .await
         .unwrap();
 
@@ -208,9 +211,9 @@ async fn test_pgstore_ger_update_event() {
 }
 
 /// Audit H2 (PG twin) — `commit_ger_event_atomic` must be idempotent on retry.
-/// The legacy two-step path (`add_ger_update_event` then a separate
-/// `mark_ger_injected`) left a crash window: if the process died between them
-/// the chain had ALREADY been rolled while `is_injected` was still FALSE, so on
+/// The legacy two-step path (rolling the chain + emitting the log, then a
+/// separate injection mark) left a crash window: if the process died between
+/// them the chain had ALREADY been rolled while `is_injected` was still FALSE, so on
 /// restart the projector re-rolled the hash chain and emitted a DUPLICATE
 /// UpdateHashChainValue log — diverging the proxy's `hash_chain_value` from
 /// aggkit. Calling `commit_ger_event_atomic` twice with the same deterministic
