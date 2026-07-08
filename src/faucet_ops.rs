@@ -253,12 +253,59 @@ pub async fn register_faucet_in_bridge(
     Ok(())
 }
 
-/// Maximum decimals an ERC-20 may legitimately declare. Real-world tokens use
-/// 0..30; values above 30 are pathological and would cause `10u256.pow(decimals)`
-/// to overflow during scaling. Self-review X3 — without this bound the
-/// `parse_token_metadata` happy path accepts `decimals = 255` from a malicious
-/// or buggy ERC-20, which then overflows U256 arithmetic in the claim path.
-pub const MAX_TOKEN_DECIMALS: u8 = 30;
+/// Maximum decimals a local Miden faucet may declare. Mirrors
+/// [`miden_standards::account::faucets::FungibleFaucet::MAX_DECIMALS`], which the
+/// fungible-faucet builder enforces — `create_agglayer_faucet` panics/errors for
+/// any `decimals` above this. Our fixed [`MIDEN_DECIMALS`] must stay within it
+/// (checked at compile time below).
+pub const MAX_MIDEN_DECIMALS: u8 = miden_standards::account::faucets::FungibleFaucet::MAX_DECIMALS;
+
+/// The CAP on the number of decimals a locally-created Miden faucet declares.
+///
+/// Finding #17 (auditor cergyk): the local faucet decimals for an origin token
+/// are `min(origin_decimals, MIDEN_DECIMALS)` — capped at 8, never derived
+/// higher (this mirrors main's historical `min(origin, 8)` scheme). So a token
+/// with few decimals (e.g. 6-decimal USDC/USDT) gets a faucet matching its own
+/// decimals (scale 0), while a token with many decimals is pinned to 8 and
+/// downscaled. A bridged origin token is routable iff its downscaling factor
+/// `scale = origin_decimals - min(origin_decimals, MIDEN_DECIMALS)` fits
+/// [`MAX_SCALING_FACTOR`] (18), i.e. `origin_decimals <= MAX_ORIGIN_DECIMALS`
+/// (26). 8 is comfortably within [`MAX_MIDEN_DECIMALS`] (12).
+///
+/// NB: this is a CAP, not a fixed value — the emitted faucet decimals equal
+/// `min(origin_decimals, MIDEN_DECIMALS)`.
+pub const MIDEN_DECIMALS: u8 = 8;
+
+// The cap must never exceed what the fungible-faucet builder accepts, or
+// `create_agglayer_faucet` would fail for a token that hits the cap. Compile-time
+// guard so a future bump to MIDEN_DECIMALS can't silently break faucet creation.
+const _: () = assert!(MIDEN_DECIMALS <= MAX_MIDEN_DECIMALS);
+
+/// Maximum decimal downscaling factor `scale = origin_decimals - MIDEN_DECIMALS`
+/// supported by the bridge stack. This is `MAX_SCALING_FACTOR` in the agglayer
+/// `asset_conversion.masm`, enforced at runtime by
+/// [`miden_base_agglayer::EthAmount::scale_to_token_amount`], which returns
+/// `EthAmountError::ScaleTooLarge` for `scale > 18`. The upstream constant is
+/// not `pub`, so it is mirrored here; keep in sync with the MASM.
+pub const MAX_SCALING_FACTOR: u8 = 18;
+
+/// Maximum origin-token decimals a bridged token may declare and still be
+/// routable under the cap-at-[`MIDEN_DECIMALS`] scheme. The local faucet uses
+/// `min(origin_decimals, 8)` decimals, so for `origin_decimals > 8` the
+/// downscaling factor is `scale = origin_decimals - 8`; the largest supportable
+/// origin-decimal count is `8 + MAX_SCALING_FACTOR = 26` (tokens with <= 8
+/// decimals always route at scale 0).
+///
+/// This is the audit-aligned bound: the auditor's (cergyk) actual recommendation
+/// was "reject > 26", not "support up to 30". Tokens declaring more than 26
+/// decimals are test/probe/malicious inputs — no liquid real token lives there —
+/// and are rejected outright: their route would be unclaimable (`scale > 18`
+/// trips the shared gate) and `10u256.pow(decimals)` would overflow during amount
+/// scaling. Rejecting up-front means a poisoned (> 26-decimal) token never gets a
+/// persisted, unclaimable route (finding #17). Self-review X3 — without this
+/// bound the `parse_token_metadata` happy path accepts `decimals = 255` from a
+/// malicious or buggy ERC-20, which then overflows U256 arithmetic downstream.
+pub const MAX_ORIGIN_DECIMALS: u8 = MIDEN_DECIMALS + MAX_SCALING_FACTOR;
 
 /// Maximum byte length for an ABI-decoded token symbol/name. Token symbols are
 /// always short (1-12 chars in practice). Cap at 64 bytes so a malicious
@@ -297,12 +344,19 @@ pub fn parse_token_metadata(
 
     // Read decimals from the third 32-byte word
     let decimals = data[95]; // last byte of third word
-    // X3 — reject pathological decimals that would overflow `10^decimals` in
-    // U256 amount scaling. The bridge contract's own metadata typically caps
-    // at 18 (ETH); 30 is generous headroom for any future variant.
-    if decimals > MAX_TOKEN_DECIMALS {
+    // X3 / finding #17 — reject decimals no local route can satisfy. The local
+    // faucet uses `min(origin_decimals, MIDEN_DECIMALS (8))` decimals, so a token
+    // is routable only when `scale = origin_decimals - min(origin_decimals, 8) <=
+    // MAX_SCALING_FACTOR (18)`, i.e. `origin_decimals <= MAX_ORIGIN_DECIMALS
+    // (26)`. Above that the route would be unclaimable (the shared scale gate
+    // rejects it) and `10^decimals` would overflow U256 amount scaling — such
+    // > 26-decimal values are test/probe/malicious inputs. Reject up-front so a
+    // poisoned route is never persisted.
+    if decimals > MAX_ORIGIN_DECIMALS {
         anyhow::bail!(
-            "token decimals out of range: {decimals} > {MAX_TOKEN_DECIMALS} (would overflow U256 scaling)"
+            "token decimals out of range: {decimals} > {MAX_ORIGIN_DECIMALS} (no local faucet route \
+             with miden_decimals = min(decimals, {MIDEN_DECIMALS}) and scale <= {MAX_SCALING_FACTOR} \
+             exists)"
         );
     }
     // The decimals field is u8 in the ABI; the high 31 bytes of the word must be
@@ -491,13 +545,14 @@ mod tests {
         assert_eq!(decimals, 6);
     }
 
-    /// Self-review X3 — repro+regression. Pre-fix `parse_token_metadata`
-    /// accepted any u8 value for `decimals`, including `255`. The downstream
-    /// claim path then computes `10u256.pow(decimals)` for amount scaling,
-    /// which overflows for `decimals > ~77`. Cap at MAX_TOKEN_DECIMALS = 30
-    /// (well above any real-world token).
+    /// Self-review X3 / finding #17 — repro+regression. Pre-fix
+    /// `parse_token_metadata` accepted any u8 value for `decimals`, including
+    /// `255`. The downstream claim path then computes `10u256.pow(decimals)` for
+    /// amount scaling, which overflows for `decimals > ~77`. Under the cap-at-8
+    /// scheme the routable ceiling is MAX_ORIGIN_DECIMALS = 26 (scale <= 18);
+    /// anything above is a test/probe/malicious input and is rejected up-front.
     #[test]
-    fn x3_decimals_above_30_rejected() {
+    fn x3_decimals_above_26_rejected() {
         let metadata = bytes_with_decimals(255);
         let addr = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
         let err = parse_token_metadata(&metadata, &addr).unwrap_err();
@@ -506,12 +561,12 @@ mod tests {
             "unexpected: {err}"
         );
 
-        // Boundary: exactly MAX is accepted.
-        let metadata = bytes_with_decimals(MAX_TOKEN_DECIMALS);
+        // Boundary: exactly MAX_ORIGIN_DECIMALS (26) is accepted.
+        let metadata = bytes_with_decimals(MAX_ORIGIN_DECIMALS);
         assert!(parse_token_metadata(&metadata, &addr).is_ok());
 
-        // Off-by-one above MAX is rejected.
-        let metadata = bytes_with_decimals(MAX_TOKEN_DECIMALS + 1);
+        // Off-by-one above MAX_ORIGIN_DECIMALS (27) is rejected.
+        let metadata = bytes_with_decimals(MAX_ORIGIN_DECIMALS + 1);
         assert!(parse_token_metadata(&metadata, &addr).is_err());
     }
 
