@@ -37,7 +37,11 @@ chain_before=$(
 )
 log "hash_chain_value (before retry): $chain_before"
 
-UPDATE_HASH_TOPIC="0x0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+# keccak256("UpdateHashChainValue(bytes32,bytes32)") — must match
+# UPDATE_HASH_CHAIN_VALUE_TOPIC in src/log_synthesis.rs (and the topic the
+# projector emits in commit_ger_event_atomic). A placeholder here makes
+# eth_getLogs return 0 rows, so the idempotency assertion is a FALSE PASS.
+UPDATE_HASH_TOPIC="0x65d3bf36615f1f02a134d12dfa9ea6b1d4a52386e825973cd27ddb70895c2319"
 log "Querying UpdateHashChainValue log count..."
 logs_before=$(
     curl -sf "$BRIDGE_SERVICE_URL" -H 'Content-Type: application/json' \
@@ -45,6 +49,12 @@ logs_before=$(
         | jq '.result | length'
 )
 log "UpdateHashChainValue logs (before): $logs_before"
+
+# Guard against the historical FALSE PASS: with the wrong topic eth_getLogs
+# returned 0 rows and both assertions below held vacuously. This test only has
+# signal once a GER has actually been projected (the suite injects one via the
+# L1->L2 / ger-decomposition flows before the restart tests run).
+[ "$logs_before" -gt 0 ] || fail "no UpdateHashChainValue logs present — nothing to exercise (real topic 0x65d3bf36…; ensure a GER was injected before this test)"
 
 log "Phase B — restart the service mid-projection, assert idempotent retry"
 docker compose -f docker-compose.e2e.yml restart miden-agglayer >/dev/null 2>&1 || true

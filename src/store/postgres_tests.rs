@@ -10,7 +10,9 @@
 
 use super::postgres::PgStore;
 use super::{Store, TxnEntry};
-use crate::log_synthesis::{AddressFilter, GerEntry, LogFilter, SyntheticLog};
+use crate::log_synthesis::{
+    AddressFilter, GerEntry, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
+};
 use alloy::consensus::{TxEip1559, TxEnvelope};
 use alloy::primitives::{Address, Signature, TxHash, U256};
 
@@ -203,6 +205,83 @@ async fn test_pgstore_ger_update_event() {
 
     // GER should be seen
     assert!(store.has_seen_ger(&ger).await.unwrap());
+}
+
+/// Audit H2 (PG twin) — `commit_ger_event_atomic` must be idempotent on retry.
+/// The legacy two-step path (`add_ger_update_event` then a separate
+/// `mark_ger_injected`) left a crash window: if the process died between them
+/// the chain had ALREADY been rolled while `is_injected` was still FALSE, so on
+/// restart the projector re-rolled the hash chain and emitted a DUPLICATE
+/// UpdateHashChainValue log — diverging the proxy's `hash_chain_value` from
+/// aggkit. Calling `commit_ger_event_atomic` twice with the same deterministic
+/// `tx_hash` must emit exactly ONE log and leave the emitted `hash_chain_value`
+/// (the log's 3rd topic) unchanged. This is the Postgres twin of
+/// `memory.rs::h2_commit_ger_event_atomic_is_idempotent_on_retry` — only the
+/// in-memory path was covered before.
+///
+/// PG-gated: skips when `DATABASE_URL` is unset; runs in the postgres-feature CI.
+#[tokio::test]
+async fn test_pgstore_h2_commit_ger_event_atomic_is_idempotent_on_retry() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    // Unique tx_hash + GER so the assertions stay isolated from any GER that a
+    // concurrent test rolls into the shared `service_state` singleton: the
+    // idempotency gate keys on `tx_hash`, `is_ger_injected` keys on the GER, and
+    // the log we inspect is fetched by `tx_hash`.
+    let nonce = rand_u64();
+    let tx_hash = format!("0xh2_atomic_{nonce:016x}");
+    let mut ger = [0x55u8; 32];
+    ger[..8].copy_from_slice(&nonce.to_be_bytes());
+
+    assert!(!store.is_ger_injected(&ger).await.unwrap());
+
+    // First commit: rolls the chain, emits one log, sets is_injected = TRUE.
+    store
+        .commit_ger_event_atomic(10, [0xaa; 32], &tx_hash, &ger, None, None, 1000)
+        .await
+        .unwrap();
+    assert!(store.is_ger_injected(&ger).await.unwrap());
+
+    let logs_first = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_first.len(),
+        1,
+        "first commit must emit exactly one UpdateHashChainValue log"
+    );
+    assert_eq!(
+        logs_first[0].topics[0].to_lowercase(),
+        UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase(),
+        "emitted log must carry the UpdateHashChainValue topic"
+    );
+    // topic[2] is the rolled hash_chain_value the log carries — our observable
+    // proxy for the on-chain-visible chain value.
+    let chain_after_first = logs_first[0].topics[2].clone();
+
+    // Retry with the SAME tx_hash — simulates a re-projection after a crash
+    // before the txn committed. The gate (a log with this tx_hash already
+    // exists) must skip the chain roll + log emission; is_injected stays TRUE.
+    store
+        .commit_ger_event_atomic(10, [0xaa; 32], &tx_hash, &ger, None, None, 1000)
+        .await
+        .unwrap();
+
+    let logs_after = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after.len(),
+        1,
+        "retry must NOT emit a duplicate UpdateHashChainValue log"
+    );
+    assert_eq!(
+        logs_after[0].topics[2], chain_after_first,
+        "retry must NOT roll the hash chain a second time"
+    );
+    assert!(
+        store.is_ger_injected(&ger).await.unwrap(),
+        "GER must remain injected after the idempotent retry"
+    );
 }
 
 // ── Transactions ─────────────────────────────────────────────
