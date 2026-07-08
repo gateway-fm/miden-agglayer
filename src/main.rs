@@ -23,7 +23,7 @@ struct Command {
     /// `0.0.0.0` (all interfaces) for backward compat. Set to `127.0.0.1` to
     /// restrict to loopback — the recommended production posture when the
     /// service sits behind a reverse proxy / sidecar that owns authn.
-    #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0")]
+    #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0", value_parser = parse_bind_addr)]
     bind: String,
 
     /// Directory for miden-client data [default: $HOME/.miden]
@@ -281,10 +281,40 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
     }
 }
 
+/// clap value parser for `--bind`: validate the value as a bare IP address
+/// (`0.0.0.0`, `127.0.0.1`, `::1`, …) at the CLI boundary. The service port is
+/// a *separate* `--port` arg, so a `host:port` form (`127.0.0.1:8546`) or a
+/// bare IPv6 literal that only fails later at URL construction is rejected here
+/// with a clear message instead of blowing up deep in startup.
+fn parse_bind_addr(s: &str) -> Result<String, String> {
+    s.parse::<std::net::IpAddr>()
+        .map(|_| s.to_string())
+        .map_err(|_| {
+            format!(
+                "`{s}` is not a valid IP address (expected e.g. `0.0.0.0`, `127.0.0.1`, or `::1`; \
+             the listening port is set separately via --port, not appended here)"
+            )
+        })
+}
+
+/// Build the JSON-RPC service URL from a validated bind host + port. IPv6
+/// literals are bracketed (`::1` → `http://[::1]:8546`); without brackets the
+/// colons in the address collide with the port separator and the URL is
+/// invalid (`http://::1:8546`).
+fn build_service_url(bind: &str, port: u16) -> Result<Url, url::ParseError> {
+    let host = if bind.contains(':') {
+        format!("[{bind}]")
+    } else {
+        bind.to_string()
+    };
+    Url::from_str(&format!("http://{host}:{port}"))
+}
+
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Command")
             .field("port", &self.port)
+            .field("bind", &self.bind)
             .field("miden_store_dir", &self.miden_store_dir)
             .field("miden_node", &self.miden_node)
             .field("chain_id", &self.chain_id)
@@ -897,7 +927,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let url = Url::from_str(format!("http://{}:{}", command.bind, command.port).as_str())?;
+    let url = build_service_url(&command.bind, command.port)?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
     // RD-940 Phase 5 — graceful drain. When `service::serve` returns
@@ -1093,5 +1123,53 @@ mod hardening_tests {
         let reasons = check_hardening_invariants(&c).unwrap_err();
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("--miden-prover-url"));
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// A bad `--bind` value (host:port form, not a bare IP) is rejected at the
+    /// CLI by the value parser instead of failing late at URL construction.
+    #[test]
+    fn bad_bind_value_rejected_at_cli() {
+        // host:port is not a bare IpAddr → clap error.
+        let err = Command::try_parse_from(["prog", "--bind", "127.0.0.1:8546"]);
+        assert!(err.is_err(), "host:port bind must be rejected at the CLI");
+
+        // Outright garbage is rejected too.
+        assert!(
+            Command::try_parse_from(["prog", "--bind", "not-an-ip"]).is_err(),
+            "non-IP bind must be rejected at the CLI"
+        );
+    }
+
+    /// The value parser accepts the valid bare-IP forms it documents.
+    #[test]
+    fn good_bind_values_accepted() {
+        assert_eq!(parse_bind_addr("0.0.0.0").unwrap(), "0.0.0.0");
+        assert_eq!(parse_bind_addr("127.0.0.1").unwrap(), "127.0.0.1");
+        assert_eq!(parse_bind_addr("::1").unwrap(), "::1");
+        assert!(parse_bind_addr("127.0.0.1:8546").is_err());
+    }
+
+    /// An IPv6 bind (`::1`) produces a valid, bracketed URL — the unbracketed
+    /// `http://::1:8546` would be an invalid URL.
+    #[test]
+    fn ipv6_bind_builds_valid_bracketed_url() {
+        let url = build_service_url("::1", 8546).expect("::1 must build a valid URL");
+        assert_eq!(url.as_str(), "http://[::1]:8546/");
+        assert_eq!(url.host_str(), Some("::1"));
+        assert_eq!(url.port(), Some(8546));
+    }
+
+    /// IPv4 bind is left unbracketed.
+    #[test]
+    fn ipv4_bind_builds_plain_url() {
+        let url = build_service_url("127.0.0.1", 8546).expect("valid IPv4 URL");
+        assert_eq!(url.as_str(), "http://127.0.0.1:8546/");
+        assert_eq!(url.port(), Some(8546));
     }
 }
