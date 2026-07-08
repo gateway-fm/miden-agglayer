@@ -273,6 +273,10 @@ ensure-sponsor-key: ## Decrypt claimsponsor.keystore -> SPONSOR_PRIVATE_KEY in f
 e2e-l2-to-l1-autoclaim: ensure-sponsor-key e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund + L2→L1 bridge-out claimed automatically by the Rust bridge-autoclaim
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1-autoclaim.sh
 
+.PHONY: e2e-cantina13
+e2e-cantina13: e2e-up ## Spin up stack + run Cantina #13 Layer-2 metadata recovery test (recover, validate, quarantine)
+	$(COMPOSE_ENV) ./scripts/e2e-cantina13-metadata-recovery.sh
+
 .PHONY: e2e-restore
 e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test
 	$(COMPOSE_ENV) ./scripts/e2e-restore.sh
