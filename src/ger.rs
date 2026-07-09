@@ -123,10 +123,19 @@ async fn submit_update_ger_note(
 /// bytes are otherwise trusted verbatim: a compromised signer could inject a
 /// FORGED GER (one whose `(mainnet, rollup)` decomposition the indexer never saw
 /// on L1) onto Miden. The indexer writes the authoritative decomposition via
-/// `set_ger_exit_roots`, so a GER whose `mainnet_exit_root` is `None` was NOT
-/// observed on L1. When `require_l1_observed` is set, such a GER is refused
-/// before it reaches Miden; otherwise it is allowed through (to tolerate indexer
-/// lag) but flagged via the `ger_injection_unverified_total` metric + warn.
+/// `set_ger_exit_roots`; a GER is "resolved" only when BOTH roots are recorded —
+/// the same predicate `zkevm_getExitRootsByGER` answers with (anything less
+/// returns null there so bridge-service retries). When `require_l1_observed` is
+/// set, an unresolved GER is refused before it reaches Miden; otherwise it is
+/// allowed through (to tolerate indexer lag) but flagged via the
+/// `ger_injection_unverified_total` metric + warn.
+///
+/// The duplicate check runs BEFORE the H6 gate: an already-injected GER is a
+/// no-op (`false`) regardless of verification state. The gate exists to stop
+/// NEW submissions to Miden — a duplicate never reaches Miden, and refusing it
+/// would break idempotency: the aggoracle re-submits GERs it cannot confirm
+/// (restart with a stale view, restore replay), and an error here would put it
+/// in a permanent retry loop over an injection that already happened.
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
     miden_client: &MidenClient,
@@ -135,33 +144,7 @@ pub async fn insert_ger(
     txn_hash: TxHash,
     require_l1_observed: bool,
 ) -> anyhow::Result<bool> {
-    // Audit H6 — verify the GER was observed on L1 by the independent
-    // L1InfoTreeIndexer (it writes the (mainnet, rollup) decomposition via
-    // set_ger_exit_roots). A GER with no recorded decomposition was supplied
-    // only by the aggoracle and never corroborated by an L1 observation — a
-    // forged-GER injection signal.
-    let l1_observed = store
-        .get_ger_entry(&ger_bytes)
-        .await?
-        .is_some_and(|e| e.mainnet_exit_root.is_some());
-    if !l1_observed {
-        ::metrics::counter!("ger_injection_unverified_total").increment(1);
-        tracing::warn!(
-            ger = %hex::encode(ger_bytes),
-            tx = %txn_hash,
-            "GER injection not yet corroborated by the L1 InfoTree indexer \
-             (mainnet_exit_root unset); allowing through but unverified"
-        );
-        if require_l1_observed {
-            anyhow::bail!(
-                "GER {} was not observed on L1 by the indexer (mainnet_exit_root unset); \
-                 refusing injection under --reject-unverified-ger-injection (audit H6)",
-                hex::encode(ger_bytes)
-            );
-        }
-    }
-
-    // Check dedup before doing any work.
+    // Check dedup before doing any work (and before the H6 gate — see doc).
     //
     // Use `is_ger_injected` (not `has_seen_ger`) because the L1InfoTreeIndexer
     // pre-creates ger_entries rows for every L1 InfoTree pair as it observes
@@ -172,6 +155,40 @@ pub async fn insert_ger(
     // reflects "have we already submitted the Miden tx and committed the
     // synthetic event for this GER?".
     let is_new = !store.is_ger_injected(&ger_bytes).await?;
+
+    // Audit H6 — verify the GER was observed on L1 by the independent
+    // L1InfoTreeIndexer (it writes the (mainnet, rollup) decomposition via
+    // set_ger_exit_roots). "Observed" means BOTH roots resolved — the same
+    // predicate `zkevm_getExitRootsByGER` uses (ger_entries rows exist in
+    // partial states: the indexer pre-creates them with roots to be filled in
+    // later). A GER with no resolved decomposition was supplied only by the
+    // aggoracle and never corroborated by an L1 observation — a forged-GER
+    // injection signal. Only gate NEW injections: duplicates never reach
+    // Miden, and a strict-mode refusal must stay transient (aggoracle retries
+    // next cycle; the indexer catches up).
+    if is_new {
+        let l1_observed = store
+            .get_ger_entry(&ger_bytes)
+            .await?
+            .is_some_and(|e| e.mainnet_exit_root.is_some() && e.rollup_exit_root.is_some());
+        if !l1_observed {
+            ::metrics::counter!("ger_injection_unverified_total").increment(1);
+            if require_l1_observed {
+                anyhow::bail!(
+                    "GER {} was not observed on L1 by the indexer (exit-root decomposition \
+                     unresolved); refusing injection under --reject-unverified-ger-injection \
+                     (audit H6)",
+                    hex::encode(ger_bytes)
+                );
+            }
+            tracing::warn!(
+                ger = %hex::encode(ger_bytes),
+                tx = %txn_hash,
+                "GER injection not yet corroborated by the L1 InfoTree indexer \
+                 (exit-root decomposition unresolved); allowing through but unverified"
+            );
+        }
+    }
 
     if is_new {
         tracing::info!(
@@ -330,6 +347,72 @@ mod tests {
             assert!(
                 !err.to_string().contains("not observed on L1"),
                 "lenient mode must NOT refuse an unverified GER at the H6 gate: {err}"
+            );
+        }
+    }
+
+    /// Audit H6 (review follow-up) — the duplicate check runs BEFORE the strict
+    /// gate. A GER that is already injected must be a no-op (`Ok(false)`) even
+    /// when its exit-root decomposition never resolved: refusing it would break
+    /// idempotency, and the aggoracle — which re-submits GERs it cannot confirm
+    /// after a restart or restore replay — would loop forever retrying an
+    /// injection that already happened (the gate outcome can never change if
+    /// the roots never resolve).
+    #[tokio::test]
+    async fn h6_already_injected_ger_is_duplicate_not_refused_under_strict() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let miden_client = crate::test_helpers::create_test_service().miden_client;
+        let accounts = crate::test_helpers::test_accounts_config();
+        let tx_hash = alloy::primitives::TxHash::from_str(
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let ger = [0xABu8; 32];
+
+        // Injected on a previous run, decomposition never resolved (None, None)
+        // — the exact state that pre-fix wedged aggoracle in a retry loop.
+        store
+            .commit_ger_event_atomic(1, [0u8; 32], "0xTxDup", &ger, None, None, 0)
+            .await
+            .unwrap();
+
+        let result = insert_ger(ger, &miden_client, accounts, &store, tx_hash, true)
+            .await
+            .expect("already-injected GER must be a duplicate no-op, not an H6 refusal");
+        assert!(
+            !result,
+            "duplicate injection must return false (no new note)"
+        );
+    }
+
+    /// Audit H6 (review follow-up) — the gate uses the SAME resolved predicate
+    /// as `zkevm_getExitRootsByGER`: BOTH roots recorded. An entry the indexer
+    /// fully resolved must pass the strict gate (any downstream error from the
+    /// stub MidenClient must not be the H6 refusal).
+    #[tokio::test]
+    async fn h6_resolved_ger_passes_strict_gate() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let miden_client = crate::test_helpers::create_test_service().miden_client;
+        let accounts = crate::test_helpers::test_accounts_config();
+        let tx_hash = alloy::primitives::TxHash::from_str(
+            "0x3333333333333333333333333333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let mainnet = [0x0Au8; 32];
+        let rollup = [0x0Bu8; 32];
+        let ger = combined_ger(&mainnet, &rollup);
+
+        // The indexer observed the pair on L1 and recorded the decomposition.
+        store
+            .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let result = insert_ger(ger, &miden_client, accounts, &store, tx_hash, true).await;
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("not observed on L1"),
+                "a fully-resolved GER must pass the strict H6 gate: {err}"
             );
         }
     }
