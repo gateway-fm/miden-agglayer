@@ -351,31 +351,6 @@ async fn test_pgstore_address_mappings() {
     assert_eq!(retrieved2, Some(miden_id2));
 }
 
-// ── Bridge-out ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_pgstore_bridge_out() {
-    let Some(store) = pg_store().await else {
-        return;
-    };
-
-    let note_id = format!(
-        "test_note_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-
-    assert!(!store.is_note_processed(&note_id).await.unwrap());
-
-    let _count = store.mark_note_processed(note_id.clone()).await.unwrap();
-
-    assert!(store.is_note_processed(&note_id).await.unwrap());
-    store.unmark_note_processed(&note_id).await.unwrap();
-    assert!(!store.is_note_processed(&note_id).await.unwrap());
-}
-
 // ── Claim watcher ────────────────────────────────────────────
 
 /// `is_claim_note_processed` + `mark_claim_note_processed` round-trip,

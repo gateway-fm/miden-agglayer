@@ -534,36 +534,19 @@ pub trait Store: Send + Sync + 'static {
 
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
-    /// Mark note as processed, return the deposit count assigned to it.
-    ///
-    /// Idempotency is NOT uniform across implementations, so callers on the
-    /// retry path MUST NOT lean on this primitive alone — use
-    /// `commit_b2agg_event_atomic`, which guarantees reuse-on-retry on every
-    /// backend. Specifically:
-    ///   - `InMemoryStore` IS idempotent: re-marking an already-processed note
-    ///     reuses the originally-assigned `deposit_count`.
-    ///   - `PgStore` is NOT: this method unconditionally bumps `deposit_counter`
-    ///     and inserts a row, so a second call for the same `note_id` errors on
-    ///     the primary key rather than reusing. The idempotent reuse-or-allocate
-    ///     lives in `commit_b2agg_event_atomic`'s single txn instead.
-    /// The reason idempotent reuse matters at all: allocating a fresh
-    /// `deposit_count` on retry creates a permanent gap in the sequence,
-    /// desynchronising leaf indices from the on-chain Local Exit Tree
-    /// (Cantina MA#15 / audit H3).
-    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
-    /// Roll back a processed-note marker when later persistence fails.
-    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;
     /// Read the current deposit_counter (number of B2AGG-out notes aggkit has
     /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
     /// to compare against the bridge account's `let_num_leaves` storage slot.
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;
 
     /// Atomic, idempotent commit for a B2AGG bridge-out `BridgeEvent`. Folds:
-    ///   1. `mark_note_processed` (allocate / reuse `deposit_count`)
+    ///   1. allocate (or reuse) the note's `deposit_count` and record the note
+    ///      as processed
     ///   2. the BridgeEvent synthetic-log emission
-    /// into a single all-or-nothing operation.
+    /// into a single all-or-nothing operation. This is the SOLE write path for
+    /// the B2AGG processed-set that `is_note_processed` reads.
     ///
-    /// Why this exists (audit H1): the legacy two-step `mark_note_processed` +
+    /// Why this exists (audit H1): the legacy two-step mark-processed +
     /// bridge-event emission sequence left a crash window — a process kill
     /// between the two calls recorded the note as processed (and bumped
     /// `deposit_counter`) with NO matching `BridgeEvent`. On restart the note
@@ -573,17 +556,19 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// It is also idempotent on retry (audit H3): re-running for an
     /// already-committed note reuses the original `deposit_count`, does NOT
-    /// bump the counter again, and does NOT emit a duplicate log — closing the
-    /// gap-on-retry bug where `unmark_note_processed` deleted the dedup row but
-    /// left the counter advanced.
+    /// bump the counter again, and does NOT emit a duplicate log. Allocating a
+    /// fresh `deposit_count` on retry would create a permanent gap in the
+    /// sequence, desynchronising leaf indices from the on-chain Local Exit
+    /// Tree (Cantina MA#15).
     ///
-    /// REQUIRED — there is deliberately no default impl. A default that chained
-    /// the two primitives sequentially would NOT be all-or-nothing (a failure
-    /// after `mark_note_processed` but before the event emission reopens exactly
-    /// the Cantina MA#15 crash window this method exists to close). Each backend
-    /// MUST provide a genuine single-transaction implementation: `PgStore` uses
-    /// one postgres txn; `InMemoryStore` folds the reuse-or-allocate and the
-    /// at-most-once emission under its in-process locks.
+    /// REQUIRED — there is deliberately no default impl. A default that ran
+    /// the two steps sequentially would NOT be all-or-nothing (a failure
+    /// after the processed-marker write but before the event emission reopens
+    /// exactly the Cantina MA#15 crash window this method exists to close).
+    /// Each backend MUST provide a genuine single-transaction implementation:
+    /// `PgStore` uses one postgres txn; `InMemoryStore` folds the
+    /// reuse-or-allocate and the at-most-once emission under its in-process
+    /// locks.
     /// Returns the `deposit_count` assigned to (or reused for) this note.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(

@@ -1312,34 +1312,6 @@ impl Store for PgStore {
         Ok(val as u64)
     }
 
-    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_one(
-                "WITH counter AS (
-                    UPDATE service_state SET deposit_counter = deposit_counter + 1, updated_at = now() WHERE id = 1
-                    RETURNING deposit_counter - 1 AS val
-                 )
-                 INSERT INTO bridge_out_processed (note_id, deposit_count)
-                 SELECT $1, val FROM counter
-                 RETURNING deposit_count",
-                &[&note_id],
-            )
-            .await?;
-        Ok(row.get::<_, i32>(0) as u32)
-    }
-
-    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM bridge_out_processed WHERE note_id = $1",
-                &[&note_id],
-            )
-            .await?;
-        Ok(())
-    }
-
     /// Atomic, idempotent B2AGG commit (audit H1/H3). Single postgres txn:
     ///   1. reuse-or-allocate `deposit_count` (no counter bump on retry)
     ///   2. allocate `log_index` + INSERT the synthetic BridgeEvent (skipped if

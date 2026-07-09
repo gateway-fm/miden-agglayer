@@ -725,28 +725,6 @@ impl Store for InMemoryStore {
         Ok(*self.deposit_counter.read() as u64)
     }
 
-    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
-        // Idempotent (audit H3): reuse the originally-assigned deposit_count
-        // instead of bumping the counter on every call. A retry after a
-        // partial commit must not advance the counter a second time — that
-        // would leave a permanent gap between the proxy's `deposit_counter`
-        // and the on-chain Local Exit Tree leaf count.
-        let mut processed = self.processed_notes.write();
-        if let Some(&existing) = processed.get(&note_id) {
-            return Ok(existing);
-        }
-        let mut counter = self.deposit_counter.write();
-        let deposit_count = *counter;
-        *counter += 1;
-        processed.insert(note_id, deposit_count);
-        Ok(deposit_count)
-    }
-
-    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
-        self.processed_notes.write().remove(note_id);
-        Ok(())
-    }
-
     /// Atomic, idempotent B2AGG commit (audit H1/H3). Reuses the original
     /// `deposit_count` (no gap on retry) and emits the BridgeEvent at most once.
     ///
@@ -1241,43 +1219,49 @@ mod tests {
     }
 
     #[tokio::test]
+    // The processed-set + deposit_count tracker, exercised through its sole
+    // write path (`commit_b2agg_event_atomic`): distinct notes get sequential
+    // deposit_counts, and each becomes visible to `is_note_processed`.
     async fn test_bridge_out_tracker() {
         let store = InMemoryStore::new();
         assert!(!store.is_note_processed("note1").await.unwrap());
         let c = store
-            .mark_note_processed("note1".to_string())
+            .commit_b2agg_event_atomic(
+                "note1".to_string(),
+                "0xbridge",
+                1,
+                [0xaa; 32],
+                "0xtx1",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
             .await
             .unwrap();
         assert_eq!(c, 0);
         assert!(store.is_note_processed("note1").await.unwrap());
         let c2 = store
-            .mark_note_processed("note2".to_string())
+            .commit_b2agg_event_atomic(
+                "note2".to_string(),
+                "0xbridge",
+                2,
+                [0xab; 32],
+                "0xtx2",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
             .await
             .unwrap();
         assert_eq!(c2, 1);
-    }
-
-    #[tokio::test]
-    // Audit H3 — `mark_note_processed` must be idempotent: re-marking the same
-    // note reuses the original deposit_count instead of advancing the counter
-    // (which would leave a gap vs. the on-chain Local Exit Tree leaf count).
-    async fn h3_mark_note_processed_is_idempotent_on_retry() {
-        let store = InMemoryStore::new();
-        let dc0 = store
-            .mark_note_processed("noteA".to_string())
-            .await
-            .unwrap();
-        // Simulate a retry after a partial commit (mark ran, emit did not).
-        let dc1 = store
-            .mark_note_processed("noteA".to_string())
-            .await
-            .unwrap();
-        assert_eq!(dc0, dc1, "retry must reuse the same deposit_count");
-        assert_eq!(
-            store.get_deposit_count().await.unwrap(),
-            1,
-            "counter must advance exactly once for one note"
-        );
     }
 
     #[tokio::test]
