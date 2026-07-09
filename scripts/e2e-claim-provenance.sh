@@ -117,6 +117,17 @@ l2_tip() {
 # is a separate trust domain with its own keys, exactly like production.
 B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-claim-provenance}"
 source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+# ALWAYS start from a clean store (task #26). The foreign deployment is
+# re-provisioned from scratch every run, so reuse has no value — and a store
+# surviving a stack recreation carries the OLD chain's genesis commitment,
+# which miden-client presents in its gRPC Accept header; the new node rejects
+# the connection outright (AcceptHeaderError/NoSupportedMediaRange, displayed
+# as a bare "RPC error"). One such stale store wedged this test on 7
+# consecutive cert runs. The sibling tests (private-note, cantina13) already
+# defend via B2AGG_FRESH=1; this test uses iso_tool directly and must wipe
+# itself. `_iso_wipe_store` falls back to a root container for the
+# container-created root-owned files.
+_iso_wipe_store
 mkdir -p "$B2AGG_STORE_DIR/tmp"
 
 log "======================================================================"
