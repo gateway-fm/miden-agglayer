@@ -87,7 +87,12 @@ wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
-    while ! ( set +o pipefail; bash -c "$cmd" ) 2>/dev/null; do
+    # eval, NOT `bash -c`: the condition strings defer $(pg ...) calls, and pg
+    # is a shell FUNCTION — invisible inside a child bash (no export -f), so
+    # every pg-based wait evaluated 'command not found' -> false and timed out
+    # with the data sitting right there (cost this test three cert runs). eval
+    # runs in the current shell, matching the sibling scripts' wait_for idiom.
+    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
         echo -n "."
