@@ -71,7 +71,21 @@ PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAX)
 # manifest as empty output, which every caller already checks via `[[ -z ]]`
 # or by validating the result shape.
 pgq() {
-    "${PSQL[@]}" -c "$1" 2>/dev/null
+    # STOPPER on DB error (task #26 sweep): pre-fix `2>/dev/null` turned a dead
+    # Postgres into an empty string, which ${VAR:-0} then misread as "0 rows".
+    # stderr stays SEPARATE from the capture (locale warnings are rc=0 noise
+    # that must not corrupt numeric parses — see header comment) and is
+    # surfaced only when psql actually fails.
+    local out errf rc
+    errf="$(mktemp)"
+    out=$("${PSQL[@]}" -c "$1" 2>"$errf"); rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "pgq FAILED (rc=$rc): $(cat "$errf")" >&2
+        rm -f "$errf"
+        return 1
+    fi
+    rm -f "$errf"
+    printf '%s\n' "$out"
 }
 
 # Bootstrap: if the script is run on a fresh stack with no prior L1→L2
@@ -97,12 +111,15 @@ ensure_prereq_state() {
 
 # Pull a Prometheus counter value (single un-labeled sample). Returns 0 if absent.
 counter() {
-    local name="$1"
-    local value
-    value=$(curl -s "${L2_RPC}/metrics" | awk -v n="$name" '
+    local name="$1" body value
+    # STOPPER on unreachable /metrics (task #26 sweep): pre-fix, a down proxy
+    # read as 0 — a baseline taken against a dead endpoint could false-PASS
+    # delta assertions. Absent metric stays a legit 0 (never-incremented).
+    body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
+    value=$(awk -v n="$name" '
         $0 ~ ("^" n " ") { print $2; found=1; exit }
         END { if (!found) print 0 }
-    ')
+    ' <<<"$body")
     echo "${value%.*}"
 }
 

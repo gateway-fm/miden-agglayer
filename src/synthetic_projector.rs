@@ -1285,7 +1285,6 @@ mod tests {
             bridge: AccountIdBech32(aid(BRIDGE)),
             faucet_eth: None,
             faucet_agg: None,
-            wallet_hardhat: AccountIdBech32(aid(SERVICE)),
             ger_manager: Some(AccountIdBech32(aid(GER_MANAGER))),
         }
     }

@@ -983,7 +983,7 @@ impl std::error::Error for BridgeEventEncodeError {}
 /// Encode BridgeEvent data, panicking on metadata overflow. Use
 /// `encode_bridge_event_data_checked` for callers that handle errors.
 ///
-/// Internal callers (`Store::add_bridge_event`, restore path) pass `&[]` so
+/// Internal callers (`InMemoryStore::add_bridge_event`, restore path) pass `&[]` so
 /// the cap is unreachable today; this `unwrap_or_else` form preserves the
 /// pre-fix infallible signature for those callers while keeping the cap
 /// enforced for any future caller via the `_checked` variant.

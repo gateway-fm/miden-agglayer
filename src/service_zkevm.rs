@@ -109,7 +109,7 @@ mod tests {
         let ger = [0xAAu8; 32];
 
         store
-            .add_ger_update_event(1, [0u8; 32], "0xdead", &ger, None, None, 1000)
+            .commit_ger_event_atomic(1, [0u8; 32], "0xdead", &ger, None, None, 1000)
             .await
             .unwrap();
 
@@ -137,7 +137,7 @@ mod tests {
         let ger = crate::ger::combined_ger(&mainnet, &rollup);
 
         store
-            .add_ger_update_event(
+            .commit_ger_event_atomic(
                 5,
                 [0u8; 32],
                 "0xbeef",

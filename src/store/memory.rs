@@ -58,7 +58,7 @@ pub struct InMemoryStore {
     address_mappings: RwLock<HashMap<Address, AccountId>>,
 
     // Bridge-out
-    processed_notes: RwLock<HashSet<String>>,
+    processed_notes: RwLock<HashMap<String, u32>>,
     deposit_counter: RwLock<u32>,
 
     // Claim watcher (independent from bridge-out so CLAIM observations do not
@@ -123,7 +123,7 @@ impl InMemoryStore {
             unclaimable: RwLock::new(HashMap::new()),
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
-            processed_notes: RwLock::new(HashSet::new()),
+            processed_notes: RwLock::new(HashMap::new()),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             faucets: RwLock::new(Vec::new()),
@@ -135,6 +135,50 @@ impl InMemoryStore {
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
+    /// commit — it used to be a `Store` trait convenience method, but the only
+    /// remaining caller is `commit_b2agg_event_atomic` below (PgStore inlines
+    /// its own INSERT), so it lives here as a plain inherent method rather than
+    /// widening the trait surface.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_bridge_event(
+        &self,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+        deposit_count: u32,
+    ) -> anyhow::Result<()> {
+        let log = SyntheticLog {
+            address: bridge_address.to_string(),
+            topics: vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()],
+            data: crate::bridge_out::encode_bridge_event_data(
+                leaf_type,
+                origin_network,
+                origin_address,
+                destination_network,
+                destination_address,
+                amount,
+                metadata,
+                deposit_count,
+            ),
+            block_number,
+            block_hash,
+            transaction_hash: tx_hash.to_string(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+        self.add_log(log).await
     }
 }
 
@@ -374,12 +418,12 @@ impl Store for InMemoryStore {
         Ok(self.injected_gers.read().contains(ger))
     }
 
-    async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()> {
-        self.injected_gers.write().insert(ger);
-        Ok(())
-    }
-
-    async fn add_ger_update_event(
+    /// Atomic GER commit (audit H2). Folds the idempotent chain roll + log
+    /// emission with `is_injected = TRUE` into one operation, so a retry can
+    /// never roll the hash chain / emit the synthetic log a second time (the
+    /// in-memory analogue of postgres's single-transaction version).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
         &self,
         block_number: u64,
         block_hash: [u8; 32],
@@ -400,32 +444,46 @@ impl Store for InMemoryStore {
         )
         .await?;
 
-        let new_hash_chain = {
-            let mut hash_chain = self.hash_chain_value.write();
-            let mut hasher = Keccak256::new();
-            hasher.update(*hash_chain);
-            hasher.update(global_exit_root);
-            let result: [u8; 32] = hasher.finalize().into();
-            *hash_chain = result;
-            result
-        };
+        // Audit H2 — idempotent chain roll + log emission. A retry (e.g. after a
+        // crash) used to roll the hash chain and emit a duplicate synthetic log
+        // a SECOND time, diverging the proxy's chain from aggkit. Gate on
+        // whether a log with this deterministic tx_hash was already emitted.
+        let already_emitted = self.logs_by_tx.read().contains_key(&tx_hash.to_lowercase());
+        if !already_emitted {
+            let new_hash_chain = {
+                let mut hash_chain = self.hash_chain_value.write();
+                let mut hasher = Keccak256::new();
+                hasher.update(*hash_chain);
+                hasher.update(global_exit_root);
+                let result: [u8; 32] = hasher.finalize().into();
+                *hash_chain = result;
+                result
+            };
 
-        let log = SyntheticLog {
-            address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
-            topics: vec![
-                UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
-                format!("0x{}", hex::encode(global_exit_root)),
-                format!("0x{}", hex::encode(new_hash_chain)),
-            ],
-            data: "0x".to_string(),
-            block_number,
-            block_hash,
-            transaction_hash: tx_hash.to_string(),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-        self.add_log(log).await
+            let log = SyntheticLog {
+                address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
+                topics: vec![
+                    UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+                    format!("0x{}", hex::encode(global_exit_root)),
+                    format!("0x{}", hex::encode(new_hash_chain)),
+                ],
+                data: "0x".to_string(),
+                block_number,
+                block_hash,
+                // Canonical lowercase, consistent with the gate above,
+                // add_log's lowercase keying, and get_logs_for_tx — and with the
+                // postgres store, which persists the lowercase transaction_hash.
+                transaction_hash: tx_hash.to_lowercase(),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            };
+            self.add_log(log).await?;
+        }
+
+        // Always set is_injected = TRUE (idempotent).
+        self.injected_gers.write().insert(*global_exit_root);
+        Ok(())
     }
 
     // ── Transactions ─────────────────────────────────────────────
@@ -691,24 +749,102 @@ impl Store for InMemoryStore {
     // ── Bridge-out ───────────────────────────────────────────────
 
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
-        Ok(self.processed_notes.read().contains(note_id))
+        Ok(self.processed_notes.read().contains_key(note_id))
     }
 
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
         Ok(*self.deposit_counter.read() as u64)
     }
 
-    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
-        self.processed_notes.write().insert(note_id);
-        let mut counter = self.deposit_counter.write();
-        let deposit_count = *counter;
-        *counter += 1;
-        Ok(deposit_count)
-    }
+    /// Atomic, idempotent B2AGG commit (audit H1/H3). Reuses the original
+    /// `deposit_count` (no gap on retry) and emits the BridgeEvent at most once.
+    ///
+    /// Locking note: the `processed_notes` + `deposit_counter` write guards are
+    /// held ONLY for the step-1 allocation block below, then dropped at the end
+    /// of that scope; step 2 (the already-emitted check + `add_bridge_event`)
+    /// runs without them held. That is sound because of the SINGLE-WRITER SERIAL
+    /// INVARIANT: `commit_b2agg_event_atomic` is called ONLY from the projector
+    /// path, which is strictly serial. The projector `tick()` borrows
+    /// `&mut MidenClientLib` (one non-reentrant client) and commits one block at
+    /// a time, write-before-advance:
+    ///     while cursor < tip { project_block_notes(next).await?; set_projector_cursor(next).await? }
+    /// so at most one commit is ever in flight for a given store. The
+    /// `RECONCILE_CONCURRENCY` fan-out is FETCH-only (`sync_note_ids`), never the
+    /// commit. No concurrent writer can therefore slip between the read and the
+    /// insert here — the "TOCTOU" a reviewer might flag is not reachable, which
+    /// is why no coarser lock (or tx_hash UNIQUE constraint) is needed.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        // 1. Allocate / reuse deposit_count atomically.
+        let deposit_count = {
+            let mut processed = self.processed_notes.write();
+            if let Some(&existing) = processed.get(&note_id) {
+                existing
+            } else {
+                let mut counter = self.deposit_counter.write();
+                let dc = *counter;
+                *counter += 1;
+                processed.insert(note_id.clone(), dc);
+                dc
+            }
+        };
 
-    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
-        self.processed_notes.write().remove(note_id);
-        Ok(())
+        // 2. Emit the BridgeEvent. Idempotent on retry: the projector derives
+        //    tx_hash deterministically from note_id, so a second emit would
+        //    only duplicate the log. The InMemoryStore has no tx_hash unique
+        //    constraint, so guard by checking the existing logs_by_block entry
+        //    for the same tx_hash before emitting. This read-then-insert is race
+        //    free under the single-writer serial invariant documented above (the
+        //    projector is the only, strictly-serial caller).
+        //
+        //    Per-block scope is sufficient — this check only inspects
+        //    `logs_by_block[block_number]`, NOT every block. That is not a
+        //    cross-block dedup hole: a given note only ever projects to one
+        //    block, and cross-block RE-projection is already fenced off upstream
+        //    by the GLOBAL processed-note set. The projector consults
+        //    `is_note_processed(note_id)` before it ever calls this method, so
+        //    once a note is committed at block A it can never re-enter here for a
+        //    later block B. The only way we reach this point twice for the same
+        //    note is a same-block retry (same `block_number`, same derived
+        //    `tx_hash`), which this per-block scan catches exactly.
+        let already_emitted = self
+            .logs_by_block
+            .read()
+            .get(&block_number)
+            .map(|logs| logs.iter().any(|l| l.transaction_hash == tx_hash))
+            .unwrap_or(false);
+        if !already_emitted {
+            self.add_bridge_event(
+                bridge_address,
+                block_number,
+                block_hash,
+                tx_hash,
+                leaf_type,
+                origin_network,
+                origin_address,
+                destination_network,
+                destination_address,
+                amount,
+                metadata,
+                deposit_count,
+            )
+            .await?;
+        }
+        Ok(deposit_count)
     }
 
     // ── Claim watcher ────────────────────────────────────────────
@@ -1114,20 +1250,128 @@ mod tests {
     }
 
     #[tokio::test]
+    // The processed-set + deposit_count tracker, exercised through its sole
+    // write path (`commit_b2agg_event_atomic`): distinct notes get sequential
+    // deposit_counts, and each becomes visible to `is_note_processed`.
     async fn test_bridge_out_tracker() {
         let store = InMemoryStore::new();
         assert!(!store.is_note_processed("note1").await.unwrap());
         let c = store
-            .mark_note_processed("note1".to_string())
+            .commit_b2agg_event_atomic(
+                "note1".to_string(),
+                "0xbridge",
+                1,
+                [0xaa; 32],
+                "0xtx1",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
             .await
             .unwrap();
         assert_eq!(c, 0);
         assert!(store.is_note_processed("note1").await.unwrap());
         let c2 = store
-            .mark_note_processed("note2".to_string())
+            .commit_b2agg_event_atomic(
+                "note2".to_string(),
+                "0xbridge",
+                2,
+                [0xab; 32],
+                "0xtx2",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
             .await
             .unwrap();
         assert_eq!(c2, 1);
+    }
+
+    #[tokio::test]
+    // Audit H1 — `commit_b2agg_event_atomic` must be a single all-or-nothing
+    // operation that is also idempotent on retry: re-running it for an
+    // already-committed note reuses the original deposit_count, does NOT bump
+    // the counter, and does NOT emit a duplicate BridgeEvent.
+    async fn h1_commit_b2agg_event_atomic_is_idempotent_on_retry() {
+        use crate::log_synthesis::{BRIDGE_EVENT_TOPIC, LogFilter};
+
+        let store = InMemoryStore::new();
+        let note = "0xb2agg-note-1".to_string();
+        let block = 10u64;
+
+        let dc1 = store
+            .commit_b2agg_event_atomic(
+                note.clone(),
+                "0xbridge",
+                block,
+                [0xaa; 32],
+                "0xtx1",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
+
+        // Retry — simulates a re-projection after a crash before the txn
+        // committed. The contract: same deposit_count, no duplicate event.
+        let dc2 = store
+            .commit_b2agg_event_atomic(
+                note.clone(),
+                "0xbridge",
+                block,
+                [0xaa; 32],
+                "0xtx1",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0xcc; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dc1, dc2, "retry must reuse the same deposit_count");
+        assert_eq!(
+            store.get_deposit_count().await.unwrap(),
+            1,
+            "counter must not advance on retry"
+        );
+        assert!(
+            store.is_note_processed(&note).await.unwrap(),
+            "note stays marked processed"
+        );
+
+        // Exactly one BridgeEvent log in the store.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let bridge_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| l.topics.first().is_some_and(|t| t == BRIDGE_EVENT_TOPIC))
+            .collect();
+        assert_eq!(
+            bridge_logs.len(),
+            1,
+            "retry must not emit a duplicate BridgeEvent"
+        );
     }
 
     #[tokio::test]
@@ -1136,7 +1380,7 @@ mod tests {
         let ger = [0x11; 32];
         assert!(!store.has_seen_ger(&ger).await.unwrap());
         store
-            .add_ger_update_event(0, [0u8; 32], "0xTx1", &ger, None, None, 0)
+            .commit_ger_event_atomic(0, [0u8; 32], "0xTx1", &ger, None, None, 0)
             .await
             .unwrap();
         assert!(store.has_seen_ger(&ger).await.unwrap());
@@ -1157,13 +1401,13 @@ mod tests {
         let ger2 = [0x22; 32];
 
         store
-            .add_ger_update_event(0, [0u8; 32], "0xTx1", &ger1, None, None, 0)
+            .commit_ger_event_atomic(0, [0u8; 32], "0xTx1", &ger1, None, None, 0)
             .await
             .unwrap();
         let hash1 = *store.hash_chain_value.read();
 
         store
-            .add_ger_update_event(1, [1u8; 32], "0xTx2", &ger2, None, None, 0)
+            .commit_ger_event_atomic(1, [1u8; 32], "0xTx2", &ger2, None, None, 0)
             .await
             .unwrap();
         let hash2 = *store.hash_chain_value.read();
@@ -1432,8 +1676,114 @@ mod tests {
         let store = InMemoryStore::new();
         let ger = [0xAA; 32];
         assert!(!store.is_ger_injected(&ger).await.unwrap());
-        store.mark_ger_injected(ger).await.unwrap();
+        store
+            .commit_ger_event_atomic(0, [0u8; 32], "0xInjTx", &ger, None, None, 0)
+            .await
+            .unwrap();
         assert!(store.is_ger_injected(&ger).await.unwrap());
+    }
+
+    #[tokio::test]
+    // Audit H2 — `commit_ger_event_atomic` must be idempotent: re-running it
+    // for an already-emitted GER must NOT roll the hash chain a second time or
+    // emit a duplicate UpdateHashChainValue log. The legacy two-step "roll
+    // chain + emit log" then "mark injected" sequence could leave
+    // is_injected=FALSE after the roll had committed, so the projector re-rolled
+    // the chain on retry, diverging the proxy's hash_chain_value from aggkit.
+    // Folding both into one atomic call closes that window.
+    async fn h2_commit_ger_event_atomic_is_idempotent_on_retry() {
+        let store = InMemoryStore::new();
+        let ger = [0x55u8; 32];
+
+        store
+            .commit_ger_event_atomic(10, [0xaa; 32], "0xger-tx-1", &ger, None, None, 1000)
+            .await
+            .unwrap();
+        let chain_after_first = *store.hash_chain_value.read();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+
+        // Retry — simulates a re-projection after a crash before the txn
+        // committed. The contract: same hash_chain_value, no duplicate log,
+        // GER stays injected.
+        store
+            .commit_ger_event_atomic(10, [0xaa; 32], "0xger-tx-1", &ger, None, None, 1000)
+            .await
+            .unwrap();
+
+        let chain_after_retry = *store.hash_chain_value.read();
+        assert_eq!(
+            chain_after_first, chain_after_retry,
+            "retry must NOT roll the hash chain a second time"
+        );
+
+        // Exactly one UpdateHashChainValue log emitted.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let ger_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| {
+                l.topics
+                    .first()
+                    .is_some_and(|t| t == UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .collect();
+        assert_eq!(ger_logs.len(), 1, "retry must NOT emit a duplicate GER log");
+    }
+
+    #[tokio::test]
+    // Audit H2 — the idempotency gate must be CASE-INSENSITIVE on tx_hash.
+    // transaction_hash is canonically lowercase hex across the store, so a
+    // retry that arrives with a differently-cased form of the SAME hash must
+    // still be recognized as already-emitted — otherwise the chain re-rolls
+    // and a duplicate UpdateHashChainValue log is emitted (double-emit).
+    async fn h2_commit_ger_event_atomic_is_idempotent_case_insensitive() {
+        let store = InMemoryStore::new();
+        let ger = [0x66u8; 32];
+
+        // First commit with an UPPER/mixed-case tx_hash.
+        store
+            .commit_ger_event_atomic(10, [0xbb; 32], "0xDeadBEEF01", &ger, None, None, 1000)
+            .await
+            .unwrap();
+        let chain_after_first = *store.hash_chain_value.read();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+
+        // Retry with the SAME hash in a different case (all lowercase).
+        store
+            .commit_ger_event_atomic(10, [0xbb; 32], "0xdeadbeef01", &ger, None, None, 1000)
+            .await
+            .unwrap();
+
+        let chain_after_retry = *store.hash_chain_value.read();
+        assert_eq!(
+            chain_after_first, chain_after_retry,
+            "differently-cased retry must NOT roll the hash chain a second time"
+        );
+
+        // Exactly one UpdateHashChainValue log across both casings.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let ger_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| {
+                l.topics
+                    .first()
+                    .is_some_and(|t| t == UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .collect();
+        assert_eq!(
+            ger_logs.len(),
+            1,
+            "differently-cased retry must NOT emit a duplicate GER log"
+        );
     }
 
     #[tokio::test]

@@ -157,6 +157,14 @@ if total_notes == 0 and total_logs > 0:
     print("SANITY FAIL: node query matched ZERO consumed notes while logs exist —")
     print(f"almost certainly a wrong/bech32 BRIDGE_ID ({bridge_id}); pass the HEX id.")
     sys.exit(2)
+if total_notes == 0:
+    # Task #26 sweep: an all-zero table is NOT a pass. Zero consumed bridge
+    # notes means nothing was verified — wrong NODE_CONTAINER, a bridge id
+    # from a previous stack, or an empty run. A verifier that saw no data
+    # must say so, not certify completeness.
+    print("SANITY FAIL: zero consumed bridge notes in the node snapshot — nothing verified.")
+    print(f"Check NODE_CONTAINER ({sys.argv[1]!r} snapshot), BRIDGE_ID ({bridge_id}), and that the run produced traffic.")
+    sys.exit(2)
 print("VERDICT:", "FAIL" if overall_fail else "PASS",
       "(exact = log at the note's consumption block; late = present but later block)")
 sys.exit(1 if overall_fail else 0)

@@ -57,6 +57,13 @@ case "$test_filter" in
         # assertion races the restore's intentional genesis walk.
         "$SCRIPT_DIR/e2e-reconciler-cursor-persistence.sh"
         echo ""
+        # Audit H2 — GER atomic-commit crash consistency: plain restart, asserts
+        # the hash chain is NOT re-rolled and no duplicate UpdateHashChainValue
+        # log is emitted. Runs after cursor-persistence (both plain restarts) but
+        # BEFORE the private-note test, which ends with a destructive
+        # reset-miden-store + restore that would perturb the chain/log counts.
+        "$SCRIPT_DIR/e2e-ger-atomic-commit.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
         echo ""
         # Cantina MA#18 — erased/unbridgeable B2AGG recovery. Settlement-safe
@@ -109,6 +116,9 @@ case "$test_filter" in
     reconciler-cursor)
         "$SCRIPT_DIR/e2e-reconciler-cursor-persistence.sh"
         ;;
+    ger-atomic)
+        "$SCRIPT_DIR/e2e-ger-atomic-commit.sh"
+        ;;
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         ;;
@@ -117,7 +127,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance|erased-note-recovery]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|erased-note-recovery]" >&2
         exit 1
         ;;
 esac
