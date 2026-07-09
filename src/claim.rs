@@ -844,8 +844,8 @@ async fn publish_claim_internal(
     // cycles of 3s (15s total) which gives the NTX builder plenty of time.
     //
     // G6 — early-exit when aggkit already records the GER as injected. The
-    // `mark_ger_injected` flag is set when the proxy submits the GER inject
-    // tx; for any GER that's been through aggkit's own submit path within this
+    // `is_injected` flag is set (by `commit_ger_event_atomic`) when the proxy
+    // submits the GER inject tx; for any GER that's been through aggkit's own submit path within this
     // process's lifetime, the bridge has already consumed it (or will within
     // milliseconds). We still sync_state once to refresh, but skip the
     // 4×3s = 12s of additional waiting in the common case.

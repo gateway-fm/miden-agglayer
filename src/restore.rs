@@ -1077,10 +1077,16 @@ pub(crate) async fn project_b2agg_note(
     // (dedup-stable).
     let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
 
-    let deposit_count = store.mark_note_processed(note_id_str.clone()).await?;
-
-    if let Err(err) = store
-        .add_bridge_event(
+    // H1 — atomic B2AGG commit. The legacy two-step mark-processed +
+    // emit-bridge-event sequence left a crash window: a process kill between
+    // the steps recorded the note as processed (deposit_counter bumped) with
+    // NO matching BridgeEvent, silently stranding the exit.
+    // `commit_b2agg_event_atomic` folds both into a single DB transaction and
+    // is idempotent on retry (reuses the original deposit_count, emits no
+    // duplicate log — H3).
+    let deposit_count = store
+        .commit_b2agg_event_atomic(
+            note_id_str.clone(),
             bridge_address,
             restore_block,
             block_hash,
@@ -1092,13 +1098,8 @@ pub(crate) async fn project_b2agg_note(
             &destination_address,
             origin_amount,
             &emit_metadata,
-            deposit_count,
         )
-        .await
-    {
-        let _ = store.unmark_note_processed(&note_id_str).await;
-        return Err(err);
-    }
+        .await?;
 
     // "emitted BridgeEvent" is the production signal a bridge-out was projected —
     // both the live projector and the startup restore replay reach here, and both
@@ -1540,7 +1541,7 @@ pub(crate) async fn project_ger_note(
     };
 
     store
-        .add_ger_update_event(
+        .commit_ger_event_atomic(
             block_number,
             block_hash,
             &tx_hash,
@@ -1568,8 +1569,6 @@ pub(crate) async fn project_ger_note(
                 tracing::debug!(tx = %tx_hash, "GER receipt not finalised: {e}");
             });
     }
-
-    store.mark_ger_injected(ger_bytes).await?;
 
     tracing::info!(
         note_id = %hex::encode(note.details_commitment().as_bytes()),
@@ -2307,10 +2306,27 @@ mod tests {
         let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
         ma3_register_faucet(&store, faucet_id).await;
 
-        // Reclaim consumer, but a pre-fix run already marked it processed.
+        // Reclaim consumer, but a pre-fix run already marked it processed
+        // (seeded via the sole processed-set write path).
         let note = ma3_b2agg_input_note(faucet_id, Some(id(TEST_SENDER_MANAGER)));
         let note_id = hex::encode(note.details_commitment().as_bytes());
-        store.mark_note_processed(note_id.clone()).await.unwrap();
+        store
+            .commit_b2agg_event_atomic(
+                note_id.clone(),
+                get_bridge_address(),
+                1,
+                [7u8; 32],
+                "0xtx-legacy",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0u8; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
 
         let outcome = project_b2agg_note(
             &store,
@@ -2341,9 +2357,26 @@ mod tests {
         let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
         ma3_register_faucet(&store, faucet_id).await;
 
+        // An earlier run committed this note through the atomic write path.
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
         let note_id = hex::encode(note.details_commitment().as_bytes());
-        store.mark_note_processed(note_id.clone()).await.unwrap();
+        store
+            .commit_b2agg_event_atomic(
+                note_id.clone(),
+                get_bridge_address(),
+                1,
+                [7u8; 32],
+                "0xtx-earlier",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0u8; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
 
         let outcome = project_b2agg_note(
             &store,
