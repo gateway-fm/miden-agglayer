@@ -47,7 +47,7 @@
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
-use crate::bridge_out::is_b2agg_note;
+use crate::bridge_out::{B2AggConsumerClass, classify_b2agg_consumer, is_b2agg_note};
 use crate::miden_client::{MidenClientLib, SyncListener};
 use crate::restore::{
     B2AggRestoreOutcome, ClaimProjectOutcome, GerProjectOutcome, project_b2agg_note,
@@ -1132,6 +1132,84 @@ impl SyntheticProjector {
         // Direct projection of spent-before-import recoveries (same sealed-block
         // rules as the late sweep; see `bucket_direct_notes`).
         let direct_done = Self::bucket_direct_notes(&direct_notes, &mut by_block, cursor, tip);
+        // ── Cantina #7 PoC: LET assignment gate ────────────────────────────
+        // `depositCount` is INFERRED from consumed-note enumeration; the bridge
+        // account's Local Exit Tree is the authority. The Cantina #9 monitor
+        // already compares the two AFTER emission (alarm-only); this gate runs
+        // the same comparison BEFORE any index is handed out and HALTS
+        // projection on mismatch — a stall is recoverable, a wrongly-numbered
+        // BridgeEvent is poison (unclaimable exit + every later index shifted).
+        //
+        // Invariant: every on-chain LET leaf corresponds to exactly one
+        // bridge-consumed B2AGG note (only the bridge's consumption appends a
+        // leaf; reclaims never touch bridge storage). Emitted notes advanced
+        // `deposit_counter`; visible-but-pending ones (this tick's batch,
+        // quarantined, deferred) will. So alignment reduces to:
+        //     count(visible bridge-consumed B2AGG) == read_let_num_leaves()
+        // computed from the SAME synced client-store snapshot as the consumed
+        // feed above — no extra RPC, no assignment-vs-feed race.
+        //
+        // `direct_recovered` notes are fabricated outside the client store
+        // (spent-before-import), so they are counted in explicitly.
+        if let Some(bridge_account) = client
+            .get_account(self.bridge_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("LET gate: get_account({}): {e}", self.bridge_id))?
+        {
+            let on_chain =
+                miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
+            let visible = consumed
+                .iter()
+                .chain(direct_notes.iter())
+                .filter(|n| {
+                    is_b2agg_note(n.details())
+                        && matches!(
+                            classify_b2agg_consumer(n.consumer_account(), self.bridge_id),
+                            B2AggConsumerClass::Emit
+                        )
+                })
+                .count() as u64;
+            match let_assignment_gate(visible, on_chain) {
+                LetGateVerdict::Aligned => {}
+                LetGateVerdict::InvisibleGap { gap } => {
+                    ::metrics::counter!(
+                        "bridge_let_assignment_gate_halted_total",
+                        "kind" => "invisible_gap"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        on_chain,
+                        visible,
+                        gap,
+                        "Cantina #7 LET assignment gate: on-chain LET has leaves no visible \
+                         B2AGG note accounts for (erased/undelivered exits?) — HALTING \
+                         projection so no misnumbered depositCount is emitted; the \
+                         reconciler/recovery must close the gap (retries next tick)"
+                    );
+                    return Ok(cursor);
+                }
+                LetGateVerdict::LocalAhead { excess } => {
+                    ::metrics::counter!(
+                        "bridge_let_assignment_gate_halted_total",
+                        "kind" => "local_ahead"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        on_chain,
+                        visible,
+                        excess,
+                        "Cantina #7 LET assignment gate: more visible B2AGG consumptions than \
+                         on-chain LET leaves (client-store corruption or foreign-note \
+                         misclassification) — HALTING projection (retries next tick)"
+                    );
+                    return Ok(cursor);
+                }
+            }
+        } else {
+            // Bridge account not yet in the local client store (first boot before
+            // import) — nothing can have been consumed by it either; proceed.
+            tracing::debug!("LET gate: bridge account not yet tracked — gate skipped");
+        }
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
@@ -1169,6 +1247,42 @@ impl SyntheticProjector {
             "synthetic projector tick: caught up to Miden tip"
         );
         Ok(cursor)
+    }
+}
+
+/// Cantina #7 PoC — verdict of the pre-emit LET assignment gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LetGateVerdict {
+    /// Every on-chain LET leaf is accounted for by a visible bridge-consumed
+    /// B2AGG note — index assignment is provably aligned; safe to project.
+    Aligned,
+    /// The on-chain LET holds `gap` leaves for which NO visible note exists
+    /// (erased notes, undelivered sync). Assigning the next local index would
+    /// misnumber it (and every exit after it) — projection must halt until
+    /// the reconciler/recovery makes the missing consumption visible.
+    InvisibleGap { gap: u64 },
+    /// More visible bridge-consumed B2AGG notes than on-chain leaves — local
+    /// client-store corruption or consumer misattribution. Fail closed.
+    LocalAhead { excess: u64 },
+}
+
+/// Cantina #7 PoC — the pure alignment predicate behind the assignment gate.
+///
+/// `visible` = bridge-consumed B2AGG notes in the synced client store (plus
+/// direct recoveries); `on_chain` = `AggLayerBridge::read_let_num_leaves` from
+/// the same snapshot. Equality means the local `deposit_counter` inference and
+/// the bridge's authoritative Local Exit Tree agree leaf-for-leaf. Pure (no
+/// I/O) so it is unit-testable directly.
+pub(crate) fn let_assignment_gate(visible: u64, on_chain: u64) -> LetGateVerdict {
+    use std::cmp::Ordering as CmpOrdering;
+    match visible.cmp(&on_chain) {
+        CmpOrdering::Equal => LetGateVerdict::Aligned,
+        CmpOrdering::Less => LetGateVerdict::InvisibleGap {
+            gap: on_chain - visible,
+        },
+        CmpOrdering::Greater => LetGateVerdict::LocalAhead {
+            excess: visible - on_chain,
+        },
     }
 }
 
@@ -1242,6 +1356,31 @@ mod tests {
     };
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
+
+    /// Cantina #7 PoC — the assignment gate's pure predicate. Aligned only on
+    /// exact equality; any invisible on-chain leaf halts (that is the finding's
+    /// failure mode: the next local index would misnumber the exit and shift
+    /// every one after it); local-ahead fails closed.
+    #[test]
+    fn cantina7_let_assignment_gate_verdicts() {
+        // Exact agreement — including the genesis (0,0) case — projects.
+        assert_eq!(let_assignment_gate(0, 0), LetGateVerdict::Aligned);
+        assert_eq!(let_assignment_gate(42, 42), LetGateVerdict::Aligned);
+        // On-chain leaves nobody visible accounts for → halt with the gap size.
+        assert_eq!(
+            let_assignment_gate(41, 42),
+            LetGateVerdict::InvisibleGap { gap: 1 }
+        );
+        assert_eq!(
+            let_assignment_gate(0, 7),
+            LetGateVerdict::InvisibleGap { gap: 7 }
+        );
+        // More visible consumptions than leaves → fail closed.
+        assert_eq!(
+            let_assignment_gate(43, 42),
+            LetGateVerdict::LocalAhead { excess: 1 }
+        );
+    }
 
     /// Reconciler private-note wedge (0.15.5 hotfix): the exact miden-client
     /// rejection that froze the retroactive-heal sweep must be classified as

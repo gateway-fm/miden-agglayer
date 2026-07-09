@@ -93,6 +93,15 @@ pub fn init_metrics() {
          kind=aggkit_ahead (local state corruption)."
     );
     describe_counter!(
+        "bridge_let_assignment_gate_halted_total",
+        "Projector ticks halted by the pre-emit LET assignment gate (Cantina #7 \
+         PoC): depositCount assignment refused because the on-chain Local Exit \
+         Tree and the visible bridge-consumed B2AGG set disagree. Labels: \
+         kind=invisible_gap (on-chain leaves with no visible note — erased or \
+         undelivered exits) or kind=local_ahead (more visible consumptions than \
+         leaves — store corruption; fail closed)."
+    );
+    describe_counter!(
         "bridge_burn_serial_collision_total",
         "BURN note serial collisions (Cantina #5). Each increment marks \
          a BURN note whose serial number was already observed for a \
