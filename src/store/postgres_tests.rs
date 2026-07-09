@@ -498,31 +498,6 @@ async fn test_pgstore_address_mappings() {
     assert_eq!(retrieved2, Some(miden_id2));
 }
 
-// ── Bridge-out ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_pgstore_bridge_out() {
-    let Some(store) = pg_store().await else {
-        return;
-    };
-
-    let note_id = format!(
-        "test_note_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-
-    assert!(!store.is_note_processed(&note_id).await.unwrap());
-
-    let _count = store.mark_note_processed(note_id.clone()).await.unwrap();
-
-    assert!(store.is_note_processed(&note_id).await.unwrap());
-    store.unmark_note_processed(&note_id).await.unwrap();
-    assert!(!store.is_note_processed(&note_id).await.unwrap());
-}
-
 // ── Claim watcher ────────────────────────────────────────────
 
 /// `is_claim_note_processed` + `mark_claim_note_processed` round-trip,
@@ -668,6 +643,155 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());
     // ClaimEvent dedup query finds the row.
     assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+}
+
+/// Audit H1/H3 — `commit_b2agg_event_atomic` is a single PG txn folding
+/// deposit_count allocation + BridgeEvent emission. It MUST be idempotent on
+/// retry: a second call for the same note reuses the deposit_count, does not
+/// bump the counter, and emits no duplicate synthetic log. Run with
+/// `DATABASE_URL=postgres://… cargo test --lib test_pgstore_commit_b2agg`.
+#[tokio::test]
+async fn test_pgstore_commit_b2agg_event_atomic_idempotent() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let note_id = format!("b2agg_atomic_test_{now_ns}");
+    let block = (now_ns % 1_000_000) as u64 + 20_000;
+    let tx_hash = format!("0xb2agg_atomic_{now_ns}");
+
+    let dc_before = store.get_deposit_count().await.unwrap();
+
+    let dc1 = store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(store.is_note_processed(&note_id).await.unwrap());
+
+    // Retry — simulates a re-projection after a crash before commit.
+    let dc2 = store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(dc1, dc2, "retry must reuse the same deposit_count");
+    assert_eq!(
+        store.get_deposit_count().await.unwrap(),
+        dc_before + 1,
+        "counter must advance exactly once"
+    );
+}
+
+/// Audit H1/H3 — PG-layer log-once idempotency. Calling
+/// `commit_b2agg_event_atomic` TWICE with the same deterministic `tx_hash`
+/// (the projector re-derives it from the note, so a re-projection produces the
+/// identical hash) must emit the synthetic BridgeEvent EXACTLY ONCE and leave
+/// store state unchanged on the second call. Complements
+/// `test_pgstore_commit_b2agg_event_atomic_idempotent`, which covers the
+/// deposit_count reuse; this asserts the log-count invariant directly via
+/// `get_logs_for_tx`. Only the InMemoryStore equivalent existed before. DB-gated
+/// (skipped without `DATABASE_URL`).
+#[tokio::test]
+async fn test_pgstore_commit_b2agg_event_atomic_emits_log_once() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let note_id = format!("b2agg_logonce_test_{now_ns}");
+    let block = (now_ns % 1_000_000) as u64 + 30_000;
+    let tx_hash = format!("0xb2agg_logonce_{now_ns}");
+
+    // First commit emits the BridgeEvent.
+    store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let logs_after_first = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after_first.len(),
+        1,
+        "first commit must emit exactly one BridgeEvent"
+    );
+    let dc_after_first = store.get_deposit_count().await.unwrap();
+
+    // Retry with the SAME tx_hash — must be a no-op for the log and the counter.
+    store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let logs_after_retry = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after_retry.len(),
+        1,
+        "retry must NOT emit a duplicate BridgeEvent — log emitted exactly once"
+    );
+    assert_eq!(
+        store.get_deposit_count().await.unwrap(),
+        dc_after_first,
+        "retry must not advance the deposit_counter — store state unchanged"
+    );
 }
 
 // ── RD-913 monitor trackers ─────────────────────────────────

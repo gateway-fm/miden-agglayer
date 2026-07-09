@@ -1331,32 +1331,135 @@ impl Store for PgStore {
         Ok(val as u64)
     }
 
-    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_one(
-                "WITH counter AS (
-                    UPDATE service_state SET deposit_counter = deposit_counter + 1, updated_at = now() WHERE id = 1
-                    RETURNING deposit_counter - 1 AS val
-                 )
-                 INSERT INTO bridge_out_processed (note_id, deposit_count)
-                 SELECT $1, val FROM counter
-                 RETURNING deposit_count",
-                &[&note_id],
-            )
-            .await?;
-        Ok(row.get::<_, i32>(0) as u32)
-    }
+    /// Atomic, idempotent B2AGG commit (audit H1/H3). Single postgres txn:
+    ///   1. reuse-or-allocate `deposit_count` (no counter bump on retry)
+    ///   2. allocate `log_index` + INSERT the synthetic BridgeEvent (skipped if
+    ///      a log with this deterministic tx_hash already exists)
+    /// A crash at any point rolls the whole txn back, so the note can never be
+    /// left marked-processed without a matching BridgeEvent.
+    ///
+    /// SINGLE-WRITER SERIAL INVARIANT — why the `SELECT 1 FROM synthetic_logs`
+    /// read-then-INSERT in step 2 (and the analogous read-then-INSERT in step 1)
+    /// is NOT a reachable TOCTOU race, and why no row lock / UNIQUE constraint /
+    /// `ON CONFLICT` is required:
+    ///
+    /// This method is called ONLY from the projector path, which is strictly
+    /// serial. The projector `tick()` borrows `&mut MidenClientLib` — one
+    /// non-reentrant client instance — and drives the commit loop one block at a
+    /// time, writing before advancing the cursor:
+    ///     while cursor < tip { project_block_notes(next).await?; set_projector_cursor(next).await? }
+    /// There is exactly one in-flight `commit_b2agg_event_atomic` at any moment
+    /// for a given store, so no concurrent writer can slip an insert between this
+    /// transaction's SELECT and its INSERT. The `RECONCILE_CONCURRENCY` fan-out
+    /// is FETCH-only (parallel `sync_note_ids`), never the commit — it never
+    /// touches `service_state`, `bridge_out_processed`, or `synthetic_logs`.
+    /// A Copilot reviewer flagged the read/insert gap as a TOCTOU; it reads as
+    /// intentional under this single-writer serial invariant.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
 
-    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM bridge_out_processed WHERE note_id = $1",
+        // 1. Reuse-or-allocate deposit_count. Idempotent: a retry after a
+        //    committed txn finds the existing row and reuses its count, so the
+        //    counter never advances twice for one note (no gap — H3).
+        let deposit_count: i32 = if let Some(row) = txn
+            .query_opt(
+                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
                 &[&note_id],
             )
+            .await?
+        {
+            row.get(0)
+        } else {
+            let row = txn
+                .query_one(
+                    "UPDATE service_state
+                     SET deposit_counter = deposit_counter + 1, updated_at = now()
+                     WHERE id = 1
+                     RETURNING deposit_counter - 1",
+                    &[],
+                )
+                .await?;
+            let dc: i32 = row.get(0);
+            txn.execute(
+                "INSERT INTO bridge_out_processed (note_id, deposit_count) VALUES ($1, $2)",
+                &[&note_id, &dc],
+            )
             .await?;
-        Ok(())
+            dc
+        };
+
+        // 2. Idempotent log emission. tx_hash is derived deterministically from
+        //    note_id, so a retry produces the same tx_hash — skip the insert if
+        //    a row already exists for it (no duplicate BridgeEvent, no gap in
+        //    log_index).
+        let already_emitted = txn
+            .query_opt(
+                "SELECT 1 FROM synthetic_logs WHERE transaction_hash = $1 LIMIT 1",
+                &[&tx_hash],
+            )
+            .await?
+            .is_some();
+        if !already_emitted {
+            let row = txn
+                .query_one(
+                    "UPDATE service_state
+                     SET log_counter = log_counter + 1, updated_at = now()
+                     WHERE id = 1
+                     RETURNING log_counter - 1",
+                    &[],
+                )
+                .await?;
+            let log_index: i64 = row.get(0);
+
+            let data = crate::bridge_out::encode_bridge_event_data(
+                leaf_type,
+                origin_network,
+                origin_address,
+                destination_network,
+                destination_address,
+                amount,
+                metadata,
+                deposit_count as u32,
+            );
+            let topics_owned: [String; 1] = [crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()];
+            let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
+            txn.execute(
+                "INSERT INTO synthetic_logs
+                    (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &log_index,
+                    &bridge_address,
+                    &topics,
+                    &data,
+                    &(block_number as i64),
+                    &block_hash.as_slice(),
+                    &tx_hash,
+                    &0_i64,
+                    &false,
+                ],
+            )
+            .await?;
+        }
+
+        txn.commit().await?;
+        Ok(deposit_count as u32)
     }
 
     // ── Claim watcher ────────────────────────────────────────────
