@@ -48,15 +48,6 @@ case "$test_filter" in
         # tests (it needs the steady-state reconciler/projector, no restarts).
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         echo ""
-        # MA#18 recovery e2e runs BEFORE the proxy-restarting tests: its induced
-        # "unknown faucet" state (deleted faucet_registry row) is deliberately
-        # repaired by --restore's restore_faucet_identities (Cantina #6 heal),
-        # so a restore still finishing in the background — private-note's
-        # Phase B ends with reset+restore — can resurrect the row mid-test
-        # and flip the outcome (observed live: quarantine in 2s on one run,
-        # heal-won no-quarantine timeout on the next).
-        "$SCRIPT_DIR/e2e-erased-note-recovery.sh"
-        echo ""
         # Proxy-restarting tests run LAST (they must not race the other
         # scripts' steady-state assumptions), in this order: the cursor test
         # does a plain restart and asserts the sweep RESUMES from the
@@ -130,6 +121,12 @@ case "$test_filter" in
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         ;;
     erased-note-recovery)
+        # ON-DEMAND, not in 'all': validates the quarantine->recovery machinery
+        # deterministically, but its fault injection interacts with the suite's
+        # shared state (Cantina #6 heal races, and its timing shifts exposed an
+        # aggkit L2BridgeSyncer halt after private-note's reset+restore). Run it
+        # standalone on a fresh stack. The REAL erased-note validation is
+        # e2e-test.sh erased-note-hunt.
         "$SCRIPT_DIR/e2e-erased-note-recovery.sh"
         ;;
     erased-note-hunt)
