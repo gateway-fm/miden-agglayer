@@ -269,10 +269,16 @@ pass "B2AGG note created + consumed on-chain (LET leaf appended, L2 funds burned
 
 # The consumed B2AGG must land a quarantine row (unknown_faucet) — the positive
 # operator handle that stands in for the erased note the indexer couldn't see.
+# NOTE: do NOT filter on bridge_account = "$BRIDGE_ID" here — the toml (and
+# hence $BRIDGE_ID) is BECH32 while the PG column stores the HEX form, so the
+# equality never matches and the wait times out with the row present (the
+# bech32-vs-hex trap documented in e2e-bridge-loadtest-isolated.sh; it cost
+# this test its first live run). Count-delta over the snapshot baseline is
+# both format-proof and stronger (asserts THIS bridge-out caused the row).
 wait_for "quarantine row recorded" \
-    "[[ \"\$(pg \"SELECT count(*) FROM unbridgeable_bridge_outs WHERE bridge_account = '$BRIDGE_ID' AND reason = 'unknown_faucet'\")\" -gt 0 ]]" \
+    "[[ \"\$(pg \"SELECT count(*) FROM unbridgeable_bridge_outs WHERE reason = 'unknown_faucet'\")\" -gt $QROWS_BEFORE ]]" \
     120 5
-NOTE_ID=$(pg "SELECT note_id FROM unbridgeable_bridge_outs WHERE bridge_account = '$BRIDGE_ID' AND reason = 'unknown_faucet' ORDER BY observed_block DESC LIMIT 1")
+NOTE_ID=$(pg "SELECT note_id FROM unbridgeable_bridge_outs WHERE reason = 'unknown_faucet' ORDER BY observed_block DESC LIMIT 1")
 [[ -z "$NOTE_ID" ]] && fail "no quarantined note_id found"
 pass "BUG reproduced: bridge-out quarantined (note_id=$NOTE_ID, reason=unknown_faucet)"
 
