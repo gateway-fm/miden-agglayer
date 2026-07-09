@@ -10,7 +10,9 @@
 
 use super::postgres::PgStore;
 use super::{Store, TxnEntry};
-use crate::log_synthesis::{AddressFilter, GerEntry, LogFilter, SyntheticLog};
+use crate::log_synthesis::{
+    AddressFilter, GerEntry, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
+};
 use alloy::consensus::{TxEip1559, TxEnvelope};
 use alloy::primitives::{Address, Signature, TxHash, U256};
 
@@ -176,8 +178,11 @@ async fn test_pgstore_ger_lifecycle() {
     // Not injected yet
     assert!(!store.is_ger_injected(&ger).await.unwrap());
 
-    // Mark injected
-    store.mark_ger_injected(ger).await.unwrap();
+    // Mark injected (via the atomic commit, which folds in injection)
+    store
+        .commit_ger_event_atomic(100, [0u8; 32], "0xger_inject_tx", &ger, None, None, 999)
+        .await
+        .unwrap();
     assert!(store.is_ger_injected(&ger).await.unwrap());
 }
 
@@ -193,7 +198,7 @@ async fn test_pgstore_ger_update_event() {
 
     let ger = [0x55u8; 32];
     store
-        .add_ger_update_event(50, [0u8; 32], "0xger_tx", &ger, None, None, 999)
+        .commit_ger_event_atomic(50, [0u8; 32], "0xger_tx", &ger, None, None, 999)
         .await
         .unwrap();
 
@@ -203,6 +208,148 @@ async fn test_pgstore_ger_update_event() {
 
     // GER should be seen
     assert!(store.has_seen_ger(&ger).await.unwrap());
+}
+
+/// Audit H2 (PG twin) — `commit_ger_event_atomic` must be idempotent on retry.
+/// The legacy two-step path (rolling the chain + emitting the log, then a
+/// separate injection mark) left a crash window: if the process died between
+/// them the chain had ALREADY been rolled while `is_injected` was still FALSE, so on
+/// restart the projector re-rolled the hash chain and emitted a DUPLICATE
+/// UpdateHashChainValue log — diverging the proxy's `hash_chain_value` from
+/// aggkit. Calling `commit_ger_event_atomic` twice with the same deterministic
+/// `tx_hash` must emit exactly ONE log and leave the emitted `hash_chain_value`
+/// (the log's 3rd topic) unchanged. This is the Postgres twin of
+/// `memory.rs::h2_commit_ger_event_atomic_is_idempotent_on_retry` — only the
+/// in-memory path was covered before.
+///
+/// PG-gated: skips when `DATABASE_URL` is unset; runs in the postgres-feature CI.
+#[tokio::test]
+async fn test_pgstore_h2_commit_ger_event_atomic_is_idempotent_on_retry() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    // Unique tx_hash + GER so the assertions stay isolated from any GER that a
+    // concurrent test rolls into the shared `service_state` singleton: the
+    // idempotency gate keys on `tx_hash`, `is_ger_injected` keys on the GER, and
+    // the log we inspect is fetched by `tx_hash`.
+    let nonce = rand_u64();
+    let tx_hash = format!("0xh2_atomic_{nonce:016x}");
+    let mut ger = [0x55u8; 32];
+    ger[..8].copy_from_slice(&nonce.to_be_bytes());
+
+    assert!(!store.is_ger_injected(&ger).await.unwrap());
+
+    // First commit: rolls the chain, emits one log, sets is_injected = TRUE.
+    store
+        .commit_ger_event_atomic(10, [0xaa; 32], &tx_hash, &ger, None, None, 1000)
+        .await
+        .unwrap();
+    assert!(store.is_ger_injected(&ger).await.unwrap());
+
+    let logs_first = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_first.len(),
+        1,
+        "first commit must emit exactly one UpdateHashChainValue log"
+    );
+    assert_eq!(
+        logs_first[0].topics[0].to_lowercase(),
+        UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase(),
+        "emitted log must carry the UpdateHashChainValue topic"
+    );
+    // topic[2] is the rolled hash_chain_value the log carries — our observable
+    // proxy for the on-chain-visible chain value.
+    let chain_after_first = logs_first[0].topics[2].clone();
+
+    // Retry with the SAME tx_hash — simulates a re-projection after a crash
+    // before the txn committed. The gate (a log with this tx_hash already
+    // exists) must skip the chain roll + log emission; is_injected stays TRUE.
+    store
+        .commit_ger_event_atomic(10, [0xaa; 32], &tx_hash, &ger, None, None, 1000)
+        .await
+        .unwrap();
+
+    let logs_after = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after.len(),
+        1,
+        "retry must NOT emit a duplicate UpdateHashChainValue log"
+    );
+    assert_eq!(
+        logs_after[0].topics[2], chain_after_first,
+        "retry must NOT roll the hash chain a second time"
+    );
+    assert!(
+        store.is_ger_injected(&ger).await.unwrap(),
+        "GER must remain injected after the idempotent retry"
+    );
+}
+
+/// Audit H2 (case-insensitivity). The idempotency gate keys on `transaction_hash`,
+/// which is canonically lowercase hex everywhere else in the store
+/// (`get_logs_for_tx` queries `lower(transaction_hash)`, `memory.rs` stores
+/// lowercase). A case-SENSITIVE gate would miss an already-stored lowercase row
+/// when a retry arrives with a mixed/upper-case form of the SAME hash → the
+/// chain would re-roll and a DUPLICATE UpdateHashChainValue log would be emitted.
+/// Committing with an UPPER-case `tx_hash` and retrying with its lowercase form
+/// must emit exactly ONE log and leave `hash_chain_value` unchanged.
+///
+/// PG-gated: skips when `DATABASE_URL` is unset; runs in the postgres-feature CI.
+#[tokio::test]
+async fn test_pgstore_h2_commit_ger_event_atomic_is_idempotent_case_insensitive() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let nonce = rand_u64();
+    // Upper/mixed-case hex tx_hash for the first commit.
+    let tx_hash_upper = format!("0xH2CASE_{nonce:016X}");
+    let tx_hash_lower = tx_hash_upper.to_lowercase();
+    let mut ger = [0x77u8; 32];
+    ger[..8].copy_from_slice(&nonce.to_be_bytes());
+
+    assert!(!store.is_ger_injected(&ger).await.unwrap());
+
+    // First commit with the UPPER-case tx_hash.
+    store
+        .commit_ger_event_atomic(10, [0xbb; 32], &tx_hash_upper, &ger, None, None, 1000)
+        .await
+        .unwrap();
+    assert!(store.is_ger_injected(&ger).await.unwrap());
+
+    // Canonical lowercase lookup must find the emitted log (stored lowercase).
+    let logs_first = store.get_logs_for_tx(&tx_hash_lower).await.unwrap();
+    assert_eq!(
+        logs_first.len(),
+        1,
+        "first commit must emit exactly one UpdateHashChainValue log (found by lowercase key)"
+    );
+    let chain_after_first = logs_first[0].topics[2].clone();
+
+    // Retry with the DIFFERENTLY-CASED form of the SAME hash (lowercase). The
+    // case-insensitive gate must recognize it as already-emitted and skip.
+    store
+        .commit_ger_event_atomic(10, [0xbb; 32], &tx_hash_lower, &ger, None, None, 1000)
+        .await
+        .unwrap();
+
+    let logs_after = store.get_logs_for_tx(&tx_hash_lower).await.unwrap();
+    assert_eq!(
+        logs_after.len(),
+        1,
+        "differently-cased retry must NOT emit a duplicate UpdateHashChainValue log"
+    );
+    assert_eq!(
+        logs_after[0].topics[2], chain_after_first,
+        "differently-cased retry must NOT roll the hash chain a second time"
+    );
+    assert!(
+        store.is_ger_injected(&ger).await.unwrap(),
+        "GER must remain injected after the idempotent case-insensitive retry"
+    );
 }
 
 // ── Transactions ─────────────────────────────────────────────
@@ -351,31 +498,6 @@ async fn test_pgstore_address_mappings() {
     assert_eq!(retrieved2, Some(miden_id2));
 }
 
-// ── Bridge-out ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_pgstore_bridge_out() {
-    let Some(store) = pg_store().await else {
-        return;
-    };
-
-    let note_id = format!(
-        "test_note_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-
-    assert!(!store.is_note_processed(&note_id).await.unwrap());
-
-    let _count = store.mark_note_processed(note_id.clone()).await.unwrap();
-
-    assert!(store.is_note_processed(&note_id).await.unwrap());
-    store.unmark_note_processed(&note_id).await.unwrap();
-    assert!(!store.is_note_processed(&note_id).await.unwrap());
-}
-
 // ── Claim watcher ────────────────────────────────────────────
 
 /// `is_claim_note_processed` + `mark_claim_note_processed` round-trip,
@@ -521,6 +643,155 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());
     // ClaimEvent dedup query finds the row.
     assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+}
+
+/// Audit H1/H3 — `commit_b2agg_event_atomic` is a single PG txn folding
+/// deposit_count allocation + BridgeEvent emission. It MUST be idempotent on
+/// retry: a second call for the same note reuses the deposit_count, does not
+/// bump the counter, and emits no duplicate synthetic log. Run with
+/// `DATABASE_URL=postgres://… cargo test --lib test_pgstore_commit_b2agg`.
+#[tokio::test]
+async fn test_pgstore_commit_b2agg_event_atomic_idempotent() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let note_id = format!("b2agg_atomic_test_{now_ns}");
+    let block = (now_ns % 1_000_000) as u64 + 20_000;
+    let tx_hash = format!("0xb2agg_atomic_{now_ns}");
+
+    let dc_before = store.get_deposit_count().await.unwrap();
+
+    let dc1 = store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(store.is_note_processed(&note_id).await.unwrap());
+
+    // Retry — simulates a re-projection after a crash before commit.
+    let dc2 = store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(dc1, dc2, "retry must reuse the same deposit_count");
+    assert_eq!(
+        store.get_deposit_count().await.unwrap(),
+        dc_before + 1,
+        "counter must advance exactly once"
+    );
+}
+
+/// Audit H1/H3 — PG-layer log-once idempotency. Calling
+/// `commit_b2agg_event_atomic` TWICE with the same deterministic `tx_hash`
+/// (the projector re-derives it from the note, so a re-projection produces the
+/// identical hash) must emit the synthetic BridgeEvent EXACTLY ONCE and leave
+/// store state unchanged on the second call. Complements
+/// `test_pgstore_commit_b2agg_event_atomic_idempotent`, which covers the
+/// deposit_count reuse; this asserts the log-count invariant directly via
+/// `get_logs_for_tx`. Only the InMemoryStore equivalent existed before. DB-gated
+/// (skipped without `DATABASE_URL`).
+#[tokio::test]
+async fn test_pgstore_commit_b2agg_event_atomic_emits_log_once() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let note_id = format!("b2agg_logonce_test_{now_ns}");
+    let block = (now_ns % 1_000_000) as u64 + 30_000;
+    let tx_hash = format!("0xb2agg_logonce_{now_ns}");
+
+    // First commit emits the BridgeEvent.
+    store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let logs_after_first = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after_first.len(),
+        1,
+        "first commit must emit exactly one BridgeEvent"
+    );
+    let dc_after_first = store.get_deposit_count().await.unwrap();
+
+    // Retry with the SAME tx_hash — must be a no-op for the log and the counter.
+    store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
+            "0xbridge",
+            block,
+            [0u8; 32],
+            &tx_hash,
+            0,
+            1,
+            &[0u8; 20],
+            0,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let logs_after_retry = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    assert_eq!(
+        logs_after_retry.len(),
+        1,
+        "retry must NOT emit a duplicate BridgeEvent — log emitted exactly once"
+    );
+    assert_eq!(
+        store.get_deposit_count().await.unwrap(),
+        dc_after_first,
+        "retry must not advance the deposit_counter — store state unchanged"
+    );
 }
 
 // ── RD-913 monitor trackers ─────────────────────────────────

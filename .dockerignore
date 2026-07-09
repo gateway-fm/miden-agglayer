@@ -1,8 +1,18 @@
 # Runtime + build artefacts that must never enter the proxy image build context.
-# .miden-agglayer-data holds a root-owned keystore (created by the proxy
-# container) that the unprivileged build daemon cannot read — including it
-# fails the build with "permission denied".
+# .miden-agglayer-data and .b2agg-store hold root-owned keystores/sqlite stores
+# (created by the proxy / loadtest containers) that the unprivileged build daemon
+# cannot read — including them fails the build with "permission denied". The
+# `**/`-prefixed forms use a leading recursive wildcard that matches the pattern
+# at any directory depth, so nested copies (e.g. under Claude Code agent
+# worktrees in .claude/) are excluded too, not just the repo-root copy.
+**/.miden-agglayer-data/
 .miden-agglayer-data/
+**/.b2agg-store/
+.b2agg-store/
+# Claude Code state — agent worktrees under .claude/worktrees each carry their
+# own runtime data dirs (root-owned) and full source checkouts; none of it
+# belongs in the image build context.
+.claude/
 target/
 out/
 cache/

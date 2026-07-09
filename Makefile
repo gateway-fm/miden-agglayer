@@ -208,7 +208,7 @@ e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
 	./scripts/setup-fixtures.sh
 
 .PHONY: e2e-clean-data
-e2e-clean-data: ## Wipe .miden-agglayer-data/ + node_data volume so the stack re-inits against fresh genesis
+e2e-clean-data: ## Wipe .miden-agglayer-data/ + .b2agg-store/ + node_data volume so the stack re-inits against fresh genesis
 	# Proto 0.15: the node is a microservice stack whose state (genesis block,
 	# store, validator + ntx-builder DBs) lives in the `node_data` Docker volume,
 	# and the proxy's genesis pin lives in .miden-agglayer-data/store.sqlite3.
@@ -216,12 +216,32 @@ e2e-clean-data: ## Wipe .miden-agglayer-data/ + node_data volume so the stack re
 	# client's sync fail ("accept header validation failed"), so wipe BOTH for a
 	# clean slate. The bootstrap services rebuild genesis (deterministic from the
 	# vendored agglayer .mac files) and the proxy's --init redeploys accounts in
-	# ~45s — acceptable for E2E. The volume rm is guarded so it no-ops when the
-	# volume is absent or still in use (containers must be down first, which the
-	# regression harness guarantees via `make e2e-down`).
-	rm -rf .miden-agglayer-data
+	# ~45s — acceptable for E2E.
+	#
+	# Task #26 hardening — three closed holes:
+	#  (1) .b2agg-store/ (the tests' ISOLATED miden-client stores) is wiped too:
+	#      an isolated store surviving a stack recreation carries the OLD chain's
+	#      genesis commitment in its gRPC Accept header and the new node refuses
+	#      the connection (AcceptHeaderError, shown as a bare "RPC error") — one
+	#      such store wedged e2e-claim-provenance on 7 consecutive cert runs.
+	#      Fresh stack ⇒ no isolated store may outlive it, ever.
+	#  (2) Containers create root-owned files in these dirs; a plain `rm -rf` as
+	#      the invoking user fails on them and historically failed SILENTLY —
+	#      stale "fresh" stacks cost a night of debugging. Fall back to a root
+	#      container, then ASSERT the dirs are actually empty (wipe-that-didn't-
+	#      wipe is a hard stop, not a warning).
+	#  (3) The node_data volume rm distinguishes "absent" (fine) from "in use"
+	#      (a live container still mounts it ⇒ `make e2e-down` was not run ⇒
+	#      stale node state would survive under a "fresh" stack — hard stop).
+	rm -rf .miden-agglayer-data .b2agg-store 2>/dev/null || \
+		docker run --rm -v "$(CURDIR):/work" alpine sh -c 'rm -rf /work/.miden-agglayer-data /work/.b2agg-store'
+	@if [ -e .miden-agglayer-data ] || [ -e .b2agg-store ]; then \
+		echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
+		ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; fi
 	mkdir -p .miden-agglayer-data/tmp
-	-docker volume rm miden-agglayer_node_data 2>/dev/null || true
+	@out=$$(docker volume rm miden-agglayer_node_data 2>&1) || { \
+		echo "$$out" | grep -qi "no such volume" || { \
+			echo "e2e-clean-data: cannot remove node_data volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)

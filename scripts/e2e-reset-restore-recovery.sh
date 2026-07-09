@@ -227,7 +227,7 @@ case "$MODE" in
     ;;
   expect_recovery)
     # Post-55fa17a: Phase 0 reimport re-populates. Should be close to BEFORE_ROWS
-    # (some accounts may not be network-tracked — wallet_hardhat especially —
+    # (an account may not be network-tracked — the locally-deployed service —
     # so we allow a small loss; the network-tracked accounts MUST be present).
     [[ "$AFTER_ROWS" -gt 0 ]] \
       || fail "MODE=expect_recovery but latest_account_headers is empty after restore — Phase 0 didn't reimport"
