@@ -92,17 +92,30 @@ command -v python3 >/dev/null || fail "python3 not found"
 export PGPASSWORD="$PG_PASS"
 PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAX)
 # stderr dropped: locale-warning noise corrupts captures (see sibling scripts).
-pgq() { "${PSQL[@]}" -c "$1" 2>/dev/null; }
+pgq() {
+    # STOPPER on DB error (task #26 sweep): pre-fix `2>/dev/null` turned a dead
+    # Postgres into an empty string, which ${VAR:-0} then misread as "0 rows".
+    local out
+    if ! out=$("${PSQL[@]}" -c "$1" 2>&1); then
+        echo "pgq FAILED: $out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+}
 
 # Prometheus counter from the proxy's /metrics (0 when absent). State/metric
 # assertions over log greps throughout — docker-log field regexes are fragile
 # (ANSI escapes / format drift; see e2e log-assertion history).
 counter() {
-    local name="$1" value
-    value=$(curl -s "${L2_RPC}/metrics" | awk -v n="$name" '
+    local name="$1" body value
+    # STOPPER on unreachable /metrics (task #26 sweep): pre-fix, a down proxy
+    # read as 0 — a baseline taken against a dead endpoint could false-PASS
+    # delta assertions. Absent metric stays a legit 0 (never-incremented).
+    body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
+    value=$(awk -v n="$name" '
         $0 ~ ("^" n " ") { print $2; found=1; exit }
         END { if (!found) print 0 }
-    ')
+    ' <<<"$body")
     echo "${value%.*}"
 }
 
