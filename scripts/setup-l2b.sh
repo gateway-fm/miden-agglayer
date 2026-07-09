@@ -57,6 +57,11 @@ ROLLUP2=$(cast call $ROLLUP_MANAGER \
   "rollupIDToRollupData(uint32)(address,uint64,address,uint64,bytes32,uint64,uint64,uint64,uint64,uint64,uint64,uint8)" \
   "$L2B_NETWORK_ID" --rpc-url "$L1_RPC" | head -1)
 log "rollup #2 aggchain: $ROLLUP2"
+# The generated configs (gen-l2b-configs.sh) hardcode this snapshot-deterministic
+# address — fail loudly if the chain state diverged from the expectation.
+ROLLUP2_EXPECTED="${ROLLUP2_ADDR:-0x5D1A491A416feEbf8C123A558ec28A239960bd0E}"
+[ "$ROLLUP2" = "$ROLLUP2_EXPECTED" ] || \
+  fail "rollup #2 at $ROLLUP2 but configs expect $ROLLUP2_EXPECTED — re-run scripts/gen-l2b-configs.sh with ROLLUP2_ADDR=$ROLLUP2 and restart aggkit-l2b"
 
 # ── Step 2: initialize the aggchain (selector 0x697427f6, hand-built ABI) ───
 if [ "$(cast call "$ROLLUP2" 'trustedSequencer()(address)' --rpc-url "$L1_RPC" 2>/dev/null)" = "$SEQUENCER" ]; then
@@ -82,17 +87,35 @@ fi
 log "  trustedSequencer: $(cast call "$ROLLUP2" 'trustedSequencer()(address)' --rpc-url "$L1_RPC")"
 log "  networkName:      $(cast call "$ROLLUP2" 'networkName()(string)' --rpc-url "$L1_RPC")"
 
-# ── Step 3: bridge contracts on L2B (extract impl from L1 snapshot) ─────────
-# The L1 bridge proxy's implementation (PolygonZkEVMBridgeV2, ~13KB) is copied
-# onto L2B via anvil_setCode, fronted by a fresh proxy, then initialized with
-# networkID=$L2B_NETWORK_ID and the sovereign-GER address. TODO(next): the
-# sovereign L2 GER contract (insertGlobalExitRoot / updateExitRoot ABI) is NOT
-# on the L1 snapshot — provide it as a small vendored contract (see notes).
+# ── Step 3: bridge + GER contracts on L2B ────────────────────────────────────
+# Bridge: the L1 proxy's implementation (PolygonZkEVMBridgeV2, ~13KB) is copied
+# onto L2B via anvil_setCode, fronted by the same proxy bytecode at the same
+# address, then initialized with networkID=$L2B_NETWORK_ID. GER: the vendored
+# fixtures/SovereignGER.sol (sovereign ABI subset) setCode'd at the convention
+# address and initialized with (bridge, aggoracle-updater).
 if ! cast chain-id --rpc-url "$L2B_RPC" >/dev/null 2>&1; then
   log "Step 3 SKIPPED: L2B not reachable at $L2B_RPC (bring up anvil-l2b first)"
   exit 0
 fi
-log "Step 3: deploying bridge on L2B ($L2B_RPC)"
+FIXTURES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)"
+KEYSTORE_PW="pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"   # TEST-ONLY (see fixtures warning)
+AGGORACLE_ADDR=$(cast wallet address --keystore "$FIXTURES_DIR/aggoracle.keystore" \
+  --password "$KEYSTORE_PW" 2>/dev/null) || fail "cannot derive aggoracle address"
+log "Step 3a: funding admin/sequencer/aggoracle on L2B"
+for A in $ADMIN $SEQUENCER "$AGGORACLE_ADDR"; do
+  cast rpc anvil_setBalance "$A" 0x21e19e0c9bab2400000 --rpc-url "$L2B_RPC" >/dev/null
+done
+log "Step 3b: SovereignGER stub at $L2_GER_ADDR (updater=$AGGORACLE_ADDR)"
+GER_RUNTIME=$(forge inspect "$FIXTURES_DIR/SovereignGER.sol:SovereignGER" deployedBytecode 2>/dev/null) \
+  || fail "forge inspect SovereignGER failed"
+cast rpc anvil_setCode "$L2_GER_ADDR" "$GER_RUNTIME" --rpc-url "$L2B_RPC" >/dev/null
+if [ "$(cast call "$L2_GER_ADDR" 'bridgeAddress()(address)' --rpc-url "$L2B_RPC")" = "$L1_BRIDGE" ]; then
+  log "  GER stub already initialized"
+else
+  cast send "$L2_GER_ADDR" "initialize(address,address)" "$L1_BRIDGE" "$AGGORACLE_ADDR" \
+    --private-key $ADMIN_KEY --rpc-url "$L2B_RPC" >/dev/null || fail "GER stub initialize"
+fi
+log "Step 3c: deploying bridge on L2B ($L2B_RPC)"
 IMPL_ADDR_WORD=$(cast storage $L1_BRIDGE $EIP1967_IMPL --rpc-url "$L1_RPC")
 IMPL_CODE=$(cast code "0x${IMPL_ADDR_WORD:26}" --rpc-url "$L1_RPC")
 [ ${#IMPL_CODE} -gt 100 ] || fail "could not extract bridge impl bytecode from L1"
@@ -108,10 +131,14 @@ cast rpc anvil_setStorageAt "$L1_BRIDGE" "$EIP1967_IMPL" \
   "0x000000000000000000000000${BRIDGE_IMPL_L2B:2}" --rpc-url "$L2B_RPC" >/dev/null
 log "  proxy staged at $L1_BRIDGE -> $BRIDGE_IMPL_L2B"
 # initialize(networkID, gasToken, gasTokenNetwork, GER, rollupManager, gasTokenMetadata)
-cast send $L1_BRIDGE \
-  "initialize(uint32,address,uint32,address,address,bytes)" \
-  "$L2B_NETWORK_ID" 0x0000000000000000000000000000000000000000 0 \
-  "$L2_GER_ADDR" 0x0000000000000000000000000000000000000000 0x \
-  --private-key $ADMIN_KEY --rpc-url "$L2B_RPC" >/dev/null || fail "bridge initialize on L2B"
+if [ "$(cast call $L1_BRIDGE 'networkID()(uint32)' --rpc-url "$L2B_RPC" 2>/dev/null)" = "$L2B_NETWORK_ID" ]; then
+  log "  bridge already initialized (networkID=$L2B_NETWORK_ID)"
+else
+  cast send $L1_BRIDGE \
+    "initialize(uint32,address,uint32,address,address,bytes)" \
+    "$L2B_NETWORK_ID" 0x0000000000000000000000000000000000000000 0 \
+    "$L2_GER_ADDR" 0x0000000000000000000000000000000000000000 0x \
+    --private-key $ADMIN_KEY --rpc-url "$L2B_RPC" >/dev/null || fail "bridge initialize on L2B"
+fi
 log "  L2B bridge networkID: $(cast call $L1_BRIDGE 'networkID()(uint32)' --rpc-url "$L2B_RPC")"
 log "setup-l2b DONE (GER stub on L2B still TODO — see docs/l2-to-l2-notes.md)"

@@ -63,3 +63,18 @@ Dry-ran against the real anvil snapshot (brought up the `anvil` service alone). 
 - **agglayer config**: add `[full-node-rpcs] 2 = "http://anvil-l2b:8545"` + `[proof-signers] 2 = "0x5b06…"` (use a separate `agglayer-config-l2l2.toml` mounted by the override, so the base stack is untouched).
 - **bridge-service config**: append L2B to the `L2URLs` / `L2PolygonBridgeAddresses` / `RequireSovereignChainSmcs` / `L2PolygonZkEVMGlobalExitRootAddresses` lists (it's already multi-network by design).
 - Then flesh out `e2e-l2-to-l2.sh` steps 1-2 (ERC20 on L2B → bridgeAsset → cert → GER → claim on Miden).
+
+---
+
+## UPDATE 2 (2026-07-09): full L2B wiring written — ready for live smoke
+
+- **`docker-compose.l2l2.yml`** — override adding `anvil-l2b` (chain-id 31338, :9545) + `aggkit-l2b` (aggoracle+aggsender, reuses aggoracle/sequencer keystores) + swaps agglayer/bridge-service configs for network-2-aware variants.
+- **`scripts/gen-l2b-configs.sh`** — derives `agglayer-config-l2l2.toml` / `aggkit-l2b-config.toml` / `bridge-config-l2l2.toml` from the base fixtures at setup time (gitignored; assert-guarded so base-config drift fails loudly).
+- **`fixtures/SovereignGER.sol`** — minimal sovereign-GER (insertGlobalExitRoot/updateExitRoot/globalExitRootMap + events), setCode-deployable (no constructor; `initialize(bridge, updater)`).
+- **`scripts/setup-l2b.sh`** extended: rollup-2 address guard, L2B account funding, GER-stub deploy at `0xa40D…` (updater = aggoracle addr derived from keystore at runtime), bridge proxy+impl setCode + `initialize(networkID=2,…)` — all idempotent.
+- **`scripts/e2e-l2-to-l2.sh` step 0** wired: gen-configs → compose-up L2B services → wait → setup-l2b.
+
+### Next session
+1. **Live smoke step 0**: base stack up (`make e2e-up` w/ root-clean), then `./scripts/e2e-l2-to-l2.sh` — expect: rollup #2 registered, L2B bridge `networkID()==2`, GER stub live, aggkit-l2b logs syncing (not crash-looping). Watch: agglayer accepting config with an unreachable-then-reachable network 2; aggkit-l2b's `L1ChainID=31338` assumption; bridge impl `initialize` ABI matching this contracts version (if it reverts, decode the L1 bridge's own init tx from l1-raw-txs for the exact signature — same technique as blk83-85).
+2. **Step 1**: `forge create fixtures/TestToken.sol:TestToken` against :9545 → OPT0; approve bridge; `bridgeAsset(destNet=1, …)` on L2B.
+3. **Step 2**: watch aggsender-l2b cert → agglayer settle → L1 GER → Miden aggoracle inject → claim on Miden via bridge-service proof (`/merkle-proof` for network 2) → assert foreign-origin faucet keyed (OPT0, net-2).

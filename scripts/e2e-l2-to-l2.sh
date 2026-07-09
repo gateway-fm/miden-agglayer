@@ -5,8 +5,22 @@ set -euo pipefail
 GREEN='\033[0;32m'; NC='\033[0m'; log(){ echo -e "${GREEN}[l2l2]${NC} $*"; }
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 
-# TODO(1): deploy ERC-20 OPT0 on the OP-Stack L2 (origin_network = OP-Stack rollupID, not L1)
-log "Step 1: deploy OPT0 on OP-Stack L2 — TODO (needs OP-Stack RPC + bridge deploy)"
+# ── Step 0: bring up the L2B-extended stack + register rollup #2 ─────────────
+# (assumes the base stack is ALREADY up healthy via `make e2e-up`; this adds
+#  the L2B services on top and runs the one-time L1/L2B setup — all idempotent)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+L2B_RPC="${L2B_RPC:-http://localhost:9545}"
+log "Step 0: L2B services + rollup #2 registration"
+"$SCRIPT_DIR/gen-l2b-configs.sh"
+docker compose -f "$REPO/docker-compose.e2e.yml" -f "$REPO/docker-compose.l2l2.yml" \
+  --env-file "$REPO/fixtures/.env" up -d anvil-l2b aggkit-l2b agglayer bridge-service
+for i in $(seq 1 30); do cast chain-id --rpc-url "$L2B_RPC" >/dev/null 2>&1 && break; sleep 2; done
+cast chain-id --rpc-url "$L2B_RPC" >/dev/null 2>&1 || fail "anvil-l2b not reachable at $L2B_RPC"
+L2B_RPC="$L2B_RPC" "$SCRIPT_DIR/setup-l2b.sh"
+
+# TODO(1): deploy ERC-20 OPT0 on L2B (origin_network = 2, not L1)
+log "Step 1: deploy OPT0 on L2B — TODO (forge create fixtures/TestToken.sol vs anvil-l2b + approve bridge)"
 
 # TODO(2): FORWARD OP-Stack -> Miden: bridgeAsset(destNet=Miden) -> wait GER -> claim on Miden.
 #          Assert Miden provisions a faucet keyed by hash(tokenAddr || OP-Stack-network) [#108 (addr,network)],
