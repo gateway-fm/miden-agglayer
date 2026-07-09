@@ -855,6 +855,11 @@ async fn publish_claim_internal(
     // GER fails closed with `ERR_GER_NOT_FOUND` rather than minting (identical to
     // the old best-effort behaviour, which also submitted unconditionally after the
     // pad).
+    //
+    // (This poll subsumes main's earlier G6 `is_injected` early-exit: it checks
+    // the authoritative condition — the GER in the bridge ACCOUNT's storage,
+    // exactly what the MASM asserts — rather than the proxy-side injected flag,
+    // and still exits in ~0s in the common already-present case.)
     let claim_ger = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
     tracing::info!(
         "Cantina #21: awaiting GER on bridge account before submitting CLAIM (early-exits when \
@@ -1138,7 +1143,7 @@ pub async fn publish_claim(
     // registration), so we reimport the whole bridge_accounts set rather
     // than guess which account was the culprit from the error message.
     // `reimport_known_accounts` is best-effort and idempotent — accounts
-    // not on chain (e.g. `wallet_hardhat`) fail benignly.
+    // not yet on chain (e.g. `service` before first use) fail benignly.
     match attempt_publish_claim(
         params.clone(),
         client,

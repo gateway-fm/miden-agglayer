@@ -28,7 +28,6 @@ pub fn test_accounts_config() -> AccountsConfig {
         bridge: dummy_account_id(),
         faucet_eth: Some(dummy_account_id()),
         faucet_agg: None,
-        wallet_hardhat: dummy_account_id(),
         ger_manager: None,
     })
 }

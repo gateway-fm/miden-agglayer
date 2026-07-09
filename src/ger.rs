@@ -53,11 +53,17 @@ async fn poll_until_ready<C, F>(
 where
     F: for<'a> FnMut(&'a mut C) -> PollFuture<'a>,
 {
-    for _ in 0..max_polls {
+    for attempt in 0..max_polls {
         if Box::into_pin(check(subject)).await? {
             return Ok(true);
         }
-        tokio::time::sleep(interval).await;
+        // No sleep after the FINAL failed poll (PR #127 review): the caller's
+        // wall-clock budget is (max_polls - 1) * interval between polls, not
+        // max_polls * interval — a trailing sleep would delay the timeout
+        // verdict by one interval for nothing.
+        if attempt + 1 < max_polls {
+            tokio::time::sleep(interval).await;
+        }
     }
     Ok(false)
 }
@@ -421,6 +427,35 @@ mod tests {
         assert_eq!(
             probe.polls, 4,
             "checks exactly max_polls times then gives up"
+        );
+    }
+
+    /// PR #127 review — no sleep after the FINAL failed poll: the timeout
+    /// verdict must arrive after (max_polls - 1) * interval of waiting, not
+    /// max_polls * interval. Paused-clock test: tokio auto-advances virtual
+    /// time on sleep, so elapsed time counts exactly the sleeps performed.
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_ready_does_not_sleep_after_last_attempt() {
+        let mut probe = Probe {
+            polls: 0,
+            ready_at: u32::MAX,
+        };
+        let interval = Duration::from_secs(1);
+        let t0 = tokio::time::Instant::now();
+        let out = poll_until_ready(&mut probe, 3, interval, |p| {
+            Box::new(async move {
+                p.polls += 1;
+                Ok(false)
+            })
+        })
+        .await
+        .unwrap();
+        assert!(!out);
+        assert_eq!(probe.polls, 3);
+        assert_eq!(
+            t0.elapsed(),
+            interval * 2,
+            "3 polls must sleep exactly twice (between polls), never after the last"
         );
     }
 }
