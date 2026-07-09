@@ -18,6 +18,11 @@ docker compose -f "$REPO/docker-compose.e2e.yml" -f "$REPO/docker-compose.l2l2.y
 for i in $(seq 1 30); do cast chain-id --rpc-url "$L2B_RPC" >/dev/null 2>&1 && break; sleep 2; done
 cast chain-id --rpc-url "$L2B_RPC" >/dev/null 2>&1 || fail "anvil-l2b not reachable at $L2B_RPC"
 L2B_RPC="$L2B_RPC" "$SCRIPT_DIR/setup-l2b.sh"
+# bridge-service validates contract code at startup and exits if the L2B bridge
+# doesn't exist yet — (re)start it AFTER setup-l2b so both networks index.
+docker compose -f "$REPO/docker-compose.e2e.yml" -f "$REPO/docker-compose.l2l2.yml" \
+  --env-file "$REPO/fixtures/.env" up -d --force-recreate bridge-service
+log "  bridge-service restarted with both networks"
 
 # ── Step 1: deploy OPT0 on L2B (origin_network = 2, not L1) ──────────────────
 # PROVEN LIVE 2026-07-09 (see docs/l2-to-l2-notes.md UPDATE 3).
