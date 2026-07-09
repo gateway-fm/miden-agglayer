@@ -32,8 +32,8 @@ pub fn account_id_from_address(address: Address) -> Option<AccountId> {
 /// mapping path like any other address: a deposit targeting it resolves
 /// only if an operator has explicitly mapped it (or it happens to be a
 /// zero-padded Miden id, which the Hardhat EOA is not). No dev-only remap
-/// to `wallet_hardhat`, no gate, no bail — the address is treated like any
-/// other EVM address.
+/// to a hardcoded account, no gate, no bail — the address is treated like
+/// any other EVM address.
 ///
 /// Self-review C5 — the zero-padding fallback maps any 4-leading-zero EVM
 /// address to a Miden AccountId WITHOUT verifying the account exists on
@@ -177,38 +177,31 @@ mod tests {
     /// Cantina MA#8 — the well-known Hardhat default-account address
     /// (`0xf39f...2266`) must NOT be special-cased in `resolve_address`.
     /// Pre-fix there was an `if address == HARDHAT_ADDRESS` branch that
-    /// remapped it to `config.wallet_hardhat` on every claim (later
-    /// merely gated behind a flag). cergyk required the branch be
+    /// remapped it to a hardcoded infrastructure account on every claim
+    /// (later merely gated behind a flag). cergyk required the branch be
     /// removed entirely so the address flows through the normal mapping
     /// path with no special behavior. This test pins that: with no
     /// explicit store mapping, the Hardhat EOA (which is not a
-    /// zero-padded Miden id) resolves to nothing — it does NOT silently
-    /// land in `wallet_hardhat`, and resolution behaves exactly as it
+    /// zero-padded Miden id) resolves to nothing — it errors just as it
     /// would for any other un-mapped, non-zero-padded EVM address.
     #[tokio::test]
     async fn ma8_hardhat_address_not_special_cased() {
         use crate::store::memory::InMemoryStore;
         let store = InMemoryStore::new();
         let cfg = test_accounts_config();
-        // `wallet_hardhat` in the config is a real, valid AccountId. If the
-        // old special case were still present, resolving the Hardhat EOA
-        // below would return `cfg.wallet_hardhat.0` (an `Ok`). With the
-        // branch removed it must error like any other un-mapped address.
-        let wallet_hardhat = cfg.wallet_hardhat.0;
         let hardhat = address!("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
 
         // Default policy: the Hardhat EOA is NOT zero-padded (high bytes
-        // are 0xf39f...), there is no store mapping, so resolution errors
-        // exactly like any other un-mapped non-zero-padded address —
-        // never resolves to wallet_hardhat.
+        // are 0xf39f...), and there is no store mapping. If the old special
+        // case were still present it would resolve to a hardcoded account
+        // (an `Ok`); with the branch removed it must error exactly like any
+        // other un-mapped non-zero-padded address.
         let r = resolve_address_with_policy(&store, hardhat, &cfg, false).await;
         assert!(
             r.is_err(),
             "Hardhat EOA must not be special-cased; expected the normal \
-             'no known Miden AccountId' error, but it resolved to {:?} \
-             (== wallet_hardhat? {})",
+             'no known Miden AccountId' error, but it resolved to {:?}",
             r.as_ref().ok(),
-            r.as_ref().ok() == Some(&wallet_hardhat)
         );
 
         // And a generic un-mapped non-zero-padded address gives the same
@@ -248,7 +241,6 @@ mod tests {
             service: AccountIdBech32(id),
             faucet_eth: None,
             faucet_agg: None,
-            wallet_hardhat: AccountIdBech32(id),
         }
     }
 }

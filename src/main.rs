@@ -693,8 +693,8 @@ async fn main() -> anyhow::Result<()> {
     // an `AccountDataNotFound` or `IncorrectAccountInitialCommitment` error,
     // the caller reimports the affected account from the live Miden node and
     // retries once. We deliberately do NOT brick the proxy at startup over
-    // locally-deployed-but-not-yet-network-tracked accounts (e.g. service,
-    // wallet_hardhat) — those are healthy until first use, at which point
+    // locally-deployed-but-not-yet-network-tracked accounts (e.g. service)
+    // — those are healthy until first use, at which point
     // their initial `submit_new_transaction` deploys them on-chain.
     // Run restore if requested
     if command.restore {

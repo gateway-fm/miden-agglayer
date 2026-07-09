@@ -22,7 +22,6 @@ struct Accounts {
     service: Account,
     bridge: Account,
     faucet_eth: Account,
-    wallet_hardhat: Account,
     ger_manager: Account,
 }
 
@@ -37,7 +36,6 @@ impl From<Accounts> for AccountsConfig {
             // additional token (POL, USDC, …) is auto-created by find_or_create_faucet in
             // claim.rs on first bridge.
             faucet_agg: None,
-            wallet_hardhat: AccountIdBech32(accounts.wallet_hardhat.id()),
             ger_manager: Some(AccountIdBech32(accounts.ger_manager.id())),
         }
     }
@@ -141,7 +139,7 @@ async fn add_wallet(
     keystore: Arc<FilesystemKeyStore>,
 ) -> anyhow::Result<Account> {
     // Public storage mode is REQUIRED for the proxy's infrastructure accounts
-    // (service, ger_manager, wallet_hardhat) so a missing local sqlite row can
+    // (service, ger_manager) so a missing local sqlite row can
     // be recovered via `Client::import_account_by_id` from the live Miden
     // node. Private accounts (the AccountBuilder default) cannot be
     // recovered — their full state lives ONLY in the proxy's sqlite. The
@@ -239,12 +237,10 @@ async fn add_accounts(
         MetadataHash::from_abi_encoded(&[]),
     )
     .await?;
-    let wallet_hardhat = add_wallet(client, keystore.clone()).await?;
     Ok(Accounts {
         service,
         bridge,
         faucet_eth,
-        wallet_hardhat,
         ger_manager,
     })
 }
@@ -295,9 +291,6 @@ async fn init_internal(
         client.sync_state().await?;
     }
     tracing::info!("account settlement complete");
-
-    // Register the P2ID note tag for wallet_hardhat so sync discovers incoming P2ID notes.
-    register_wallet_p2id_tag(client, accounts.wallet_hardhat.id()).await?;
 
     // Faucet bridge registration is handled in create_and_register_faucet (via add_faucet)
 
