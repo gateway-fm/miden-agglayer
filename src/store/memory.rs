@@ -660,6 +660,23 @@ impl Store for InMemoryStore {
         Ok(self.unbridgeable_bridge_outs.read().get(note_id).cloned())
     }
 
+    async fn list_unbridgeable_bridge_outs(&self) -> anyhow::Result<Vec<UnbridgeableBridgeOut>> {
+        Ok(self
+            .unbridgeable_bridge_outs
+            .read()
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_unbridgeable_bridge_out(&self, note_id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .unbridgeable_bridge_outs
+            .write()
+            .remove(note_id)
+            .is_some())
+    }
+
     // ── Address mappings ─────────────────────────────────────────
 
     async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>> {

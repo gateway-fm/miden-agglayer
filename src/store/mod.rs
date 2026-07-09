@@ -571,6 +571,26 @@ pub trait Store: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// List every quarantined `unbridgeable_bridge_outs` row (Cantina MA#18).
+    ///
+    /// The recovery path (`crate::bridge_out_recovery`) iterates these to
+    /// re-attempt BridgeEvent synthesis from each row's captured `note_dump`
+    /// once the underlying blocker (unknown faucet, transient commit failure)
+    /// is resolved. Default impl returns an empty list so stores without the
+    /// table don't crash the recovery driver.
+    async fn list_unbridgeable_bridge_outs(&self) -> anyhow::Result<Vec<UnbridgeableBridgeOut>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete a quarantined `unbridgeable_bridge_outs` row by `note_id`, called
+    /// after the recovery path has successfully re-emitted its BridgeEvent so
+    /// the row is not re-attempted. Returns `true` if a row was removed.
+    /// Default impl is a no-op so the recovery driver stays safe on legacy
+    /// stores.
+    async fn delete_unbridgeable_bridge_out(&self, _note_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     // === Claim watcher ===
     //
     // Tracks consumed CLAIM notes the `claim_watcher` SyncListener has already

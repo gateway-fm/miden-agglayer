@@ -144,6 +144,7 @@ fn bucket_method_label(method: &str) -> &'static str {
         "zkevm_getExitRootsByGER" => "zkevm_getExitRootsByGER",
         "admin_registerFaucet" => "admin_registerFaucet",
         "admin_listFaucets" => "admin_listFaucets",
+        "admin_recoverUnbridgeableBridgeOuts" => "admin_recoverUnbridgeableBridgeOuts",
         // Anything else → "other". Includes typos and method-name-fuzzing
         // attacks. We still log the actual method via tracing for debugging.
         _ => "other",
@@ -638,6 +639,18 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             let params: (crate::service_admin::RegisterFaucetParams,) = request.parse_params()?;
             let result = crate::service_admin::admin_register_faucet(service, params.0).await;
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::AdminRegisterFaucet)
+        }
+
+        "admin_recoverUnbridgeableBridgeOuts" => {
+            // Cantina MA#18 — sweep the quarantine table and re-emit BridgeEvents
+            // for rows whose blocker is now resolved. Takes no params.
+            let result =
+                crate::service_admin::admin_recover_unbridgeable_bridge_outs(service).await;
+            json_rpc_response_from_result(
+                result,
+                answer_id,
+                ServiceErrorCode::AdminRecoverUnbridgeable,
+            )
         }
 
         "admin_listFaucets" => {

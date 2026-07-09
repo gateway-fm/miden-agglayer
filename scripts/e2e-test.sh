@@ -59,6 +59,11 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
         echo ""
+        # Cantina MA#18 — erased/unbridgeable B2AGG recovery. Settlement-safe
+        # (it recovers a REAL, on-chain-backed leaf), so it runs BEFORE the
+        # cantina13 poison-leaf test that must stay last.
+        "$SCRIPT_DIR/e2e-erased-note-recovery.sh"
+        echo ""
         # ABSOLUTELY LAST on purpose: its final phase leaves a self-targeted
         # poison leaf in the LET (by design of the Cantina #13 circuit-break
         # repro), which wedges any certificate settlement that would happen
@@ -107,9 +112,12 @@ case "$test_filter" in
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         ;;
+    erased-note-recovery)
+        "$SCRIPT_DIR/e2e-erased-note-recovery.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance|erased-note-recovery]" >&2
         exit 1
         ;;
 esac

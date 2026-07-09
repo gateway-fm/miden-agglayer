@@ -5,6 +5,7 @@ pub mod block_monitor;
 pub mod block_state;
 pub mod bridge_address;
 pub mod bridge_out;
+pub mod bridge_out_recovery;
 pub mod burn_serial_tracker;
 pub mod claim;
 pub mod claim_watcher;

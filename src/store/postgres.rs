@@ -1253,6 +1253,56 @@ impl Store for PgStore {
         }))
     }
 
+    async fn list_unbridgeable_bridge_outs(&self) -> anyhow::Result<Vec<UnbridgeableBridgeOut>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT note_id, bridge_account, reason, detail, note_dump, observed_block \
+                 FROM unbridgeable_bridge_outs ORDER BY observed_block ASC, note_id ASC",
+                &[],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let note_id_col: String = row.get(0);
+            let bridge_account_hex: String = row.get(1);
+            let reason_str: String = row.get(2);
+            let detail: String = row.get(3);
+            let note_dump: String = row.get(4);
+            let observed_block: i64 = row.get(5);
+            let reason = match reason_str.as_str() {
+                "storage_parse_failed" => UnbridgeableBridgeOutReason::StorageParseFailed,
+                "no_fungible_asset" => UnbridgeableBridgeOutReason::NoFungibleAsset,
+                "unknown_faucet" => UnbridgeableBridgeOutReason::UnknownFaucet,
+                "amount_overflow" => UnbridgeableBridgeOutReason::AmountOverflow,
+                "atomic_commit_failed" => UnbridgeableBridgeOutReason::AtomicCommitFailed,
+                "metadata_too_large" => UnbridgeableBridgeOutReason::MetadataTooLarge,
+                other => anyhow::bail!("unknown unbridgeable_bridge_outs.reason value: {other}"),
+            };
+            out.push(UnbridgeableBridgeOut {
+                note_id: note_id_col,
+                bridge_account: AccountId::from_hex(&bridge_account_hex)
+                    .map_err(|e| anyhow::anyhow!("decoding bridge_account from db row: {e}"))?,
+                reason,
+                detail,
+                note_dump,
+                observed_block: u64::try_from(observed_block)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn delete_unbridgeable_bridge_out(&self, note_id: &str) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let n = client
+            .execute(
+                "DELETE FROM unbridgeable_bridge_outs WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
     // ── Address mappings ─────────────────────────────────────────
 
     async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>> {

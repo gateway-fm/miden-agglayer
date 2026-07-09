@@ -264,6 +264,43 @@ pub async fn admin_register_faucet(
     Ok(id_hex)
 }
 
+/// `admin_recoverUnbridgeableBridgeOuts` — Cantina MA#18 recovery entrypoint.
+///
+/// Sweeps the `unbridgeable_bridge_outs` quarantine table and re-emits the
+/// synthetic `BridgeEvent` for every row whose blocker is now resolved (e.g. an
+/// `unknown_faucet` note whose faucet has since been registered via
+/// `admin_registerFaucet`). Recovered rows advance `deposit_count` (closing the
+/// Cantina #9 LET divergence) and are deleted; rows that stay blocked (truly
+/// erased storage, faucet still unknown, self-targeted poison) are left in place
+/// as the durable operator handle. Idempotent — safe to call repeatedly.
+///
+/// Returns the sweep summary `{attempted, recovered, stale_cleared,
+/// still_blocked}`.
+pub async fn admin_recover_unbridgeable_bridge_outs(
+    state: ServiceState,
+) -> anyhow::Result<serde_json::Value> {
+    let summary = crate::bridge_out_recovery::recover_all_unbridgeable_bridge_outs(
+        &state.store,
+        &state.block_state,
+        crate::bridge_address::get_bridge_address(),
+        state.network_id,
+    )
+    .await?;
+    tracing::info!(
+        attempted = summary.attempted,
+        recovered = summary.recovered,
+        stale_cleared = summary.stale_cleared,
+        still_blocked = summary.still_blocked,
+        "admin_recoverUnbridgeableBridgeOuts: MA#18 recovery sweep complete"
+    );
+    Ok(serde_json::json!({
+        "attempted": summary.attempted,
+        "recovered": summary.recovered,
+        "stale_cleared": summary.stale_cleared,
+        "still_blocked": summary.still_blocked,
+    }))
+}
+
 fn parse_eth_address(s: &str) -> anyhow::Result<[u8; 20]> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(s)?;

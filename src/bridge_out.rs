@@ -245,6 +245,12 @@ pub struct BridgeOutScanner {
     /// fallback (recovery then relies solely on the all-Miden candidate, and
     /// gates if that does not validate).
     l1_rpc_url: Option<String>,
+    /// Synthetic block state, used by the Cantina MA#18 recovery sweep to look
+    /// up the `block_hash` of a quarantined bridge-out's observed block when it
+    /// re-emits the `BridgeEvent`. `None` disables the recovery sweep (unit
+    /// tests that only exercise the monitors leave it unset); production wires
+    /// it via [`Self::with_block_state`].
+    block_state: Option<Arc<crate::block_state::BlockState>>,
 }
 
 impl BridgeOutScanner {
@@ -274,6 +280,7 @@ impl BridgeOutScanner {
             ownership_probe_every_n_ticks: 5, // every 5 sync ticks (~30s at 6s/tick)
             tick_counter: std::sync::atomic::AtomicU32::new(0),
             l1_rpc_url: None,
+            block_state: None,
         }
     }
 
@@ -282,6 +289,14 @@ impl BridgeOutScanner {
     /// tests that don't need recovery stay unchanged.
     pub fn with_l1_rpc_url(mut self, l1_rpc_url: Option<String>) -> Self {
         self.l1_rpc_url = l1_rpc_url;
+        self
+    }
+
+    /// Wire the synthetic [`BlockState`](crate::block_state::BlockState) so the
+    /// Cantina MA#18 recovery sweep can re-emit quarantined bridge-outs. Builder
+    /// so existing tests/call sites that don't need recovery stay unchanged.
+    pub fn with_block_state(mut self, block_state: Arc<crate::block_state::BlockState>) -> Self {
+        self.block_state = Some(block_state);
         self
     }
 
@@ -394,10 +409,19 @@ pub(crate) fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
         .iter()
         .map(|f| format!("{}", f.as_canonical_u64()))
         .collect();
+    // Emit the faucet id as canonical hex (`AccountId::to_hex`) rather than the
+    // `Display` (bech32) form so the MA#18 recovery path can round-trip it back
+    // via `AccountId::from_hex` when re-deriving the BridgeEvent from this dump.
     let assets: Vec<String> = details
         .assets()
         .iter_fungible()
-        .map(|fa| format!("{{faucet={}, amount={}}}", fa.faucet_id(), fa.amount()))
+        .map(|fa| {
+            format!(
+                "{{faucet={}, amount={}}}",
+                fa.faucet_id().to_hex(),
+                fa.amount()
+            )
+        })
         .collect();
     let mut out = String::with_capacity(256);
     let _ = write!(out, "{{\"script_root\":\"0x{script_root_hex}\",");
@@ -734,6 +758,54 @@ impl BridgeOutScanner {
                     "Cantina #9: bridge LET advanced past aggkit's deposit count — \
                      private B2AGG processed without aggkit observing"
                 );
+                // Cantina MA#18 recovery — the LET gap is the signal that one or
+                // more bridge-outs were consumed on-chain but never emitted a
+                // BridgeEvent (erased notes, unknown faucets, …). Attempt to
+                // close the gap by re-driving the quarantine table: any row whose
+                // blocker is now resolved re-emits its BridgeEvent (the same path
+                // a normal bridge-out takes) and advances deposit_count. Rows
+                // that stay blocked (truly erased, faucet still unknown) remain
+                // as the durable operator handle.
+                if let Some(block_state) = self.block_state.clone() {
+                    match crate::bridge_out_recovery::recover_all_unbridgeable_bridge_outs(
+                        &self.store,
+                        &block_state,
+                        crate::bridge_address::get_bridge_address(),
+                        self.local_network_id,
+                    )
+                    .await
+                    {
+                        Ok(summary) if summary.recovered > 0 || summary.stale_cleared > 0 => {
+                            tracing::warn!(
+                                target: "bridge_out::recovery",
+                                attempted = summary.attempted,
+                                recovered = summary.recovered,
+                                stale_cleared = summary.stale_cleared,
+                                still_blocked = summary.still_blocked,
+                                "Cantina MA#18: LET-divergence recovery sweep re-emitted \
+                                 quarantined bridge-outs — deposit_count advanced toward on-chain LET"
+                            );
+                        }
+                        Ok(summary) => {
+                            tracing::debug!(
+                                target: "bridge_out::recovery",
+                                attempted = summary.attempted,
+                                still_blocked = summary.still_blocked,
+                                "Cantina MA#18: LET-divergence recovery sweep found nothing \
+                                 recoverable this tick (gap needs the note preimage or a \
+                                 protocol-level fix)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "bridge_out::recovery",
+                                error = %e,
+                                "Cantina MA#18: LET-divergence recovery sweep failed (transient — \
+                                 will retry next tick)"
+                            );
+                        }
+                    }
+                }
             }
             crate::let_divergence::LetDivergence::AggkitAhead { gap } => {
                 metrics::counter!(

@@ -628,7 +628,10 @@ async fn main() -> anyhow::Result<()> {
         )
         // Cantina #13 Layer 2 — wire the L1 RPC so legacy ERC-20 faucet rows with
         // empty metadata can be recovered + validated before a bridge-out emits.
-        .with_l1_rpc_url(command.l1_rpc_url.clone()),
+        .with_l1_rpc_url(command.l1_rpc_url.clone())
+        // Cantina MA#18 — wire block state so the LET-divergence recovery sweep
+        // can re-emit quarantined bridge-outs (looks up the observed block hash).
+        .with_block_state(block_state.clone()),
     );
     // Cantina #7: clone the tracker handle now so we can plumb it into
     // ServiceState below — `bridge_out_scanner` is moved into the listener
