@@ -104,3 +104,14 @@ Full live run on the real stack (base + `docker-compose.l2l2.yml`):
 - **Step 3**: same-address/different-origin faucet isolation (absorbs #15).
 - **Step 4**: Miden → L2B back-bridge (bridge-out + claim on L2B against an injected GER — needs aggoracle-l2b GER injection into the stub, already wired).
 - **Step 5**: exact-block asserts + N-run variant; wire into `e2e-test.sh` as `l2-to-l2`.
+
+---
+
+## UPDATE 4: BOTH-WAYS implementation plan (mechanics confirmed from existing e2e)
+
+Remaining legs reuse existing machinery — no manual merkle-proof/claimAsset:
+- **2b claim on Miden**: bridge-autoclaim (net 2 now indexed) auto-claims like e2e-l1-to-l2 → proxy provisions the foreign-origin faucet keyed (OPT0, net 2) + mints wrapped. ASSERT: faucet(OPT0,net2) exists; wrapped balance; ClaimEvent at exact block.
+- **3 faucet isolation (#15)**: same address on L1 AND L2B, bridge both in → ASSERT two DISTINCT faucets (hash(A‖net0) ≠ hash(A‖net2)), no cross-contamination.
+- **4 back Miden→OP-Stack**: B2AGG bridge-out with destNet=2 (e2e-l2-to-l1 path, destNet=2 not 0) → aggsender cert → agglayer settle → aggoracle-l2b injects GER into the SovereignGER stub (wired) → claim on L2B → ASSERT OPT0 restored, Miden wrapped back to 0.
+- **5**: exact-block asserts across round-trip + wire `l2-to-l2` into e2e-test.sh (BEFORE cantina13).
+Order: 2b → 4 → 3 → 5, each verified live on base+l2l2 stack.
