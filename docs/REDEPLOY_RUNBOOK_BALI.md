@@ -102,6 +102,13 @@ INFO DB migrations complete applied=1 already_present=4
 INFO L1InfoTreeIndexer starting
 INFO L1InfoTreeIndexer cursor initialized start_block=... stored_cursor=0 l1_head=...
 INFO RPC server listening on 0.0.0.0:8546
+```
+
+> Note (post-#17 hardening): the binary now defaults to `127.0.0.1`. A
+> network-facing deployment like this one must set `--bind 0.0.0.0` (or
+> `BIND_ADDR=0.0.0.0`) explicitly — the log line above will then match.
+
+```
 ... (within ~30s)
 INFO GER injection: submitting to Miden... ger: 0x<combined>
 WARN GER injection: recoverable account error, reimporting ger_manager and retrying err: account data wasn't found for account id 0xe9a21e616d9ed59016d481c7001393

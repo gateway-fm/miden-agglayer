@@ -225,6 +225,9 @@ services:
     environment:
       CHAIN_ID: "${CHAIN_ID:-2}"
       NETWORK_ID: "${NETWORK_ID:-1}"
+      # #17 fail-closed: the binary now defaults to loopback; a container
+      # serving other containers must opt into all-interfaces explicitly.
+      BIND_ADDR: "0.0.0.0"
       DATABASE_URL: "host=agglayer-postgres user=agglayer password=agglayer dbname=agglayer_store"
       RUST_LOG: "info"
       # Regression requirement: offload ALL proxy tx proving (CLAIM / GER /

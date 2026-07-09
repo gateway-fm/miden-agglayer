@@ -19,11 +19,13 @@ struct Command {
     #[arg(long, default_value_t = 8546)]
     port: u16,
 
-    /// Bind address for the JSON-RPC HTTP service (audit H2/C2). Default
-    /// `0.0.0.0` (all interfaces) for backward compat. Set to `127.0.0.1` to
-    /// restrict to loopback — the recommended production posture when the
-    /// service sits behind a reverse proxy / sidecar that owns authn.
-    #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0", value_parser = parse_bind_addr)]
+    /// Bind address for the JSON-RPC HTTP service (audit H2/C2, follow-up
+    /// #17). Default `127.0.0.1` (loopback) — FAIL-CLOSED: a proxy that was
+    /// not explicitly told to face a network never does. Set `0.0.0.0`
+    /// deliberately where the topology requires it (containers serving other
+    /// containers — the e2e compose does this via BIND_ADDR — or a host
+    /// deployment behind a firewall that owns exposure policy).
+    #[arg(long, env = "BIND_ADDR", default_value = "127.0.0.1", value_parser = parse_bind_addr)]
     bind: String,
 
     /// Directory for miden-client data [default: $HOME/.miden]
