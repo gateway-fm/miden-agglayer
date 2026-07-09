@@ -125,9 +125,15 @@ case "$test_filter" in
     erased-note-recovery)
         "$SCRIPT_DIR/e2e-erased-note-recovery.sh"
         ;;
+    erased-note-hunt)
+        # Probe, not a regression gate: fires up to HUNT_MAX real bridge-outs
+        # hunting a GENUINE same-block erasure and verifies the divergence
+        # monitor detects it. Load-shaped runtime — deliberately NOT in 'all'.
+        "$SCRIPT_DIR/e2e-erased-note-hunt.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|erased-note-recovery]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|erased-note-recovery|erased-note-hunt]" >&2
         exit 1
         ;;
 esac
