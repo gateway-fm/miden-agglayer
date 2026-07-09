@@ -1115,19 +1115,42 @@ impl SyntheticProjector {
                 })
                 .filter(|n| !swept.contains(&n.details_commitment().as_bytes()))
                 .collect();
-            let ids = late
-                .iter()
-                .map(|n| n.details_commitment().as_bytes())
-                .collect();
-            if !late.is_empty() {
+            // #27 (2026-07-09): the late bucket lands at `cursor + 1`, which only
+            // the `while cursor < tip` loop below projects. When the projector is
+            // CAUGHT UP (`cursor == tip` — true on most ticks, since ticks are ~1s
+            // and blocks ~5s), that loop never runs — pre-fix the late ids were
+            // still marked swept afterwards, permanently dropping the note's
+            // BridgeEvent (funds stranded until a restart cleared the in-memory
+            // cache and the sweep retried). Verified live: a load-delayed
+            // consumption (note fd0f5b62…, consumed block 543) sat in the store
+            // unprojected while `deposit_counter` lagged the on-chain LET by 1;
+            // restarting the proxy healed it in 11s. Fix: when caught up, DEFER —
+            // don't bucket, don't mark swept — the next block-advancing tick
+            // projects them (bounded by block cadence).
+            if late.is_empty() || cursor >= tip {
+                if !late.is_empty() {
+                    tracing::debug!(
+                        late = late.len(),
+                        cursor,
+                        tip,
+                        "late-consumption sweep: deferred — projector caught up \
+                         (cursor == tip), retrying when the chain advances"
+                    );
+                }
+                Vec::new()
+            } else {
+                let ids = late
+                    .iter()
+                    .map(|n| n.details_commitment().as_bytes())
+                    .collect();
                 tracing::info!(
                     late = late.len(),
                     first_block = cursor + 1,
                     "late-consumption sweep: projecting notes discovered after their block"
                 );
                 by_block.entry(cursor + 1).or_default().extend(late);
+                ids
             }
-            ids
         };
         // Direct projection of spent-before-import recoveries (same sealed-block
         // rules as the late sweep; see `bucket_direct_notes`).
