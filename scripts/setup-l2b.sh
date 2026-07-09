@@ -106,8 +106,15 @@ for A in $ADMIN $SEQUENCER "$AGGORACLE_ADDR"; do
   cast rpc anvil_setBalance "$A" 0x21e19e0c9bab2400000 --rpc-url "$L2B_RPC" >/dev/null
 done
 log "Step 3b: SovereignGER stub at $L2_GER_ADDR (updater=$AGGORACLE_ADDR)"
-GER_RUNTIME=$(forge inspect "$FIXTURES_DIR/SovereignGER.sol:SovereignGER" deployedBytecode 2>/dev/null) \
-  || fail "forge inspect SovereignGER failed"
+# forge inspect needs a foundry project; forge create compiles standalone files
+# (the TestToken pattern) — deploy a throwaway instance, lift its runtime code,
+# and setCode it at the convention address. The throwaway stays uninitialized.
+GER_DEPLOY_OUT=$(forge create "$FIXTURES_DIR/SovereignGER.sol:SovereignGER" \
+  --rpc-url "$L2B_RPC" --private-key $ADMIN_KEY --broadcast 2>&1)
+GER_TMP=$(echo "$GER_DEPLOY_OUT" | grep "Deployed to:" | awk '{print $NF}')
+[ -n "$GER_TMP" ] || fail "SovereignGER throwaway deploy failed: $GER_DEPLOY_OUT"
+GER_RUNTIME=$(cast code "$GER_TMP" --rpc-url "$L2B_RPC")
+[ ${#GER_RUNTIME} -gt 10 ] || fail "empty SovereignGER runtime code"
 cast rpc anvil_setCode "$L2_GER_ADDR" "$GER_RUNTIME" --rpc-url "$L2B_RPC" >/dev/null
 if [ "$(cast call "$L2_GER_ADDR" 'bridgeAddress()(address)' --rpc-url "$L2B_RPC")" = "$L1_BRIDGE" ]; then
   log "  GER stub already initialized"
@@ -129,7 +136,19 @@ PROXY_CODE=$(cast code $L1_BRIDGE --rpc-url "$L1_RPC")
 cast rpc anvil_setCode "$L1_BRIDGE" "$PROXY_CODE" --rpc-url "$L2B_RPC" >/dev/null
 cast rpc anvil_setStorageAt "$L1_BRIDGE" "$EIP1967_IMPL" \
   "0x000000000000000000000000${BRIDGE_IMPL_L2B:2}" --rpc-url "$L2B_RPC" >/dev/null
-log "  proxy staged at $L1_BRIDGE -> $BRIDGE_IMPL_L2B"
+# This bridge fork gates initialize() to the PROXY ADMIN's owner: it reads the
+# EIP-1967 admin slot and staticcalls owner() on it (trace: "call to
+# non-contract address" when absent). Replicate the L1 ProxyAdmin on L2B with
+# our admin EOA as its owner, and point the proxy's admin slot at it.
+EIP1967_ADMIN=0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103
+PROXY_ADMIN=0xd60F1BCf5566fCCD62f8AA3bE00525DdA6Ab997c
+PACODE=$(cast code $PROXY_ADMIN --rpc-url "$L1_RPC")
+cast rpc anvil_setCode $PROXY_ADMIN "$PACODE" --rpc-url "$L2B_RPC" >/dev/null
+cast rpc anvil_setStorageAt $PROXY_ADMIN 0x0 \
+  "0x000000000000000000000000${ADMIN:2}" --rpc-url "$L2B_RPC" >/dev/null
+cast rpc anvil_setStorageAt "$L1_BRIDGE" "$EIP1967_ADMIN" \
+  "0x000000000000000000000000${PROXY_ADMIN:2}" --rpc-url "$L2B_RPC" >/dev/null
+log "  proxy staged at $L1_BRIDGE -> $BRIDGE_IMPL_L2B (admin=$PROXY_ADMIN owner=$ADMIN)"
 # initialize(networkID, gasToken, gasTokenNetwork, GER, rollupManager, gasTokenMetadata)
 if [ "$(cast call $L1_BRIDGE 'networkID()(uint32)' --rpc-url "$L2B_RPC" 2>/dev/null)" = "$L2B_NETWORK_ID" ]; then
   log "  bridge already initialized (networkID=$L2B_NETWORK_ID)"
@@ -141,4 +160,13 @@ else
     --private-key $ADMIN_KEY --rpc-url "$L2B_RPC" >/dev/null || fail "bridge initialize on L2B"
 fi
 log "  L2B bridge networkID: $(cast call $L1_BRIDGE 'networkID()(uint32)' --rpc-url "$L2B_RPC")"
-log "setup-l2b DONE (GER stub on L2B still TODO — see docs/l2-to-l2-notes.md)"
+# The bridge impl externalizes getTokenMetadata to a helper contract whose
+# address is an immutable baked into the impl bytecode (found via cast run
+# trace: "call to non-contract address 0xcC87d4..."). Copy it from L1 too, or
+# every ERC-20 bridgeAsset reverts bare.
+METADATA_HELPER=0xcC87d48FC24fa81e4866f207820A894d20F14599
+HCODE=$(cast code $METADATA_HELPER --rpc-url "$L1_RPC")
+[ ${#HCODE} -gt 10 ] || fail "metadata helper $METADATA_HELPER has no code on L1"
+cast rpc anvil_setCode $METADATA_HELPER "$HCODE" --rpc-url "$L2B_RPC" >/dev/null
+log "  metadata helper copied to $METADATA_HELPER ($(( (${#HCODE}-2)/2 )) bytes)"
+log "setup-l2b DONE — rollup #2 registered + L2B bridge/GER live"

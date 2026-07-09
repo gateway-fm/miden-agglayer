@@ -78,3 +78,29 @@ Dry-ran against the real anvil snapshot (brought up the `anvil` service alone). 
 1. **Live smoke step 0**: base stack up (`make e2e-up` w/ root-clean), then `./scripts/e2e-l2-to-l2.sh` — expect: rollup #2 registered, L2B bridge `networkID()==2`, GER stub live, aggkit-l2b logs syncing (not crash-looping). Watch: agglayer accepting config with an unreachable-then-reachable network 2; aggkit-l2b's `L1ChainID=31338` assumption; bridge impl `initialize` ABI matching this contracts version (if it reverts, decode the L1 bridge's own init tx from l1-raw-txs for the exact signature — same technique as blk83-85).
 2. **Step 1**: `forge create fixtures/TestToken.sol:TestToken` against :9545 → OPT0; approve bridge; `bridgeAsset(destNet=1, …)` on L2B.
 3. **Step 2**: watch aggsender-l2b cert → agglayer settle → L1 GER → Miden aggoracle inject → claim on Miden via bridge-service proof (`/merkle-proof` for network 2) → assert foreign-origin faucet keyed (OPT0, net-2).
+
+---
+
+## UPDATE 3 (2026-07-09): FORWARD PIPELINE PROVEN LIVE — L2B deposit settled to L1 + GER on Miden
+
+Full live run on the real stack (base + `docker-compose.l2l2.yml`):
+
+1. `setup-l2b.sh` end-to-end ✓ (idempotent): rollup #2 attached+initialized on L1; L2B funded; SovereignGER stub setCode'd+initialized; bridge impl+proxy setCode'd + **initialize gated by the ProxyAdmin-owner** (the fork reads the EIP-1967 admin slot and staticcalls `owner()` — solved by replicating the L1 ProxyAdmin at `0xd60F1B…` with our admin as owner); **getTokenMetadata helper** at `0xcC87d4…` (immutable in the impl) copied from L1 — without it every ERC-20 `bridgeAsset` bare-reverts.
+2. **aggkit-l2b healthy** (no crash-loop) — synced rollup 2, connected to agglayer.
+3. `OPT0` deployed on L2B; `bridgeAsset(destNet=1, 500 OPT0)` → `depositCount=1`, GER stub `lastRollupExitRoot=0xe3c6b488…`.
+4. **aggsender-l2b built a cert → agglayer SETTLED it** (`settled certificate from AggLayer: 0/0xbbcc2031…`; agglayer NetworkTask network_id=2).
+5. **L1**: rollup #2 `lastLocalExitRoot == 0xe3c6b488…` (exact match), rollupExitRoot updated, new GER `0x3e591e9e…`.
+6. **Miden**: `zkevm_getLatestGlobalExitRoot == 0x3e591e9e…` — the Miden aggoracle injected the cross-L2 GER.
+
+`e2e-l2-to-l2.sh` steps 1–2a now encode this proven flow (deploy + bridgeAsset + GER-propagation wait).
+
+### Debug lessons (this stack's bridge fork)
+- Bare `execution reverted, data: "0x"` from the bridge → `cast send --gas-limit 3M` + `cast run <hash>` traces the real cause ("call to non-contract address X").
+- Two hidden L1 dependencies must be replicated on any fresh EVM L2: the **ProxyAdmin** (initialize gate) and the **metadata helper** (bridgeAsset). Both are now in setup-l2b.sh.
+- Transparent-proxy note: with an empty admin slot, `cast call` (default `from=0x0`) hits the admin dispatch and reverts — set the admin slot (done) or pass `--from`.
+
+### Remaining for the full e2e
+- **Step 2b**: claim on Miden — bridge-service `/merkle-proof` for a network-2 deposit + `claimAsset` via the proxy → assert foreign-origin faucet keyed `(OPT0, net 2)` (#108) + wrapped balance + exact-block ClaimEvent. (bridge-service indexes network 2 via the generated config; verify its sync of anvil-l2b.)
+- **Step 3**: same-address/different-origin faucet isolation (absorbs #15).
+- **Step 4**: Miden → L2B back-bridge (bridge-out + claim on L2B against an injected GER — needs aggoracle-l2b GER injection into the stub, already wired).
+- **Step 5**: exact-block asserts + N-run variant; wire into `e2e-test.sh` as `l2-to-l2`.
