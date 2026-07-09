@@ -73,11 +73,18 @@ PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAX)
 pgq() {
     # STOPPER on DB error (task #26 sweep): pre-fix `2>/dev/null` turned a dead
     # Postgres into an empty string, which ${VAR:-0} then misread as "0 rows".
-    local out
-    if ! out=$("${PSQL[@]}" -c "$1" 2>&1); then
-        echo "pgq FAILED: $out" >&2
+    # stderr stays SEPARATE from the capture (locale warnings are rc=0 noise
+    # that must not corrupt numeric parses — see header comment) and is
+    # surfaced only when psql actually fails.
+    local out errf rc
+    errf="$(mktemp)"
+    out=$("${PSQL[@]}" -c "$1" 2>"$errf"); rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "pgq FAILED (rc=$rc): $(cat "$errf")" >&2
+        rm -f "$errf"
         return 1
     fi
+    rm -f "$errf"
     printf '%s\n' "$out"
 }
 

@@ -242,9 +242,18 @@ async fn sync_with_retry(
         };
         let height = client.get_sync_height().await.ok().map(|h| h.as_u64());
         let progressed = matches!((last_height, height), (Some(prev), Some(now)) if now > prev);
-        if progressed {
-            // Forward progress — this attempt does NOT count toward the stall
-            // window (it wasn't "without progress"); fully reset the counter.
+        // First successfully-read height establishes the BASELINE — that
+        // attempt is not a stall datapoint (nothing to compare against). A
+        // failed height read PRESERVES the previous baseline (overwriting it
+        // with None would blind progress detection on every later attempt)
+        // and counts toward the stall window fail-closed.
+        let baseline_established = last_height.is_none() && height.is_some();
+        if height.is_some() {
+            last_height = height;
+        }
+        if progressed || baseline_established {
+            // Forward progress (or first baseline) — this attempt does NOT
+            // count toward the stall window; fully reset the counter.
             stalled = 0;
         } else {
             stalled += 1;
@@ -259,7 +268,6 @@ async fn sync_with_retry(
             "[{label}] sync attempt failed at height {height:?} \
              ({stalled}/{MAX_STALLED} without progress), retrying in {RETRY_DELAY_SECS}s: {err:?}"
         );
-        last_height = height;
         tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
     }
 }
