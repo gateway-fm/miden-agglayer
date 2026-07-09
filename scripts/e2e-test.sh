@@ -48,6 +48,15 @@ case "$test_filter" in
         # tests (it needs the steady-state reconciler/projector, no restarts).
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         echo ""
+        # MA#18 recovery e2e runs BEFORE the proxy-restarting tests: its induced
+        # "unknown faucet" state (deleted faucet_registry row) is deliberately
+        # repaired by --restore's restore_faucet_identities (Cantina #6 heal),
+        # so a restore still finishing in the background — private-note's
+        # Phase B ends with reset+restore — can resurrect the row mid-test
+        # and flip the outcome (observed live: quarantine in 2s on one run,
+        # heal-won no-quarantine timeout on the next).
+        "$SCRIPT_DIR/e2e-erased-note-recovery.sh"
+        echo ""
         # Proxy-restarting tests run LAST (they must not race the other
         # scripts' steady-state assumptions), in this order: the cursor test
         # does a plain restart and asserts the sweep RESUMES from the
@@ -69,8 +78,6 @@ case "$test_filter" in
         # Cantina MA#18 — erased/unbridgeable B2AGG recovery. Settlement-safe
         # (it recovers a REAL, on-chain-backed leaf), so it runs BEFORE the
         # cantina13 poison-leaf test that must stay last.
-        "$SCRIPT_DIR/e2e-erased-note-recovery.sh"
-        echo ""
         # ABSOLUTELY LAST on purpose: its final phase leaves a self-targeted
         # poison leaf in the LET (by design of the Cantina #13 circuit-break
         # repro), which wedges any certificate settlement that would happen

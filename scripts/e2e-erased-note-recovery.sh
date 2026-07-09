@@ -258,7 +258,29 @@ log "deposit_counter before=$DEP_BEFORE  quarantine_rows before=$QROWS_BEFORE  d
 # NO BridgeEvent, exactly like an erased note the indexer can't translate.
 DEL=$(pg "DELETE FROM faucet_registry WHERE faucet_id = '$FAUCET_ID' RETURNING faucet_id")
 [[ -z "$DEL" ]] && fail "faucet_registry DELETE matched no row for $FAUCET_ID"
-pass "Induced unbridgeable condition: faucet_registry row removed for $FAUCET_ID"
+
+# The induced state must be STABLE: --restore's restore_faucet_identities
+# (Cantina #6 heal) rebuilds deleted rows from the bridge's on-chain
+# faucet_metadata_map — a restore still finishing in the proxy resurrects the
+# row mid-test and the bridge-out processes normally (observed live: run A
+# quarantined in 2s, run B heal-won and timed out). The suite now orders this
+# test before any restore-triggering test; this guard defends the invariant
+# regardless: confirm the row stays gone across 3 checks, re-deleting if a
+# heal resurrects it, and fail loudly if it will not stay down.
+for attempt in 1 2 3; do
+    stable=1
+    for _ in 1 2 3; do
+        sleep 2
+        if [[ -n "$(pg "SELECT faucet_id FROM faucet_registry WHERE faucet_id = '$FAUCET_ID'")" ]]; then
+            stable=0; break
+        fi
+    done
+    [[ $stable -eq 1 ]] && break
+    warn "faucet_registry row for $FAUCET_ID was rebuilt (a restore/heal is active) — re-deleting (attempt $attempt/3)"
+    pg "DELETE FROM faucet_registry WHERE faucet_id = '$FAUCET_ID'" >/dev/null
+    [[ $attempt -eq 3 ]] && fail "induced state will not hold: faucet row keeps being rebuilt — a restore is in flight; check suite ordering (this test must run before restore-triggering tests)"
+done
+pass "Induced unbridgeable condition: faucet_registry row removed for $FAUCET_ID (stable across 6s)"
 
 OUT_AMOUNT=$((BALANCE / 2))
 log "Bridging $OUT_AMOUNT $TOKEN_SYMBOL Miden units L2→L1 (must quarantine, no BridgeEvent)..."
