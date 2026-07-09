@@ -1117,7 +1117,7 @@ pub async fn publish_claim(
     // registration), so we reimport the whole bridge_accounts set rather
     // than guess which account was the culprit from the error message.
     // `reimport_known_accounts` is best-effort and idempotent — accounts
-    // not on chain (e.g. `wallet_hardhat`) fail benignly.
+    // not yet on chain (e.g. `service` before first use) fail benignly.
     match attempt_publish_claim(
         params.clone(),
         client,
