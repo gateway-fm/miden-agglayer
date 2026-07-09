@@ -695,7 +695,7 @@ impl SyntheticProjector {
         // MA#3 gate data: every transaction the BRIDGE executed across the
         // spend-block range, with the nullifiers each one consumed.
         let spend_blocks: Vec<BlockNumber> = heights.values().flatten().copied().collect();
-        let consumed_by_bridge: HashMap<Nullifier, (u64, u32)> =
+        let consumed_by_bridge: HashMap<Nullifier, (u64, u32, u32)> =
             match (spend_blocks.iter().min(), spend_blocks.iter().max()) {
                 (Some(min_h), Some(max_h)) => {
                     let txs = rpc
@@ -723,7 +723,7 @@ impl SyntheticProjector {
                 continue;
             };
             match consumed_by_bridge.get(&c.nullifier) {
-                Some((block, tx_order)) => {
+                Some((block, tx_order, _within_tx_pos)) => {
                     debug_assert_eq!(*block, spend_block.as_u64());
                     let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
                         nullifier_block_height: spend_block,
@@ -876,37 +876,61 @@ impl SyntheticProjector {
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
         client: Option<&mut MidenClientLib>,
+        within_tx: Option<&HashMap<Nullifier, (u32, u32)>>,
     ) -> anyhow::Result<usize> {
         let block_notes: Vec<&InputNoteRecord> = consumed
             .iter()
             .filter(|n| n.state().consumed_block_height().map(|h| h.as_u64()) == Some(miden_block))
             .collect();
-        self.project_block_notes(&block_notes, output_metadata, miden_block, client)
-            .await
+        self.project_block_notes(
+            &block_notes,
+            output_metadata,
+            miden_block,
+            client,
+            within_tx,
+        )
+        .await
     }
 
     /// Project the already-filtered notes consumed at `miden_block` into the
     /// single synthetic block `miden_block` (Miden-1:1), advancing the tip once
     /// after the block (write-before-advance), even when there are zero notes.
+    ///
+    /// `within_tx` (Cantina #7): optional map `nullifier → (per-block bridge-tx
+    /// order, within-tx input position)` from [`bridge_consumed_nullifiers`],
+    /// supplied by `tick` when a block contains several B2AGG notes consumed by
+    /// the SAME transaction. Their `consumed_tx_order` ties; the within-tx
+    /// position is the on-chain LET append order, so it must break the tie
+    /// ahead of the (arbitrary) details-commitment.
     async fn project_block_notes(
         &self,
         block_notes: &[&InputNoteRecord],
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
         mut client: Option<&mut MidenClientLib>,
+        within_tx: Option<&HashMap<Nullifier, (u32, u32)>>,
     ) -> anyhow::Result<usize> {
         let mut notes: Vec<&InputNoteRecord> = block_notes.to_vec();
 
-        // Determinism: order intra-block events by (consumed_tx_order, note-id).
-        // `consumed_tx_order` is the per-account position of the consuming
-        // transaction within the block; the 32-byte details-commitment is the
-        // stable tie-breaker. Compare the commitment bytes directly — identical
-        // ordering to the old hex-string compare, but no per-comparison
-        // allocation (matters when many notes share a block).
+        // Determinism: order intra-block events by (consumed_tx_order,
+        // within-tx position, note-id). `consumed_tx_order` is the per-account
+        // position of the consuming transaction within the block; the within-tx
+        // position (when supplied — see `within_tx` above) is the on-chain
+        // consumption order INSIDE one transaction; the 32-byte
+        // details-commitment stays as the final deterministic tie-breaker.
+        // Compare the commitment bytes directly — identical ordering to the old
+        // hex-string compare, but no per-comparison allocation (matters when
+        // many notes share a block).
+        let within_key = |n: &&InputNoteRecord| -> (u32, u32) {
+            n.nullifier()
+                .and_then(|nf| within_tx.and_then(|m| m.get(&nf).copied()))
+                .unwrap_or((u32::MAX, u32::MAX))
+        };
         notes.sort_by(|a, b| {
             a.state()
                 .consumed_tx_order()
                 .cmp(&b.state().consumed_tx_order())
+                .then_with(|| within_key(a).cmp(&within_key(b)))
                 .then_with(|| {
                     a.details_commitment()
                         .as_bytes()
@@ -1026,7 +1050,7 @@ impl SyntheticProjector {
             .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
             .collect();
 
-        self.project_notes(&consumed, &output_metadata, miden_block, Some(client))
+        self.project_notes(&consumed, &output_metadata, miden_block, Some(client), None)
             .await
     }
 
@@ -1210,12 +1234,123 @@ impl SyntheticProjector {
             // import) — nothing can have been consumed by it either; proceed.
             tracing::debug!("LET gate: bridge account not yet tracked — gate skipped");
         }
+        // ── Cantina #7 PoC (part 2): same-tx B2AGG ordering ────────────────
+        // `consumed_tx_order` is per-TRANSACTION, so two B2AGG notes consumed
+        // by the SAME bridge tx tie under the intra-block sort and would fall
+        // back to the details-commitment — a hash, arbitrary relative to the
+        // on-chain LET append order (the tx's input-note order). The bridge's
+        // per-account transaction feed carries that order in each header's
+        // `input_notes()` list; when a tie exists, fetch it and thread the
+        // (per-block tx order, within-tx position) pair into the sort. No tie
+        // (the overwhelmingly common case) → zero extra RPC.
+        let is_emit_b2agg = |n: &InputNoteRecord| {
+            is_b2agg_note(n.details())
+                && matches!(
+                    classify_b2agg_consumer(n.consumer_account(), self.bridge_id),
+                    B2AggConsumerClass::Emit
+                )
+        };
+        // Group by the note's REAL consumed (block, tx_order): late-swept notes
+        // share a bucket with on-time ones, and a tie is only a same-tx tie if
+        // the consuming block matches too.
+        //
+        // PoC LIMITATION: the within-tx map is keyed by nullifier, but a
+        // reconciler-fabricated `ConsumedExternalNoteState` record carries no
+        // metadata, so `InputNoteRecord::nullifier()` returns `None` for it and
+        // it cannot be matched to the tx feed. Those records fall back to the
+        // details-commitment tie-break (unchanged from today). A production
+        // version would additionally map nullifier→details-commitment (derivable
+        // from each tx-input note) so metadata-less records also order exactly.
+        let tied_notes: Vec<&InputNoteRecord> = {
+            let mut groups: HashMap<(Option<u64>, Option<u32>), Vec<&InputNoteRecord>> =
+                HashMap::new();
+            for n in by_block.values().flatten().filter(|n| is_emit_b2agg(n)) {
+                let key = (
+                    n.state().consumed_block_height().map(|h| h.as_u64()),
+                    n.state().consumed_tx_order(),
+                );
+                groups.entry(key).or_default().push(n);
+            }
+            groups
+                .into_values()
+                .filter(|g| g.len() >= 2)
+                .flatten()
+                .collect()
+        };
+        let mut within_tx: Option<HashMap<Nullifier, (u32, u32)>> = None;
+        if !tied_notes.is_empty() {
+            if let Some(rpc) = self.node_rpc.clone() {
+                let heights: Vec<u64> = tied_notes
+                    .iter()
+                    .filter_map(|n| n.state().consumed_block_height().map(|h| h.as_u64()))
+                    .collect();
+                let (min_h, max_h) = match (heights.iter().min(), heights.iter().max()) {
+                    (Some(min), Some(max)) => (*min, *max),
+                    _ => (0, tip),
+                };
+                let txs = rpc
+                    .sync_transactions(
+                        BlockNumber::from(min_h as u32),
+                        BlockNumber::from(max_h as u32),
+                        vec![self.bridge_id],
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "same-tx ordering: sync_transactions({min_h}..{max_h}): {e}"
+                        )
+                    })?;
+                let full = bridge_consumed_nullifiers(&txs, self.bridge_id);
+                // Every tied note MUST be orderable, or emitting risks the
+                // exact swap this exists to prevent — halt like the gate does.
+                let unresolvable = tied_notes
+                    .iter()
+                    .any(|n| n.nullifier().is_none_or(|nf| !full.contains_key(&nf)));
+                if unresolvable {
+                    ::metrics::counter!(
+                        "bridge_let_assignment_gate_halted_total",
+                        "kind" => "unordered_tie"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        tied = tied_notes.len(),
+                        min_h,
+                        max_h,
+                        "Cantina #7 same-tx ordering: a tied B2AGG note is missing from the \
+                         bridge transaction feed — cannot determine on-chain LET append \
+                         order; HALTING projection so no swapped depositCount is emitted \
+                         (retries next tick)"
+                    );
+                    return Ok(cursor);
+                }
+                within_tx = Some(
+                    full.into_iter()
+                        .map(|(nf, (_block, order, pos))| (nf, (order, pos)))
+                        .collect(),
+                );
+            } else {
+                // No node RPC (unit-test topology): keep the legacy
+                // commitment tie-break; production always wires node_rpc.
+                tracing::warn!(
+                    tied = tied_notes.len(),
+                    "Cantina #7 same-tx ordering: node RPC unavailable — falling back to \
+                     details-commitment tie-break for same-tx B2AGG notes"
+                );
+            }
+        }
+        drop(tied_notes);
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
-            self.project_block_notes(bucket, &output_metadata, next, Some(client))
-                .await?;
+            self.project_block_notes(
+                bucket,
+                &output_metadata,
+                next,
+                Some(client),
+                within_tx.as_ref(),
+            )
+            .await?;
             // Advance the cursor only after the block is fully projected, so a
             // crash mid-block re-projects (idempotently) rather than skipping.
             // Persist BEFORE updating the in-memory cache so the durable cursor
@@ -1288,7 +1423,7 @@ pub(crate) fn let_assignment_gate(visible: u64, on_chain: u64) -> LetGateVerdict
 
 /// MA#3 reclaim gate for the spent-before-import recovery path: map every
 /// nullifier consumed by a BRIDGE-executed transaction to `(spend_block,
-/// per-block bridge-tx order)`.
+/// per-block bridge-tx order, within-tx input position)`.
 ///
 /// The node's `sync_transactions` feed is filtered per account and each
 /// transaction header commits to the nullifiers of the notes that transaction
@@ -1297,10 +1432,17 @@ pub(crate) fn let_assignment_gate(visible: u64, on_chain: u64) -> LetGateVerdict
 /// (`consumer == bridge`). The account-id re-check is fail-closed defense in
 /// depth against a node that ignores the server-side filter. Pure (no I/O) so
 /// it is unit-testable directly.
+///
+/// The **within-tx input position** (Cantina #7) is the note's index in the
+/// header's ordered `input_notes()` list. Note scripts execute in exactly that
+/// order during transaction execution, so for a tx consuming several B2AGG
+/// notes it is the order their LET leaves were appended on-chain — the
+/// authoritative intra-tx `depositCount` order that the client-store
+/// `consumed_tx_order` (per-tx, not per-note) cannot distinguish.
 pub(crate) fn bridge_consumed_nullifiers(
     txs: &[TransactionRecord],
     bridge_id: AccountId,
-) -> HashMap<Nullifier, (u64, u32)> {
+) -> HashMap<Nullifier, (u64, u32, u32)> {
     let mut per_block_order: HashMap<u64, u32> = HashMap::new();
     let mut out = HashMap::new();
     for tx in txs {
@@ -1312,8 +1454,8 @@ pub(crate) fn bridge_consumed_nullifiers(
             .entry(block)
             .and_modify(|i| *i += 1)
             .or_insert(0u32);
-        for input in tx.transaction_header.input_notes().iter() {
-            out.insert(input.nullifier(), (block, order));
+        for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
+            out.insert(input.nullifier(), (block, order, pos as u32));
         }
     }
     out
@@ -1829,7 +1971,7 @@ mod tests {
         let projector = test_projector(&store, &block_state).await;
 
         let written = projector
-            .project_notes(&notes, &output_metadata, 5, None)
+            .project_notes(&notes, &output_metadata, 5, None, None)
             .await
             .unwrap();
         assert_eq!(written, 3, "all three derivations must emit one log each");
@@ -1886,14 +2028,14 @@ mod tests {
         let projector = test_projector(&store, &block_state).await;
 
         let first = projector
-            .project_notes(&notes, &output_metadata, 7, None)
+            .project_notes(&notes, &output_metadata, 7, None, None)
             .await
             .unwrap();
         assert_eq!(first, 3);
         assert_eq!(store.get_latest_block_number().await.unwrap(), 7);
 
         let second = projector
-            .project_notes(&notes, &output_metadata, 7, None)
+            .project_notes(&notes, &output_metadata, 7, None, None)
             .await
             .unwrap();
         assert_eq!(second, 0, "second projection must emit no new logs");
@@ -1925,7 +2067,7 @@ mod tests {
         // Project Miden block 3: only the B2AGG note belongs here → synthetic 3.
         assert_eq!(
             projector
-                .project_notes(&notes, &output_metadata, 3, None)
+                .project_notes(&notes, &output_metadata, 3, None, None)
                 .await
                 .unwrap(),
             1
@@ -1934,7 +2076,7 @@ mod tests {
         // Project Miden block 8: only the CLAIM note belongs here → synthetic 8.
         assert_eq!(
             projector
-                .project_notes(&notes, &output_metadata, 8, None)
+                .project_notes(&notes, &output_metadata, 8, None, None)
                 .await
                 .unwrap(),
             1
@@ -1993,7 +2135,7 @@ mod tests {
             b2agg_note_with_amount(100, Some(3), 44),
         ];
         let written = projector
-            .project_notes(&same_block, &output_metadata, 100, None)
+            .project_notes(&same_block, &output_metadata, 100, None, None)
             .await
             .unwrap();
         assert_eq!(written, 4, "all four B2AGG notes must emit a log");
@@ -2033,7 +2175,7 @@ mod tests {
             b2agg_note_with_amount(250, Some(2), 77),
         ];
         let written_later = projector
-            .project_notes(&later_block, &output_metadata, 250, None)
+            .project_notes(&later_block, &output_metadata, 250, None, None)
             .await
             .unwrap();
         assert_eq!(written_later, 3);
@@ -2066,7 +2208,7 @@ mod tests {
             let block_state = StdArc::new(BlockState::new());
             let projector = test_projector(&store, &block_state).await;
             let written = projector
-                .project_notes(&notes, &output_metadata, 9, None)
+                .project_notes(&notes, &output_metadata, 9, None, None)
                 .await
                 .unwrap();
             assert_eq!(written, 3);
@@ -2117,7 +2259,7 @@ mod tests {
         let projector = test_projector(&store, &block_state).await;
         assert_eq!(
             projector
-                .project_notes(&notes, &output_metadata, 5, None)
+                .project_notes(&notes, &output_metadata, 5, None, None)
                 .await
                 .unwrap(),
             1
@@ -2189,11 +2331,11 @@ mod tests {
         // Project the buckets exactly like the tick loop.
         let empty = HashMap::new();
         let logs6 = projector
-            .project_block_notes(&by_block[&6], &empty, 6, None)
+            .project_block_notes(&by_block[&6], &empty, 6, None, None)
             .await
             .unwrap();
         let logs8 = projector
-            .project_block_notes(&by_block[&8], &empty, 8, None)
+            .project_block_notes(&by_block[&8], &empty, 8, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2245,7 +2387,7 @@ mod tests {
 
         // No own output record → fail-closed skip.
         let written = projector
-            .project_notes(&notes, &HashMap::new(), 4, None)
+            .project_notes(&notes, &HashMap::new(), 4, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2263,7 +2405,7 @@ mod tests {
 
         // Same note, WITH the output-record metadata → verified and emitted.
         let written = projector
-            .project_notes(&notes, &HashMap::from([ger_meta]), 4, None)
+            .project_notes(&notes, &HashMap::from([ger_meta]), 4, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2309,15 +2451,56 @@ mod tests {
             tx(aid(BRIDGE), 9, c),  // second bridge tx in the block → order 1
         ];
         let map = bridge_consumed_nullifiers(&txs, aid(BRIDGE));
-        assert_eq!(map.get(&a), Some(&(9, 0)));
+        assert_eq!(map.get(&a), Some(&(9, 0, 0)));
         assert_eq!(
             map.get(&c),
-            Some(&(9, 1)),
+            Some(&(9, 1, 0)),
             "per-block bridge-tx order increments"
         );
         assert!(
             !map.contains_key(&b),
             "non-bridge consumption must be gated out (MA#3 fail-closed)"
+        );
+    }
+
+    /// Cantina #7 — a single bridge transaction consuming SEVERAL B2AGG notes
+    /// must expose each note's within-tx input position: that is the order the
+    /// note scripts executed and therefore the order their LET leaves were
+    /// appended on-chain. `consumed_tx_order` alone cannot distinguish them.
+    #[test]
+    fn cantina7_bridge_consumed_nullifiers_within_tx_positions() {
+        use miden_protocol::note::Nullifier;
+        use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
+
+        fn nf(byte: u64) -> Nullifier {
+            Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
+        }
+        let (first, second, third) = (nf(7), nf(8), nf(9));
+        let batched = TransactionRecord {
+            block_num: BlockNumber::from(42u32),
+            transaction_header: TransactionHeader::new(
+                aid(BRIDGE),
+                Word::empty(),
+                Word::empty(),
+                InputNotes::new(vec![
+                    InputNoteCommitment::from(first),
+                    InputNoteCommitment::from(second),
+                    InputNoteCommitment::from(third),
+                ])
+                .unwrap(),
+                vec![],
+                FungibleAsset::new(aid(FAUCET), 0).unwrap(),
+            ),
+            output_notes: vec![],
+            erased_output_notes: vec![],
+        };
+        let map = bridge_consumed_nullifiers(&[batched], aid(BRIDGE));
+        assert_eq!(map.get(&first), Some(&(42, 0, 0)));
+        assert_eq!(map.get(&second), Some(&(42, 0, 1)));
+        assert_eq!(
+            map.get(&third),
+            Some(&(42, 0, 2)),
+            "within-tx position must follow the header's ordered input_notes()"
         );
     }
 }
