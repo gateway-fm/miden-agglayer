@@ -28,7 +28,6 @@ pub fn test_accounts_config() -> AccountsConfig {
         bridge: dummy_account_id(),
         faucet_eth: Some(dummy_account_id()),
         faucet_agg: None,
-        wallet_hardhat: dummy_account_id(),
         ger_manager: None,
     })
 }
@@ -53,12 +52,18 @@ pub async fn seed_test_faucets(store: &dyn Store) {
 
 /// Create a `ServiceState` backed by `InMemoryStore` and a test `MidenClient`
 /// stub (no real Miden node connection). Suitable for unit tests.
+///
+/// Audit C2 — `allow_any_signer = true` so tests that exercise the submission
+/// paths don't each have to configure an allow-list. Production defaults remain
+/// fail-closed (`allow_any_signer = false`, `allowed_signers = None`).
 pub fn create_test_service() -> ServiceState {
     let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
     let block_state = Arc::new(BlockState::new());
     let miden_client = MidenClient::new_test();
     let accounts = test_accounts_config();
-    ServiceState::new(miden_client, accounts, 1, 1, store, block_state)
+    let mut state = ServiceState::new(miden_client, accounts, 1, 1, store, block_state);
+    state.allow_any_signer = true;
+    state
 }
 
 /// Build a REAL `MidenClientLib` backed by a throwaway sqlite store and an RPC

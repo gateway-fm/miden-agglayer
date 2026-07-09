@@ -105,21 +105,37 @@ Give the proxy ~45s after "healthy" to write `bridge_accounts.toml`.
 
 ## 5. Manual deposit / withdraw
 
+The stack ships no pre-funded user wallet (the old `wallet_hardhat` account
+was removed): provision an INDEPENDENT wallet in an isolated store, fund it
+with a normal L1→L2 deposit to its address, then bridge out from it — the
+same flow the e2e drives via `scripts/lib-isolated-wallet.sh`. The easiest
+end-to-end path is simply:
+
+```bash
+./scripts/e2e-l2-to-l1.sh   # provisions + funds the isolated wallet, bridges out, autoclaims on L1
+```
+
+For a manual run:
+
 ```bash
 source fixtures/.env; export PATH="$HOME/.foundry/bin:$PATH"
 C=miden-agglayer-miden-agglayer-1
 ACCT=$(docker exec $C cat /var/lib/miden-agglayer-service/bridge_accounts.toml)
-WALLET=$(echo "$ACCT" | sed -n 's/.*wallet_hardhat = "\(.*\)"/\1/p')
 BRIDGE=$(echo "$ACCT" | sed -n 's/.*bridge = "\(.*\)"/\1/p')
 FAUCET=$(echo "$ACCT" | sed -n 's/.*faucet_eth = "\(.*\)"/\1/p')
 
+# provision an independent wallet in an isolated store (prints wallet-id):
+docker exec $C bridge-out-tool --store-dir /tmp/manual-wallet \
+  --node-url http://miden-node:57291 --create-wallet
+WALLET=<wallet-id printed above>  # fund it first: L1→L2 deposit to its eth-address form (section below)
+
 # L2->L1 withdraw (bridge-autoclaim settles on L1):
-docker exec $C bridge-out-tool --store-dir /var/lib/miden-agglayer-service \
+docker exec $C bridge-out-tool --store-dir /tmp/manual-wallet \
   --node-url http://miden-node:57291 --wallet-id $WALLET --bridge-id $BRIDGE \
   --faucet-id $FAUCET --amount 500 --dest-address 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --dest-network 0
 
 # check L2 balance (dry probe):
-docker exec $C bridge-out-tool --store-dir /var/lib/miden-agglayer-service \
+docker exec $C bridge-out-tool --store-dir /tmp/manual-wallet \
   --node-url http://miden-node:57291 --wallet-id $WALLET --bridge-id $BRIDGE \
   --faucet-id $FAUCET --amount 999999999 --dest-address 0xdead --dest-network 0 2>&1 | grep 'wallet balance:'
 ```

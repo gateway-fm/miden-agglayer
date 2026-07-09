@@ -250,7 +250,7 @@ ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
     || die "miden-agglayer not initialized"
 # The bridge + ETH faucet are the proxy's global accounts (shared on the node);
 # the bridge-out WALLET, however, is a fresh INDEPENDENT wallet we provision in
-# the isolated store below (NOT wallet_hardhat).
+# the isolated store below (the stack ships no pre-funded user wallet).
 # Preserve any caller-supplied hex bridge id BEFORE this internal overwrite
 # (the toml form is bech32, for iso_tool; the verifier needs hex — upgrade
 # scenarios pass it via env because the recreated proxy never logged the

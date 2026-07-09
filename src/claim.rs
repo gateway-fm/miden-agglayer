@@ -844,8 +844,8 @@ async fn publish_claim_internal(
     // cycles of 3s (15s total) which gives the NTX builder plenty of time.
     //
     // G6 — early-exit when aggkit already records the GER as injected. The
-    // `mark_ger_injected` flag is set when the proxy submits the GER inject
-    // tx; for any GER that's been through aggkit's own submit path within this
+    // `is_injected` flag is set (by `commit_ger_event_atomic`) when the proxy
+    // submits the GER inject tx; for any GER that's been through aggkit's own submit path within this
     // process's lifetime, the bridge has already consumed it (or will within
     // milliseconds). We still sync_state once to refresh, but skip the
     // 4×3s = 12s of additional waiting in the common case.
@@ -1117,7 +1117,7 @@ pub async fn publish_claim(
     // registration), so we reimport the whole bridge_accounts set rather
     // than guess which account was the culprit from the error message.
     // `reimport_known_accounts` is best-effort and idempotent — accounts
-    // not on chain (e.g. `wallet_hardhat`) fail benignly.
+    // not yet on chain (e.g. `service` before first use) fail benignly.
     match attempt_publish_claim(
         params.clone(),
         client,

@@ -271,6 +271,19 @@ services:
       # deterministic 0x133e6a88… orphan). Anvil's history is ~100s of blocks
       # so a from-genesis scan is trivial (max_range chunks it).
       - "--l1-indexer-from-block=1"
+      # Audit C2 — the signer default is now fail-closed: with no
+      # `--allowed-signers` configured, `eth_sendRawTransaction` rejects EVERY
+      # signer. The e2e stack's legitimate submitters (aggoracle/aggsender GER +
+      # exit-root txs, bridge-autoclaim claims, loadtest deposits/claims) are
+      # signed by keys derived from gitignored, per-setup-generated keystores —
+      # their addresses are not stable or knowable at commit time, so a static
+      # `--allowed-signers` list here cannot work. This proxy is bound to
+      # loopback only (`127.0.0.1:8546`, see `ports:` above) with no external
+      # ingress, which is exactly the documented-safe posture for the explicit
+      # legacy open-mode opt-in. Restore open mode for the e2e so tx submission
+      # is accepted. (`--require-hardening` is intentionally NOT set here, so
+      # this flag does not trip the hardening gate.)
+      - "--insecure-allow-any-signer"
       # R1 admin-auth key is supplied via the `ADMIN_API_KEY` env var
       # from `fixtures/.env`, generated fresh per setup by
       # scripts/setup-fixtures.sh (or scripts/ensure-e2e-secrets.sh on
