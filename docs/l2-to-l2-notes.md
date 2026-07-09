@@ -1,6 +1,6 @@
 # L2→L2 e2e (Miden ↔ OP-Stack) — scaffold notes & design (task #25)
 
-**Status: DESIGN + skeleton only** (branch `feat/l2-to-l2-e2e`). This is a large multi-day task; below is the map so it can be picked up cleanly. Absorbs task #15 (same-address/different-origin faucet isolation).
+**Status: FULLY IMPLEMENTED, legs 2b-5 pending live validation** (branch `feat/l2-to-l2-e2e`). Steps 0-2a (L2B bring-up, rollup #2 registration, forward deposit → L1 settle → GER on Miden) are PROVEN LIVE; legs 2b-5 (claim on Miden, faucet isolation #15, back-bridge, completeness) are written to the proven sibling idioms and await a stack window — see UPDATE 5 for how to run + the live-run punch list. Absorbs task #15 (same-address/different-origin faucet isolation).
 
 ## Goal
 Exercise the true cross-L2 bridge path through agglayer, which today's e2e (single Miden L2 ↔ L1) never covers: deploy an ERC-20 on a **second** L2 (OP-Stack), bridge it **OP-Stack → Miden** (foreign-origin → Miden provisions a wrapped-asset faucet), then bridge it **Miden → OP-Stack** back, asserting exact-block completeness and faucet isolation.
@@ -115,3 +115,72 @@ Remaining legs reuse existing machinery — no manual merkle-proof/claimAsset:
 - **4 back Miden→OP-Stack**: B2AGG bridge-out with destNet=2 (e2e-l2-to-l1 path, destNet=2 not 0) → aggsender cert → agglayer settle → aggoracle-l2b injects GER into the SovereignGER stub (wired) → claim on L2B → ASSERT OPT0 restored, Miden wrapped back to 0.
 - **5**: exact-block asserts across round-trip + wire `l2-to-l2` into e2e-test.sh (BEFORE cantina13).
 Order: 2b → 4 → 3 → 5, each verified live on base+l2l2 stack.
+
+---
+
+## UPDATE 5: legs 2b-5 IMPLEMENTED (script complete, pending live validation)
+
+`scripts/e2e-l2-to-l2.sh` now runs the full both-ways flow. **How to run**:
+
+```sh
+make e2e-up                        # base stack healthy first
+./scripts/e2e-l2-to-l2.sh          # or: ./scripts/e2e-test.sh l2-to-l2
+```
+
+The script itself brings up the L2B overlay services (leg 0, idempotent) and
+restarts bridge-service with the network-2 config — so do NOT interleave it
+with the `all` suite (it is deliberately not in the `all` list).
+
+What each leg asserts (state-first: PG on :5434 + proxy RPC + bridge-service;
+docker-log greps only where the sibling suites proved them stable):
+
+- **Leg 2b** — forward deposit destination is now the ISOLATED WALLET's
+  zero-padded address (the old skeleton bridged to the bare admin EOA, which
+  is unclaimable on Miden). Waits ready_for_claim (bridge-service, network 2
+  source) → ClaimTxManager auto-claim → asserts: faucet keyed
+  `(OPT0, origin_network=2)` present in BOTH `admin_listFaucets` and the PG
+  `faucet_registry` (ids must agree); wrapped balance == amount/10^10 via the
+  isolated-wallet dry probe; a `ClaimEvent` synthetic_logs row for the
+  deposit's exact global index.
+- **Leg 3 (#15)** — TRUE same-address collision: a fresh keypair deploys
+  TestToken at nonce 0 on BOTH L1 and L2B → identical CREATE address. Both
+  get bridged in with distinct amounts. Asserts: exactly two
+  `faucet_registry` rows for that address keyed `(addr,0)` / `(addr,2)` with
+  DISTINCT faucet ids; per-faucet wrapped balances match their own amounts
+  (no cross-contamination); negative control — `(OPT0, net 0)` resolves to
+  NO faucet and OPT0's address has exactly one row.
+- **Leg 4** — `bridge-out-tool --dest-network 2` burns the wrapped OPT0;
+  asserts the synthesized BridgeEvent carries the `(OPT0, net 2)` origin
+  identity (PG), waits cert settle + ready_for_claim, claims on L2B
+  (bridge-service ClaimTxManager autoclaim preferred; fallback: manual
+  `claimAsset` from `/merkle-proof`, gated on the SovereignGER stub's
+  `globalExitRootMap` being populated by aggoracle-l2b). Asserts net-zero:
+  L2B holder balance back to its exact pre-forward value AND Miden wrapped
+  balance back to baseline.
+- **Leg 5** — 0 `database is locked` in the proxy logs for the run;
+  synthetic tip advancing; optional exact-block event completeness via
+  `verify-event-completeness.sh` (runs when `target/debug/bridge-out-tool`
+  is built; `STRICT_COMPLETENESS=1` makes it mandatory, `ALLOW_LATE=0`
+  tightens the late-log policy).
+
+Leg-0 additions since UPDATE 3: bridge-service HTTP readiness wait after the
+force-recreate, and the claim sponsor (claimsponsor.keystore /
+`SPONSOR_PRIVATE_KEY`) is funded on L2B — the ClaimTxManager needs gas there
+for the leg-4 autoclaim.
+
+### Live-run punch list (assumptions to verify in the stack window)
+1. **bridge-service network-2 coverage**: `ready_for_claim` must flip for
+   BOTH directions — net-2-origin → net-1-dest (leg 2b) and net-1-origin →
+   net-2-dest (leg 4). The old "net-2 leaves never synchronize" observation
+   predates the network-2 config; re-verify with `bridge-config-l2l2.toml`.
+2. **ClaimTxManager on L2B**: whether the upstream bridge-service actually
+   autoclaims on the second L2 (it is multi-network by design). If not, the
+   manual-claim fallback path runs — verify `/merkle-proof?net_id=1` returns
+   a proof whose GER lands in the SovereignGER stub (aggoracle-l2b inject).
+3. **Foreign-origin claim on Miden** (leg 2b): first live exercise of the
+   proxy claiming a rollup-tree (non-mainnet) global index — verify the
+   rollup_merkle_proof path in the MASM/proxy accepts it.
+4. **Faucet mint size**: forward amount was reduced from 500e18 to 1e15 wei
+   (100000 Miden units) to mirror e2e-dynamic-erc20's proven mint size.
+5. **Timeouts**: GER propagation 600s, L2B COL faucet pair 900s, cert settle
+   900s — tune after a cold-stack run.
