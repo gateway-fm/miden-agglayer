@@ -107,9 +107,18 @@ case "$test_filter" in
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         ;;
+    l2-to-l2)
+        # OPTIONAL, deliberately NOT in `all`: needs the docker-compose.l2l2.yml
+        # overlay (second rollup + aggkit-l2b) on top of the base stack, which
+        # the plain `make e2e-up` stacks don't run. The script brings the L2B
+        # services up itself (idempotent) but restarts bridge-service with the
+        # network-2 config, so don't interleave it with the `all` suite.
+        "$SCRIPT_DIR/e2e-l2-to-l2.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|claim-provenance|l2-to-l2]" >&2
+        echo "       (l2-to-l2 is optional and not part of 'all' — it needs the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;
 esac
