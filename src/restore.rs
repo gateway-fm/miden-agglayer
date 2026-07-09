@@ -276,7 +276,7 @@ pub async fn restore(
     //
     // Best-effort: per-account failures are logged + counted but do not
     // abort restore. Locally-deployed-but-not-network-tracked accounts
-    // (`service`, `wallet_hardhat`) will return `AccountNotFoundOnChain`
+    // (`service`) will return `AccountNotFoundOnChain`
     // here and that's fine — they're healthy until first use.
     tracing::info!("Phase 0: re-importing bridge accounts from Miden node...");
     crate::account_recovery::reimport_known_accounts(miden_client, accounts).await;
