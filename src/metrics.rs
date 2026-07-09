@@ -139,8 +139,8 @@ pub fn init_metrics() {
         "bridge_twin_note_foreign_skipped_total",
         "Consumed note skipped by the twin-detector (Cantina #6) because it was \
          consumed by a KNOWN account that is none of OURS — neither the bridge, \
-         a registered faucet, nor a known-local account (service, ger_manager, \
-         wallet_hardhat) — i.e. it provably belongs to another deployment. Keeps \
+         a registered faucet, nor a known-local account (service, ger_manager) \
+         — i.e. it provably belongs to another deployment. Keeps \
          another deployment's note-graph out of our twin tracker. \
          Informational/audit."
     );
@@ -149,7 +149,7 @@ pub fn init_metrics() {
         "BURN note skipped by the serial-collision tracker (Cantina #5) because \
          it was consumed by a KNOWN account that is none of OURS — neither the \
          bridge, a registered faucet, nor a known-local account (service, \
-         ger_manager, wallet_hardhat) — i.e. it provably belongs to another \
+         ger_manager) — i.e. it provably belongs to another \
          deployment. Keeps another deployment's serials out of our collision \
          tracker. Informational/audit."
     );

@@ -297,7 +297,7 @@ pub fn mint_forged_alert(
 /// burn-serial and #6 twin-note). Returns `true` iff the note was consumed by a
 /// KNOWN account that is none of OUR accounts — neither the bridge, nor a
 /// registered faucet, nor one of the known-LOCAL non-faucet accounts
-/// (`local_accounts`: the service account, `ger_manager`, `wallet_hardhat`, all
+/// (`local_accounts`: the service account, `ger_manager`, all
 /// created in `init.rs`). Only then does it provably belong to another
 /// deployment sharing the chain (foreign tag-0 notes the reconciler imports).
 ///
@@ -353,7 +353,7 @@ pub struct BridgeOutScanner {
     /// gates if that does not validate).
     l1_rpc_url: Option<String>,
     /// KNOWN-LOCAL non-faucet accounts this deployment creates in `init.rs`
-    /// (the service account, the `ger_manager`, and `wallet_hardhat`). These
+    /// (the service account and the `ger_manager`). These
     /// are OURS but are neither the bridge nor a registered faucet, so without
     /// this set the consumer-keyed provenance predicate
     /// ([`note_positively_foreign`]) would mislabel a real twin/burn note that
@@ -404,7 +404,7 @@ impl BridgeOutScanner {
     }
 
     /// Register the KNOWN-LOCAL non-faucet accounts (service, `ger_manager`,
-    /// `wallet_hardhat`) so the consumer-keyed provenance predicate
+    /// `ger_manager`) so the consumer-keyed provenance predicate
     /// ([`note_positively_foreign`]) does NOT mislabel a note one of these local
     /// flows consumed as foreign and suppress its #5/#6 alert (fail-closed).
     /// Builder so existing call sites and tests stay unchanged. Accepts any
@@ -1654,7 +1654,7 @@ mod tests {
     }
 
     /// Fail-CLOSED regression (Copilot #16): `init.rs` creates LOCAL non-faucet
-    /// accounts (service, `ger_manager`, `wallet_hardhat`) that are neither the
+    /// accounts (service, `ger_manager`) that are neither the
     /// bridge nor a registered faucet. A real twin/burn/mint note consumed by
     /// one of those LOCAL flows is OURS and MUST stay monitored (surfaced) — the
     /// pre-fix predicate mislabeled it "foreign" and SUPPRESSED the #5/#6 alert
