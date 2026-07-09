@@ -30,8 +30,8 @@
 //! 006) — e.g. an `unknown_faucet` note whose faucet is now registered, or an
 //! `atomic_commit_failed` transient. For each such row we re-derive the
 //! BridgeEvent fields from the captured `note_dump` and emit it via the SAME
-//! two store primitives a normal bridge-out takes (`mark_note_processed` +
-//! `add_bridge_event`, with rollback on failure — see
+//! atomic store primitive a normal bridge-out takes
+//! (`commit_b2agg_event_atomic`, all-or-nothing + idempotent on retry — see
 //! `restore::project_b2agg_note`), then delete the quarantine row. This
 //! implements the recovery that migration 006 previously declared
 //! "NOT IMPLEMENTED YET", and closes the `deposit_count` gap so the LET
@@ -176,8 +176,8 @@ pub fn derive_destination_from_felts(items: &[u64]) -> anyhow::Result<(u32, [u8;
 
 /// Attempt to recover a single quarantined bridge-out from its captured
 /// `note_dump`. On success emits the synthetic `BridgeEvent` (via the same
-/// `mark_note_processed` + `add_bridge_event` commit a normal bridge-out uses)
-/// and deletes the quarantine row. On a still-present blocker, LEAVES the row
+/// atomic `commit_b2agg_event_atomic` a normal bridge-out uses) and deletes
+/// the quarantine row. On a still-present blocker, LEAVES the row
 /// in place and returns [`RecoveryOutcome::StillBlocked`].
 pub async fn recover_unbridgeable_bridge_out(
     store: &Arc<dyn Store>,
@@ -294,17 +294,17 @@ pub async fn recover_unbridgeable_bridge_out(
     }
 
     // ── Commit — the SAME path a normal bridge-out takes ──────────────────
-    // NOTE (merge-order): on current main the b2agg commit is the two-step
-    // `mark_note_processed` + `add_bridge_event`. Audit H1 (PR #117) replaces
-    // that with the atomic `commit_b2agg_event_atomic`. If #117 lands first,
-    // rebase this emit onto the atomic call (identical fields, returns
-    // deposit_count, self-rolls-back — drop the manual unmark below).
+    // Audit H1 (#117, now on main): `commit_b2agg_event_atomic` folds the
+    // mark-processed + BridgeEvent emission into one all-or-nothing DB txn —
+    // it allocates (or, on retry, reuses) the deposit_count, and a failure
+    // rolls back wholesale, so there is no counter-bump-without-event window
+    // and no manual unmark to get wrong. This is the SOLE write path for the
+    // B2AGG processed-set.
     let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id);
     let block_hash = block_state.get_block_hash(entry.observed_block);
-    let deposit_count = store.mark_note_processed(note_id.clone()).await?;
-
-    if let Err(err) = store
-        .add_bridge_event(
+    let deposit_count = store
+        .commit_b2agg_event_atomic(
+            note_id.clone(),
             bridge_address,
             entry.observed_block,
             block_hash,
@@ -316,14 +316,8 @@ pub async fn recover_unbridgeable_bridge_out(
             &destination_address,
             origin_amount,
             &origin.metadata,
-            deposit_count,
         )
-        .await
-    {
-        // Roll back the counter bump so the note is retried cleanly.
-        let _ = store.unmark_note_processed(&note_id).await;
-        return Err(err);
-    }
+        .await?;
 
     // Clear the quarantine handle now that the leaf is enacted.
     store.delete_unbridgeable_bridge_out(&note_id).await?;

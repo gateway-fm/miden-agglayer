@@ -251,7 +251,20 @@ pub struct BridgeOutScanner {
     /// tests that only exercise the monitors leave it unset); production wires
     /// it via [`Self::with_block_state`].
     block_state: Option<Arc<crate::block_state::BlockState>>,
+    /// PR #126 review — exponential tick-backoff for the MA#18 recovery sweep.
+    /// A persistent LET divergence caused by TRULY-unrecoverable quarantine
+    /// rows (erased storage, unknown faucet) would otherwise re-drive the
+    /// whole quarantine table every sync tick forever (FPI reads + log spam).
+    /// After a sweep that recovers nothing, the next sweeps are skipped with
+    /// exponential growth (1, 2, 4, … capped at `RECOVERY_BACKOFF_CAP_TICKS`);
+    /// any progress — or the divergence clearing — resets the backoff.
+    recovery_skip_ticks: std::sync::atomic::AtomicU32,
+    recovery_backoff_ticks: std::sync::atomic::AtomicU32,
 }
+
+/// Cap for the MA#18 recovery-sweep backoff, in sync ticks (~5s each): worst
+/// case one full quarantine re-drive every ~42 min while the gap persists.
+const RECOVERY_BACKOFF_CAP_TICKS: u32 = 512;
 
 impl BridgeOutScanner {
     pub fn new(
@@ -281,6 +294,8 @@ impl BridgeOutScanner {
             tick_counter: std::sync::atomic::AtomicU32::new(0),
             l1_rpc_url: None,
             block_state: None,
+            recovery_skip_ticks: std::sync::atomic::AtomicU32::new(0),
+            recovery_backoff_ticks: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -743,7 +758,14 @@ impl BridgeOutScanner {
         let on_chain = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
         let aggkit = self.store.get_deposit_count().await?;
         match crate::let_divergence::compare_let_state(on_chain, aggkit) {
-            crate::let_divergence::LetDivergence::InSync => {}
+            crate::let_divergence::LetDivergence::InSync => {
+                // Divergence cleared — a future divergence starts with a fresh
+                // (immediate) recovery sweep.
+                self.recovery_skip_ticks
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.recovery_backoff_ticks
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             crate::let_divergence::LetDivergence::OnChainAhead { gap } => {
                 metrics::counter!(
                     "bridge_let_divergence_total",
@@ -766,7 +788,18 @@ impl BridgeOutScanner {
                 // a normal bridge-out takes) and advances deposit_count. Rows
                 // that stay blocked (truly erased, faucet still unknown) remain
                 // as the durable operator handle.
-                if let Some(block_state) = self.block_state.clone() {
+                // PR #126 review — don't re-drive the quarantine every tick
+                // while nothing is recoverable: exponential backoff, reset on
+                // any progress (or when the divergence clears, above). The
+                // admin_recoverUnbridgeableBridgeOuts RPC bypasses this and
+                // always sweeps immediately.
+                let skip = self
+                    .recovery_skip_ticks
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if skip > 0 {
+                    self.recovery_skip_ticks
+                        .store(skip - 1, std::sync::atomic::Ordering::Relaxed);
+                } else if let Some(block_state) = self.block_state.clone() {
                     match crate::bridge_out_recovery::recover_all_unbridgeable_bridge_outs(
                         &self.store,
                         &block_state,
@@ -776,6 +809,10 @@ impl BridgeOutScanner {
                     .await
                     {
                         Ok(summary) if summary.recovered > 0 || summary.stale_cleared > 0 => {
+                            self.recovery_skip_ticks
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                            self.recovery_backoff_ticks
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!(
                                 target: "bridge_out::recovery",
                                 attempted = summary.attempted,
@@ -787,13 +824,23 @@ impl BridgeOutScanner {
                             );
                         }
                         Ok(summary) => {
+                            let next = self
+                                .recovery_backoff_ticks
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .saturating_mul(2)
+                                .clamp(1, RECOVERY_BACKOFF_CAP_TICKS);
+                            self.recovery_backoff_ticks
+                                .store(next, std::sync::atomic::Ordering::Relaxed);
+                            self.recovery_skip_ticks
+                                .store(next, std::sync::atomic::Ordering::Relaxed);
                             tracing::debug!(
                                 target: "bridge_out::recovery",
                                 attempted = summary.attempted,
                                 still_blocked = summary.still_blocked,
+                                backoff_ticks = next,
                                 "Cantina MA#18: LET-divergence recovery sweep found nothing \
-                                 recoverable this tick (gap needs the note preimage or a \
-                                 protocol-level fix)"
+                                 recoverable (gap needs the note preimage or a protocol-level \
+                                 fix); backing off before the next sweep"
                             );
                         }
                         Err(e) => {
