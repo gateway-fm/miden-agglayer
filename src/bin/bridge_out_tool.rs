@@ -243,7 +243,9 @@ async fn sync_with_retry(
         let height = client.get_sync_height().await.ok().map(|h| h.as_u64());
         let progressed = matches!((last_height, height), (Some(prev), Some(now)) if now > prev);
         if progressed {
-            stalled = 1; // forward progress — restart the stall window
+            // Forward progress — this attempt does NOT count toward the stall
+            // window (it wasn't "without progress"); fully reset the counter.
+            stalled = 0;
         } else {
             stalled += 1;
         }
