@@ -1540,7 +1540,7 @@ pub(crate) async fn project_ger_note(
     };
 
     store
-        .add_ger_update_event(
+        .commit_ger_event_atomic(
             block_number,
             block_hash,
             &tx_hash,
@@ -1568,8 +1568,6 @@ pub(crate) async fn project_ger_note(
                 tracing::debug!(tx = %tx_hash, "GER receipt not finalised: {e}");
             });
     }
-
-    store.mark_ger_injected(ger_bytes).await?;
 
     tracing::info!(
         note_id = %hex::encode(note.details_commitment().as_bytes()),

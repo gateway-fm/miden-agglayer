@@ -1035,18 +1035,17 @@ mod tests {
         // injected to L2. Mark BOTH so the gate passes.
         let ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
         store
-            .mark_ger_seen(
+            .commit_ger_event_atomic(
+                1,
+                [0u8; 32],
+                "0xger-seed",
                 &ger,
-                crate::log_synthesis::GerEntry {
-                    mainnet_exit_root: Some([0u8; 32]),
-                    rollup_exit_root: Some([0u8; 32]),
-                    block_number: 1,
-                    timestamp: 0,
-                },
+                Some([0u8; 32]),
+                Some([0u8; 32]),
+                0,
             )
             .await
             .unwrap();
-        store.mark_ger_injected(ger).await.unwrap();
 
         let result = service_send_raw_txn(service, input_hex).await;
         assert!(result.is_err(), "publish_claim should fail with test stub");

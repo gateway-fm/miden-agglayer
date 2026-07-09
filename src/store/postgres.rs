@@ -579,20 +579,12 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
-    async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO ger_entries (ger_hash, block_number, timestamp, is_injected)
-                 VALUES ($1, 0, 0, TRUE)
-                 ON CONFLICT (ger_hash) DO UPDATE SET is_injected = TRUE",
-                &[&ger.as_slice()],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn add_ger_update_event(
+    /// Atomic GER commit (audit H2). Single postgres txn folding the
+    /// idempotent chain roll + log emission with `is_injected = TRUE`, so a
+    /// crash can never leave the chain rolled without the injected flag set
+    /// (which would cause a duplicate roll on retry).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
         &self,
         block_number: u64,
         block_hash: [u8; 32],
@@ -621,54 +613,81 @@ impl Store for PgStore {
         )
         .await?;
 
-        let row = txn
-            .query_one(
-                "SELECT hash_chain_value FROM service_state WHERE id = 1 FOR UPDATE",
-                &[],
+        // Idempotent chain roll + log emission (H2): skip if already emitted.
+        // Canonicalize tx_hash to lowercase to match the store's convention
+        // (get_logs_for_tx / memory.rs) so a mixed-case retry still matches the
+        // stored lowercase row instead of double-emitting.
+        let tx_hash_key = tx_hash.to_lowercase();
+        let already_emitted = txn
+            .query_opt(
+                "SELECT 1 FROM synthetic_logs WHERE lower(transaction_hash) = $1 LIMIT 1",
+                &[&tx_hash_key],
+            )
+            .await?
+            .is_some();
+        if !already_emitted {
+            let row = txn
+                .query_one(
+                    "SELECT hash_chain_value FROM service_state WHERE id = 1 FOR UPDATE",
+                    &[],
+                )
+                .await?;
+            let old_chain = bytes_to_array_32(row.get(0));
+
+            let mut hasher = Keccak256::new();
+            hasher.update(old_chain);
+            hasher.update(global_exit_root);
+            let new_chain: [u8; 32] = hasher.finalize().into();
+
+            txn.execute(
+                "UPDATE service_state SET hash_chain_value = $1, updated_at = now() WHERE id = 1",
+                &[&new_chain.as_slice()],
             )
             .await?;
-        let old_chain = bytes_to_array_32(row.get(0));
 
-        let mut hasher = Keccak256::new();
-        hasher.update(old_chain);
-        hasher.update(global_exit_root);
-        let new_chain: [u8; 32] = hasher.finalize().into();
-
-        txn.execute(
-            "UPDATE service_state SET hash_chain_value = $1, updated_at = now() WHERE id = 1",
-            &[&new_chain.as_slice()],
-        )
-        .await?;
-
-        let row = txn
-            .query_one(
-                "UPDATE service_state
-                 SET log_counter = log_counter + 1, updated_at = now()
-                 WHERE id = 1
-                 RETURNING log_counter - 1",
-                &[],
+            let row = txn
+                .query_one(
+                    "UPDATE service_state
+                     SET log_counter = log_counter + 1, updated_at = now()
+                     WHERE id = 1
+                     RETURNING log_counter - 1",
+                    &[],
+                )
+                .await?;
+            let log_index: i64 = row.get(0);
+            let topics = [
+                UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+                format!("0x{}", hex::encode(global_exit_root)),
+                format!("0x{}", hex::encode(new_chain)),
+            ];
+            let topic_refs: Vec<&str> = topics.iter().map(|topic| topic.as_str()).collect();
+            txn.execute(
+                "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &log_index,
+                    &L2_GLOBAL_EXIT_ROOT_ADDRESS,
+                    &topic_refs,
+                    &"0x",
+                    &(block_number as i64),
+                    &block_hash.as_slice(),
+                    &tx_hash_key,
+                    &0_i64,
+                    &false,
+                ],
             )
             .await?;
-        let log_index: i64 = row.get(0);
-        let topics = [
-            UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
-            format!("0x{}", hex::encode(global_exit_root)),
-            format!("0x{}", hex::encode(new_chain)),
-        ];
-        let topic_refs: Vec<&str> = topics.iter().map(|topic| topic.as_str()).collect();
+        }
+
+        // Always set is_injected = TRUE (idempotent UPSERT).
         txn.execute(
-            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO ger_entries (ger_hash, block_number, timestamp, is_injected)
+             VALUES ($1, $2, $3, TRUE)
+             ON CONFLICT (ger_hash) DO UPDATE SET is_injected = TRUE",
             &[
-                &log_index,
-                &L2_GLOBAL_EXIT_ROOT_ADDRESS,
-                &topic_refs,
-                &"0x",
+                &global_exit_root.as_slice(),
                 &(block_number as i64),
-                &block_hash.as_slice(),
-                &tx_hash,
-                &0_i64,
-                &false,
+                &(timestamp as i64),
             ],
         )
         .await?;

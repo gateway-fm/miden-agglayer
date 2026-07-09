@@ -374,12 +374,12 @@ impl Store for InMemoryStore {
         Ok(self.injected_gers.read().contains(ger))
     }
 
-    async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()> {
-        self.injected_gers.write().insert(ger);
-        Ok(())
-    }
-
-    async fn add_ger_update_event(
+    /// Atomic GER commit (audit H2). Folds the idempotent chain roll + log
+    /// emission with `is_injected = TRUE` into one operation, so a retry can
+    /// never roll the hash chain / emit the synthetic log a second time (the
+    /// in-memory analogue of postgres's single-transaction version).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_ger_event_atomic(
         &self,
         block_number: u64,
         block_hash: [u8; 32],
@@ -400,32 +400,46 @@ impl Store for InMemoryStore {
         )
         .await?;
 
-        let new_hash_chain = {
-            let mut hash_chain = self.hash_chain_value.write();
-            let mut hasher = Keccak256::new();
-            hasher.update(*hash_chain);
-            hasher.update(global_exit_root);
-            let result: [u8; 32] = hasher.finalize().into();
-            *hash_chain = result;
-            result
-        };
+        // Audit H2 — idempotent chain roll + log emission. A retry (e.g. after a
+        // crash) used to roll the hash chain and emit a duplicate synthetic log
+        // a SECOND time, diverging the proxy's chain from aggkit. Gate on
+        // whether a log with this deterministic tx_hash was already emitted.
+        let already_emitted = self.logs_by_tx.read().contains_key(&tx_hash.to_lowercase());
+        if !already_emitted {
+            let new_hash_chain = {
+                let mut hash_chain = self.hash_chain_value.write();
+                let mut hasher = Keccak256::new();
+                hasher.update(*hash_chain);
+                hasher.update(global_exit_root);
+                let result: [u8; 32] = hasher.finalize().into();
+                *hash_chain = result;
+                result
+            };
 
-        let log = SyntheticLog {
-            address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
-            topics: vec![
-                UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
-                format!("0x{}", hex::encode(global_exit_root)),
-                format!("0x{}", hex::encode(new_hash_chain)),
-            ],
-            data: "0x".to_string(),
-            block_number,
-            block_hash,
-            transaction_hash: tx_hash.to_string(),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-        self.add_log(log).await
+            let log = SyntheticLog {
+                address: L2_GLOBAL_EXIT_ROOT_ADDRESS.to_string(),
+                topics: vec![
+                    UPDATE_HASH_CHAIN_VALUE_TOPIC.to_string(),
+                    format!("0x{}", hex::encode(global_exit_root)),
+                    format!("0x{}", hex::encode(new_hash_chain)),
+                ],
+                data: "0x".to_string(),
+                block_number,
+                block_hash,
+                // Canonical lowercase, consistent with the gate above,
+                // add_log's lowercase keying, and get_logs_for_tx — and with the
+                // postgres store, which persists the lowercase transaction_hash.
+                transaction_hash: tx_hash.to_lowercase(),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            };
+            self.add_log(log).await?;
+        }
+
+        // Always set is_injected = TRUE (idempotent).
+        self.injected_gers.write().insert(*global_exit_root);
+        Ok(())
     }
 
     // ── Transactions ─────────────────────────────────────────────
@@ -1119,7 +1133,7 @@ mod tests {
         let ger = [0x11; 32];
         assert!(!store.has_seen_ger(&ger).await.unwrap());
         store
-            .add_ger_update_event(0, [0u8; 32], "0xTx1", &ger, None, None, 0)
+            .commit_ger_event_atomic(0, [0u8; 32], "0xTx1", &ger, None, None, 0)
             .await
             .unwrap();
         assert!(store.has_seen_ger(&ger).await.unwrap());
@@ -1140,13 +1154,13 @@ mod tests {
         let ger2 = [0x22; 32];
 
         store
-            .add_ger_update_event(0, [0u8; 32], "0xTx1", &ger1, None, None, 0)
+            .commit_ger_event_atomic(0, [0u8; 32], "0xTx1", &ger1, None, None, 0)
             .await
             .unwrap();
         let hash1 = *store.hash_chain_value.read();
 
         store
-            .add_ger_update_event(1, [1u8; 32], "0xTx2", &ger2, None, None, 0)
+            .commit_ger_event_atomic(1, [1u8; 32], "0xTx2", &ger2, None, None, 0)
             .await
             .unwrap();
         let hash2 = *store.hash_chain_value.read();
@@ -1415,8 +1429,114 @@ mod tests {
         let store = InMemoryStore::new();
         let ger = [0xAA; 32];
         assert!(!store.is_ger_injected(&ger).await.unwrap());
-        store.mark_ger_injected(ger).await.unwrap();
+        store
+            .commit_ger_event_atomic(0, [0u8; 32], "0xInjTx", &ger, None, None, 0)
+            .await
+            .unwrap();
         assert!(store.is_ger_injected(&ger).await.unwrap());
+    }
+
+    #[tokio::test]
+    // Audit H2 — `commit_ger_event_atomic` must be idempotent: re-running it
+    // for an already-emitted GER must NOT roll the hash chain a second time or
+    // emit a duplicate UpdateHashChainValue log. The legacy two-step "roll
+    // chain + emit log" then "mark injected" sequence could leave
+    // is_injected=FALSE after the roll had committed, so the projector re-rolled
+    // the chain on retry, diverging the proxy's hash_chain_value from aggkit.
+    // Folding both into one atomic call closes that window.
+    async fn h2_commit_ger_event_atomic_is_idempotent_on_retry() {
+        let store = InMemoryStore::new();
+        let ger = [0x55u8; 32];
+
+        store
+            .commit_ger_event_atomic(10, [0xaa; 32], "0xger-tx-1", &ger, None, None, 1000)
+            .await
+            .unwrap();
+        let chain_after_first = *store.hash_chain_value.read();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+
+        // Retry — simulates a re-projection after a crash before the txn
+        // committed. The contract: same hash_chain_value, no duplicate log,
+        // GER stays injected.
+        store
+            .commit_ger_event_atomic(10, [0xaa; 32], "0xger-tx-1", &ger, None, None, 1000)
+            .await
+            .unwrap();
+
+        let chain_after_retry = *store.hash_chain_value.read();
+        assert_eq!(
+            chain_after_first, chain_after_retry,
+            "retry must NOT roll the hash chain a second time"
+        );
+
+        // Exactly one UpdateHashChainValue log emitted.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let ger_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| {
+                l.topics
+                    .first()
+                    .is_some_and(|t| t == UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .collect();
+        assert_eq!(ger_logs.len(), 1, "retry must NOT emit a duplicate GER log");
+    }
+
+    #[tokio::test]
+    // Audit H2 — the idempotency gate must be CASE-INSENSITIVE on tx_hash.
+    // transaction_hash is canonically lowercase hex across the store, so a
+    // retry that arrives with a differently-cased form of the SAME hash must
+    // still be recognized as already-emitted — otherwise the chain re-rolls
+    // and a duplicate UpdateHashChainValue log is emitted (double-emit).
+    async fn h2_commit_ger_event_atomic_is_idempotent_case_insensitive() {
+        let store = InMemoryStore::new();
+        let ger = [0x66u8; 32];
+
+        // First commit with an UPPER/mixed-case tx_hash.
+        store
+            .commit_ger_event_atomic(10, [0xbb; 32], "0xDeadBEEF01", &ger, None, None, 1000)
+            .await
+            .unwrap();
+        let chain_after_first = *store.hash_chain_value.read();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+
+        // Retry with the SAME hash in a different case (all lowercase).
+        store
+            .commit_ger_event_atomic(10, [0xbb; 32], "0xdeadbeef01", &ger, None, None, 1000)
+            .await
+            .unwrap();
+
+        let chain_after_retry = *store.hash_chain_value.read();
+        assert_eq!(
+            chain_after_first, chain_after_retry,
+            "differently-cased retry must NOT roll the hash chain a second time"
+        );
+
+        // Exactly one UpdateHashChainValue log across both casings.
+        let filter = LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 0xffff).await.unwrap();
+        let ger_logs: Vec<_> = logs
+            .iter()
+            .filter(|l| {
+                l.topics
+                    .first()
+                    .is_some_and(|t| t == UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .collect();
+        assert_eq!(
+            ger_logs.len(),
+            1,
+            "differently-cased retry must NOT emit a duplicate GER log"
+        );
     }
 
     #[tokio::test]
