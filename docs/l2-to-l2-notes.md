@@ -42,3 +42,24 @@ Key IDs: `fixtures/.env` → `ROLLUP_ADDRESS`, `NETWORK_ID=1`, `CHAIN_ID=2`. Fix
 ## Where I landed (this session)
 - Branch `feat/l2-to-l2-e2e` created off `ec2e58f` with a **documented skeleton** `scripts/e2e-l2-to-l2.sh` (the 5-step flow as commented TODO stubs) + this notes file. No compose/chain wiring yet (that's the multi-day part).
 - **Next step**: decide chain option (a) vs (b), then wire the 2nd rollup into `agglayer-config.toml` + a `docker-compose.l2l2.yml` override adding the OP-Stack L2 + its aggkit, and flesh out step 1-2 of the script (deploy + forward-bridge).
+
+---
+
+## UPDATE (2026-07-09): L1 registration PROVEN live + recipe captured
+
+Dry-ran against the real anvil snapshot (brought up the `anvil` service alone). **Rollup #2 registration works end-to-end** — see `scripts/setup-l2b.sh` (steps 1-2 verified, step 3 bytecode-extraction verified viable):
+
+1. **Decoded the snapshot's own creation txs** (`fixtures/l1-raw-txs.txt`, blocks 83-85):
+   - blk83 `addNewRollupType(0xabcb5198)`: consensusImpl `0xFB054898…` (AggchainECDSAMultisig), verifier 0, forkID 0, verifierType 2, genesis 0, "kurtosis-devnet", vkey 0 → **rollupTypeId 1 (reusable for rollup #2 — no new type needed)**.
+   - blk84 `attachAggchainToAL(0x97d289a3)`: `(typeId=1, chainID=2, abi.encode(aggchainAdmin))`.
+   - blk85 aggchain init (selector `0x697427f6`): `(admin, trustedSequencer, gasToken, sequencerURL, networkName, bytes32(0), signers[(addr,url)], threshold)`. **The original rollup #1 was an OP-reth sovereign chain** — its init literally contains `http://op-el-1-op-reth-op-node-001:8545` / `"op-sovereign"`. The Miden proxy replaced it. Our L2B mirrors the same consensus shape, so a plain anvil L2B is consensus-equivalent (mock-verifier + ECDSA-multisig certs).
+2. **Live dry-run results**: `attachAggchainToAL(1, 31338, abi.encode(0xE34a…))` from the admin key → rollupCount 2, aggchain at `0x5D1A491A…bd0E` (address is snapshot-deterministic but the script reads it from `rollupIDToRollupData(2)`); hand-built init calldata (layout above) → `trustedSequencer=0x5b06… ✓ networkName="l2b-sovereign" ✓ threshold=1 ✓`.
+3. **Keys**: admin `0xE34aaF64…9970` = kurtosis-cdk standard key (in setup-l2b.sh, TEST-ONLY); committee[0] reuses the existing `sequencer.keystore` (`0x5b06…`) so **aggkit-l2b's aggsender can reuse the same keystore** and agglayer `[proof-signers] 2` = same signer.
+4. **Bridge on L2B**: L1 bridge impl (PolygonZkEVMBridgeV2, 13150 bytes at EIP-1967 impl of `0xC8cb…`) extracts cleanly via `cast code` → `anvil_setCode` on L2B at the same proxy address + fresh `initialize(networkID=2, …)` (step 3 of setup-l2b.sh, written not yet exercised).
+
+### Remaining (next session)
+- **Sovereign L2-GER contract on L2B** — not on the L1 snapshot; vendor a minimal contract with the sovereign ABI (`insertGlobalExitRoot`, `updateExitRoot`, `globalExitRootMap`) at `0xa40D…` or compile the real `GlobalExitRootManagerL2SovereignChain`.
+- **Compose override** `docker-compose.l2l2.yml`: `anvil-l2b` (plain anvil, chain-id 31338, port 9545) + `aggkit-l2b` (copy of aggkit config with `L2URL=anvil-l2b`, RollupID/NetworkID 2, same keystores) + run `setup-l2b.sh` as a one-shot service after anvil healthy.
+- **agglayer config**: add `[full-node-rpcs] 2 = "http://anvil-l2b:8545"` + `[proof-signers] 2 = "0x5b06…"` (use a separate `agglayer-config-l2l2.toml` mounted by the override, so the base stack is untouched).
+- **bridge-service config**: append L2B to the `L2URLs` / `L2PolygonBridgeAddresses` / `RequireSovereignChainSmcs` / `L2PolygonZkEVMGlobalExitRootAddresses` lists (it's already multi-network by design).
+- Then flesh out `e2e-l2-to-l2.sh` steps 1-2 (ERC20 on L2B → bridgeAsset → cert → GER → claim on Miden).
