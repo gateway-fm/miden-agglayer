@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-l2l2-forward.sh — SIMPLE, DETERMINISTIC L2<->L2 forward scenario
-# ("l2-to-l2-forward"), decomposed from e2e-l2-to-l2.sh legs 1+2+2b.
+# ("l2-to-l2-forward") — the canonical forward leg of the l2l2 group (legs 1+2+2b).
 #
 #   deploy OPT0 on L2B (origin_network = 2, NOT L1)
 #   -> bridgeAsset(destNet=1) L2B -> Miden
@@ -127,9 +127,8 @@ evidence_settlement "leg2" forward "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST
 
 # ── Leg 2b: claim on Miden — foreign-origin faucet + wrapped balance ─────────
 step "Leg 2b: claim on Miden (auto-claim) + (OPT0, net $L2B_NETWORK_ID) faucet asserts"
-wait_for "L2B->Miden deposit ready_for_claim in bridge-service" \
-    "find_deposit '$DEST_ADDR' $L2B_NETWORK_ID '$OPT0_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') and d.get('dest_net')==$MIDEN_NETWORK_ID else 1)\"" \
-    600 5
+wait_for "L2B->Miden deposit ready_for_claim in bridge-service" 600 5 \
+    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$OPT0_LOWER" "$MIDEN_NETWORK_ID"
 FWD_DEPOSIT=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "$OPT0_LOWER")
 [[ -n "$FWD_DEPOSIT" ]] || fail "forward deposit vanished from bridge-service"
 FWD_GI=$(dep_field "$FWD_DEPOSIT" global_index)
@@ -142,11 +141,10 @@ log "  forward deposit: cnt=$(dep_field "$FWD_DEPOSIT" deposit_cnt) globalIndex=
 # test false-progress on someone else's claim and then fail the OPT0-specific
 # assert below. Match the claim.rs:487 line "…token_address: 0x<OPT0>, symbol:…".
 nudge_until "faucet auto-creation for OPT0 (claim scan)" \
-    "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -qi \"auto-creating faucet.*token_address: $OPT0\"" \
+    _pred_log_grep "$AGGLAYER_CONTAINER" "$TEST_START_TIME" "auto-creating faucet.*token_address: $OPT0" \
     || fail "claim scan never picked up the forward deposit (OPT0 $OPT0) despite repeated nudges"
-wait_for "claim tx committed on Miden" \
-    "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'claim tx.*committed to block'" \
-    300 5
+wait_for "claim tx committed on Miden" 300 5 \
+    _pred_log_grep "$AGGLAYER_CONTAINER" "$TEST_START_TIME" "claim tx.*committed to block"
 
 # (a) Faucet keyed (OPT0, net 2) — RPC view + PG truth must agree.
 FAUCETS_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" \

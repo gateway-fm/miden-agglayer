@@ -77,9 +77,22 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # foundry (cast/forge), taplo, etc. — the scripts shell out to `cast`.
-      - name: Install tooling
-        run: make install-tools
+      # `make install-tools` installs taplo/typos/etc. but NOT Foundry — yet the
+      # scripts shell out to `cast`/`forge`. Treat Foundry as a runner prerequisite:
+      # install it via foundryup if absent (warm self-hosted runners usually have
+      # it) and FAIL LOUD if it still isn't available, rather than dying mid-run.
+      - name: Install tooling (Foundry cast/forge asserted)
+        run: |
+          make install-tools
+          if ! command -v cast >/dev/null 2>&1 || ! command -v forge >/dev/null 2>&1; then
+            echo "Foundry (cast/forge) not found — installing via foundryup"
+            curl -L https://foundry.paradigm.xyz | bash
+            "$HOME/.foundry/bin/foundryup"
+            echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+          fi
+          PATH="$HOME/.foundry/bin:$PATH" command -v cast >/dev/null 2>&1 \
+            && PATH="$HOME/.foundry/bin:$PATH" command -v forge >/dev/null 2>&1 \
+            || { echo "::error::Foundry (cast/forge) is required on this runner and could not be installed"; exit 1; }
 
       # Kurtosis fixtures (l1-raw-txs.txt, combined.json, keystores). Skippable
       # on a warm self-hosted runner that already has fixtures/.

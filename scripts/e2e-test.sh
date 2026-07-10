@@ -151,15 +151,10 @@ case "$test_filter" in
     l2l2-back)
         "$SCRIPT_DIR/e2e-l2l2-back.sh"
         ;;
-    l2-to-l2)
-        # OPTIONAL, deliberately NOT in `all`: the monolithic 5-leg L2<->L2 e2e
-        # (superset of the l2l2 group above, plus same-address faucet isolation).
-        "$SCRIPT_DIR/e2e-l2-to-l2.sh"
-        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back|l2-to-l2]" >&2
-        echo "       (l2l2 / l2-to-l2 are optional and not part of 'all' — they need the docker-compose.l2l2.yml overlay)" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
+        echo "       (l2l2 is optional and not part of 'all' — it needs the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;
 esac

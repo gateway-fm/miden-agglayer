@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # e2e-l2l2-clash.sh — same-address / different-origin faucet isolation (#15/#108),
-# decomposed from e2e-l2-to-l2.sh leg 3 into the l2l2 group.
+# the canonical same-address faucet-isolation leg of the l2l2 group (leg 3).
 #
 # Precondition: e2e-l2l2-forward.sh ran and bridged OPT0 in as a net-2-ONLY asset
 # (used as the negative control below). Reads the shared scenario state file.
@@ -116,15 +116,13 @@ log "  COL bridged from BOTH origins (net 0: $COL_L1_WEI wei, net 2: $COL_L2B_WE
 # ── Drive both claims on Miden -> two faucet rows for COL ────────────────────
 # (COL, net 2) is event-driven off the L1 rollup-exit-root update (needs a nudge);
 # (COL, net 0) rides the mainnet-exit-root path. Both auto-create faucets on Miden.
-wait_for "COL net-2 deposit ready_for_claim" \
-    "find_deposit '$DEST_ADDR' $L2B_NETWORK_ID '$COL_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') else 1)\"" \
-    600 5
+wait_for "COL net-2 deposit ready_for_claim" 600 5 \
+    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER"
 nudge_until "TWO faucet_registry rows for COL (claim scan)" \
-    "[ \"\$(pgq \"SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';\")\" = \"2\" ]" \
+    _pred_pg_eq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';" "2" \
     || fail "claim scan never produced both COL faucets despite repeated nudges"
-wait_for "TWO faucet_registry rows for COL (net 0 + net 2)" \
-    "[ \"\$(pgq \"SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';\")\" = \"2\" ]" \
-    900 10
+wait_for "TWO faucet_registry rows for COL (net 0 + net 2)" 900 10 \
+    _pred_pg_eq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';" "2"
 
 # ── Assert isolation: distinct faucets + negative control ───────────────────
 COL_FID_NET0=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}' AND origin_network = 0;")

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # lib-l2l2.sh — shared constants + helpers for the L2<->L2 (Miden <-> "L2B")
-# scenarios. SOURCED, not executed. Extracted verbatim from the mechanics proven
-# by the monolithic e2e-l2-to-l2.sh so the decomposed simple scenarios
-# (e2e-l2l2-forward.sh / e2e-l2l2-back.sh) and the mixed loadtest/chaos tiers all
-# share ONE source of truth for the L2B contract topology, GER-propagation waits,
+# scenarios. SOURCED, not executed. THE single source of truth consumed by the
+# canonical l2l2 group (e2e-l2l2-forward.sh / e2e-l2l2-clash.sh / e2e-l2l2-back.sh)
+# and the mixed loadtest/chaos tiers, so they all
+# share ONE definition of the L2B contract topology, GER-propagation waits,
 # ready_for_claim polling and the AreClaimsBetweenL2sEnabled nudge-cert dance.
 #
 # Contract: the SOURCING script sets PROJECT_DIR (repo root) and SCRIPT_DIR, then
@@ -30,7 +30,7 @@ PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-
 # ── Compose project auto-detect (worktree dirs derive distinct project names;
 #    the l2l2 worktree -> "l2l2", the chaos worktree -> "chaos", main ->
 #    "miden-agglayer"). Detect from the live proxy container, same pattern as
-#    e2e-l2-to-l2.sh / e2e-l2-to-l1.sh. ───────────────────────────────────────
+#    e2e-l2-to-l1.sh. ──────────────────────────────────────────────────────────
 # `set +o pipefail` + `|| true`: with no matching proxy container `grep` exits 1
 # (and `head` closing the pipe early can SIGPIPE `grep`=141) — under the caller's
 # `set -euo pipefail` a bare `_DETECTED_PROJECT=$(… failing pipeline …)` would exit
@@ -79,11 +79,34 @@ pgq() { "${PSQL[@]}" -c "$1" 2>/dev/null; }
 # shell FUNCTIONS in the sourcing script, invisible to a child bash (no
 # `export -f`). The sub-shell isolates `set +o pipefail` and stderr. This is the
 # same idiom as scripts/e2e-bridge-loadtest-isolated.sh::wait_for.
+# ── Predicate helpers for wait_for/nudge_until ──────────────────────────────
+# Named predicate functions so the pollers invoke a FUNCTION (+ args) rather than
+# eval() a runtime-built string — no dynamic string execution (closes the eval
+# audit finding) and predicate failure semantics are explicit. Each returns 0 when
+# satisfied. They run inside the pollers' `( set +o pipefail; … )` subshell.
+_pred_rpc_reachable() { cast chain-id --rpc-url "$1" >/dev/null 2>&1; }          # <rpc>
+_pred_http_ok()       { curl -sf "$1" >/dev/null 2>&1; }                          # <url>
+_pred_pg_eq()         { [[ "$(pgq "$1")" == "$2" ]]; }                            # <sql> <expected>
+_pred_pg_gt()         { local v; v=$(pgq "$1"); [[ "${v:-0}" -gt "$2" ]]; }       # <sql> <threshold>
+_pred_log_grep()      { docker logs --since "$2" "$1" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -qiE "$3"; }  # <container> <since> <ere>
+_pred_deposit_ready() {                                                          # <dest> <netid> <orig> [wanted_dest_net]
+    local dep; dep=$(find_deposit "$1" "$2" "$3")
+    [[ -n "$dep" ]] || return 1
+    printf '%s' "$dep" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+want = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] != '' else None
+sys.exit(0 if bool(d.get('ready_for_claim')) and (want is None or str(d.get('dest_net')) == want) else 1)
+" "${4:-}"
+}
+
+# wait_for <desc> <timeout> <interval> <predicate-fn> [args...]
+# Polls the NAMED predicate function until it succeeds or <timeout>s elapse.
 wait_for() {
-    local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
+    local desc="$1" timeout="$2" interval="${3:-5}"; shift 3
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
-    while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
+    while ! ( set +o pipefail; "$@" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
         [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
         echo -n "."; sleep "$interval"
@@ -159,8 +182,7 @@ l2l2_ensure_stack() {
     COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" docker compose \
         -f "$REPO/docker-compose.e2e.yml" -f "$REPO/docker-compose.l2l2.yml" \
         --env-file "$REPO/fixtures/.env" up -d anvil-l2b aggkit-l2b agglayer bridge-service
-    wait_for "anvil-l2b reachable at $L2B_RPC" \
-        "cast chain-id --rpc-url '$L2B_RPC' >/dev/null 2>&1" 60 2
+    wait_for "anvil-l2b reachable at $L2B_RPC" 60 2 _pred_rpc_reachable "$L2B_RPC"
     L2B_RPC="$L2B_RPC" "$SCRIPT_DIR/setup-l2b.sh"
     : "${SPONSOR_PRIVATE_KEY:?fixtures/.env must define SPONSOR_PRIVATE_KEY}"
     local sponsor_addr; sponsor_addr=$(cast wallet address --private-key "$SPONSOR_PRIVATE_KEY")
@@ -169,8 +191,8 @@ l2l2_ensure_stack() {
     COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" docker compose \
         -f "$REPO/docker-compose.e2e.yml" -f "$REPO/docker-compose.l2l2.yml" \
         --env-file "$REPO/fixtures/.env" up -d --force-recreate bridge-service
-    wait_for "bridge-service HTTP API up (post-recreate)" \
-        "curl -sf '$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000' >/dev/null" 120 3
+    wait_for "bridge-service HTTP API up (post-recreate)" 120 3 \
+        _pred_http_ok "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000"
     pass "Leg 0 done: rollup #2 registered, L2B bridge/GER live, bridge-service indexing both networks"
 }
 
@@ -226,15 +248,16 @@ nudge_cert() {
 }
 # nudge_until <desc> <check-cmd> — nudge, poll up to 75s, repeat NUDGE_TRIES
 # rounds (a single nudge can lose a second race vs the trusted-GER sync).
+# nudge_until <desc> <predicate-fn> [args...] — nudge a cert cycle, then poll the
+# NAMED predicate function (no eval) for up to 75s; repeat up to NUDGE_TRIES times.
 nudge_until() {
-    local desc="$1" check="$2" tries="${NUDGE_TRIES:-6}" t waited
+    local desc="$1"; shift
+    local tries="${NUDGE_TRIES:-6}" t waited
     for t in $(seq 1 "$tries"); do
         nudge_cert
         waited=0
         while [[ $waited -lt 75 ]]; do
-            # `check` is a static test-authored condition string (see wait_for's
-            # eval-contract note above) — deferred pg/l2b_* shell-function calls.
-            if ( set +o pipefail; eval "$check" ) 2>/dev/null; then
+            if ( set +o pipefail; "$@" ) 2>/dev/null; then
                 log "  nudge round $t unblocked: $desc"; return 0
             fi
             sleep 5; waited=$((waited + 5)); echo -n "."

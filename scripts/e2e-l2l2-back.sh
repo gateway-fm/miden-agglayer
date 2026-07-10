@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # e2e-l2l2-back.sh — SIMPLE, DETERMINISTIC L2<->L2 back scenario
-# ("l2-to-l2-back"), decomposed from e2e-l2-to-l2.sh leg 4.
+# ("l2-to-l2-back") — the canonical reverse leg of the l2l2 group (leg 4).
 #
 # Precondition: e2e-l2l2-forward.sh ran and left a Miden wallet holding wrapped
 # OPT0 (state file written to the shared isolated store).
 #
 #   bridge-out wrapped OPT0 Miden -> L2B (destNet=2)
 #   -> certificate settle -> Miden->L2B deposit ready_for_claim
-#   -> claim on L2B (ClaimTxManager autoclaim; manual claimAsset fallback)
+#   -> claim on L2B (direct proof-backed claimAsset; L2B autoclaim out of scope)
 #   -> ASSERT: net-zero round trip — L2B holder balance restored to its
 #      pre-forward value AND the Miden wrapped balance fully burned.
 #
@@ -78,9 +78,8 @@ pass "B2AGG note created for wrapped OPT0 -> L2B"
 EXPECTED_BACK_WEI=$(python3 -c "print($BACK_AMOUNT * $WEI_PER_MIDEN_UNIT)")
 BACK_AMT_HEX=$(python3 -c "print(format($EXPECTED_BACK_WEI, '064x'))")
 DESTNET_HEX=$(python3 -c "print(format($L2B_NETWORK_ID, '064x'))")
-wait_for "synthetic BridgeEvent row (PG count +1)" \
-    "[ \"\$(pgq \"SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}';\")\" -gt \"${BE_ROWS_BEFORE:-0}\" ]" \
-    300 5
+wait_for "synthetic BridgeEvent row (PG count +1)" 300 5 \
+    _pred_pg_gt "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}';" "${BE_ROWS_BEFORE:-0}"
 NEW_BE=$(pgq "SELECT lower(data) FROM synthetic_logs WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}' ORDER BY block_number DESC, log_index DESC LIMIT 1;")
 [[ -n "$NEW_BE" ]]                            || fail "no synthetic BridgeEvent row found"
 [[ "$NEW_BE" == *"${OPT0_HEX}"* ]]            || fail "newest BridgeEvent does not carry OPT0 origin ($OPT0_HEX)"
@@ -94,17 +93,15 @@ pass "synthetic BridgeEvent bound to this run: OPT0 origin, ADMIN dest, destNet=
 # ACCEPTED the all-zero root (which starts with '0'). `0x0*[1-9a-f]` = optional
 # leading zeros then at least one non-zero hex digit => any genuinely non-zero root
 # (incl. ones starting with 2), never the zero root.
-wait_for "Miden certificate settled on L1 (non-zero exit root, since leg4 start)" \
-    "docker logs --since $LEG4_START $AGGKIT_CONTAINER 2>&1 | grep -qE 'changed status.*Settled.*NewLocalExitRoot: 0x0*[1-9a-f]'" \
-    900 10
+wait_for "Miden certificate settled on L1 (non-zero exit root, since leg4 start)" 900 10 \
+    _pred_log_grep "$AGGKIT_CONTAINER" "$LEG4_START" "changed status.*Settled.*NewLocalExitRoot: 0x0*[1-9a-f]"
 pass "certificate settled"
 # CERTIFICATE SETTLEMENT (back): the Miden (network 1) cert whose settlement on
 # L1 carried the back-bridge exit root. Grep the Miden aggsender, verify on L1.
 evidence_settlement "leg4" back "$AGGKIT_CONTAINER" "$LEG4_START" 1 || true
 
-wait_for "Miden->L2B deposit ready_for_claim" \
-    "find_deposit '$ADMIN' $MIDEN_NETWORK_ID '$OPT0_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') and d.get('dest_net')==$L2B_NETWORK_ID else 1)\"" \
-    600 5
+wait_for "Miden->L2B deposit ready_for_claim" 600 5 \
+    _pred_deposit_ready "$ADMIN" "$MIDEN_NETWORK_ID" "$OPT0_LOWER" "$L2B_NETWORK_ID"
 BACK_DEPOSIT=$(find_deposit "$ADMIN" $MIDEN_NETWORK_ID "$OPT0_LOWER")
 [[ -n "$BACK_DEPOSIT" ]] || fail "back deposit vanished from bridge-service"
 BACK_CNT=$(dep_field "$BACK_DEPOSIT" deposit_cnt)
