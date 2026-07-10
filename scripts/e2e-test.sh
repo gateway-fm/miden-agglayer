@@ -121,9 +121,10 @@ case "$test_filter" in
         # SIMPLE L2<->L2 pipeline group (NOT in `all` — needs the
         # docker-compose.l2l2.yml overlay: second rollup + aggkit-l2b on top of
         # the base stack). Ordered: forward (deploy+bridge L2B->Miden+claim,
-        # foreign-origin faucet) then back (bridge-out Miden->L2B+claim,
-        # net-zero). forward brings the L2B overlay up idempotently (reused if
-        # already registered) and hands off a shared wallet state file to back.
+        # foreign-origin faucet), clash (same-address L1-vs-L2B faucet isolation,
+        # #108), then back (bridge-out Miden->L2B+claim, net-zero). forward brings
+        # the L2B overlay up idempotently (reused if already registered) and hands
+        # off a shared wallet + OPT0 state file the clash and back legs consume.
         #
         # Preflight ONCE up front (fail-loud: nothing runs against a
         # half-configured/port-colliding stack), then pin ONE per-run evidence
@@ -137,7 +138,12 @@ case "$test_filter" in
         export L2L2_PREFLIGHT_DONE=1
         "$SCRIPT_DIR/e2e-l2l2-forward.sh"
         echo ""
+        "$SCRIPT_DIR/e2e-l2l2-clash.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-l2l2-back.sh"
+        ;;
+    l2l2-clash)
+        "$SCRIPT_DIR/e2e-l2l2-clash.sh"
         ;;
     l2l2-forward)
         "$SCRIPT_DIR/e2e-l2l2-forward.sh"
@@ -152,7 +158,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-back|l2-to-l2]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back|l2-to-l2]" >&2
         echo "       (l2l2 / l2-to-l2 are optional and not part of 'all' — they need the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;
