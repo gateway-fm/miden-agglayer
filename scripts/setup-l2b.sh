@@ -137,19 +137,18 @@ ROLLUP2_EXPECTED="${ROLLUP2_ADDR:-0x5D1A491A416feEbf8C123A558ec28A239960bd0E}"
   fail "rollup #2 at $ROLLUP2 but configs expect $ROLLUP2_EXPECTED — re-run scripts/gen-l2b-configs.sh with ROLLUP2_ADDR=$ROLLUP2 and restart aggkit-l2b"
 log "  trustedSequencer: $(cast call "$ROLLUP2" 'trustedSequencer()(address)' --rpc-url "$L1_RPC")"
 log "  networkName:      $(cast call "$ROLLUP2" 'networkName()(string)' --rpc-url "$L1_RPC")"
-# L1 traceability: the attach tx MUST have emitted the RollupManager creation
-# event for rollupID 2 (AddNewRollupType + the attach event in the same flow).
-ATTACH_LOGS=$(cast rpc --raw eth_getLogs "[{\"fromBlock\":\"0x0\",\"toBlock\":\"latest\",\"address\":\"$ROLLUP_MANAGER\"}]" --rpc-url "$L1_RPC")
+# L1 traceability: attachAggchainToAL MUST have emitted the RollupManager's
+# CreateNewAggchain(rollupID indexed, ...) event for rollupID 2.
+CREATE_AGGCHAIN_TOPIC=0x144e3f9b5c63682a3bb7e9ad31e99c043890d3d540cd79dcebc3b5bdfba94c9b
+RID_TOPIC=0x$(printf '%064x' "$L2B_NETWORK_ID")
+ATTACH_LOGS=$(cast rpc --raw eth_getLogs "[{\"fromBlock\":\"0x0\",\"toBlock\":\"latest\",\"address\":\"$ROLLUP_MANAGER\",\"topics\":[\"$CREATE_AGGCHAIN_TOPIC\",\"$RID_TOPIC\"]}]" --rpc-url "$L1_RPC")
 ATTACH_TX=$(echo "$ATTACH_LOGS" | python3 -c "
 import json, sys
-rid = format($L2B_NETWORK_ID, 'x').rjust(64, '0')
-for lg in json.load(sys.stdin):
-    # rollupID is an indexed topic on the rollup-creation/attach events
-    if any(t[2:] == rid for t in lg['topics'][1:]):
-        print(lg['transactionHash']); break
+logs = json.load(sys.stdin)
+if logs: print(logs[-1]['transactionHash'])
 ")
-[ -n "$ATTACH_TX" ] || fail "no RollupManager event carries rollupID $L2B_NETWORK_ID — attach not traceable on L1"
-log "  L1 attach tx (RollupManager event, rollupID $L2B_NETWORK_ID): $ATTACH_TX"
+[ -n "$ATTACH_TX" ] || fail "no CreateNewAggchain(rollupID=$L2B_NETWORK_ID) event on the RollupManager — attach not traceable on L1"
+log "  L1 attach tx (CreateNewAggchain rollupID $L2B_NETWORK_ID): $ATTACH_TX"
 
 # ── Step 2: predeploy the sovereign genesis on L2B ───────────────────────────
 if ! cast chain-id --rpc-url "$L2B_RPC" >/dev/null 2>&1; then
