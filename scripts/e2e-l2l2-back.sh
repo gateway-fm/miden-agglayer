@@ -105,23 +105,16 @@ else
     warn "evidence: no aggoracle-l2b GER-inject tx found since $LEG4_START — ger_inject(back) not recorded"
 fi
 
-# Wake the rollupID-2 claim scan on L2B (non-fatal — manual fallback covers a miss).
-nudge_until "L2B autoclaim of the back deposit" \
-    "find_deposit '$ADMIN' $MIDEN_NETWORK_ID '$OPT0_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('claim_tx_hash') else 1)\"" \
-    || warn "autoclaim scan not woken by nudges — relying on the manual-claim fallback"
-
-CLAIM_TX_HASH=$(echo "$BACK_DEPOSIT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
-if [[ -z "$CLAIM_TX_HASH" ]]; then
-    log "  waiting up to 180s for ClaimTxManager autoclaim on L2B..."
-    for _ in $(seq 1 36); do
-        sleep 5
-        BACK_DEPOSIT=$(find_deposit "$ADMIN" $MIDEN_NETWORK_ID "$OPT0_LOWER")
-        CLAIM_TX_HASH=$(echo "$BACK_DEPOSIT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')" 2>/dev/null || true)
-        [[ -n "$CLAIM_TX_HASH" ]] && break
-        echo -n "."
-    done
-    echo ""
-fi
+# CLAIM ON L2B — we claim the back deposit DIRECTLY via claimAsset (robust manual
+# claim) rather than depending on the vendored bridge-service ClaimTxManager
+# autoclaim. The upstream L2->L2 autoclaim only re-scans on an L1 rollup-exit-root
+# update, so a deposit that turns ready BETWEEN scans can sit unclaimed
+# indefinitely (an upstream timing quirk we deliberately do not gate the test on;
+# fixing it is out of scope). The manual claim is still fully on-chain e2e: a real
+# claimAsset against the bridge-service-served merkle proof + the aggoracle-injected
+# L2B GER, with the real net-zero settlement asserted below. If the autoclaimer
+# happened to beat us to it, we adopt that tx instead (also e2e).
+CLAIM_TX_HASH=$(echo "$BACK_DEPOSIT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')" 2>/dev/null || true)
 
 if [[ -n "$CLAIM_TX_HASH" ]]; then
     log "  autoclaimed on L2B (tx $CLAIM_TX_HASH); verifying receipt..."
@@ -130,45 +123,48 @@ if [[ -n "$CLAIM_TX_HASH" ]]; then
         || fail "L2B autoclaim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
     pass "claim on L2B via ClaimTxManager autoclaim"
 else
-    warn "no autoclaim within 180s — claiming manually on L2B"
-    PROOF_JSON=""
-    for _ in $(seq 1 18); do
-        PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$BACK_CNT&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
-        [[ -n "$PROOF_JSON" ]] && break
-        sleep 5
-    done
-    [[ -n "$PROOF_JSON" ]] || fail "could not fetch merkle proof for back deposit after 90s"
-    MAINNET_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])")
-    ROLLUP_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])")
-    SMT_LOCAL=$(echo "$PROOF_JSON" | python3 -c "
-import json, sys
-p = json.load(sys.stdin)['proof']['merkle_proof']
-while len(p) < 32: p.append('0x' + '00' * 32)
-print('[' + ','.join(p[:32]) + ']')")
-    SMT_ROLLUP=$(echo "$PROOF_JSON" | python3 -c "
-import json, sys
-p = json.load(sys.stdin)['proof']['rollup_merkle_proof']
-while len(p) < 32: p.append('0x' + '00' * 32)
-print('[' + ','.join(p[:32]) + ']')")
-    BACK_GER=$(cast keccak "0x${MAINNET_EXIT_ROOT#0x}${ROLLUP_EXIT_ROOT#0x}")
-    wait_for "GER $BACK_GER injected into L2B AgglayerGERL2 (aggoracle-l2b)" \
-        "_g=\$(cast call $L2B_GER 'globalExitRootMap(bytes32)(uint256)' $BACK_GER --rpc-url '$L2B_RPC' 2>/dev/null | awk '{print \$1}'); [ -n \"\$_g\" ] && [ \"\$_g\" != \"0\" ]" \
-        300 5
+    log "  claiming the back deposit directly on L2B via claimAsset (robust: fresh proof + retry until settleable)"
     ORIG_NET=$(dep_field "$BACK_DEPOSIT" orig_net)
     DEST_NET=$(dep_field "$BACK_DEPOSIT" dest_net)
     DEST_ADDR_CLAIM=$(dep_field "$BACK_DEPOSIT" dest_addr)
     METADATA_CLAIM=$(echo "$BACK_DEPOSIT" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m != '0x' else '0x')")
-    CLAIM_TX=$(cast send --rpc-url "$L2B_RPC" --private-key "$ADMIN_KEY" \
-        "$BRIDGE" \
-        'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
-        "$SMT_LOCAL" "$SMT_ROLLUP" "$BACK_GI" \
-        "$MAINNET_EXIT_ROOT" "$ROLLUP_EXIT_ROOT" \
-        "$ORIG_NET" "$OPT0" "$DEST_NET" "$DEST_ADDR_CLAIM" \
-        "$BACK_AMOUNT_WEI" "$METADATA_CLAIM" 2>&1) || true
-    STATUS=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="status"{print $2; exit}')
-    [[ "$STATUS" == "1" ]] || { warn "L2B claim tx output: $CLAIM_TX"; fail "manual claimAsset on L2B failed"; }
-    CLAIM_TX_HASH=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="transactionHash"{print $2; exit}')
-    pass "claim on L2B via manual claimAsset"
+    CLAIM_TX_HASH=""
+    # The proof's roots and their L2B-GER injection LAG the deposit turning ready,
+    # and the served proof advances as the exit tree grows. So rather than fetch one
+    # proof and wait on one specific GER (racy), each attempt RE-FETCHES a fresh
+    # proof and tries claimAsset. `cast send` gas-estimates first, so a not-yet-
+    # settleable claim (covering GER not injected on L2B, or a stale sibling) reverts
+    # in estimation and fails FAST without submitting -> retry with a newer proof.
+    # Once the covering GER is injected on L2B, estimation passes and it settles.
+    for attempt in $(seq 1 30); do   # ~7.5 min worst case
+        PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$BACK_CNT&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
+        if [[ -n "$PROOF_JSON" ]]; then
+            MAINNET_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])" 2>/dev/null || true)
+            ROLLUP_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])" 2>/dev/null || true)
+            SMT_LOCAL=$(echo "$PROOF_JSON" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+            SMT_ROLLUP=$(echo "$PROOF_JSON" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['rollup_merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+            if [[ -n "$SMT_LOCAL" && -n "$SMT_ROLLUP" && -n "$MAINNET_EXIT_ROOT" ]]; then
+                CLAIM_OUT=$(cast send --rpc-url "$L2B_RPC" --private-key "$ADMIN_KEY" --json "$BRIDGE" \
+                    'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
+                    "$SMT_LOCAL" "$SMT_ROLLUP" "$BACK_GI" "$MAINNET_EXIT_ROOT" "$ROLLUP_EXIT_ROOT" \
+                    "$ORIG_NET" "$OPT0" "$DEST_NET" "$DEST_ADDR_CLAIM" "$BACK_AMOUNT_WEI" "$METADATA_CLAIM" 2>/dev/null || true)
+                CLAIM_TX_HASH=$(echo "$CLAIM_OUT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('transactionHash','') if str(d.get('status','')) in ('0x1','1','true') else '')" 2>/dev/null || true)
+                [[ -n "$CLAIM_TX_HASH" ]] && break
+            fi
+        fi
+        log "  attempt $attempt/30: back deposit not settleable on L2B yet (GER-injection/proof lag) — retrying in 15s"
+        sleep 15
+    done
+    [[ -n "$CLAIM_TX_HASH" ]] || fail "manual claimAsset on L2B did not settle after 30 attempts (~7.5m)"
+    pass "claim on L2B via robust manual claimAsset (tx $CLAIM_TX_HASH)"
 fi
 # CLAIM (back): on L2B via the AgglayerBridgeL2 proxy — cast-receiptable tx.
 evidence_tx "leg4" back L2B claim "$L2B_RPC" "$CLAIM_TX_HASH" "$BRIDGE" \

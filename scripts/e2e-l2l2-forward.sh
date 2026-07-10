@@ -133,9 +133,14 @@ FWD_GI=$(dep_field "$FWD_DEPOSIT" global_index)
 log "  forward deposit: cnt=$(dep_field "$FWD_DEPOSIT" deposit_cnt) globalIndex=$FWD_GI"
 
 # Deposit ready — force settle cycles until the claim scan picks it up.
+# Scope the auto-create gate to THIS run's OPT0 token_address — a bare
+# 'auto-creating faucet' grep cross-matches any other foreign token being claimed
+# concurrently (e.g. under N=20 address-clash load, or leftover state), letting the
+# test false-progress on someone else's claim and then fail the OPT0-specific
+# assert below. Match the claim.rs:487 line "…token_address: 0x<OPT0>, symbol:…".
 nudge_until "faucet auto-creation for OPT0 (claim scan)" \
-    "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'auto-creating faucet'" \
-    || fail "claim scan never picked up the forward deposit despite repeated nudges"
+    "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -qi \"auto-creating faucet.*token_address: $OPT0\"" \
+    || fail "claim scan never picked up the forward deposit (OPT0 $OPT0) despite repeated nudges"
 wait_for "claim tx committed on Miden" \
     "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'claim tx.*committed to block'" \
     300 5

@@ -314,27 +314,40 @@ _pf_bridge_fresh() {
     fi
 }
 
-# _pf_sync_lag <net-id> <rpc> <label> — assert bridge-service's synchronizer for
-# a network is CLOSE to that chain's tip. A synchronizer can keep logging (passes
-# freshness) yet be stuck re-checking one block and never advance (observed after
-# a chain reset desynced the claimtxman); such a stall stops new deposits from
-# ever reaching ready_for_claim. Compares the newest "Checking Block N" to the tip.
+# _pf_sync_lag <net-id> <rpc> <label> — assert bridge-service's synchronizer for a
+# network has CAUGHT UP. A synchronizer can keep logging (passes freshness) yet be
+# stuck re-checking one block and never advance (observed after a chain reset
+# desynced the claimtxman); such a stall stops new deposits from ever reaching
+# ready_for_claim.
+#
+# We read the synchronizer's OWN authoritative catch-up state from its bridge_db
+# `sync.status` (network_id, percentage, remaining_blocks, synced) — updated every
+# sync cycle. This replaces the earlier "newest checkReorg block vs chain tip"
+# heuristic, which FALSE-POSITIVED on a quiet fresh L1: sync.block / checkReorg only
+# track EVENT-BEARING blocks, so with sparse L1 GER events the checkReorg block sits
+# thousands of (auto-mined, empty) blocks below the tip even when fully synced.
+# sync.status.synced is immune to that and still flips false when a reset wedges the
+# synchronizer mid-reorg (remaining_blocks climbs / synced=false). $rpc is unused
+# now but kept for call-site compatibility. Retries for PF_SYNC_SETTLE seconds so a
+# legitimate initial catch-up right after (re)create isn't flagged as a wedge.
 _pf_sync_lag() {
-    local net="$1" rpc="$2" label="$3" max="${PF_BRIDGE_LAG_MAX:-400}" synced tip lag
-    synced=$( ( set +o pipefail; docker logs --tail 6000 "${COMPOSE_PROJECT_NAME}-bridge-service-1" 2>&1 \
-        | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
-        | grep -oE "NetworkID: $net, \[checkReorg function\] Checking Block [0-9]+" \
-        | tail -1 | grep -oE '[0-9]+$' ) || true )
-    tip=$(cast block-number --rpc-url "$rpc" 2>/dev/null || true)
-    if [[ -z "$synced" || -z "$tip" ]]; then
-        _pf_fail "bridge-service $label sync: could not read synced block ('${synced:-}') or chain tip ('${tip:-}')"
-        return
-    fi
-    lag=$(( tip - synced ))
-    if [[ "$lag" -le "$max" ]]; then
-        _pf_pass "bridge-service $label sync near tip (synced $synced, tip $tip, lag $lag)"
+    local net="$1" _rpc="$2" label="$3" max="${PF_BRIDGE_LAG_MAX:-400}"
+    local pg="${COMPOSE_PROJECT_NAME}-postgres-1" deadline row synced remaining
+    deadline=$(( $(date +%s) + ${PF_SYNC_SETTLE:-90} ))
+    while :; do
+        row=$( ( set +o pipefail; docker exec "$pg" psql -U bridge_user -d bridge_db -tAX \
+            -c "SELECT synced||'|'||remaining_blocks FROM sync.status WHERE network_id=$net" 2>/dev/null ) | tr -d '[:space:]' )
+        synced="${row%%|*}"; remaining="${row##*|}"
+        [[ "$synced" == "true" && "${remaining:-999999}" -le "$max" ]] && break
+        [[ $(date +%s) -ge $deadline ]] && break
+        sleep 3
+    done
+    if [[ -z "$row" ]]; then
+        _pf_fail "bridge-service $label sync: no sync.status row for network $net in bridge_db (synchronizer not started?)"
+    elif [[ "$synced" == "true" && "${remaining:-999999}" -le "$max" ]]; then
+        _pf_pass "bridge-service $label synced (sync.status: synced=$synced remaining_blocks=$remaining)"
     else
-        _pf_fail "bridge-service $label sync STALLED — synced block $synced vs chain tip $tip (lag $lag > $max); synchronizer wedged, deposits won't reach ready_for_claim"
+        _pf_fail "bridge-service $label sync STALLED — sync.status synced=${synced:-?} remaining_blocks=${remaining:-?} after ${PF_SYNC_SETTLE:-90}s (>$max); synchronizer wedged, deposits won't reach ready_for_claim"
     fi
 }
 
@@ -462,10 +475,14 @@ evidence_tx() {
     local step="$1" direction="$2" chain="$3" kind="$4" rpc="$5" tx="$6" contract="$7" extra="${8:-}"
     local block="" status="norcpt" st
     if [[ -n "$tx" && "$tx" != "0x" ]]; then
-        # `|| true`: a receipt fetch that races the RPC (or a not-yet-mined tx)
-        # must not abort a caller running under `set -e -o pipefail`.
-        block=$(cast receipt "$tx" blockNumber --rpc-url "$rpc" 2>/dev/null | awk '{print $1}' || true)
-        st=$(cast receipt "$tx" status --rpc-url "$rpc" 2>/dev/null | awk '{print $1}' || true)
+        # `timeout` is REQUIRED, not just `|| true`: `cast receipt` WAITS (polls)
+        # for the tx to be mined and hangs INDEFINITELY when the tx is not on this
+        # rpc's chain (e.g. an aggoracle inject-GER tx id that isn't an L2B tx). A
+        # bare `|| true` never fires because the call never returns. Bound it so
+        # best-effort evidence never wedges the test; a miss just records
+        # "unverified". `|| true` still guards the pipe under `set -e -o pipefail`.
+        block=$(timeout 15 cast receipt "$tx" blockNumber --rpc-url "$rpc" 2>/dev/null | awk '{print $1}' || true)
+        st=$(timeout 15 cast receipt "$tx" status --rpc-url "$rpc" 2>/dev/null | awk '{print $1}' || true)
         case "$st" in
             1|0x1|true) status="success" ;;
             "")         status="unverified" ;;
