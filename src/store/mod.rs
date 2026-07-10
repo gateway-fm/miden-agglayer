@@ -402,10 +402,27 @@ pub trait Store: Send + Sync + 'static {
         l1_timestamp: u64,
     ) -> anyhow::Result<()>;
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
-    async fn mark_ger_injected(&self, ger: [u8; 32]) -> anyhow::Result<()>;
-    /// Atomically: mark GER seen, update hash chain, emit UpdateHashChainValue log.
+    /// Atomically, in a single all-or-nothing operation: mark the GER seen,
+    /// idempotently roll the hash chain + emit the `UpdateHashChainValue`
+    /// synthetic log, and set `is_injected = TRUE`.
+    ///
+    /// MUST be idempotent on the hash-chain roll + log emission: re-running it
+    /// for a GER whose log was already emitted (e.g. a retry after a crash)
+    /// must NOT roll the chain a second time or insert a duplicate log
+    /// (audit H2). Implementations gate the roll on whether a synthetic log
+    /// with `tx_hash` already exists.
+    ///
+    /// Why atomic: a legacy two-step "roll chain + emit log" then "mark
+    /// injected" sequence left a crash window — if the process died between
+    /// them, the chain roll + log had ALREADY committed while `is_ger_injected`
+    /// was still FALSE. On restart the projector re-entered and rolled the hash
+    /// chain + emitted a duplicate log a SECOND time — diverging the proxy's
+    /// `hash_chain_value` from aggkit's view (settlement stall or poisoned
+    /// certificate). Folding both into one transaction closes that window; there
+    /// is deliberately no default impl, so every store must provide a genuine
+    /// single-transaction implementation.
     #[allow(clippy::too_many_arguments)]
-    async fn add_ger_update_event(
+    async fn commit_ger_event_atomic(
         &self,
         block_number: u64,
         block_hash: [u8; 32],
@@ -534,14 +551,58 @@ pub trait Store: Send + Sync + 'static {
 
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
-    /// Mark note as processed, return the deposit count assigned to it.
-    async fn mark_note_processed(&self, note_id: String) -> anyhow::Result<u32>;
-    /// Roll back a processed-note marker when later persistence fails.
-    async fn unmark_note_processed(&self, note_id: &str) -> anyhow::Result<()>;
     /// Read the current deposit_counter (number of B2AGG-out notes aggkit has
     /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
     /// to compare against the bridge account's `let_num_leaves` storage slot.
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;
+
+    /// Atomic, idempotent commit for a B2AGG bridge-out `BridgeEvent`. Folds:
+    ///   1. allocate (or reuse) the note's `deposit_count` and record the note
+    ///      as processed
+    ///   2. the BridgeEvent synthetic-log emission
+    /// into a single all-or-nothing operation. This is the SOLE write path for
+    /// the B2AGG processed-set that `is_note_processed` reads.
+    ///
+    /// Why this exists (audit H1): the legacy two-step mark-processed +
+    /// bridge-event emission sequence left a crash window — a process kill
+    /// between the two calls recorded the note as processed (and bumped
+    /// `deposit_counter`) with NO matching `BridgeEvent`. On restart the note
+    /// was silently skipped, stranding the exit: aggkit never certified it and
+    /// the L1 autoclaim never fired. The Claim path already had the atomic
+    /// pattern (`commit_manual_claim_event_atomic`); the B2AGG path did not.
+    ///
+    /// It is also idempotent on retry (audit H3): re-running for an
+    /// already-committed note reuses the original `deposit_count`, does NOT
+    /// bump the counter again, and does NOT emit a duplicate log. Allocating a
+    /// fresh `deposit_count` on retry would create a permanent gap in the
+    /// sequence, desynchronising leaf indices from the on-chain Local Exit
+    /// Tree (Cantina MA#15).
+    ///
+    /// REQUIRED — there is deliberately no default impl. A default that ran
+    /// the two steps sequentially would NOT be all-or-nothing (a failure
+    /// after the processed-marker write but before the event emission reopens
+    /// exactly the Cantina MA#15 crash window this method exists to close).
+    /// Each backend MUST provide a genuine single-transaction implementation:
+    /// `PgStore` uses one postgres txn; `InMemoryStore` folds the
+    /// reuse-or-allocate and the at-most-once emission under its in-process
+    /// locks.
+    /// Returns the `deposit_count` assigned to (or reused for) this note.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_b2agg_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        leaf_type: u8,
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_network: u32,
+        destination_address: &[u8; 20],
+        amount: u128,
+        metadata: &[u8],
+    ) -> anyhow::Result<u32>;
 
     /// Record a B2AGG bridge-out that was observed consumed by the bridge but
     /// could NOT be translated into a synthetic BridgeEvent (Cantina MA#18).
@@ -682,46 +743,6 @@ pub trait Store: Send + Sync + 'static {
                 origin_address,
                 destination_address,
                 amount,
-            ),
-            block_number,
-            block_hash,
-            transaction_hash: tx_hash.to_string(),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-        self.add_log(log).await
-    }
-
-    // === Convenience: bridge event log ===
-    #[allow(clippy::too_many_arguments)]
-    async fn add_bridge_event(
-        &self,
-        bridge_address: &str,
-        block_number: u64,
-        block_hash: [u8; 32],
-        tx_hash: &str,
-        leaf_type: u8,
-        origin_network: u32,
-        origin_address: &[u8; 20],
-        destination_network: u32,
-        destination_address: &[u8; 20],
-        amount: u128,
-        metadata: &[u8],
-        deposit_count: u32,
-    ) -> anyhow::Result<()> {
-        let log = SyntheticLog {
-            address: bridge_address.to_string(),
-            topics: vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()],
-            data: crate::bridge_out::encode_bridge_event_data(
-                leaf_type,
-                origin_network,
-                origin_address,
-                destination_network,
-                destination_address,
-                amount,
-                metadata,
-                deposit_count,
             ),
             block_number,
             block_hash,
