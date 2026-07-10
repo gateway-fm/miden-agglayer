@@ -55,14 +55,23 @@ on:
         default: "false"
   pull_request:
     # Opt-in per PR: add the `e2e-l2l2` label to a PR to trigger one run.
-    types: [labeled]
+    types: [labeled, synchronize]
+
+# Least-privilege GITHUB_TOKEN (CodeQL rec): this job only checks out + runs the
+# stack; it needs read access to repo contents and nothing else.
+permissions:
+  contents: read
 
 jobs:
   e2e-l2l2:
     # Never on a bare push/sync — only manual dispatch or an explicit label.
+    # Run on manual dispatch, or on any labeled/synchronize PR event where the
+    # 'e2e-l2l2' label is CURRENTLY present (checking the labels array, not
+    # github.event.label.name which is only set on the 'labeled' event — so a
+    # later push/synchronize re-runs while the label is still applied).
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'e2e-l2l2')
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e-l2l2'))
     runs-on: ${{ github.event.inputs.runner || 'self-hosted' }}
     timeout-minutes: 120
     steps:

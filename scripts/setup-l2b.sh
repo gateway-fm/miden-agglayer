@@ -67,7 +67,9 @@ cast chain-id --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 not reachable at $
 
 # The contracts container joins the L1 anvil's network namespace so the
 # hardhat 'localhost' network (127.0.0.1:8545) IS our L1 anvil.
-_DETECTED_PROJECT=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E -- '-anvil-1$' | head -1 | sed 's/-anvil-1$//')
+# pipefail-safe: no match -> grep exits 1 (and head can SIGPIPE grep=141); a bare
+# assignment would abort the script under set -euo pipefail before the fallback.
+_DETECTED_PROJECT=$( ( set +o pipefail; docker ps --format '{{.Names}}' 2>/dev/null | grep -E -- '-anvil-1$' | head -1 | sed 's/-anvil-1$//' ) || true )
 L1_CONTAINER="${L1_CONTAINER:-${_DETECTED_PROJECT:-l2l2}-anvil-1}"
 docker inspect "$L1_CONTAINER" >/dev/null 2>&1 || fail "L1 anvil container '$L1_CONTAINER' not found (set L1_CONTAINER=)"
 

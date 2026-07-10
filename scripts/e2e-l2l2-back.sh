@@ -43,9 +43,9 @@ evidence_init
 # rollup_register + exit-root baseline (so `back` standalone is also self-complete).
 evidence_rollup_register "leg4"
 evidence_exit_root "leg4" back pre-back
-l2l2_deploy_nudge_token
-evidence_tx "leg4" back L2B deploy "$L2B_RPC" "$NDG_DEPLOY_TX" "$NDG" "token=NDG role=cert-nudge"
-
+# NOTE: no cert-nudge token here. The reverse claim is a DIRECT proof-backed
+# claimAsset on L2B (L2B autoclaim is intentionally out of scope), and the back GER
+# reaches L2B via aggoracle-l2b watching L1 — neither needs an L2B->L1 nudge cert.
 BACK_AMOUNT="$FWD_MIDEN_UNITS"     # forward credited exactly this
 ADMIN_LOWER=$(echo "$ADMIN" | tr 'A-F' 'a-f')
 LEG4_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -62,16 +62,32 @@ iso_tool --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$OPT0_FA
     || fail "bridge-out-tool failed (destNet=$L2B_NETWORK_ID)"
 pass "B2AGG note created for wrapped OPT0 -> L2B"
 
-# Synthetic BridgeEvent must carry origin (OPT0, net 2).
+# Bind the NEW BridgeEvent to THIS run's transfer — not just "a count bump plus any
+# historical OPT0 row". The newest BridgeEvent's ABI data must, in ONE row, carry:
+# origin token OPT0, destination ADMIN, destinationNetwork=2 (L2B), and the exact
+# amount (Miden units -> origin wei). Amount is re-checked against the bridge-service
+# deposit leaf below (EXPECTED_BACK_WEI), and cnt/global-index are pinned there too.
+EXPECTED_BACK_WEI=$(python3 -c "print($BACK_AMOUNT * $WEI_PER_MIDEN_UNIT)")
+BACK_AMT_HEX=$(python3 -c "print(format($EXPECTED_BACK_WEI, '064x'))")
+DESTNET_HEX=$(python3 -c "print(format($L2B_NETWORK_ID, '064x'))")
 wait_for "synthetic BridgeEvent row (PG count +1)" \
     "[ \"\$(pgq \"SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}';\")\" -gt \"${BE_ROWS_BEFORE:-0}\" ]" \
     300 5
-BE_ORIGIN_OK=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}' AND lower(data) LIKE '%${OPT0_HEX}%';")
-[[ "${BE_ORIGIN_OK:-0}" -ge 1 ]] || fail "no BridgeEvent row carries the OPT0 origin address"
-pass "synthetic BridgeEvent carries OPT0 origin"
+NEW_BE=$(pgq "SELECT lower(data) FROM synthetic_logs WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}' ORDER BY block_number DESC, log_index DESC LIMIT 1;")
+[[ -n "$NEW_BE" ]]                            || fail "no synthetic BridgeEvent row found"
+[[ "$NEW_BE" == *"${OPT0_HEX}"* ]]            || fail "newest BridgeEvent does not carry OPT0 origin ($OPT0_HEX)"
+[[ "$NEW_BE" == *"${ADMIN_LOWER#0x}"* ]]      || fail "newest BridgeEvent does not carry ADMIN destination"
+[[ "$NEW_BE" == *"${DESTNET_HEX}"* ]]         || fail "newest BridgeEvent does not carry destNet=$L2B_NETWORK_ID"
+[[ "$NEW_BE" == *"${BACK_AMT_HEX}"* ]]        || fail "newest BridgeEvent does not carry amount $EXPECTED_BACK_WEI wei"
+pass "synthetic BridgeEvent bound to this run: OPT0 origin, ADMIN dest, destNet=$L2B_NETWORK_ID, amount=$EXPECTED_BACK_WEI"
 
-wait_for "Miden certificate settled on L1" \
-    "docker logs --since $LEG4_START $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
+# Match a Settled cert with a NON-ZERO NewLocalExitRoot since LEG4_START. The old
+# `0x[^2]` was doubly wrong: it REJECTED a valid root beginning with '2' and
+# ACCEPTED the all-zero root (which starts with '0'). `0x0*[1-9a-f]` = optional
+# leading zeros then at least one non-zero hex digit => any genuinely non-zero root
+# (incl. ones starting with 2), never the zero root.
+wait_for "Miden certificate settled on L1 (non-zero exit root, since leg4 start)" \
+    "docker logs --since $LEG4_START $AGGKIT_CONTAINER 2>&1 | grep -qE 'changed status.*Settled.*NewLocalExitRoot: 0x0*[1-9a-f]'" \
     900 10
 pass "certificate settled"
 # CERTIFICATE SETTLEMENT (back): the Miden (network 1) cert whose settlement on
@@ -105,25 +121,24 @@ else
     warn "evidence: no aggoracle-l2b GER-inject tx found since $LEG4_START — ger_inject(back) not recorded"
 fi
 
-# CLAIM ON L2B — we claim the back deposit DIRECTLY via claimAsset (robust manual
-# claim) rather than depending on the vendored bridge-service ClaimTxManager
-# autoclaim. The upstream L2->L2 autoclaim only re-scans on an L1 rollup-exit-root
-# update, so a deposit that turns ready BETWEEN scans can sit unclaimed
-# indefinitely (an upstream timing quirk we deliberately do not gate the test on;
-# fixing it is out of scope). The manual claim is still fully on-chain e2e: a real
-# claimAsset against the bridge-service-served merkle proof + the aggoracle-injected
-# L2B GER, with the real net-zero settlement asserted below. If the autoclaimer
-# happened to beat us to it, we adopt that tx instead (also e2e).
+# CLAIM ON L2B — the reverse-path ACCEPTANCE is a direct, proof-backed
+# `AgglayerBridgeL2.claimAsset` on L2B. L2B ClaimTxManager autoclaim is
+# intentionally out of scope for this test (the upstream L2->L2 autoclaim only
+# re-scans on an L1 rollup-exit-root update and can skip a deposit that turns ready
+# between scans), so this is the expected reverse claim, NOT a fallback. The
+# (dormant) autoclaim-adoption below is a pure defensive shortcut: if a claim tx
+# ever did appear it is simply verified and reused; on this stack it never does,
+# and the direct claimAsset runs.
 CLAIM_TX_HASH=$(echo "$BACK_DEPOSIT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')" 2>/dev/null || true)
 
 if [[ -n "$CLAIM_TX_HASH" ]]; then
-    log "  autoclaimed on L2B (tx $CLAIM_TX_HASH); verifying receipt..."
+    log "  a claim tx already exists on L2B (tx $CLAIM_TX_HASH); verifying receipt..."
     RECEIPT_STATUS=$(cast receipt --rpc-url "$L2B_RPC" "$CLAIM_TX_HASH" status 2>/dev/null || echo "")
     [[ "$RECEIPT_STATUS" == *1* || "$RECEIPT_STATUS" == *true* ]] \
-        || fail "L2B autoclaim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
-    pass "claim on L2B via ClaimTxManager autoclaim"
+        || fail "L2B claim tx $CLAIM_TX_HASH receipt status not success: ${RECEIPT_STATUS:-<none>}"
+    pass "claim on L2B verified (pre-existing claim tx)"
 else
-    log "  claiming the back deposit directly on L2B via claimAsset (robust: fresh proof + retry until settleable)"
+    log "  claiming the back deposit directly on L2B via claimAsset (proof-backed; fresh proof + retry until settleable)"
     ORIG_NET=$(dep_field "$BACK_DEPOSIT" orig_net)
     DEST_NET=$(dep_field "$BACK_DEPOSIT" dest_net)
     DEST_ADDR_CLAIM=$(dep_field "$BACK_DEPOSIT" dest_addr)

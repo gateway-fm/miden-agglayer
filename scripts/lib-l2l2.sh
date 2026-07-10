@@ -31,7 +31,11 @@ PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-
 #    the l2l2 worktree -> "l2l2", the chaos worktree -> "chaos", main ->
 #    "miden-agglayer"). Detect from the live proxy container, same pattern as
 #    e2e-l2-to-l2.sh / e2e-l2-to-l1.sh. ───────────────────────────────────────
-_DETECTED_PROJECT=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E -- '-miden-agglayer-1$' | head -1 | sed 's/-miden-agglayer-1$//')
+# `set +o pipefail` + `|| true`: with no matching proxy container `grep` exits 1
+# (and `head` closing the pipe early can SIGPIPE `grep`=141) — under the caller's
+# `set -euo pipefail` a bare `_DETECTED_PROJECT=$(… failing pipeline …)` would exit
+# the script BEFORE the explicit COMPOSE_PROJECT_NAME / fallback below can apply.
+_DETECTED_PROJECT=$( ( set +o pipefail; docker ps --format '{{.Names}}' 2>/dev/null | grep -E -- '-miden-agglayer-1$' | head -1 | sed 's/-miden-agglayer-1$//' ) || true )
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${_DETECTED_PROJECT:-miden-agglayer}}"
 AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
@@ -188,12 +192,16 @@ l2l2_miden_identities() {
 # Deploy NDG once per script via l2l2_deploy_nudge_token (sets NDG).
 l2l2_deploy_nudge_token() {
     local out
+    # `|| true` on the substitution so a forge failure is CAPTURED (not a set -e
+    # exit), and the grep runs in a pipefail-disabled subshell so a changed/absent
+    # "Deployed to:" line yields an empty NDG that reaches the explicit diagnostic
+    # below — same fix already applied to the OPT0 parser.
     out=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L2B_RPC" \
         --private-key "$ADMIN_KEY" --broadcast \
-        --constructor-args "NudgeToken" "NDG" 18 1000000000000000000 2>&1)
-    NDG=$(echo "$out" | grep "Deployed to:" | awk '{print $NF}')
-    NDG_DEPLOY_TX=$(echo "$out" | awk '/Transaction hash:/{print $NF; exit}')
-    [[ -n "$NDG" ]] || fail "NDG deploy failed: $(echo "$out" | tail -2)"
+        --constructor-args "NudgeToken" "NDG" 18 1000000000000000000 2>&1) || true
+    NDG=$( ( set +o pipefail; echo "$out" | grep "Deployed to:" | awk '{print $NF}' ) || true )
+    NDG_DEPLOY_TX=$( ( set +o pipefail; echo "$out" | awk '/Transaction hash:/{print $NF; exit}' ) || true )
+    [[ -n "$NDG" ]] || fail "NDG deploy failed: $(echo "$out" | tail -3)"
     log "  nudge token NDG deployed on L2B: $NDG"
 }
 nudge_cert() {

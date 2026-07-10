@@ -27,12 +27,13 @@ B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-l2l2}"
 STATE_FILE="${STATE_FILE:-$B2AGG_STORE_DIR/l2l2-scenario-state.env}"
 
 source "$SCRIPT_DIR/lib-l2l2.sh"
+source "$SCRIPT_DIR/lib-isolated-wallet.sh"
 
 [[ -f "$STATE_FILE" ]] || fail "no scenario state at $STATE_FILE — run e2e-l2l2-forward.sh first"
 # shellcheck disable=SC1090
 source "$STATE_FILE"
-[[ -n "${OPT0_HEX:-}" && -n "${DEST_ADDR:-}" ]] \
-    || fail "scenario state incomplete (need OPT0_HEX + DEST_ADDR): $STATE_FILE"
+[[ -n "${OPT0_HEX:-}" && -n "${DEST_ADDR:-}" && -n "${BRIDGE_ID:-}" ]] \
+    || fail "scenario state incomplete (need OPT0_HEX + DEST_ADDR + BRIDGE_ID): $STATE_FILE"
 
 for c in cast forge psql curl python3 docker; do command -v "$c" >/dev/null || fail "$c not found"; done
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 (Anvil) not reachable at $L1_RPC"
@@ -46,8 +47,12 @@ if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
 evidence_init
 evidence_rollup_register "leg3"
 
-COL_L1_WEI="${COL_L1_WEI:-1000000000000000}"     # COL bridged from L1 (net 0)
-COL_L2B_WEI="${COL_L2B_WEI:-1000000000000000}"   # COL bridged from L2B (net 2)
+# DISTINCT amounts per origin so a swapped/cross-contaminated mint can't pass: the
+# net-0 and net-2 wrapped balances below must match THEIR OWN origin's amount.
+COL_L1_WEI="${COL_L1_WEI:-1000000000000000}"     # net 0 -> 1e5 Miden units
+COL_L2B_WEI="${COL_L2B_WEI:-3000000000000000}"   # net 2 -> 3e5 Miden units (distinct)
+COL_L1_UNITS=$((COL_L1_WEI / WEI_PER_MIDEN_UNIT))
+COL_L2B_UNITS=$((COL_L2B_WEI / WEI_PER_MIDEN_UNIT))
 l2l2_deploy_nudge_token                          # NDG, so nudge_cert can force cert cycles
 evidence_tx "leg3" clash L2B deploy "$L2B_RPC" "$NDG_DEPLOY_TX" "$NDG" "token=NDG role=cert-nudge"
 
@@ -129,8 +134,41 @@ COL_FID_NET2=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(or
 [[ "$COL_FID_NET0" != "$COL_FID_NET2" ]] \
     || fail "FAUCET COLLISION: (COL, net 0) and (COL, net 2) share faucet $COL_FID_NET0"
 pass "distinct faucets for one address: net0=$COL_FID_NET0 net2=$COL_FID_NET2"
-evidence_record "leg3" clash Miden claim "" "" "$COL" "isolated" \
-    "COL faucets net0=$COL_FID_NET0 net2=$COL_FID_NET2 (distinct)"
+
+# Registry rows precede the mint, and equal amounts would hide a swapped route — so
+# require BOTH claims to actually COMPLETE with the correct PER-ORIGIN amount, and
+# pin each to its exact deposit global index + ClaimEvent (not "a row exists").
+COL_DEP_NET0=$(find_deposit "$DEST_ADDR" 0 "$COL_LOWER")
+COL_DEP_NET2=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER")
+[[ -n "$COL_DEP_NET0" && -n "$COL_DEP_NET2" ]] \
+    || fail "COL deposit missing in bridge-service: net0='${COL_DEP_NET0:+present}' net2='${COL_DEP_NET2:+present}'"
+COL_GI_NET0=$(dep_field "$COL_DEP_NET0" global_index)
+COL_GI_NET2=$(dep_field "$COL_DEP_NET2" global_index)
+[[ -n "$COL_GI_NET0" && -n "$COL_GI_NET2" && "$COL_GI_NET0" != "$COL_GI_NET2" ]] \
+    || fail "COL net0/net2 global index degenerate: net0=$COL_GI_NET0 net2=$COL_GI_NET2"
+
+# Per-faucet WRAPPED BALANCE must equal THAT origin's amount (distinct amounts =>
+# a swap or cross-mint is caught here, and a non-zero balance proves the mint
+# actually completed — not merely that the faucet was registered).
+CB0=0; CB2=0
+for attempt in $(seq 1 18); do
+    sleep 10
+    CB0=$(iso_wallet_balance "$BRIDGE_ID" "$COL_FID_NET0"); CB0="${CB0:-0}"
+    CB2=$(iso_wallet_balance "$BRIDGE_ID" "$COL_FID_NET2"); CB2="${CB2:-0}"
+    log "  attempt $attempt/18: COL wrapped balances net0=$CB0 (want $COL_L1_UNITS) net2=$CB2 (want $COL_L2B_UNITS)"
+    [[ "$CB0" -gt 0 && "$CB2" -gt 0 ]] && break
+done
+[[ "$CB0" -eq "$COL_L1_UNITS" ]]  || fail "(COL, net 0) wrapped balance: got $CB0, expected $COL_L1_UNITS (routing/mint wrong)"
+[[ "$CB2" -eq "$COL_L2B_UNITS" ]] || fail "(COL, net 2) wrapped balance: got $CB2, expected $COL_L2B_UNITS (routing/mint wrong)"
+pass "distinct mints: (COL,net0)=$CB0 via $COL_FID_NET0 ; (COL,net2)=$CB2 via $COL_FID_NET2"
+
+# ClaimEvent pinned to each COL deposit's EXACT global index (not any COL row).
+CR0=$(claim_event_rows "$COL_GI_NET0"); CR2=$(claim_event_rows "$COL_GI_NET2")
+[[ "${CR0:-0}" -ge 1 ]] || fail "no ClaimEvent for (COL,net0) globalIndex $COL_GI_NET0"
+[[ "${CR2:-0}" -ge 1 ]] || fail "no ClaimEvent for (COL,net2) globalIndex $COL_GI_NET2"
+pass "ClaimEvent pinned: net0 gi=$COL_GI_NET0 (rows=$CR0), net2 gi=$COL_GI_NET2 (rows=$CR2)"
+evidence_record "leg3" clash Miden claim "" "" "$COL" "isolated+minted" \
+    "net0 faucet=$COL_FID_NET0 bal=$CB0 gi=$COL_GI_NET0 ; net2 faucet=$COL_FID_NET2 bal=$CB2 gi=$COL_GI_NET2"
 
 # Negative control: OPT0 (from the forward leg) exists ONLY as an origin-network-2
 # asset — a lookup under origin_network=0 must yield NOTHING, and exactly one row.
