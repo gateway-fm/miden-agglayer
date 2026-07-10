@@ -117,18 +117,32 @@ case "$test_filter" in
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         ;;
+    l2l2)
+        # SIMPLE L2<->L2 pipeline group (NOT in `all` — needs the
+        # docker-compose.l2l2.yml overlay: second rollup + aggkit-l2b on top of
+        # the base stack). Ordered: forward (deploy+bridge L2B->Miden+claim,
+        # foreign-origin faucet) then back (bridge-out Miden->L2B+claim,
+        # net-zero). forward brings the L2B overlay up idempotently (reused if
+        # already registered) and hands off a shared wallet state file to back.
+        "$SCRIPT_DIR/e2e-l2l2-forward.sh"
+        echo ""
+        "$SCRIPT_DIR/e2e-l2l2-back.sh"
+        ;;
+    l2l2-forward)
+        "$SCRIPT_DIR/e2e-l2l2-forward.sh"
+        ;;
+    l2l2-back)
+        "$SCRIPT_DIR/e2e-l2l2-back.sh"
+        ;;
     l2-to-l2)
-        # OPTIONAL, deliberately NOT in `all`: needs the docker-compose.l2l2.yml
-        # overlay (second rollup + aggkit-l2b) on top of the base stack, which
-        # the plain `make e2e-up` stacks don't run. The script brings the L2B
-        # services up itself (idempotent) but restarts bridge-service with the
-        # network-2 config, so don't interleave it with the `all` suite.
+        # OPTIONAL, deliberately NOT in `all`: the monolithic 5-leg L2<->L2 e2e
+        # (superset of the l2l2 group above, plus same-address faucet isolation).
         "$SCRIPT_DIR/e2e-l2-to-l2.sh"
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2-to-l2]" >&2
-        echo "       (l2-to-l2 is optional and not part of 'all' — it needs the docker-compose.l2l2.yml overlay)" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-back|l2-to-l2]" >&2
+        echo "       (l2l2 / l2-to-l2 are optional and not part of 'all' — they need the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;
 esac
