@@ -256,6 +256,31 @@ nudge_cert() {
     log "  nudge cert sent (1 wei NDG L2B->L1) — wakes the L2->L2 claim scan"
 }
 
+# nudge_until <desc> <check-cmd> — nudge, poll <check-cmd> up to 75s, repeat
+# (NUDGE_TRIES rounds, default 6). A single nudge can lose a SECOND race: the
+# scan it wakes may run before the destination's trusted GER has synced
+# (claimtxman.go:202 "not fully synced yet ... It will retry it later" — and
+# 'later' is again only the next rollup-exit-root event). Observed live
+# 2026-07-10: leg-3's COL-net-2 claim missed one nudge, unblocked by the next.
+# Returns non-zero when every round misses (caller decides fatality).
+nudge_until() {
+    local desc="$1" check="$2" tries="${NUDGE_TRIES:-6}" t waited
+    for t in $(seq 1 "$tries"); do
+        nudge_cert
+        waited=0
+        while [[ $waited -lt 75 ]]; do
+            if ( set +o pipefail; eval "$check" ) 2>/dev/null; then
+                log "  nudge round $t unblocked: $desc"
+                return 0
+            fi
+            sleep 5; waited=$((waited + 5)); echo -n "."
+        done
+        echo ""
+        warn "nudge round $t/$tries did not unblock: $desc — re-nudging"
+    done
+    return 1
+}
+
 # ── Leg 2 (forward): bridgeAsset L2B -> Miden + GER propagation ──────────────
 step "Leg 2: bridgeAsset(destNet=$MIDEN_NETWORK_ID, $FWD_AMOUNT_WEI OPT0 wei) on L2B"
 # Snapshot the L2B holder BEFORE the forward bridge — leg 4 asserts the
@@ -365,7 +390,10 @@ FWD_DEPOSIT=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "$OPT0_LOWER")
 [[ -n "$FWD_DEPOSIT" ]] || fail "forward deposit vanished from bridge-service"
 FWD_GI=$(dep_field "$FWD_DEPOSIT" global_index)
 log "  forward deposit: cnt=$(dep_field "$FWD_DEPOSIT" deposit_cnt) globalIndex=$FWD_GI"
-nudge_cert   # deposit is ready — force the next settle so the claim scan runs
+# Deposit is ready — force settles until the claim scan picks it up.
+nudge_until "faucet auto-creation for OPT0 (claim scan)" \
+    "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'auto-creating faucet'" \
+    || fail "claim scan never picked up the forward deposit despite repeated nudges"
 
 # ClaimTxManager submits claimAsset to the proxy; proxy auto-creates the
 # faucet and mints. Proven log lines from the l1-to-l2/dynamic-erc20 suites.
@@ -475,7 +503,9 @@ log "  COL bridged from BOTH origins (net 0: $COL_L1_WEI wei, net 2: $COL_L2B_WE
 wait_for "COL net-2 deposit ready_for_claim" \
     "find_deposit '$DEST_ADDR' $L2B_NETWORK_ID '$COL_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') else 1)\"" \
     600 5
-nudge_cert
+nudge_until "TWO faucet_registry rows for COL (claim scan)" \
+    "[ \"\$(pgq \"SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';\")\" = \"2\" ]" \
+    || fail "claim scan never picked up the COL net-2 deposit despite repeated nudges"
 
 # Both claims auto-create faucets; wait on the PG registry (state, not logs).
 wait_for "TWO faucet_registry rows for COL (net 0 + net 2)" \
@@ -570,7 +600,11 @@ log "  back deposit: cnt=$BACK_CNT globalIndex=$BACK_GI amount=$BACK_AMOUNT_WEI 
 EXPECTED_BACK_WEI=$(python3 -c "print($BACK_AMOUNT * $WEI_PER_MIDEN_UNIT)")
 [[ "$BACK_AMOUNT_WEI" == "$EXPECTED_BACK_WEI" ]] \
     || fail "back-bridge amount mismatch: exit leaf carries $BACK_AMOUNT_WEI wei, expected $EXPECTED_BACK_WEI"
-nudge_cert   # back deposit is ready — wake the rollupID-2 claim scan on L2B
+# Back deposit is ready — wake the rollupID-2 claim scan on L2B. Non-fatal:
+# the manual-claimAsset fallback below covers a total autoclaim miss.
+nudge_until "L2B autoclaim of the back deposit" \
+    "find_deposit '$ADMIN' $MIDEN_NETWORK_ID '$OPT0_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('claim_tx_hash') else 1)\"" \
+    || warn "autoclaim scan not woken by nudges — relying on the manual-claim fallback"
 
 # Claim on L2B: prefer the bridge-service ClaimTxManager autoclaim; fall back
 # to a manual claimAsset (proof from /merkle-proof, GER gated on AgglayerGERL2).
