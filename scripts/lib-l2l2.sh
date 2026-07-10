@@ -69,6 +69,12 @@ export PGPASSWORD="$PG_PASS"
 PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAX)
 pgq() { "${PSQL[@]}" -c "$1" 2>/dev/null; }
 
+# `cmd` / `check` are STATIC, TEST-AUTHORED condition strings assembled inside
+# this repo's e2e scripts — never external/runtime input. `eval` (not `bash -c`)
+# is deliberate: the conditions defer $(pg ...) / $(l2b_* ...) calls that are
+# shell FUNCTIONS in the sourcing script, invisible to a child bash (no
+# `export -f`). The sub-shell isolates `set +o pipefail` and stderr. This is the
+# same idiom as scripts/e2e-bridge-loadtest-isolated.sh::wait_for.
 wait_for() {
     local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
     local elapsed=0
@@ -205,6 +211,8 @@ nudge_until() {
         nudge_cert
         waited=0
         while [[ $waited -lt 75 ]]; do
+            # `check` is a static test-authored condition string (see wait_for's
+            # eval-contract note above) — deferred pg/l2b_* shell-function calls.
             if ( set +o pipefail; eval "$check" ) 2>/dev/null; then
                 log "  nudge round $t unblocked: $desc"; return 0
             fi

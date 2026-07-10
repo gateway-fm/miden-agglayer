@@ -3,11 +3,15 @@
 # aggkit instance, and swaps the agglayer / bridge-service configs for variants
 # that know about network 2.
 #
-# Usage:
+# Usage (the config files this override mounts —
+#   fixtures/{agglayer-config-l2l2,aggkit-l2b-config,bridge-config-l2l2}.toml —
+#   are GENERATED + gitignored, so generate them BEFORE `up`):
+#   ./scripts/gen-l2b-configs.sh  # emits the three generated config files
 #   docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml \
 #     --env-file fixtures/.env up -d
 #   ./scripts/setup-l2b.sh        # host-side: registers rollup #2 on L1 +
-#                                 # deploys bridge/GER on L2B (idempotent)
+#                                 # deploys real sovereign bridge/GER on L2B
+#                                 # (idempotent; also re-runs gen-l2b-configs)
 #
 # The snapshot's original rollup #1 was an OP-reth sovereign chain that the
 # Miden proxy replaced; L2B mirrors the same AggchainECDSAMultisig consensus

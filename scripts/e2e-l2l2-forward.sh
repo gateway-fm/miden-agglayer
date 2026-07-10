@@ -49,7 +49,7 @@ step "Leg 1: deploying OPT0 on L2B"
 OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L2B_RPC" \
     --private-key "$ADMIN_KEY" --broadcast \
     --constructor-args "L2BToken" "OPT0" 18 "$TOKEN_SUPPLY" 2>&1)
-OPT0=$(echo "$OUT" | grep "Deployed to:" | awk '{print $NF}')
+OPT0=$(echo "$OUT" | awk '/Deployed to:/{print $NF}')
 [[ -n "$OPT0" ]] || fail "OPT0 deploy failed: $(echo "$OUT" | tail -2)"
 OPT0_LOWER=$(echo "$OPT0" | tr 'A-F' 'a-f'); OPT0_HEX="${OPT0_LOWER#0x}"
 pass "OPT0 deployed on L2B: $OPT0 (origin network $L2B_NETWORK_ID)"
