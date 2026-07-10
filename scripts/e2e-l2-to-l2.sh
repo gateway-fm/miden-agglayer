@@ -713,7 +713,16 @@ pass "tip advancing: $TIP_A -> $TIP_B"
 # Needs the locally built bridge-out-tool for the canonical script roots.
 TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"
 if [[ -x "$TOOL_BIN" ]]; then
-    BRIDGE_ID="$BRIDGE_ID" ALLOW_LATE="${ALLOW_LATE:-1}" TOOL_BIN="$TOOL_BIN" \
+    # Pass the project-prefixed container names — verify-event-completeness.sh
+    # defaults to the main-repo 'miden-agglayer-*' names, but this stack is the
+    # l2l2 compose project (node/proxy are l2l2-*). Do NOT pass BRIDGE_ID: our
+    # $BRIDGE_ID is the bech32 form from the toml, but the verifier needs the
+    # HEX id (it compares against the node DB's hex target_account_id, and its
+    # #128 sanity-guard rejects bech32). Left unset, it auto-detects the hex id
+    # from the proxy's 'deploying bridge account 0x…' log line.
+    ALLOW_LATE="${ALLOW_LATE:-1}" TOOL_BIN="$TOOL_BIN" \
+        NODE_CONTAINER="${COMPOSE_PROJECT_NAME}-miden-node-1" \
+        AGGLAYER_CONTAINER="$AGGLAYER_CONTAINER" \
         "$SCRIPT_DIR/verify-event-completeness.sh" \
         || fail "event-completeness verification failed"
     pass "exact-block event completeness verified"
