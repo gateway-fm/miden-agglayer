@@ -564,22 +564,45 @@ evidence_summary() {
     if python3 - "$EVIDENCE_FILE" "${required[@]}" <<'PY'
 import json, sys
 path, required = sys.argv[1], sys.argv[2:]
-counts, total = {}, 0
+# A required token is either "kind" (any direction) or "direction:kind" (exact).
+# An entry only COUNTS toward a requirement if it is not a failed/receipt-less
+# record; a cert_settlement additionally must have actually hit the RollupManager.
+# This makes the summary fail closed and DIRECTIONAL: forward evidence can no
+# longer satisfy a required back-direction (ger_inject / cert_settlement / claim).
+BAD_PREFIX = ("failed", "norcpt")
+counts, by_kind, by_pair, total, bad = {}, {}, {}, 0, []
 with open(path) as f:
     for line in f:
         line = line.strip()
         if not line:
             continue
         r = json.loads(line); total += 1
-        counts[r.get("kind", "?")] = counts.get(r.get("kind", "?"), 0) + 1
+        k = r.get("kind", "?"); d = r.get("direction", "?")
+        st = (r.get("status") or "").lower(); ex = (r.get("extra") or "").lower()
+        counts[k] = counts.get(k, 0) + 1
+        if any(st.startswith(p) for p in BAD_PREFIX):
+            bad.append(f"{d}:{k}[status={st}]"); continue
+        if k == "cert_settlement" and "hitsrollupmanager=yes" not in ex:
+            bad.append(f"{d}:{k}[not on RollupManager]"); continue
+        by_kind[k] = by_kind.get(k, 0) + 1
+        by_pair[(d, k)] = by_pair.get((d, k), 0) + 1
 for k in sorted(counts):
     print(f"  {k:16s} {counts[k]}")
 print(f"  {'TOTAL':16s} {total}")
-missing = [k for k in required if counts.get(k, 0) < 1]
+if bad:
+    print("  REJECTED (failed / no-receipt / settlement-not-on-RollupManager): " + "; ".join(bad[:8]))
+missing = []
+for tok in required:
+    if ":" in tok:
+        d, k = tok.split(":", 1)
+        if by_pair.get((d, k), 0) < 1:
+            missing.append(tok)
+    elif by_kind.get(tok, 0) < 1:
+        missing.append(tok)
 if missing:
-    print("  MISSING REQUIRED KINDS: " + ", ".join(missing))
+    print("  MISSING REQUIRED: " + ", ".join(missing))
     sys.exit(3)
-print("  ALL REQUIRED KINDS PRESENT: " + ", ".join(required))
+print("  ALL REQUIRED PRESENT (good status): " + ", ".join(required))
 PY
     then
         pass "evidence complete — every required kind present; audit trail at $EVIDENCE_FILE"

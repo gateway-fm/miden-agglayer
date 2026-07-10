@@ -202,7 +202,15 @@ done
 pass "Miden wrapped OPT0 fully burned"
 evidence_exit_root "leg4" back post-back-claim
 
-evidence_summary
+# Final, DIRECTIONAL evidence gate for the whole group: require BOTH directions'
+# deposit/ger_inject/cert_settlement/claim (forward evidence can't cover a missing
+# back-direction record) plus rollup_register/deploy/exit_root (any direction). The
+# summary rejects failed/receipt-less records and settlements that didn't hit the
+# RollupManager, so a required (direction,kind) present only as a bad record fails.
+evidence_summary \
+    forward:deposit forward:ger_inject forward:cert_settlement forward:claim \
+    back:deposit    back:ger_inject    back:cert_settlement    back:claim \
+    rollup_register deploy exit_root
 
 log "======================================================================"
 log "  L2<->L2 BACK PASS — net-zero round trip L2B -> Miden -> L2B"
