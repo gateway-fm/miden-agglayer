@@ -464,6 +464,10 @@ e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 e2e-down: ## Stop E2E environment
 	$(E2E_COMPOSE) down -v
 
+.PHONY: e2e-l2l2-down
+e2e-l2l2-down: ## Stop the L2<->L2 stack (base + L2B overlay). --remove-orphans so anvil-l2b/aggkit-l2b/bridge-service don't linger on a reused (self-hosted) host
+	$(L2L2_COMPOSE) down -v --remove-orphans
+
 .PHONY: e2e-logs
 e2e-logs: ## Tail all E2E service logs
 	$(E2E_COMPOSE) logs -f
