@@ -12,9 +12,11 @@
 #      faucet id is a hard FAIL (the #108 collision). Negative control: (OPT0,
 #      net 0) resolves to NOTHING and OPT0's address has exactly one row (net 2).
 #
-# The COL claims settle ON MIDEN via the proxy's foreign-faucet auto-creation
-# (same path the forward leg proved); the L2B-origin COL needs the event-driven
-# L2->L2 scan woken by nudge certs. Assertions read the proxy store faucet_registry
+# The COL claims settle ON MIDEN via the proxy's foreign-faucet auto-creation (same
+# path the forward leg proved): the L1-origin COL is AUTO-claimed (canonical L1->L2),
+# and the L2B-origin COL is client-submitted (proof from the L2B service -> proxy),
+# since per-rollup isolation means the Miden service no longer indexes L2B. Assertions
+# read the proxy store faucet_registry
 # (PG state, not logs) so they're robust under load / repeated runs (COL is a fresh
 # random address each run -> naturally N=20-safe).
 #
@@ -114,13 +116,27 @@ evidence_tx "leg3" clash L1 deposit "$L1_RPC" "$COL_L1_TX" "$BRIDGE_ADDRESS" "to
 log "  COL bridged from BOTH origins (net 0: $COL_L1_WEI wei, net 2: $COL_L2B_WEI wei)"
 
 # ── Drive both claims on Miden -> two faucet rows for COL ────────────────────
-# (COL, net 2) is event-driven off the L1 rollup-exit-root update (needs a nudge);
-# (COL, net 0) rides the mainnet-exit-root path. Both auto-create faucets on Miden.
+# (COL, net 0) is an L1->Miden claim: AUTO-claimed by the Miden ClaimTxManager (the
+# canonical L1->L2 autoclaim, still enabled — proven: it rides the mainnet-exit-root
+# path and creates its faucet without help). (COL, net 2) is an L2B->Miden claim:
+# with per-rollup bridge-service isolation the Miden service does NOT index L2B, so —
+# exactly like the forward leg — we client-submit a proof-backed claimAsset (proof
+# fetched from the L2B service) to the Miden proxy. nudge_until drives L2B cert cycles
+# so Miden sees the covering GER (proxy C6 has_seen_ger gate).
 wait_for "COL net-2 deposit ready_for_claim" 600 5 \
-    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER"
-nudge_until "TWO faucet_registry rows for COL (claim scan)" \
-    _pred_pg_eq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';" "2" \
-    || fail "claim scan never produced both COL faucets despite repeated nudges"
+    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER" "" "$L2B_BRIDGE_SERVICE_URL"
+COL_DEP_NET2_SUBMIT=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER" "$L2B_BRIDGE_SERVICE_URL")
+[[ -n "$COL_DEP_NET2_SUBMIT" ]] || fail "COL net-2 deposit not found in L2B service for claim submission"
+CN2_CNT=$(dep_field "$COL_DEP_NET2_SUBMIT" deposit_cnt)
+CN2_GI=$(dep_field "$COL_DEP_NET2_SUBMIT" global_index)
+CN2_ONET=$(dep_field "$COL_DEP_NET2_SUBMIT" orig_net)
+CN2_DNET=$(dep_field "$COL_DEP_NET2_SUBMIT" dest_net)
+CN2_DADDR=$(dep_field "$COL_DEP_NET2_SUBMIT" dest_addr)
+CN2_META=$(echo "$COL_DEP_NET2_SUBMIT" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m != '0x' else '0x')")
+nudge_until "COL net-2 claimAsset accepted on Miden (ClaimEvent for gi $CN2_GI)" \
+    _pred_submit_forward_claim "$CN2_CNT" "$CN2_GI" "$CN2_ONET" "$COL" "$CN2_DNET" "$CN2_DADDR" "$COL_L2B_WEI" "$CN2_META" \
+    || fail "COL net-2 claimAsset never accepted on the Miden proxy (gi $CN2_GI) despite repeated nudges"
+# Both must now be present: net-2 just client-submitted, net-0 auto-claimed (L1->L2).
 wait_for "TWO faucet_registry rows for COL (net 0 + net 2)" 900 10 \
     _pred_pg_eq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';" "2"
 
@@ -136,8 +152,10 @@ pass "distinct faucets for one address: net0=$COL_FID_NET0 net2=$COL_FID_NET2"
 # Registry rows precede the mint, and equal amounts would hide a swapped route — so
 # require BOTH claims to actually COMPLETE with the correct PER-ORIGIN amount, and
 # pin each to its exact deposit global index + ClaimEvent (not "a row exists").
+# net-0 (L1) COL deposit is indexed by both services (both watch L1) -> Miden svc;
+# net-2 (L2B) COL deposit lives in the isolated L2B service.
 COL_DEP_NET0=$(find_deposit "$DEST_ADDR" 0 "$COL_LOWER")
-COL_DEP_NET2=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER")
+COL_DEP_NET2=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER" "$L2B_BRIDGE_SERVICE_URL")
 [[ -n "$COL_DEP_NET0" && -n "$COL_DEP_NET2" ]] \
     || fail "COL deposit missing in bridge-service: net0='${COL_DEP_NET0:+present}' net2='${COL_DEP_NET2:+present}'"
 COL_GI_NET0=$(dep_field "$COL_DEP_NET0" global_index)

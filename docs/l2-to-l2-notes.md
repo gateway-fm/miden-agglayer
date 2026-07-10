@@ -61,14 +61,14 @@ Dry-ran against the real anvil snapshot (brought up the `anvil` service alone). 
 - **Sovereign L2-GER contract on L2B** — not on the L1 snapshot; vendor a minimal contract with the sovereign ABI (`insertGlobalExitRoot`, `updateExitRoot`, `globalExitRootMap`) at `0xa40D…` or compile the real `GlobalExitRootManagerL2SovereignChain`.
 - **Compose override** `docker-compose.l2l2.yml`: `anvil-l2b` (plain anvil, chain-id 31338, port 9545) + `aggkit-l2b` (copy of aggkit config with `L2URL=anvil-l2b`, RollupID/NetworkID 2, same keystores) + run `setup-l2b.sh` as a one-shot service after anvil healthy.
 - **agglayer config**: add `[full-node-rpcs] 2 = "http://anvil-l2b:8545"` + `[proof-signers] 2 = "0x5b06…"` (use a separate `agglayer-config-l2l2.toml` mounted by the override, so the base stack is untouched).
-- **bridge-service config**: append L2B to the `L2URLs` / `L2PolygonBridgeAddresses` / `RequireSovereignChainSmcs` / `L2PolygonZkEVMGlobalExitRootAddresses` lists (it's already multi-network by design).
+- **bridge-service (ISOLATED per rollup)**: the base bridge-service stays Miden-only; L2B gets its OWN bridge-service + DB (`bridge-config-l2b.toml`, `postgres-l2b`, ports :28080/:29090) that indexes L1 + L2B only — canonical AggKit topology, not a single shared multi-network service.
 - Then flesh out `e2e-l2-to-l2.sh` steps 1-2 (ERC20 on L2B → bridgeAsset → cert → GER → claim on Miden).
 
 ---
 
 ## UPDATE 2 (2026-07-09): full L2B wiring written — ready for live smoke
 
-- **`docker-compose.l2l2.yml`** — override adding `anvil-l2b` (chain-id 31338, :9545) + `aggkit-l2b` (aggoracle+aggsender, reuses aggoracle/sequencer keystores) + swaps agglayer/bridge-service configs for network-2-aware variants.
+- **`docker-compose.l2l2.yml`** — override adding `anvil-l2b` (chain-id 31338, :9545) + `aggkit-l2b` (aggoracle+aggsender, reuses aggoracle/sequencer keystores) + a network-2-aware agglayer config + an ISOLATED L2B bridge-service (`bridge-service-l2b`) with its own DB (`postgres-l2b`); the base bridge-service stays Miden-only.
 - **`scripts/gen-l2b-configs.sh`** — derives `agglayer-config-l2l2.toml` / `aggkit-l2b-config.toml` / `bridge-config-l2l2.toml` from the base fixtures at setup time (gitignored; assert-guarded so base-config drift fails loudly).
 - **`fixtures/SovereignGER.sol`** — minimal sovereign-GER (insertGlobalExitRoot/updateExitRoot/globalExitRootMap + events), setCode-deployable (no constructor; `initialize(bridge, updater)`).
 - **`scripts/setup-l2b.sh`** extended: rollup-2 address guard, L2B account funding, GER-stub deploy at `0xa40D…` (updater = aggoracle addr derived from keystore at runtime), bridge proxy+impl setCode + `initialize(networkID=2,…)` — all idempotent.

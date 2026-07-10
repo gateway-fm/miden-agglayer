@@ -22,7 +22,8 @@ source "$FIXTURES_DIR/.env"
 L1_RPC="${L1_RPC:-http://localhost:8545}"
 L2_RPC="${L2_RPC:-http://localhost:8546}"          # Miden proxy synthetic RPC
 L2B_RPC="${L2B_RPC:-http://localhost:9545}"        # anvil-l2b
-BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"
+BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"          # Miden bridge-service (indexes L1 + Miden)
+L2B_BRIDGE_SERVICE_URL="${L2B_BRIDGE_SERVICE_URL:-http://localhost:28080}"   # ISOLATED L2B bridge-service (indexes L1 + L2B)
 
 PG_HOST="${PG_HOST:-localhost}"; PG_PORT="${PG_PORT:-5434}"
 PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-agglayer_store}"
@@ -89,8 +90,8 @@ _pred_http_ok()       { curl -sf "$1" >/dev/null 2>&1; }                        
 _pred_pg_eq()         { [[ "$(pgq "$1")" == "$2" ]]; }                            # <sql> <expected>
 _pred_pg_gt()         { local v; v=$(pgq "$1"); [[ "${v:-0}" -gt "$2" ]]; }       # <sql> <threshold>
 _pred_log_grep()      { docker logs --since "$2" "$1" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -qiE "$3"; }  # <container> <since> <ere>
-_pred_deposit_ready() {                                                          # <dest> <netid> <orig> [wanted_dest_net]
-    local dep; dep=$(find_deposit "$1" "$2" "$3")
+_pred_deposit_ready() {                                                          # <dest> <netid> <orig> [wanted_dest_net] [service-url]
+    local dep; dep=$(find_deposit "$1" "$2" "$3" "${5:-$BRIDGE_SERVICE_URL}")
     [[ -n "$dep" ]] || return 1
     printf '%s' "$dep" | python3 -c "
 import json, sys
@@ -122,8 +123,13 @@ l2_tip() {
 
 # find_deposit <dest_addr> <source_network_id> <orig_addr_lower> — newest match.
 find_deposit() {
-    local dest="$1" netid="$2" orig="$3"
-    curl -sf "$BRIDGE_SERVICE_URL/bridges/$dest?limit=100" 2>/dev/null | python3 -c "
+    # <dest> <netid> <orig> [service-url]. Per-rollup isolation: a deposit is
+    # indexed by the bridge-service watching the chain it was MADE on — L2B
+    # deposits (network_id=2) live in the L2B service (pass $L2B_BRIDGE_SERVICE_URL),
+    # Miden deposits (network_id=1) in the default Miden service. L1 deposits
+    # (network_id=0) are indexed by both, so either URL works.
+    local dest="$1" netid="$2" orig="$3" svc="${4:-$BRIDGE_SERVICE_URL}"
+    curl -sf "$svc/bridges/$dest?limit=100" 2>/dev/null | python3 -c "
 import json, sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(0)
@@ -142,6 +148,55 @@ claim_event_rows() {
     local gi_hex
     gi_hex=$(python3 -c "print(format(int('$1'),'064x'))")
     pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${gi_hex}%';"
+}
+
+# _pred_submit_forward_claim <fwd_cnt> <global_index> <orig_net> <orig_token> <dest_net> <dest_addr> <amount_wei> <metadata>
+# Canonical forward (L2B->Miden) claim. With per-rollup bridge-service isolation
+# (canonical kurtosis-cdk: ONE bridge-service per chain, each indexing L1 + ONLY its
+# own L2) the Miden service does NOT index L2B, so nothing auto-submits this claim —
+# the shared service that auto-claimed it was the non-canonical shortcut, and canonical
+# kurtosis sets NO AreClaimsBetweenL2sEnabled anywhere (claimtxman is L1->L2 only).
+# So the claim is client-submitted, exactly like the back leg: fetch the L2B deposit's
+# proof from the L2B service (which is the only thing indexing L2B) and submit a
+# proof-backed claimAsset to the Miden proxy (:8546), which accepts it
+# (worker_handle_claim_asset) and auto-creates the foreign faucet + mints. The proof
+# verifies against L1's GER, but is SERVED by the source (L2B) service.
+# Reports success iff the synthetic ClaimEvent row for this global index exists.
+# Re-fetches a FRESH proof each call: the proxy gates on has_seen_ger(combined(main,
+# rollup)) (service_send_raw_txn.rs C6) and rejects until Miden has the covering GER,
+# which LAGS the deposit turning ready — nudge_until drives L2B cert cycles to
+# propagate it, and each retry re-reads the (advancing) served proof.
+_pred_submit_forward_claim() {
+    local cnt="$1" gi="$2" onet="$3" otok="$4" dnet="$5" daddr="$6" amt="$7" meta="$8"
+    [[ "$(claim_event_rows "$gi")" -ge 1 ]] && return 0        # already landed (idempotent)
+    local pj mer rer smtL smtR
+    pj=$(curl -sf "$L2B_BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=$L2B_NETWORK_ID" 2>/dev/null || true)
+    [[ -n "$pj" ]] || return 1
+    mer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])" 2>/dev/null || true)
+    rer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])" 2>/dev/null || true)
+    smtL=$(echo "$pj" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+    smtR=$(echo "$pj" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['rollup_merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+    [[ -n "$mer" && -n "$rer" && -n "$smtL" && -n "$smtR" ]] || return 1
+    # --legacy + explicit gas: the Miden proxy's synthetic RPC does NOT implement
+    # eth_feeHistory (cast's default EIP-1559 fee path -32601s before submitting) and
+    # eth_estimateGas returns 0 — so force legacy pricing off eth_gasPrice (served: 1
+    # gwei) and a fixed gas limit. --async: don't depend on the proxy's synthetic-
+    # receipt semantics; the ClaimEvent row (checked below / next poll) is the source
+    # of truth for both the sync and writer-worker dispatch paths. A premature submit
+    # (covering GER not yet seen) just fails and we retry with a fresher proof.
+    cast send --async --rpc-url "$L2_RPC" --private-key "$ADMIN_KEY" \
+        --legacy --gas-price "${MIDEN_CLAIM_GAS_PRICE:-1000000000}" --gas-limit "${MIDEN_CLAIM_GAS_LIMIT:-3000000}" "$BRIDGE" \
+        'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
+        "$smtL" "$smtR" "$gi" "$mer" "$rer" "$onet" "$otok" "$dnet" "$daddr" "$amt" "$meta" >/dev/null 2>&1 || true
+    [[ "$(claim_event_rows "$gi")" -ge 1 ]]
 }
 
 # ── L2B stack lifecycle ──────────────────────────────────────────────────────
@@ -164,7 +219,9 @@ _l2l2_stack_ready() {
     [[ "$(cast code "$BRIDGE" --rpc-url "$L2B_RPC" 2>/dev/null | head -c 4)" == "0x60" ]] || return 1
     [[ "$(cast code "$L2B_GER" --rpc-url "$L2B_RPC" 2>/dev/null | head -c 4)" == "0x60" ]] || return 1
     [[ "$(cast call "$BRIDGE" 'networkID()(uint32)' --rpc-url "$L2B_RPC" 2>/dev/null | awk '{print $1}')" == "2" ]] || return 1
+    # BOTH isolated bridge-services must be serving: Miden (:18080) and L2B (:28080).
     curl -sf "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000" >/dev/null 2>&1 || return 1
+    curl -sf "$L2B_BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000" >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -179,21 +236,26 @@ l2l2_ensure_stack() {
     fi
     step "Leg 0: bringing up the L2B overlay + registering rollup #2"
     "$SCRIPT_DIR/gen-l2b-configs.sh"
+    # Bring up the L2B overlay: anvil-l2b, aggkit-l2b, the config-swapped agglayer,
+    # the base (Miden) bridge-service, AND the isolated L2B bridge-service + its DB.
     COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" docker compose \
         -f "$REPO/docker-compose.e2e.yml" -f "$REPO/docker-compose.l2l2.yml" \
-        --env-file "$REPO/fixtures/.env" up -d anvil-l2b aggkit-l2b agglayer bridge-service
+        --env-file "$REPO/fixtures/.env" up -d anvil-l2b aggkit-l2b agglayer bridge-service postgres-l2b bridge-service-l2b
     wait_for "anvil-l2b reachable at $L2B_RPC" 60 2 _pred_rpc_reachable "$L2B_RPC"
     L2B_RPC="$L2B_RPC" "$SCRIPT_DIR/setup-l2b.sh"
     : "${SPONSOR_PRIVATE_KEY:?fixtures/.env must define SPONSOR_PRIVATE_KEY}"
     local sponsor_addr; sponsor_addr=$(cast wallet address --private-key "$SPONSOR_PRIVATE_KEY")
     cast rpc anvil_setBalance "$sponsor_addr" 0x21e19e0c9bab2400000 --rpc-url "$L2B_RPC" >/dev/null
     log "  claim sponsor $sponsor_addr funded on L2B"
+    # Re-create ONLY the L2B bridge-service so it (re)indexes network 2 now that
+    # rollup #2 is registered + the L2B bridge/GER exist. The Miden bridge-service
+    # indexes L1 + Miden and is unaffected by rollup #2, so it is left running.
     COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" docker compose \
         -f "$REPO/docker-compose.e2e.yml" -f "$REPO/docker-compose.l2l2.yml" \
-        --env-file "$REPO/fixtures/.env" up -d --force-recreate bridge-service
-    wait_for "bridge-service HTTP API up (post-recreate)" 120 3 \
-        _pred_http_ok "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000"
-    pass "Leg 0 done: rollup #2 registered, L2B bridge/GER live, bridge-service indexing both networks"
+        --env-file "$REPO/fixtures/.env" up -d --force-recreate bridge-service-l2b
+    wait_for "L2B bridge-service HTTP API up (post-recreate)" 120 3 \
+        _pred_http_ok "$L2B_BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000"
+    pass "Leg 0 done: rollup #2 registered, L2B bridge/GER live, isolated Miden + L2B bridge-services indexing"
 }
 
 # l2l2_miden_identities — read the proxy's bridge account ids and provision the
@@ -336,24 +398,25 @@ _pf_port_owner_ok() {
 # within PF_BRIDGE_FRESH_MAX seconds). A frozen synchronizer stops emitting lines
 # while the container stays "Up"; this is the liveness gate that catches it.
 _pf_bridge_fresh() {
-    local container="${COMPOSE_PROJECT_NAME}-bridge-service-1" iso ts now age
+    local container="${1:-${COMPOSE_PROJECT_NAME}-bridge-service-1}" iso ts now age
+    local label="${2:-bridge-service}"
     iso=$( ( set +o pipefail; docker logs --tail 8 "$container" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
         | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | tail -1 ) || true )
     if [[ -z "$iso" ]]; then
-        _pf_fail "bridge-service liveness: no parseable log timestamp in recent output (frozen?)"
+        _pf_fail "$label liveness: no parseable log timestamp in recent output (frozen?)"
         return
     fi
     ts=$(python3 -c "import datetime; print(int(datetime.datetime.fromisoformat('${iso}'.replace('Z','+00:00')).timestamp()))" 2>/dev/null || true)
     now=$(date -u +%s)
     if [[ -z "$ts" ]]; then
-        _pf_fail "bridge-service liveness: unparsable log timestamp '$iso'"
+        _pf_fail "$label liveness: unparsable log timestamp '$iso'"
         return
     fi
     age=$(( now - ts ))
     if [[ "$age" -le "${PF_BRIDGE_FRESH_MAX:-240}" ]]; then
-        _pf_pass "bridge-service actively syncing (newest log line ${age}s ago)"
+        _pf_pass "$label actively syncing (newest log line ${age}s ago)"
     else
-        _pf_fail "bridge-service FROZEN — newest log line is ${age}s old (>${PF_BRIDGE_FRESH_MAX:-240}s); synchronizer wedged, deposits will never reach ready_for_claim"
+        _pf_fail "$label FROZEN — newest log line is ${age}s old (>${PF_BRIDGE_FRESH_MAX:-240}s); synchronizer wedged, deposits will never reach ready_for_claim"
     fi
 }
 
@@ -374,8 +437,11 @@ _pf_bridge_fresh() {
 # now but kept for call-site compatibility. Retries for PF_SYNC_SETTLE seconds so a
 # legitimate initial catch-up right after (re)create isn't flagged as a wedge.
 _pf_sync_lag() {
-    local net="$1" _rpc="$2" label="$3" max="${PF_BRIDGE_LAG_MAX:-400}"
-    local pg="${COMPOSE_PROJECT_NAME}-postgres-1" deadline row synced remaining
+    # <net-id> <rpc> <label> [pg-container]. Per-rollup isolation: net 2 (L2B)
+    # sync.status lives in the isolated L2B bridge_db (postgres-l2b); net 0/1 in the
+    # base bridge_db (postgres). Pass the right container per network.
+    local net="$1" _rpc="$2" label="$3" pg="${4:-${COMPOSE_PROJECT_NAME}-postgres-1}"
+    local max="${PF_BRIDGE_LAG_MAX:-400}" deadline row synced remaining
     deadline=$(( $(date +%s) + ${PF_SYNC_SETTLE:-90} ))
     while :; do
         row=$( ( set +o pipefail; docker exec "$pg" psql -U bridge_user -d bridge_db -tAX \
@@ -447,20 +513,24 @@ l2l2_validate_stack() {
         && _pf_pass "L2B GER $L2B_GER has code on :9545" \
         || _pf_fail "L2B GER $L2B_GER has NO code on :9545 (got '${gcode:-<none>}')"
 
-    # (d) bridge-service indexing BOTH networks (its logs show NetworkID: 1 AND 2)
+    # (d) ISOLATED per-rollup bridge-services: the base (Miden) service indexes
+    # L1 + Miden (NetworkID 0 + 1); the SEPARATE L2B service indexes L1 + L2B
+    # (NetworkID 0 + 2). Each is checked on its OWN container/DB.
     _pf_log_has "${COMPOSE_PROJECT_NAME}-bridge-service-1" 'NetworkID: 1[,)]' 8000 \
-        "bridge-service indexing network 1 (Miden)"
-    _pf_log_has "${COMPOSE_PROJECT_NAME}-bridge-service-1" 'NetworkID: 2[,)]' 8000 \
-        "bridge-service indexing network 2 (L2B)"
+        "Miden bridge-service indexing network 1"
+    _pf_log_has "${COMPOSE_PROJECT_NAME}-bridge-service-l2b-1" 'NetworkID: 2[,)]' 8000 \
+        "L2B bridge-service indexing network 2"
     # ...and it is CURRENTLY advancing, not frozen. A wedged synchronizer keeps
     # the container "Up" and its historical NetworkID:1/2 lines intact (so the two
     # checks above still pass) yet indexes nothing new — deposits never reach
     # ready_for_claim. Two liveness gates: (i) newest log line is fresh (catches a
     # total log-freeze); (ii) each synchronizer is near its chain tip (catches a
     # stuck-but-still-logging synchronizer).
-    _pf_bridge_fresh
-    _pf_sync_lag 0 "$L1_RPC"  L1
-    _pf_sync_lag 2 "$L2B_RPC" L2B
+    _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-1"     "Miden bridge-service"
+    _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-l2b-1" "L2B bridge-service"
+    # net 0/1 on the base bridge_db (postgres); net 2 on the isolated L2B bridge_db (postgres-l2b)
+    _pf_sync_lag 0 "$L1_RPC"  "L1 (Miden svc)"  "${COMPOSE_PROJECT_NAME}-postgres-1"
+    _pf_sync_lag 2 "$L2B_RPC" "L2B (L2B svc)"   "${COMPOSE_PROJECT_NAME}-postgres-l2b-1"
 
     # (e) aggkit-l2b aggoracle alive — GER injection into L2B GER. A quiet stack
     # legitimately has no RECENT inject (aggoracle only fires on a new L1 GER), so

@@ -5,7 +5,9 @@
 #   deploy OPT0 on L2B (origin_network = 2, NOT L1)
 #   -> bridgeAsset(destNet=1) L2B -> Miden
 #   -> GER propagation (cert settle -> L1 GER -> Miden aggoracle)
-#   -> ClaimTxManager auto-claim on Miden
+#   -> submit a proof-backed claimAsset to the Miden proxy (canonical client claim:
+#      per-rollup isolation means the Miden service doesn't index L2B, so nothing
+#      auto-claims — fetch the L2B proof from the L2B service, submit to the proxy)
 #   -> ASSERT: foreign-origin faucet keyed (OPT0, net 2); wrapped balance
 #      credited to the destination wallet; a ClaimEvent row exists for the
 #      deposit's global index.
@@ -125,26 +127,34 @@ evidence_record "leg2" forward Miden ger_inject "${FWD_GER_INJECT_TX:-}" "" "mid
 # L1 carried the forward deposit's exit root into the L1 GER.
 evidence_settlement "leg2" forward "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST_START_TIME" 2 || true
 
-# ── Leg 2b: claim on Miden — foreign-origin faucet + wrapped balance ─────────
-step "Leg 2b: claim on Miden (auto-claim) + (OPT0, net $L2B_NETWORK_ID) faucet asserts"
+# ── Leg 2b: claim on Miden — canonical client-submitted claimAsset ───────────
+# With per-rollup bridge-service isolation (canonical kurtosis: one service per
+# chain, each indexing L1 + ONLY its own L2) the Miden service does NOT index L2B,
+# so nothing auto-submits this forward claim — the shared service that auto-claimed
+# it was the non-canonical shortcut. The canonical flow (a bridge client, and our
+# back leg): fetch the L2B deposit's proof from the L2B service and submit a
+# proof-backed claimAsset to the Miden proxy, which accepts it
+# (worker_handle_claim_asset) and auto-creates the foreign faucet + mints.
+step "Leg 2b: submit proof-backed claimAsset to Miden proxy + (OPT0, net $L2B_NETWORK_ID) faucet asserts"
 wait_for "L2B->Miden deposit ready_for_claim in bridge-service" 600 5 \
-    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$OPT0_LOWER" "$MIDEN_NETWORK_ID"
-FWD_DEPOSIT=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "$OPT0_LOWER")
+    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$OPT0_LOWER" "$MIDEN_NETWORK_ID" "$L2B_BRIDGE_SERVICE_URL"
+FWD_DEPOSIT=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "$OPT0_LOWER" "$L2B_BRIDGE_SERVICE_URL")
 [[ -n "$FWD_DEPOSIT" ]] || fail "forward deposit vanished from bridge-service"
 FWD_GI=$(dep_field "$FWD_DEPOSIT" global_index)
-log "  forward deposit: cnt=$(dep_field "$FWD_DEPOSIT" deposit_cnt) globalIndex=$FWD_GI"
+FWD_CNT=$(dep_field "$FWD_DEPOSIT" deposit_cnt)
+FWD_ORIG_NET=$(dep_field "$FWD_DEPOSIT" orig_net)
+FWD_DEST_NET=$(dep_field "$FWD_DEPOSIT" dest_net)
+FWD_DEST_ADDR=$(dep_field "$FWD_DEPOSIT" dest_addr)
+FWD_METADATA=$(echo "$FWD_DEPOSIT" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m != '0x' else '0x')")
+log "  forward deposit: cnt=$FWD_CNT globalIndex=$FWD_GI origNet=$FWD_ORIG_NET destNet=$FWD_DEST_NET"
 
-# Deposit ready — force settle cycles until the claim scan picks it up.
-# Scope the auto-create gate to THIS run's OPT0 token_address — a bare
-# 'auto-creating faucet' grep cross-matches any other foreign token being claimed
-# concurrently (e.g. under N=20 address-clash load, or leftover state), letting the
-# test false-progress on someone else's claim and then fail the OPT0-specific
-# assert below. Match the claim.rs:487 line "…token_address: 0x<OPT0>, symbol:…".
-nudge_until "faucet auto-creation for OPT0 (claim scan)" \
-    _pred_log_grep "$AGGLAYER_CONTAINER" "$TEST_START_TIME" "auto-creating faucet.*token_address: $OPT0" \
-    || fail "claim scan never picked up the forward deposit (OPT0 $OPT0) despite repeated nudges"
-wait_for "claim tx committed on Miden" 300 5 \
-    _pred_log_grep "$AGGLAYER_CONTAINER" "$TEST_START_TIME" "claim tx.*committed to block"
+# Submit the claimAsset to the Miden proxy, retrying with a FRESH proof each round
+# while nudge_cert drives L2B cert cycles so Miden sees the covering GER (proxy C6
+# has_seen_ger gate). The predicate reports success when the synthetic ClaimEvent
+# for this globalIndex lands — the on-Miden proof of a completed claim.
+nudge_until "forward claimAsset accepted on Miden (ClaimEvent for globalIndex $FWD_GI)" \
+    _pred_submit_forward_claim "$FWD_CNT" "$FWD_GI" "$FWD_ORIG_NET" "$OPT0" "$FWD_DEST_NET" "$FWD_DEST_ADDR" "$FWD_AMOUNT_WEI" "$FWD_METADATA" \
+    || fail "forward claimAsset never accepted on the Miden proxy (globalIndex $FWD_GI) despite repeated nudges"
 
 # (a) Faucet keyed (OPT0, net 2) — RPC view + PG truth must agree.
 FAUCETS_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" \

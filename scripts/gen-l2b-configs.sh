@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate the network-2-aware config variants for the L2->L2 e2e (task #25)
 # from the base fixtures, so they never drift: agglayer-config-l2l2.toml,
-# aggkit-l2b-config.toml, bridge-config-l2l2.toml. Run before
+# aggkit-l2b-config.toml, bridge-config-l2b.toml. Run before
 # `docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml up`.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -49,32 +49,34 @@ for old, new in subs:
     s = s.replace(old, new)
 open(f"{F}/aggkit-l2b-config.toml","w").write(hdr + s)
 
-# ── bridge-service: append network 2 to the multi-network lists ──────────────
+# ── bridge-service (L2B, ISOLATED): index L1 + L2B ONLY, on its OWN database ──
+# Canonical AggKit runs one bridge-service + DB PER rollup. The base
+# bridge-service stays Miden-only (bridge-config.toml, unchanged); this variant
+# is a SEPARATE service (docker-compose.l2l2.yml: bridge-service-l2b + postgres-l2b)
+# that watches L1 + L2B and writes to its own bridge_db on `postgres-l2b`. It is
+# just the base config with the L2 pointed at anvil-l2b and the DB host swapped to
+# the isolated postgres-l2b. NO AreClaimsBetweenL2sEnabled — canonical kurtosis
+# sets it nowhere (claimtxman is L1->L2 only), and on a service that indexes only
+# L1+L2B it would be a no-op anyway (no cross-L2 deposits in its DB); the forward
+# L2B->Miden and back Miden->L2B claims are both client-submitted with a proof
+# fetched from the source rollup's service. The L2B sovereign bridge/GER live at
+# the SAME addresses as Miden's (they mirror the same genesis), so the
+# single-element bridge/GER/GenBlock lists are already correct.
 s = open(f"{F}/bridge-config.toml").read()
 subs = [
-    # L2->L2 autoclaims are OFF by default (claimtxman.go:192
-    # AreClaimsBetweenL2sEnabled) — without it the claim process never picks
-    # up deposits whose source AND destination are both L2s.
-    ('[ClaimTxManager]\nEnabled = true',
-     '[ClaimTxManager]\nEnabled = true\nAreClaimsBetweenL2sEnabled = true'),
-    ('L2URLs = ["http://miden-agglayer:8546"]',
-     f'L2URLs = ["http://miden-agglayer:8546", "{L2B}"]'),
-    ('L2GenBlockNumbers = [0]', 'L2GenBlockNumbers = [0, 0]'),
-    ('L2PolygonBridgeAddresses = ["0xC8cbEBf950B9Df44d987c8619f092beA980fF038"]',
-     'L2PolygonBridgeAddresses = ["0xC8cbEBf950B9Df44d987c8619f092beA980fF038", "0xC8cbEBf950B9Df44d987c8619f092beA980fF038"]'),
-    ('RequireSovereignChainSmcs = [true]', 'RequireSovereignChainSmcs = [true, true]'),
-    ('L2PolygonZkEVMGlobalExitRootAddresses = [\n  "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa",\n]',
-     'L2PolygonZkEVMGlobalExitRootAddresses = [\n  "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa",\n  "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa",\n]'),
+    ('L2URLs = ["http://miden-agglayer:8546"]', f'L2URLs = ["{L2B}"]'),
+    ('Host = "postgres"', 'Host = "postgres-l2b"'),   # both PgStorage blocks -> isolated DB
 ]
 for old, new in subs:
-    assert old in s, f"bridge patch source missing: {old}"
+    assert old in s, f"bridge-l2b patch source missing: {old}"
     s = s.replace(old, new)
-open(f"{F}/bridge-config-l2l2.toml","w").write(hdr + s)
-print("generated: agglayer-config-l2l2.toml aggkit-l2b-config.toml bridge-config-l2l2.toml")
+assert 'postgres-l2b' in s and s.count('postgres-l2b') == 2, "expected exactly 2 DB hosts swapped"
+open(f"{F}/bridge-config-l2b.toml","w").write(hdr + s)
+print("generated: agglayer-config-l2l2.toml aggkit-l2b-config.toml bridge-config-l2b.toml")
 PY
 
 # Normalize generated TOML so `make lint` (taplo fmt --check) stays green — the
 # python writer emits valid but un-taplo-formatted TOML.
 if command -v taplo >/dev/null 2>&1; then
-    RUST_LOG=warn taplo fmt "$F"/agglayer-config-l2l2.toml "$F"/aggkit-l2b-config.toml "$F"/bridge-config-l2l2.toml >/dev/null 2>&1 || true
+    RUST_LOG=warn taplo fmt "$F"/agglayer-config-l2l2.toml "$F"/aggkit-l2b-config.toml "$F"/bridge-config-l2b.toml >/dev/null 2>&1 || true
 fi

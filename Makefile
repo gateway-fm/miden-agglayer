@@ -276,10 +276,12 @@ e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay
 	@echo ">> waiting for anvil-l2b (:9545) before registering rollup #2"
 	@until cast chain-id --rpc-url http://localhost:9545 >/dev/null 2>&1; do sleep 2; done
 	L2B_RPC=http://localhost:9545 ./scripts/setup-l2b.sh
-	# Rollup #2 now exists: (re)create the L2B services and WAIT for them to go
-	# healthy. Only these two — NOT anvil-l2b, whose freshly-deployed L2B contract
-	# state is in-memory and would be wiped by a recreate.
-	$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service
+	# Rollup #2 now exists: (re)create the network-2 services and WAIT for them to
+	# go healthy — aggkit-l2b and the ISOLATED L2B bridge-service (which must
+	# re-index network 2 now that rollup #2 + the L2B bridge/GER exist). NOT
+	# anvil-l2b (freshly-deployed in-memory L2B state) and NOT the base Miden
+	# bridge-service (indexes L1 + Miden, unaffected by rollup #2).
+	$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b
 
 .PHONY: e2e-l2l2
 e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
