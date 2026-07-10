@@ -99,7 +99,8 @@ kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
 # belt-and-suspenders restore in case a trap raced (correct container names)
 docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
 NET="$(docker inspect "$AGGLAYER_CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')"
-[ -n "$NET" ] && docker network connect "$NET" "${PROJECT}-miden-node-1" >/dev/null 2>&1 || true
+# reconnect WITH the compose alias (a plain connect drops 'miden-node' resolution)
+[ -n "$NET" ] && docker network connect --alias miden-node "$NET" "${PROJECT}-miden-node-1" >/dev/null 2>&1 || true
 for c in tx-prover-1 miden-agglayer-1; do docker start "${PROJECT}-$c" >/dev/null 2>&1 || true; done
 FAULTS_DONE=$(grep -c "FAULT " "$CHAOS_LOG" 2>/dev/null || echo 0)
 say "chaos stopped: $FAULTS_DONE faults injected (log: $CHAOS_LOG)"

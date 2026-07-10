@@ -38,13 +38,30 @@ PROXY="${PROJECT}-miden-agglayer-1"
 NODE="${PROJECT}-miden-node-1"
 # the docker network the proxy<->node talk over (compose default)
 NET="$(docker inspect "$PROXY" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')"
+# CRITICAL: a plain `docker network connect` does NOT restore the compose service
+# alias (e.g. 'miden-node') — only the container-name alias — so after a
+# partition fault nothing could resolve the node and the whole stack wedges
+# permanently. Capture the node's non-container-name aliases on this net and
+# ALWAYS reconnect with them. (Default to the compose service name 'miden-node'.)
+_node_aliases() {
+    docker inspect "$NODE" --format \
+      "{{range \$k,\$v := .NetworkSettings.Networks}}{{if eq \$k \"$NET\"}}{{range \$v.Aliases}}{{.}} {{end}}{{end}}{{end}}" 2>/dev/null \
+      | tr ' ' '\n' | grep -vx "$NODE" | grep -v '^$'
+}
+NODE_ALIASES="$(_node_aliases)"
+[ -z "$NODE_ALIASES" ] && NODE_ALIASES="miden-node"
+_reconnect_node() {
+    local a args=()
+    for a in $NODE_ALIASES; do args+=(--alias "$a"); done
+    docker network connect "${args[@]}" "$NET" "$NODE" >/dev/null 2>&1
+}
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$CHAOS_LOG"; }
 
 # ── restore-everything safety net (runs on ANY exit) ────────────────────────
 restore_all() {
     docker unpause "$PG" >/dev/null 2>&1 || true
-    [ -n "${NET:-}" ] && docker network connect "$NET" "$NODE" >/dev/null 2>&1 || true
+    [ -n "${NET:-}" ] && _reconnect_node || true
     # ensure the faultable services are running
     for c in "$PROVER" "$PROXY"; do
         docker start "$c" >/dev/null 2>&1 || true
@@ -78,8 +95,8 @@ fault_partition_node() {
     log "FAULT partition-node ($dur s) — cut proxy<->node link"
     docker network disconnect "$NET" "$NODE" >/dev/null 2>&1
     sleep "$dur"
-    docker network connect "$NET" "$NODE" >/dev/null 2>&1
-    log "  -> node reconnected"
+    _reconnect_node    # restore WITH the compose alias(es) — else name resolution stays broken
+    log "  -> node reconnected (aliases: $NODE_ALIASES)"
 }
 
 FAULTS=(fault_pause_pg fault_kill_prover fault_restart_proxy fault_partition_node)
