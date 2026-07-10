@@ -52,6 +52,11 @@ open(f"{F}/aggkit-l2b-config.toml","w").write(hdr + s)
 # ── bridge-service: append network 2 to the multi-network lists ──────────────
 s = open(f"{F}/bridge-config.toml").read()
 subs = [
+    # L2->L2 autoclaims are OFF by default (claimtxman.go:192
+    # AreClaimsBetweenL2sEnabled) — without it the claim process never picks
+    # up deposits whose source AND destination are both L2s.
+    ('[ClaimTxManager]\nEnabled = true',
+     '[ClaimTxManager]\nEnabled = true\nAreClaimsBetweenL2sEnabled = true'),
     ('L2URLs = ["http://miden-agglayer:8546"]',
      f'L2URLs = ["http://miden-agglayer:8546", "{L2B}"]'),
     ('L2GenBlockNumbers = [0]', 'L2GenBlockNumbers = [0, 0]'),

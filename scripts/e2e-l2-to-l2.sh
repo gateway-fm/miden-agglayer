@@ -228,6 +228,34 @@ OPT0_LOWER=$(echo "$OPT0" | tr 'A-F' 'a-f')
 OPT0_HEX="${OPT0_LOWER#0x}"
 pass "OPT0 deployed on L2B: $OPT0 (origin network $L2B_NETWORK_ID)"
 
+# NDG — dedicated nudge token (see nudge_cert below). Distinct from OPT0 so
+# nudges never disturb the leg-4 net-zero balance assert.
+OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L2B_RPC" \
+    --private-key $ADMIN_KEY --broadcast \
+    --constructor-args "NudgeToken" "NDG" 18 1000000000000000000 2>&1)
+NDG=$(echo "$OUT" | grep "Deployed to:" | awk '{print $NF}')
+[[ -n "$NDG" ]] || fail "NDG deploy failed: $(echo "$OUT" | tail -2)"
+
+# The upstream ClaimTxManager is EVENT-driven: it scans for L2->L2 claims only
+# when a NEW rollup exit root lands on L1 (claimtxman.go:190,
+# GetDepositsFromOtherL2ToClaim), and a deposit only turns ready_for_claim
+# AFTER its own settle cycle round-trips through the destination's trusted GER
+# (claimtxman.go:418). A single L2->L2 transfer therefore sits ready but
+# unscanned until the NEXT certificate settles. nudge_cert forces that next
+# cycle: bridge 1 wei of NDG L2B->L1 — destination L1 means no claimtxman /
+# Miden-proxy side effects (L1 claims are manual and we never claim it), but
+# the resulting cert advances the L1 rollups exit root and wakes the scan.
+# Call it only AFTER observing ready_for_claim, or the nudge folds into the
+# same cert and triggers nothing.
+nudge_cert() {
+    cast send "$NDG" "approve(address,uint256)" $BRIDGE 1 \
+        --private-key $ADMIN_KEY --rpc-url "$L2B_RPC" >/dev/null || fail "NDG approve (nudge)"
+    cast send $BRIDGE "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
+        0 "$ADMIN" 1 "$NDG" true 0x \
+        --private-key $ADMIN_KEY --rpc-url "$L2B_RPC" >/dev/null || fail "NDG bridgeAsset (nudge)"
+    log "  nudge cert sent (1 wei NDG L2B->L1) — wakes the L2->L2 claim scan"
+}
+
 # ── Leg 2 (forward): bridgeAsset L2B -> Miden + GER propagation ──────────────
 step "Leg 2: bridgeAsset(destNet=$MIDEN_NETWORK_ID, $FWD_AMOUNT_WEI OPT0 wei) on L2B"
 # Snapshot the L2B holder BEFORE the forward bridge — leg 4 asserts the
@@ -324,6 +352,7 @@ FWD_DEPOSIT=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "$OPT0_LOWER")
 [[ -n "$FWD_DEPOSIT" ]] || fail "forward deposit vanished from bridge-service"
 FWD_GI=$(dep_field "$FWD_DEPOSIT" global_index)
 log "  forward deposit: cnt=$(dep_field "$FWD_DEPOSIT" deposit_cnt) globalIndex=$FWD_GI"
+nudge_cert   # deposit is ready — force the next settle so the claim scan runs
 
 # ClaimTxManager submits claimAsset to the proxy; proxy auto-creates the
 # faucet and mints. Proven log lines from the l1-to-l2/dynamic-erc20 suites.
@@ -427,6 +456,14 @@ STATUS=$(printf '%s\n' "$TX" | awk '$1=="status"{print $2; exit}')
 [[ "$STATUS" == "1" ]] || fail "COL bridgeAsset on L1 failed (status=$STATUS): $TX"
 log "  COL bridged from BOTH origins (net 0: $COL_L1_WEI wei, net 2: $COL_L2B_WEI wei)"
 
+# The (COL, net 2) claim needs the event-driven scan (see nudge_cert): wait
+# for its readiness, then force the next settle cycle. The (COL, net 0) claim
+# rides the mainnet-exit-root path and needs no nudge.
+wait_for "COL net-2 deposit ready_for_claim" \
+    "find_deposit '$DEST_ADDR' $L2B_NETWORK_ID '$COL_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') else 1)\"" \
+    600 5
+nudge_cert
+
 # Both claims auto-create faucets; wait on the PG registry (state, not logs).
 wait_for "TWO faucet_registry rows for COL (net 0 + net 2)" \
     "[ \"\$(pgq \"SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${COL_HEX}';\")\" = \"2\" ]" \
@@ -520,6 +557,7 @@ log "  back deposit: cnt=$BACK_CNT globalIndex=$BACK_GI amount=$BACK_AMOUNT_WEI 
 EXPECTED_BACK_WEI=$(python3 -c "print($BACK_AMOUNT * $WEI_PER_MIDEN_UNIT)")
 [[ "$BACK_AMOUNT_WEI" == "$EXPECTED_BACK_WEI" ]] \
     || fail "back-bridge amount mismatch: exit leaf carries $BACK_AMOUNT_WEI wei, expected $EXPECTED_BACK_WEI"
+nudge_cert   # back deposit is ready — wake the rollupID-2 claim scan on L2B
 
 # Claim on L2B: prefer the bridge-service ClaimTxManager autoclaim; fall back
 # to a manual claimAsset (proof from /merkle-proof, GER gated on AgglayerGERL2).

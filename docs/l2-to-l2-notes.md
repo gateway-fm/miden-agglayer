@@ -268,3 +268,17 @@ already answers `globalExitRootUpdater()`.
 2. the settlement tx exists (RollupManager event with rollupID-2 topic since
    the leg-2 start block; receipt status 1; tx hash logged),
 3. the L1 GER contract's `lastRollupExitRoot()` moves (exit-root propagation).
+
+### L2→L2 autoclaim: two upstream gotchas found live (2026-07-10)
+1. **`ClaimTxManager.AreClaimsBetweenL2sEnabled` defaults to false** — without
+   it the bridge-service NEVER scans for claims whose source AND destination
+   are both L2s (`claimtxman.go:192`). `gen-l2b-configs.sh` now sets it in
+   `bridge-config-l2l2.toml`.
+2. **The claim scan is event-driven and one cycle late**: it runs only when a
+   NEW rollup exit root lands on L1 (`claimtxman.go:190`), while a deposit
+   turns ready_for_claim only after its own settle cycle round-trips through
+   the destination's trusted GER (`claimtxman.go:418`). A single L2→L2
+   transfer therefore sits ready but unscanned forever on a quiet chain. The
+   e2e's `nudge_cert` (1 wei of a dedicated NDG token bridged L2B→L1 AFTER
+   observing ready_for_claim) forces the next cycle; destination L1 means no
+   claimtxman/proxy side effects. Applied in legs 2b, 3 (net-2 COL) and 4.
