@@ -160,8 +160,12 @@ say "======================================================================"
 say "  UNIFIED CHAOS SOAK RESULT"
 say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
 say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=$FOREIGN_LEAK"
-LEGIT_OK=0; [[ "$VC_RC" == "0" && "${LOCKS:-1}" == "0" ]] && LEGIT_OK=1
-say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC locks=$LOCKS)"
+# The mixed loadtest (MIX_VERIFY=0) exits 0 on a clean completion and non-zero
+# ONLY if its driver ABORTED (a fail() — e.g. a wedge or a harness bug). A
+# crashed driver means the full mixed load never ran, so it must NOT green even
+# if the (reduced) traffic verifies — else a dead driver false-passes.
+LEGIT_OK=0; [[ "$VC_RC" == "0" && "${LOCKS:-1}" == "0" && "$LT_RC" == "0" ]] && LEGIT_OK=1
+say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC locks=$LOCKS loadtest_rc=$LT_RC)"
 say "    (b) GARBO containment:  $([[ $GARBO_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK)"
 if [[ "$LEGIT_OK" == "1" && "$GARBO_OK" == "1" ]]; then
     say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"

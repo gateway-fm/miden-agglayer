@@ -160,7 +160,11 @@ clash_check() {
     kout=$(cast wallet new)
     deployer=$(echo "$kout" | awk '/Address:/{print $2}')
     key=$(echo "$kout" | awk '/Private key:/{print $3}')
-    cast send --rpc-url "$L1_RPC" --private-key "$ADMIN_KEY" --value 1ether "$deployer" >/dev/null 2>&1
+    # Fund the deployer on BOTH chains via anvil_setBalance (NOT a cast-send from
+    # ADMIN) — the background L1 bulk load spends from the SAME key (ADMIN==FUNDED)
+    # on L1, so an ADMIN L1 tx here would race its nonce ("replacement tx
+    # underpriced"). anvil_setBalance mutates state directly, no nonce.
+    cast rpc anvil_setBalance "$deployer" 0xde0b6b3a7640000 --rpc-url "$L1_RPC"  >/dev/null 2>&1
     cast rpc anvil_setBalance "$deployer" 0xde0b6b3a7640000 --rpc-url "$L2B_RPC" >/dev/null 2>&1
     _deploy() { forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$1" --private-key "$key" \
         --broadcast --constructor-args "CollideToken" "COL" 18 "$TOKEN_SUPPLY" 2>&1 | grep "Deployed to:" | awk '{print $NF}'; }
@@ -208,13 +212,16 @@ if [[ "$SKIP_L1_LOAD" != "1" ]]; then
     log "  L1<->Miden loadtest PID $LT_PID (log: $LT_OUT)"
 fi
 
-# ── Concurrent L2<->L2 workload + clash ──────────────────────────────────────
-step "Driving L2<->L2 workload concurrently ($L2L2_FWD fwd, $L2L2_BACK back, 1 clash)"
-clash_check &                       # run the clash concurrently with the fwd/back ops
-CLASH_PID=$!
+# ── L2<->L2 workload + clash (SEQUENTIAL among themselves) ───────────────────
+# These ops all drive nudge certs from the SAME ADMIN account on L2B, so they
+# must NOT overlap each other (concurrent cast-sends race the nonce). They DO
+# run concurrently with the background L1<->Miden bulk load — that is the
+# "under concurrency" the mixed test asserts (the clash resolves while real
+# L1<->Miden traffic hammers the same bridge/proxy).
+step "Driving L2<->L2 workload ($L2L2_FWD fwd, $L2L2_BACK back, 1 clash) concurrently with the L1 bulk load"
 for i in $(seq 1 "$L2L2_FWD"); do l2l2_fwd_op "$i"; done
+clash_check
 for i in $(seq 1 "$L2L2_BACK"); do l2l2_back_op "$i"; done
-wait "$CLASH_PID" 2>/dev/null || true
 
 # ── Wait for the L1<->Miden load to finish ───────────────────────────────────
 if [[ -n "$LT_PID" ]]; then
