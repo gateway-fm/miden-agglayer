@@ -7,8 +7,16 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 F=fixtures
 
-# Rollup #2 aggchain address — deterministic for this snapshot (RollupManager
-# CREATE nonce); setup-l2b.sh verifies it at runtime and fails loudly on drift.
+# Rollup #2 aggchain address — deterministic for this snapshot (the aggchain
+# proxy is CREATE'd by the RollupManager at a fixed nonce during
+# attachAggchainToAL); setup-l2b.sh verifies it at runtime and fails loudly on
+# drift. When setup-l2b.sh has already run, prefer its recorded tool output
+# (fixtures/l2b/out/sovereign-rollup-out.json, kurtosis sovereign-rollup-out
+# format) over the pinned default.
+SRO="$F/l2b/out/sovereign-rollup-out.json"
+if [ -z "${ROLLUP2_ADDR:-}" ] && [ -s "$SRO" ]; then
+  ROLLUP2_ADDR=$(python3 -c "import json;print(json.load(open('$SRO'))['sovereignRollupContract'])")
+fi
 ROLLUP2_ADDR="${ROLLUP2_ADDR:-0x5D1A491A416feEbf8C123A558ec28A239960bd0E}"
 L2B_URL_DOCKER="http://anvil-l2b:8545"
 SEQUENCER=0x5b06837A43bdC3dD9F114558DAf4B26ed49842Ed

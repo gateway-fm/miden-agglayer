@@ -3,8 +3,10 @@
 #
 # Topology: base stack (make e2e-up) + docker-compose.l2l2.yml overlay:
 #   L2B = plain anvil chain (chain-id 31338, :9545) registered as agglayer
-#   rollup #2 (networkID=2) with the L1 bridge contracts replicated on it
-#   (scripts/setup-l2b.sh) and its own aggkit (aggoracle+aggsender).
+#   rollup #2 (networkID=2) via the real kurtosis sovereign flow — the
+#   agglayer-contracts image's 4_createRollup.ts on L1 plus the generated
+#   sovereign genesis (REAL AgglayerBridgeL2 + AgglayerGERL2) injected on L2B
+#   (scripts/setup-l2b.sh) — and its own aggkit (aggoracle+aggsender).
 #
 # Legs:
 #   0   bring up L2B services + register rollup #2 (idempotent)
@@ -62,9 +64,10 @@ AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 AGGKIT_L2B_CONTAINER="${AGGKIT_L2B_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-l2b-1}"
 
 # L2B contract topology (see setup-l2b.sh; addresses are snapshot-deterministic)
-BRIDGE=0xC8cbEBf950B9Df44d987c8619f092beA980fF038      # bridge proxy on BOTH L1 and L2B
-GER_L1=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674      # L1 global exit root
-L2B_GER=0xa40D5f56745a118D0906a34E69aeC8C0Db1cB8fA     # SovereignGER stub on L2B
+BRIDGE=0xC8cbEBf950B9Df44d987c8619f092beA980fF038      # AgglayerBridge(L2) proxy on BOTH L1 and L2B
+GER_L1=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674      # L1 global exit root (AgglayerGER)
+L2B_GER=0xa40D5f56745a118D0906a34E69aeC8C0Db1cB8fA     # real AgglayerGERL2 proxy on L2B
+ROLLUP_MANAGER=0x6c6c009cC348976dB4A908c92B24433d4F6edA43
 L2B_NETWORK_ID=2
 MIDEN_NETWORK_ID=1
 
@@ -231,7 +234,19 @@ step "Leg 2: bridgeAsset(destNet=$MIDEN_NETWORK_ID, $FWD_AMOUNT_WEI OPT0 wei) on
 # round trip restores exactly this balance.
 L2B_BAL_BEFORE_FORWARD=$(cast call "$OPT0" 'balanceOf(address)(uint256)' $ADMIN --rpc-url "$L2B_RPC" | awk '{print $1}')
 L1GER_PRE=$(cast call $GER_L1 'getLastGlobalExitRoot()(bytes32)' --rpc-url "$L1_RPC")
+# L1-traceability baselines: rollup #2's last local exit root recorded on the
+# RollupManager, the L1 GER's rollup exit root, and the L1 block height — the
+# cert settlement MUST move all of them (asserted after propagation).
+rollup2_ler() {
+    cast call $ROLLUP_MANAGER \
+        "rollupIDToRollupData(uint32)(address,uint64,address,uint64,bytes32,uint64,uint64,uint64,uint64,uint64,uint64,uint8)" \
+        "$L2B_NETWORK_ID" --rpc-url "$L1_RPC" | sed -n 5p
+}
+LER2_PRE=$(rollup2_ler)
+L1_RER_PRE=$(cast call $GER_L1 'lastRollupExitRoot()(bytes32)' --rpc-url "$L1_RPC")
+LEG2_L1_BLOCK=$(cast block-number --rpc-url "$L1_RPC")
 log "  L2B OPT0 holder balance before forward: $L2B_BAL_BEFORE_FORWARD"
+log "  rollup#2 lastLocalExitRoot pre: $LER2_PRE (L1 block $LEG2_L1_BLOCK)"
 
 cast send "$OPT0" "approve(address,uint256)" $BRIDGE "$FWD_AMOUNT_WEI" \
     --private-key $ADMIN_KEY --rpc-url "$L2B_RPC" >/dev/null || fail "OPT0 approve on L2B"
@@ -263,6 +278,32 @@ done
 echo ""
 [[ -n "$MIDENGER" && "$MIDENGER" == "$L1GER" && "$L1GER" != "$L1GER_PRE" ]] \
     || fail "GER did not propagate to Miden within ${GER_TIMEOUT}s (pre=$L1GER_PRE L1=$L1GER miden=${MIDENGER:-<none>})"
+
+# ── Leg 2 L1-traceability: the settlement must be evidenced ON the L1 chain ──
+# (1) rollup #2's lastLocalExitRoot on the RollupManager moved off its baseline.
+LER2_POST=$(rollup2_ler)
+[[ "$LER2_POST" != "$LER2_PRE" ]] \
+    || fail "rollupIDToRollupData($L2B_NETWORK_ID).lastLocalExitRoot did not move ($LER2_PRE) — cert not settled on L1"
+pass "L1 RollupManager: rollup#2 lastLocalExitRoot $LER2_PRE -> $LER2_POST"
+# (2) the L1 settlement tx exists: a RollupManager event since leg-2 start
+# carries rollupID 2 as an indexed topic; its receipt must be status 1.
+SETTLE_LOGS=$(cast rpc --raw eth_getLogs "[{\"fromBlock\":\"$(printf 0x%x "$LEG2_L1_BLOCK")\",\"toBlock\":\"latest\",\"address\":\"$ROLLUP_MANAGER\"}]" --rpc-url "$L1_RPC")
+SETTLE_TX=$(echo "$SETTLE_LOGS" | python3 -c "
+import json, sys
+rid = format($L2B_NETWORK_ID, 'x').rjust(64, '0')
+txs = [lg['transactionHash'] for lg in json.load(sys.stdin) if any(t[2:] == rid for t in lg['topics'][1:])]
+print(txs[-1] if txs else '')
+")
+[[ -n "$SETTLE_TX" ]] || fail "no RollupManager event with rollupID $L2B_NETWORK_ID since L1 block $LEG2_L1_BLOCK — settlement tx not found on L1"
+SETTLE_STATUS=$(cast receipt "$SETTLE_TX" status --rpc-url "$L1_RPC")
+[[ "$SETTLE_STATUS" == *1* ]] || fail "L1 settlement tx $SETTLE_TX receipt status: $SETTLE_STATUS"
+SETTLE_TO=$(cast receipt "$SETTLE_TX" to --rpc-url "$L1_RPC")
+pass "L1 settlement tx: $SETTLE_TX (status 1, to=$SETTLE_TO)"
+# (3) the L1 GER contract absorbed the new rollup exit root.
+L1_RER_POST=$(cast call $GER_L1 'lastRollupExitRoot()(bytes32)' --rpc-url "$L1_RPC")
+[[ "$L1_RER_POST" != "$L1_RER_PRE" ]] \
+    || fail "L1 GER lastRollupExitRoot did not move ($L1_RER_PRE) — exit-root propagation broken"
+pass "L1 GER ($GER_L1): lastRollupExitRoot $L1_RER_PRE -> $L1_RER_POST"
 pass "Leg 2 done: cross-L2 GER on Miden: $MIDENGER"
 
 # ── Leg 2b: claim on Miden — foreign-origin faucet + wrapped balance ─────────
@@ -465,7 +506,7 @@ wait_for "Miden certificate settled on L1" \
 pass "certificate settled"
 
 # bridge-service must sync the exit AND flip ready_for_claim once aggoracle-l2b
-# injects the new GER into the L2B SovereignGER stub.
+# injects the new GER into the real AgglayerGERL2 on L2B.
 wait_for "Miden->L2B deposit ready_for_claim" \
     "find_deposit '$ADMIN' $MIDEN_NETWORK_ID '$OPT0_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') and d.get('dest_net')==$L2B_NETWORK_ID else 1)\"" \
     600 5
@@ -480,7 +521,7 @@ EXPECTED_BACK_WEI=$(python3 -c "print($BACK_AMOUNT * $WEI_PER_MIDEN_UNIT)")
     || fail "back-bridge amount mismatch: exit leaf carries $BACK_AMOUNT_WEI wei, expected $EXPECTED_BACK_WEI"
 
 # Claim on L2B: prefer the bridge-service ClaimTxManager autoclaim; fall back
-# to a manual claimAsset (proof from /merkle-proof, GER gated on the stub).
+# to a manual claimAsset (proof from /merkle-proof, GER gated on AgglayerGERL2).
 CLAIM_TX_HASH=$(echo "$BACK_DEPOSIT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_tx_hash') or '')")
 if [[ -z "$CLAIM_TX_HASH" ]]; then
     log "  waiting up to 180s for ClaimTxManager autoclaim on L2B..."
@@ -523,10 +564,10 @@ p = json.load(sys.stdin)['proof']['rollup_merkle_proof']
 while len(p) < 32: p.append('0x' + '00' * 32)
 print('[' + ','.join(p[:32]) + ']')
 ")
-    # claimAsset on L2B verifies the GER exists in the SovereignGER stub —
-    # aggoracle-l2b injects it after settlement. Gate on the stub's map.
+    # claimAsset on L2B verifies the GER exists in the real AgglayerGERL2 —
+    # aggoracle-l2b injects it after settlement. Gate on its globalExitRootMap.
     BACK_GER=$(cast keccak "0x${MAINNET_EXIT_ROOT#0x}${ROLLUP_EXIT_ROOT#0x}")
-    wait_for "GER $BACK_GER injected into L2B stub (aggoracle-l2b)" \
+    wait_for "GER $BACK_GER injected into L2B AgglayerGERL2 (aggoracle-l2b)" \
         "[ \"\$(cast call $L2B_GER 'globalExitRootMap(bytes32)(uint256)' $BACK_GER --rpc-url '$L2B_RPC' | awk '{print \$1}')\" != \"0\" ]" \
         300 5
     ORIG_NET=$(dep_field "$BACK_DEPOSIT" orig_net)

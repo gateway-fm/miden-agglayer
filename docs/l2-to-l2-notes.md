@@ -1,6 +1,6 @@
 # L2→L2 e2e (Miden ↔ OP-Stack) — scaffold notes & design (task #25)
 
-**Status: FULLY IMPLEMENTED, legs 2b-5 pending live validation** (branch `feat/l2-to-l2-e2e`). Steps 0-2a (L2B bring-up, rollup #2 registration, forward deposit → L1 settle → GER on Miden) are PROVEN LIVE; legs 2b-5 (claim on Miden, faucet isolation #15, back-bridge, completeness) are written to the proven sibling idioms and await a stack window — see UPDATE 5 for how to run + the live-run punch list. Absorbs task #15 (same-address/different-origin faucet isolation).
+**Status: FULLY IMPLEMENTED with the REAL sovereign contracts** (branch `feat/l2-to-l2-e2e`). The hand-written `SovereignGER.sol` stub and the L1-bytecode-copy bridge are GONE — L2B now runs the real v12 `AgglayerBridgeL2` + `AgglayerGERL2` (impl+proxy) generated and initialized by the same agglayer-contracts tooling kurtosis-cdk uses, and rollup #2 is registered on L1 by the real `4_createRollup.ts` flow (new rollup type + `attachAggchainToAL`), not by piggybacking an existing rollup type. See UPDATE 6 for the mechanism. Absorbs task #15 (same-address/different-origin faucet isolation). UPDATEs 1-5 below are historical (stub era) — kept for provenance.
 
 ## Goal
 Exercise the true cross-L2 bridge path through agglayer, which today's e2e (single Miden L2 ↔ L1) never covers: deploy an ERC-20 on a **second** L2 (OP-Stack), bridge it **OP-Stack → Miden** (foreign-origin → Miden provisions a wrapped-asset faucet), then bridge it **Miden → OP-Stack** back, asserting exact-block completeness and faucet isolation.
@@ -184,3 +184,87 @@ for the leg-4 autoclaim.
    (100000 Miden units) to mirror e2e-dynamic-erc20's proven mint size.
 5. **Timeouts**: GER propagation 600s, L2B COL faucet pair 900s, cert settle
    900s — tune after a cold-stack run.
+
+---
+
+## UPDATE 6 (2026-07-10): stub replaced by the REAL sovereign contracts (kurtosis flow)
+
+The stub era (UPDATEs 1-5: `fixtures/SovereignGER.sol` + L1-bridge-bytecode
+copy) is over. `scripts/setup-l2b.sh` now mirrors how kurtosis-cdk attaches an
+OP-Stack chain as a sovereign chain, using the SAME pinned tooling image
+(`agglayer-contracts:v12.2.3`, from kurtosis `src/package_io/constants.star`).
+
+### Why the stub had to go
+The vendored zkevm-bridge-service decodes the smc v12 sovereign events
+(`etherman/etherman.go`): the L2 GER manager must emit
+`UpdateHashChainValue(bytes32,bytes32)` on `insertGlobalExitRoot`. The stub
+emitted `InsertGlobalExitRoot(bytes32)` — so the bridge-service never recorded
+L2B's trusted exit root, `GetLatestTrustedExitRoot(network=2)` stayed empty and
+the claimtxman L2→L2 readiness branch (`claimtxman.go:418`) never fired:
+L2B→Miden deposits never became `ready_for_claim`.
+
+### L1 registration (kurtosis `contracts.sh create_sovereign_rollup_predeployed`)
+`setup-l2b.sh` step 1 runs `deployment/v2/4_createRollup.ts` (hardhat) inside
+the contracts image, joined to the L1 anvil's network namespace so the
+`localhost` hardhat network IS our L1. Inputs (mirrors of kurtosis
+`static_files/contracts/sovereign-rollup/create_new_rollup.json` and
+`deploy_parameters.json`, filled from `fixtures/combined.json`):
+- `fixtures/l2b/create_rollup_parameters.json` — AggchainECDSAMultisig,
+  chainID 31338, networkName `l2b-sovereign`, `isVanillaClient: true`,
+  sovereignParams (globalExitRootUpdater = aggoracle `0x0b6805…`),
+  aggchainParams (signers `[0x5b06…]`, threshold 1, selector `0x00000000`).
+- `fixtures/l2b/deploy_parameters.json` — reproduces the base L2 genesis.
+
+The script deploys a fresh `AggchainECDSAMultisig` implementation, calls
+`RollupManager.addNewRollupType(impl, verifier=0, forkID=0,
+rollupVerifierType=2 (ALGateway), genesis=0, programVKey=0)` → rollupTypeID 2,
+then `attachAggchainToAL(2, 31338, …)` → rollupID 2 aggchain proxy at
+`0x5D1A491A…bd0E` (CREATE'd by the RollupManager — snapshot-deterministic,
+same address the configs pin), and initializes the aggchain
+(admin/trustedSequencer/signers/threshold). `addDefaultAggchainVKey` is
+commented out exactly like kurtosis does for `l2_network_id != 1` (the
+selector route exists from rollup #1 and would revert). Result is verified and
+recorded kurtosis-style: `rollupIDToRollupData(2)` →
+`fixtures/l2b/out/sovereign-rollup-out.json` (chainID 31338 + verifierType 2
+asserted), plus an L1 `eth_getLogs` check that a RollupManager event carries
+rollupID 2 (attach tx traceability).
+
+### L2B contracts (kurtosis "predeployed" model, real artifacts)
+With `isVanillaClient: true`, `4_createRollup.ts` also emits
+`genesis_sovereign.json` — the base L2 genesis (reproduced offline by
+`1_createGenesis.ts` from our deploy_parameters; bridge proxy
+`0xC8cbEBf9…f038`, GER proxy `0xa40D5f56…B8fA`, BridgeLib, TokenWrapped impl,
+ProxyAdmin `0xd60F1B…`, timelock) with the REAL `AgglayerBridgeL2` +
+`AgglayerGERL2` implementations swapped in and the proxy storage fully
+initialized (bridge `networkID=2`, GER wired, `globalExitRootUpdater` =
+aggoracle, bridgeManager/remover/pauser = admin). On an OP chain kurtosis
+bakes these allocs into the chain genesis; L2B is a live anvil, so step 2
+injects the same allocs via `anvil_setCode`/`anvil_setStorageAt`/
+`anvil_setBalance`/`anvil_setNonce` — same real code+storage, different
+delivery. The old hand-replicated pieces (ProxyAdmin owner gate, metadata
+helper `0xcC87d4…`) come along for free because they are IN the genesis.
+
+Outputs live in `fixtures/l2b/out/` (`genesis-base.json`,
+`genesis-l2b-sovereign.json`, `create_rollup_output.json`,
+`sovereign-rollup-out.json`, hardhat logs). The dir is gitignored like every
+other snapshot-derived artifact (`combined.json` etc.) — setup-l2b.sh
+regenerates it whenever it registers rollup #2 on a fresh L1.
+`gen-l2b-configs.sh` reads `sovereign-rollup-out.json` for the rollup-2
+aggchain address when present. Everything is idempotent: registration is
+skipped when `chainIDToRollupID(31338) != 0`, injection when the GER proxy
+already answers `globalExitRootUpdater()`.
+
+### Live evidence (fresh stack, 2026-07-10)
+- aggkit-l2b aggoracle: `inject GER transaction submitted … GER: 0x133e6a88…`
+  → mined+finalized to `0xa40D5f56…` (the real AgglayerGERL2);
+  `globalExitRootMap(0x133e6a88…)` returns the insertion timestamp.
+- bridge-service: `networkID: 2, adding L2 ger to the channel. GER:
+  0x133e6a88…` — the line the stub could never produce — and claimtxman
+  `RollupID: 2, … The destination network is another L2` both fire.
+
+### Leg 2 L1-traceability asserts (now enforced by the e2e)
+`e2e-l2-to-l2.sh` leg 2 additionally asserts, with on-chain L1 reads:
+1. `rollupIDToRollupData(2).lastLocalExitRoot` moves off its pre-bridge value,
+2. the settlement tx exists (RollupManager event with rollupID-2 topic since
+   the leg-2 start block; receipt status 1; tx hash logged),
+3. the L1 GER contract's `lastRollupExitRoot()` moves (exit-root propagation).
