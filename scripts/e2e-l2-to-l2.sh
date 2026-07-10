@@ -297,7 +297,8 @@ print(txs[-1] if txs else '')
 [[ -n "$SETTLE_TX" ]] || fail "no RollupManager event with rollupID $L2B_NETWORK_ID since L1 block $LEG2_L1_BLOCK — settlement tx not found on L1"
 SETTLE_STATUS=$(cast receipt "$SETTLE_TX" status --rpc-url "$L1_RPC")
 [[ "$SETTLE_STATUS" == *1* ]] || fail "L1 settlement tx $SETTLE_TX receipt status: $SETTLE_STATUS"
-SETTLE_TO=$(cast receipt "$SETTLE_TX" to --rpc-url "$L1_RPC")
+SETTLE_TO=$(cast receipt "$SETTLE_TX" --json --rpc-url "$L1_RPC" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("to"))')
 pass "L1 settlement tx: $SETTLE_TX (status 1, to=$SETTLE_TO)"
 # (3) the L1 GER contract absorbed the new rollup exit root.
 L1_RER_POST=$(cast call $GER_L1 'lastRollupExitRoot()(bytes32)' --rpc-url "$L1_RPC")
