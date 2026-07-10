@@ -72,3 +72,9 @@ for old, new in subs:
 open(f"{F}/bridge-config-l2l2.toml","w").write(hdr + s)
 print("generated: agglayer-config-l2l2.toml aggkit-l2b-config.toml bridge-config-l2l2.toml")
 PY
+
+# Normalize generated TOML so `make lint` (taplo fmt --check) stays green — the
+# python writer emits valid but un-taplo-formatted TOML.
+if command -v taplo >/dev/null 2>&1; then
+    RUST_LOG=warn taplo fmt "$F"/agglayer-config-l2l2.toml "$F"/aggkit-l2b-config.toml "$F"/bridge-config-l2l2.toml >/dev/null 2>&1 || true
+fi
