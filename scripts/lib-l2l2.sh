@@ -128,7 +128,19 @@ _l2l2_stack_ready() {
     cast chain-id --rpc-url "$L2B_RPC" >/dev/null 2>&1 || return 1
     local rc; rc=$(cast call "$ROLLUP_MANAGER" 'rollupCount()(uint32)' --rpc-url "$L1_RPC" 2>/dev/null | awk '{print $1}')
     [[ "${rc:-0}" -ge 2 ]] || return 1
+    # Identity, not just presence: rollup #2 must be OUR L2B (chainID 31338), the
+    # L2B bridge must self-report networkID 2 (a leftover/foreign bridge at this
+    # address would not), and the real GER contract must have code — otherwise a
+    # stale/wrong overlay would be silently REUSED. These are cheap and distinguish
+    # a correct reused overlay from one that must be re-brought-up + reconciled.
+    local r2chain
+    r2chain=$( ( set +o pipefail; cast call "$ROLLUP_MANAGER" \
+        'rollupIDToRollupData(uint32)(address,uint64,address,uint64,bytes32,uint64,uint64,uint64,uint64,uint8,uint8)' 2 \
+        --rpc-url "$L1_RPC" 2>/dev/null | sed -n '2p' | awk '{print $1}' ) || true )
+    [[ "$r2chain" == "31338" ]] || return 1
     [[ "$(cast code "$BRIDGE" --rpc-url "$L2B_RPC" 2>/dev/null | head -c 4)" == "0x60" ]] || return 1
+    [[ "$(cast code "$L2B_GER" --rpc-url "$L2B_RPC" 2>/dev/null | head -c 4)" == "0x60" ]] || return 1
+    [[ "$(cast call "$BRIDGE" 'networkID()(uint32)' --rpc-url "$L2B_RPC" 2>/dev/null | awk '{print $1}')" == "2" ]] || return 1
     curl -sf "$BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000" >/dev/null 2>&1 || return 1
     return 0
 }

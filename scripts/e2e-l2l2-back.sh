@@ -26,8 +26,16 @@ source "$SCRIPT_DIR/lib-isolated-wallet.sh"
 [[ -f "$STATE_FILE" ]] || fail "no scenario state at $STATE_FILE — run e2e-l2l2-forward.sh first"
 # shellcheck disable=SC1090
 source "$STATE_FILE"
-[[ -n "${OPT0:-}" && -n "${OPT0_FAUCET_ID:-}" && -n "${WALLET_ID:-}" && -n "${BRIDGE_ID:-}" ]] \
-    || fail "scenario state incomplete: $STATE_FILE"
+# Validate ALL required fields before doing anything (fail closed on a truncated file).
+for _f in OPT0 OPT0_LOWER OPT0_HEX OPT0_FAUCET_ID WALLET_ID BRIDGE_ID DEST_ADDR FWD_MIDEN_UNITS; do
+    [[ -n "${!_f:-}" ]] || fail "scenario state incomplete: missing $_f in $STATE_FILE"
+done
+# Reject a state file left over from a DIFFERENT stack/run: its chain fingerprint
+# must match the chains we're about to drive.
+_NOW_L1=$(cast chain-id --rpc-url "$L1_RPC" 2>/dev/null || echo "?")
+_NOW_L2B=$(cast chain-id --rpc-url "$L2B_RPC" 2>/dev/null || echo "?")
+[[ "${STATE_L1_CHAINID:-}" == "$_NOW_L1" && "${STATE_L2B_CHAINID:-}" == "$_NOW_L2B" ]] \
+    || fail "stale scenario state: fingerprint L1=${STATE_L1_CHAINID:-?}/L2B=${STATE_L2B_CHAINID:-?} != current L1=$_NOW_L1/L2B=$_NOW_L2B (re-run forward on THIS stack)"
 
 for c in cast forge psql curl python3 docker; do command -v "$c" >/dev/null || fail "$c not found"; done
 cast block-number --rpc-url "$L1_RPC" >/dev/null 2>&1 || fail "L1 (Anvil) not reachable at $L1_RPC"

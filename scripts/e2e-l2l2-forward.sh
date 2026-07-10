@@ -24,6 +24,9 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # here must be able to spend it in the back scenario.
 B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/e2e-l2l2}"
 STATE_FILE="${STATE_FILE:-$B2AGG_STORE_DIR/l2l2-scenario-state.env}"
+# Remove any leftover state from a prior run up front: if THIS forward dies before
+# it atomically writes a fresh file, a stale one must not be consumed by clash/back.
+rm -f "$STATE_FILE" "$STATE_FILE".tmp.* 2>/dev/null || true
 
 source "$SCRIPT_DIR/lib-l2l2.sh"
 
@@ -186,10 +189,19 @@ evidence_record "leg2b" forward Miden claim "" "${FWD_CLAIM_BLOCK:-}" "$BRIDGE_I
     "ClaimEvent-present rows=$CLAIM_ROWS" "globalIndex=$FWD_GI faucet=$OPT0_FAUCET_ID units=$FWD_MIDEN_UNITS"
 evidence_exit_root "leg2b" forward post-forward-claim
 
-# ── Persist state for the back scenario ──────────────────────────────────────
+# ── Persist state for the clash + back scenarios (atomic + fingerprinted) ────
+# Write to a temp file and atomically rename so a consumer never sees a partial
+# file, and stamp the chain fingerprint (L1+L2B chain ids) + this run's id so the
+# back/clash legs can reject a state file left over from a DIFFERENT stack/run.
 mkdir -p "$B2AGG_STORE_DIR"
-cat > "$STATE_FILE" <<EOF
+L1_CHAINID=$(cast chain-id --rpc-url "$L1_RPC" 2>/dev/null || echo "?")
+L2B_CHAINID=$(cast chain-id --rpc-url "$L2B_RPC" 2>/dev/null || echo "?")
+STATE_TMP="$STATE_FILE.tmp.$$"
+cat > "$STATE_TMP" <<EOF
 # written by e2e-l2l2-forward.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
+STATE_RUN_ID=${EVIDENCE_RUN_TS:-$$}
+STATE_L1_CHAINID=$L1_CHAINID
+STATE_L2B_CHAINID=$L2B_CHAINID
 OPT0=$OPT0
 OPT0_LOWER=$OPT0_LOWER
 OPT0_HEX=$OPT0_HEX
@@ -201,7 +213,8 @@ L2B_BAL_BEFORE_FORWARD=$L2B_BAL_BEFORE_FORWARD
 FWD_AMOUNT_WEI=$FWD_AMOUNT_WEI
 FWD_MIDEN_UNITS=$FWD_MIDEN_UNITS
 EOF
-log "  scenario state -> $STATE_FILE"
+mv -f "$STATE_TMP" "$STATE_FILE"
+log "  scenario state -> $STATE_FILE (run=${EVIDENCE_RUN_TS:-$$} L1=$L1_CHAINID L2B=$L2B_CHAINID)"
 
 evidence_summary
 
