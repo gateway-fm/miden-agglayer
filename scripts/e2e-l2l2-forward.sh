@@ -42,6 +42,13 @@ log "  L2<->L2 FORWARD (L2B -> Miden): deploy, bridge, claim, foreign faucet"
 log "======================================================================"
 
 l2l2_ensure_stack
+# Fail-loud preflight before ANY test step (skipped if the e2e-test.sh group
+# already ran it this invocation).
+if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
+evidence_init
+# rollup #2 registration tx (CreateNewAggchain on L1) + exit-root baseline.
+evidence_rollup_register "leg0"
+evidence_exit_root "leg0" forward pre-forward
 l2l2_miden_identities
 
 # ── Leg 1: deploy OPT0 on L2B (origin_network = 2) ───────────────────────────
@@ -51,9 +58,13 @@ OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L2B_RPC" 
     --constructor-args "L2BToken" "OPT0" 18 "$TOKEN_SUPPLY" 2>&1) || true
 OPT0=$(echo "$OUT" | awk '/Deployed to:/{print $NF}')
 [[ -n "$OPT0" ]] || fail "OPT0 deploy failed: $(echo "$OUT" | tail -2)"
+OPT0_DEPLOY_TX=$(echo "$OUT" | awk '/Transaction hash:/{print $NF; exit}')
 OPT0_LOWER=$(echo "$OPT0" | tr 'A-F' 'a-f'); OPT0_HEX="${OPT0_LOWER#0x}"
 pass "OPT0 deployed on L2B: $OPT0 (origin network $L2B_NETWORK_ID)"
+evidence_tx "leg1" forward L2B deploy "$L2B_RPC" "$OPT0_DEPLOY_TX" "$OPT0" \
+    "token=OPT0 originNetwork=$L2B_NETWORK_ID supply=$TOKEN_SUPPLY"
 l2l2_deploy_nudge_token
+evidence_tx "leg1" forward L2B deploy "$L2B_RPC" "$NDG_DEPLOY_TX" "$NDG" "token=NDG role=cert-nudge"
 
 # ── Leg 2: forward bridgeAsset(destNet=1) + GER propagation ──────────────────
 step "Leg 2: bridgeAsset(destNet=$MIDEN_NETWORK_ID, $FWD_AMOUNT_WEI OPT0 wei) on L2B"
@@ -78,6 +89,8 @@ print(be[0]['address'] if be else '')")
 [[ "$(echo "$BE_EMITTER" | tr 'A-F' 'a-f')" == "$(echo "$BRIDGE" | tr 'A-F' 'a-f')" ]] \
     || fail "bridgeAsset tx $FWD_TX_HASH has no BridgeEvent from $BRIDGE (emitter: ${BE_EMITTER:-<none>})"
 pass "L2B BridgeEvent in tx $FWD_TX_HASH"
+evidence_tx "leg2" forward L2B deposit "$L2B_RPC" "$FWD_TX_HASH" "$BRIDGE" \
+    "token=$OPT0 amountWei=$FWD_AMOUNT_WEI destNet=$MIDEN_NETWORK_ID destAddr=$DEST_ADDR"
 
 GER_TIMEOUT="${GER_TIMEOUT:-600}"
 log "  waiting for GER propagation L2B -> L1 -> Miden (cert settle, <=${GER_TIMEOUT}s)..."
@@ -94,6 +107,20 @@ echo ""
 [[ -n "$MIDENGER" && "$MIDENGER" == "$L1GER" && "$L1GER" != "$L1GER_PRE" ]] \
     || fail "GER did not propagate to Miden within ${GER_TIMEOUT}s (pre=$L1GER_PRE L1=$L1GER miden=${MIDENGER:-<none>})"
 pass "Leg 2 done: cross-L2 GER on Miden: $MIDENGER"
+# GER INJECTION (forward): aggoracle (aggkit #1) injects the L1 GER into Miden.
+# Miden's GER lives behind the synthetic proxy RPC (not a cast-reachable EVM
+# contract), so verification is: the value the proxy reports == the injected GER,
+# plus the aggoracle inject-tx id from its logs (best-effort).
+# `|| true`: a no-match grep here (the Miden aggoracle may not log this exact GER
+# value — Miden's GER arrives via the proxy, not always aggkit-1) must NOT abort
+# the run under `set -e -o pipefail`; the record is still made (rpc-verified).
+FWD_GER_INJECT_TX=$( ( set +o pipefail; docker logs "${COMPOSE_PROJECT_NAME}-aggkit-1" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+    | grep -iE "inject GER transaction.*GER: ${MIDENGER}$" | grep -oE 'ID: 0x[0-9a-fA-F]{64}' | tail -1 | awk '{print $2}' ) || true )
+evidence_record "leg2" forward Miden ger_inject "${FWD_GER_INJECT_TX:-}" "" "miden-ger(proxy)" \
+    "rpc-verified" "ger=$MIDENGER source=aggoracle(miden) verifiedVia=zkevm_getLatestGlobalExitRoot"
+# CERTIFICATE SETTLEMENT (forward): the network-2 (L2B) cert whose settlement on
+# L1 carried the forward deposit's exit root into the L1 GER.
+evidence_settlement "leg2" forward "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST_START_TIME" 2 || true
 
 # ── Leg 2b: claim on Miden — foreign-origin faucet + wrapped balance ─────────
 step "Leg 2b: claim on Miden (auto-claim) + (OPT0, net $L2B_NETWORK_ID) faucet asserts"
@@ -148,6 +175,11 @@ CLAIM_ROWS=$(claim_event_rows "$FWD_GI")
 [[ "${CLAIM_ROWS:-0}" -ge 1 ]] || fail "no ClaimEvent synthetic_logs row for globalIndex $FWD_GI"
 FWD_CLAIM_BLOCK=$(pgq "SELECT block_number FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x$(python3 -c "print(format(int('$FWD_GI'),'064x'))")%' ORDER BY block_number LIMIT 1;")
 pass "ClaimEvent at synthetic block ${FWD_CLAIM_BLOCK:-?} (rows=$CLAIM_ROWS)"
+# CLAIM (forward): auto-claimed on Miden. The Miden claim is an internal Miden tx
+# (no cast receipt); it is verified by the ClaimEvent synthetic_logs row above.
+evidence_record "leg2b" forward Miden claim "" "${FWD_CLAIM_BLOCK:-}" "$BRIDGE_ID" \
+    "ClaimEvent-present rows=$CLAIM_ROWS" "globalIndex=$FWD_GI faucet=$OPT0_FAUCET_ID units=$FWD_MIDEN_UNITS"
+evidence_exit_root "leg2b" forward post-forward-claim
 
 # ── Persist state for the back scenario ──────────────────────────────────────
 mkdir -p "$B2AGG_STORE_DIR"
@@ -166,10 +198,13 @@ FWD_MIDEN_UNITS=$FWD_MIDEN_UNITS
 EOF
 log "  scenario state -> $STATE_FILE"
 
+evidence_summary
+
 log "======================================================================"
 log "  L2<->L2 FORWARD PASS"
 log "    OPT0 (origin net $L2B_NETWORK_ID): $OPT0"
 log "    forward:              $FWD_AMOUNT_WEI wei -> $FWD_MIDEN_UNITS units (gi $FWD_GI)"
 log "    foreign-origin faucet: $OPT0_FAUCET_ID"
 log "    ClaimEvent block:     ${FWD_CLAIM_BLOCK:-?}"
+log "    evidence NDJSON:      $EVIDENCE_FILE"
 log "======================================================================"

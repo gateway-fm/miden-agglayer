@@ -37,6 +37,7 @@ tests/baselines/*.log
 # local test artifacts
 .loadtest-results/
 .b2agg-store/
+.l2l2-evidence/
 cache/
 out/
 

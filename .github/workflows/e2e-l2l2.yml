@@ -1,0 +1,104 @@
+# L2<->L2 end-to-end (BOTH directions) + evidence artifact.
+#
+# What it runs: `make e2e-l2l2` -> `scripts/e2e-test.sh l2l2`, which is the
+# fail-loud preflight (l2l2_validate_stack) then forward (L2B -> Miden) then
+# back (Miden -> L2B). Both directions run because the `l2l2` group is
+# [forward, back]. The per-run evidence NDJSON (.l2l2-evidence/run-<ts>.ndjson,
+# every on-chain tx recorded + receipt-verified) is uploaded as an artifact.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# RUNNER REQUIREMENTS — READ BEFORE ENABLING (honest assessment)
+# ─────────────────────────────────────────────────────────────────────────────
+# This job brings up the FULL docker stack (miden-node built from git,
+# miden-agglayer proxy built from this repo, tx-prover, TWO anvils, agglayer,
+# TWO aggkits, bridge-service, and two postgres) and drives real certificate
+# settlement + GER propagation. Concretely it needs, on the runner:
+#   * docker + `docker compose` v2 and permission to run privileged-ish builds;
+#   * ~40-60 GB free disk (multi-GB images: aggkit/agglayer/bridge-service +
+#     the foundry image + the agglayer-contracts:v12.2.3 image pulled by
+#     setup-l2b.sh + a from-source miden-node build + this repo's image);
+#   * >= 8 GB RAM held for ~30+ min (11 long-lived containers + prover);
+#   * OUTBOUND NETWORK to ghcr.io/agglayer, ghcr.io/foundry-rs, and
+#     europe-west2-docker.pkg.dev (contracts image), plus the miden-node git
+#     source; `make e2e-setup` additionally needs a working Kurtosis engine to
+#     mint the fixtures (l1-raw-txs.txt, combined.json, keystores);
+#   * ~60-120 min wall time (cert settle + GER waits dominate).
+#
+# VERDICT: a standard GitHub-hosted `ubuntu-latest` runner has docker but is
+# NOT a reliable fit — 14 GB disk and 7 GB RAM make OOM/ENOSPC likely once the
+# node build + 11 containers are resident, and `make e2e-setup` (Kurtosis) is
+# slow/flaky in that sandbox. Therefore this workflow is:
+#   (1) manual-only (workflow_dispatch) OR opt-in per-PR via the `e2e-l2l2`
+#       label — it never runs on every push/PR; and
+#   (2) targeted at a SELF-HOSTED runner by default (the `runner` input; a
+#       machine that already has the fixtures + prebuilt images amortizes the
+#       cost). Override `runner: ubuntu-latest` to attempt a hosted run at your
+#       own risk (expect it to be tight on disk/RAM).
+#
+# If your self-hosted runner is a persistent bare-metal box that keeps the
+# stack + fixtures warm, set `skip_setup: true` to reuse them (skips the
+# heavy `make e2e-setup` + rebuild and just re-runs the group on the live
+# stack — this is the fast path the maintainers use for the 3x cert).
+
+name: e2e-l2l2
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (default self-hosted; ubuntu-latest is tight — see file header)"
+        required: false
+        default: self-hosted
+      skip_setup:
+        description: "Reuse an already-warm stack + fixtures (skip e2e-setup + bring-up)"
+        required: false
+        default: "false"
+  pull_request:
+    # Opt-in per PR: add the `e2e-l2l2` label to a PR to trigger one run.
+    types: [labeled]
+
+jobs:
+  e2e-l2l2:
+    # Never on a bare push/sync — only manual dispatch or an explicit label.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'e2e-l2l2')
+    runs-on: ${{ github.event.inputs.runner || 'self-hosted' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # foundry (cast/forge), taplo, etc. — the scripts shell out to `cast`.
+      - name: Install tooling
+        run: make install-tools
+
+      # Kurtosis fixtures (l1-raw-txs.txt, combined.json, keystores). Skippable
+      # on a warm self-hosted runner that already has fixtures/.
+      - name: Generate e2e fixtures (Kurtosis)
+        if: ${{ github.event.inputs.skip_setup != 'true' }}
+        run: make e2e-setup
+
+      # Base stack + L2B overlay + rollup #2 registration + bridge-service
+      # re-index of both networks (fresh data dir). Skippable on a warm runner.
+      - name: Bring up base stack + L2B overlay
+        if: ${{ github.event.inputs.skip_setup != 'true' }}
+        run: make e2e-l2l2-up
+
+      # Preflight (fail-loud) + forward (L2B->Miden) + back (Miden->L2B) + the
+      # per-run evidence NDJSON with its required-kind assertion.
+      - name: Run L2<->L2 group (both directions) + evidence
+        run: make e2e-l2l2
+
+      # Always upload the audit trail — even on failure, for forensics.
+      - name: Upload evidence NDJSON
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: l2l2-evidence
+          path: .l2l2-evidence/*.ndjson
+          if-no-files-found: warn
+
+      # Tear the stack down unless we brought up a warm one we want to keep.
+      - name: Tear down stack
+        if: ${{ always() && github.event.inputs.skip_setup != 'true' }}
+        run: make e2e-down

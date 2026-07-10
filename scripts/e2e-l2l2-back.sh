@@ -38,7 +38,13 @@ log "======================================================================"
 log "  OPT0=$OPT0  faucet=$OPT0_FAUCET_ID  wallet=$WALLET_ID"
 
 l2l2_ensure_stack
+if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
+evidence_init
+# rollup_register + exit-root baseline (so `back` standalone is also self-complete).
+evidence_rollup_register "leg4"
+evidence_exit_root "leg4" back pre-back
 l2l2_deploy_nudge_token
+evidence_tx "leg4" back L2B deploy "$L2B_RPC" "$NDG_DEPLOY_TX" "$NDG" "token=NDG role=cert-nudge"
 
 BACK_AMOUNT="$FWD_MIDEN_UNITS"     # forward credited exactly this
 ADMIN_LOWER=$(echo "$ADMIN" | tr 'A-F' 'a-f')
@@ -68,6 +74,9 @@ wait_for "Miden certificate settled on L1" \
     "docker logs --since $LEG4_START $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
     900 10
 pass "certificate settled"
+# CERTIFICATE SETTLEMENT (back): the Miden (network 1) cert whose settlement on
+# L1 carried the back-bridge exit root. Grep the Miden aggsender, verify on L1.
+evidence_settlement "leg4" back "$AGGKIT_CONTAINER" "$LEG4_START" 1 || true
 
 wait_for "Miden->L2B deposit ready_for_claim" \
     "find_deposit '$ADMIN' $MIDEN_NETWORK_ID '$OPT0_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') and d.get('dest_net')==$L2B_NETWORK_ID else 1)\"" \
@@ -81,6 +90,20 @@ log "  back deposit: cnt=$BACK_CNT globalIndex=$BACK_GI amount=$BACK_AMOUNT_WEI 
 EXPECTED_BACK_WEI=$(python3 -c "print($BACK_AMOUNT * $WEI_PER_MIDEN_UNIT)")
 [[ "$BACK_AMOUNT_WEI" == "$EXPECTED_BACK_WEI" ]] \
     || fail "back-bridge amount mismatch: exit leaf carries $BACK_AMOUNT_WEI wei, expected $EXPECTED_BACK_WEI"
+# DEPOSIT (back): the Miden->L2B bridge-out (B2AGG). Created as a Miden note (no
+# EVM tx); verified via the synthetic BridgeEvent row + bridge-service deposit.
+evidence_record "leg4" back Miden deposit "" "" "$BRIDGE_ID" "bridged-out ready_for_claim" \
+    "token=$OPT0 amountWei=$BACK_AMOUNT_WEI destNet=$L2B_NETWORK_ID globalIndex=$BACK_GI depositCnt=$BACK_CNT"
+# GER INJECTION (back): aggoracle-l2b injects the new GER into the REAL L2B GER
+# contract — a cast-receiptable L2B tx. Grep aggkit-l2b's aggoracle log.
+# `|| true`: no-match grep must not abort under `set -e -o pipefail`.
+BACK_GER_INJECT_TX=$( ( set +o pipefail; docker logs --since "$LEG4_START" "$AGGKIT_L2B_CONTAINER" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+    | grep -oiE 'inject GER transaction submitted with ID: 0x[0-9a-f]{64}' | tail -1 | grep -oiE '0x[0-9a-f]{64}' ) || true )
+if [[ -n "$BACK_GER_INJECT_TX" ]]; then
+    evidence_tx "leg4" back L2B ger_inject "$L2B_RPC" "$BACK_GER_INJECT_TX" "$L2B_GER" "source=aggoracle-l2b"
+else
+    warn "evidence: no aggoracle-l2b GER-inject tx found since $LEG4_START — ger_inject(back) not recorded"
+fi
 
 # Wake the rollupID-2 claim scan on L2B (non-fatal — manual fallback covers a miss).
 nudge_until "L2B autoclaim of the back deposit" \
@@ -144,8 +167,12 @@ print('[' + ','.join(p[:32]) + ']')")
         "$BACK_AMOUNT_WEI" "$METADATA_CLAIM" 2>&1) || true
     STATUS=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="status"{print $2; exit}')
     [[ "$STATUS" == "1" ]] || { warn "L2B claim tx output: $CLAIM_TX"; fail "manual claimAsset on L2B failed"; }
+    CLAIM_TX_HASH=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="transactionHash"{print $2; exit}')
     pass "claim on L2B via manual claimAsset"
 fi
+# CLAIM (back): on L2B via the AgglayerBridgeL2 proxy — cast-receiptable tx.
+evidence_tx "leg4" back L2B claim "$L2B_RPC" "$CLAIM_TX_HASH" "$BRIDGE" \
+    "globalIndex=$BACK_GI token=$OPT0 destNet=$L2B_NETWORK_ID"
 
 # ── Net-zero round trip ──────────────────────────────────────────────────────
 L2B_BAL_FINAL=$(cast call "$OPT0" 'balanceOf(address)(uint256)' "$ADMIN" --rpc-url "$L2B_RPC" | awk '{print $1}')
@@ -162,9 +189,13 @@ for attempt in $(seq 1 12); do
 done
 [[ "$WRAPPED_FINAL" -eq 0 ]] || fail "Miden wrapped OPT0 not fully burned: $WRAPPED_FINAL remains"
 pass "Miden wrapped OPT0 fully burned"
+evidence_exit_root "leg4" back post-back-claim
+
+evidence_summary
 
 log "======================================================================"
 log "  L2<->L2 BACK PASS — net-zero round trip L2B -> Miden -> L2B"
 log "    back: $BACK_AMOUNT units -> $BACK_AMOUNT_WEI wei (gi $BACK_GI)"
 log "    L2B holder net-zero: $L2B_BAL_BEFORE_FORWARD == $L2B_BAL_FINAL"
+log "    evidence NDJSON:     $EVIDENCE_FILE"
 log "======================================================================"

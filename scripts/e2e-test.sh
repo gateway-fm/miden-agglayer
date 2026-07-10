@@ -124,6 +124,17 @@ case "$test_filter" in
         # foreign-origin faucet) then back (bridge-out Miden->L2B+claim,
         # net-zero). forward brings the L2B overlay up idempotently (reused if
         # already registered) and hands off a shared wallet state file to back.
+        #
+        # Preflight ONCE up front (fail-loud: nothing runs against a
+        # half-configured/port-colliding stack), then pin ONE per-run evidence
+        # timestamp so forward+back write the SAME NDJSON file for this run (a
+        # fresh invocation => a fresh file: 3x cert => 3 evidence artifacts).
+        PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+        source "$SCRIPT_DIR/lib-l2l2.sh"
+        export EVIDENCE_RUN_TS="$(date +%s)"
+        l2l2_ensure_stack
+        l2l2_validate_stack
+        export L2L2_PREFLIGHT_DONE=1
         "$SCRIPT_DIR/e2e-l2l2-forward.sh"
         echo ""
         "$SCRIPT_DIR/e2e-l2l2-back.sh"

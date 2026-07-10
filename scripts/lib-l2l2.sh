@@ -192,6 +192,7 @@ l2l2_deploy_nudge_token() {
         --private-key "$ADMIN_KEY" --broadcast \
         --constructor-args "NudgeToken" "NDG" 18 1000000000000000000 2>&1)
     NDG=$(echo "$out" | grep "Deployed to:" | awk '{print $NF}')
+    NDG_DEPLOY_TX=$(echo "$out" | awk '/Transaction hash:/{print $NF; exit}')
     [[ -n "$NDG" ]] || fail "NDG deploy failed: $(echo "$out" | tail -2)"
     log "  nudge token NDG deployed on L2B: $NDG"
 }
@@ -222,4 +223,342 @@ nudge_until() {
         warn "nudge round $t/$tries did not unblock: $desc — re-nudging"
     done
     return 1
+}
+
+# ── STACK VALIDATION (preflight, fail-loud) ─────────────────────────────────
+# l2l2_validate_stack — asserts the L2B overlay is COMPLETE + HEALTHY before any
+# test step runs, so nothing executes against a half-configured/port-colliding
+# stack. Every check prints a PASS/FAIL line; failures are accumulated (so the
+# operator sees ALL problems at once) then the whole preflight fails loud.
+# CreateNewAggchain event topic (RollupManager) — also used by evidence_rollup_register.
+CREATE_AGGCHAIN_TOPIC="0x144e3f9b5c63682a3bb7e9ad31e99c043890d3d540cd79dcebc3b5bdfba94c9b"
+_PF_FAILS=0
+_pf_pass() { echo -e "  ${GREEN}PASS${NC} $*"; }
+_pf_fail() { echo -e "  ${RED}FAIL${NC} $*"; _PF_FAILS=$((_PF_FAILS + 1)); }
+
+# _pf_log_has <container> <ere-pattern> <tail-lines> <desc> — assert a pattern
+# appears in a container's recent logs, with retries. Uses a BOUNDED --tail (not
+# the whole multi-100k-line log) so it's fast AND immune to a transient docker
+# hiccup on a busy shared host returning an empty/partial read (which otherwise
+# flakes an all-log capture). Patterns checked here recur throughout the log, so
+# a healthy stack always has them within the tail window.
+# tail="all" streams the whole log but grep -q short-circuits at the first match
+# (cheap when the pattern appears early, e.g. a start-up GER injection whose later
+# recurrences are buried under unrelated high-volume module spam).
+_pf_log_has() {
+    local container="$1" pattern="$2" tail="$3" desc="$4" i
+    local -a args=(logs)
+    [[ "$tail" != "all" ]] && args+=(--tail "$tail")
+    args+=("$container")
+    for i in 1 2 3 4 5; do
+        # Subshell + `set +o pipefail`: `grep -q` short-circuits on the first
+        # match and SIGPIPE-kills `docker logs`/`sed` upstream; under the caller's
+        # `set -o pipefail` that 141 would masquerade as a pipeline failure and
+        # spuriously fail an otherwise-passing check. Same idiom as wait_for.
+        if ( set +o pipefail; docker "${args[@]}" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -qE "$pattern" ); then
+            _pf_pass "$desc"
+            return 0
+        fi
+        sleep 2
+    done
+    _pf_fail "$desc — pattern '/$pattern/' absent from ${tail} log lines of $container after 5 tries"
+}
+
+# Container is OK if its healthcheck reports "healthy" OR (no healthcheck AND it
+# is "running"). Anything else (starting/unhealthy/exited/absent) is a failure.
+_pf_container() {
+    local svc="$1" name="${COMPOSE_PROJECT_NAME}-$1-1" st
+    st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$name" 2>/dev/null) || st="absent"
+    case "$st" in
+        healthy|running) _pf_pass "container $svc ($name): $st" ;;
+        *)               _pf_fail "container $svc ($name): $st" ;;
+    esac
+}
+
+# Detect a foreign container squatting a host port THIS stack needs (the
+# leftover-:5433/:5434 hygiene failure). Owner must belong to our project.
+_pf_port_owner_ok() {
+    local port="$1" want="$2" owner
+    owner=$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -E "(:|^)$port->" | awk '{print $1}' | head -1)
+    if [[ -z "$owner" ]]; then
+        _pf_fail "host port $port ($want) not published by any container"
+    elif [[ "$owner" != "$COMPOSE_PROJECT_NAME-"* ]]; then
+        _pf_fail "host port $port ($want) held by FOREIGN container '$owner' (expected project '$COMPOSE_PROJECT_NAME') — leftover/colliding stack"
+    else
+        _pf_pass "host port $port ($want) owned by $owner"
+    fi
+}
+
+# _pf_bridge_fresh — assert bridge-service is actively logging (newest log line
+# within PF_BRIDGE_FRESH_MAX seconds). A frozen synchronizer stops emitting lines
+# while the container stays "Up"; this is the liveness gate that catches it.
+_pf_bridge_fresh() {
+    local container="${COMPOSE_PROJECT_NAME}-bridge-service-1" iso ts now age
+    iso=$( ( set +o pipefail; docker logs --tail 8 "$container" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+        | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | tail -1 ) || true )
+    if [[ -z "$iso" ]]; then
+        _pf_fail "bridge-service liveness: no parseable log timestamp in recent output (frozen?)"
+        return
+    fi
+    ts=$(python3 -c "import datetime; print(int(datetime.datetime.fromisoformat('${iso}'.replace('Z','+00:00')).timestamp()))" 2>/dev/null || true)
+    now=$(date -u +%s)
+    if [[ -z "$ts" ]]; then
+        _pf_fail "bridge-service liveness: unparsable log timestamp '$iso'"
+        return
+    fi
+    age=$(( now - ts ))
+    if [[ "$age" -le "${PF_BRIDGE_FRESH_MAX:-240}" ]]; then
+        _pf_pass "bridge-service actively syncing (newest log line ${age}s ago)"
+    else
+        _pf_fail "bridge-service FROZEN — newest log line is ${age}s old (>${PF_BRIDGE_FRESH_MAX:-240}s); synchronizer wedged, deposits will never reach ready_for_claim"
+    fi
+}
+
+# _pf_sync_lag <net-id> <rpc> <label> — assert bridge-service's synchronizer for
+# a network is CLOSE to that chain's tip. A synchronizer can keep logging (passes
+# freshness) yet be stuck re-checking one block and never advance (observed after
+# a chain reset desynced the claimtxman); such a stall stops new deposits from
+# ever reaching ready_for_claim. Compares the newest "Checking Block N" to the tip.
+_pf_sync_lag() {
+    local net="$1" rpc="$2" label="$3" max="${PF_BRIDGE_LAG_MAX:-400}" synced tip lag
+    synced=$( ( set +o pipefail; docker logs --tail 6000 "${COMPOSE_PROJECT_NAME}-bridge-service-1" 2>&1 \
+        | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+        | grep -oE "NetworkID: $net, \[checkReorg function\] Checking Block [0-9]+" \
+        | tail -1 | grep -oE '[0-9]+$' ) || true )
+    tip=$(cast block-number --rpc-url "$rpc" 2>/dev/null || true)
+    if [[ -z "$synced" || -z "$tip" ]]; then
+        _pf_fail "bridge-service $label sync: could not read synced block ('${synced:-}') or chain tip ('${tip:-}')"
+        return
+    fi
+    lag=$(( tip - synced ))
+    if [[ "$lag" -le "$max" ]]; then
+        _pf_pass "bridge-service $label sync near tip (synced $synced, tip $tip, lag $lag)"
+    else
+        _pf_fail "bridge-service $label sync STALLED — synced block $synced vs chain tip $tip (lag $lag > $max); synchronizer wedged, deposits won't reach ready_for_claim"
+    fi
+}
+
+l2l2_validate_stack() {
+    _PF_FAILS=0
+    step "PREFLIGHT: validating l2l2 stack (project=$COMPOSE_PROJECT_NAME)"
+
+    # Fixtures the stack cannot come up without (missing l1-raw-txs.txt = a
+    # worktree that was never `make e2e-setup`).
+    if [[ -s "$FIXTURES_DIR/l1-raw-txs.txt" ]]; then
+        _pf_pass "fixture l1-raw-txs.txt present ($(wc -l <"$FIXTURES_DIR/l1-raw-txs.txt") lines)"
+    else
+        _pf_fail "fixture l1-raw-txs.txt missing/empty — run 'make e2e-setup' in this worktree"
+    fi
+
+    # (a) all l2l2 containers healthy
+    local c
+    for c in miden-agglayer miden-node tx-prover anvil anvil-l2b aggkit aggkit-l2b \
+             bridge-service agglayer postgres agglayer-postgres; do
+        _pf_container "$c"
+    done
+    # port-collision hygiene for the ports the flows dial
+    _pf_port_owner_ok 8545 anvil-L1
+    _pf_port_owner_ok 9545 anvil-l2b
+    _pf_port_owner_ok 18080 bridge-service
+    _pf_port_owner_ok 5434 agglayer-postgres
+
+    # (b) rollup #2 registered on L1
+    local rd sovc rchain rvtype
+    rd=$(cast call "$ROLLUP_MANAGER" \
+        'rollupIDToRollupData(uint32)(address,uint64,address,uint64,bytes32,uint64,uint64,uint64,uint64,uint64,uint64,uint8)' \
+        "$L2B_NETWORK_ID" --rpc-url "$L1_RPC" 2>/dev/null) || rd=""
+    sovc=$(echo "$rd"  | sed -n '1p' | awk '{print $1}')
+    rchain=$(echo "$rd" | sed -n '2p' | awk '{print $1}')
+    rvtype=$(echo "$rd" | sed -n '12p' | awk '{print $1}')
+    if [[ -n "$sovc" && "$sovc" != "0x0000000000000000000000000000000000000000" ]]; then
+        _pf_pass "rollup #$L2B_NETWORK_ID sovereignRollupContract=$sovc"
+    else
+        _pf_fail "rollup #$L2B_NETWORK_ID sovereignRollupContract is zero/absent (not registered)"
+    fi
+    [[ "$rchain" == "31338" ]] && _pf_pass "rollup #$L2B_NETWORK_ID rollupChainID=31338" \
+        || _pf_fail "rollup #$L2B_NETWORK_ID rollupChainID=${rchain:-<none>}, expected 31338"
+    [[ "$rvtype" == "2" ]] && _pf_pass "rollup #$L2B_NETWORK_ID rollupVerifierType=2 (ALGateway)" \
+        || _pf_fail "rollup #$L2B_NETWORK_ID rollupVerifierType=${rvtype:-<none>}, expected 2"
+
+    # (c) L2B bridge + GER have code deployed on :9545
+    local bcode gcode
+    bcode=$(cast code "$BRIDGE" --rpc-url "$L2B_RPC" 2>/dev/null | head -c 4)
+    gcode=$(cast code "$L2B_GER" --rpc-url "$L2B_RPC" 2>/dev/null | head -c 4)
+    [[ "$bcode" == "0x60" || "$bcode" == "0x36" || "$bcode" == "0x73" ]] \
+        && _pf_pass "L2B bridge $BRIDGE has code on :9545" \
+        || _pf_fail "L2B bridge $BRIDGE has NO code on :9545 (got '${bcode:-<none>}')"
+    [[ "$gcode" == "0x60" || "$gcode" == "0x36" || "$gcode" == "0x73" ]] \
+        && _pf_pass "L2B GER $L2B_GER has code on :9545" \
+        || _pf_fail "L2B GER $L2B_GER has NO code on :9545 (got '${gcode:-<none>}')"
+
+    # (d) bridge-service indexing BOTH networks (its logs show NetworkID: 1 AND 2)
+    _pf_log_has "${COMPOSE_PROJECT_NAME}-bridge-service-1" 'NetworkID: 1[,)]' 8000 \
+        "bridge-service indexing network 1 (Miden)"
+    _pf_log_has "${COMPOSE_PROJECT_NAME}-bridge-service-1" 'NetworkID: 2[,)]' 8000 \
+        "bridge-service indexing network 2 (L2B)"
+    # ...and it is CURRENTLY advancing, not frozen. A wedged synchronizer keeps
+    # the container "Up" and its historical NetworkID:1/2 lines intact (so the two
+    # checks above still pass) yet indexes nothing new — deposits never reach
+    # ready_for_claim. Two liveness gates: (i) newest log line is fresh (catches a
+    # total log-freeze); (ii) each synchronizer is near its chain tip (catches a
+    # stuck-but-still-logging synchronizer).
+    _pf_bridge_fresh
+    _pf_sync_lag 0 "$L1_RPC"  L1
+    _pf_sync_lag 2 "$L2B_RPC" L2B
+
+    # (e) aggkit-l2b aggoracle alive — GER injection into L2B GER. A quiet stack
+    # legitimately has no RECENT inject (aggoracle only fires on a new L1 GER), so
+    # a historical injection proves the component is wired + working; the running
+    # container was already asserted in (a). Streamed full-log grep short-circuits
+    # at the first (early) injection.
+    _pf_log_has "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" 'inject GER transaction (submitted|already exists)' all \
+        "aggkit-l2b aggoracle alive (GER injection observed)"
+
+    if [[ "$_PF_FAILS" -gt 0 ]]; then
+        fail "PREFLIGHT FAILED — $_PF_FAILS check(s) failed; refusing to run l2l2 tests against a half-configured stack"
+    fi
+    pass "PREFLIGHT PASSED — l2l2 stack healthy, rollup #2 registered, both networks indexed"
+}
+
+# ── RUNTIME EVIDENCE — record every on-chain action to a durable NDJSON file ──
+# One line per action: {step,direction,chain,kind,tx_hash,block,contract,status,extra}.
+# The file is per-RUN (EVIDENCE_RUN_TS pinned by the caller so forward+back of ONE
+# l2l2 group share ONE file; separate invocations get separate files — no append
+# soup across the 3x cert). REQUIRED kinds: deploy deposit ger_inject claim
+# cert_settlement rollup_register exit_root.
+EVIDENCE_DIR="${EVIDENCE_DIR:-$PROJECT_DIR/.l2l2-evidence}"
+: "${EVIDENCE_RUN_TS:=$(date +%s)}"
+EVIDENCE_FILE="${EVIDENCE_FILE:-$EVIDENCE_DIR/run-${EVIDENCE_RUN_TS}.ndjson}"
+EVIDENCE_REQUIRED_KINDS=(deploy deposit ger_inject claim cert_settlement rollup_register exit_root)
+
+evidence_init() {
+    mkdir -p "$EVIDENCE_DIR"
+    : >>"$EVIDENCE_FILE"
+    log "evidence NDJSON -> $EVIDENCE_FILE"
+}
+
+# evidence_record <step> <direction> <chain> <kind> <tx_hash> <block> <contract> <status> [extra]
+evidence_record() {
+    mkdir -p "$EVIDENCE_DIR"
+    EV_STEP="$1" EV_DIR="$2" EV_CHAIN="$3" EV_KIND="$4" EV_TX="$5" EV_BLOCK="$6" \
+    EV_CONTRACT="$7" EV_STATUS="$8" EV_EXTRA="${9:-}" \
+    python3 - >>"$EVIDENCE_FILE" <<'PY'
+import json, os, time
+m = [("step","EV_STEP"),("direction","EV_DIR"),("chain","EV_CHAIN"),("kind","EV_KIND"),
+     ("tx_hash","EV_TX"),("block","EV_BLOCK"),("contract","EV_CONTRACT"),
+     ("status","EV_STATUS"),("extra","EV_EXTRA")]
+rec = {"ts": int(time.time())}
+for k, e in m:
+    rec[k] = os.environ.get(e, "")
+print(json.dumps(rec, separators=(",", ":")))
+PY
+    log "  evidence[$4/$2/$3] tx=${5:--} block=${6:--} status=${8:--}${9:+ ($9)}"
+}
+
+# evidence_tx <step> <direction> <chain> <kind> <rpc> <tx_hash> <contract> [extra]
+# — fetch the receipt from <rpc> (block + status) so the recorded tx is
+# on-chain-verified, then record it.
+evidence_tx() {
+    local step="$1" direction="$2" chain="$3" kind="$4" rpc="$5" tx="$6" contract="$7" extra="${8:-}"
+    local block="" status="norcpt" st
+    if [[ -n "$tx" && "$tx" != "0x" ]]; then
+        # `|| true`: a receipt fetch that races the RPC (or a not-yet-mined tx)
+        # must not abort a caller running under `set -e -o pipefail`.
+        block=$(cast receipt "$tx" blockNumber --rpc-url "$rpc" 2>/dev/null | awk '{print $1}' || true)
+        st=$(cast receipt "$tx" status --rpc-url "$rpc" 2>/dev/null | awk '{print $1}' || true)
+        case "$st" in
+            1|0x1|true) status="success" ;;
+            "")         status="unverified" ;;
+            *)          status="failed(${st})" ;;
+        esac
+    fi
+    evidence_record "$step" "$direction" "$chain" "$kind" "$tx" "$block" "$contract" "$status" "$extra"
+}
+
+# evidence_rollup_register <step> — retro-locate the CreateNewAggchain(rollupID=2)
+# tx on L1 and record it (verified via receipt; must hit the RollupManager).
+evidence_rollup_register() {
+    local step="$1" rid_topic tx
+    rid_topic="0x$(printf '%064x' "$L2B_NETWORK_ID")"
+    tx=$( ( set +o pipefail; cast rpc --raw eth_getLogs \
+        "[{\"fromBlock\":\"0x0\",\"toBlock\":\"latest\",\"address\":\"$ROLLUP_MANAGER\",\"topics\":[\"$CREATE_AGGCHAIN_TOPIC\",\"$rid_topic\"]}]" \
+        --rpc-url "$L1_RPC" 2>/dev/null \
+        | python3 -c "import json,sys; l=json.load(sys.stdin); print(l[-1]['transactionHash'] if l else '')" 2>/dev/null ) || true )
+    if [[ -z "$tx" ]]; then
+        warn "evidence: no CreateNewAggchain(rollupID=$L2B_NETWORK_ID) event on L1 — rollup_register NOT recorded"
+        return 1
+    fi
+    evidence_tx "$step" both L1 rollup_register "$L1_RPC" "$tx" "$ROLLUP_MANAGER" \
+        "event=CreateNewAggchain rollupID=$L2B_NETWORK_ID chainID=31338"
+}
+
+# evidence_settlement <step> <direction> <container> <since> <network_label> —
+# grep the newest SettlementTxnHash from an aggsender's logs, cast-receipt it on
+# L1 and assert it hit the RollupManager; record kind=cert_settlement.
+evidence_settlement() {
+    local step="$1" direction="$2" container="$3" since="$4" netlabel="$5" tx to hits=no
+    tx=$( ( set +o pipefail; docker logs --since "$since" "$container" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+        | grep -oE 'SettlementTxnHash: 0x[0-9a-fA-F]{64}' | tail -1 | awk '{print $2}' ) || true )
+    if [[ -z "$tx" ]]; then
+        warn "evidence: no SettlementTxnHash in $container logs since $since (network=$netlabel)"
+        return 1
+    fi
+    # `to` is not a valid `cast receipt` field selector (unlike status/blockNumber)
+    # — parse it out of the full receipt table.
+    to=$(cast receipt "$tx" --rpc-url "$L1_RPC" 2>/dev/null | awk '$1=="to"{print $2}' || true)
+    [[ "$(echo "$to" | tr 'A-F' 'a-f')" == "$(echo "$ROLLUP_MANAGER" | tr 'A-F' 'a-f')" ]] && hits=yes
+    evidence_tx "$step" "$direction" L1 cert_settlement "$L1_RPC" "$tx" "$ROLLUP_MANAGER" \
+        "network=$netlabel hitsRollupManager=$hits"
+    [[ "$hits" == yes ]] || warn "evidence: settlement tx $tx 'to'=$to is NOT the RollupManager"
+    return 0
+}
+
+# evidence_exit_root <step> <direction> <phase> — snapshot rollup #2's
+# lastLocalExitRoot AND the L1 GER's lastRollupExitRoot at a point in the flow.
+evidence_exit_root() {
+    local step="$1" direction="$2" phase="$3" ller l1rer bn
+    ller=$( ( set +o pipefail; cast call "$ROLLUP_MANAGER" \
+        'rollupIDToRollupData(uint32)(address,uint64,address,uint64,bytes32,uint64,uint64,uint64,uint64,uint64,uint64,uint8)' \
+        "$L2B_NETWORK_ID" --rpc-url "$L1_RPC" 2>/dev/null | sed -n '5p' | awk '{print $1}' ) || true )
+    l1rer=$(cast call "$GER_L1" 'lastRollupExitRoot()(bytes32)' --rpc-url "$L1_RPC" 2>/dev/null || true)
+    bn=$(cast block-number --rpc-url "$L1_RPC" 2>/dev/null || true)
+    evidence_record "$step" "$direction" L1 exit_root "" "$bn" "$ROLLUP_MANAGER" "$phase" \
+        "phase=$phase rollup2LastLocalExitRoot=${ller:-?} l1LastRollupExitRoot=${l1rer:-?}"
+}
+
+# evidence_summary [required-kind...] — print a per-kind count and FAIL if any
+# required kind is missing (≥1 each). Leaves the NDJSON file for inspection.
+evidence_summary() {
+    local required=("$@")
+    [[ ${#required[@]} -gt 0 ]] || required=("${EVIDENCE_REQUIRED_KINDS[@]}")
+    echo ""
+    log "======================================================================"
+    log "  EVIDENCE SUMMARY — $EVIDENCE_FILE"
+    log "======================================================================"
+    [[ -s "$EVIDENCE_FILE" ]] || fail "evidence file empty/missing: $EVIDENCE_FILE"
+    if python3 - "$EVIDENCE_FILE" "${required[@]}" <<'PY'
+import json, sys
+path, required = sys.argv[1], sys.argv[2:]
+counts, total = {}, 0
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line); total += 1
+        counts[r.get("kind", "?")] = counts.get(r.get("kind", "?"), 0) + 1
+for k in sorted(counts):
+    print(f"  {k:16s} {counts[k]}")
+print(f"  {'TOTAL':16s} {total}")
+missing = [k for k in required if counts.get(k, 0) < 1]
+if missing:
+    print("  MISSING REQUIRED KINDS: " + ", ".join(missing))
+    sys.exit(3)
+print("  ALL REQUIRED KINDS PRESENT: " + ", ".join(required))
+PY
+    then
+        pass "evidence complete — every required kind present; audit trail at $EVIDENCE_FILE"
+    else
+        fail "EVIDENCE INCOMPLETE — a required tx kind was never recorded (see above); NDJSON left at $EVIDENCE_FILE"
+    fi
 }

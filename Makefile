@@ -198,6 +198,10 @@ MIDEN_NODE_GIT_REF := v0.15.0
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
+# L2<->L2 overlay (task #25): base stack + the second-rollup overlay. The
+# generated configs it mounts must be produced by `make gen-l2b-configs` first.
+L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env
+
 .PHONY: miden-node-image-coords
 miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
 	@echo "url: $(MIDEN_NODE_GIT_URL)"
@@ -257,6 +261,22 @@ COMPOSE_ENV := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MID
 .PHONY: e2e-test
 e2e-test: ## Run E2E tests (assumes stack is already up)
 	$(COMPOSE_ENV) ./scripts/e2e-test.sh
+
+# --- L2<->L2 (second rollup) --------------------------------------------------
+.PHONY: gen-l2b-configs
+gen-l2b-configs: ## Generate the L2B overlay configs (agglayer/aggkit-l2b/bridge, taplo-normalized)
+	./scripts/gen-l2b-configs.sh
+
+.PHONY: e2e-l2l2-up
+e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay, register rollup #2 (fresh data dir)
+	$(L2L2_COMPOSE) up -d --build --wait
+	L2B_RPC=http://localhost:9545 ./scripts/setup-l2b.sh
+	# Re-create bridge-service so it (re)indexes both networks after rollup #2 exists.
+	$(L2L2_COMPOSE) up -d --force-recreate bridge-service
+
+.PHONY: e2e-l2l2
+e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
+	$(COMPOSE_ENV) ./scripts/e2e-test.sh l2l2
 
 .PHONY: e2e-l1-to-l2
 e2e-l1-to-l2: e2e-up ## Spin up stack + run L1→L2 deposit + claim test
