@@ -48,7 +48,7 @@ l2l2_miden_identities
 step "Leg 1: deploying OPT0 on L2B"
 OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L2B_RPC" \
     --private-key "$ADMIN_KEY" --broadcast \
-    --constructor-args "L2BToken" "OPT0" 18 "$TOKEN_SUPPLY" 2>&1)
+    --constructor-args "L2BToken" "OPT0" 18 "$TOKEN_SUPPLY" 2>&1) || true
 OPT0=$(echo "$OUT" | awk '/Deployed to:/{print $NF}')
 [[ -n "$OPT0" ]] || fail "OPT0 deploy failed: $(echo "$OUT" | tail -2)"
 OPT0_LOWER=$(echo "$OPT0" | tr 'A-F' 'a-f'); OPT0_HEX="${OPT0_LOWER#0x}"

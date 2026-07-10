@@ -129,7 +129,7 @@ while len(p) < 32: p.append('0x' + '00' * 32)
 print('[' + ','.join(p[:32]) + ']')")
     BACK_GER=$(cast keccak "0x${MAINNET_EXIT_ROOT#0x}${ROLLUP_EXIT_ROOT#0x}")
     wait_for "GER $BACK_GER injected into L2B AgglayerGERL2 (aggoracle-l2b)" \
-        "[ \"\$(cast call $L2B_GER 'globalExitRootMap(bytes32)(uint256)' $BACK_GER --rpc-url '$L2B_RPC' | awk '{print \$1}')\" != \"0\" ]" \
+        "_g=\$(cast call $L2B_GER 'globalExitRootMap(bytes32)(uint256)' $BACK_GER --rpc-url '$L2B_RPC' 2>/dev/null | awk '{print \$1}'); [ -n \"\$_g\" ] && [ \"\$_g\" != \"0\" ]" \
         300 5
     ORIG_NET=$(dep_field "$BACK_DEPOSIT" orig_net)
     DEST_NET=$(dep_field "$BACK_DEPOSIT" dest_net)

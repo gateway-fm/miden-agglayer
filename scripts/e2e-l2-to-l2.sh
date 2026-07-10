@@ -221,7 +221,7 @@ log "Dest:   $DEST_ADDR (zero-padded, network $MIDEN_NETWORK_ID)"
 step "Leg 1: deploying OPT0 on L2B"
 OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L2B_RPC" \
     --private-key $ADMIN_KEY --broadcast \
-    --constructor-args "L2BToken" "OPT0" 18 "$TOKEN_SUPPLY" 2>&1)
+    --constructor-args "L2BToken" "OPT0" 18 "$TOKEN_SUPPLY" 2>&1) || true
 OPT0=$(echo "$OUT" | awk '/Deployed to:/{print $NF}')
 [[ -n "$OPT0" ]] || fail "OPT0 deploy failed: $(echo "$OUT" | tail -2)"
 OPT0_LOWER=$(echo "$OPT0" | tr 'A-F' 'a-f')
@@ -232,7 +232,7 @@ pass "OPT0 deployed on L2B: $OPT0 (origin network $L2B_NETWORK_ID)"
 # nudges never disturb the leg-4 net-zero balance assert.
 OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L2B_RPC" \
     --private-key $ADMIN_KEY --broadcast \
-    --constructor-args "NudgeToken" "NDG" 18 1000000000000000000 2>&1)
+    --constructor-args "NudgeToken" "NDG" 18 1000000000000000000 2>&1) || true
 NDG=$(echo "$OUT" | awk '/Deployed to:/{print $NF}')
 [[ -n "$NDG" ]] || fail "NDG deploy failed: $(echo "$OUT" | tail -2)"
 
@@ -654,7 +654,7 @@ print('[' + ','.join(p[:32]) + ']')
     # aggoracle-l2b injects it after settlement. Gate on its globalExitRootMap.
     BACK_GER=$(cast keccak "0x${MAINNET_EXIT_ROOT#0x}${ROLLUP_EXIT_ROOT#0x}")
     wait_for "GER $BACK_GER injected into L2B AgglayerGERL2 (aggoracle-l2b)" \
-        "[ \"\$(cast call $L2B_GER 'globalExitRootMap(bytes32)(uint256)' $BACK_GER --rpc-url '$L2B_RPC' | awk '{print \$1}')\" != \"0\" ]" \
+        "_g=\$(cast call $L2B_GER 'globalExitRootMap(bytes32)(uint256)' $BACK_GER --rpc-url '$L2B_RPC' 2>/dev/null | awk '{print \$1}'); [ -n \"\$_g\" ] && [ \"\$_g\" != \"0\" ]" \
         300 5
     ORIG_NET=$(dep_field "$BACK_DEPOSIT" orig_net)
     DEST_NET=$(dep_field "$BACK_DEPOSIT" dest_net)
