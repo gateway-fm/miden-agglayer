@@ -4,7 +4,8 @@
 # canonical l2l2 group (e2e-l2l2-forward.sh / e2e-l2l2-clash.sh / e2e-l2l2-back.sh)
 # and the mixed loadtest/chaos tiers, so they all
 # share ONE definition of the L2B contract topology, GER-propagation waits,
-# ready_for_claim polling and the AreClaimsBetweenL2sEnabled nudge-cert dance.
+# ready_for_claim polling, the client-submitted L2->L2 claimAsset flow, and the
+# nudge-cert dance that drives L2B cert cycles so the covering GER reaches Miden.
 #
 # Contract: the SOURCING script sets PROJECT_DIR (repo root) and SCRIPT_DIR, then
 #   source "$SCRIPT_DIR/lib-l2l2.sh"
@@ -280,11 +281,13 @@ l2l2_miden_identities() {
     log "Dest:   $DEST_ADDR (zero-padded, network $MIDEN_NETWORK_ID)"
 }
 
-# ── Nudge-cert mechanics (AreClaimsBetweenL2sEnabled) ────────────────────────
-# The upstream ClaimTxManager scans L2->L2 claims only when a NEW rollup exit
-# root lands on L1. A single L2->L2 transfer sits ready but unscanned until the
-# NEXT certificate settles. nudge_cert forces that next cycle by bridging 1 wei
-# of a dedicated NDG token L2B->L1 (dest L1 => no claimtxman/Miden side effects).
+# ── Nudge-cert mechanics (drive L2B cert cycles) ─────────────────────────────
+# An L2B->Miden claim can only be accepted once Miden has SEEN the GER covering the
+# deposit's L2B exit root (proxy C6 has_seen_ger gate). On a quiet L2B chain the
+# covering exit root reaches L1 (and then Miden) only when the NEXT certificate
+# settles. nudge_cert forces that next cycle by bridging 1 wei of a dedicated NDG
+# token L2B->L1 (dest L1 => no claimtxman/Miden side effects); the client-submit
+# claim predicate then re-fetches a fresh proof and retries until it sticks.
 # Deploy NDG once per script via l2l2_deploy_nudge_token (sets NDG).
 l2l2_deploy_nudge_token() {
     local out

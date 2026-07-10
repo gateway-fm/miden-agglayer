@@ -191,8 +191,9 @@ CLAIM_ROWS=$(claim_event_rows "$FWD_GI")
 [[ "${CLAIM_ROWS:-0}" -ge 1 ]] || fail "no ClaimEvent synthetic_logs row for globalIndex $FWD_GI"
 FWD_CLAIM_BLOCK=$(pgq "SELECT block_number FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x$(python3 -c "print(format(int('$FWD_GI'),'064x'))")%' ORDER BY block_number LIMIT 1;")
 pass "ClaimEvent at synthetic block ${FWD_CLAIM_BLOCK:-?} (rows=$CLAIM_ROWS)"
-# CLAIM (forward): auto-claimed on Miden. The Miden claim is an internal Miden tx
-# (no cast receipt); it is verified by the ClaimEvent synthetic_logs row above.
+# CLAIM (forward): client-submitted proof-backed claimAsset to the Miden proxy (see
+# leg 2b). The resulting Miden claim is an internal Miden tx (no cast receipt); it is
+# verified by the ClaimEvent synthetic_logs row above.
 evidence_record "leg2b" forward Miden claim "" "${FWD_CLAIM_BLOCK:-}" "$BRIDGE_ID" \
     "ClaimEvent-present rows=$CLAIM_ROWS" "globalIndex=$FWD_GI faucet=$OPT0_FAUCET_ID units=$FWD_MIDEN_UNITS"
 evidence_exit_root "leg2b" forward post-forward-claim

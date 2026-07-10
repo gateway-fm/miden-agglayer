@@ -69,7 +69,7 @@ Dry-ran against the real anvil snapshot (brought up the `anvil` service alone). 
 ## UPDATE 2 (2026-07-09): full L2B wiring written — ready for live smoke
 
 - **`docker-compose.l2l2.yml`** — override adding `anvil-l2b` (chain-id 31338, :9545) + `aggkit-l2b` (aggoracle+aggsender, reuses aggoracle/sequencer keystores) + a network-2-aware agglayer config + an ISOLATED L2B bridge-service (`bridge-service-l2b`) with its own DB (`postgres-l2b`); the base bridge-service stays Miden-only.
-- **`scripts/gen-l2b-configs.sh`** — derives `agglayer-config-l2l2.toml` / `aggkit-l2b-config.toml` / `bridge-config-l2l2.toml` from the base fixtures at setup time (gitignored; assert-guarded so base-config drift fails loudly).
+- **`scripts/gen-l2b-configs.sh`** — derives `agglayer-config-l2l2.toml` / `aggkit-l2b-config.toml` / `bridge-config-l2b.toml` from the base fixtures at setup time (gitignored; assert-guarded so base-config drift fails loudly).
 - **`fixtures/SovereignGER.sol`** — minimal sovereign-GER (insertGlobalExitRoot/updateExitRoot/globalExitRootMap + events), setCode-deployable (no constructor; `initialize(bridge, updater)`).
 - **`scripts/setup-l2b.sh`** extended: rollup-2 address guard, L2B account funding, GER-stub deploy at `0xa40D…` (updater = aggoracle addr derived from keystore at runtime), bridge proxy+impl setCode + `initialize(networkID=2,…)` — all idempotent.
 - **`scripts/e2e-l2-to-l2.sh` step 0** wired: gen-configs → compose-up L2B services → wait → setup-l2b.
@@ -172,7 +172,7 @@ for the leg-4 autoclaim.
 1. **bridge-service network-2 coverage**: `ready_for_claim` must flip for
    BOTH directions — net-2-origin → net-1-dest (leg 2b) and net-1-origin →
    net-2-dest (leg 4). The old "net-2 leaves never synchronize" observation
-   predates the network-2 config; re-verify with `bridge-config-l2l2.toml`.
+   predates the network-2 config; re-verify with `bridge-config-l2b.toml`.
 2. **ClaimTxManager on L2B**: whether the upstream bridge-service actually
    autoclaims on the second L2 (it is multi-network by design). If not, the
    manual-claim fallback path runs — verify `/merkle-proof?net_id=1` returns
@@ -269,16 +269,27 @@ already answers `globalExitRootUpdater()`.
    the leg-2 start block; receipt status 1; tx hash logged),
 3. the L1 GER contract's `lastRollupExitRoot()` moves (exit-root propagation).
 
-### L2→L2 autoclaim: two upstream gotchas found live (2026-07-10)
-1. **`ClaimTxManager.AreClaimsBetweenL2sEnabled` defaults to false** — without
-   it the bridge-service NEVER scans for claims whose source AND destination
-   are both L2s (`claimtxman.go:192`). `gen-l2b-configs.sh` now sets it in
-   `bridge-config-l2l2.toml`.
-2. **The claim scan is event-driven and one cycle late**: it runs only when a
-   NEW rollup exit root lands on L1 (`claimtxman.go:190`), while a deposit
-   turns ready_for_claim only after its own settle cycle round-trips through
-   the destination's trusted GER (`claimtxman.go:418`). A single L2→L2
-   transfer therefore sits ready but unscanned forever on a quiet chain. The
-   e2e's `nudge_cert` (1 wei of a dedicated NDG token bridged L2B→L1 AFTER
-   observing ready_for_claim) forces the next cycle; destination L1 means no
-   claimtxman/proxy side effects. Applied in legs 2b, 3 (net-2 COL) and 4.
+### L2→L2 claims are CLIENT-submitted (canonical per-rollup isolation, 2026-07-10)
+Canonical kurtosis-cdk runs ONE bridge-service per chain (L1 + only its own L2) and
+sets NO `AreClaimsBetweenL2sEnabled` anywhere — the ClaimTxManager does L1→L2
+autoclaims only. L2↔L2 claims are client-initiated. Our harness matches this:
+- **Config split** (`gen-l2b-configs.sh` → `bridge-config-l2b.toml`): a SEPARATE
+  isolated L2B bridge-service (`L2URLs=[anvil-l2b]`, own `postgres-l2b` DB). The base
+  Miden service stays Miden-only and does NOT index L2B. (An earlier shortcut used one
+  shared service indexing both L2s + `AreClaimsBetweenL2sEnabled`, which auto-claimed
+  the forward leg — non-canonical, now removed.)
+- **Forward L2B→Miden (leg 2b) and clash net-2 COL (leg 3)**: `_pred_submit_forward_claim`
+  fetches the deposit's proof from the L2B service (`:28080/merkle-proof`) and submits a
+  proof-backed `claimAsset` to the Miden proxy (`:8546`), which auto-creates the foreign
+  faucet + mints. Clash net-0 COL (L1→Miden) still AUTO-claims (canonical L1→L2). Back
+  Miden→L2B (leg 4) submits `claimAsset` to real anvil-l2b (already client-side).
+- **Nudge still needed, different reason**: a claim is accepted only once Miden has SEEN
+  the GER covering the deposit's L2B exit root (proxy `service_send_raw_txn.rs` C6
+  `has_seen_ger`). On a quiet L2B that root reaches L1 (then Miden) only on the next
+  cert; `nudge_cert` (1 wei NDG L2B→L1, dest L1 = no side effects) forces that cycle, and
+  the claim predicate re-fetches a fresh proof each round until it sticks.
+- **GOTCHA — proxy has no `eth_feeHistory`**: the Miden proxy synthetic RPC does not
+  implement `eth_feeHistory` (cast's default EIP-1559 fee path -32601s BEFORE submitting)
+  and `eth_estimateGas` returns 0. So `claimAsset` to the proxy MUST use
+  `cast send --legacy --gas-price <eth_gasPrice=1gwei> --gas-limit <fixed>`. The back leg
+  is unaffected (submits to real anvil-l2b, which has `eth_feeHistory`).
