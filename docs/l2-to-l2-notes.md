@@ -1,6 +1,6 @@
 # L2→L2 e2e (Miden ↔ OP-Stack) — scaffold notes & design (task #25)
 
-**Status: FULLY IMPLEMENTED with the REAL sovereign contracts** (branch `feat/l2-to-l2-e2e`). The hand-written `SovereignGER.sol` stub and the L1-bytecode-copy bridge are GONE — L2B now runs the real v12 `AgglayerBridgeL2` + `AgglayerGERL2` (impl+proxy) generated and initialized by the same agglayer-contracts tooling kurtosis-cdk uses, and rollup #2 is registered on L1 by the real `4_createRollup.ts` flow (new rollup type + `attachAggchainToAL`), not by piggybacking an existing rollup type. See UPDATE 6 for the mechanism. Absorbs task #15 (same-address/different-origin faucet isolation). UPDATEs 1-5 below are historical (stub era) — kept for provenance.
+**Status: FULLY IMPLEMENTED with the REAL sovereign contracts** (branch `feat/l2-to-l2-e2e`). The hand-written `SovereignGER.sol` stub and the L1-bytecode-copy bridge are GONE — L2B now runs the real v12 `AgglayerBridgeL2` + `AgglayerGERL2` (impl+proxy) generated and initialized by the same agglayer-contracts tooling kurtosis-cdk uses, and rollup #2 is registered on L1 by the real `4_createRollup.ts` flow (new rollup type + `attachAggchainToAL`), not by piggybacking an existing rollup type. See UPDATE 6 for the mechanism. Absorbs task #15 (same-address/different-origin faucet isolation). UPDATE entries 1-5 below are historical (stub era) — kept for provenance.
 
 ## Goal
 Exercise the true cross-L2 bridge path through agglayer, which today's e2e (single Miden L2 ↔ L1) never covers: deploy an ERC-20 on a **second** L2 (OP-Stack), bridge it **OP-Stack → Miden** (foreign-origin → Miden provisions a wrapped-asset faucet), then bridge it **Miden → OP-Stack** back, asserting exact-block completeness and faucet isolation.
@@ -189,7 +189,7 @@ for the leg-4 autoclaim.
 
 ## UPDATE 6 (2026-07-10): stub replaced by the REAL sovereign contracts (kurtosis flow)
 
-The stub era (UPDATEs 1-5: `fixtures/SovereignGER.sol` + L1-bridge-bytecode
+The stub era (UPDATE entries 1-5: `fixtures/SovereignGER.sol` + L1-bridge-bytecode
 copy) is over. `scripts/setup-l2b.sh` now mirrors how kurtosis-cdk attaches an
 OP-Stack chain as a sovereign chain, using the SAME pinned tooling image
 (`agglayer-contracts:v12.2.3`, from kurtosis `src/package_io/constants.star`).
