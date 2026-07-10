@@ -187,9 +187,15 @@ wait_for "bridge-service HTTP API up (post-recreate)" \
 pass "Leg 0 done: rollup #2 registered, L2B bridge/GER live, bridge-service indexing both networks"
 
 # ── Miden-side identities: infra accounts + isolated destination wallet ──────
-ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
-    cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \
-    || fail "miden-agglayer not initialized yet"
+# The proxy writes bridge_accounts.toml ~45s AFTER reporting healthy (account
+# deploy + registry init) — wait for it instead of failing on a fresh stack.
+ACCOUNTS=""
+for _ in $(seq 1 30); do
+    ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
+        cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) && break
+    sleep 5
+done
+[[ -n "$ACCOUNTS" ]] || fail "miden-agglayer not initialized within 150s (bridge_accounts.toml absent)"
 BRIDGE_ID=$(echo "$ACCOUNTS" | grep 'bridge = ' | sed 's/.*= "//;s/"//')
 FAUCET_ETH=$(echo "$ACCOUNTS" | grep faucet_eth | sed 's/.*= "//;s/"//')
 [[ -n "$BRIDGE_ID" && -n "$FAUCET_ETH" ]] || fail "could not read bridge account ids"
