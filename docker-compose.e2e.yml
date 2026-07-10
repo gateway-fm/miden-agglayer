@@ -17,7 +17,11 @@ services:
       - ./fixtures/l1-raw-txs.txt:/state/l1-raw-txs.txt:ro
       - ./scripts/replay-txs.sh:/state/replay-txs.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "cast rpc eth_getCode 0xC8cbEBf950B9Df44d987c8619f092beA980fF038 latest --rpc-url http://localhost:8545 2>/dev/null | grep -v '0x$$'"]
+      # NOTE: cast rpc returns a JSON string — '"0x"' — so the empty-code guard
+      # must account for the quotes, else it false-positives on an empty chain
+      # (bit us when a stale l1-raw-txs.txt mount skipped the replay: the stack
+      # came up "healthy" with NO contracts and agglayer/aggkit crash-looped).
+      test: ["CMD-SHELL", "cast rpc eth_getCode 0xC8cbEBf950B9Df44d987c8619f092beA980fF038 latest --rpc-url http://localhost:8545 2>/dev/null | grep -vE '^\"?0x\"?$$'"]
       interval: 3s
       timeout: 3s
       retries: 30
