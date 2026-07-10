@@ -285,6 +285,19 @@ STATUS=$(printf '%s\n' "$TX" | awk '$1=="status"{print $2; exit}')
 [[ "$STATUS" == "1" ]] || fail "bridgeAsset on L2B failed (status=$STATUS): $TX"
 DC=$(cast call $BRIDGE 'depositCount()(uint256)' --rpc-url "$L2B_RPC")
 log "  L2B depositCount: $DC"
+# L1-traceability (4): the bridgeAsset receipt must carry the real
+# AgglayerBridgeL2's BridgeEvent, emitted by the canonical bridge proxy.
+FWD_TX_HASH=$(printf '%s\n' "$TX" | awk '$1=="transactionHash"{print $2; exit}')
+[[ -n "$FWD_TX_HASH" ]] || fail "could not parse bridgeAsset tx hash"
+BE_EMITTER=$(cast receipt "$FWD_TX_HASH" --json --rpc-url "$L2B_RPC" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+be = [l for l in r['logs'] if l['topics'][0] == '$BRIDGE_EVENT_TOPIC']
+print(be[0]['address'] if be else '')
+")
+[[ "$(echo "$BE_EMITTER" | tr 'A-F' 'a-f')" == "$(echo "$BRIDGE" | tr 'A-F' 'a-f')" ]] \
+    || fail "bridgeAsset tx $FWD_TX_HASH has no BridgeEvent from $BRIDGE (emitter: ${BE_EMITTER:-<none>})"
+pass "L2B BridgeEvent in tx $FWD_TX_HASH (emitter $BE_EMITTER)"
 
 # aggsender-l2b cert -> agglayer settle -> L1 GER update -> Miden aggoracle.
 # Two-part criterion: the L1 GER must MOVE off its pre-bridge value (our cert
