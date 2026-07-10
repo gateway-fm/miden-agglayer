@@ -722,62 +722,10 @@ pub async fn serve(
     state: ServiceState,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> anyhow::Result<()> {
-    // R13 — per-IP rate limit. The default config (500 req/sec sustained,
-    // 500-token burst) slows brute-force probing of admin auth (R1) and
-    // signer-allow-list rejection paths (R2) without affecting legitimate
-    // aggkit traffic.
-    //
-    // Self-review of the original R13 wiring: the builder's `.per_second(N)`
-    // method is named MISLEADINGLY — it sets the REPLENISH PERIOD in seconds,
-    // i.e. "one token every N seconds", which is the *inverse* of what the
-    // const name `DEFAULT_RATE_LIMIT_PER_SECOND` implied. The original
-    // shipped wiring at `.per_second(60)` therefore yielded one token every
-    // 60 seconds (~0.0167 req/sec sustained), not 60 req/sec. Once the
-    // 60-token burst was exhausted aggkit was throttled for hours, with
-    // 429 cooldowns of 90s+ visible in its sync logs.
-    //
-    // Use `.per_millisecond(1000 / N)` so the const name maps to the actual
-    // sustained rate. `1000 / N` clamps to ≥1 ms to avoid divide-by-zero
-    // when N >= 1000 — at N=1000 we get one token per ms i.e. 1000 req/sec
-    // exactly; at higher rates the millisecond floor caps us at 1000/sec
-    // sustained, which is comfortably above any legitimate use case.
-    let replenish_period_ms = 1000_u64
-        .checked_div(state.rate_limit_per_second)
-        .unwrap_or(1)
-        .max(1);
-    let governor_conf = std::sync::Arc::new(
-        GovernorConfigBuilder::default()
-            .per_millisecond(replenish_period_ms)
-            .burst_size(state.rate_limit_burst)
-            .finish()
-            .expect("rate-limit config must produce a valid governor"),
-    );
-    let governor_layer = GovernorLayer::new(governor_conf);
-
-    let app = Router::new()
-        .route("/", post(json_rpc_endpoint))
-        .route("/health", get(health_check))
-        .layer(
-            ServiceBuilder::new()
-                .layer(SetResponseHeaderLayer::if_not_present(
-                    http::header::CACHE_CONTROL,
-                    HeaderValue::from_static("no-cache"),
-                ))
-                .layer(TraceLayer::new_for_http())
-                // R6 — cap inbound bodies before any handler reads them. Bodies bigger
-                // than MAX_REQUEST_BODY_BYTES are rejected with HTTP 413 by tower-http
-                // without ever allocating the full payload.
-                .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
-                // R13 — per-IP rate limiting. Applied before the JSON-RPC handler so
-                // an attacker cannot exhaust the worker pool via a flood.
-                .layer(governor_layer)
-                .layer(build_cors_layer(state.cors_allowed_origins.as_deref())),
-        )
-        .with_state(state)
-        .route(
-            "/metrics",
-            get(move || async move { metrics_handle.render() }),
-        );
+    // Build the router (all routes, including `/metrics`, behind the shared
+    // governor + body-limit layer chain — audit H5). See `build_app` for the
+    // R13 per_second → per_millisecond rationale.
+    let app = build_app(state, metrics_handle);
 
     let listener = url
         .socket_addrs(|| None)
@@ -796,6 +744,65 @@ pub async fn serve(
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// Build the application router: JSON-RPC routes + `/health` + `/metrics`, all
+/// behind the shared layer chain (rate limit, body limit, CORS, trace).
+///
+/// Audit H5 — previously `/metrics` was mounted AFTER `.with_state(...)`, which
+/// put it on a separate sub-router that escaped the `GovernorLayer` (per-IP
+/// rate limit) and `RequestBodyLimitLayer` (256 KB cap). An unauthenticated
+/// caller could flood `/metrics` without throttling, and the Prometheus
+/// rendering (which iterates every series) was an unbounded DoS surface. All
+/// routes are now mounted BEFORE `.with_state(...)` so the layer chain applies
+/// uniformly.
+pub(crate) fn build_app(
+    state: ServiceState,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+) -> Router<()> {
+    // R13 — per-IP rate limit (500 req/sec, 500-token burst by default).
+    // `per_second(N)` is named misleadingly in tower_governor — it sets the
+    // replenish PERIOD, not the rate. We use `.per_millisecond(1000 / N)` so
+    // the config name maps to the actual sustained rate (clamped to ≥1 ms).
+    let replenish_period_ms = 1000_u64
+        .checked_div(state.rate_limit_per_second)
+        .unwrap_or(1)
+        .max(1);
+    let governor_conf = std::sync::Arc::new(
+        GovernorConfigBuilder::default()
+            .per_millisecond(replenish_period_ms)
+            .burst_size(state.rate_limit_burst)
+            .finish()
+            .expect("rate-limit config must produce a valid governor"),
+    );
+    let governor_layer = GovernorLayer::new(governor_conf);
+
+    Router::new()
+        .route("/", post(json_rpc_endpoint))
+        .route("/health", get(health_check))
+        // H5 — /metrics mounted here (before .with_state) so it inherits the
+        // governor + body-limit layers below.
+        .route(
+            "/metrics",
+            get(move || async move { metrics_handle.render() }),
+        )
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    http::header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache"),
+                ))
+                .layer(TraceLayer::new_for_http())
+                // R6 — cap inbound bodies before any handler reads them. Bodies bigger
+                // than MAX_REQUEST_BODY_BYTES are rejected with HTTP 413 by tower-http
+                // without ever allocating the full payload.
+                .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+                // R13 — per-IP rate limiting. Applied before the JSON-RPC handler so
+                // an attacker cannot exhaust the worker pool via a flood.
+                .layer(governor_layer)
+                .layer(build_cors_layer(state.cors_allowed_origins.as_deref())),
+        )
+        .with_state(state)
 }
 
 /// Build the CORS layer for the JSON-RPC route.
@@ -1199,6 +1206,52 @@ mod tests {
         const _: () = assert!(
             MAX_REQUEST_BODY_BYTES < 1024 * 1024,
             "limit too generous — must stay below axum default 2 MB"
+        );
+    }
+
+    /// Audit H5 — `/metrics` MUST be inside the governor layer chain. Pre-fix it
+    /// was mounted after `.with_state(...)`, escaping the per-IP rate limiter and
+    /// the 256 KB body cap, so an unauthenticated caller could flood it without
+    /// throttling (Prometheus rendering is an unbounded DoS surface).
+    ///
+    /// This drives the real `build_app` over a real TCP listener with a tight
+    /// rate limit (burst = 1) and asserts a second immediate `/metrics` request
+    /// is throttled with 429. Before the fix the second request succeeded (200).
+    #[tokio::test]
+    async fn h5_metrics_route_is_rate_limited() {
+        use std::net::SocketAddr;
+
+        // build_recorder() does NOT install a process-global recorder, so this
+        // test is safe to run in parallel with other metrics tests.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        let mut state = crate::test_helpers::create_test_service();
+        state.rate_limit_per_second = 1; // 1 req/sec sustained
+        state.rate_limit_burst = 1; // 1-token burst — second immediate hit throttles
+
+        let app = build_app(state, metrics_handle);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        );
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+
+        let url = format!("http://{addr}/metrics");
+
+        // First request consumes the single burst token → 200.
+        let r1 = reqwest::get(&url).await.unwrap();
+        assert_eq!(r1.status(), 200, "first /metrics request must succeed");
+
+        // Second immediate request exceeds the burst → 429 (Too Many Requests).
+        let r2 = reqwest::get(&url).await.unwrap();
+        assert_eq!(
+            r2.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "second /metrics request must be rate-limited (governor must cover /metrics)"
         );
     }
 }
