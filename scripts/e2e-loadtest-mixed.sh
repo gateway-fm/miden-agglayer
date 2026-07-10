@@ -114,56 +114,54 @@ echo 0 > "$CNT_DIR/back_sub"; echo 0 > "$CNT_DIR/back_ok"
 echo pending > "$CNT_DIR/clash"
 bump() { local f="$CNT_DIR/$1"; echo $(( $(cat "$f") + 1 )) > "$f"; }
 
-# ── L2<->L2 forward op: bridge another chunk, confirm claimed (ClaimEvent) ────
-l2l2_fwd_op() {
+# ══════════════════════════════════════════════════════════════════════════════
+# DECOUPLED L2<->L2: SUBMIT fast during the load, CONFIRM in a drain phase after
+# the L1 bulk load settles. The Miden prover is a single shared bottleneck — an
+# L2<->L2 claim queued behind a burst of L1 claims cannot land within a short
+# per-op window, so gating each op on its claim inline serialized the workload
+# into a ~40-min wait. Submitting all ops up front (they ARE the concurrent mixed
+# traffic) and confirming once the prover drains is both faster and a truer test.
+# ══════════════════════════════════════════════════════════════════════════════
+declare -a FWD_GIS BACK_TAG
+COL_HEX=""; BACK_BEFORE0=""
+
+# forward SUBMIT: bridge a chunk L2B->Miden, record its global index once indexed.
+l2l2_fwd_submit() {
     local i="$1" gi
     bump fwd_sub
     forward_bridge "$FWD_OP_WEI" >/dev/null || { mix "fwd#$i submit FAILED"; return; }
-    # newest ready MOP deposit's gi, then nudge until its ClaimEvent lands.
-    if ! wait_for "fwd#$i ready_for_claim" \
-        "find_deposit '$DEST_ADDR' $L2B_NETWORK_ID '$MOP_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') else 1)\"" \
-        600 5; then mix "fwd#$i never ready"; return; fi
+    # brief wait for bridge-service to index the new deposit (NOT ready — that is
+    # cert/prover-driven and confirmed in the drain), then record its gi.
+    wait_for "fwd#$i indexed" \
+        "[ \"\$(find_deposit '$DEST_ADDR' $L2B_NETWORK_ID '$MOP_LOWER' | python3 -c \"import json,sys; print(json.load(sys.stdin).get('global_index',''))\" 2>/dev/null)\" != '' ]" \
+        120 5 || { mix "fwd#$i not indexed"; return; }
     gi=$(dep_field "$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "$MOP_LOWER")" global_index)
-    if nudge_until "fwd#$i ClaimEvent (gi $gi)" \
-        "[ \"\$(claim_event_rows $gi)\" -ge 1 ]"; then
-        bump fwd_ok; mix "fwd#$i CLAIMED (gi $gi)"
-    else mix "fwd#$i claim did not land (gi $gi)"; fi
+    FWD_GIS+=("$gi"); mix "fwd#$i submitted (gi $gi)"
 }
 
-# ── L2<->L2 back op: bridge-out to L2B ADMIN, confirm claimed (balance delta) ──
-l2l2_back_op() {
-    local i="$1" before after
+# back SUBMIT: bridge-out wrapped MOP Miden->L2B ADMIN (creates the B2AGG note).
+l2l2_back_submit() {
+    local i="$1"
+    [[ -z "$BACK_BEFORE0" ]] && BACK_BEFORE0=$(cast call "$MOP" 'balanceOf(address)(uint256)' "$ADMIN" --rpc-url "$L2B_RPC" | awk '{print $1}')
     bump back_sub
-    before=$(cast call "$MOP" 'balanceOf(address)(uint256)' "$ADMIN" --rpc-url "$L2B_RPC" | awk '{print $1}')
-    if ! iso_tool --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$MOP_FAUCET_ID" \
+    if iso_tool --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$MOP_FAUCET_ID" \
         --amount "$BACK_OP_UNITS" --dest-address "$ADMIN" --dest-network "$L2B_NETWORK_ID" >>"$MIX_LOG" 2>&1; then
-        mix "back#$i bridge-out FAILED"; return
-    fi
-    # wait for settle + ready, nudge L2B scan, confirm ADMIN balance rose.
-    if ! wait_for "back#$i ready_for_claim" \
-        "find_deposit '$ADMIN' $MIDEN_NETWORK_ID '$MOP_LOWER' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') and d.get('dest_net')==$L2B_NETWORK_ID else 1)\"" \
-        900 10; then mix "back#$i never ready"; return; fi
-    local want=$(python3 -c "print(int('$before') + $BACK_OP_UNITS * $WEI_PER_MIDEN_UNIT)")
-    if nudge_until "back#$i L2B claim (balance $before -> $want)" \
-        "[ \"\$(cast call $MOP 'balanceOf(address)(uint256)' $ADMIN --rpc-url $L2B_RPC | awk '{print \$1}')\" = \"$want\" ]"; then
-        bump back_ok; mix "back#$i CLAIMED on L2B"
+        BACK_TAG+=("ok"); mix "back#$i bridged out ($BACK_OP_UNITS units -> L2B)"
     else
-        after=$(cast call "$MOP" 'balanceOf(address)(uint256)' "$ADMIN" --rpc-url "$L2B_RPC" | awk '{print $1}')
-        mix "back#$i claim not confirmed (bal $before -> $after, want $want)"
+        mix "back#$i bridge-out FAILED"
     fi
 }
 
-# ── ADDRESS CLASH under concurrency: same CREATE addr on L1 + L2B ────────────
-clash_check() {
+# clash SUBMIT: deploy COL at the SAME CREATE addr on L1+L2B, bridge from BOTH.
+clash_submit() {
     mix "clash: deploying COL at the same address on L1 + L2B (nonce-0 fresh key)"
-    local kout deployer key col_l1 col_l2b col_lower col_hex tx status
+    local kout deployer key col_l1 col_l2b tx status
     kout=$(cast wallet new)
     deployer=$(echo "$kout" | awk '/Address:/{print $2}')
     key=$(echo "$kout" | awk '/Private key:/{print $3}')
-    # Fund the deployer on BOTH chains via anvil_setBalance (NOT a cast-send from
-    # ADMIN) — the background L1 bulk load spends from the SAME key (ADMIN==FUNDED)
-    # on L1, so an ADMIN L1 tx here would race its nonce ("replacement tx
-    # underpriced"). anvil_setBalance mutates state directly, no nonce.
+    # Fund the deployer via anvil_setBalance (NOT an ADMIN cast-send) — the L1
+    # bulk load spends the SAME key (ADMIN==FUNDED) on L1, so an ADMIN L1 tx here
+    # would race its nonce ("replacement tx underpriced").
     cast rpc anvil_setBalance "$deployer" 0xde0b6b3a7640000 --rpc-url "$L1_RPC"  >/dev/null 2>&1
     cast rpc anvil_setBalance "$deployer" 0xde0b6b3a7640000 --rpc-url "$L2B_RPC" >/dev/null 2>&1
     _deploy() { forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$1" --private-key "$key" \
@@ -172,33 +170,17 @@ clash_check() {
     if [[ -z "$col_l1" || "$(echo "$col_l1" | tr 'A-F' 'a-f')" != "$(echo "$col_l2b" | tr 'A-F' 'a-f')" ]]; then
         echo "addr-mismatch" > "$CNT_DIR/clash"; mix "clash: CREATE address mismatch L1=$col_l1 L2B=$col_l2b"; return
     fi
-    col_lower=$(echo "$col_l1" | tr 'A-F' 'a-f'); col_hex="${col_lower#0x}"
+    COL_HEX="$(echo "${col_l1#0x}" | tr 'A-F' 'a-f')"
     mix "clash: COL at $col_l1 on both chains"
-    # bridge from L2B origin (net 2)
     cast send "$col_l1" "approve(address,uint256)" "$BRIDGE" "$COL_L2B_WEI" --private-key "$key" --rpc-url "$L2B_RPC" >/dev/null 2>&1
     tx=$(cast send "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$COL_L2B_WEI" "$col_l1" true 0x --private-key "$key" --rpc-url "$L2B_RPC" 2>&1)
     status=$(printf '%s\n' "$tx" | awk '$1=="status"{print $2; exit}')
     [[ "$status" == "1" ]] || { echo "l2b-bridge-fail" > "$CNT_DIR/clash"; mix "clash: L2B bridge failed"; return; }
-    # bridge from L1 origin (net 0)
     cast send --rpc-url "$L1_RPC" --private-key "$key" "$col_l1" "approve(address,uint256)" "$BRIDGE_ADDRESS" "$COL_L1_WEI" >/dev/null 2>&1
     tx=$(cast send --rpc-url "$L1_RPC" --private-key "$key" "$BRIDGE_ADDRESS" 'bridgeAsset(uint32,address,uint256,address,bool,bytes)' "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$COL_L1_WEI" "$col_l1" true 0x 2>&1)
     status=$(printf '%s\n' "$tx" | awk '$1=="status"{print $2; exit}')
     [[ "$status" == "1" ]] || { echo "l1-bridge-fail" > "$CNT_DIR/clash"; mix "clash: L1 bridge failed"; return; }
-    # wait for both faucets (net2 needs the scan nudge)
-    if ! wait_for "clash: COL net-2 ready" \
-        "find_deposit '$DEST_ADDR' $L2B_NETWORK_ID '$col_lower' | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if d.get('ready_for_claim') else 1)\"" 600 5; then
-        echo "net2-not-ready" > "$CNT_DIR/clash"; return; fi
-    if ! nudge_until "clash: TWO COL faucet rows" \
-        "[ \"\$(pgq \"SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex')='${col_hex}';\")\" = \"2\" ]"; then
-        echo "faucets-incomplete" > "$CNT_DIR/clash"; mix "clash: two faucet rows never appeared"; return; fi
-    local f0 f2
-    f0=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex')='${col_hex}' AND origin_network=0;")
-    f2=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex')='${col_hex}' AND origin_network=${L2B_NETWORK_ID};")
-    if [[ -n "$f0" && -n "$f2" && "$f0" != "$f2" ]]; then
-        echo "distinct" > "$CNT_DIR/clash"; mix "clash: DISTINCT faucets net0=$f0 net2=$f2"
-    else
-        echo "collision" > "$CNT_DIR/clash"; mix "clash: COLLISION net0=$f0 net2=$f2"
-    fi
+    echo "submitted" > "$CNT_DIR/clash"; mix "clash: COL bridged from BOTH origins (net0 + net2)"
 }
 
 # ── Launch the L1<->Miden bulk load in the background ────────────────────────
@@ -212,18 +194,17 @@ if [[ "$SKIP_L1_LOAD" != "1" ]]; then
     log "  L1<->Miden loadtest PID $LT_PID (log: $LT_OUT)"
 fi
 
-# ── L2<->L2 workload + clash (SEQUENTIAL among themselves) ───────────────────
-# These ops all drive nudge certs from the SAME ADMIN account on L2B, so they
-# must NOT overlap each other (concurrent cast-sends race the nonce). They DO
-# run concurrently with the background L1<->Miden bulk load — that is the
-# "under concurrency" the mixed test asserts (the clash resolves while real
-# L1<->Miden traffic hammers the same bridge/proxy).
-step "Driving L2<->L2 workload ($L2L2_FWD fwd, $L2L2_BACK back, 1 clash) concurrently with the L1 bulk load"
-for i in $(seq 1 "$L2L2_FWD"); do l2l2_fwd_op "$i"; done
-clash_check
-for i in $(seq 1 "$L2L2_BACK"); do l2l2_back_op "$i"; done
+# ── SUBMIT phase: fire all L2<->L2 traffic + the clash, concurrently with the
+#    background L1 bulk load. Ops are sequential AMONG THEMSELVES (they share the
+#    ADMIN account on L2B — concurrent cast-sends would race the nonce), but all
+#    run while the L1<->Miden load hammers the same bridge/proxy — the real
+#    "under concurrency" the clash asserts. Confirmation is deferred to the drain.
+step "SUBMIT L2<->L2 traffic ($L2L2_FWD fwd, $L2L2_BACK back, 1 clash) under the L1 bulk load"
+for i in $(seq 1 "$L2L2_FWD"); do l2l2_fwd_submit "$i"; done
+clash_submit
+for i in $(seq 1 "$L2L2_BACK"); do l2l2_back_submit "$i"; done
 
-# ── Wait for the L1<->Miden load to finish ───────────────────────────────────
+# ── Wait for the L1<->Miden load to finish (frees the prover for the drain) ──
 if [[ -n "$LT_PID" ]]; then
     log "Waiting for L1<->Miden loadtest (PID $LT_PID) to settle..."
     wait "$LT_PID"; LT_RC=$?
@@ -231,6 +212,41 @@ if [[ -n "$LT_PID" ]]; then
     grep -aE "OVERALL RELIABILITY|database is locked count" "$LT_OUT" | tail -3 || true
 else
     LT_RC=0
+fi
+
+# ── DRAIN phase: with the prover freed, confirm every submitted L2<->L2 op landed.
+# Generous nudge budget (the claim scan is event-driven; each round forces a
+# settle cycle). Confirmation is state-based: fwd -> its ClaimEvent row on Miden;
+# back -> the L2B holder balance rose by the full bridged-out total; clash -> two
+# DISTINCT faucet rows for one address.
+step "DRAIN: confirming L2<->L2 claims (prover freed)"
+export NUDGE_TRIES="${DRAIN_NUDGE_TRIES:-10}"
+# NDG nudges wake BOTH the Miden-side (fwd) and L2B-side (back/clash) claim scans.
+for gi in ${FWD_GIS[@]+"${FWD_GIS[@]}"}; do
+    if nudge_until "fwd ClaimEvent (gi $gi)" "[ \"\$(claim_event_rows $gi)\" -ge 1 ]"; then
+        bump fwd_ok; mix "fwd CLAIMED (gi $gi)"
+    else mix "fwd claim did NOT land (gi $gi)"; fi
+done
+if [[ "$(cat "$CNT_DIR/clash")" == "submitted" ]]; then
+    if nudge_until "clash: TWO COL faucet rows" \
+        "[ \"\$(pgq \"SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}';\")\" = \"2\" ]"; then
+        f0=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}' AND origin_network=0;")
+        f2=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}' AND origin_network=${L2B_NETWORK_ID};")
+        if [[ -n "$f0" && -n "$f2" && "$f0" != "$f2" ]]; then
+            echo "distinct" > "$CNT_DIR/clash"; mix "clash: DISTINCT faucets net0=$f0 net2=$f2"
+        else echo "collision" > "$CNT_DIR/clash"; mix "clash: COLLISION net0=$f0 net2=$f2"; fi
+    else echo "faucets-incomplete" > "$CNT_DIR/clash"; mix "clash: two faucet rows never appeared"; fi
+fi
+BACK_N=$(cat "$CNT_DIR/back_sub")
+if [[ "$BACK_N" -gt 0 && -n "$BACK_BEFORE0" ]]; then
+    want=$(python3 -c "print(int('$BACK_BEFORE0') + $BACK_N * $BACK_OP_UNITS * $WEI_PER_MIDEN_UNIT)")
+    if nudge_until "back: L2B holder +$((BACK_N * BACK_OP_UNITS)) units (-> $want)" \
+        "[ \"\$(cast call $MOP 'balanceOf(address)(uint256)' $ADMIN --rpc-url $L2B_RPC | awk '{print \$1}')\" = \"$want\" ]"; then
+        echo "$BACK_N" > "$CNT_DIR/back_ok"; mix "back: all $BACK_N claimed on L2B (holder balance == $want)"
+    else
+        now=$(cast call "$MOP" 'balanceOf(address)(uint256)' "$ADMIN" --rpc-url "$L2B_RPC" | awk '{print $1}')
+        mix "back: not all claimed (L2B holder $BACK_BEFORE0 -> $now, want $want)"
+    fi
 fi
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
