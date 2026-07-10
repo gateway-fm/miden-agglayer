@@ -1055,7 +1055,41 @@ impl SyntheticProjector {
                 "note reconciler failed (transient — will retry next tick)"
             );
         }
-        if cursor >= tip {
+        // #30 VISIBILITY BARRIER: never seal a synthetic block the reconciler
+        // has not fully swept. `reconcile_notes` (above) advances
+        // `reconcile_cursor` to its last completed sweep window; every external
+        // bridge-out note at a block <= reconcile_cursor is therefore already in
+        // the client store. Capping the projection loop at `min(tip,
+        // reconcile_cursor)` makes exact-block emission a GUARANTEE for all event
+        // types: a note is always visible BEFORE its block is projected, so
+        // nothing is ever "late" (proxy-created CLAIM/GER notes are instant-
+        // visible and were never late; B2AGG lateness was purely import lag,
+        // eliminated here by construction — the late sweep below becomes an
+        // alarm). In steady state the reconciler reaches `tip` every tick
+        // (sub-second ~1000-block windows), so the barrier is a no-op; it only
+        // bites when the reconciler falls behind, and then holding is the
+        // correct failure mode — a late synthetic tip is benign (aggkit reads
+        // block ranges and just sees the chain pause), an event at the wrong
+        // block is poison. No reconciler wired (node_rpc = None, pure unit
+        // tests / a non-reconciling deployment) => no barrier, legacy behavior.
+        let project_to = if self.node_rpc.is_some() {
+            let reconcile_cursor = self.reconcile_cursor.load(Ordering::Acquire);
+            let held = tip.saturating_sub(reconcile_cursor);
+            ::metrics::gauge!("projector_visibility_barrier_held_blocks").set(held as f64);
+            if held > 0 {
+                tracing::debug!(
+                    tip,
+                    reconcile_cursor,
+                    held,
+                    "visibility barrier: holding projection at the reconcile frontier \
+                     (reconciler behind tip)"
+                );
+            }
+            tip.min(reconcile_cursor)
+        } else {
+            tip
+        };
+        if cursor >= project_to {
             return Ok(cursor);
         }
         // Perf-critical: fetch the consumed-note feed + output-note metadata ONCE
@@ -1127,36 +1161,43 @@ impl SyntheticProjector {
             // restarting the proxy healed it in 11s. Fix: when caught up, DEFER —
             // don't bucket, don't mark swept — the next block-advancing tick
             // projects them (bounded by block cadence).
-            if late.is_empty() || cursor >= tip {
-                if !late.is_empty() {
-                    tracing::debug!(
-                        late = late.len(),
-                        cursor,
-                        tip,
-                        "late-consumption sweep: deferred — projector caught up \
-                         (cursor == tip), retrying when the chain advances"
-                    );
-                }
+            // With the #30 visibility barrier a note can no longer be late: its
+            // block is projected only after the reconciler swept it, so it was
+            // present on time. The sweep is kept as a fail-safe + ALARM — any
+            // non-empty `late` here means the barrier's invariant was violated
+            // (a note surfaced for an already-sealed block), which is a bug
+            // signal, not routine. Emit the anomaly metric + WARN, then still
+            // recover it (bucket at cursor+1, honoring the #27 caught-up defer
+            // against `project_to`) so no funds strand even in the anomaly case.
+            if !late.is_empty() {
+                ::metrics::counter!("projector_late_sweep_anomaly_total")
+                    .increment(late.len() as u64);
+                tracing::warn!(
+                    late = late.len(),
+                    cursor,
+                    project_to,
+                    "late-consumption sweep found notes AFTER their sealed block — the \
+                     visibility barrier should make this impossible; recovering them but \
+                     investigate (projector_late_sweep_anomaly_total)"
+                );
+            }
+            if late.is_empty() || cursor >= project_to {
                 Vec::new()
             } else {
                 let ids = late
                     .iter()
                     .map(|n| n.details_commitment().as_bytes())
                     .collect();
-                tracing::info!(
-                    late = late.len(),
-                    first_block = cursor + 1,
-                    "late-consumption sweep: projecting notes discovered after their block"
-                );
                 by_block.entry(cursor + 1).or_default().extend(late);
                 ids
             }
         };
         // Direct projection of spent-before-import recoveries (same sealed-block
         // rules as the late sweep; see `bucket_direct_notes`).
-        let direct_done = Self::bucket_direct_notes(&direct_notes, &mut by_block, cursor, tip);
+        let direct_done =
+            Self::bucket_direct_notes(&direct_notes, &mut by_block, cursor, project_to);
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
-        while cursor < tip {
+        while cursor < project_to {
             let next = cursor + 1;
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
             self.project_block_notes(bucket, &output_metadata, next, Some(client))
