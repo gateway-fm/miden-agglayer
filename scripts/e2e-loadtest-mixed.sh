@@ -234,6 +234,14 @@ CLASH=$(cat "$CNT_DIR/clash")
 step "Verdict: settle margin, then event-completeness across net-0/1/2"
 sleep "${MIX_SETTLE:-60}"
 VC_RC=2
+if [[ "${MIX_VERIFY:-1}" != "1" ]]; then
+    # The chaos soak suppresses the mixed loadtest's own verify and runs ONE
+    # authoritative verify post-heal. Report per-op + clash here; leave the
+    # completeness verdict to the caller.
+    log "MIX_VERIFY=0 — skipping internal completeness (caller verifies post-heal)"
+    log "  L1<->Miden rc=$LT_RC  fwd=$FWD_OK/$FWD_SUB  back=$BACK_OK/$BACK_SUB  clash=$CLASH"
+    exit 0
+fi
 if [[ -x "$TOOL_BIN" ]]; then
     ALLOW_LATE="${ALLOW_LATE:-1}" TOOL_BIN="$TOOL_BIN" \
         NODE_CONTAINER="$NODE_CONTAINER" AGGLAYER_CONTAINER="$AGGLAYER_CONTAINER" \

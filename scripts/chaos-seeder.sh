@@ -28,7 +28,11 @@ CHAOS_LOG="${CHAOS_LOG:-/tmp/chaos-events.log}"
 SEED="${CHAOS_SEED:-$$}"                # reproducible-ish ordering per run
 RANDOM=$SEED
 
-PG="${PROJECT}-miden-agglayer-postgres-1"
+# The Miden proxy's store lives in the agglayer_store DB on the "agglayer-postgres"
+# container (published :5434) — NOT a "miden-agglayer-postgres" container (which
+# does not exist). Pausing it stalls the proxy's store writes (the intended
+# fault). Overridable via PG_CONTAINER for non-standard topologies.
+PG="${PG_CONTAINER:-${PROJECT}-agglayer-postgres-1}"
 PROVER="${PROJECT}-tx-prover-1"
 PROXY="${PROJECT}-miden-agglayer-1"
 NODE="${PROJECT}-miden-node-1"

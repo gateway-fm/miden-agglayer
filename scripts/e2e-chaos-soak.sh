@@ -1,95 +1,174 @@
 #!/usr/bin/env bash
-# e2e-chaos-soak.sh — the highest-trust test: drive a large loadtest WHILE a
-# randomized fault storm hits the proxy + its deps, then assert ZERO events were
-# lost across the chaos. If the proxy's resilience contracts hold (H1/H2 atomic
-# commits, #26 sync retry, #27 late-sweep heal, cursor persistence), every
-# submitted bridge-out/claim/GER still lands its synthetic event.
+# e2e-chaos-soak.sh — TIER 3: the unified WEEKEND CHAOS SOAK, the highest-trust
+# pre-release test. Miden runs under BOTH mixed real traffic (L1<->Miden AND
+# L2<->L2, including same-address clashes) AND adversarial "garbo" input AND
+# infrastructure chaos — then a TWO-SIDED verdict asserts:
+#   (a) every LEGITIMATE event still landed exact-block (verify-event-completeness:
+#       0 missing / 0 extra / 0 store-locks on the healed stack), AND
+#   (b) every GARBO input was correctly contained (skipped/quarantined/never
+#       projected): the foreign-claim global indexes produced ZERO synthetic
+#       ClaimEvent rows, and no garbo note leaked as a real BridgeEvent (the
+#       verify's extra==0 proves it).
+# PASS only if BOTH hold.
 #
 # Sequence:
-#   1. fresh stack
-#   2. start chaos-seeder (background, self-restoring) covering the load+settle
-#   3. run the loadtest (submits + settles) — NO internal verify (SKIP the noisy
-#      mid-chaos verify; we verify once at the end on a healed stack)
-#   4. stop chaos, restore all faults, wait for it to fully exit
-#   5. POST-CHAOS SETTLE: give the proxy time to heal (late-sweep, cursor catch-up,
-#      any restart re-sync) — the whole point of #27's fix
-#   6. verify-event-completeness = THE verdict: 0 missing / 0 extra / 0 store-locks
+#   1. L2<->L2 stack (fresh with FRESH=1, else reuse a live one)
+#   2. concurrent STORM window:
+#        - chaos-seeder  (infra faults: pause pg / kill prover / restart proxy /
+#          partition node — external, self-restoring)
+#        - chaos-garbo   (adversarial: private/tag-0 notes + a foreign-deployment
+#          claim — each with a benign EXPECTED outcome)
+#        - e2e-loadtest-mixed (L1<->Miden bulk + L2<->L2 fwd/back + address clash)
+#   3. stop injectors + FULL restore (unpause/reconnect/restart)
+#   4. post-chaos heal window (late-sweep / cursor catch-up / reconciler)
+#   5. two-sided verdict
 #
-# Usage: N=100 CHAOS_DURATION=600 ./scripts/e2e-chaos-soak.sh
+# Usage: N=60 CHAOS_DURATION=300 GARBO_DURATION=300 ./scripts/e2e-chaos-soak.sh
+#        FRESH=1 to bring up a clean stack first (requires NO other e2e stack up —
+#        the compose network 'miden-e2e' and host ports are shared).
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$REPO"
 cd "$REPO"
 
-PROJECT="${PROJECT:-miden-agglayer}"
-N="${N:-100}"
-CHAOS_DURATION="${CHAOS_DURATION:-600}"
-POST_CHAOS_SETTLE="${POST_CHAOS_SETTLE:-120}"
+N="${N:-60}"
+CHAOS_DURATION="${CHAOS_DURATION:-300}"
+GARBO_DURATION="${GARBO_DURATION:-300}"
+POST_CHAOS_SETTLE="${POST_CHAOS_SETTLE:-150}"
+L2L2_FWD="${L2L2_FWD:-2}"
+L2L2_BACK="${L2L2_BACK:-2}"
+FRESH="${FRESH:-0}"
+TOOL_BIN="${TOOL_BIN:-/home/mandrigin/miden-agglayer/target/debug/bridge-out-tool}"
+
 CHAOS_LOG="${CHAOS_LOG:-/tmp/chaos-events.log}"
-: > "$CHAOS_LOG"
+GARBO_LOG="${GARBO_LOG:-/tmp/chaos-garbo.log}"
+GARBO_SUMMARY="${GARBO_SUMMARY:-/tmp/chaos-garbo-summary.env}"
+: > "$CHAOS_LOG"; : > "$GARBO_LOG"; : > "$GARBO_SUMMARY"
 
 say() { echo "[$(date '+%H:%M:%S')] CHAOS-SOAK: $*"; }
 
-say "=== fresh stack ==="
-docker compose -f docker-compose.e2e.yml --env-file fixtures/.env down -v --remove-orphans >/dev/null 2>&1
-if ! timeout 900 make e2e-up >/tmp/chaos-up.out 2>&1; then say "e2e-up FAILED"; tail -15 /tmp/chaos-up.out; exit 4; fi
-say "stack up: $(docker ps --filter name=${PROJECT}- -q | wc -l) containers"
+CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
 
-# 2. chaos in the background, bounded, self-restoring
-say "=== launching chaos-seeder (${CHAOS_DURATION}s) ==="
+# ── 1. stack ─────────────────────────────────────────────────────────────────
+if [[ "$FRESH" == "1" ]]; then
+    say "=== FRESH stack (down -v + make e2e-up + L2B overlay) ==="
+    docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env down -v --remove-orphans >/dev/null 2>&1
+    if ! timeout 1200 make e2e-up >/tmp/chaos-up.out 2>&1; then say "e2e-up FAILED"; tail -20 /tmp/chaos-up.out; exit 4; fi
+fi
+
+# lib-l2l2 auto-detects the compose project from the live proxy container
+# (FIX for known bug #1: never hardcode 'miden-agglayer'). It also brings up the
+# L2B overlay idempotently (FIX for known bug #2: the soak now runs against the
+# L2L2 stack so L2B exists).
+source "$SCRIPT_DIR/lib-l2l2.sh"
+say "compose project detected: $COMPOSE_PROJECT_NAME"
+l2l2_ensure_stack || { say "L2B overlay bring-up FAILED"; exit 4; }
+PROJECT="$COMPOSE_PROJECT_NAME"
+say "stack up: $(docker ps --filter name=${PROJECT}- -q | wc -l) containers (proxy=$AGGLAYER_CONTAINER)"
+
+# Baseline the garbo-containment metrics + the persistent quarantine table.
+counter() { local n="$1" b; b=$(curl -sf "${L2_RPC}/metrics" 2>/dev/null) || { echo 0; return; }; awk -v n="$n" '$0 ~ ("^" n " "){print $2; f=1; exit} END{if(!f)print 0}' <<<"$b" | sed 's/\..*//'; }
+BASE_PRIV_SKIP=$(counter synthetic_reconciler_private_skipped_total)
+BASE_FOREIGN_SKIP=$(counter claim_event_foreign_skipped_total)
+say "garbo baselines: private_skipped=$BASE_PRIV_SKIP foreign_skipped=$BASE_FOREIGN_SKIP"
+
+# ── 2. STORM: chaos-seeder + chaos-garbo + mixed loadtest, concurrent ────────
+say "=== STORM: chaos-seeder (${CHAOS_DURATION}s) + chaos-garbo (${GARBO_DURATION}s) + mixed loadtest (N=$N) ==="
 PROJECT="$PROJECT" CHAOS_DURATION="$CHAOS_DURATION" CHAOS_LOG="$CHAOS_LOG" \
-    "$SCRIPT_DIR/chaos-seeder.sh" &
-CHAOS_PID=$!
+    "$SCRIPT_DIR/chaos-seeder.sh" >/tmp/chaos-seeder.out 2>&1 &
+SEEDER_PID=$!
+GARBO_DURATION="$GARBO_DURATION" GARBO_LOG="$GARBO_LOG" GARBO_SUMMARY="$GARBO_SUMMARY" \
+    "$SCRIPT_DIR/chaos-garbo.sh" >/tmp/chaos-garbo.out 2>&1 &
+GARBO_PID=$!
 
-# 3. loadtest concurrently — skip its internal verify (we do the authoritative one post-heal)
-say "=== loadtest N=$N under chaos ==="
-N="$N" ALLOW_LATE=1 VERIFY=0 timeout 2400 "$SCRIPT_DIR/e2e-bridge-loadtest-isolated.sh" >/tmp/chaos-lt.out 2>&1
+# The mixed loadtest drives all the legit traffic; suppress its internal verify
+# (MIX_VERIFY=0) — the soak runs ONE authoritative verify post-heal.
+say "=== mixed loadtest under storm ==="
+N="$N" L2L2_FWD="$L2L2_FWD" L2L2_BACK="$L2L2_BACK" MIX_VERIFY=0 ALLOW_LATE=1 \
+    COMPOSE_PROJECT_NAME="$PROJECT" \
+    timeout 3600 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
 LT_RC=$?
-say "loadtest exited rc=$LT_RC"
+say "mixed loadtest exited rc=$LT_RC"
+grep -aE "MIXED LOADTEST RESULT|forward ops|back ops|address clash|L1<->Miden rc" /tmp/chaos-lt.out | tail -6 || true
 
-# 4. stop chaos + guarantee full restore
-say "=== stopping chaos + restoring all faults ==="
-kill "$CHAOS_PID" 2>/dev/null || true
-wait "$CHAOS_PID" 2>/dev/null || true
-# belt-and-suspenders restore in case the trap raced
-docker unpause "${PROJECT}-miden-agglayer-postgres-1" >/dev/null 2>&1 || true
-NET="$(docker inspect ${PROJECT}-miden-agglayer-1 --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')"
+# ── 3. stop injectors + FULL restore ─────────────────────────────────────────
+say "=== stopping injectors + restoring all faults ==="
+kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
+kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
+# belt-and-suspenders restore in case a trap raced (correct container names)
+docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
+NET="$(docker inspect "$AGGLAYER_CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')"
 [ -n "$NET" ] && docker network connect "$NET" "${PROJECT}-miden-node-1" >/dev/null 2>&1 || true
 for c in tx-prover-1 miden-agglayer-1; do docker start "${PROJECT}-$c" >/dev/null 2>&1 || true; done
-FAULTS_DONE=$(grep -c "^\[.*\] FAULT " "$CHAOS_LOG" 2>/dev/null || echo 0)
+FAULTS_DONE=$(grep -c "FAULT " "$CHAOS_LOG" 2>/dev/null || echo 0)
 say "chaos stopped: $FAULTS_DONE faults injected (log: $CHAOS_LOG)"
+# shellcheck disable=SC1090
+[[ -f "$GARBO_SUMMARY" ]] && source "$GARBO_SUMMARY" || true
+say "garbo fired: private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0} gis='${GARBO_FOREIGN_GIS:-}'"
 
-# 5. POST-CHAOS HEAL — wait for the proxy to fully recover + catch up
+# ── 4. post-chaos heal ───────────────────────────────────────────────────────
 say "=== post-chaos settle (${POST_CHAOS_SETTLE}s heal window) ==="
-# wait for the proxy to be healthy again first
 for _ in $(seq 1 30); do
-    docker inspect "${PROJECT}-miden-agglayer-1" --format '{{.State.Health.Status}}' 2>/dev/null | grep -q healthy && break
+    docker inspect "$AGGLAYER_CONTAINER" --format '{{.State.Health.Status}}' 2>/dev/null | grep -q healthy && break
     sleep 5
 done
 sleep "$POST_CHAOS_SETTLE"
 
-# 6. THE VERDICT — authoritative completeness on the healed stack
-say "=== verify-event-completeness (the verdict) ==="
-TOOL_BIN="${TOOL_BIN:-$REPO/target/debug/bridge-out-tool}"
-if [[ ! -x "$TOOL_BIN" ]]; then say "WARN: $TOOL_BIN not built — completeness cannot run (build with cargo build --bin bridge-out-tool)"; VC_RC=2
-else
+# ── 5a. LEGITIMATE completeness (the primary verdict) ────────────────────────
+say "=== (a) verify-event-completeness (legit traffic) ==="
+VC_RC=2
+if [[ -x "$TOOL_BIN" ]]; then
     ALLOW_LATE="${ALLOW_LATE:-1}" TOOL_BIN="$TOOL_BIN" \
-        NODE_CONTAINER="${PROJECT}-miden-node-1" AGGLAYER_CONTAINER="${PROJECT}-miden-agglayer-1" \
+        NODE_CONTAINER="${PROJECT}-miden-node-1" AGGLAYER_CONTAINER="$AGGLAYER_CONTAINER" \
         "$SCRIPT_DIR/verify-event-completeness.sh" > /tmp/chaos-verify.out 2>&1
     VC_RC=$?
-    grep -aE "TYPE|B2AGG->|CLAIM->|GER->|VERDICT|SANITY" /tmp/chaos-verify.out | tail -8
+    grep -aE "TYPE|B2AGG->|CLAIM->|GER->|VERDICT|SANITY|MISSING" /tmp/chaos-verify.out | tail -10
+else
+    say "WARN: $TOOL_BIN not found — completeness cannot run"
 fi
-LOCKS=$(docker logs "${PROJECT}-miden-agglayer-1" 2>&1 | grep -c "database is locked" || true)
+LOCKS=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -c "database is locked" || true)
 
+# ── 5b. GARBO containment (the second verdict) ───────────────────────────────
+say "=== (b) garbo containment ==="
+GARBO_OK=1
+# Foreign-claim class: each fabricated global index must have ZERO ClaimEvent rows.
+FOREIGN_LEAK=0
+for gi_hex in ${GARBO_FOREIGN_GIS:-}; do
+    gi_pad=$(python3 -c "print(format(int('$gi_hex',16),'064x'))" 2>/dev/null || echo "")
+    [[ -z "$gi_pad" ]] && continue
+    rows=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${gi_pad}%';")
+    if [[ "${rows:-0}" != "0" ]]; then
+        say "  GARBO LEAK: foreign gi 0x$gi_hex has $rows ClaimEvent row(s) — CONTAINMENT BREACH"
+        FOREIGN_LEAK=$((FOREIGN_LEAK + rows)); GARBO_OK=0
+    else
+        say "  foreign gi 0x$gi_hex: 0 ClaimEvent rows (contained)"
+    fi
+done
+[[ "${GARBO_FOREIGN_FIRED:-0}" -gt 0 && -z "${GARBO_FOREIGN_GIS:-}" ]] && { say "  WARN: foreign fired but no gi recorded"; }
+# Skip counters (best-effort — in-memory, may have reset on a chaos proxy restart).
+NOW_PRIV_SKIP=$(counter synthetic_reconciler_private_skipped_total)
+NOW_FOREIGN_SKIP=$(counter claim_event_foreign_skipped_total)
+say "  private_skipped_total: $BASE_PRIV_SKIP -> $NOW_PRIV_SKIP (garbo private fired=${GARBO_PRIVATE_FIRED:-0})"
+say "  foreign_skipped_total: $BASE_FOREIGN_SKIP -> $NOW_FOREIGN_SKIP (garbo foreign fired=${GARBO_FOREIGN_FIRED:-0})"
+# The verify's extra==0 (checked below via VC_RC) is the restart-robust proof
+# that NO private/tag-0/garbo note leaked as a real BridgeEvent/ClaimEvent.
+
+# ── 6. two-sided verdict ─────────────────────────────────────────────────────
 say "======================================================================"
-say "  CHAOS SOAK RESULT"
-say "    N=$N  faults=$FAULTS_DONE  loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS"
-if [ "$VC_RC" = "0" ] && [ "${LOCKS:-1}" = "0" ]; then
-    say "  >>> CHAOS SOAK PASS — every event survived the fault storm, 0 store-locks <<<"
+say "  UNIFIED CHAOS SOAK RESULT"
+say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
+say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=$FOREIGN_LEAK"
+LEGIT_OK=0; [[ "$VC_RC" == "0" && "${LOCKS:-1}" == "0" ]] && LEGIT_OK=1
+say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC locks=$LOCKS)"
+say "    (b) GARBO containment:  $([[ $GARBO_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK)"
+if [[ "$LEGIT_OK" == "1" && "$GARBO_OK" == "1" ]]; then
+    say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"
     say "======================================================================"
     exit 0
 else
-    say "  >>> CHAOS SOAK NOT-GREEN (verify_rc=$VC_RC locks=$LOCKS) — inspect /tmp/chaos-verify.out + $CHAOS_LOG <<<"
+    say "  >>> CHAOS SOAK NOT-GREEN — inspect /tmp/chaos-verify.out, $CHAOS_LOG, $GARBO_LOG, /tmp/chaos-lt.out <<<"
+    say "  (stack left UP for forensics)"
     say "======================================================================"
     exit 1
 fi
