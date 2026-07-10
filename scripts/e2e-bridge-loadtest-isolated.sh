@@ -647,6 +647,7 @@ r "======================================================================"
 # script root) against eth_getLogs on the synthetic L2 — each event must exist
 # at EXACTLY the note's consumption block. Failure fails the whole loadtest.
 VERIFY_RC=0
+VERIFY_RC=0
 if [[ "${VERIFY:-1}" == "1" ]]; then
     r "Event-completeness verification (node DB ⇄ eth_getLogs):"
     # BRIDGE_ID above holds the toml's bech32 form (for iso_tool); the
