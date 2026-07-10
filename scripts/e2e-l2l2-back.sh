@@ -148,41 +148,11 @@ else
     DEST_NET=$(dep_field "$BACK_DEPOSIT" dest_net)
     DEST_ADDR_CLAIM=$(dep_field "$BACK_DEPOSIT" dest_addr)
     METADATA_CLAIM=$(echo "$BACK_DEPOSIT" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m != '0x' else '0x')")
-    CLAIM_TX_HASH=""
-    # The proof's roots and their L2B-GER injection LAG the deposit turning ready,
-    # and the served proof advances as the exit tree grows. So rather than fetch one
-    # proof and wait on one specific GER (racy), each attempt RE-FETCHES a fresh
-    # proof and tries claimAsset. `cast send` gas-estimates first, so a not-yet-
-    # settleable claim (covering GER not injected on L2B, or a stale sibling) reverts
-    # in estimation and fails FAST without submitting -> retry with a newer proof.
-    # Once the covering GER is injected on L2B, estimation passes and it settles.
-    for attempt in $(seq 1 30); do   # ~7.5 min worst case
-        PROOF_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$BACK_CNT&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
-        if [[ -n "$PROOF_JSON" ]]; then
-            MAINNET_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])" 2>/dev/null || true)
-            ROLLUP_EXIT_ROOT=$(echo "$PROOF_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])" 2>/dev/null || true)
-            SMT_LOCAL=$(echo "$PROOF_JSON" | python3 -c "
-import json,sys
-p=json.load(sys.stdin)['proof']['merkle_proof']
-while len(p)<32:p.append('0x'+'00'*32)
-print('['+','.join(p[:32])+']')" 2>/dev/null || true)
-            SMT_ROLLUP=$(echo "$PROOF_JSON" | python3 -c "
-import json,sys
-p=json.load(sys.stdin)['proof']['rollup_merkle_proof']
-while len(p)<32:p.append('0x'+'00'*32)
-print('['+','.join(p[:32])+']')" 2>/dev/null || true)
-            if [[ -n "$SMT_LOCAL" && -n "$SMT_ROLLUP" && -n "$MAINNET_EXIT_ROOT" ]]; then
-                CLAIM_OUT=$(cast send --rpc-url "$L2B_RPC" --private-key "$ADMIN_KEY" --json "$BRIDGE" \
-                    'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
-                    "$SMT_LOCAL" "$SMT_ROLLUP" "$BACK_GI" "$MAINNET_EXIT_ROOT" "$ROLLUP_EXIT_ROOT" \
-                    "$ORIG_NET" "$OPT0" "$DEST_NET" "$DEST_ADDR_CLAIM" "$BACK_AMOUNT_WEI" "$METADATA_CLAIM" 2>/dev/null || true)
-                CLAIM_TX_HASH=$(echo "$CLAIM_OUT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('transactionHash','') if str(d.get('status','')) in ('0x1','1','true') else '')" 2>/dev/null || true)
-                [[ -n "$CLAIM_TX_HASH" ]] && break
-            fi
-        fi
-        log "  attempt $attempt/30: back deposit not settleable on L2B yet (GER-injection/proof lag) — retrying in 15s"
-        sleep 15
-    done
+    # submit_back_claim (lib-l2l2.sh) runs the fresh-proof retry loop: fetch the Miden
+    # deposit's proof, submit claimAsset to the real anvil-l2b, retry until the covering
+    # GER is injected on L2B (~7.5 min budget). Shared with the mixed loadtest's back ops.
+    CLAIM_TX_HASH=$(submit_back_claim "$BACK_CNT" "$BACK_GI" "$ORIG_NET" "$OPT0" \
+        "$DEST_NET" "$DEST_ADDR_CLAIM" "$BACK_AMOUNT_WEI" "$METADATA_CLAIM") || true
     [[ -n "$CLAIM_TX_HASH" ]] || fail "manual claimAsset on L2B did not settle after 30 attempts (~7.5m)"
     pass "claim on L2B via robust manual claimAsset (tx $CLAIM_TX_HASH)"
 fi

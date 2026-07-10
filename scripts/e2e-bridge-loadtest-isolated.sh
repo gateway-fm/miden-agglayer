@@ -433,11 +433,29 @@ declare -a OP_TOKEN OP_DIR
 declare -a SUB_L1 SUB_L2 FAIL_L1 FAIL_L2
 for k in $(seq 0 $((NUM_TOKENS - 1))); do SUB_L1[$k]=0; SUB_L2[$k]=0; FAIL_L1[$k]=0; FAIL_L2[$k]=0; done
 PLAN_L1=0; PLAN_L2=0
-for i in $(seq 1 "$N"); do
-    OP_TOKEN[$i]=$((RANDOM % NUM_TOKENS))
-    d=$((RANDOM % 2)); OP_DIR[$i]=$d
-    [[ $d -eq 0 ]] && PLAN_L1=$((PLAN_L1+1)) || PLAN_L2=$((PLAN_L2+1))
-done
+# Direction assignment. Default: each op random L1->L2 / L2->L1 (RANDOM % 2). When
+# PLAN_L1_TARGET + PLAN_L2_TARGET are BOTH set (used by the mixed loadtest for an
+# EXACT per-direction split, e.g. 10 L1->L2 + 10 L2->L1), honor those counts exactly
+# and interleave them (pick whichever direction has more remaining) so the two
+# directions stay MIXED rather than all-L1-then-all-L2; N is set to their sum.
+if [[ -n "${PLAN_L1_TARGET:-}" && -n "${PLAN_L2_TARGET:-}" ]]; then
+    N=$((PLAN_L1_TARGET + PLAN_L2_TARGET))
+    l1left=$PLAN_L1_TARGET; l2left=$PLAN_L2_TARGET
+    for i in $(seq 1 "$N"); do
+        OP_TOKEN[$i]=$((RANDOM % NUM_TOKENS))
+        if [[ $l1left -gt 0 && ( $l2left -eq 0 || $l1left -ge $l2left ) ]]; then
+            OP_DIR[$i]=0; l1left=$((l1left - 1)); PLAN_L1=$((PLAN_L1 + 1))
+        else
+            OP_DIR[$i]=1; l2left=$((l2left - 1)); PLAN_L2=$((PLAN_L2 + 1))
+        fi
+    done
+else
+    for i in $(seq 1 "$N"); do
+        OP_TOKEN[$i]=$((RANDOM % NUM_TOKENS))
+        d=$((RANDOM % 2)); OP_DIR[$i]=$d
+        [[ $d -eq 0 ]] && PLAN_L1=$((PLAN_L1+1)) || PLAN_L2=$((PLAN_L2+1))
+    done
+fi
 r "----------------------------------------------------------------------"
 r "Load: $N ops planned — L1→L2=$PLAN_L1  L2→L1=$PLAN_L2"
 r "----------------------------------------------------------------------"

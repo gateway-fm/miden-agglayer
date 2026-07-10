@@ -200,6 +200,48 @@ print('['+','.join(p[:32])+']')" 2>/dev/null || true)
     [[ "$(claim_event_rows "$gi")" -ge 1 ]]
 }
 
+# submit_back_claim <cnt> <gi> <orig_net> <orig_token> <dest_net> <dest_addr> <amount_wei> <metadata>
+# Client-submit a Miden->L2B (back) claim: fetch the Miden deposit's proof from the
+# Miden bridge-service (net_id=1) and submit a proof-backed claimAsset to the REAL
+# anvil-l2b bridge (EIP-1559 fine — a real EVM chain, unlike the proxy, so NO --legacy).
+# The served proof's roots + their L2B-GER injection LAG the deposit turning ready and
+# the exit tree advances, so each attempt RE-FETCHES a fresh proof; `cast send` gas-
+# estimates first, so a not-yet-settleable claim reverts FAST without submitting ->
+# retry with a newer proof until the covering GER is injected on L2B. Prints the claim
+# tx hash on success (empty + rc 1 if it never settles within the retry budget). Shared
+# by e2e-l2l2-back.sh (leg 4) and e2e-loadtest-mixed.sh (back ops).
+submit_back_claim() {
+    local cnt="$1" gi="$2" onet="$3" otok="$4" dnet="$5" daddr="$6" amt="$7" meta="$8"
+    local tries="${BACK_CLAIM_TRIES:-30}" interval="${BACK_CLAIM_INTERVAL:-15}"
+    local attempt pj mer rer smtL smtR out txh
+    for attempt in $(seq 1 "$tries"); do
+        pj=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
+        if [[ -n "$pj" ]]; then
+            mer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])" 2>/dev/null || true)
+            rer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])" 2>/dev/null || true)
+            smtL=$(echo "$pj" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+            smtR=$(echo "$pj" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['rollup_merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+            if [[ -n "$smtL" && -n "$smtR" && -n "$mer" ]]; then
+                out=$(cast send --rpc-url "$L2B_RPC" --private-key "$ADMIN_KEY" --json "$BRIDGE" \
+                    'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
+                    "$smtL" "$smtR" "$gi" "$mer" "$rer" "$onet" "$otok" "$dnet" "$daddr" "$amt" "$meta" 2>/dev/null || true)
+                txh=$(echo "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('transactionHash','') if str(d.get('status','')) in ('0x1','1','true') else '')" 2>/dev/null || true)
+                [[ -n "$txh" ]] && { echo "$txh"; return 0; }
+            fi
+        fi
+        sleep "$interval"
+    done
+    return 1
+}
+
 # ── L2B stack lifecycle ──────────────────────────────────────────────────────
 # _l2l2_stack_ready — 0 when the L2B overlay is already up + rollup #2
 # registered + bridge-service indexing (so ensure can SKIP the costly bring-up).
