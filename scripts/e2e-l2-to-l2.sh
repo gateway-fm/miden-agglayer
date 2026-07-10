@@ -52,7 +52,11 @@ PG_USER="${PG_USER:-agglayer}"
 PG_PASS="${PG_PASS:-agglayer}"
 PG_DB="${PG_DB:-agglayer_store}"
 
-COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-miden-agglayer}"
+# Compose derives the project name from the CHECKOUT DIRECTORY (main repo ->
+# "miden-agglayer", the l2l2 worktree -> "l2l2"), so never assume — detect it
+# from the live proxy container, falling back to the main-repo default.
+_DETECTED_PROJECT=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E -- '-miden-agglayer-1$' | head -1 | sed 's/-miden-agglayer-1$//')
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${_DETECTED_PROJECT:-miden-agglayer}}"
 AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 AGGKIT_L2B_CONTAINER="${AGGKIT_L2B_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-l2b-1}"
