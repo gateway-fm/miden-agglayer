@@ -1080,6 +1080,20 @@ impl SyntheticProjector {
             .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
             .as_u64();
         let mut cursor = self.cursor.load(Ordering::Acquire);
+        // #30 BARRIER LEAK FIX (2026-07-12): capture reconcile_cursor BEFORE this tick's
+        // reconcile. The barrier below seals only up to THIS value — the frontier the
+        // reconciler had FULLY completed as of the PREVIOUS tick. Why not the current
+        // frontier: `reconcile_notes` imports notes by CREATION (`sync_notes`), but a note's
+        // CONSUMPTION (`consumed_block_height`) is discovered only by a `sync_state` nullifier
+        // check, and the client sync loop runs exactly one `sync_state` BEFORE each `tick`.
+        // So a note imported in tick T-1 has its consumption discovered by the sync preceding
+        // tick T — meaning by the time we seal up to T-1's frontier, every consumption at or
+        // below it is already visible. Sealing to the CURRENT frontier (pre-fix) raced that
+        // discovery: a note consumed at N <= reconcile_cursor whose nullifier hadn't synced
+        // yet was sealed without its BridgeEvent, surfacing late (211 anomalies/run, 1 dropped
+        // event under N=30). One tick of lag — sub-second, ~0-1 blocks in steady state, 0 when
+        // idle (tip constant => prev == tip) — closes it deterministically.
+        let reconcile_cursor_prev = self.reconcile_cursor.load(Ordering::Acquire);
         // Reconcile BEFORE the early-return: the reconciler must run even on
         // ticks where the projector is already at the tip, or imports stall
         // whenever Miden block production pauses. Failures are transient —
@@ -1110,7 +1124,10 @@ impl SyntheticProjector {
         // block is poison. No reconciler wired (node_rpc = None, pure unit
         // tests / a non-reconciling deployment) => no barrier, legacy behavior.
         let project_to = if self.node_rpc.is_some() {
-            let reconcile_cursor = self.reconcile_cursor.load(Ordering::Acquire);
+            // One-tick-lagged frontier (see the BARRIER LEAK FIX note above): seal only up
+            // to the reconcile frontier a full sync cycle has already validated consumptions
+            // for, never the frontier this very tick's reconcile just reached.
+            let reconcile_cursor = reconcile_cursor_prev;
             let held = tip.saturating_sub(reconcile_cursor);
             ::metrics::gauge!("projector_visibility_barrier_held_blocks").set(held as f64);
             if held > 0 {
