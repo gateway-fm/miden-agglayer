@@ -55,7 +55,11 @@ pub struct FaucetRegistryReconciler {
 }
 
 impl FaucetRegistryReconciler {
-    pub fn new(miden_client: Arc<MidenClient>, store: Arc<dyn Store>, bridge_id: AccountId) -> Self {
+    pub fn new(
+        miden_client: Arc<MidenClient>,
+        store: Arc<dyn Store>,
+        bridge_id: AccountId,
+    ) -> Self {
         Self {
             miden_client,
             store,
@@ -254,8 +258,14 @@ mod tests {
         let mut streaks = HashMap::new();
         let f = faucet_id(1);
         // Seen unknown but under the grace threshold on the first two scans.
-        assert_eq!(FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3), None);
-        assert_eq!(FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3), None);
+        assert_eq!(
+            FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3),
+            None
+        );
+        assert_eq!(
+            FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3),
+            None
+        );
         // Third consecutive scan reaches grace_ticks -> trips.
         assert_eq!(
             FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3),
@@ -268,13 +278,25 @@ mod tests {
         let mut streaks = HashMap::new();
         let f = faucet_id(2);
         // Unknown for two scans (proxy registration in flight)...
-        assert_eq!(FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3), None);
-        assert_eq!(FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3), None);
+        assert_eq!(
+            FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3),
+            None
+        );
+        assert_eq!(
+            FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3),
+            None
+        );
         // ...then the store row commits: no longer unknown -> streak drops.
-        assert_eq!(FaucetRegistryReconciler::evaluate(&[], &mut streaks, 3), None);
+        assert_eq!(
+            FaucetRegistryReconciler::evaluate(&[], &mut streaks, 3),
+            None
+        );
         assert!(streaks.is_empty());
         // A later transient sighting starts from zero again, so it does NOT immediately trip.
-        assert_eq!(FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3), None);
+        assert_eq!(
+            FaucetRegistryReconciler::evaluate(&[f], &mut streaks, 3),
+            None
+        );
     }
 
     #[test]
@@ -292,7 +314,10 @@ mod tests {
         let mut streaks = HashMap::new();
         let (a, b) = (faucet_id(4), faucet_id(5));
         // `a` unknown for two scans; `b` only appears on the second.
-        assert_eq!(FaucetRegistryReconciler::evaluate(&[a], &mut streaks, 3), None);
+        assert_eq!(
+            FaucetRegistryReconciler::evaluate(&[a], &mut streaks, 3),
+            None
+        );
         assert_eq!(
             FaucetRegistryReconciler::evaluate(&[a, b], &mut streaks, 3),
             None

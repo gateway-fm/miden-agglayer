@@ -556,8 +556,8 @@ async fn main() -> anyhow::Result<()> {
         // 1. Deploy the operator-owned fungible faucet (custom symbol/decimals).
         let symbol = TokenSymbol::new(&args.native_symbol)
             .map_err(|e| anyhow!("invalid TokenSymbol {:?}: {e:?}", args.native_symbol))?;
-        let name = TokenName::new(&symbol.to_string())
-            .map_err(|e| anyhow!("invalid TokenName: {e:?}"))?;
+        let name =
+            TokenName::new(&symbol.to_string()).map_err(|e| anyhow!("invalid TokenName: {e:?}"))?;
         let faucet_component = FungibleFaucet::builder()
             .name(name)
             .symbol(symbol)
@@ -591,7 +591,10 @@ async fn main() -> anyhow::Result<()> {
         wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
             .await
             .map_err(|e| anyhow!("faucet deploy commit wait failed: {e:?}"))?;
-        println!("[native-faucet] deployed operator faucet {}", faucet.id().to_hex());
+        println!(
+            "[native-faucet] deployed operator faucet {}",
+            faucet.id().to_hex()
+        );
 
         // 2. Mint --mint-units to the wallet (produces a P2ID note the wallet consumes).
         if args.mint_units > 0 {
@@ -636,7 +639,10 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow!("consume commit wait failed: {e:?}"))?;
-            println!("[native-faucet] minted {} units to wallet {}", args.mint_units, wallet_hex);
+            println!(
+                "[native-faucet] minted {} units to wallet {}",
+                args.mint_units, wallet_hex
+            );
         }
 
         // Machine-readable output the e2e greps for.
