@@ -7,7 +7,7 @@
 use crate::faucet_ops;
 use crate::service_state::ServiceState;
 use crate::store::FaucetEntry;
-use miden_base_agglayer::MetadataHash;
+use miden_base_agglayer::{EthAddress, MetadataHash};
 use miden_protocol::account::AccountId;
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
@@ -261,6 +261,129 @@ pub async fn admin_register_faucet(
     tracing::info!(
         faucet_id = %id_hex,
         "admin_registerFaucet: faucet created and registered"
+    );
+    Ok(id_hex)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterNativeFaucetParams {
+    /// The EXISTING, externally-deployed Miden faucet account id (hex) to allowlist as
+    /// native. The proxy does NOT create it — an external party (e.g. the bridge-out
+    /// app's `--create-native-faucet`) deploys + mints it first.
+    pub faucet_id: String,
+    /// The 20-byte origin token address the bridge records for this native faucet (its
+    /// canonical L1/agglayer-side representation).
+    pub origin_token_address: String,
+    pub symbol: String,
+    pub decimals: u8,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// `admin_registerNativeFaucet` — allowlist an EXTERNALLY-deployed Miden-ORIGINATED
+/// (native lock/unlock) faucet on the bridge. Faucet bridging is a PERMISSIONED
+/// ALLOWLIST: only the bridge admin can register, and the admin IS this proxy's
+/// `service` account — so the external party deploys the faucet, the PROXY registers it.
+///
+/// This is the REQUEST side (mirrors `ger.rs::insert_ger`): it sends the admin
+/// `ConfigAggBridgeNote` with `is_native = true` and persists the proxy-store row. The
+/// faucet-registry DISCOVERY module is the decoupled read side — it reconciles entries
+/// registered by anyone (including a different admin, adopted with a `warn!`) and after
+/// a restart, independent of and order-agnostic to this request.
+///
+/// Native means the token ORIGINATES on this Miden network, so the origin network is
+/// this proxy's CONFIGURED `network_id` (never hardcoded 1): `is_native` is derivable as
+/// `origin_network == service.network_id`. There is no L1<->Miden decimal scaling for a
+/// native token (`scale = 0`, `origin_decimals == miden_decimals`).
+pub async fn admin_register_native_faucet(
+    state: ServiceState,
+    params: RegisterNativeFaucetParams,
+) -> anyhow::Result<String> {
+    let faucet_id = AccountId::from_hex(&params.faucet_id)
+        .map_err(|e| anyhow::anyhow!("bad faucet_id {}: {e:?}", params.faucet_id))?;
+    let origin_address = parse_eth_address(&params.origin_token_address)?;
+    let origin_network = state.network_id;
+    let scale = 0u8;
+    let miden_decimals = params.decimals;
+
+    // Idempotent: an existing native route for this (origin_address, origin_network) is
+    // returned as-is (register-if-absent), matching admin_registerFaucet's contract.
+    if state
+        .store
+        .get_faucet_by_origin(&origin_address, origin_network)
+        .await?
+        .is_some()
+    {
+        tracing::info!(
+            origin_network,
+            "admin_registerNativeFaucet: a route already exists for this origin — returning it"
+        );
+        return Ok(faucet_id.to_hex());
+    }
+
+    // abi.encode(name, symbol, decimals) — same preimage the bridge/L2 wrapped-token
+    // metadata hashes to (Cantina #13); reused for the on-Miden MetadataHash + the
+    // stored FaucetEntry.metadata so a later bridge-out emits matching metadata.
+    use alloy_core::sol_types::SolValue;
+    let metadata_name = params.name.clone().unwrap_or_else(|| params.symbol.clone());
+    let metadata_bytes = AdminTokenMetadata {
+        name: metadata_name,
+        symbol: params.symbol.clone(),
+        decimals: params.decimals,
+    }
+    .abi_encode_params();
+    let metadata_hash = MetadataHash::from_abi_encoded(&metadata_bytes);
+
+    let accounts = &state.accounts.0;
+    let service_id = accounts.service.0;
+    let bridge_id = accounts.bridge.0;
+    let symbol_clone = params.symbol.clone();
+
+    // REQUEST: admin ConfigAggBridgeNote registering the EXISTING faucet as native
+    // (is_native = true). Register only — the faucet was deployed externally.
+    state
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                let origin_addr = EthAddress::new(origin_address);
+                faucet_ops::register_faucet_in_bridge(
+                    client,
+                    service_id,
+                    bridge_id,
+                    faucet_id,
+                    &origin_addr,
+                    origin_network,
+                    scale,
+                    metadata_hash,
+                    &symbol_clone,
+                    true, // is_native — Miden-ORIGINATED lock/unlock faucet
+                )
+                .await
+            })
+        })
+        .await?;
+
+    // Persist the proxy-store row (origin_network == the configured net id => is_native
+    // is derivable; no separate column).
+    state
+        .store
+        .register_faucet(FaucetEntry {
+            faucet_id,
+            origin_address,
+            origin_network,
+            symbol: params.symbol,
+            origin_decimals: miden_decimals, // native: no L1<->Miden scaling
+            miden_decimals,
+            scale,
+            metadata: metadata_bytes,
+        })
+        .await?;
+
+    let id_hex = faucet_id.to_hex();
+    tracing::info!(
+        faucet_id = %id_hex,
+        origin_network,
+        "admin_registerNativeFaucet: native faucet allowlisted on the bridge"
     );
     Ok(id_hex)
 }

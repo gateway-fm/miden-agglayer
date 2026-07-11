@@ -143,6 +143,7 @@ fn bucket_method_label(method: &str) -> &'static str {
         "zkevm_getLatestGlobalExitRoot" => "zkevm_getLatestGlobalExitRoot",
         "zkevm_getExitRootsByGER" => "zkevm_getExitRootsByGER",
         "admin_registerFaucet" => "admin_registerFaucet",
+        "admin_registerNativeFaucet" => "admin_registerNativeFaucet",
         "admin_listFaucets" => "admin_listFaucets",
         // Anything else → "other". Includes typos and method-name-fuzzing
         // attacks. We still log the actual method via tracing for debugging.
@@ -637,6 +638,16 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
         "admin_registerFaucet" => {
             let params: (crate::service_admin::RegisterFaucetParams,) = request.parse_params()?;
             let result = crate::service_admin::admin_register_faucet(service, params.0).await;
+            json_rpc_response_from_result(result, answer_id, ServiceErrorCode::AdminRegisterFaucet)
+        }
+
+        "admin_registerNativeFaucet" => {
+            // Allowlist an EXTERNALLY-deployed Miden-ORIGINATED (native lock/unlock) faucet
+            // on the bridge — only the bridge admin (this proxy's service account) can.
+            let params: (crate::service_admin::RegisterNativeFaucetParams,) =
+                request.parse_params()?;
+            let result =
+                crate::service_admin::admin_register_native_faucet(service, params.0).await;
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::AdminRegisterFaucet)
         }
 
