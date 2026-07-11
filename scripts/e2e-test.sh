@@ -71,6 +71,24 @@ case "$test_filter" in
         # repro), which wedges any certificate settlement that would happen
         # after it — so no settlement-dependent test may follow.
         "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
+        echo ""
+        # L2<->L2 + native Miden-originated tiers — canonical part of the full suite on
+        # this branch. They need the docker-compose.l2l2.yml overlay (postgres-l2b /
+        # bridge-service-l2b), so GUARD on the overlay being up: on the base stack they're
+        # skipped with a warning; on the l2l2 stack they run. `e2e-test.sh l2l2` runs the
+        # L2<->L2 group (forward/clash/back); the native round-trips exercise a
+        # Miden-originated token to BOTH destinations (->L2B and ->L1).
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'postgres-l2b'; then
+            echo "== L2<->L2 group (L2B overlay present) =="
+            "$SCRIPT_DIR/e2e-test.sh" l2l2
+            echo ""
+            echo "== native Miden-originated round-trips (->L2B, ->L1) =="
+            DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
+            echo ""
+            DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
+        else
+            echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
+        fi
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
