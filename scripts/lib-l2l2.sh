@@ -151,6 +151,25 @@ claim_event_rows() {
     pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${gi_hex}%';"
 }
 
+# _pred_native_bridgeevent_origin <origin_addr_0x> <origin_network>
+# True iff a synthetic BridgeEvent (proxy store) encodes the given originAddress +
+# originNetwork — i.e. a Miden bridge-OUT correctly DISCOVERED the native faucet's
+# registration and emitted the CONFIGURED origin network (not a 0/2 fallback). The
+# BridgeEvent data is ABI-encoded 32-byte words (encode_bridge_event_data): word 0 =
+# leafType, word 1 = originNetwork (uint32 in the low 8 hex), word 2 = originAddress
+# (address in the low 40 hex). After the leading '0x' (chars 1-2), word 1 starts at
+# char 67 and word 2 at char 131 (1-indexed).
+_pred_native_bridgeevent_origin() {
+    local addr net n
+    addr=$(echo "${1#0x}" | tr 'A-F' 'a-f')          # 40 hex, no 0x
+    net=$(printf '%08x' "$2")                          # uint32 -> 8 hex
+    n=$(pgq "SELECT COUNT(*) FROM synthetic_logs
+             WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}'
+               AND substring(lower(data) from 67 for 64) LIKE '%${net}'
+               AND substring(lower(data) from 131 for 64) LIKE '%${addr}';")
+    [[ "${n:-0}" -ge 1 ]]
+}
+
 # _pred_submit_forward_claim <fwd_cnt> <global_index> <orig_net> <orig_token> <dest_net> <dest_addr> <amount_wei> <metadata>
 # Canonical forward (L2B->Miden) claim. With per-rollup bridge-service isolation
 # (canonical kurtosis-cdk: ONE bridge-service per chain, each indexing L1 + ONLY its
