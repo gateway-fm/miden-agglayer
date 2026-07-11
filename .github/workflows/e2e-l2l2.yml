@@ -121,6 +121,10 @@ jobs:
           if-no-files-found: warn
 
       # Tear the stack down unless we brought up a warm one we want to keep.
+      # Use the L2L2 teardown (matches `make e2e-l2l2-up` above): it runs
+      # `docker compose` with the L2B overlay + --remove-orphans so the L2B-only
+      # containers (anvil-l2b, aggkit-l2b, postgres-l2b, bridge-service-l2b) don't
+      # linger on a reused self-hosted runner. Base `make e2e-down` would leave them.
       - name: Tear down stack
         if: ${{ always() && github.event.inputs.skip_setup != 'true' }}
-        run: make e2e-down
+        run: make e2e-l2l2-down

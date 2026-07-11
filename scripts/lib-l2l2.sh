@@ -256,7 +256,7 @@ _l2l2_stack_ready() {
     # a correct reused overlay from one that must be re-brought-up + reconciled.
     local r2chain
     r2chain=$( ( set +o pipefail; cast call "$ROLLUP_MANAGER" \
-        'rollupIDToRollupData(uint32)(address,uint64,address,uint64,bytes32,uint64,uint64,uint64,uint64,uint8,uint8)' 2 \
+        'rollupIDToRollupData(uint32)(address,uint64,address,uint64,bytes32,uint64,uint64,uint64,uint64,uint64,uint64,uint8)' 2 \
         --rpc-url "$L1_RPC" 2>/dev/null | sed -n '2p' | awk '{print $1}' ) || true )
     [[ "$r2chain" == "31338" ]] || return 1
     [[ "$(cast code "$BRIDGE" --rpc-url "$L2B_RPC" 2>/dev/null | head -c 4)" == "0x60" ]] || return 1
@@ -520,14 +520,17 @@ l2l2_validate_stack() {
     # (a) all l2l2 containers healthy
     local c
     for c in miden-agglayer miden-node tx-prover anvil anvil-l2b aggkit aggkit-l2b \
-             bridge-service agglayer postgres agglayer-postgres; do
+             bridge-service agglayer postgres agglayer-postgres \
+             postgres-l2b bridge-service-l2b; do
         _pf_container "$c"
     done
     # port-collision hygiene for the ports the flows dial
     _pf_port_owner_ok 8545 anvil-L1
     _pf_port_owner_ok 9545 anvil-l2b
     _pf_port_owner_ok 18080 bridge-service
+    _pf_port_owner_ok 28080 bridge-service-l2b
     _pf_port_owner_ok 5434 agglayer-postgres
+    _pf_port_owner_ok 5435 postgres-l2b
 
     # (b) rollup #2 registered on L1
     local rd sovc rchain rvtype

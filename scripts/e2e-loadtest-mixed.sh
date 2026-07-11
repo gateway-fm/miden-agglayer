@@ -48,7 +48,7 @@ N_L1_BACK="${N_L1_BACK:-10}"        # Miden->L1 bridge-outs (sequential, auto-cl
 L2L2_FWD="${L2L2_FWD:-5}"           # L2B->Miden deposits (client-submit claim on Miden)
 L2L2_BACK="${L2L2_BACK:-5}"         # Miden->L2B bridge-outs (client-submit claim on L2B)
 SKIP_L1_LOAD="${SKIP_L1_LOAD:-0}"
-TOOL_BIN="${TOOL_BIN:-/home/mandrigin/miden-agglayer/target/debug/bridge-out-tool}"
+TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"   # repo-local default; override with $TOOL_BIN
 
 FWD_SEED_WEI="${FWD_SEED_WEI:-5000000000000000}"    # 0.005 MOP -> 500000 units (faucet + pool for back ops)
 FWD_OP_WEI="${FWD_OP_WEI:-1000000000000000}"        # 0.001 MOP -> 100000 units per L2B->Miden op
