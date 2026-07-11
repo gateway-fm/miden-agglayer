@@ -58,6 +58,9 @@ l2l2_ensure_stack
 if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
 l2l2_miden_identities
 evidence_init 2>/dev/null || true
+# Deploy the NDG nudge token (sets $NDG) — step 5's nudge_until drives L2B cert cycles
+# so the covering GER reaches Miden for the native claim-back (proxy C6 has_seen_ger gate).
+l2l2_deploy_nudge_token
 
 # ── 1. Two-party setup: external deploy, then proxy (admin) allowlist ─────────
 # The Miden bridge is a PERMISSIONED ALLOWLIST: a faucet is non-bridgeable until the
@@ -94,9 +97,14 @@ pass "proxy allowlisted native faucet on the bridge (origin_network=$MIDEN_NETWO
 
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> L2B (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
-# Bridge OUT to ADMIN (an address we control on L2B) so we can bridge the wrapped token
-# BACK in step 4 (a fresh keyless address would strand the wrapped token there).
-BACK_DEST="$ADMIN"
+# Bridge OUT to a FRESH funded account whose key we KEEP, so step 4 can approve + bridge
+# the wrapped token BACK. NOT ADMIN: ADMIN is the proxy-admin of bridge-deployed wrapped
+# tokens (TransparentUpgradeableProxy blocks its admin from calling ERC20 fns like approve).
+BACK_KEYS=$(cast wallet new)
+BACK_DEST=$(echo "$BACK_KEYS" | awk '/Address:/{print $2}')
+BACK_KEY=$(echo "$BACK_KEYS" | awk '/Private key:/{print $3}')
+[[ -n "$BACK_DEST" && -n "$BACK_KEY" ]] || fail "could not generate BACK_DEST account"
+cast rpc anvil_setBalance "$BACK_DEST" 0xde0b6b3a7640000 --rpc-url "$L2B_RPC" >/dev/null 2>&1 || true
 # --asset-callbacks-disabled: a native operator faucet mints via FungibleAsset::new
 # (callbacks DISABLED), so its assets live in the disabled vault slot (AggLayer wrapped
 # faucets use the enabled slot). Bridge OUT from the matching slot.
@@ -137,11 +145,12 @@ WRAPPED_L2B=$(cast call "$BRIDGE" "getTokenWrappedAddress(uint32,address)(addres
     "$MIDEN_NETWORK_ID" "$NATIVE_ORIGIN_ADDR" --rpc-url "$L2B_RPC" 2>/dev/null | awk '{print $1}')
 [[ -n "$WRAPPED_L2B" && "$WRAPPED_L2B" != 0x0000000000000000000000000000000000000000 ]] \
     || fail "no wrapped native-Miden token on L2B for ($NATIVE_ORIGIN_ADDR, net $MIDEN_NETWORK_ID)"
+# Use BACK_KEY (the wrapped-token holder), NOT ADMIN_KEY — ADMIN is the wrapped-proxy admin.
 cast send "$WRAPPED_L2B" "approve(address,uint256)" "$BRIDGE" "$OUT_AMT" \
-    --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" >/dev/null || fail "approve wrapped on L2B"
+    --private-key "$BACK_KEY" --rpc-url "$L2B_RPC" >/dev/null || fail "approve wrapped on L2B"
 BACK_TX=$(cast send "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
     "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$OUT_AMT" "$WRAPPED_L2B" true 0x \
-    --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" --json 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('transactionHash',''))") \
+    --private-key "$BACK_KEY" --rpc-url "$L2B_RPC" --json 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('transactionHash',''))") \
     || fail "bridgeAsset (wrapped back) on L2B failed"
 pass "wrapped burned + bridged L2B -> Miden (tx $BACK_TX)"
 
