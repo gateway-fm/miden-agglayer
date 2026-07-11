@@ -523,13 +523,17 @@ async fn main() -> anyhow::Result<()> {
         use miden_agglayer_service::miden_client::{
             submit_new_transaction, wait_for_transaction_commit,
         };
+        use miden_client::account::AccountBuilderSchemaCommitmentExt;
         use miden_client::crypto::FeltRng;
         use miden_client::keystore::Keystore;
         use miden_client::transaction::TransactionRequestBuilder;
         use miden_protocol::account::{Account, AccountType};
-        use miden_protocol::asset::{AssetAmount, TokenSymbol};
+        use miden_protocol::asset::TokenSymbol;
         use miden_protocol::note::{Note, NoteType};
         use miden_standards::account::faucets::{FungibleFaucet, TokenName};
+        use miden_standards::account::policies::{
+            BurnPolicyConfig, MintPolicyConfig, PolicyRegistration, TokenPolicyManager,
+        };
 
         let wallet_hex = args
             .wallet_id
@@ -548,15 +552,25 @@ async fn main() -> anyhow::Result<()> {
             .name(name)
             .symbol(symbol)
             .decimals(args.native_decimals)
-            .max_supply(AssetAmount::new(u64::MAX / 2).unwrap())
+            .max_supply(FungibleAsset::MAX_AMOUNT)
             .build()
             .map_err(|e| anyhow!("faucet builder failed: {e:?}"))?;
+        // Mint/burn policies (AllowAll) — REQUIRED for the faucet to mint; without the
+        // policy slots the mint tx aborts with "storage slot ... does not exist". Only
+        // mint/burn (no transfer policies — those force AssetCallbackFlag::Enabled keys,
+        // which FungibleAsset::new does not set).
+        let policy_manager = TokenPolicyManager::new()
+            .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
+            .map_err(|e| anyhow!("mint policy failed: {e:?}"))?
+            .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
+            .map_err(|e| anyhow!("burn policy failed: {e:?}"))?;
         let (auth_component, key_pair) = create_auth_component(&mut client)?;
         let faucet = Account::builder(client.rng().draw_word().into())
             .account_type(AccountType::Public)
             .with_component(faucet_component)
+            .with_components(policy_manager)
             .with_auth_component(auth_component)
-            .build()
+            .build_with_schema_commitment()
             .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
         keystore.add_key(&key_pair, faucet.id()).await?;
         client.add_account(&faucet, false).await?;
