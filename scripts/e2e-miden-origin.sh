@@ -95,8 +95,12 @@ pass "proxy allowlisted native faucet on the bridge (origin_network=$MIDEN_NETWO
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> L2B (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
 BACK_DEST=$(cast wallet new | awk '/Address:/{print $2}')
+# --asset-callbacks-disabled: a native operator faucet mints via FungibleAsset::new
+# (callbacks DISABLED), so its assets live in the disabled vault slot (AggLayer wrapped
+# faucets use the enabled slot). Bridge OUT from the matching slot.
 iso_tool --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$NATIVE_FAUCET_ID" \
     --amount "$OUT_UNITS" --dest-address "$BACK_DEST" --dest-network "$L2B_NETWORK_ID" \
+    --asset-callbacks-disabled \
     || fail "bridge-out-tool failed for native faucet (destNet=$L2B_NETWORK_ID)"
 # DISCOVERY assertion: the synthetic BridgeEvent for this bridge-out must carry
 # originNetwork == the proxy's configured net id (read from the discovered native

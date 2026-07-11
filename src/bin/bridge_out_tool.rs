@@ -189,6 +189,16 @@ struct Args {
     /// Units of the native token to mint to --wallet-id under --create-native-faucet.
     #[arg(long, default_value_t = 0)]
     mint_units: u64,
+
+    /// Bridge out from the wallet vault's callbacks-DISABLED slot. AggLayer
+    /// (bridge-owned wrapped) faucets register callbacks ENABLED (the default here), so
+    /// their bridged-in assets live in the enabled slot. A Miden-NATIVE operator faucet
+    /// (--create-native-faucet) mints via `FungibleAsset::new`, which defaults callbacks
+    /// DISABLED — its assets live in the disabled slot. Set this when bridging OUT a
+    /// Miden-originated (native) token, or the b2agg tx aborts with "amount in the vault
+    /// is less than the amount to remove" (it would address the empty enabled slot).
+    #[arg(long)]
+    asset_callbacks_disabled: bool,
 }
 
 impl std::fmt::Debug for Args {
@@ -1009,9 +1019,14 @@ async fn main() -> anyhow::Result<()> {
     // callbacks DISABLED, so a default-flag asset addresses a different (empty)
     // vault slot and the bridge-out tx fails with "amount in the vault is less
     // than the amount to remove". Match the vault by enabling callbacks.
+    let cb_flag = if args.asset_callbacks_disabled {
+        AssetCallbackFlag::Disabled // Miden-native operator faucet: assets in the disabled slot
+    } else {
+        AssetCallbackFlag::Enabled // AggLayer bridge-owned wrapped faucet: enabled slot
+    };
     let asset: Asset = FungibleAsset::new(faucet_id, args.amount)
         .map_err(|e| anyhow!("invalid asset: {e}"))?
-        .with_callbacks(AssetCallbackFlag::Enabled)
+        .with_callbacks(cb_flag)
         .into();
     let note_assets = NoteAssets::new(vec![asset]).map_err(|e| anyhow!("note assets: {e}"))?;
 
