@@ -50,14 +50,40 @@ GER_ROOT=$(awk -F= '$1=="ger"{print $2}' "$TMP/roots")
 BRIDGE_ID="${BRIDGE_ID:-$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -oE "deploying bridge account 0x[0-9a-f]+" | head -1 | awk '{print $NF}')}"
 [[ -n "$BRIDGE_ID" ]] || { echo "FAIL: bridge account id not found in proxy logs"; exit 1; }
 
-# 3. Snapshot the node DB (truth), then give the projector's late-consumption
-#    sweep a settle margin before reading logs. GER injections flow
+# 3. Snapshot the node DB (truth), then wait for the synthetic projector to
+#    catch up to that snapshot before reading logs. GER injections flow
 #    CONTINUOUSLY (aggoracle), so there is no global quiescence — instead the
 #    python below applies a consistency cut at the snapshot's chain tip:
 #    only notes consumed ≤ tip are expected, and only logs ≤ tip can be
 #    "extra" (later logs may belong to post-snapshot consumptions).
 docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3 > "$TMP/node.sqlite3" \
     || { echo "FAIL: cannot snapshot node store"; exit 1; }
+
+# BARRIER-AWARE SETTLE (vb #30). The visibility barrier holds synthetic
+# projection at project_to = min(tip, reconcile_cursor), so under load a note
+# consumed at/below the snapshot tip may not be SEALED yet — its BridgeEvent
+# then reads as MISSING though the barrier is working exactly as designed
+# (0 late). A blind fixed sleep is a race: heavier load (N=30 vs N=20) makes the
+# reconciler lag more, so the timer expires before the last note's block is
+# projected. Instead, snapshot FIRST (fixes the cut), then WAIT for the projector
+# to report projector_cursor >= that cut. The tip only grows, so cursor >= cut
+# guarantees every note consumed <= cut has been projected (its BridgeEvent
+# sealed). On timeout we fall through and count anyway, so a genuinely stuck
+# barrier FAILS loud rather than hanging.
+cut=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT max(block_num) FROM block_headers').fetchone()[0] or 0)" "$TMP/node.sqlite3")
+catchup_timeout="${PROJECTOR_CATCHUP_TIMEOUT:-300}"; waited=0; cur=""
+echo "barrier-aware settle: waiting for projector_cursor >= ${cut} (snapshot tip)…"
+while [ "$waited" -lt "$catchup_timeout" ]; do
+    cur=$(docker logs --tail 40 "$AGGLAYER_CONTAINER" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' \
+          | grep -oE 'projector_cursor: [0-9]+' | tail -1 | awk '{print $2}')
+    if [ -n "$cur" ] && [ "$cur" -ge "$cut" ]; then
+        echo "  projector reached cursor=${cur} >= ${cut} after ${waited}s"; break
+    fi
+    sleep 5; waited=$((waited + 5))
+done
+[ "$waited" -ge "$catchup_timeout" ] && \
+    echo "  WARN: projector_cursor (${cur:-none}) did not reach ${cut} within ${catchup_timeout}s — counting anyway (a genuinely stuck barrier will now FAIL loud)"
+# Small extra margin for eth_getLogs / synthetic-store read propagation.
 sleep "${SETTLE_MARGIN_SECS:-20}"
 
 # 4. Cross-check.
