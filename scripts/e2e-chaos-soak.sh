@@ -39,7 +39,7 @@ POST_CHAOS_SETTLE="${POST_CHAOS_SETTLE:-150}"
 L2L2_FWD="${L2L2_FWD:-2}"
 L2L2_BACK="${L2L2_BACK:-2}"
 FRESH="${FRESH:-0}"
-TOOL_BIN="${TOOL_BIN:-/home/mandrigin/miden-agglayer/target/debug/bridge-out-tool}"
+TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"   # repo-local default; override with $TOOL_BIN
 
 CHAOS_LOG="${CHAOS_LOG:-/tmp/chaos-events.log}"
 GARBO_LOG="${GARBO_LOG:-/tmp/chaos-garbo.log}"
@@ -104,7 +104,10 @@ NET="$(docker inspect "$AGGLAYER_CONTAINER" --format '{{range $k,$v := .NetworkS
 # reconnect WITH the compose alias (a plain connect drops 'miden-node' resolution)
 [ -n "$NET" ] && docker network connect --alias miden-node "$NET" "${PROJECT}-miden-node-1" >/dev/null 2>&1 || true
 for c in tx-prover-1 miden-agglayer-1; do docker start "${PROJECT}-$c" >/dev/null 2>&1 || true; done
-FAULTS_DONE=$(grep -c "FAULT " "$CHAOS_LOG" 2>/dev/null || echo 0)
+# grep -c prints "0" AND exits 1 on no match; `|| echo 0` would then append a second "0"
+# (FAULTS_DONE="0\n0", non-numeric). `|| true` swallows the exit and keeps the single count.
+# Excludes SKIPPED faults (see chaos-seeder.sh: skipped faults are logged without "FAULT ").
+FAULTS_DONE=$(grep -c "FAULT " "$CHAOS_LOG" 2>/dev/null || true); FAULTS_DONE="${FAULTS_DONE:-0}"
 say "chaos stopped: $FAULTS_DONE faults injected (log: $CHAOS_LOG)"
 # shellcheck disable=SC1090
 [[ -f "$GARBO_SUMMARY" ]] && source "$GARBO_SUMMARY" || true
@@ -167,9 +170,17 @@ say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=
 # crashed driver means the full mixed load never ran, so it must NOT green even
 # if the (reduced) traffic verifies — else a dead driver false-passes.
 LEGIT_OK=0; [[ "$VC_RC" == "0" && "${LOCKS:-1}" == "0" && "$LT_RC" == "0" ]] && LEGIT_OK=1
+# (c) chaos ACTUALLY happened — a soak that injected no infra faults or fired no garbo
+# class would otherwise false-pass on an empty run. Require >=1 injected fault AND each
+# enabled garbo class fired (private always; foreign only when GARBO_FOREIGN=1).
+CHAOS_OK=1
+[[ "${FAULTS_DONE:-0}" -ge 1 ]]              || CHAOS_OK=0
+[[ "${GARBO_PRIVATE_FIRED:-0}" -ge 1 ]]      || CHAOS_OK=0
+[[ "${GARBO_FOREIGN:-1}" != "1" || "${GARBO_FOREIGN_FIRED:-0}" -ge 1 ]] || CHAOS_OK=0
 say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC locks=$LOCKS loadtest_rc=$LT_RC)"
 say "    (b) GARBO containment:  $([[ $GARBO_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK)"
-if [[ "$LEGIT_OK" == "1" && "$GARBO_OK" == "1" ]]; then
+say "    (c) CHAOS actually fired: $([[ $CHAOS_OK == 1 ]] && echo PASS || echo FAIL)  (faults=${FAULTS_DONE:-0} private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
+if [[ "$LEGIT_OK" == "1" && "$GARBO_OK" == "1" && "$CHAOS_OK" == "1" ]]; then
     say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"
     say "======================================================================"
     exit 0

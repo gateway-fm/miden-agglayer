@@ -71,32 +71,48 @@ restore_all() {
 trap restore_all EXIT
 
 # ── individual faults (each self-bounded + self-restoring) ──────────────────
+# The soak counts INJECTED faults via `grep -c "FAULT "`. This script runs WITHOUT
+# `set -e` and docker exit codes are otherwise unchecked, so the "FAULT " (counted)
+# marker is emitted ONLY AFTER the docker operation that actually injects the fault
+# SUCCEEDS. A failed docker pause/restart/disconnect logs "SKIP" (not counted), so a
+# fault that never took effect can't satisfy the soak's CHAOS_OK "chaos actually fired"
+# gate. Recovery ops (unpause/reconnect) are best-effort and don't gate the count.
 fault_pause_pg() {
     local dur=$(( 4 + RANDOM % 8 ))   # 4-11s stall
-    log "FAULT pause-pg ($dur s) — proxy store unavailable"
-    docker pause "$PG" >/dev/null 2>&1
-    sleep "$dur"
-    docker unpause "$PG" >/dev/null 2>&1
-    log "  -> pg unpaused"
+    if docker pause "$PG" >/dev/null 2>&1; then
+        log "FAULT pause-pg ($dur s) — proxy store unavailable (injected)"
+        sleep "$dur"
+        docker unpause "$PG" >/dev/null 2>&1 || log "  WARN: pg unpause failed"
+        log "  -> pg unpaused"
+    else
+        log "SKIP pause-pg (docker pause $PG failed — not injected)"
+    fi
 }
 fault_kill_prover() {
-    log "FAULT kill-prover — restart tx-prover mid-proof"
-    docker restart -t 2 "$PROVER" >/dev/null 2>&1
-    log "  -> prover restarted"
+    if docker restart -t 2 "$PROVER" >/dev/null 2>&1; then
+        log "FAULT kill-prover — restart tx-prover mid-proof (injected)"
+    else
+        log "SKIP kill-prover (docker restart $PROVER failed — not injected)"
+    fi
 }
 fault_restart_proxy() {
-    log "FAULT restart-proxy — crash the proxy mid-flight (tests cursor persist + late-sweep heal)"
-    docker restart -t 2 "$PROXY" >/dev/null 2>&1
-    log "  -> proxy restarted"
+    if docker restart -t 2 "$PROXY" >/dev/null 2>&1; then
+        log "FAULT restart-proxy — crash the proxy mid-flight (injected; tests cursor persist + late-sweep heal)"
+    else
+        log "SKIP restart-proxy (docker restart $PROXY failed — not injected)"
+    fi
 }
 fault_partition_node() {
     local dur=$(( 5 + RANDOM % 10 ))  # 5-14s partition
-    [ -z "${NET:-}" ] && { log "FAULT partition-node SKIPPED (no network found)"; return; }
-    log "FAULT partition-node ($dur s) — cut proxy<->node link"
-    docker network disconnect "$NET" "$NODE" >/dev/null 2>&1
-    sleep "$dur"
-    _reconnect_node    # restore WITH the compose alias(es) — else name resolution stays broken
-    log "  -> node reconnected (aliases: $NODE_ALIASES)"
+    [ -z "${NET:-}" ] && { log "SKIP partition-node (no network found — not injected)"; return; }
+    if docker network disconnect "$NET" "$NODE" >/dev/null 2>&1; then
+        log "FAULT partition-node ($dur s) — cut proxy<->node link (injected)"
+        sleep "$dur"
+        _reconnect_node    # restore WITH the compose alias(es) — else name resolution stays broken
+        log "  -> node reconnected (aliases: $NODE_ALIASES)"
+    else
+        log "SKIP partition-node (docker network disconnect failed — not injected)"
+    fi
 }
 
 FAULTS=(fault_pause_pg fault_kill_prover fault_restart_proxy fault_partition_node)
