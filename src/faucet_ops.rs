@@ -25,6 +25,7 @@ use miden_protocol::account::{Account, AccountId};
 /// 2. Deploy it to the Miden network
 /// 3. Register it in the bridge via `ConfigAggBridgeNote` (required for CLAIM FPI validation)
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_and_register_faucet(
     client: &mut MidenClientLib,
     symbol: &str,
@@ -35,6 +36,9 @@ pub async fn create_and_register_faucet(
     service_id: AccountId,
     bridge_id: AccountId,
     metadata_hash: MetadataHash,
+    // See register_faucet_in_bridge: true = Miden-native lock/unlock faucet (external
+    // tooling only). Proxy callers pass false (bridge-owned mint/burn).
+    is_native: bool,
 ) -> anyhow::Result<Account> {
     let max_supply =
         Felt::new(u64::from(FungibleAsset::MAX_AMOUNT)).expect("value is a valid field element");
@@ -89,6 +93,7 @@ pub async fn create_and_register_faucet(
         scale,
         metadata_hash,
         symbol,
+        is_native,
     )
     .await?;
 
@@ -198,9 +203,15 @@ pub async fn register_faucet_in_bridge(
     scale: u8,
     metadata_hash: MetadataHash,
     faucet_name: &str,
+    // is_native=true registers a Miden-ORIGINATED (lock/unlock) faucet: the on-chain
+    // bridge LOCKs it on bridge-out and UNLOCKs on claim (is_faucet_native branch)
+    // instead of mint/burn. Every faucet the PROXY creates is a bridge-owned mint/burn
+    // faucet for an L1/L2B-origin token (is_native=false); only external tooling (the
+    // bridge-out app's --create-native-faucet) registers native faucets on the bridge.
+    is_native: bool,
 ) -> anyhow::Result<()> {
     tracing::info!(
-        "registering {} faucet {} in bridge {}...",
+        "registering {} faucet {} in bridge {} (is_native={is_native})...",
         faucet_name,
         AccountIdBech32(faucet_id),
         AccountIdBech32(bridge_id),
@@ -212,7 +223,7 @@ pub async fn register_faucet_in_bridge(
             origin_token_address: *origin_token_address,
             scale,
             origin_network,
-            is_native: false,
+            is_native,
             metadata_hash,
         },
         service_id,

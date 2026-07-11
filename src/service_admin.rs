@@ -222,6 +222,7 @@ pub async fn admin_register_faucet(
                     service_id,
                     bridge_id,
                     metadata_hash,
+                    false, // admin_registerFaucet: bridge-owned mint/burn (not Miden-native)
                 )
                 .await?;
                 let _ = result_inner.set(account.id());

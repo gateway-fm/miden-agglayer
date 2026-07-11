@@ -467,6 +467,7 @@ async fn main() -> anyhow::Result<()> {
             service.id(),
             bridge.id(),
             MetadataHash::from_abi_encoded(&[]),
+            false, // foreign ETH faucet: bridge-owned mint/burn (not Miden-native)
         )
         .await
         .map_err(|e| anyhow!("foreign faucet creation/registration failed: {e:?}"))?;

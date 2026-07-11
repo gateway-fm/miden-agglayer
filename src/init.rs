@@ -130,6 +130,7 @@ async fn add_faucet(
         service_id,
         bridge_account_id,
         metadata_hash,
+        false, // proxy-created faucet: bridge-owned mint/burn (not Miden-native)
     )
     .await
 }
