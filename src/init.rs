@@ -41,7 +41,9 @@ impl From<Accounts> for AccountsConfig {
     }
 }
 
-fn create_auth_component(
+// pub so external operator tooling (bridge-out app's --create-native-faucet) can
+// create a NON-service, operator-owned faucet with the same auth scheme as the proxy.
+pub fn create_auth_component(
     client: &mut MidenClientLib,
 ) -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
     let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());

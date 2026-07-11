@@ -59,27 +59,38 @@ if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
 l2l2_miden_identities
 evidence_init 2>/dev/null || true
 
-# ── 1. Register a NATIVE Miden faucet on the bridge + mint initial supply ─────
-# GREEN work: admin_registerNativeFaucet creates an OPERATOR-owned faucet (not a
-# bridge mint/burn faucet), registers it on the bridge with is_native=true +
-# origin_network == the proxy's configured net id + NATIVE_ORIGIN_ADDR, and mints
-# MINT_UNITS to $BRIDGE_ID's wallet. Returns {faucet_id}.
-step "1. Register native Miden faucet (is_native=true, origin_network=$MIDEN_NETWORK_ID) + mint $MINT_UNITS"
+# ── 1. Two-party setup: external deploy, then proxy (admin) allowlist ─────────
+# The Miden bridge is a PERMISSIONED ALLOWLIST: a faucet is non-bridgeable until the
+# bridge admin registers it (ConfigAggBridgeNote, admin-only). The admin is the
+# proxy's `service` account — so only the PROXY can register. Realistic flow:
+#   1a. EXTERNAL party (bridge-out tool) DEPLOYS an operator faucet + mints. No admin.
+#   1b. PROXY (admin) REGISTERS/allowlists it native on the bridge + records it.
+step "1a. External (bridge-out tool) deploys an operator faucet on Miden + mints $MINT_UNITS (custom symbol MDN)"
+# RED infra: bridge-out tool --create-native-faucet deploys an operator-owned faucet
+# with a CUSTOM symbol/decimals and mints MINT_UNITS to the wallet. Prints faucet-id.
+NATIVE_FAUCET_ID=$(iso_tool --create-native-faucet --native-symbol "MDN" --native-decimals 8 \
+    --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" 2>&1 | awk '/faucet-id:/{print $NF}') \
+  || true
+[[ -n "$NATIVE_FAUCET_ID" ]] || fail "bridge-out-tool --create-native-faucet did not deploy a faucet (NOT YET IMPLEMENTED — RED infra)"
+pass "external party deployed native faucet: $NATIVE_FAUCET_ID + minted $MINT_UNITS MDN"
+
+step "1b. Proxy (bridge ADMIN) allowlists the faucet as native (is_native=true, origin_network=$MIDEN_NETWORK_ID)"
+# Only the proxy (bridge admin = service account) can register. admin_registerNativeFaucet
+# takes the EXTERNALLY-deployed faucet_id + its chosen origin_address and sends the
+# admin ConfigAggBridgeNote (is_native=true, origin_network = the CONFIGURED net id).
 REG_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
   \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
-  \"params\":[{\"symbol\":\"MDN\",\"name\":\"MidenNative\",\"decimals\":8,
-    \"origin_token_address\":\"$NATIVE_ORIGIN_ADDR\",\"mint_units\":$MINT_UNITS,
-    \"dest\":\"$BRIDGE_ID\"}]}" 2>/dev/null) \
-  || fail "admin_registerNativeFaucet unreachable (NOT YET IMPLEMENTED — this is the RED)"
-NATIVE_FAUCET_ID=$(echo "$REG_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('faucet_id',''))" 2>/dev/null)
-[[ -n "$NATIVE_FAUCET_ID" ]] || fail "admin_registerNativeFaucet returned no faucet_id: $REG_JSON"
-pass "native faucet registered: $NATIVE_FAUCET_ID (origin_network=$MIDEN_NETWORK_ID)"
-
-# The proxy MUST record is_native via origin_network == its own network id (not a
-# separate column). Verify the registry row reads back native.
+  \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$NATIVE_ORIGIN_ADDR\",
+    \"symbol\":\"MDN\",\"decimals\":8}]}" 2>/dev/null) \
+  || fail "admin_registerNativeFaucet unreachable (NOT YET IMPLEMENTED — the GREEN registration endpoint)"
+echo "$REG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if 'result' in d else 1)" \
+  || fail "admin_registerNativeFaucet failed: $REG_JSON"
+# The proxy records origin_network == its OWN configured network id (is_native is
+# derived from origin_network == service.network_id — no separate column).
 NATIVE_NET=$(pgq "SELECT origin_network FROM faucet_registry WHERE lower(faucet_id)=lower('$NATIVE_FAUCET_ID');")
 [[ "$NATIVE_NET" == "$MIDEN_NETWORK_ID" ]] \
   || fail "native faucet origin_network=$NATIVE_NET, expected $MIDEN_NETWORK_ID (proxy must record the CONFIGURED net id)"
+pass "proxy allowlisted native faucet on the bridge (origin_network=$MIDEN_NETWORK_ID)"
 
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> L2B (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
