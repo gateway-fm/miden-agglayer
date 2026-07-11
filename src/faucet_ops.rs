@@ -66,7 +66,6 @@ pub fn classify_faucet_account(
 /// 2. Deploy it to the Miden network
 /// 3. Register it in the bridge via `ConfigAggBridgeNote` (required for CLAIM FPI validation)
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub async fn create_and_register_faucet(
     client: &mut MidenClientLib,
     symbol: &str,

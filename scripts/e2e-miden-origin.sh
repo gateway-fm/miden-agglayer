@@ -92,7 +92,7 @@ step "1a. External (bridge-out tool) deploys an operator faucet on Miden + mints
 NATIVE_FAUCET_ID=$(iso_tool --create-native-faucet --native-symbol "MDN" --native-decimals 8 \
     --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" 2>&1 | awk '/faucet-id:/{print $NF}') \
   || true
-[[ -n "$NATIVE_FAUCET_ID" ]] || fail "bridge-out-tool --create-native-faucet did not deploy a faucet (NOT YET IMPLEMENTED — RED infra)"
+[[ -n "$NATIVE_FAUCET_ID" ]] || fail "bridge-out-tool --create-native-faucet did not print a faucet-id — deploy/mint failed (check the tool output above)"
 pass "external party deployed native faucet: $NATIVE_FAUCET_ID + minted $MINT_UNITS MDN"
 
 step "1b. Proxy (bridge ADMIN) allowlists the faucet as native (is_native=true, origin_network=$MIDEN_NETWORK_ID)"
@@ -103,7 +103,7 @@ REG_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEA
   \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
   \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$NATIVE_ORIGIN_ADDR\",
     \"symbol\":\"MDN\",\"decimals\":8}]}" 2>/dev/null) \
-  || fail "admin_registerNativeFaucet unreachable (NOT YET IMPLEMENTED — the GREEN registration endpoint)"
+  || fail "admin_registerNativeFaucet unreachable — check the proxy is up on $L2_RPC and ADMIN_API_KEY is valid"
 echo "$REG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if 'result' in d else 1)" \
   || fail "admin_registerNativeFaucet failed: $REG_JSON"
 # The proxy records origin_network == its OWN configured network id (is_native is

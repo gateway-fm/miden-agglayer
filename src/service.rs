@@ -648,7 +648,11 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 request.parse_params()?;
             let result =
                 crate::service_admin::admin_register_native_faucet(service, params.0).await;
-            json_rpc_response_from_result(result, answer_id, ServiceErrorCode::AdminRegisterFaucet)
+            json_rpc_response_from_result(
+                result,
+                answer_id,
+                ServiceErrorCode::AdminRegisterNativeFaucet,
+            )
         }
 
         "admin_listFaucets" => {

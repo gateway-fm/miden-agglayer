@@ -308,17 +308,21 @@ pub async fn admin_register_native_faucet(
 
     // Idempotent: an existing native route for this (origin_address, origin_network) is
     // returned as-is (register-if-absent), matching admin_registerFaucet's contract.
-    if state
+    if let Some(existing) = state
         .store
         .get_faucet_by_origin(&origin_address, origin_network)
         .await?
-        .is_some()
     {
+        // Return the EXISTING route's faucet_id, not the caller-supplied one: the origin
+        // is already bound to `existing.faucet_id`, and echoing the caller's (possibly
+        // different) id would falsely imply THAT faucet is the registered route.
         tracing::info!(
             origin_network,
-            "admin_registerNativeFaucet: a route already exists for this origin — returning it"
+            existing_faucet_id = %existing.faucet_id.to_hex(),
+            requested_faucet_id = %faucet_id.to_hex(),
+            "admin_registerNativeFaucet: a route already exists for this origin — returning the existing route's faucet"
         );
-        return Ok(faucet_id.to_hex());
+        return Ok(existing.faucet_id.to_hex());
     }
 
     // abi.encode(name, symbol, decimals) — same preimage the bridge/L2 wrapped-token
