@@ -127,9 +127,12 @@ impl FaucetRegistryReconciler {
     async fn poll_once(&self, streaks: &mut HashMap<AccountId, u32>) -> anyhow::Result<()> {
         let bridge_id = self.bridge_id;
         let store = self.store.clone();
-        let unknown: Arc<std::sync::Mutex<Vec<AccountId>>> =
+        // Anomalous bridge faucets this tick, each with a human reason. Two anomaly classes:
+        //   - no local store row (registered outside the proxy — admin key used elsewhere)
+        //   - unknown faucet TYPE (account matches no supported kind — malformed/hostile)
+        let anomalies: Arc<std::sync::Mutex<Vec<(AccountId, String)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let unknown_inner = unknown.clone();
+        let anomalies_inner = anomalies.clone();
 
         self.miden_client
             .with(move |client| {
@@ -141,11 +144,26 @@ impl FaucetRegistryReconciler {
                         return Ok(());
                     };
                     let ids = enumerate_registered_faucet_ids(bridge_account.storage());
-                    let mut missing = Vec::new();
+                    let mut found = Vec::new();
                     for id in ids {
+                        // Type check FIRST — only when the faucet account is locally synced,
+                        // so sync lag (account not yet imported) is skipped this tick rather
+                        // than mistaken for an unsupported type.
+                        if let Ok(Some(acct)) = client.get_account(id).await
+                            && let Err(e) = crate::faucet_ops::classify_faucet_account(&acct)
+                        {
+                            found.push((id, format!("unknown faucet TYPE: {e}")));
+                            continue;
+                        }
+                        // Store membership. A read error is treated as "known" this tick so an
+                        // infra blip cannot trip the wire.
                         match store.get_faucet_by_id(id).await {
                             Ok(Some(_)) => {}
-                            Ok(None) => missing.push(id),
+                            Ok(None) => found.push((
+                                id,
+                                "no local faucet_registry row (registered outside the proxy)"
+                                    .to_string(),
+                            )),
                             Err(e) => tracing::warn!(
                                 faucet_id = %id,
                                 error = ?e,
@@ -153,22 +171,30 @@ impl FaucetRegistryReconciler {
                             ),
                         }
                     }
-                    *unknown_inner.lock().unwrap() = missing;
+                    *anomalies_inner.lock().unwrap() = found;
                     Ok(())
                 })
             })
             .await?;
 
-        let observed = unknown.lock().unwrap().clone();
+        let found = anomalies.lock().unwrap().clone();
+        let observed: Vec<AccountId> = found.iter().map(|(id, _)| *id).collect();
+        let reasons: HashMap<AccountId, String> = found.into_iter().collect();
 
         if let Some(tripped) = Self::evaluate(&observed, streaks, self.grace_ticks) {
+            let reason = reasons
+                .get(&tripped)
+                .map(String::as_str)
+                .unwrap_or("anomalous bridge faucet");
             tracing::error!(
                 faucet_id = %tripped,
+                reason,
                 grace_ticks = self.grace_ticks,
-                "SECURITY TRIPWIRE: the bridge registers a faucet the proxy has NO local \
-                 faucet_registry row for, persisting past the grace window. The bridge admin \
-                 key was used OUTSIDE the proxy (compromise or leaked key). Halting fail-closed. \
-                 Import it via --restore only after confirming the registration is legitimate."
+                "SECURITY TRIPWIRE: the bridge registers a faucet that is anomalous \
+                 (see `reason`), persisting past the grace window. Either the bridge admin key \
+                 was used OUTSIDE the proxy (compromise/leak) or an unsupported faucet type was \
+                 registered. Halting fail-closed. Import a legitimate faucet via --restore only \
+                 after confirming it."
             );
             metrics::counter!("faucet_registry_reconciler_unknown_faucet_total").increment(1);
             // Let tracing flush the fatal line before the process dies.
