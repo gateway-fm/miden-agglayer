@@ -94,7 +94,9 @@ pass "proxy allowlisted native faucet on the bridge (origin_network=$MIDEN_NETWO
 
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> L2B (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
-BACK_DEST=$(cast wallet new | awk '/Address:/{print $2}')
+# Bridge OUT to ADMIN (an address we control on L2B) so we can bridge the wrapped token
+# BACK in step 4 (a fresh keyless address would strand the wrapped token there).
+BACK_DEST="$ADMIN"
 # --asset-callbacks-disabled: a native operator faucet mints via FungibleAsset::new
 # (callbacks DISABLED), so its assets live in the disabled vault slot (AggLayer wrapped
 # faucets use the enabled slot). Bridge OUT from the matching slot.
@@ -111,16 +113,21 @@ pass "native bridge-out emitted BridgeEvent originNetwork=$MIDEN_NETWORK_ID (dis
 
 # ── 3. Claim on L2B — wrapped native-Miden token minted (foreign origin) ──────
 step "3. Claim on L2B (wrapped native-Miden minted, origin_network=$MIDEN_NETWORK_ID)"
-wait_for "Miden->L2B native deposit ready_for_claim" 600 5 \
+# Native tokens are registered scale=0, so amounts stay UNSCALED (Miden units) end-to-end.
+# The claimAsset amount MUST equal the deposit's leaf amount — using OUT_UNITS*WEI_PER_MIDEN_UNIT
+# would make the L2B bridge compute a different leaf and revert with InvalidSmtProof.
+# Timeout is generous: a single native deposit on an otherwise-quiet chain certifies slower
+# than the l2l2 group (which generates constant cert-triggering traffic).
+wait_for "Miden->L2B native deposit ready_for_claim" 1200 5 \
     _pred_deposit_ready "$BACK_DEST" "$MIDEN_NETWORK_ID" "$(echo "$NATIVE_ORIGIN_ADDR" | tr 'A-F' 'a-f')" "$L2B_NETWORK_ID"
 BACK_DEP=$(find_deposit "$BACK_DEST" "$MIDEN_NETWORK_ID" "$(echo "$NATIVE_ORIGIN_ADDR" | tr 'A-F' 'a-f')")
 [[ -n "$BACK_DEP" ]] || fail "native Miden->L2B deposit not indexed"
 OUT_CNT=$(dep_field "$BACK_DEP" deposit_cnt); OUT_GI=$(dep_field "$BACK_DEP" global_index)
+OUT_AMT=$(dep_field "$BACK_DEP" amount)   # leaf-authoritative (unscaled for native)
 OUT_META=$(echo "$BACK_DEP" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m!='0x' else '0x')")
-OUT_WEI=$((OUT_UNITS * WEI_PER_MIDEN_UNIT))
-CLAIM_TX=$(submit_back_claim "$OUT_CNT" "$OUT_GI" "$MIDEN_NETWORK_ID" "$NATIVE_ORIGIN_ADDR" "$L2B_NETWORK_ID" "$BACK_DEST" "$OUT_WEI" "$OUT_META") \
+CLAIM_TX=$(submit_back_claim "$OUT_CNT" "$OUT_GI" "$MIDEN_NETWORK_ID" "$NATIVE_ORIGIN_ADDR" "$L2B_NETWORK_ID" "$BACK_DEST" "$OUT_AMT" "$OUT_META") \
     || fail "claim of native-origin deposit on L2B never settled"
-pass "wrapped native-Miden minted on L2B (claim tx $CLAIM_TX)"
+pass "wrapped native-Miden minted on L2B (amount $OUT_AMT, claim tx $CLAIM_TX)"
 
 # ── 4. Bridge BACK L2B -> Miden (burn the wrapped) ───────────────────────────
 step "4. Bridge back L2B -> Miden (burn wrapped native-Miden)"
@@ -130,10 +137,10 @@ WRAPPED_L2B=$(cast call "$BRIDGE" "getTokenWrappedAddress(uint32,address)(addres
     "$MIDEN_NETWORK_ID" "$NATIVE_ORIGIN_ADDR" --rpc-url "$L2B_RPC" 2>/dev/null | awk '{print $1}')
 [[ -n "$WRAPPED_L2B" && "$WRAPPED_L2B" != 0x0000000000000000000000000000000000000000 ]] \
     || fail "no wrapped native-Miden token on L2B for ($NATIVE_ORIGIN_ADDR, net $MIDEN_NETWORK_ID)"
-cast send "$WRAPPED_L2B" "approve(address,uint256)" "$BRIDGE" "$OUT_WEI" \
+cast send "$WRAPPED_L2B" "approve(address,uint256)" "$BRIDGE" "$OUT_AMT" \
     --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" >/dev/null || fail "approve wrapped on L2B"
 BACK_TX=$(cast send "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
-    "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$OUT_WEI" "$WRAPPED_L2B" true 0x \
+    "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$OUT_AMT" "$WRAPPED_L2B" true 0x \
     --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" --json 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('transactionHash',''))") \
     || fail "bridgeAsset (wrapped back) on L2B failed"
 pass "wrapped burned + bridged L2B -> Miden (tx $BACK_TX)"
@@ -142,15 +149,16 @@ pass "wrapped burned + bridged L2B -> Miden (tx $BACK_TX)"
 step "5. Claim on Miden (bridge UNLOCKS native; proxy must NOT auto-create a wrapped faucet)"
 FAUCETS_BEFORE=$(pgq "SELECT COUNT(*) FROM faucet_registry;")
 # Client-submit the claimAsset for the L2B->Miden deposit of the wrapped-native token.
-# originNetwork == $MIDEN_NETWORK_ID (native) => proxy routes to the existing native
-# faucet + the bridge unlocks; it must NOT provision a new wrapped faucet.
-wait_for "L2B->Miden wrapped deposit ready_for_claim" 600 5 \
+# originNetwork == $MIDEN_NETWORK_ID (native) => proxy resolves the EXISTING native faucet
+# (from the discovery/registry entry) + the bridge unlocks; it must NOT provision a wrapped one.
+wait_for "L2B->Miden wrapped deposit ready_for_claim" 1200 5 \
     _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$(echo "$NATIVE_ORIGIN_ADDR" | tr 'A-F' 'a-f')" "$MIDEN_NETWORK_ID" "$L2B_BRIDGE_SERVICE_URL"
 BACK2_DEP=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$(echo "$NATIVE_ORIGIN_ADDR" | tr 'A-F' 'a-f')" "$L2B_BRIDGE_SERVICE_URL")
 BK_CNT=$(dep_field "$BACK2_DEP" deposit_cnt); BK_GI=$(dep_field "$BACK2_DEP" global_index)
+BK_AMT=$(dep_field "$BACK2_DEP" amount)   # leaf-authoritative (unscaled for native)
 BK_META=$(echo "$BACK2_DEP" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m!='0x' else '0x')")
 nudge_until "native claim UNLOCKED on Miden (ClaimEvent gi $BK_GI)" \
-    _pred_submit_forward_claim "$BK_CNT" "$BK_GI" "$MIDEN_NETWORK_ID" "$NATIVE_ORIGIN_ADDR" "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$OUT_WEI" "$BK_META" \
+    _pred_submit_forward_claim "$BK_CNT" "$BK_GI" "$MIDEN_NETWORK_ID" "$NATIVE_ORIGIN_ADDR" "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$BK_AMT" "$BK_META" \
     || fail "native claim never unlocked on Miden (gi $BK_GI)"
 FAUCETS_AFTER=$(pgq "SELECT COUNT(*) FROM faucet_registry;")
 [[ "$FAUCETS_AFTER" == "$FAUCETS_BEFORE" ]] \
