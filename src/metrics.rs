@@ -96,6 +96,19 @@ pub fn init_metrics() {
          rather than freezing. MUST stay 0 in a healthy stack; any increment means either a node \
          note-DB fault or a genuine dropped exit to investigate."
     );
+    describe_counter!(
+        "synthetic_projector_completeness_missing_total",
+        "in-proxy completeness auditor: consumed B2AGG notes (past the settle margin, with the \
+         projector's own emit gates mirrored) that have NO BridgeEvent at exactly their \
+         consumption block. Detection only — getLogs immutability forbids late healing. MUST \
+         stay 0; the soak gates on it. Alarmed once per note; the counter is cumulative."
+    );
+    describe_gauge!(
+        "synthetic_projector_completeness_audit_lag",
+        "in-proxy completeness auditor liveness beacon: the highest block audited so far \
+         (projector cursor minus the settle margin). Flat while the chain advances = auditor \
+         dead."
+    );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
     describe_histogram!("rpc_request_duration_seconds", "JSON-RPC request duration");

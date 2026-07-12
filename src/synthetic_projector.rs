@@ -47,7 +47,10 @@
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
-use crate::bridge_out::is_b2agg_note;
+use crate::bridge_out::{
+    B2AggConsumerClass, classify_b2agg_consumer, derive_bridge_out_tx_hash, is_b2agg_note,
+    parse_b2agg_storage,
+};
 use crate::miden_client::{MidenClientLib, SyncListener};
 use crate::restore::{
     B2AggRestoreOutcome, ClaimProjectOutcome, GerProjectOutcome, project_b2agg_note,
@@ -102,6 +105,14 @@ const RECONCILE_TICK_BUDGET_MS_DEFAULT: u64 = 2_000;
 /// is ~a handful of seconds — long enough for a transient lag to clear, short enough that a
 /// genuine node fault never halts the bridge.
 const FETCH_MISS_RETRY_BOUND: u32 = 20;
+
+/// Completeness-auditor cadence: audit once every N projector ticks (~1s each → ~30s cycles).
+const AUDIT_EVERY_N_TICKS: u64 = 30;
+
+/// Completeness-auditor settle margin: only audit blocks at least this far behind the
+/// projector cursor, so the client store's (lagging) consumption view has definitely caught
+/// up on the audited range. Costs only detection latency, prevents false positives.
+const AUDIT_SETTLE_MARGIN: u64 = 10;
 
 /// Parse a `u64` tuning knob from the environment, falling back to `default`
 /// on absence or garbage (never panics at boot for a bad env var).
@@ -267,6 +278,14 @@ pub struct SyntheticProjector {
     /// (a note whose block falls in an un-sourced gap would silently miss). Pure diagnostics —
     /// it never influences windowing or any control flow.
     last_source_window_to: AtomicU64,
+    /// Completeness auditor (detection only, no healing): details-commitments already
+    /// VERIFIED (BridgeEvent found at the exact consumption block) or already ALARMED
+    /// (missing — alarm once, counter cumulative). Skipping these keeps each ~30s audit
+    /// cycle O(new consumptions) and de-dupes alarms. In-memory on purpose: a restart
+    /// re-audits from scratch, which is cheap and re-surfaces any standing violation.
+    audit_resolved: std::sync::Mutex<HashSet<[u8; 32]>>,
+    /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
+    audit_tick_counter: AtomicU64,
 }
 
 impl SyntheticProjector {
@@ -348,6 +367,8 @@ impl SyntheticProjector {
             recovered_bodies: std::sync::Mutex::new(HashMap::new()),
             fetch_miss_attempts: std::sync::Mutex::new(HashMap::new()),
             last_source_window_to: AtomicU64::new(0),
+            audit_resolved: std::sync::Mutex::new(HashSet::new()),
+            audit_tick_counter: AtomicU64::new(0),
         })
     }
 
@@ -965,6 +986,124 @@ impl SyntheticProjector {
         Ok(recs)
     }
 
+    /// COMPLETENESS AUDITOR — in-proxy early detection of missed BridgeEvents (the
+    /// productionized `scripts/verify-event-completeness.sh`), detection ONLY: getLogs
+    /// immutability forbids emitting into a sealed block, so a miss is alarmed loudly
+    /// (metric + error log), never healed late.
+    ///
+    /// Ground truth needs no new RPC: the miden-client STORE. The reconciler imports every
+    /// B2AGG note body and `sync_state` eventually marks it `Consumed*` with a
+    /// `consumed_block_height` — laggingly, which is fine for detection: only blocks at
+    /// least [`AUDIT_SETTLE_MARGIN`] behind the projector cursor are audited, and the full
+    /// consumed set is re-scanned each cycle (late-learned consumptions cannot escape),
+    /// de-duped via [`Self::audit_resolved`] so each cycle is O(new consumptions).
+    ///
+    /// For every consumed B2AGG note that SHOULD have emitted (mirrors the projector's own
+    /// emit gates, so legitimately-skipped notes never false-alarm):
+    ///   * reclaimed (consumer == Some(non-bridge)) → no event expected (MA#3), skip;
+    ///   * unparsable storage → quarantined, never emits, skip;
+    ///   * self-targeted (destination == local network) → poison-leaf, never emits (#13), skip;
+    ///   * consumer unknown (`None`, the common case for externally-observed consumptions) →
+    ///     INCLUDED — the log check decides (the unified projector emits from bridge-tx
+    ///     attribution, so a genuinely bridge-consumed note must have its event);
+    ///
+    /// …check the synthetic store for a BridgeEvent at EXACTLY its consumption block, via the
+    /// same join the projector writes: `derive_bridge_out_tx_hash(hex(details_commitment))`.
+    /// Missing (or present at the wrong block) → `synthetic_projector_completeness_missing_total`
+    /// (must stay 0; the soak gates on it) + a loud error, once per note.
+    ///
+    /// Returns the cycle's tallies so unit tests can assert alarm/no-alarm/dedupe directly.
+    async fn audit_completeness(
+        &self,
+        consumed: &[InputNoteRecord],
+        projector_cursor: u64,
+    ) -> anyhow::Result<AuditOutcome> {
+        let audit_to = projector_cursor.saturating_sub(AUDIT_SETTLE_MARGIN);
+        // Liveness beacon: how far the auditor has audited (0 = not yet past the margin).
+        ::metrics::gauge!("synthetic_projector_completeness_audit_lag").set(audit_to as f64);
+        let mut outcome = AuditOutcome::default();
+        if audit_to == 0 {
+            return Ok(outcome);
+        }
+        for note in consumed {
+            if !is_b2agg_note(note.details()) {
+                continue;
+            }
+            let Some(block) = note.state().consumed_block_height().map(|h| h.as_u64()) else {
+                continue;
+            };
+            if block > audit_to {
+                // Inside the settle margin — not audited yet (next cycles will catch it).
+                outcome.settling += 1;
+                continue;
+            }
+            // Mirror the projector's emit gates (see doc comment): a note the projector
+            // legitimately refuses to emit must not false-alarm.
+            if matches!(
+                classify_b2agg_consumer(note.consumer_account(), self.bridge_id),
+                B2AggConsumerClass::Reclaimed
+            ) {
+                continue;
+            }
+            let Ok((destination_network, _)) = parse_b2agg_storage(note.details().storage()) else {
+                continue; // quarantined (MA#18) — never emits
+            };
+            if destination_network == self.local_network_id {
+                continue; // self-targeted poison leaf (#13) — never emits
+            }
+            let key: [u8; 32] = note.details_commitment().as_bytes();
+            {
+                let resolved = self
+                    .audit_resolved
+                    .lock()
+                    .expect("audit-resolved set poisoned");
+                if resolved.contains(&key) {
+                    continue;
+                }
+            } // lock dropped before the await below
+            let note_id_str = hex::encode(key);
+            let tx_hash = derive_bridge_out_tx_hash(&note_id_str);
+            let logs = self.store.get_logs_for_tx(&tx_hash).await?;
+            outcome.audited += 1;
+            if logs.iter().any(|l| l.block_number == block) {
+                outcome.verified += 1;
+            } else {
+                // MISSED (or wrong-block, equally a violation). Alarm ONCE per note (the
+                // resolved-set insert below de-dupes); the counter stays cumulative.
+                outcome.missing += 1;
+                ::metrics::counter!("synthetic_projector_completeness_missing_total").increment(1);
+                tracing::error!(
+                    details_commitment = %note_id_str,
+                    nullifier = %note
+                        .nullifier()
+                        .map(|n| n.to_hex())
+                        .unwrap_or_else(|| "none(consumed)".into()),
+                    consumed_block = block,
+                    audit_to,
+                    found_at_blocks = ?logs.iter().map(|l| l.block_number).collect::<Vec<_>>(),
+                    "completeness auditor: synthetic BridgeEvent MISSING at the consumption \
+                     block — completeness violation (detection only; getLogs immutability \
+                     forbids late healing)"
+                );
+            }
+            self.audit_resolved
+                .lock()
+                .expect("audit-resolved set poisoned")
+                .insert(key);
+        }
+        if outcome.missing > 0 || outcome.audited > 0 {
+            tracing::info!(
+                audit_to,
+                audited = outcome.audited,
+                verified = outcome.verified,
+                missing = outcome.missing,
+                settling = outcome.settling,
+                "completeness auditor: cycle done"
+            );
+        }
+        Ok(outcome)
+    }
+
     /// The #30 visibility-barrier projection ceiling. With a barrier active (`has_barrier`
     /// — a reconciler is wired), never project past the reconciler's last completed sweep
     /// (`reconcile_cursor`), so a synthetic block is sealed only after its notes are
@@ -1446,6 +1585,23 @@ impl SyntheticProjector {
             }
             cursor = next;
         }
+        // COMPLETENESS AUDITOR (detection only, every AUDIT_EVERY_N_TICKS ticks): diff the
+        // store's consumed-B2AGG view against the synthetic log store for comfortably-sealed
+        // blocks. Reuses this tick's already-fetched `consumed` feed — zero extra queries.
+        // Non-fatal by construction: an audit failure warns and retries next cycle, it never
+        // blocks projection.
+        if self.node_rpc.is_some()
+            && self
+                .audit_tick_counter
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(AUDIT_EVERY_N_TICKS)
+            && let Err(e) = self.audit_completeness(&consumed, cursor).await
+        {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "completeness auditor failed (non-fatal — retried next cycle)"
+            );
+        }
         // Observability: the projector follows the MIDEN chain, so its progress is
         // measured against the Miden tip (NOT L1). With the #30 barrier the projector
         // catches up to `project_to = min(tip, reconcile_cursor)`, NOT necessarily the raw
@@ -1467,6 +1623,19 @@ impl SyntheticProjector {
         );
         Ok(cursor)
     }
+}
+
+/// One completeness-audit cycle's tallies (see [`SyntheticProjector::audit_completeness`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuditOutcome {
+    /// Notes checked against the synthetic log store this cycle (new, past the margin).
+    pub audited: usize,
+    /// Audited notes whose BridgeEvent was found at the exact consumption block.
+    pub verified: usize,
+    /// Audited notes with NO BridgeEvent at their consumption block — violations (alarmed).
+    pub missing: usize,
+    /// Notes still inside the settle margin — deferred to a later cycle.
+    pub settling: usize,
 }
 
 /// One bridge-consumed input note, attributed from the bridge's transaction feed.
@@ -2837,6 +3006,159 @@ mod tests {
         assert!(
             evict.is_empty(),
             "nothing resolved → nothing queued for eviction"
+        );
+    }
+
+    /// Completeness auditor, happy + violation paths. A consumed B2AGG note past the settle
+    /// margin WITH its BridgeEvent at the exact consumption block verifies (no alarm); one
+    /// WITHOUT is a violation (missing=1).
+    #[tokio::test]
+    async fn completeness_auditor_flags_missing_event_and_passes_present_one() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Note A: consumed at block 5 and PROJECTED (real event in the synthetic store).
+        let emitted = b2agg_note_with_amount(5, Some(0), 11);
+        assert_eq!(
+            projector
+                .project_notes(std::slice::from_ref(&emitted), &HashMap::new(), 5, None)
+                .await
+                .unwrap(),
+            1,
+            "fixture: the event must actually be emitted"
+        );
+        // Note B: consumed at block 6, NEVER projected — the drop the auditor must catch.
+        let dropped = b2agg_note_with_amount(6, Some(0), 22);
+
+        // Cursor far enough that both blocks are past the settle margin.
+        let outcome = projector
+            .audit_completeness(&[emitted.clone(), dropped.clone()], 6 + AUDIT_SETTLE_MARGIN)
+            .await
+            .unwrap();
+        assert_eq!(outcome.audited, 2);
+        assert_eq!(
+            outcome.verified, 1,
+            "the emitted note verifies at its exact block"
+        );
+        assert_eq!(
+            outcome.missing, 1,
+            "the dropped note must be flagged as a completeness violation"
+        );
+    }
+
+    /// Settle margin: a consumption newer than `audit_to` is NOT audited yet — no false
+    /// positive while the store's (lagging) consumption view catches up. It IS audited (and
+    /// flagged) once the cursor moves past the margin.
+    #[tokio::test]
+    async fn completeness_auditor_defers_consumptions_inside_settle_margin() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Consumed at block 50, never projected; cursor only 3 past it (< margin).
+        let fresh = b2agg_note_with_amount(50, Some(0), 33);
+        let outcome = projector
+            .audit_completeness(std::slice::from_ref(&fresh), 53)
+            .await
+            .unwrap();
+        assert_eq!(outcome.audited, 0, "inside the margin: not audited");
+        assert_eq!(outcome.missing, 0, "inside the margin: no false positive");
+        assert_eq!(outcome.settling, 1, "deferred, not forgotten");
+
+        // Cursor past the margin: now audited and flagged.
+        let outcome = projector
+            .audit_completeness(std::slice::from_ref(&fresh), 50 + AUDIT_SETTLE_MARGIN)
+            .await
+            .unwrap();
+        assert_eq!(outcome.audited, 1);
+        assert_eq!(outcome.missing, 1, "past the margin the drop is caught");
+    }
+
+    /// Alarm de-dupe: the same missing note alarms exactly ONCE — later cycles skip it (the
+    /// per-cycle `missing` tally returns to 0; the metric counter stays cumulative). A
+    /// verified note is equally never re-checked.
+    #[tokio::test]
+    async fn completeness_auditor_alarms_once_per_note() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let dropped = b2agg_note_with_amount(7, Some(0), 44);
+        let cursor = 7 + AUDIT_SETTLE_MARGIN;
+
+        let first = projector
+            .audit_completeness(std::slice::from_ref(&dropped), cursor)
+            .await
+            .unwrap();
+        assert_eq!(first.missing, 1, "first cycle alarms");
+
+        let second = projector
+            .audit_completeness(std::slice::from_ref(&dropped), cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.missing, 0,
+            "second cycle must NOT re-alarm (deduped)"
+        );
+        assert_eq!(second.audited, 0, "already-resolved notes are skipped");
+    }
+
+    /// Emit-gate mirroring: notes the projector legitimately refuses to emit (reclaimed by a
+    /// non-bridge consumer — MA#3; self-targeted destination — #13) must never false-alarm.
+    #[tokio::test]
+    async fn completeness_auditor_skips_legitimately_unemitted_notes() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Reclaimed: consumed by the SERVICE account, not the bridge → no event expected.
+        let reclaimed = {
+            let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
+            let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+            let asset: Asset = FungibleAsset::new(aid(FAUCET), 55).unwrap().into();
+            let assets = NoteAssets::new(vec![asset]).unwrap();
+            consumed_note(
+                NoteDetails::new(assets, recipient),
+                NoteAttachments::default(),
+                Some(aid(SERVICE)),
+                8,
+                Some(0),
+            )
+        };
+        // Self-targeted: destination_network == local (7) → poison leaf, never emits. The
+        // first storage felt encodes the destination network byte-swapped (see
+        // parse_b2agg_storage): 7u32 → swap → 0x07000000.
+        let self_targeted = {
+            let mut felts = vec![Felt::from(0u32); 6];
+            felts[0] = Felt::from(u32::from_le_bytes(7u32.to_be_bytes()));
+            let storage = NoteStorage::new(felts).unwrap();
+            let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+            let asset: Asset = FungibleAsset::new(aid(FAUCET), 66).unwrap().into();
+            let assets = NoteAssets::new(vec![asset]).unwrap();
+            consumed_note(
+                NoteDetails::new(assets, recipient),
+                NoteAttachments::default(),
+                Some(aid(BRIDGE)),
+                8,
+                Some(1),
+            )
+        };
+        let outcome = projector
+            .audit_completeness(&[reclaimed, self_targeted], 8 + AUDIT_SETTLE_MARGIN)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.missing, 0,
+            "legitimately-unemitted notes must never false-alarm"
+        );
+        assert_eq!(
+            outcome.audited, 0,
+            "gated notes are excluded before the log check"
         );
     }
 }
