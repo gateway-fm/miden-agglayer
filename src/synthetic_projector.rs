@@ -222,14 +222,30 @@ pub struct SyntheticProjector {
     /// Per-tick catch-up time budget (`RECONCILE_TICK_BUDGET_MS` env override,
     /// default [`RECONCILE_TICK_BUDGET_MS_DEFAULT`]).
     reconcile_budget: Duration,
-    /// Note BODIES for spent-before-import notes, keyed by nullifier. A B2AGG note
-    /// ALREADY CONSUMED when the reconciler imports it is silently dropped by
-    /// miden-client 0.15 (import returns Ok, note absent from store), so its body
-    /// never lands in the store. `tick` sources consumptions authoritatively from
-    /// the bridge's transaction feed and resolves each consumed nullifier to its
-    /// note body from the store — this cache supplies the bodies the store is
-    /// missing (populated by [`Self::recover_dropped_note_bodies`]), so a
-    /// dropped-then-consumed note's BridgeEvent is still emitted at its exact block.
+    /// In-flight B2AGG note BODIES keyed by nullifier — the projector's authoritative
+    /// body-resolution source, bounded to imported-but-not-yet-projected notes.
+    ///
+    /// `tick` sources B2AGG consumptions authoritatively from the bridge's transaction
+    /// feed (nullifiers) and must resolve each nullifier to its note body. It CANNOT
+    /// read the body from the live store by nullifier: [`InputNoteRecord::nullifier`]
+    /// returns `Some` only while `metadata()` is `Some`, and a note's metadata becomes
+    /// `None` the instant `sync_state` marks it `ConsumedExternal` — so the moment a
+    /// B2AGG note is consumed it drops out of any store-nullifier map, and (since the
+    /// nullifier mixes in the metadata word, [`Nullifier::new`]) it cannot be recomputed
+    /// from `NoteDetails` alone. The body must therefore be captured by nullifier WHILE
+    /// the note still has metadata, into this cache. Two feeders populate it, both
+    /// filtered to B2AGG:
+    ///
+    ///   * [`Self::cache_committed_b2agg_bodies`] — every store note whose nullifier is
+    ///     still computable (Committed etc.), refreshed at import time AND once per tick,
+    ///     so a note imported this run OR still-Committed from a prior run is captured
+    ///     before it can transition to `ConsumedExternal`.
+    ///   * [`Self::recover_dropped_note_bodies`] — spent-before-import notes miden-client
+    ///     0.15 silently drops on import (import returns Ok, note absent from store); it
+    ///     re-fetches their bodies from the node so they resolve too.
+    ///
+    /// `tick` EVICTS a nullifier once its block is projected, keeping the map bounded to
+    /// the in-flight set (imported, not-yet-projected) rather than growing without limit.
     recovered_bodies: std::sync::Mutex<HashMap<Nullifier, (NoteDetails, NoteAttachments)>>,
 }
 
@@ -562,17 +578,18 @@ impl SyntheticProjector {
                 // Spent-before-import: `import_notes` returns Ok even for notes it
                 // silently DROPPED because they were already consumed at import time
                 // (miden-client 0.15 bug — see the `recovered_bodies` field docs).
-                // Re-query which attempted ids landed; the dropped ones' bodies are
-                // cached by `recover_dropped_note_bodies` so `tick`'s authoritative
-                // consumption sourcing can still resolve and emit them.
+                // Re-query which attempted ids landed; cache the LANDED (Committed) B2AGG
+                // bodies by nullifier now, while their metadata is present, so they resolve
+                // in `tick` even after `sync_state` marks them ConsumedExternal; the DROPPED
+                // ones' bodies are recovered from the node by `recover_dropped_note_bodies`.
                 if !attempted.is_empty() {
-                    let landed: HashSet<NoteId> = client
+                    let landed_recs = client
                         .get_input_notes(NoteFilter::List(attempted.clone()))
                         .await
-                        .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?
-                        .into_iter()
-                        .filter_map(|rec| rec.id())
-                        .collect();
+                        .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?;
+                    self.cache_committed_b2agg_bodies(&landed_recs);
+                    let landed: HashSet<NoteId> =
+                        landed_recs.iter().filter_map(|rec| rec.id()).collect();
                     let missing: Vec<NoteId> = attempted
                         .into_iter()
                         .filter(|id| !landed.contains(id))
@@ -593,6 +610,43 @@ impl SyntheticProjector {
             }
         }
         Ok(())
+    }
+
+    /// Capture the bodies of the given store notes into the B2AGG body cache, keyed by
+    /// nullifier, for every note whose nullifier is still computable (metadata present —
+    /// Committed and other pre-consumption states). This is how a B2AGG body survives the
+    /// note later becoming `ConsumedExternal` (which nulls out
+    /// [`InputNoteRecord::nullifier`]); see the [`Self::recovered_bodies`] field docs.
+    ///
+    /// Called at import time (freshly landed notes) AND once per tick over the whole store
+    /// (notes still Committed from a prior run), so no B2AGG note can be consumed before its
+    /// body is cached. Idempotent — re-inserting the same nullifier is a no-op. Only B2AGG
+    /// bodies are kept (CLAIM/GER ride the store's consumed feed; other notes emit no event).
+    fn cache_committed_b2agg_bodies(&self, records: &[InputNoteRecord]) {
+        let mut cache = self
+            .recovered_bodies
+            .lock()
+            .expect("recovered-bodies cache poisoned");
+        for rec in records {
+            // `nullifier()` is `Some` only while metadata is present; a note already
+            // `ConsumedExternal` returns `None` and cannot be (re)cached here — by then it
+            // must already be in the cache from an earlier Committed observation.
+            let Some(nullifier) = rec.nullifier() else {
+                continue;
+            };
+            if !is_b2agg_note(rec.details()) {
+                continue;
+            }
+            if cache
+                .insert(
+                    nullifier,
+                    (rec.details().clone(), rec.attachments().clone()),
+                )
+                .is_none()
+            {
+                metrics::counter!("synthetic_reconciler_recovered_body_total").increment(1);
+            }
+        }
     }
 
     /// Cache the note BODIES of spent-before-import notes, keyed by nullifier.
@@ -997,23 +1051,27 @@ impl SyntheticProjector {
                 by_block.entry(h).or_default().push(note);
             }
         }
-        // AUTHORITATIVE B2AGG: resolve each bridge-consumed nullifier in the window to its
-        // imported note BODY (store notes first, then the dropped-body cache for
-        // spent-before-import notes), rebuild a ConsumedExternal record at the authoritative
-        // (block, tx_order), and keep ONLY the B2AGG ones. A non-B2AGG consumption (a
-        // GER/CLAIM the store feed already covers) or one whose body is not yet imported is
-        // SKIPPED, never fail-closed: only B2AGG must emit here, its body is guaranteed
-        // imported by the barrier (reconcile_cursor >= project_to), and anything genuinely
-        // missing surfaces as a missing BridgeEvent in e2e rather than a wedged tip.
+        // AUTHORITATIVE B2AGG: for each bridge-consumed nullifier in the window, resolve its
+        // note BODY from the `recovered_bodies` cache and rebuild a ConsumedExternal record
+        // at the authoritative (block, tx_order). The cache — NOT a live-store nullifier map
+        // — is the resolution source ON PURPOSE: a B2AGG note's `InputNoteRecord::nullifier()`
+        // goes `None` the instant `sync_state` marks it ConsumedExternal (its metadata is
+        // dropped), so on a fresh-stack catch-up the note is routinely consumed before the
+        // projector reaches its block and would vanish from any store map — dropping the
+        // BridgeEvent. The cache captured its body by nullifier while it was still Committed
+        // (import time + every tick), so it survives. A nullifier NOT in the cache is a
+        // CLAIM/GER (the store feed above covers it) or a not-yet-imported note — SKIPPED,
+        // never fail-closed. Projected nullifiers are evicted below to keep the cache bounded.
+        let mut evict_by_block: HashMap<u64, Vec<Nullifier>> = HashMap::new();
         let auth_b2agg: Vec<InputNoteRecord> = if let Some(rpc) = self.node_rpc.as_ref() {
+            // Refresh the cache from the store's currently-resolvable (Committed) B2AGG notes
+            // so notes still Committed from a PRIOR run are captured before they can be
+            // consumed this run (import-time caching only covers notes imported THIS run).
             let all_input = client
                 .get_input_notes(NoteFilter::All)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to get input notes: {e}"))?;
-            let body_by_nullifier: HashMap<Nullifier, &InputNoteRecord> = all_input
-                .iter()
-                .filter_map(|rec| rec.nullifier().map(|nf| (nf, rec)))
-                .collect();
+            self.cache_committed_b2agg_bodies(&all_input);
             let txs = rpc
                 .sync_transactions(
                     BlockNumber::from((cursor + 1) as u32),
@@ -1024,34 +1082,32 @@ impl SyntheticProjector {
                 .map_err(|e| {
                     anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, project_to)
                 })?;
-            // No `await` past this lock — resolution + record building are synchronous.
-            let recovered = self
+            // No `await` past this lock — resolution + record building are synchronous. The
+            // cache holds ONLY B2AGG bodies (both feeders filter), so a hit is B2AGG by
+            // construction and needs no re-check.
+            let cache = self
                 .recovered_bodies
                 .lock()
                 .expect("recovered-bodies cache poisoned");
             let mut recs: Vec<InputNoteRecord> = Vec::new();
             for (nullifier, (block, tx_order)) in bridge_consumed_nullifiers(&txs, self.bridge_id) {
-                // Resolve the note body: imported store notes first, then the dropped-body
-                // cache (spent-before-import B2AGG the store is missing).
-                let (details, attachments) = if let Some(rec) = body_by_nullifier.get(&nullifier) {
-                    (rec.details().clone(), rec.attachments().clone())
-                } else if let Some((d, a)) = recovered.get(&nullifier) {
-                    (d.clone(), a.clone())
-                } else {
-                    // Body not imported: a CLAIM/GER (the store feed covers it) or a
+                let Some((details, attachments)) = cache.get(&nullifier) else {
+                    // Not a cached B2AGG body: a CLAIM/GER (store feed covers it) or a
                     // not-yet-imported note. Skip — do NOT wedge the tip.
                     continue;
                 };
-                // Only B2AGG is sourced here; CLAIM/GER ride the store feed above.
-                if !is_b2agg_note(&details) {
-                    continue;
-                }
                 let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
                     nullifier_block_height: BlockNumber::from(block as u32),
                     consumer_account: Some(self.bridge_id),
                     consumed_tx_order: Some(tx_order),
                 });
-                recs.push(InputNoteRecord::new(details, attachments, None, state));
+                recs.push(InputNoteRecord::new(
+                    details.clone(),
+                    attachments.clone(),
+                    None,
+                    state,
+                ));
+                evict_by_block.entry(block).or_default().push(nullifier);
             }
             recs
         } else {
@@ -1076,6 +1132,20 @@ impl SyntheticProjector {
             // never runs ahead of fully-projected state.
             self.store.set_projector_cursor(next).await?;
             self.cursor.store(next, Ordering::Release);
+            // Evict this block's projected B2AGG nullifiers AFTER the cursor is persisted, so
+            // the cache stays bounded to imported-but-not-yet-projected notes. Ordering it
+            // after the persist means a crash before the persist leaves the entry in place
+            // for the idempotent re-projection; a crash after (before evict) only leaks a
+            // bounded, already-projected entry — never drops an event.
+            if let Some(nulls) = evict_by_block.get(&next) {
+                let mut cache = self
+                    .recovered_bodies
+                    .lock()
+                    .expect("recovered-bodies cache poisoned");
+                for nf in nulls {
+                    cache.remove(nf);
+                }
+            }
             cursor = next;
         }
         // Observability: the projector follows the MIDEN chain, so its progress is
@@ -2048,6 +2118,43 @@ mod tests {
         assert!(
             !map.contains_key(&b),
             "non-bridge consumption must be gated out (MA#3 fail-closed)"
+        );
+    }
+
+    /// Regression lock for the dropped-BridgeEvent bug: the reason the projector resolves
+    /// B2AGG bodies from the `recovered_bodies` cache (fed while notes are Committed) instead
+    /// of a live-store nullifier map. Once `sync_state` marks a B2AGG note ConsumedExternal,
+    /// [`InputNoteRecord::nullifier`] returns `None` (the metadata the nullifier is derived
+    /// from is gone), so the note vanishes from any store map keyed on `nullifier()` — and on
+    /// a fresh-stack catch-up the note is routinely consumed BEFORE the projector reaches its
+    /// block, which silently dropped its BridgeEvent. Two invariants pin this down:
+    ///   1. a consumed B2AGG note has no `nullifier()`, and
+    ///   2. feeding an already-consumed note to `cache_committed_b2agg_bodies` caches NOTHING
+    ///      (no key to store it under) — so bodies MUST be captured earlier, while Committed.
+    #[tokio::test]
+    async fn consumed_b2agg_note_cannot_be_cached_post_hoc() {
+        let note = b2agg_note(7, Some(0));
+        assert!(
+            note.nullifier().is_none(),
+            "a ConsumedExternal note must have no nullifier() — the exact miden-client \
+             behavior the body cache exists to work around"
+        );
+
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // An already-consumed note has no nullifier to key on → nothing is cached. This is
+        // WHY `cache_committed_b2agg_bodies` runs at import time and every tick over the
+        // still-Committed store notes, before any of them can transition to ConsumedExternal.
+        projector.cache_committed_b2agg_bodies(std::slice::from_ref(&note));
+        assert!(
+            projector
+                .recovered_bodies
+                .lock()
+                .expect("cache poisoned")
+                .is_empty(),
+            "a consumed note cannot be cached post-hoc; the cache is fed while Committed"
         );
     }
 }
