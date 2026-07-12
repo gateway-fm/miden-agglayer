@@ -96,6 +96,13 @@ const RECONCILE_CONCURRENCY_MAX: usize = 16;
 /// the single near-tip window completes in one iteration exactly as before.
 const RECONCILE_TICK_BUDGET_MS_DEFAULT: u64 = 2_000;
 
+/// How many ticks the projector holds (retries) for an UNAUTHENTICATED bridge-consumed note
+/// the node's `get_notes_by_id` has not returned yet (tx feed ahead of the note DB) before it
+/// gives up and loud-skips rather than freezing the tip. At the sub-second sync cadence this
+/// is ~a handful of seconds — long enough for a transient lag to clear, short enough that a
+/// genuine node fault never halts the bridge.
+const FETCH_MISS_RETRY_BOUND: u32 = 20;
+
 /// Parse a `u64` tuning knob from the environment, falling back to `default`
 /// on absence or garbage (never panics at boot for a bad env var).
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -247,6 +254,14 @@ pub struct SyntheticProjector {
     /// `tick` EVICTS a nullifier once its block is projected, keeping the map bounded to
     /// the in-flight set (imported, not-yet-projected) rather than growing without limit.
     recovered_bodies: std::sync::Mutex<HashMap<Nullifier, (NoteDetails, NoteAttachments)>>,
+    /// Per-nullifier retry counter for the note-DB-lag backstop: an UNAUTHENTICATED
+    /// bridge-consumed note the tx feed reported but `get_notes_by_id` has not returned yet
+    /// (`sync_transactions` is eventual-consistent AHEAD of the node's note DB). The tick
+    /// holds (Errs, retries) for up to [`FETCH_MISS_RETRY_BOUND`] ticks so a transient lag
+    /// resolves correctly; past the bound it loud-skips and advances rather than freezing the
+    /// tip forever (a frozen tip is a liveness failure). Entries are cleared once the note
+    /// resolves or is skipped, so the map is bounded to the in-flight not-yet-returned set.
+    fetch_miss_attempts: std::sync::Mutex<HashMap<Nullifier, u32>>,
 }
 
 impl SyntheticProjector {
@@ -326,6 +341,7 @@ impl SyntheticProjector {
             reconcile_concurrency,
             reconcile_budget,
             recovered_bodies: std::sync::Mutex::new(HashMap::new()),
+            fetch_miss_attempts: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -708,30 +724,29 @@ impl SyntheticProjector {
     }
 
     /// Resolve the note bodies for a window's bridge-consumed nullifiers into ConsumedExternal
-    /// records to project. Two-tier, no `await` under the cache lock:
+    /// records to project. `bridge_consumed_nullifiers` yields EVERY bridge consumption — real
+    /// B2AGG exits AND the non-B2AGG notes the bridge routinely consumes (CLAIM, UpdateGerNote,
+    /// genesis/setup notes) — so most inputs here are legitimately NOT B2AGG exits.
     ///
-    ///   * FAST PATH — a body already in the `recovered_bodies` cache (captured while Committed
-    ///     or via dropped-note recovery) resolves with no node round-trip.
-    ///   * AUTHORITATIVE BACKSTOP — a cache MISS is NOT a safe skip: the #30 barrier guarantees
-    ///     the block was SWEPT, not that the body was CACHED. A note created+consumed under load
-    ///     before the reconciler imports it Committed is consumed UNAUTHENTICATED, so the
-    ///     consuming tx carries its note id ([`ConsumedRef::note_id`]); fetch that public body by
-    ///     id and emit at its exact `(block, order)`. This is what stops the residual
-    ///     dropped-BridgeEvent (note `0xacfee0cb…`, N=30 loadtest).
-    ///
-    /// There is NO silent-drop path left for a known bridge consumption. A cache miss is one of:
-    ///   * NO note id (AUTHENTICATED, uncached) — impossible for a real public exit (the note
-    ///     lived long enough to be discovered+cached), so FAIL the tick loudly (retry+surface);
-    ///   * note id present, node returned a public B2AGG body — resolve+emit;
-    ///   * note id present, node RETURNED it as non-public / non-b2agg — provably not an exit
-    ///     (the bridge legitimately consumes CLAIM/GER), so safe-skip (must NOT fail-closed or a
-    ///     legit non-exit consumption would wedge the tip);
-    ///   * note id present, node did NOT return it — the `sync_transactions` tx feed is ahead of
-    ///     the note DB `get_notes_by_id` reads (an eventual-consistency load race), so FAIL the
-    ///     tick loudly; the next tick re-fetches once the note DB catches up.
+    /// INVARIANT — the projector MUST NEVER freeze the tip (a frozen tip is a liveness failure).
+    /// Only a silent drop of a RESOLVABLE B2AGG exit is forbidden; skipping an unresolvable
+    /// non-exit, or bounded-retry-then-loud-skip of an unresolvable one, is correct. Each cache
+    /// miss is one of:
+    ///   * AUTHENTICATED (no note id in the tx) + uncached — the cache is B2AGG-only, so this is
+    ///     normally a non-B2AGG consumption (CLAIM/GER/genesis) the store consumed feed already
+    ///     covers. SAFE SKIP + non-fatal metric (NEVER wedge — the pre-unified projector also
+    ///     skipped these and passed the suite; fail-closing here froze the tip on block-13 setup).
+    ///   * UNAUTHENTICATED, node returns a public B2AGG body — resolve + emit at exact block. This
+    ///     is the acfee0cb completeness fix (note created+consumed under load before import).
+    ///   * UNAUTHENTICATED, node RETURNS it as non-public / non-b2agg — provably not an exit
+    ///     (legit CLAIM/GER) — SAFE SKIP.
+    ///   * UNAUTHENTICATED, node did NOT return it — `sync_transactions` is ahead of the node's
+    ///     note DB (eventual-consistent under load). BOUNDED RETRY: hold the tick (Err) up to
+    ///     [`FETCH_MISS_RETRY_BOUND`] ticks so a transient lag resolves the real body; past the
+    ///     bound, loud-skip + advance rather than freeze forever.
     ///
     /// Every resolved nullifier is recorded in `evict_by_block` so `tick` can bound the cache
-    /// after the block seals.
+    /// after the block seals. No `await` is held under any lock.
     async fn resolve_b2agg_consumptions(
         &self,
         fetcher: &dyn PublicNoteFetcher,
@@ -747,7 +762,10 @@ impl SyntheticProjector {
             InputNoteRecord::new(details, attachments, None, state)
         };
 
-        // Phase 1 (fast path, no I/O): resolve from the cache; collect misses for the fetch.
+        // Phase 1 (fast path, no I/O): resolve from the cache. A cache miss WITHOUT a note id is
+        // an authenticated consumption the B2AGG-only cache can't hold — normally a legit
+        // non-B2AGG note (CLAIM/GER/genesis) covered by the store consumed feed: SAFE SKIP, never
+        // wedge. Only UNAUTHENTICATED misses (note id present) go to the authoritative fetch.
         let mut recs: Vec<InputNoteRecord> = Vec::new();
         let mut misses: Vec<(Nullifier, ConsumedRef)> = Vec::new();
         {
@@ -764,8 +782,18 @@ impl SyntheticProjector {
                         .entry(cref.block)
                         .or_default()
                         .push(nullifier);
-                } else {
+                } else if cref.note_id.is_some() {
                     misses.push((nullifier, cref));
+                } else {
+                    // Authenticated + uncached → non-B2AGG consumption (store feed covers it).
+                    metrics::counter!("synthetic_projector_b2agg_authenticated_skip_total")
+                        .increment(1);
+                    tracing::debug!(
+                        nullifier = %nullifier.to_hex(),
+                        block = cref.block,
+                        "projector: skipping authenticated uncached bridge consumption \
+                         (non-B2AGG — CLAIM/GER/genesis, covered by the store consumed feed)"
+                    );
                 }
             }
         }
@@ -773,28 +801,7 @@ impl SyntheticProjector {
             return Ok(recs);
         }
 
-        // Fail-closed on authenticated-and-uncached misses BEFORE any authoritative fetch or
-        // projection: a known bridge consumption we can neither resolve nor safely skip.
-        for (nullifier, cref) in &misses {
-            if cref.note_id.is_none() {
-                metrics::counter!("synthetic_projector_b2agg_unresolved_total").increment(1);
-                tracing::error!(
-                    nullifier = %nullifier.to_hex(),
-                    block = cref.block,
-                    "projector: bridge consumed an AUTHENTICATED note with no cached body and no \
-                     note id to fetch — a KNOWN B2AGG consumption we cannot resolve. Holding the \
-                     tick (retry) rather than sealing a block missing its BridgeEvent."
-                );
-                return Err(anyhow::anyhow!(
-                    "projector: unresolved authenticated bridge consumption (nullifier {}, \
-                     block {}) — no cached body and no note id",
-                    nullifier.to_hex(),
-                    cref.block
-                ));
-            }
-        }
-
-        // Phase 2 (authoritative backstop): fetch the uncached (unauthenticated) bodies by id.
+        // Phase 2 (authoritative backstop): fetch the uncached UNAUTHENTICATED bodies by id.
         let fetch_ids: Vec<NoteId> = misses
             .iter()
             .filter_map(|(_, cref)| cref.note_id)
@@ -810,54 +817,88 @@ impl SyntheticProjector {
             .filter(|b| is_b2agg_note(&b.details))
             .map(|b| (b.id, b))
             .collect();
+        // Track the note-DB-lag retry counters under one lock (no await in this loop). A note
+        // still under its retry bound holds the tick; past the bound it loud-skips and advances.
+        let mut attempts = self
+            .fetch_miss_attempts
+            .lock()
+            .expect("fetch-miss-attempts poisoned");
+        let mut retry_ctx: Option<(Nullifier, NoteId, u64, u32)> = None;
         for (nullifier, cref) in &misses {
             let Some(note_id) = cref.note_id else {
-                unreachable!("note_id-less misses fail-closed above");
+                unreachable!("authenticated (note_id-less) misses are skipped in phase 1");
             };
-            let Some(body) = body_by_id.get(&note_id) else {
-                if returned_ids.contains(&note_id) {
-                    // The node RETURNED this note but it is non-public / non-b2agg — the bridge
-                    // legitimately consumes CLAIM/GER notes, so this is provably not a public
-                    // exit. Safe skip (must NOT fail-closed, or a legit consumption wedges).
-                    tracing::debug!(
-                        note_id = %note_id.to_hex(),
-                        block = cref.block,
-                        "authoritative fetch: node returned a non-b2agg note — safe skip (not an exit)"
-                    );
-                    continue;
-                }
-                // The node did NOT return this id: `sync_transactions` is ahead of the note DB
-                // `get_notes_by_id` reads (eventual-consistent under load). FAIL-CLOSED — never
-                // seal a block missing a KNOWN bridge consumption; the next tick re-fetches.
-                metrics::counter!("synthetic_projector_b2agg_fetch_missing_total").increment(1);
-                tracing::error!(
-                    nullifier = %nullifier.to_hex(),
+            if let Some(body) = body_by_id.get(&note_id) {
+                recs.push(build(body.details.clone(), body.attachments.clone(), cref));
+                evict_by_block
+                    .entry(cref.block)
+                    .or_default()
+                    .push(*nullifier);
+                attempts.remove(nullifier);
+                metrics::counter!("synthetic_projector_b2agg_authoritative_fetch_total")
+                    .increment(1);
+                tracing::info!(
                     note_id = %note_id.to_hex(),
                     block = cref.block,
-                    "projector: bridge-consumed note not returned by get_notes_by_id (tx feed \
-                     ahead of the note DB) — holding the tick (retry) rather than sealing a \
-                     block missing its BridgeEvent."
+                    "projector: resolved an uncached (unauthenticated) B2AGG consumption by \
+                     authoritative fetch"
                 );
-                return Err(anyhow::anyhow!(
-                    "projector: bridge-consumed note not yet in the node's note DB (nullifier \
-                     {}, note_id {}, block {}) — tx feed ahead of note DB, retry",
-                    nullifier.to_hex(),
-                    note_id.to_hex(),
-                    cref.block
-                ));
-            };
-            recs.push(build(body.details.clone(), body.attachments.clone(), cref));
-            evict_by_block
-                .entry(cref.block)
-                .or_default()
-                .push(*nullifier);
-            metrics::counter!("synthetic_projector_b2agg_authoritative_fetch_total").increment(1);
-            tracing::info!(
+            } else if returned_ids.contains(&note_id) {
+                // Node RETURNED it but it is non-public / non-b2agg — legit CLAIM/GER. Safe skip
+                // (must NOT fail-closed, or a legit consumption wedges the tip).
+                attempts.remove(nullifier);
+                tracing::debug!(
+                    note_id = %note_id.to_hex(),
+                    block = cref.block,
+                    "authoritative fetch: node returned a non-b2agg note — safe skip (not an exit)"
+                );
+            } else {
+                // Node did NOT return the id: tx feed ahead of the note DB. Bounded retry.
+                let n = attempts.entry(*nullifier).or_insert(0);
+                *n += 1;
+                if *n > FETCH_MISS_RETRY_BOUND {
+                    // Give up rather than freeze the tip forever: loud-skip and advance. A real
+                    // b2agg exit lost here would surface as a missing BridgeEvent AND this alarm;
+                    // a permanent not-return is a node fault worth alarming, not a bridge halt.
+                    metrics::counter!("synthetic_projector_b2agg_fetch_missing_total").increment(1);
+                    tracing::error!(
+                        nullifier = %nullifier.to_hex(),
+                        note_id = %note_id.to_hex(),
+                        block = cref.block,
+                        attempts = *n,
+                        "projector: bridge-consumed note STILL not returned by get_notes_by_id \
+                         after {FETCH_MISS_RETRY_BOUND} ticks — loud-skipping to keep the tip \
+                         live (investigate: possible node note-DB fault or a genuine drop)."
+                    );
+                    attempts.remove(nullifier);
+                } else if retry_ctx.is_none() {
+                    // Within the bound: remember it to hold (Err) the tick after the loop.
+                    retry_ctx = Some((*nullifier, note_id, cref.block, *n));
+                }
+            }
+        }
+        drop(attempts);
+        if let Some((nullifier, note_id, block, n)) = retry_ctx {
+            // Hold (retry) the whole tick: nothing seals, cursor unchanged, next tick re-fetches
+            // once the note DB catches up. Bounded by FETCH_MISS_RETRY_BOUND so it can't freeze.
+            tracing::warn!(
+                nullifier = %nullifier.to_hex(),
                 note_id = %note_id.to_hex(),
-                block = cref.block,
-                "projector: resolved an uncached (unauthenticated) B2AGG consumption by \
-                 authoritative fetch"
+                block,
+                attempt = n,
+                bound = FETCH_MISS_RETRY_BOUND,
+                "projector: bridge-consumed note not yet in the node's note DB (tx feed ahead) — \
+                 holding the tick to retry"
             );
+            return Err(anyhow::anyhow!(
+                "projector: bridge-consumed note not yet in the node's note DB (nullifier {}, \
+                 note_id {}, block {}, attempt {}/{}) — tx feed ahead of note DB, retry",
+                nullifier.to_hex(),
+                note_id.to_hex(),
+                block,
+                n,
+                FETCH_MISS_RETRY_BOUND
+            ));
         }
         Ok(recs)
     }
@@ -2533,50 +2574,51 @@ mod tests {
         );
     }
 
-    /// The fail-closed side: a bridge consumption that is neither cached NOR fetchable — an
-    /// AUTHENTICATED consumption (no note id in the tx) whose body was never cached — must
-    /// FAIL the tick loudly, never silently skip. An authenticated consumption means the note
-    /// lived long enough to be discovered+cached, so this is provably impossible for a real
-    /// public exit; failing surfaces it (discovery gap) rather than sealing a block missing a
-    /// known BridgeEvent.
+    /// The block-13 un-wedge regression: an AUTHENTICATED bridge consumption (no note id in the
+    /// tx) with no cached body is NORMALLY a legit non-B2AGG note (CLAIM/GER/genesis setup) the
+    /// store consumed feed covers — the B2AGG-only cache never holds it. It must be a SAFE SKIP
+    /// (no Err, no record, tick advances); an earlier version fail-closed here and froze the
+    /// synthetic tip at 0 on the first block-13 GER/genesis consumption (244× ERROR, dead bridge).
     #[tokio::test]
-    async fn uncached_authenticated_consumption_fails_the_tick_never_silent_skip() {
+    async fn authenticated_uncached_consumption_is_a_safe_skip_never_wedges() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
 
-        let nf = nullifier(0x99);
+        // Block-13-shaped: an authenticated bridge consumption, no cached body, no note id.
+        let nf = nullifier(0x64);
         let consumed_refs = HashMap::from([(
             nf,
             ConsumedRef {
-                block: 700,
+                block: 13,
                 order: 0,
-                note_id: None, // authenticated: no id to fetch by
+                note_id: None, // authenticated: no id, and not in the B2AGG cache
             },
         )]);
         let fetcher = MockFetcher::default();
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
-        let err = projector
+        let recs = projector
             .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
             .await
-            .expect_err("an unresolvable authenticated bridge consumption must fail the tick");
+            .expect("authenticated uncached consumption must be a safe skip, NEVER an Err");
         assert!(
-            format!("{err:#}").contains("unresolved authenticated"),
-            "must fail loudly (never silent-skip): {err:#}"
+            recs.is_empty(),
+            "an authenticated non-B2AGG consumption emits no record (store feed covers it)"
         );
         assert!(
             evict.is_empty(),
-            "a failed tick must not have queued any eviction (resolved nothing)"
+            "nothing resolved → nothing queued for eviction; the tick advances"
         );
     }
 
-    /// Case (B) — the residual silent-drop this refinement closes. A bridge consumption whose
-    /// body is uncached and unauthenticated (note id in the tx), but `get_notes_by_id` does NOT
-    /// return the id — `sync_transactions` is ahead of the node's note DB under load. This is a
-    /// KNOWN consumption we cannot yet resolve, so the tick must FAIL (retry next tick), never
-    /// silently seal the block without its BridgeEvent.
+    /// Case (B) — the acfee0cb backstop under a note-DB lag, with the un-wedge guard. A bridge
+    /// consumption that is uncached + unauthenticated (note id in the tx) but that
+    /// `get_notes_by_id` does NOT return — `sync_transactions` is ahead of the node's note DB.
+    /// The tick HOLDS (Errs, retries) for a bounded window so a transient lag can resolve the
+    /// real body; past [`FETCH_MISS_RETRY_BOUND`] it LOUD-SKIPS and advances rather than freezing
+    /// the tip forever. Both halves are asserted: it retries within the bound, then stops.
     #[tokio::test]
-    async fn uncached_unauthenticated_fetch_omitted_fails_the_tick() {
+    async fn uncached_unauthenticated_fetch_omitted_retries_then_loud_skips() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
@@ -2589,29 +2631,39 @@ mod tests {
             ),
         );
         let nf = nullifier(0xb0);
-        let consumed_refs = HashMap::from([(
-            nf,
-            ConsumedRef {
-                block: 880,
-                order: 0,
-                note_id: Some(note_id),
-            },
-        )]);
-        // The node returns NOTHING for the requested id (not yet indexed).
+        let cref = ConsumedRef {
+            block: 880,
+            order: 0,
+            note_id: Some(note_id),
+        };
+        // The node returns NOTHING for the requested id (never indexed) on every tick.
         let fetcher = MockFetcher::default();
+
+        // Within the bound: each tick HOLDS (Err), so the block never seals without its exit.
+        for attempt in 1..=FETCH_MISS_RETRY_BOUND {
+            let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+            let err = projector
+                .resolve_b2agg_consumptions(&fetcher, HashMap::from([(nf, cref)]), &mut evict)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not yet in the node's note DB"),
+                "attempt {attempt} must hold the tick with the load-race reason: {err:#}"
+            );
+            assert!(evict.is_empty(), "a held tick queues no eviction");
+        }
+
+        // Past the bound: LOUD-SKIP + advance (Ok, no record) — the tip is never frozen forever.
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
-        let err = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+        let recs = projector
+            .resolve_b2agg_consumptions(&fetcher, HashMap::from([(nf, cref)]), &mut evict)
             .await
-            .expect_err("a note the node did not return must fail the tick, not silent-skip");
+            .expect("past the retry bound the tick must advance (loud-skip), never freeze");
         assert!(
-            format!("{err:#}").contains("not yet in the node's note DB"),
-            "must fail loudly with the load-race reason: {err:#}"
+            recs.is_empty(),
+            "the unresolvable note is skipped, not emitted"
         );
-        assert!(
-            evict.is_empty(),
-            "a failed tick must not have queued any eviction"
-        );
+        assert!(evict.is_empty(), "nothing resolved → nothing to evict");
     }
 
     /// Case (A) — the complement: a bridge consumption the node DID return, but as a non-b2agg

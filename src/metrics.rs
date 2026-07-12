@@ -82,18 +82,19 @@ pub fn init_metrics() {
          that prevents the residual dropped-BridgeEvent."
     );
     describe_counter!(
-        "synthetic_projector_b2agg_unresolved_total",
-        "unified projector FAIL-CLOSE: a KNOWN bridge-consumed B2AGG nullifier that is neither \
-         cached nor fetchable (authenticated consumption with no note id) — the tick returns Err \
-         and retries rather than sealing a block missing its BridgeEvent. MUST stay 0; any \
-         increment means a genuine discovery gap to investigate."
+        "synthetic_projector_b2agg_authenticated_skip_total",
+        "unified projector: authenticated bridge consumptions skipped because they are not in the \
+         B2AGG-only body cache — normally a non-B2AGG note (CLAIM/GER/genesis) the store consumed \
+         feed already covers. NON-FATAL and expected-nonzero (esp. at genesis/setup); the tick \
+         never wedges on these. Only meaningful if it climbs alongside missing BridgeEvents."
     );
     describe_counter!(
         "synthetic_projector_b2agg_fetch_missing_total",
-        "unified projector FAIL-CLOSE (transient): a bridge-consumed note the tx feed reported \
-         but get_notes_by_id did NOT return — sync_transactions is ahead of the node note DB \
-         under load. The tick returns Err and re-fetches next tick once the DB catches up; brief \
-         nonzero blips under load are expected, a sustained climb means the note DB is stuck."
+        "unified projector LOUD-SKIP: an UNAUTHENTICATED bridge-consumed note the tx feed reported \
+         but get_notes_by_id STILL did not return after the bounded retry — the tick held for the \
+         retry window (sync_transactions ahead of the note DB) then advanced to keep the tip live \
+         rather than freezing. MUST stay 0 in a healthy stack; any increment means either a node \
+         note-DB fault or a genuine dropped exit to investigate."
     );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
