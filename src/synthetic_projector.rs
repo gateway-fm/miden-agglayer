@@ -450,6 +450,13 @@ impl SyntheticProjector {
                     self.import_reconcile_window(client, rpc, from, to, &candidates)
                         .await?;
                 }
+                // Option 3 (getLogs immutability): authoritatively confirm bridge
+                // consumptions at blocks <= to BEFORE the cursor advances past `to`,
+                // so a block is never sealed before its BridgeEvents are known and
+                // never emitted late. Live path only (unit tests pass no client/rpc).
+                if let (Some(client), Some(rpc)) = (client.as_deref_mut(), rpc) {
+                    self.confirm_window_consumptions(client, rpc, to).await?;
+                }
                 // Persist write-behind AFTER the window's work completed, and
                 // BEFORE updating the in-memory cache (same ordering guarantee
                 // as the projection cursor in `tick`): the durable cursor never
@@ -767,6 +774,151 @@ impl SyntheticProjector {
                 .expect("direct-recovered queue poisoned");
             // Defensive dedup: a record already queued (not yet drained by
             // `tick`) must not be double-projected in one block.
+            let queued: HashSet<[u8; 32]> = queue
+                .iter()
+                .map(|n| n.details_commitment().as_bytes())
+                .collect();
+            queue.extend(
+                recovered
+                    .into_iter()
+                    .filter(|n| !queued.contains(&n.details_commitment().as_bytes())),
+            );
+        }
+        Ok(())
+    }
+
+    /// Option 3 — getLogs IMMUTABILITY (2026-07-12). The #30 barrier gates on
+    /// `reconcile_cursor`, which `reconcile_notes` advances by note CREATION
+    /// (`sync_notes`). But a note's CONSUMPTION (`consumed_block_height`) is
+    /// discovered only by a LATER `sync_state` nullifier check — so the barrier
+    /// could seal a block before its BridgeEvent was known, and the late-sweep
+    /// (or the direct-recovery fallback above) would then emit that event into a
+    /// LATER block. That MUTATES `eth_getLogs` for an already-exposed range,
+    /// which aggkit/agglayer must never observe. This closes it: before the
+    /// reconcile cursor advances past `to`, ask the node AUTHORITATIVELY whether
+    /// any OUTSTANDING (store-unspent) B2AGG note is already consumed at a block
+    /// `<= to`, and for the bridge-consumed ones queue a `ConsumedExternal`
+    /// record NOW. Because this runs while the projection cursor still lags `to`
+    /// (one-tick lag), the note is queued while its spend block is still AHEAD of
+    /// the projection cursor, so `merge_direct_recovered` buckets it at its EXACT
+    /// spend block (never the late fallback). Same fail-closed MA#3 gate as
+    /// `recover_spent_before_import`: only bridge-executed consumptions emit;
+    /// reclaim / unknown consumers are skipped. `recover_spent_before_import`
+    /// still covers notes miden-client DROPPED at import (never in the store);
+    /// this covers notes it imported as unconsumed whose nullifier hadn't synced.
+    async fn confirm_window_consumptions(
+        &self,
+        client: &mut MidenClientLib,
+        rpc: &dyn NodeRpcClient,
+        to: u64,
+    ) -> anyhow::Result<()> {
+        // Outstanding B2AGG notes: imported, store not yet marked consumed.
+        let unspent = client
+            .get_input_notes(NoteFilter::Unspent)
+            .await
+            .map_err(|e| anyhow::anyhow!("confirm-window get_input_notes(Unspent): {e}"))?;
+        struct Cand {
+            id: NoteId,
+            details: NoteDetails,
+            attachments: NoteAttachments,
+            nullifier: Nullifier,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        for rec in &unspent {
+            let (Some(id), Some(nullifier)) = (rec.id(), rec.nullifier()) else {
+                continue;
+            };
+            if !is_b2agg_note(rec.details()) {
+                continue;
+            }
+            cands.push(Cand {
+                id,
+                details: rec.details().clone(),
+                attachments: rec.attachments().clone(),
+                nullifier,
+            });
+        }
+        if cands.is_empty() {
+            return Ok(());
+        }
+        // Authoritative spend heights from the node (nullifiers are indexed, so a
+        // genesis-floor search is a lookup, not a scan).
+        let nullifiers: BTreeSet<Nullifier> = cands.iter().map(|c| c.nullifier).collect();
+        let heights = rpc
+            .get_nullifier_commit_heights(nullifiers, BlockNumber::from(0u32))
+            .await
+            .map_err(|e| anyhow::anyhow!("confirm-window get_nullifier_commit_heights: {e}"))?;
+        // Only those already consumed at a block <= to (this window's sealed frontier).
+        let spent: Vec<(&Cand, BlockNumber)> = cands
+            .iter()
+            .filter_map(|c| {
+                heights
+                    .get(&c.nullifier)
+                    .copied()
+                    .flatten()
+                    .filter(|h| h.as_u64() <= to)
+                    .map(|h| (c, h))
+            })
+            .collect();
+        if spent.is_empty() {
+            return Ok(());
+        }
+        // Bridge-consumer verification (MA#3) over the spend range.
+        let (min_h, max_h) = spent.iter().fold(
+            (BlockNumber::from(u32::MAX), BlockNumber::from(0u32)),
+            |(lo, hi), (_, h)| (lo.min(*h), hi.max(*h)),
+        );
+        let txs = rpc
+            .sync_transactions(min_h, max_h, vec![self.bridge_id])
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("confirm-window sync_transactions({min_h}..{max_h}): {e}")
+            })?;
+        let by_bridge = bridge_consumed_nullifiers(&txs, self.bridge_id);
+        let mut recovered: Vec<InputNoteRecord> = Vec::new();
+        for (c, spend_block) in spent {
+            match by_bridge.get(&c.nullifier) {
+                Some((_, tx_order)) => {
+                    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+                        nullifier_block_height: spend_block,
+                        consumer_account: Some(self.bridge_id),
+                        consumed_tx_order: Some(*tx_order),
+                    });
+                    metrics::counter!("synthetic_reconciler_consumption_confirmed_total")
+                        .increment(1);
+                    tracing::debug!(
+                        note_id = %c.id.to_hex(),
+                        spend_block = spend_block.as_u64(),
+                        "confirm-window: bridge-consumed B2AGG confirmed pre-seal; queued at exact block"
+                    );
+                    recovered.push(InputNoteRecord::new(
+                        c.details.clone(),
+                        c.attachments.clone(),
+                        None,
+                        state,
+                    ));
+                }
+                None => {
+                    // Consumed, but not by a bridge transaction — reclaim/unknown;
+                    // emitting would mint a withdrawal for value that never left
+                    // Miden. Skip fail-closed (MA#3).
+                    metrics::counter!("synthetic_reconciler_unverified_consumption_total")
+                        .increment(1);
+                    tracing::warn!(
+                        note_id = %c.id.to_hex(),
+                        spend_block = spend_block.as_u64(),
+                        bridge = %self.bridge_id,
+                        "confirm-window: consumed B2AGG NOT consumed by any bridge transaction \
+                         at its spend block — reclaim/unknown consumer; skipping (fail-closed)"
+                    );
+                }
+            }
+        }
+        if !recovered.is_empty() {
+            let mut queue = self
+                .direct_recovered
+                .lock()
+                .expect("direct-recovered queue poisoned");
             let queued: HashSet<[u8; 32]> = queue
                 .iter()
                 .map(|n| n.details_commitment().as_bytes())
