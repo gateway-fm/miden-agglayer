@@ -595,35 +595,21 @@ impl SyntheticProjector {
         Ok(())
     }
 
-    /// Direct-projection recovery for notes that were already CONSUMED when the
-    /// reconciler imported them (and were therefore silently dropped by
-    /// miden-client's import — see the [`Self::direct_recovered`] field docs).
-    /// The node still serves everything needed (`sync_notes` / `get_notes_by_id`
-    /// both return consumed notes), so bypass the client store:
+    /// Cache the note BODIES of spent-before-import notes, keyed by nullifier.
     ///
-    /// 1. Fetch the full public note bodies via `get_notes_by_id`. Private notes
-    ///    cannot be reconstructed and B2AGG bridge-outs are public network
-    ///    notes; non-B2AGG public notes (e.g. MINTs to external wallets) derive
-    ///    no synthetic event, and CLAIM/GER notes are created by our own
-    ///    service so they always reach the store through the normal path.
-    /// 2. Resolve each note's spend block from the node's nullifier feed.
-    /// 3. **MA#3 reclaim gate** — a B2AGG can be consumed by the bridge (real
-    ///    exit → must emit) or reclaimed by its sender (asset stayed → must NOT
-    ///    emit), and the nullifier alone doesn't say who consumed. The bridge's
-    ///    LET frontier map stores only the O(log n) Merkle frontier nodes
-    ///    (overwritten as leaves append), so a direct "leaf present in LET"
-    ///    check is not implementable. Instead we use a strictly precise gate:
-    ///    the node's per-account `sync_transactions` feed for the BRIDGE
-    ///    account, whose transaction headers commit to the nullifiers of the
-    ///    notes each transaction consumed. "A bridge-executed transaction
-    ///    consumed this nullifier" is exactly the condition
-    ///    `classify_b2agg_consumer == Emit` encodes (consumer == bridge), from
-    ///    the same trust root as every other projector input (the node RPC).
-    ///    Anything else is treated as reclaim/unknown and skipped fail-closed
-    ///    with a WARN + metric.
-    /// 4. Queue an in-memory `ConsumedExternal` record (consumer = bridge) that
-    ///    `tick` runs through the SAME `project_b2agg_note` derivation as every
-    ///    other note (store dedup via `is_note_processed` keeps it idempotent).
+    /// A B2AGG note ALREADY CONSUMED when the reconciler tries to import it is
+    /// silently dropped by miden-client 0.15 (import returns Ok, note absent from
+    /// store), so its body never lands in the client store. `tick` sources
+    /// consumptions AUTHORITATIVELY from the bridge's transaction feed and resolves
+    /// each consumed nullifier to its note body from the store — this fills the bodies
+    /// the store is missing, so a dropped-then-consumed note's BridgeEvent is still
+    /// emitted at its exact block.
+    ///
+    /// Only PUBLIC B2AGG bodies are cached: private notes can't be reconstructed,
+    /// non-B2AGG public notes derive no synthetic event, and CLAIM/GER are our own
+    /// notes that always reach the store normally. The MA#3 reclaim gate lives in
+    /// `tick` now — it only ever sources consumptions from bridge transactions, so a
+    /// reclaimed/unknown consumption is never projected (no gate needed here).
     async fn recover_dropped_note_bodies(
         &self,
         rpc: &dyn NodeRpcClient,
