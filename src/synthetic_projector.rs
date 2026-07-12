@@ -262,6 +262,11 @@ pub struct SyntheticProjector {
     /// tip forever (a frozen tip is a liveness failure). Entries are cleared once the note
     /// resolves or is skipped, so the map is bounded to the in-flight not-yet-returned set.
     fetch_miss_attempts: std::sync::Mutex<HashMap<Nullifier, u32>>,
+    /// INSTR (observability-only): the `project_to` of the previous tick's `sync_transactions`
+    /// sourcing window, so `tick` can detect a gap/overlap between consecutive source windows
+    /// (a note whose block falls in an un-sourced gap would silently miss). Pure diagnostics —
+    /// it never influences windowing or any control flow.
+    last_source_window_to: AtomicU64,
 }
 
 impl SyntheticProjector {
@@ -342,6 +347,7 @@ impl SyntheticProjector {
             reconcile_budget,
             recovered_bodies: std::sync::Mutex::new(HashMap::new()),
             fetch_miss_attempts: std::sync::Mutex::new(HashMap::new()),
+            last_source_window_to: AtomicU64::new(0),
         })
     }
 
@@ -603,7 +609,7 @@ impl SyntheticProjector {
                         .get_input_notes(NoteFilter::List(attempted.clone()))
                         .await
                         .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?;
-                    self.cache_committed_b2agg_bodies(&landed_recs);
+                    self.cache_committed_b2agg_bodies(&landed_recs, "import");
                     let landed: HashSet<NoteId> =
                         landed_recs.iter().filter_map(|rec| rec.id()).collect();
                     let missing: Vec<NoteId> = attempted
@@ -638,7 +644,7 @@ impl SyntheticProjector {
     /// (notes still Committed from a prior run), so no B2AGG note can be consumed before its
     /// body is cached. Idempotent — re-inserting the same nullifier is a no-op. Only B2AGG
     /// bodies are kept (CLAIM/GER ride the store's consumed feed; other notes emit no event).
-    fn cache_committed_b2agg_bodies(&self, records: &[InputNoteRecord]) {
+    fn cache_committed_b2agg_bodies(&self, records: &[InputNoteRecord], source: &str) {
         let mut cache = self
             .recovered_bodies
             .lock()
@@ -653,6 +659,26 @@ impl SyntheticProjector {
             if !is_b2agg_note(rec.details()) {
                 continue;
             }
+            // INSTR (observability-only): trace every B2AGG body captured, keyed by nullifier.
+            let committed_block = rec
+                .inclusion_proof()
+                .map(|p| p.location().block_num().as_u64());
+            let (tag, note_type) = rec
+                .metadata()
+                .map(|m| (m.tag().as_u32(), format!("{:?}", m.note_type())))
+                .unzip();
+            tracing::info!(
+                "INSTR discover: nullifier={} note_id={} committed_block={:?} tag={:?} \
+                 note_type={:?} source={}",
+                nullifier.to_hex(),
+                rec.id()
+                    .map(|i| i.to_hex())
+                    .unwrap_or_else(|| "none".into()),
+                committed_block,
+                tag,
+                note_type,
+                source
+            );
             if cache
                 .insert(
                     nullifier,
@@ -712,6 +738,13 @@ impl SyntheticProjector {
             if !is_b2agg_note(&details) {
                 continue;
             }
+            // INSTR (observability-only): trace recovery-sourced B2AGG bodies, keyed by nullifier.
+            tracing::info!(
+                "INSTR discover: nullifier={} note_id={} committed_block=None tag=None \
+                 note_type=None source=recovery",
+                nullifier.to_hex(),
+                id.to_hex()
+            );
             if cache.insert(nullifier, (details, attachments)).is_none() {
                 metrics::counter!("synthetic_reconciler_recovered_body_total").increment(1);
                 tracing::debug!(
@@ -782,12 +815,23 @@ impl SyntheticProjector {
                         .entry(cref.block)
                         .or_default()
                         .push(nullifier);
+                    tracing::info!(
+                        "INSTR resolve: nullifier={} block={} outcome=cache_hit note_id={:?}",
+                        nullifier.to_hex(),
+                        cref.block,
+                        cref.note_id.map(|i| i.to_hex())
+                    );
                 } else if cref.note_id.is_some() {
                     misses.push((nullifier, cref));
                 } else {
                     // Authenticated + uncached → non-B2AGG consumption (store feed covers it).
                     metrics::counter!("synthetic_projector_b2agg_authenticated_skip_total")
                         .increment(1);
+                    tracing::info!(
+                        "INSTR resolve: nullifier={} block={} outcome=authenticated_skip note_id=None",
+                        nullifier.to_hex(),
+                        cref.block
+                    );
                     tracing::debug!(
                         nullifier = %nullifier.to_hex(),
                         block = cref.block,
@@ -838,6 +882,12 @@ impl SyntheticProjector {
                 metrics::counter!("synthetic_projector_b2agg_authoritative_fetch_total")
                     .increment(1);
                 tracing::info!(
+                    "INSTR resolve: nullifier={} block={} outcome=authoritative_fetch note_id={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    note_id.to_hex()
+                );
+                tracing::info!(
                     note_id = %note_id.to_hex(),
                     block = cref.block,
                     "projector: resolved an uncached (unauthenticated) B2AGG consumption by \
@@ -847,6 +897,12 @@ impl SyntheticProjector {
                 // Node RETURNED it but it is non-public / non-b2agg — legit CLAIM/GER. Safe skip
                 // (must NOT fail-closed, or a legit consumption wedges the tip).
                 attempts.remove(nullifier);
+                tracing::info!(
+                    "INSTR resolve: nullifier={} block={} outcome=skip_returned_non_b2agg note_id={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    note_id.to_hex()
+                );
                 tracing::debug!(
                     note_id = %note_id.to_hex(),
                     block = cref.block,
@@ -854,6 +910,12 @@ impl SyntheticProjector {
                 );
             } else {
                 // Node did NOT return the id: tx feed ahead of the note DB. Bounded retry.
+                tracing::info!(
+                    "INSTR resolve: nullifier={} block={} outcome=fail_missing_fetch note_id={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    note_id.to_hex()
+                );
                 let n = attempts.entry(*nullifier).or_insert(0);
                 *n += 1;
                 if *n > FETCH_MISS_RETRY_BOUND {
@@ -1026,6 +1088,17 @@ impl SyntheticProjector {
             .await?
                 == B2AggRestoreOutcome::Emitted
             {
+                // INSTR (observability-only): a B2AGG BridgeEvent was emitted. The reconstructed
+                // ConsumedExternal record usually has no `nullifier()` (metadata dropped), so
+                // the details-commitment is the join key back to the discover/resolve logs.
+                tracing::info!(
+                    "INSTR emit: nullifier={} details_commitment={} block={}",
+                    note.nullifier()
+                        .map(|n| n.to_hex())
+                        .unwrap_or_else(|| "none".into()),
+                    hex::encode(note.details_commitment().as_bytes()),
+                    miden_block
+                );
                 logs += 1;
                 continue;
             }
@@ -1267,7 +1340,7 @@ impl SyntheticProjector {
                 .get_input_notes(NoteFilter::All)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to get input notes: {e}"))?;
-            self.cache_committed_b2agg_bodies(&all_input);
+            self.cache_committed_b2agg_bodies(&all_input, "tick_scan");
             let txs = rpc
                 .sync_transactions(
                     BlockNumber::from((cursor + 1) as u32),
@@ -1278,7 +1351,60 @@ impl SyntheticProjector {
                 .map_err(|e| {
                     anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, project_to)
                 })?;
+            // INSTR (observability-only): the sourcing window + a continuity check across ticks, so a
+            // note whose consumption block fell in an un-sourced gap is visible. Pure logging —
+            // reads/updates `last_source_window_to` but never affects windowing or control flow.
+            let source_from = cursor + 1;
+            tracing::info!(
+                "INSTR source_window: from={} to={} reconcile_cursor={} tip={} tx_count={}",
+                source_from,
+                project_to,
+                reconcile_cursor,
+                tip,
+                txs.len()
+            );
+            let prev_to = self
+                .last_source_window_to
+                .swap(project_to, Ordering::AcqRel);
+            if prev_to != 0 && source_from != prev_to + 1 {
+                tracing::info!(
+                    "INSTR WINDOW_GAP: prev_to={} this_from={} (gap/overlap of {} blocks)",
+                    prev_to,
+                    source_from,
+                    (source_from as i128) - (prev_to as i128 + 1)
+                );
+            }
+            for tx in &txs {
+                if tx.transaction_header.account_id() != self.bridge_id {
+                    continue;
+                }
+                let nulls: Vec<String> = tx
+                    .transaction_header
+                    .input_notes()
+                    .iter()
+                    .map(|i| i.nullifier().to_hex())
+                    .collect();
+                tracing::info!(
+                    "INSTR source_tx: tx_id={} block={} n_inputs={} nullifiers=[{}]",
+                    tx.transaction_header.id().to_hex(),
+                    tx.block_num.as_u64(),
+                    nulls.len(),
+                    nulls.join(",")
+                );
+            }
             let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id);
+            // INSTR (observability-only): every attributed bridge consumption, keyed by nullifier.
+            for (nullifier, cref) in &consumed_refs {
+                tracing::info!(
+                    "INSTR source_consumption: nullifier={} block={} order={} note_id={:?} \
+                     authenticated={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    cref.order,
+                    cref.note_id.map(|i| i.to_hex()),
+                    cref.note_id.is_none()
+                );
+            }
             let fetcher = RpcNoteFetcher(&**rpc);
             self.resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict_by_block)
                 .await?
@@ -2459,7 +2585,7 @@ mod tests {
         // An already-consumed note has no nullifier to key on → nothing is cached. This is
         // WHY `cache_committed_b2agg_bodies` runs at import time and every tick over the
         // still-Committed store notes, before any of them can transition to ConsumedExternal.
-        projector.cache_committed_b2agg_bodies(std::slice::from_ref(&note));
+        projector.cache_committed_b2agg_bodies(std::slice::from_ref(&note), "tick_scan");
         assert!(
             projector
                 .recovered_bodies
