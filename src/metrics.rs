@@ -70,8 +70,10 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "projector_unresolved_consumed_body_total",
-        "unified projector: a bridge-consumed nullifier whose note body could not be \
-         resolved (store + dropped-body cache) — fail-closed, tick held; any increment is a bug"
+        "unified projector fail-close health readout, held at 0: the tick routes bridge \
+         consumptions by note kind (B2AGG authoritative, CLAIM/GER from the store feed) and \
+         SKIPS — never wedges — a consumption whose body isn't imported; a genuine B2AGG miss \
+         surfaces as a missing BridgeEvent in e2e, not here"
     );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");

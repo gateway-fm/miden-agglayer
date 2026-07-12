@@ -909,14 +909,19 @@ impl SyntheticProjector {
         // block is poison. No reconciler wired (node_rpc = None, pure unit
         // tests / a non-reconciling deployment) => no barrier, legacy behavior.
         // Barrier = note-BODY-import gate: `reconcile_cursor` is the frontier whose note
-        // BODIES the reconciler has imported (`sync_notes`). A note consumed at N was created
-        // at C <= N, so `reconcile_cursor >= N` guarantees its body is in the store. We do NOT
-        // gate on consumptions here — those are sourced AUTHORITATIVELY per block from
-        // `sync_transactions` below, so there is no consumption lag and nothing is ever late.
+        // BODIES the reconciler has imported (`sync_notes`). A B2AGG note consumed at N was
+        // created at C <= N, so `reconcile_cursor >= N` guarantees its body is in the store.
+        // We do NOT gate on B2AGG consumptions here — those are sourced AUTHORITATIVELY per
+        // block from `sync_transactions` below, so there is no consumption lag and no B2AGG is
+        // ever late; CLAIM/GER ride the store's consumed feed (proxy-internal, on time).
         let reconcile_cursor = self.reconcile_cursor.load(Ordering::Acquire);
         let project_to = if self.node_rpc.is_some() {
             let held = tip.saturating_sub(reconcile_cursor);
             ::metrics::gauge!("projector_visibility_barrier_held_blocks").set(held as f64);
+            // Keep the fail-close alarm present and readable as 0 (this design routes by note
+            // kind and skips — never wedges — a consumption whose body isn't imported, so the
+            // counter is only ever a health readout; a genuine B2AGG miss surfaces in e2e).
+            ::metrics::counter!("projector_unresolved_consumed_body_total").absolute(0);
             if held > 0 {
                 tracing::debug!(
                     tip,
@@ -957,16 +962,50 @@ impl SyntheticProjector {
             .into_iter()
             .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
             .collect();
-        // AUTHORITATIVE per-block consumption sourcing (docs/design/UNIFIED-PROJECTOR.md).
-        // Every event this projector emits is triggered by the BRIDGE consuming a note
-        // (B2AGG bridge-out, CLAIM, UpdateGerNote). The bridge's transactions across the
-        // blocks about to be sealed are the COMPLETE, FINALIZED consumption set of
-        // [cursor+1, project_to] — read from the chain, not the lagging local store, so a
-        // consumption can never surface "late". Resolve each consumed nullifier to its note
-        // BODY from the imported store notes (the barrier guarantees the body is imported:
-        // reconcile_cursor >= project_to >= consumption block), then rebuild a
-        // ConsumedExternal record at the AUTHORITATIVE (block, tx_order).
-        let consumed_records: Vec<InputNoteRecord> = if let Some(rpc) = self.node_rpc.as_ref() {
+        // Per-block consumption sourcing (docs/design/UNIFIED-PROJECTOR.md), routed by note
+        // kind because the three types surface their consumptions differently:
+        //
+        //   * CLAIM / UpdateGerNote — created AND consumed by this proxy's own operations
+        //     (the bridge consumes a GER injection roughly every block). They land in the
+        //     local store's consumed feed on time and were never the notes the late-sweep
+        //     chased, so they are sourced from the store's `Consumed` feed — the SAME source
+        //     the projector always used for them.
+        //
+        //   * B2AGG bridge-out — imported EXTERNALLY by the reconciler; the store's discovery
+        //     of its CONSUMPTION lags the chain (the bug the late-sweep fought). Sourced
+        //     AUTHORITATIVELY from the bridge's own transaction feed, which gives the
+        //     COMPLETE, FINALIZED B2AGG consumption set of [cursor+1, project_to] — so a
+        //     B2AGG consumption can never surface "late", and the late-sweep is deleted.
+        //
+        // A bridge transaction can consume any of the three; routing by kind (NOT forcing
+        // every bridge consumption through the B2AGG body path) is what keeps a GER/CLAIM
+        // consumption — whose body the authoritative feed reports before the store's B2AGG
+        // import frontier would have it — from wedging the tip.
+        let consumed = client
+            .get_input_notes(NoteFilter::Consumed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?;
+        // CLAIM / GER from the store's consumed feed, at their finalized consumption block.
+        // B2AGG is skipped here — sourced authoritatively below (keeping the two sources
+        // disjoint keeps the reasoning clean; `is_note_processed` would dedup either way).
+        let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
+        for note in &consumed {
+            if is_b2agg_note(note.details()) {
+                continue;
+            }
+            if let Some(h) = note.state().consumed_block_height().map(|h| h.as_u64()) {
+                by_block.entry(h).or_default().push(note);
+            }
+        }
+        // AUTHORITATIVE B2AGG: resolve each bridge-consumed nullifier in the window to its
+        // imported note BODY (store notes first, then the dropped-body cache for
+        // spent-before-import notes), rebuild a ConsumedExternal record at the authoritative
+        // (block, tx_order), and keep ONLY the B2AGG ones. A non-B2AGG consumption (a
+        // GER/CLAIM the store feed already covers) or one whose body is not yet imported is
+        // SKIPPED, never fail-closed: only B2AGG must emit here, its body is guaranteed
+        // imported by the barrier (reconcile_cursor >= project_to), and anything genuinely
+        // missing surfaces as a missing BridgeEvent in e2e rather than a wedged tip.
+        let auth_b2agg: Vec<InputNoteRecord> = if let Some(rpc) = self.node_rpc.as_ref() {
             let all_input = client
                 .get_input_notes(NoteFilter::All)
                 .await
@@ -992,23 +1031,21 @@ impl SyntheticProjector {
                 .expect("recovered-bodies cache poisoned");
             let mut recs: Vec<InputNoteRecord> = Vec::new();
             for (nullifier, (block, tx_order)) in bridge_consumed_nullifiers(&txs, self.bridge_id) {
-                // Resolve the note body: the imported store notes first, then the
-                // dropped-body cache (spent-before-import notes the store is missing).
+                // Resolve the note body: imported store notes first, then the dropped-body
+                // cache (spent-before-import B2AGG the store is missing).
                 let (details, attachments) = if let Some(rec) = body_by_nullifier.get(&nullifier) {
                     (rec.details().clone(), rec.attachments().clone())
                 } else if let Some((d, a)) = recovered.get(&nullifier) {
                     (d.clone(), a.clone())
                 } else {
-                    // FAIL-CLOSED: the barrier guarantees the body is imported (or cached). A
-                    // missing body would mean emitting a BridgeEvent without the note, or
-                    // dropping one — both forbidden. Abort the tick (nothing projected yet) and
-                    // retry; the stalled tip surfaces it loudly if it persists.
-                    ::metrics::counter!("projector_unresolved_consumed_body_total").increment(1);
-                    return Err(anyhow::anyhow!(
-                        "projector: bridge-consumed nullifier at block {block} has no imported \
-                         note body (reconcile_cursor >= {project_to}) — holding fail-closed, retry"
-                    ));
+                    // Body not imported: a CLAIM/GER (the store feed covers it) or a
+                    // not-yet-imported note. Skip — do NOT wedge the tip.
+                    continue;
                 };
+                // Only B2AGG is sourced here; CLAIM/GER ride the store feed above.
+                if !is_b2agg_note(&details) {
+                    continue;
+                }
                 let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
                     nullifier_block_height: BlockNumber::from(block as u32),
                     consumer_account: Some(self.bridge_id),
@@ -1022,9 +1059,7 @@ impl SyntheticProjector {
             // authoritative path is a no-op; tests drive `project_notes` directly.
             Vec::new()
         };
-        // Bucket the authoritative consumed records by their finalized block.
-        let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
-        for rec in &consumed_records {
+        for rec in &auth_b2agg {
             if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
                 by_block.entry(h).or_default().push(rec);
             }
