@@ -58,6 +58,24 @@ BRIDGE_ID="${BRIDGE_ID:-$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -oE "dep
 #    "extra" (later logs may belong to post-snapshot consumptions).
 docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3 > "$TMP/node.sqlite3" \
     || { echo "FAIL: cannot snapshot node store"; exit 1; }
+# WAL-aware: recent commits live in the -wal file until checkpointed; without it the
+# snapshot under-counts the newest consumptions (a false-PASS direction, still wrong).
+docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3-wal > "$TMP/node.sqlite3-wal" 2>/dev/null \
+    || rm -f "$TMP/node.sqlite3-wal"
+
+# 3b. Deliberately-DEFERRED bridge-outs are NOT missing. The proxy refuses to emit a
+#     BridgeEvent for a poisoned/unrecoverable faucet-registry row (MA#18; cantina13's
+#     unrecoverable-row scenario) — recovery is via --restore, so the note stays
+#     log-less on the live path BY DESIGN. Collect the refused faucet ids from the
+#     proxy logs; the python reclassifies matching missing candidates to "deferred"
+#     (reported, non-failing). Only an UNEXPLAINED absence fails the verdict.
+#     (Root cause of two false FAILs on 2026-07-12: the post-suite chain always
+#     carries exactly one such note, at the suite's cantina13 block.)
+#     NOTE: strip ANSI first — tracing colors the field names, which breaks the grep.
+DEFERRED_FAUCETS="${DEFERRED_FAUCETS:-$(docker logs "$AGGLAYER_CONTAINER" 2>&1 \
+    | sed -e 's/\x1b\[[0-9;]*m//g' \
+    | grep -aiE "refusing to emit|unrecoverable" \
+    | grep -aoE "faucet_id: 0x[0-9a-f]+" | awk '{print $2}' | sed 's/^0x//' | sort -u | tr '\n' ' ')}"
 
 # BARRIER-AWARE SETTLE (vb #30). The visibility barrier holds synthetic
 # projection at project_to = min(tip, reconcile_cursor), so under load a note
@@ -87,11 +105,14 @@ done
 sleep "${SETTLE_MARGIN_SECS:-20}"
 
 # 4. Cross-check.
-python3 - "$TMP/node.sqlite3" "$L2_RPC" "$BRIDGE_ID" "$B2AGG_ROOT" "$CLAIM_ROOT" "$GER_ROOT" "$ALLOW_LATE" <<'PY'
+python3 - "$TMP/node.sqlite3" "$L2_RPC" "$BRIDGE_ID" "$B2AGG_ROOT" "$CLAIM_ROOT" "$GER_ROOT" "$ALLOW_LATE" "$DEFERRED_FAUCETS" <<'PY'
 import json, sqlite3, sys, urllib.request
 from collections import Counter
 
 db, rpc, bridge_id, b2agg_root, claim_root, ger_root, allow_late = sys.argv[1:8]
+# Faucets whose bridge-outs the proxy DELIBERATELY refused to emit (poisoned/
+# unrecoverable registry rows — see step 3b in the shell). Lower-case hex, no 0x.
+deferred_faucets = set((sys.argv[8] if len(sys.argv) > 8 else "").lower().split())
 bridge_hex = bridge_id[2:].upper()
 
 TOPICS = {
@@ -138,8 +159,8 @@ overall_fail = False
 total_notes = 0
 total_logs = 0
 print(f"consistency cut: node snapshot tip = block {cut}")
-print(f"{'TYPE':<22} {'notes':>6} {'logs':>6} {'exact':>6} {'late':>5} {'missing':>8} {'extra':>6}  verdict")
-print("-" * 78)
+print(f"{'TYPE':<22} {'notes':>6} {'logs':>6} {'exact':>6} {'late':>5} {'missing':>8} {'defer':>6} {'extra':>6}  verdict")
+print("-" * 85)
 for name, (topic, root) in TOPICS.items():
     rows = list(n.execute(
         "SELECT consumed_at FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
@@ -164,21 +185,33 @@ for name, (topic, root) in TOPICS.items():
     missing = unmatched_notes - late
     extra = max(0, n_logs_cut - exact_cut - late)
 
+    # Reclassify DELIBERATE emit refusals: a missing candidate whose asset faucet is in
+    # the proxy's refused set is DEFERRED (expected on the live path; recovery is via
+    # --restore), not missing. Only unexplained absences remain in `missing`.
+    deferred = 0
+    if missing > 0:
+        unmatched = note_blocks - log_blocks
+        det = list(n.execute(
+            "SELECT hex(note_id) i, consumed_at b, hex(assets) a FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
+            "AND hex(target_account_id)=? ORDER BY consumed_at", (bytes.fromhex(root[2:]), bridge_hex)))
+        for r in det:
+            if unmatched.get(r["b"], 0) > 0:
+                # asset faucet id: 15 bytes after the 2-byte assets prefix
+                fauc = (r["a"] or "")[4:34].lower()
+                if fauc and fauc in deferred_faucets and deferred < missing:
+                    deferred += 1
+                    print(f"    DEFERRED (deliberate emit refusal, recovery via --restore): "
+                          f"note 0x{r['i'].lower()} consumed_at={r['b']} faucet={fauc}")
+                else:
+                    print(f"    MISSING candidate: note 0x{r['i'].lower()} consumed_at={r['b']}")
+        missing -= deferred
     total_notes += n_notes
     total_logs += n_logs_cut
     ok = missing == 0 and extra == 0 and (late == 0 or allow_late == "1")
     overall_fail |= not ok
-    if missing > 0:
-        unmatched = note_blocks - log_blocks
-        det = list(n.execute(
-            "SELECT hex(note_id) i, consumed_at b FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
-            "AND hex(target_account_id)=? ORDER BY consumed_at", (bytes.fromhex(root[2:]), bridge_hex)))
-        for r in det:
-            if unmatched.get(r["b"], 0) > 0:
-                print(f"    MISSING candidate: note 0x{r['i'].lower()} consumed_at={r['b']}")
-    print(f"{name:<22} {n_notes:>6} {n_logs_cut:>6} {exact:>6} {late:>5} {missing:>8} {extra:>6}  {'PASS' if ok else 'FAIL'}")
+    print(f"{name:<22} {n_notes:>6} {n_logs_cut:>6} {exact:>6} {late:>5} {missing:>8} {deferred:>6} {extra:>6}  {'PASS' if ok else 'FAIL'}")
 
-print("-" * 78)
+print("-" * 85)
 if total_notes == 0 and total_logs > 0:
     print("SANITY FAIL: node query matched ZERO consumed notes while logs exist —")
     print(f"almost certainly a wrong/bech32 BRIDGE_ID ({bridge_id}); pass the HEX id.")
