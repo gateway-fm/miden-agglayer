@@ -707,6 +707,124 @@ impl SyntheticProjector {
         Ok(())
     }
 
+    /// Resolve the note bodies for a window's bridge-consumed nullifiers into ConsumedExternal
+    /// records to project. Two-tier, no `await` under the cache lock:
+    ///
+    ///   * FAST PATH — a body already in the `recovered_bodies` cache (captured while Committed
+    ///     or via dropped-note recovery) resolves with no node round-trip.
+    ///   * AUTHORITATIVE BACKSTOP — a cache MISS is NOT a safe skip: the #30 barrier guarantees
+    ///     the block was SWEPT, not that the body was CACHED. A note created+consumed under load
+    ///     before the reconciler imports it Committed is consumed UNAUTHENTICATED, so the
+    ///     consuming tx carries its note id ([`ConsumedRef::note_id`]); fetch that public body by
+    ///     id and emit at its exact `(block, order)`. This is what stops the residual
+    ///     dropped-BridgeEvent (note `0xacfee0cb…`, N=30 loadtest).
+    ///
+    /// A cache miss with NO note id is an AUTHENTICATED consumption whose body was never cached —
+    /// provably impossible for a real public exit (authenticated ⟺ the note lived long enough to
+    /// be discovered+cached). Rather than silently drop a KNOWN bridge consumption, FAIL the tick
+    /// loudly so it retries and surfaces (never sealing a block missing a BridgeEvent). Every
+    /// resolved nullifier is recorded in `evict_by_block` so `tick` can bound the cache after the
+    /// block seals.
+    async fn resolve_b2agg_consumptions(
+        &self,
+        fetcher: &dyn PublicNoteFetcher,
+        consumed_refs: HashMap<Nullifier, ConsumedRef>,
+        evict_by_block: &mut HashMap<u64, Vec<Nullifier>>,
+    ) -> anyhow::Result<Vec<InputNoteRecord>> {
+        let build = |details: NoteDetails, attachments: NoteAttachments, cref: &ConsumedRef| {
+            let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+                nullifier_block_height: BlockNumber::from(cref.block as u32),
+                consumer_account: Some(self.bridge_id),
+                consumed_tx_order: Some(cref.order),
+            });
+            InputNoteRecord::new(details, attachments, None, state)
+        };
+
+        // Phase 1 (fast path, no I/O): resolve from the cache; collect misses for the fetch.
+        let mut recs: Vec<InputNoteRecord> = Vec::new();
+        let mut misses: Vec<(Nullifier, ConsumedRef)> = Vec::new();
+        {
+            let cache = self
+                .recovered_bodies
+                .lock()
+                .expect("recovered-bodies cache poisoned");
+            for (nullifier, cref) in consumed_refs {
+                if let Some((details, attachments)) = cache.get(&nullifier) {
+                    // The cache holds ONLY B2AGG bodies (both feeders filter), so a hit needs
+                    // no re-check.
+                    recs.push(build(details.clone(), attachments.clone(), &cref));
+                    evict_by_block
+                        .entry(cref.block)
+                        .or_default()
+                        .push(nullifier);
+                } else {
+                    misses.push((nullifier, cref));
+                }
+            }
+        }
+        if misses.is_empty() {
+            return Ok(recs);
+        }
+
+        // Fail-closed on authenticated-and-uncached misses BEFORE any authoritative fetch or
+        // projection: a known bridge consumption we can neither resolve nor safely skip.
+        for (nullifier, cref) in &misses {
+            if cref.note_id.is_none() {
+                metrics::counter!("synthetic_projector_b2agg_unresolved_total").increment(1);
+                tracing::error!(
+                    nullifier = %nullifier.to_hex(),
+                    block = cref.block,
+                    "projector: bridge consumed an AUTHENTICATED note with no cached body and no \
+                     note id to fetch — a KNOWN B2AGG consumption we cannot resolve. Holding the \
+                     tick (retry) rather than sealing a block missing its BridgeEvent."
+                );
+                return Err(anyhow::anyhow!(
+                    "projector: unresolved authenticated bridge consumption (nullifier {}, \
+                     block {}) — no cached body and no note id",
+                    nullifier.to_hex(),
+                    cref.block
+                ));
+            }
+        }
+
+        // Phase 2 (authoritative backstop): fetch the uncached (unauthenticated) bodies by id.
+        let fetch_ids: Vec<NoteId> = misses
+            .iter()
+            .filter_map(|(_, cref)| cref.note_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let bodies = fetcher.fetch_public_bodies(&fetch_ids).await?;
+        let body_by_id: HashMap<NoteId, &FetchedBody> = bodies
+            .iter()
+            .filter(|b| is_b2agg_note(&b.details))
+            .map(|b| (b.id, b))
+            .collect();
+        for (nullifier, cref) in &misses {
+            let Some(note_id) = cref.note_id else {
+                unreachable!("note_id-less misses fail-closed above");
+            };
+            let Some(body) = body_by_id.get(&note_id) else {
+                // Fetched but not a public B2AGG note (private/non-b2agg, or the node did not
+                // return it) — cannot be a real public exit. Skip (debug-logged in the fetcher).
+                continue;
+            };
+            recs.push(build(body.details.clone(), body.attachments.clone(), cref));
+            evict_by_block
+                .entry(cref.block)
+                .or_default()
+                .push(*nullifier);
+            metrics::counter!("synthetic_projector_b2agg_authoritative_fetch_total").increment(1);
+            tracing::info!(
+                note_id = %note_id.to_hex(),
+                block = cref.block,
+                "projector: resolved an uncached (unauthenticated) B2AGG consumption by \
+                 authoritative fetch"
+            );
+        }
+        Ok(recs)
+    }
+
     /// The #30 visibility-barrier projection ceiling. With a barrier active (`has_barrier`
     /// — a reconciler is wired), never project past the reconciler's last completed sweep
     /// (`reconcile_cursor`), so a synthetic block is sealed only after its notes are
@@ -1052,16 +1170,16 @@ impl SyntheticProjector {
             }
         }
         // AUTHORITATIVE B2AGG: for each bridge-consumed nullifier in the window, resolve its
-        // note BODY from the `recovered_bodies` cache and rebuild a ConsumedExternal record
-        // at the authoritative (block, tx_order). The cache — NOT a live-store nullifier map
-        // — is the resolution source ON PURPOSE: a B2AGG note's `InputNoteRecord::nullifier()`
-        // goes `None` the instant `sync_state` marks it ConsumedExternal (its metadata is
-        // dropped), so on a fresh-stack catch-up the note is routinely consumed before the
-        // projector reaches its block and would vanish from any store map — dropping the
-        // BridgeEvent. The cache captured its body by nullifier while it was still Committed
-        // (import time + every tick), so it survives. A nullifier NOT in the cache is a
-        // CLAIM/GER (the store feed above covers it) or a not-yet-imported note — SKIPPED,
-        // never fail-closed. Projected nullifiers are evicted below to keep the cache bounded.
+        // note BODY and rebuild a ConsumedExternal record at the authoritative (block,
+        // tx_order). Resolution is cache-first (bodies captured while the note was still
+        // Committed — a B2AGG note's `InputNoteRecord::nullifier()` goes `None` the instant
+        // `sync_state` marks it ConsumedExternal, so no live-store map can find it after
+        // consumption) with an authoritative node fetch backing up any cache miss (a note
+        // created+consumed under load before import is never cached but IS consumed
+        // unauthenticated, so the tx carries its id). See `resolve_b2agg_consumptions`. A
+        // nullifier that is neither cached, fetchable, nor B2AGG is a CLAIM/GER (the store
+        // feed above covers it) or a not-yet-imported note — skipped there; an authenticated
+        // uncached one fails the tick loudly. Projected nullifiers are evicted below.
         let mut evict_by_block: HashMap<u64, Vec<Nullifier>> = HashMap::new();
         let auth_b2agg: Vec<InputNoteRecord> = if let Some(rpc) = self.node_rpc.as_ref() {
             // Refresh the cache from the store's currently-resolvable (Committed) B2AGG notes
@@ -1082,34 +1200,10 @@ impl SyntheticProjector {
                 .map_err(|e| {
                     anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, project_to)
                 })?;
-            // No `await` past this lock — resolution + record building are synchronous. The
-            // cache holds ONLY B2AGG bodies (both feeders filter), so a hit is B2AGG by
-            // construction and needs no re-check.
-            let cache = self
-                .recovered_bodies
-                .lock()
-                .expect("recovered-bodies cache poisoned");
-            let mut recs: Vec<InputNoteRecord> = Vec::new();
-            for (nullifier, (block, tx_order)) in bridge_consumed_nullifiers(&txs, self.bridge_id) {
-                let Some((details, attachments)) = cache.get(&nullifier) else {
-                    // Not a cached B2AGG body: a CLAIM/GER (store feed covers it) or a
-                    // not-yet-imported note. Skip — do NOT wedge the tip.
-                    continue;
-                };
-                let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
-                    nullifier_block_height: BlockNumber::from(block as u32),
-                    consumer_account: Some(self.bridge_id),
-                    consumed_tx_order: Some(tx_order),
-                });
-                recs.push(InputNoteRecord::new(
-                    details.clone(),
-                    attachments.clone(),
-                    None,
-                    state,
-                ));
-                evict_by_block.entry(block).or_default().push(nullifier);
-            }
-            recs
+            let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id);
+            let fetcher = RpcNoteFetcher(&**rpc);
+            self.resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict_by_block)
+                .await?
         } else {
             // No reconciler wired (pure unit tests / non-reconciling deployment): the
             // authoritative path is a no-op; tests drive `project_notes` directly.
@@ -1171,9 +1265,81 @@ impl SyntheticProjector {
     }
 }
 
-/// MA#3 reclaim gate for the spent-before-import recovery path: map every
-/// nullifier consumed by a BRIDGE-executed transaction to `(spend_block,
-/// per-block bridge-tx order)`.
+/// One bridge-consumed input note, attributed from the bridge's transaction feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsumedRef {
+    /// Finalized block the bridge consumed the note in.
+    pub block: u64,
+    /// Per-block order of the consuming bridge transaction (intra-block determinism).
+    pub order: u32,
+    /// The consumed note's id — carried by the consuming transaction IFF the input was
+    /// UNAUTHENTICATED ([`InputNoteCommitment::header`] is `Some` exactly then). An
+    /// authenticated consumption carries no header, hence `None`; that is precisely the
+    /// case where the note lived long enough to be discovered and cached, so the projector
+    /// never needs to fetch it by id. When present, it lets the projector resolve a note
+    /// body the cache never captured (created+consumed under load before import) by fetching
+    /// it authoritatively from the node.
+    pub note_id: Option<NoteId>,
+}
+
+/// A public note body fetched by id from the node — enough to rebuild a ConsumedExternal
+/// record for projection. Private notes are dropped by the fetcher (a real public B2AGG
+/// exit is always public), so callers only ever see public bodies.
+#[derive(Clone)]
+pub(crate) struct FetchedBody {
+    pub id: NoteId,
+    pub details: NoteDetails,
+    pub attachments: NoteAttachments,
+}
+
+/// The single node-RPC capability the authoritative B2AGG resolution needs: fetch the
+/// PUBLIC note bodies for a set of ids. Narrowed to one method (and pre-decoded to
+/// [`FetchedBody`], dropping private notes) so it is trivially mockable in unit tests — the
+/// full [`NodeRpcClient`] has ~30 methods and needs a live node.
+#[async_trait::async_trait]
+pub(crate) trait PublicNoteFetcher: Send + Sync {
+    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<Vec<FetchedBody>>;
+}
+
+/// Production [`PublicNoteFetcher`] over a live node RPC client. A `Sized` wrapper (not a
+/// blanket `impl … for dyn NodeRpcClient`) because a `&dyn NodeRpcClient` cannot be coerced
+/// to `&dyn PublicNoteFetcher` — both are unsized, so the fat-pointer vtable can only be
+/// built from a `Sized` source.
+pub(crate) struct RpcNoteFetcher<'a>(pub &'a dyn NodeRpcClient);
+
+#[async_trait::async_trait]
+impl PublicNoteFetcher for RpcNoteFetcher<'_> {
+    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<Vec<FetchedBody>> {
+        let fetched = self
+            .0
+            .get_notes_by_id(ids)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_notes_by_id({}): {e}", ids.len()))?;
+        let mut out = Vec::with_capacity(fetched.len());
+        for f in fetched {
+            let id = f.id();
+            let FetchedNote::Public(note, _inclusion) = f else {
+                tracing::debug!(
+                    note_id = %id.to_hex(),
+                    "authoritative fetch: skipping non-public note (cannot be a real public exit)"
+                );
+                continue;
+            };
+            let attachments = note.attachments().clone();
+            let details: NoteDetails = note.into();
+            out.push(FetchedBody {
+                id,
+                details,
+                attachments,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// MA#3 reclaim gate for the authoritative consumption path: map every nullifier consumed
+/// by a BRIDGE-executed transaction to a [`ConsumedRef`] (spend block, per-block bridge-tx
+/// order, and — for unauthenticated inputs — the note id).
 ///
 /// The node's `sync_transactions` feed is filtered per account and each
 /// transaction header commits to the nullifiers of the notes that transaction
@@ -1185,7 +1351,7 @@ impl SyntheticProjector {
 pub(crate) fn bridge_consumed_nullifiers(
     txs: &[TransactionRecord],
     bridge_id: AccountId,
-) -> HashMap<Nullifier, (u64, u32)> {
+) -> HashMap<Nullifier, ConsumedRef> {
     let mut per_block_order: HashMap<u64, u32> = HashMap::new();
     let mut out = HashMap::new();
     for tx in txs {
@@ -1198,7 +1364,17 @@ pub(crate) fn bridge_consumed_nullifiers(
             .and_modify(|i| *i += 1)
             .or_insert(0u32);
         for input in tx.transaction_header.input_notes().iter() {
-            out.insert(input.nullifier(), (block, order));
+            // `header()` is `Some` IFF the input is unauthenticated — then it carries the
+            // NoteId, letting `tick` fetch an uncached body authoritatively.
+            let note_id = input.header().map(|h| h.id());
+            out.insert(
+                input.nullifier(),
+                ConsumedRef {
+                    block,
+                    order,
+                    note_id,
+                },
+            );
         }
     }
     out
@@ -1236,8 +1412,8 @@ mod tests {
     use miden_protocol::asset::{Asset, FungibleAsset};
     use miden_protocol::block::BlockNumber;
     use miden_protocol::note::{
-        NoteAssets, NoteAttachment, NoteAttachments, NoteDetails, NoteMetadata, NoteRecipient,
-        NoteStorage, NoteType, PartialNoteMetadata,
+        NoteAssets, NoteAttachment, NoteAttachments, NoteDetails, NoteHeader, NoteId, NoteMetadata,
+        NoteRecipient, NoteStorage, NoteType, PartialNoteMetadata,
     };
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
@@ -2086,14 +2262,18 @@ mod tests {
         fn nf(byte: u64) -> Nullifier {
             Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
         }
-        fn tx(account: AccountId, block: u32, nullifier: Nullifier) -> TransactionRecord {
+        fn tx(
+            account: AccountId,
+            block: u32,
+            commitment: InputNoteCommitment,
+        ) -> TransactionRecord {
             TransactionRecord {
                 block_num: BlockNumber::from(block),
                 transaction_header: TransactionHeader::new(
                     account,
                     Word::empty(),
                     Word::empty(),
-                    InputNotes::new(vec![InputNoteCommitment::from(nullifier)]).unwrap(),
+                    InputNotes::new(vec![commitment]).unwrap(),
                     vec![],
                     FungibleAsset::new(aid(FAUCET), 0).unwrap(),
                 ),
@@ -2103,17 +2283,52 @@ mod tests {
         }
 
         let (a, b, c) = (nf(1), nf(2), nf(3));
+        // Authenticated inputs (nullifier only, no header) — the common case.
+        let auth = |n: Nullifier| InputNoteCommitment::from(n);
+        // An UNAUTHENTICATED input carries a note header → the note id is recoverable. Build a
+        // real header so its `id()` is what `bridge_consumed_nullifiers` must surface.
+        let details_commitment = b2agg_note(5, Some(0)).details_commitment();
+        let metadata = NoteMetadata::new(
+            PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+            &NoteAttachments::default(),
+        );
+        let header = NoteHeader::new(details_commitment, metadata);
+        let expected_id = header.id();
+        let unauth = InputNoteCommitment::from_parts_unchecked(nf(4), Some(header));
+
         let txs = vec![
-            tx(aid(BRIDGE), 9, a),  // bridge consumption → attributed, order 0
-            tx(aid(SERVICE), 9, b), // sender reclaim → NOT attributed
-            tx(aid(BRIDGE), 9, c),  // second bridge tx in the block → order 1
+            tx(aid(BRIDGE), 9, auth(a)),  // bridge consumption → attributed, order 0
+            tx(aid(SERVICE), 9, auth(b)), // sender reclaim → NOT attributed
+            tx(aid(BRIDGE), 9, auth(c)),  // second bridge tx in the block → order 1
+            tx(aid(BRIDGE), 9, unauth), // unauthenticated bridge consumption → order 2, id carried
         ];
         let map = bridge_consumed_nullifiers(&txs, aid(BRIDGE));
-        assert_eq!(map.get(&a), Some(&(9, 0)));
+        assert_eq!(
+            map.get(&a),
+            Some(&ConsumedRef {
+                block: 9,
+                order: 0,
+                note_id: None
+            }),
+            "authenticated input → attributed with no note id"
+        );
         assert_eq!(
             map.get(&c),
-            Some(&(9, 1)),
+            Some(&ConsumedRef {
+                block: 9,
+                order: 1,
+                note_id: None
+            }),
             "per-block bridge-tx order increments"
+        );
+        assert_eq!(
+            map.get(&nf(4)),
+            Some(&ConsumedRef {
+                block: 9,
+                order: 2,
+                note_id: Some(expected_id)
+            }),
+            "unauthenticated input must carry the consuming tx's note id (enables authoritative fetch)"
         );
         assert!(
             !map.contains_key(&b),
@@ -2155,6 +2370,130 @@ mod tests {
                 .expect("cache poisoned")
                 .is_empty(),
             "a consumed note cannot be cached post-hoc; the cache is fed while Committed"
+        );
+    }
+
+    /// A [`PublicNoteFetcher`] test double returning a fixed set of public bodies (filtered by
+    /// requested id), standing in for the node's `get_notes_by_id`.
+    struct MockFetcher {
+        bodies: Vec<FetchedBody>,
+    }
+    #[async_trait::async_trait]
+    impl PublicNoteFetcher for MockFetcher {
+        async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<Vec<FetchedBody>> {
+            Ok(self
+                .bodies
+                .iter()
+                .filter(|b| ids.contains(&b.id))
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn nullifier(byte: u64) -> super::Nullifier {
+        super::Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
+    }
+
+    /// The regression for note `0xacfee0cb…` (N=30 loadtest, exactly 1 missing BridgeEvent): a
+    /// bridge consumption whose body the projector never cached — because the note was
+    /// created+consumed under load before the reconciler imported it Committed — must still be
+    /// resolved and emitted at its exact block. Such a consumption is UNAUTHENTICATED, so the
+    /// consuming tx carried the note id; `resolve_b2agg_consumptions` fetches the body by id
+    /// (authoritative backstop) instead of silently dropping it.
+    #[tokio::test]
+    async fn uncached_unauthenticated_consumption_resolves_via_authoritative_fetch() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await; // cache empty
+
+        // A real B2AGG body the node would return, and the id the consuming tx carries.
+        let body_note = b2agg_note(544, Some(0));
+        let details = body_note.details().clone();
+        let note_id = NoteId::new(
+            body_note.details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let nf = nullifier(0xac);
+
+        let consumed_refs = HashMap::from([(
+            nf,
+            ConsumedRef {
+                block: 544,
+                order: 0,
+                note_id: Some(note_id),
+            },
+        )]);
+        let fetcher = MockFetcher {
+            bodies: vec![FetchedBody {
+                id: note_id,
+                details: details.clone(),
+                attachments: NoteAttachments::default(),
+            }],
+        };
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let recs = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .await
+            .expect("uncached-but-unauthenticated consumption must resolve, not error");
+
+        assert_eq!(
+            recs.len(),
+            1,
+            "the uncached unauthenticated consumption must resolve via authoritative fetch"
+        );
+        assert_eq!(
+            recs[0].state().consumed_block_height().map(|h| h.as_u64()),
+            Some(544),
+            "resolved at the exact consumption block"
+        );
+        assert!(
+            is_b2agg_note(recs[0].details()),
+            "the fetched body is the B2AGG note"
+        );
+        assert_eq!(
+            evict.get(&544).map(|v| v.as_slice()),
+            Some([nf].as_slice()),
+            "the resolved nullifier is queued for post-seal eviction"
+        );
+    }
+
+    /// The fail-closed side: a bridge consumption that is neither cached NOR fetchable — an
+    /// AUTHENTICATED consumption (no note id in the tx) whose body was never cached — must
+    /// FAIL the tick loudly, never silently skip. An authenticated consumption means the note
+    /// lived long enough to be discovered+cached, so this is provably impossible for a real
+    /// public exit; failing surfaces it (discovery gap) rather than sealing a block missing a
+    /// known BridgeEvent.
+    #[tokio::test]
+    async fn uncached_authenticated_consumption_fails_the_tick_never_silent_skip() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let nf = nullifier(0x99);
+        let consumed_refs = HashMap::from([(
+            nf,
+            ConsumedRef {
+                block: 700,
+                order: 0,
+                note_id: None, // authenticated: no id to fetch by
+            },
+        )]);
+        let fetcher = MockFetcher { bodies: vec![] };
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let err = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .await
+            .expect_err("an unresolvable authenticated bridge consumption must fail the tick");
+        assert!(
+            format!("{err:#}").contains("unresolved authenticated"),
+            "must fail loudly (never silent-skip): {err:#}"
+        );
+        assert!(
+            evict.is_empty(),
+            "a failed tick must not have queued any eviction (resolved nothing)"
         );
     }
 }

@@ -70,10 +70,23 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "projector_unresolved_consumed_body_total",
-        "unified projector fail-close health readout, held at 0: the tick routes bridge \
-         consumptions by note kind (B2AGG authoritative, CLAIM/GER from the store feed) and \
-         SKIPS — never wedges — a consumption whose body isn't imported; a genuine B2AGG miss \
-         surfaces as a missing BridgeEvent in e2e, not here"
+        "legacy unified-projector health readout, held at 0; the live fail-close signal is now \
+         synthetic_projector_b2agg_unresolved_total"
+    );
+    describe_counter!(
+        "synthetic_projector_b2agg_authoritative_fetch_total",
+        "unified projector: bridge-consumed B2AGG bodies resolved by AUTHORITATIVE node fetch \
+         (get_notes_by_id) rather than the local cache — i.e. notes created+consumed under load \
+         before the reconciler imported them Committed (consumed unauthenticated, so the tx \
+         carries the note id). Nonzero under load is expected and healthy; it is the backstop \
+         that prevents the residual dropped-BridgeEvent."
+    );
+    describe_counter!(
+        "synthetic_projector_b2agg_unresolved_total",
+        "unified projector FAIL-CLOSE: a KNOWN bridge-consumed B2AGG nullifier that is neither \
+         cached nor fetchable (authenticated consumption with no note id) — the tick returns Err \
+         and retries rather than sealing a block missing its BridgeEvent. MUST stay 0; any \
+         increment means a genuine discovery gap to investigate."
     );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
