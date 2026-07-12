@@ -559,12 +559,12 @@ impl SyntheticProjector {
                     to,
                     "note reconciler: imported network notes missed by sync"
                 );
-                // Spent-before-import recovery: `import_notes` returns Ok even
-                // for notes it silently DROPPED because they were already
-                // consumed at import time (miden-client 0.15 bug — see the
-                // `direct_recovered` field docs). Re-query which of the
-                // attempted ids actually landed; the rest must be projected
-                // directly from node data or their BridgeEvents are lost.
+                // Spent-before-import: `import_notes` returns Ok even for notes it
+                // silently DROPPED because they were already consumed at import time
+                // (miden-client 0.15 bug — see the `recovered_bodies` field docs).
+                // Re-query which attempted ids landed; the dropped ones' bodies are
+                // cached by `recover_dropped_note_bodies` so `tick`'s authoritative
+                // consumption sourcing can still resolve and emit them.
                 if !attempted.is_empty() {
                     let landed: HashSet<NoteId> = client
                         .get_input_notes(NoteFilter::List(attempted.clone()))

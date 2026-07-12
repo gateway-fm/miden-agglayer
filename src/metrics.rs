@@ -69,9 +69,9 @@ pub fn init_metrics() {
          sweep cursor is behind the Miden tip (0 in steady state; >0 signals reconciler lag)"
     );
     describe_counter!(
-        "projector_late_sweep_anomaly_total",
-        "#30: notes the late-consumption sweep found for an already-sealed block — the \
-         visibility barrier should make this impossible, so any increment is a bug signal"
+        "projector_unresolved_consumed_body_total",
+        "unified projector: a bridge-consumed nullifier whose note body could not be \
+         resolved (store + dropped-body cache) — fail-closed, tick held; any increment is a bug"
     );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
