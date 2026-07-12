@@ -89,10 +89,15 @@ l2l2_deploy_nudge_token
 step "1a. External (bridge-out tool) deploys an operator faucet on Miden + mints $MINT_UNITS (custom symbol MDN)"
 # RED infra: bridge-out tool --create-native-faucet deploys an operator-owned faucet
 # with a CUSTOM symbol/decimals and mints MINT_UNITS to the wallet. Prints faucet-id.
-NATIVE_FAUCET_ID=$(iso_tool --create-native-faucet --native-symbol "MDN" --native-decimals 8 \
-    --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" 2>&1 | awk '/faucet-id:/{print $NF}') \
-  || true
-[[ -n "$NATIVE_FAUCET_ID" ]] || fail "bridge-out-tool --create-native-faucet did not print a faucet-id — deploy/mint failed (check the tool output above)"
+# Capture the tool's full output so a failure is DIAGNOSABLE — the old
+# `2>&1 | awk` swallowed the tool's error, leaving "did not print a faucet-id"
+# with no cause. Tee to a log, extract the id from it, dump it on failure.
+_nf_log="$(mktemp)"
+iso_tool --create-native-faucet --native-symbol "MDN" --native-decimals 8 \
+    --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" > "$_nf_log" 2>&1 || true
+NATIVE_FAUCET_ID=$(awk '/faucet-id:/{print $NF}' "$_nf_log")
+[[ -n "$NATIVE_FAUCET_ID" ]] || { echo "─── bridge-out-tool --create-native-faucet output ───"; cat "$_nf_log"; echo "─── end tool output ───"; rm -f "$_nf_log"; fail "bridge-out-tool --create-native-faucet did not print a faucet-id — deploy/mint failed (see tool output above)"; }
+rm -f "$_nf_log"
 pass "external party deployed native faucet: $NATIVE_FAUCET_ID + minted $MINT_UNITS MDN"
 
 step "1b. Proxy (bridge ADMIN) allowlists the faucet as native (is_native=true, origin_network=$MIDEN_NETWORK_ID)"
