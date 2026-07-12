@@ -75,7 +75,9 @@ swap() {  # $1 = "release" | "branch"; recreates ONLY the proxy on the same volu
   if [ "$1" = release ]; then "${REL[@]}" up -d miden-agglayer; else "${BASE[@]}" up -d miden-agglayer; fi
   wait_healthy 300 || fail "proxy not healthy after swap to $1"
   # no data loss: cursor resumed ahead, no genesis re-sweep
-  docker logs "$PROXY" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -aq "from: 1," \
+  # Scope to the NOTE RECONCILER: the L1InfoTreeIndexer legitimately scans L1 from
+  # block 1 on every boot (--l1-indexer-from-block=1) and also logs "from: 1,".
+  docker logs "$PROXY" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -a "note reconciler" | grep -aq "from: 1," \
       && fail "genesis re-sweep detected after swap to $1 (reconciler window from=1)"
   pass "no genesis re-sweep after swap to $1"
   # immutability: the pre-swap exposed range must hash identically
