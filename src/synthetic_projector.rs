@@ -719,12 +719,19 @@ impl SyntheticProjector {
     ///     id and emit at its exact `(block, order)`. This is what stops the residual
     ///     dropped-BridgeEvent (note `0xacfee0cb…`, N=30 loadtest).
     ///
-    /// A cache miss with NO note id is an AUTHENTICATED consumption whose body was never cached —
-    /// provably impossible for a real public exit (authenticated ⟺ the note lived long enough to
-    /// be discovered+cached). Rather than silently drop a KNOWN bridge consumption, FAIL the tick
-    /// loudly so it retries and surfaces (never sealing a block missing a BridgeEvent). Every
-    /// resolved nullifier is recorded in `evict_by_block` so `tick` can bound the cache after the
-    /// block seals.
+    /// There is NO silent-drop path left for a known bridge consumption. A cache miss is one of:
+    ///   * NO note id (AUTHENTICATED, uncached) — impossible for a real public exit (the note
+    ///     lived long enough to be discovered+cached), so FAIL the tick loudly (retry+surface);
+    ///   * note id present, node returned a public B2AGG body — resolve+emit;
+    ///   * note id present, node RETURNED it as non-public / non-b2agg — provably not an exit
+    ///     (the bridge legitimately consumes CLAIM/GER), so safe-skip (must NOT fail-closed or a
+    ///     legit non-exit consumption would wedge the tip);
+    ///   * note id present, node did NOT return it — the `sync_transactions` tx feed is ahead of
+    ///     the note DB `get_notes_by_id` reads (an eventual-consistency load race), so FAIL the
+    ///     tick loudly; the next tick re-fetches once the note DB catches up.
+    ///
+    /// Every resolved nullifier is recorded in `evict_by_block` so `tick` can bound the cache
+    /// after the block seals.
     async fn resolve_b2agg_consumptions(
         &self,
         fetcher: &dyn PublicNoteFetcher,
@@ -794,7 +801,10 @@ impl SyntheticProjector {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let bodies = fetcher.fetch_public_bodies(&fetch_ids).await?;
+        let FetchedBodies {
+            bodies,
+            returned_ids,
+        } = fetcher.fetch_public_bodies(&fetch_ids).await?;
         let body_by_id: HashMap<NoteId, &FetchedBody> = bodies
             .iter()
             .filter(|b| is_b2agg_note(&b.details))
@@ -805,9 +815,36 @@ impl SyntheticProjector {
                 unreachable!("note_id-less misses fail-closed above");
             };
             let Some(body) = body_by_id.get(&note_id) else {
-                // Fetched but not a public B2AGG note (private/non-b2agg, or the node did not
-                // return it) — cannot be a real public exit. Skip (debug-logged in the fetcher).
-                continue;
+                if returned_ids.contains(&note_id) {
+                    // The node RETURNED this note but it is non-public / non-b2agg — the bridge
+                    // legitimately consumes CLAIM/GER notes, so this is provably not a public
+                    // exit. Safe skip (must NOT fail-closed, or a legit consumption wedges).
+                    tracing::debug!(
+                        note_id = %note_id.to_hex(),
+                        block = cref.block,
+                        "authoritative fetch: node returned a non-b2agg note — safe skip (not an exit)"
+                    );
+                    continue;
+                }
+                // The node did NOT return this id: `sync_transactions` is ahead of the note DB
+                // `get_notes_by_id` reads (eventual-consistent under load). FAIL-CLOSED — never
+                // seal a block missing a KNOWN bridge consumption; the next tick re-fetches.
+                metrics::counter!("synthetic_projector_b2agg_fetch_missing_total").increment(1);
+                tracing::error!(
+                    nullifier = %nullifier.to_hex(),
+                    note_id = %note_id.to_hex(),
+                    block = cref.block,
+                    "projector: bridge-consumed note not returned by get_notes_by_id (tx feed \
+                     ahead of the note DB) — holding the tick (retry) rather than sealing a \
+                     block missing its BridgeEvent."
+                );
+                return Err(anyhow::anyhow!(
+                    "projector: bridge-consumed note not yet in the node's note DB (nullifier \
+                     {}, note_id {}, block {}) — tx feed ahead of note DB, retry",
+                    nullifier.to_hex(),
+                    note_id.to_hex(),
+                    cref.block
+                ));
             };
             recs.push(build(body.details.clone(), body.attachments.clone(), cref));
             evict_by_block
@@ -1292,13 +1329,25 @@ pub(crate) struct FetchedBody {
     pub attachments: NoteAttachments,
 }
 
-/// The single node-RPC capability the authoritative B2AGG resolution needs: fetch the
-/// PUBLIC note bodies for a set of ids. Narrowed to one method (and pre-decoded to
-/// [`FetchedBody`], dropping private notes) so it is trivially mockable in unit tests — the
-/// full [`NodeRpcClient`] has ~30 methods and needs a live node.
+/// The result of an authoritative fetch: the decoded PUBLIC bodies AND the full set of ids
+/// the node actually RETURNED (public or private, before any filtering). The `returned_ids`
+/// set is the signal that lets the caller distinguish two very different cache-miss outcomes
+/// for a note id it asked for: RETURNED-but-not-a-public-b2agg (proven not an exit → safe
+/// skip) vs NOT-RETURNED (the node omitted it — a `sync_transactions`-ahead-of-note-DB load
+/// race → fail-closed, retry). Without it a not-yet-indexed just-consumed note would silently
+/// drop its BridgeEvent, the acfee0cb-class bug one level down.
+pub(crate) struct FetchedBodies {
+    pub bodies: Vec<FetchedBody>,
+    pub returned_ids: HashSet<NoteId>,
+}
+
+/// The single node-RPC capability the authoritative B2AGG resolution needs: fetch the note
+/// bodies for a set of ids, decoded to public [`FetchedBody`]s plus the set of ids the node
+/// returned. Narrowed to one method so it is trivially mockable in unit tests — the full
+/// [`NodeRpcClient`] has ~30 methods and needs a live node.
 #[async_trait::async_trait]
 pub(crate) trait PublicNoteFetcher: Send + Sync {
-    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<Vec<FetchedBody>>;
+    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<FetchedBodies>;
 }
 
 /// Production [`PublicNoteFetcher`] over a live node RPC client. A `Sized` wrapper (not a
@@ -1309,31 +1358,38 @@ pub(crate) struct RpcNoteFetcher<'a>(pub &'a dyn NodeRpcClient);
 
 #[async_trait::async_trait]
 impl PublicNoteFetcher for RpcNoteFetcher<'_> {
-    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<Vec<FetchedBody>> {
+    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<FetchedBodies> {
         let fetched = self
             .0
             .get_notes_by_id(ids)
             .await
             .map_err(|e| anyhow::anyhow!("get_notes_by_id({}): {e}", ids.len()))?;
-        let mut out = Vec::with_capacity(fetched.len());
+        let mut bodies = Vec::with_capacity(fetched.len());
+        let mut returned_ids = HashSet::with_capacity(fetched.len());
         for f in fetched {
             let id = f.id();
+            // Record EVERY id the node responded with (public or private) BEFORE filtering — a
+            // returned-but-non-public id is provably not an exit; a NOT-returned id is unknown.
+            returned_ids.insert(id);
             let FetchedNote::Public(note, _inclusion) = f else {
                 tracing::debug!(
                     note_id = %id.to_hex(),
-                    "authoritative fetch: skipping non-public note (cannot be a real public exit)"
+                    "authoritative fetch: node returned a non-public note (cannot be a real exit)"
                 );
                 continue;
             };
             let attachments = note.attachments().clone();
             let details: NoteDetails = note.into();
-            out.push(FetchedBody {
+            bodies.push(FetchedBody {
                 id,
                 details,
                 attachments,
             });
         }
-        Ok(out)
+        Ok(FetchedBodies {
+            bodies,
+            returned_ids,
+        })
     }
 }
 
@@ -2373,20 +2429,36 @@ mod tests {
         );
     }
 
-    /// A [`PublicNoteFetcher`] test double returning a fixed set of public bodies (filtered by
-    /// requested id), standing in for the node's `get_notes_by_id`.
+    /// A [`PublicNoteFetcher`] test double standing in for the node's `get_notes_by_id`.
+    /// `bodies` are the public B2AGG-eligible bodies the node returns; `also_returned` are ids
+    /// the node returns but WITHOUT a public b2agg body (e.g. a public CLAIM/GER or a private
+    /// note) — present in `returned_ids` but absent from `bodies`. An id in neither is one the
+    /// node did NOT return at all (the load-race case).
+    #[derive(Default)]
     struct MockFetcher {
         bodies: Vec<FetchedBody>,
+        also_returned: Vec<NoteId>,
     }
     #[async_trait::async_trait]
     impl PublicNoteFetcher for MockFetcher {
-        async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<Vec<FetchedBody>> {
-            Ok(self
+        async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<FetchedBodies> {
+            let bodies: Vec<FetchedBody> = self
                 .bodies
                 .iter()
                 .filter(|b| ids.contains(&b.id))
                 .cloned()
-                .collect())
+                .collect();
+            let mut returned_ids: HashSet<NoteId> = bodies.iter().map(|b| b.id).collect();
+            returned_ids.extend(
+                self.also_returned
+                    .iter()
+                    .filter(|id| ids.contains(id))
+                    .copied(),
+            );
+            Ok(FetchedBodies {
+                bodies,
+                returned_ids,
+            })
         }
     }
 
@@ -2432,6 +2504,7 @@ mod tests {
                 details: details.clone(),
                 attachments: NoteAttachments::default(),
             }],
+            ..Default::default()
         };
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
         let recs = projector
@@ -2481,7 +2554,7 @@ mod tests {
                 note_id: None, // authenticated: no id to fetch by
             },
         )]);
-        let fetcher = MockFetcher { bodies: vec![] };
+        let fetcher = MockFetcher::default();
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
         let err = projector
             .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
@@ -2494,6 +2567,98 @@ mod tests {
         assert!(
             evict.is_empty(),
             "a failed tick must not have queued any eviction (resolved nothing)"
+        );
+    }
+
+    /// Case (B) — the residual silent-drop this refinement closes. A bridge consumption whose
+    /// body is uncached and unauthenticated (note id in the tx), but `get_notes_by_id` does NOT
+    /// return the id — `sync_transactions` is ahead of the node's note DB under load. This is a
+    /// KNOWN consumption we cannot yet resolve, so the tick must FAIL (retry next tick), never
+    /// silently seal the block without its BridgeEvent.
+    #[tokio::test]
+    async fn uncached_unauthenticated_fetch_omitted_fails_the_tick() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let note_id = NoteId::new(
+            b2agg_note(880, Some(0)).details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let nf = nullifier(0xb0);
+        let consumed_refs = HashMap::from([(
+            nf,
+            ConsumedRef {
+                block: 880,
+                order: 0,
+                note_id: Some(note_id),
+            },
+        )]);
+        // The node returns NOTHING for the requested id (not yet indexed).
+        let fetcher = MockFetcher::default();
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let err = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .await
+            .expect_err("a note the node did not return must fail the tick, not silent-skip");
+        assert!(
+            format!("{err:#}").contains("not yet in the node's note DB"),
+            "must fail loudly with the load-race reason: {err:#}"
+        );
+        assert!(
+            evict.is_empty(),
+            "a failed tick must not have queued any eviction"
+        );
+    }
+
+    /// Case (A) — the complement: a bridge consumption the node DID return, but as a non-b2agg
+    /// note (the bridge legitimately consumes CLAIM/GER). This is provably NOT a public exit, so
+    /// it is a safe skip — no record, no error, no eviction. Skipping here (not fail-closing) is
+    /// what keeps a legit CLAIM/GER bridge consumption from wedging the tip.
+    #[tokio::test]
+    async fn returned_non_b2agg_consumption_is_a_safe_skip_not_a_wedge() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // A CLAIM note's id: the node returns it, but its body is not B2AGG.
+        let claim = claim_note(901, Some(0));
+        let note_id = NoteId::new(
+            claim.details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let nf = nullifier(0xc1);
+        let consumed_refs = HashMap::from([(
+            nf,
+            ConsumedRef {
+                block: 901,
+                order: 0,
+                note_id: Some(note_id),
+            },
+        )]);
+        // Node RETURNS the id (in returned_ids) but with no public b2agg body.
+        let fetcher = MockFetcher {
+            bodies: vec![],
+            also_returned: vec![note_id],
+        };
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let recs = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .await
+            .expect("a returned non-b2agg note must be a safe skip, not an error");
+        assert!(
+            recs.is_empty(),
+            "a non-b2agg bridge consumption emits no B2AGG record"
+        );
+        assert!(
+            evict.is_empty(),
+            "nothing resolved → nothing queued for eviction"
         );
     }
 }

@@ -88,6 +88,13 @@ pub fn init_metrics() {
          and retries rather than sealing a block missing its BridgeEvent. MUST stay 0; any \
          increment means a genuine discovery gap to investigate."
     );
+    describe_counter!(
+        "synthetic_projector_b2agg_fetch_missing_total",
+        "unified projector FAIL-CLOSE (transient): a bridge-consumed note the tx feed reported \
+         but get_notes_by_id did NOT return — sync_transactions is ahead of the node note DB \
+         under load. The tick returns Err and re-fetches next tick once the DB catches up; brief \
+         nonzero blips under load are expected, a sustained climb means the note DB is stuck."
+    );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
     describe_histogram!("rpc_request_duration_seconds", "JSON-RPC request duration");
