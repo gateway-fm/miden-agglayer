@@ -212,11 +212,26 @@ if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
 fi
 pass "aggkit synced past block ${CLAIM_BLOCK} with zero claim-calldata parse errors"
 
-# (c) certificate pipeline alive: a cert reaches Settled after the restart window.
-wait_for "certificate settled" \
-    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'changed status.*Settled' | grep -q 'NewLocalExitRoot'" \
+# (c) certificate pipeline alive THROUGH the recovered claim's window. A settled cert
+# needs something to certify: with no new bridge activity aggsender (correctly) builds
+# nothing and any wait here times out against a healthy stack. So drive one real
+# Miden→L1 bridge-out; aggsender must then build a NEW certificate over the window
+# containing the derived-hash claim and settle it with a non-empty exit root.
+step "6b: driving a bridge-out so a fresh certificate must build over the claim window"
+"$SCRIPT_DIR/e2e-l2-to-l1.sh" 2>&1 | strip_ansi | tail -5 \
+    | while IFS= read -r line; do echo "  [l2-to-l1] $line"; done
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "post-restore bridge-out (e2e-l2-to-l1.sh) failed"
+
+EMPTY_LER="0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"
+wait_for "certificate settled with non-empty exit root" \
+    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'changed status.*Settled' | grep 'NewLocalExitRoot' | grep -qv '$EMPTY_LER'" \
     "$AGGKIT_SYNC_TIMEOUT" 10
-pass "certificate settled — pipeline unwedged"
+# The wedge signature must STILL be absent after the full cert build consumed the claim.
+if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
+    | grep -q "input too short"; then
+    fail "aggkit logged 'input too short' during certificate build"
+fi
+pass "certificate settled (non-empty NewLocalExitRoot) — pipeline unwedged through the claim window"
 
 log "======================================================================"
 log "  PASS: synthesized claim serves authoritative full calldata;"
