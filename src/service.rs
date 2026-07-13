@@ -575,7 +575,8 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .map_err(|e| store_error(answer_id.clone(), e))?;
             if let Some(log) = logs.first() {
                 tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
-                let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
+                let synthetic_tx =
+                    build_synthetic_tx_json(txn_hash, log, service.chain_id, service.network_id);
                 return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
             }
 

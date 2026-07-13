@@ -146,11 +146,74 @@ pub(crate) fn json_rpc_response_from_result<T: serde::Serialize>(
     }
 }
 
+/// SOAK FINDING #2 — render well-formed `claimAsset` calldata for a PROXY-SYNTHESIZED
+/// claim transaction, reconstructed from its ClaimEvent log. Returns `None` for
+/// non-ClaimEvent logs (or undecodable data), where the synthetic tx keeps its legacy
+/// empty input.
+///
+/// aggkit's bridgesync (v0.8.3 L2BridgeSyncer) fetches EVERY claim's transaction by hash
+/// and PARSES its `claimAsset` calldata ("DetailedClaimEvent"); a synthesized claim tx
+/// serving `input: "0x"` fails its decoder with "input too short: 0 bytes", and the
+/// downloader retries that block forever — wedging the whole certificate pipeline. The
+/// ClaimEvent log data carries the exact fields the event was derived from
+/// (`log_synthesis::encode_claim_event_data`: globalIndex | originNetwork |
+/// originAddress | destinationAddress | amount, 5×32 bytes), so those are re-encoded
+/// TRUTHFULLY; `destinationNetwork` is this rollup's network id (a claim served by this
+/// chain is by definition destined for it). The SMT proofs / exit roots are NOT
+/// recoverable from the log — they are zero-filled, keeping the calldata structurally
+/// valid (correct selector + argument layout) for aggkit's parser, whose certificate
+/// fields come from the truthful part.
+///
+/// Note tx bodies are NOT covered by the getLogs-immutability invariant: retroactively
+/// serving calldata for an already-synthesized claim tx hash is safe (and is exactly
+/// what un-wedges a live chain poisoned by an empty-input claim tx).
+pub(crate) fn encode_claim_asset_from_log(
+    log: &crate::log_synthesis::SyntheticLog,
+    local_network_id: u32,
+) -> Option<String> {
+    if log.topics.first().map(String::as_str) != Some(crate::log_synthesis::CLAIM_EVENT_TOPIC) {
+        return None;
+    }
+    let data_hex = log.data.strip_prefix("0x").unwrap_or(&log.data);
+    let data = hex::decode(data_hex).ok()?;
+    // ClaimEvent data layout (encode_claim_event_data): 5 fields × 32 bytes.
+    if data.len() < 5 * 32 {
+        return None;
+    }
+    let global_index = alloy::primitives::U256::from_be_slice(&data[0..32]);
+    let origin_network = u32::from_be_bytes(data[60..64].try_into().ok()?);
+    let origin_address: [u8; 20] = data[76..96].try_into().ok()?;
+    let destination_address: [u8; 20] = data[108..128].try_into().ok()?;
+    let amount = alloy::primitives::U256::from_be_slice(&data[128..160]);
+
+    let zero32 = alloy::primitives::FixedBytes::<32>::ZERO;
+    let call = crate::claim::claimAssetCall {
+        smtProofLocalExitRoot: [zero32; 32],
+        smtProofRollupExitRoot: [zero32; 32],
+        globalIndex: global_index,
+        mainnetExitRoot: zero32,
+        rollupExitRoot: zero32,
+        originNetwork: origin_network,
+        originTokenAddress: alloy::primitives::Address::from(origin_address),
+        destinationNetwork: local_network_id,
+        destinationAddress: alloy::primitives::Address::from(destination_address),
+        amount,
+        metadata: alloy::primitives::Bytes::new(),
+    };
+    Some(format!("0x{}", hex::encode(SolCall::abi_encode(&call))))
+}
+
 pub(crate) fn build_synthetic_tx_json(
     txn_hash: TxHash,
     log: &crate::log_synthesis::SyntheticLog,
     chain_id: u64,
+    local_network_id: u32,
 ) -> serde_json::Value {
+    // SOAK FINDING #2: a ClaimEvent-bearing synthetic tx must serve parseable
+    // `claimAsset` calldata (see `encode_claim_asset_from_log`); every other synthetic
+    // tx keeps the legacy empty input.
+    let input =
+        encode_claim_asset_from_log(log, local_network_id).unwrap_or_else(|| "0x".to_string());
     serde_json::json!({
         "type": "0x0",
         "nonce": "0x0",
@@ -158,7 +221,7 @@ pub(crate) fn build_synthetic_tx_json(
         "gas": "0x0",
         "to": &log.address,
         "value": "0x0",
-        "input": "0x",
+        "input": input,
         "v": "0x1b",
         "r": "0x1",
         "s": "0x1",
@@ -395,7 +458,7 @@ mod tests {
             removed: false,
         };
 
-        let json = build_synthetic_tx_json(txn_hash, &log, 2);
+        let json = build_synthetic_tx_json(txn_hash, &log, 2, 1);
 
         assert_eq!(json["type"], "0x0");
         assert_eq!(json["nonce"], "0x0");
@@ -435,11 +498,120 @@ mod tests {
             removed: false,
         };
 
-        let json = build_synthetic_tx_json(txn_hash, &log, 1337);
+        let json = build_synthetic_tx_json(txn_hash, &log, 1337, 1);
 
         assert_eq!(json["blockNumber"], "0xff");
         assert_eq!(json["chainId"], "0x539");
         assert_eq!(json["from"], log.address);
         assert_eq!(json["to"], log.address);
+    }
+
+    /// SOAK FINDING #2 regression — a PROXY-SYNTHESIZED claim tx (MA#27 chain-tail
+    /// watcher / derived-hash path) must serve WELL-FORMED `claimAsset` calldata:
+    /// correct selector, decodable argument layout, truthful globalIndex (+ origin/
+    /// destination/amount, all straight from the ClaimEvent log the tx bears).
+    /// aggkit v0.8.3's bridgesync parses this calldata for every claim; an empty
+    /// input wedges its downloader ("input too short: 0 bytes") and halts certs.
+    #[test]
+    fn synthesized_claim_tx_serves_wellformed_claim_asset_calldata() {
+        use alloy_core::sol_types::SolCall;
+        let gi: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[24..].copy_from_slice(&0x8000000000000028u64.to_be_bytes()); // the soak gi
+            b
+        };
+        let origin_addr = [0xABu8; 20];
+        let dest_addr = [0xCDu8; 20];
+        let data = crate::log_synthesis::encode_claim_event_data_u64(
+            &gi,
+            0, // origin network (L1 mainnet)
+            &origin_addr,
+            &dest_addr,
+            1_000_000,
+        );
+        let txn_hash = TxHash::from([7u8; 32]);
+        let log = SyntheticLog {
+            address: "0xc8cbebf950b9df44d987c8619f092bea980ff038".to_string(),
+            topics: vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
+            data,
+            block_number: 8831, // the wedged soak block
+            block_hash: [0xAA; 32],
+            transaction_hash: format!("{txn_hash:#x}"),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+        let local_network_id = 2u32;
+
+        let json = build_synthetic_tx_json(txn_hash, &log, 1, local_network_id);
+        let input = json["input"].as_str().expect("input is a string");
+        assert_ne!(
+            input, "0x",
+            "a ClaimEvent-bearing tx must NOT serve empty calldata"
+        );
+
+        let raw = hex::decode(input.strip_prefix("0x").unwrap()).expect("valid hex");
+        assert!(
+            raw.starts_with(&crate::claim::claimAssetCall::SELECTOR),
+            "calldata must carry the claimAsset selector"
+        );
+        let decoded =
+            crate::claim::claimAssetCall::abi_decode(&raw).expect("aggkit-parseable layout");
+        assert_eq!(
+            decoded.globalIndex,
+            alloy::primitives::U256::from_be_slice(&gi),
+            "globalIndex must be truthful (aggkit derives the certificate from it)"
+        );
+        assert_eq!(decoded.originNetwork, 0);
+        assert_eq!(decoded.originTokenAddress.as_slice(), &origin_addr);
+        assert_eq!(decoded.destinationNetwork, local_network_id);
+        assert_eq!(decoded.destinationAddress.as_slice(), &dest_addr);
+        assert_eq!(decoded.amount, alloy::primitives::U256::from(1_000_000u64));
+        assert!(
+            decoded.metadata.is_empty(),
+            "no metadata is reconstructable"
+        );
+    }
+
+    /// EVERY ClaimEvent-bearing synthetic tx the service serves must have non-empty
+    /// input, across data variants; non-claim synthetic txs keep the legacy empty
+    /// input (bridge events are read from LOGS by aggkit, not calldata).
+    #[test]
+    fn every_claim_event_bearing_synthetic_tx_has_non_empty_input() {
+        let mk_log = |topics: Vec<String>, data: String| SyntheticLog {
+            address: "0xc8cbebf950b9df44d987c8619f092bea980ff038".to_string(),
+            topics,
+            data,
+            block_number: 1,
+            block_hash: [0u8; 32],
+            transaction_hash: "0x11".to_string(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+        // Several ClaimEvent data shapes (different gi / networks / amounts).
+        for (gi_byte, net, amount) in [(1u8, 0u32, 1u64), (0x80, 5, u64::MAX), (0xFF, 42, 0)] {
+            let mut gi = [0u8; 32];
+            gi[0] = gi_byte;
+            let data = crate::log_synthesis::encode_claim_event_data_u64(
+                &gi, net, &[1u8; 20], &[2u8; 20], amount,
+            );
+            let log = mk_log(
+                vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
+                data,
+            );
+            let json = build_synthetic_tx_json(TxHash::from([9u8; 32]), &log, 1, 2);
+            assert_ne!(
+                json["input"], "0x",
+                "ClaimEvent tx (gi_byte={gi_byte:#x}) must serve calldata"
+            );
+        }
+        // Non-claim synthetic tx: unchanged legacy shape.
+        let bridge_log = mk_log(vec!["0xdeadbeef".to_string()], "0x".to_string());
+        let json = build_synthetic_tx_json(TxHash::from([9u8; 32]), &bridge_log, 1, 2);
+        assert_eq!(
+            json["input"], "0x",
+            "non-claim synthetic txs keep empty input"
+        );
     }
 }

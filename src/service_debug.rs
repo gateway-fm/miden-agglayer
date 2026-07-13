@@ -49,7 +49,9 @@ pub(crate) async fn service_debug_trace_transaction(
         ));
     }
 
-    // Fallback for synthetic bridge-out txs
+    // Fallback for synthetic txs: a ClaimEvent-bearing tx serves reconstructed
+    // `claimAsset` calldata (SOAK FINDING #2 — aggkit parses it), a BridgeEvent-bearing
+    // tx serves the legacy `bridgeAsset` reconstruction.
     let input_data = if let Ok(hash) = TxHash::from_str(&params.0) {
         let tx_key = format!("{hash:#x}");
         let logs = service
@@ -58,7 +60,8 @@ pub(crate) async fn service_debug_trace_transaction(
             .await
             .unwrap_or_default();
         if let Some(log) = logs.first() {
-            encode_bridge_asset_from_log(log)
+            crate::service_helpers::encode_claim_asset_from_log(log, service.network_id)
+                .unwrap_or_else(|| encode_bridge_asset_from_log(log))
         } else {
             "0x".to_string()
         }
