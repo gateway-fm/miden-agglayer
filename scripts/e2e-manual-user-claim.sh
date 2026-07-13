@@ -62,7 +62,7 @@ WEI_PER_MIDEN_UNIT=10000000000
 EXPECTED_UNITS_PER_DEPOSIT=$((DEPOSIT_AMOUNT / WEI_PER_MIDEN_UNIT))
 
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
-MAX_LEG1_ATTEMPTS="${MAX_LEG1_ATTEMPTS:-3}"
+MAX_LEG1_ATTEMPTS="${MAX_LEG1_ATTEMPTS:-5}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
@@ -192,67 +192,107 @@ do_l1_deposit() {
     [[ "$status" == "1" ]] || fail "L1 deposit tx failed (status=$status): $tx"
 }
 
+# dep_static_vars <deposit-json> → emits shell assignments for the deposit's
+# static claim fields (one python invocation; values are bridge-service hex
+# strings / integers). eval'd by the callers.
+dep_static_vars() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+m = d.get('metadata') or '0x'
+if m in ('None', 'null', ''): m = '0x'
+print(f\"DEP_CNT={d['deposit_cnt']};DEP_GI={d['global_index']};\"
+      f\"DEP_ORIG_NET={d['orig_net']};DEP_ORIG_ADDR={d['orig_addr']};\"
+      f\"DEP_DEST_NET={d['dest_net']};DEP_DEST_ADDR={d['dest_addr']};\"
+      f\"DEP_AMOUNT={d['amount']};DEP_METADATA={m}\")
+"
+}
+
 # build_user_claim_raw <deposit-json> → prints the pre-signed raw claimAsset tx
-# for the USER key (empty on proof-not-ready). Nonce is re-read per call.
+# for the USER key (empty on proof-not-ready). One-shot convenience wrapper
+# (the race loop in submit_user_claim inlines a faster variant).
 build_user_claim_raw() {
-    local dep="$1" cnt gi orig_net orig_addr dest_net dest_addr amount metadata
-    local proof mer rer smt_local smt_rollup calldata nonce_hex nonce
-    cnt=$(echo "$dep" | dep_field deposit_cnt)
-    gi=$(echo "$dep" | dep_field global_index)
-    orig_net=$(echo "$dep" | dep_field orig_net)
-    orig_addr=$(echo "$dep" | dep_field orig_addr)
-    dest_net=$(echo "$dep" | dep_field dest_net)
-    dest_addr=$(echo "$dep" | dep_field dest_addr)
-    amount=$(echo "$dep" | dep_field amount)
-    metadata=$(echo "$dep" | dep_field metadata)
-    [[ -z "$metadata" || "$metadata" == "None" ]] && metadata="0x"
-
-    proof=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=0" 2>/dev/null) || return 0
+    local dep="$1" proof calldata nonce_hex
+    local DEP_CNT DEP_GI DEP_ORIG_NET DEP_ORIG_ADDR DEP_DEST_NET DEP_DEST_ADDR DEP_AMOUNT DEP_METADATA
+    local MER RER SMT_LOCAL SMT_ROLLUP
+    eval "$(echo "$dep" | dep_static_vars)" || return 0
+    proof=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEP_CNT&net_id=0" 2>/dev/null) || return 0
     [[ -z "$proof" ]] && return 0
-    mer=$(echo "$proof" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])") || return 0
-    rer=$(echo "$proof" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])") || return 0
-    smt_local=$(echo "$proof" | python3 -c "
-import json, sys
-p = json.load(sys.stdin)['proof']['merkle_proof']
-while len(p) < 32: p.append('0x' + '00' * 32)
-print('[' + ','.join(p[:32]) + ']')
-") || return 0
-    smt_rollup=$(echo "$proof" | python3 -c "
-import json, sys
-p = json.load(sys.stdin)['proof']['rollup_merkle_proof']
-while len(p) < 32: p.append('0x' + '00' * 32)
-print('[' + ','.join(p[:32]) + ']')
-") || return 0
-
-    calldata=$(cast calldata \
-        'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
-        "$smt_local" "$smt_rollup" "$gi" "$mer" "$rer" \
-        "$orig_net" "$orig_addr" "$dest_net" "$dest_addr" "$amount" "$metadata") || return 0
-
+    eval "$(echo "$proof" | proof_vars)" || return 0
+    [[ -z "${MER:-}" ]] && return 0
+    calldata=$(claim_calldata_for) || return 0
     nonce_hex=$(rpc eth_getTransactionCount "[\"$USER_ADDR\",\"latest\"]" \
         | python3 -c "import json,sys; print(json.load(sys.stdin)['result'])") || return 0
-    nonce=$((nonce_hex))
-
-    cast mktx --private-key "$USER_KEY" --chain "$CHAIN_ID" --nonce "$nonce" \
+    cast mktx --private-key "$USER_KEY" --chain "$CHAIN_ID" --nonce "$((nonce_hex))" \
         --legacy --gas-price 1000000000 --gas-limit 5000000 \
         "$BRIDGE_ADDRESS" "$calldata" 2>/dev/null || return 0
 }
 
+# proof_vars: stdin = merkle-proof JSON → shell assignments MER/RER/SMT_LOCAL/
+# SMT_ROLLUP (single python invocation — the race loop is latency-sensitive).
+proof_vars() {
+    python3 -c "
+import json, sys
+try:
+    p = json.load(sys.stdin)['proof']
+except Exception:
+    sys.exit(0)
+def pad(a):
+    a = list(a)
+    while len(a) < 32: a.append('0x' + '00' * 32)
+    return '[' + ','.join(a[:32]) + ']'
+print(f\"MER={p['main_exit_root']};RER={p['rollup_exit_root']};\"
+      f\"SMT_LOCAL={pad(p['merkle_proof'])};SMT_ROLLUP={pad(p['rollup_merkle_proof'])}\")
+"
+}
+
+# claim_calldata_for: uses the DEP_*/MER/RER/SMT_* vars in scope.
+claim_calldata_for() {
+    cast calldata \
+        'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
+        "$SMT_LOCAL" "$SMT_ROLLUP" "$DEP_GI" "$MER" "$RER" \
+        "$DEP_ORIG_NET" "$DEP_ORIG_ADDR" "$DEP_DEST_NET" "$DEP_DEST_ADDR" \
+        "$DEP_AMOUNT" "$DEP_METADATA"
+}
+
 # submit_user_claim <deposit-json> <timeout-secs>
-# Tight retry loop: rebuild + submit the user's claim until accepted or the
-# dedup rejection fires. Sets:
+# Tight retry loop racing the sponsor's 2s ClaimTxManager monitor: re-fetch the
+# proof each round (the exit-root pair must coincide with an injected GER —
+# C6), but only re-sign when the pair CHANGES, and fetch the nonce once — the
+# loop period stays well under the sponsor's poll. Sets:
 #   SUBMIT_OUTCOME = user_won | dedup_rejected | timeout
 #   USER_TX        = the user's accepted tx hash (user_won only)
 #   LAST_ERR       = last JSON-RPC error message
 submit_user_claim() {
-    local dep="$1" timeout="$2" started raw resp result errmsg
+    local dep="$1" timeout="$2" started proof raw resp result errmsg
+    local calldata nonce_hex nonce last_pair=""
+    local DEP_CNT DEP_GI DEP_ORIG_NET DEP_ORIG_ADDR DEP_DEST_NET DEP_DEST_ADDR DEP_AMOUNT DEP_METADATA
+    local MER RER SMT_LOCAL SMT_ROLLUP
     SUBMIT_OUTCOME="timeout"; USER_TX=""; LAST_ERR=""
+
+    eval "$(echo "$dep" | dep_static_vars)"
+    # The user's proxy nonce only advances when a tx is ACCEPTED — which ends
+    # this loop — so one fetch up front is safe.
+    nonce_hex=$(rpc eth_getTransactionCount "[\"$USER_ADDR\",\"latest\"]" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['result'])") || nonce_hex=0x0
+    nonce=$((nonce_hex))
+
     started=$(date +%s)
+    raw=""
     while (( $(date +%s) - started < timeout )); do
-        raw=$(build_user_claim_raw "$dep")
-        if [[ -z "$raw" ]]; then
-            sleep 1; continue    # proof not available yet
+        proof=$(curl -sf -m 5 "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$DEP_CNT&net_id=0" 2>/dev/null) || { sleep 0.5; continue; }
+        [[ -z "$proof" ]] && { sleep 0.5; continue; }
+        MER=""
+        eval "$(echo "$proof" | proof_vars)"
+        [[ -z "$MER" ]] && { sleep 0.5; continue; }
+        if [[ "$MER|$RER" != "$last_pair" ]]; then
+            calldata=$(claim_calldata_for) || { sleep 0.5; continue; }
+            raw=$(cast mktx --private-key "$USER_KEY" --chain "$CHAIN_ID" --nonce "$nonce" \
+                --legacy --gas-price 1000000000 --gas-limit 5000000 \
+                "$BRIDGE_ADDRESS" "$calldata" 2>/dev/null) || { sleep 0.5; continue; }
+            last_pair="$MER|$RER"
         fi
+        [[ -z "$raw" ]] && { sleep 0.5; continue; }
         resp=$(rpc eth_sendRawTransaction "[\"$raw\"]")
         result=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or '')" 2>/dev/null || true)
         errmsg=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',{}).get('message') or '')" 2>/dev/null || true)
@@ -263,8 +303,8 @@ submit_user_claim() {
         if [[ "$errmsg" == *"already submitted"* ]]; then
             SUBMIT_OUTCOME="dedup_rejected"; return 0
         fi
-        # C6 GER-not-seen and transient rejections: retry.
-        sleep 1
+        # C6 GER-not-seen and transient rejections: retry quickly.
+        sleep 0.3
     done
     return 0
 }
@@ -393,7 +433,12 @@ wait_for "race deposit ready_for_claim" \
 pass "race deposit is ready_for_claim — sponsor is live on it now"
 
 # Anchor the proxy log BEFORE the race so the dedup-rejection grep is scoped.
-LOGS_BEFORE=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | wc -l)
+# Timestamp anchor + `--tail` window, NOT a line-count over a full read:
+# docker's sequential log readers (plain read, --since) can die at a corrupt
+# entry mid-file on long-lived stacks (observed live: full read stopped hours
+# behind the tip), silently returning nothing past it. `--tail` seeks from the
+# END and stays reliable; ISO-8601 timestamps compare lexicographically.
+RACE_START_TS=$(date -u +%Y-%m-%dT%H:%M:%S)
 
 submit_user_claim "$DEP_JSON" 420
 WINNER=""; WINNER_TX=""
@@ -450,11 +495,12 @@ else
     warn "could not rebuild the user claim for the deterministic dedup check"
 fi
 
-# Best-effort: the proxy-side view of the loser (ANSI stripped, anchored on
-# the exact dedup message + this gi — never a bare FAIL/error grep).
-DEDUP_LOG_HITS=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 \
-    | tail -n +$((LOGS_BEFORE + 1)) \
+# The proxy-side view of the loser (ANSI stripped, anchored on the exact
+# dedup message + this gi — never a bare FAIL/error grep). The deterministic
+# resubmission above guarantees at least one hit exists.
+DEDUP_LOG_HITS=$(docker logs --tail 6000 "$AGGLAYER_CONTAINER" 2>&1 \
     | strip_ansi \
+    | awk -v ts="$RACE_START_TS" '$1 >= ts' \
     | grep -c "already submitted for global_index ${GI2}" || true)
 log "proxy log dedup rejections for gi=$GI2 since race start: $DEDUP_LOG_HITS"
 [[ "$DEDUP_LOG_HITS" -ge 1 ]] \
@@ -474,6 +520,36 @@ done
 [[ "$BALANCE" -ge $((BAL_AFTER_LEG1 + EXPECTED_UNITS_PER_DEPOSIT)) ]] \
     || fail "raced deposit never minted (balance $BALANCE, expected ≥ $((BAL_AFTER_LEG1 + EXPECTED_UNITS_PER_DEPOSIT)))"
 pass "raced deposit minted exactly once: balance $BAL_AFTER_LEG1 → $BALANCE"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Epilogue — DETECT (report-only) the sponsor ethtxmanager wedge
+# ══════════════════════════════════════════════════════════════════════════════
+# FINDING (observed live, 2026-07-13 rel-v0158): when the user front-runs the
+# sponsor, aggkit's ClaimTxManager wedges. It has already signed its own claim
+# tx for the raced gi at its next nonce; the proxy rejects that tx FOREVER
+# ("claim already submitted" — the gi landed under the user's tx, hard dedup),
+# the R4 nonce gate never advances, and every later sponsor claim queues
+# behind it at nonce+1 ("nonce mismatch", observed live as tx.nonce=35 vs
+# expected=34 every 2s). On a real EVM chain the sponsor's claimAsset would
+# MINE as an AlreadyClaimed revert and consume the nonce; the proxy instead
+# rejects at RPC submission, so the nonce never burns — sponsor autoclaim is
+# dead for ALL later deposits from that point on. This epilogue only DETECTS
+# and reports the wedge; the operator remedy (verified live) is to consume the
+# sponsor's expected nonce with a benign accepted tx, e.g. a zero-amount
+# claimAsset signed by the fixture sponsor key, once per head-blocked tx.
+step "Epilogue — check whether this run wedged the sponsor autoclaimer"
+sleep 8
+RECENT=$(docker logs --tail 400 "$AGGLAYER_CONTAINER" 2>&1 \
+    | strip_ansi \
+    | awk -v ts="$(date -u -d '-9 seconds' +%Y-%m-%dT%H:%M:%S)" '$1 >= ts')
+if echo "$RECENT" | grep -qE "ERR claim already submitted for global_index (${LEG1_GI}|${GI2})\b"; then
+    warn "SPONSOR WEDGED: the proxy is still rejecting the sponsor's head tx for a"
+    warn "user-won gi every ~2s (hard dedup + R4 strict nonce = permanent block)."
+    warn "Sponsor autoclaim will NOT work for later deposits until an operator"
+    warn "consumes the sponsor's expected nonce (see comment above this check)."
+else
+    pass "no head-blocked dedup spam from the sponsor in the last 8s"
+fi
 
 echo ""
 log "======================================================================"
