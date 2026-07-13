@@ -135,7 +135,7 @@ docker compose up -d miden-agglayer
 - **Allowlist before announcing**: a native token must be registered
   (`admin_registerNativeFaucet`) *before* users can bridge it — the on-chain bridge will
   lock assets regardless of proxy registration.
-- Alert on `bridge_out_unknown_faucet_total` > 0 — it is always either a mis-ordered
+- Alert on `bridge_out_unknown_faucet_total` > 0 — it is always either a badly ordered
   rollout (register late) or a probe.
 - Release follow-up (task #47): e2e covering this exact scenario end-to-end
   (lock → quarantine → register → restore → claimable), plus a live-projection-path unit
