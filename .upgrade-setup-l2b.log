@@ -1,0 +1,23 @@
+[0;32m[setup-l2b][0m Step 1: 4_createRollup.ts (agglayer-contracts image) — addNewRollupType + attachAggchainToAL + aggchain init
+[0;32m[setup-l2b][0m   create_rollup_output: rollupAddress=0x5D1A491A416feEbf8C123A558ec28A239960bd0E consensus=AggchainECDSAMultisig
+[0;32m[setup-l2b][0m rollupIDToRollupData(2): aggchain=0x5D1A491A416feEbf8C123A558ec28A239960bd0E chainID=31338 verifierType=2
+[0;32m[setup-l2b][0m   trustedSequencer: 0x5b06837A43bdC3dD9F114558DAf4B26ed49842Ed
+[0;32m[setup-l2b][0m   networkName:      "l2b-sovereign"
+[0;32m[setup-l2b][0m   L1 attach tx (CreateNewAggchain rollupID 2): 0xd1601b6d148d155b54aa6ad9e624abb4204e8a484a65b84c37718ec7945d94e4
+[0;32m[setup-l2b][0m Step 2: injecting sovereign genesis into L2B (anvil_setCode/Storage/Balance/Nonce)
+  TokenWrapped implementation: 0xA4D0c0ffab6cEf8297919677d99bdc767bAC0AE7 code=True slots=1
+  BridgeLib: 0xa6DdA31A1dB1cbecbCc91df9b4bb84F1d893871E code=True slots=0
+  PolygonZkEVMDeployer: 0x1b50e2F3bf500Ab9Da6A7DBb6644D392D9D14b99 code=True slots=1
+  ProxyAdmin: 0xd60F1BCf5566fCCD62f8AA3bE00525DdA6Ab997c code=True slots=1
+  AgglayerBridgeL2 implementation: 0xcb12D626fBB88E7443bEf58Ad263Bf63185EAF1e code=True slots=1
+  AgglayerBridgeL2 proxy: 0xC8cbEBf950B9Df44d987c8619f092beA980fF038 code=True slots=9
+  AgglayerGERL2 implementation: 0xECa9c346cB0b76340a645fC03a077C2B8dDC5B10 code=True slots=1
+  AgglayerGERL2 proxy: 0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa code=True slots=4
+  PolygonZkEVMTimelock: 0x21D5360f869bf65aCFe784070Db4698E843B35A3 code=True slots=10
+  keyless Deployer: 0x575C158b45Ab2636BCf2b7030e91c9F43c4BD09C code=False slots=0
+  deployer: 0xE34aaF64b29273B7D567FCFc40544c014EEe9970 code=False slots=0
+injected 9 code blobs, 28 storage slots
+[0;32m[setup-l2b][0m   L2B AgglayerGERL2 proxy 0xa40D5f56745a118D0906a34E69aeC8C0Db1cB8fA: globalExitRootUpdater=0x0b68058E5b2592b1f472AdFe106305295A332A7C
+[0;32m[setup-l2b][0m   L2B AgglayerBridgeL2 proxy 0xC8cbEBf950B9Df44d987c8619f092beA980fF038: networkID=2 GER=0xa40D5f56745a118D0906a34E69aeC8C0Db1cB8fA
+[0;32m[setup-l2b][0m Step 3: funding admin/sequencer/aggoracle on L2B
+[0;32m[setup-l2b][0m setup-l2b DONE — rollup #2 registered (real kurtosis flow) + real sovereign contracts live on L2B

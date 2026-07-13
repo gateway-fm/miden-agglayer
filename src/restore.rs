@@ -650,7 +650,11 @@ async fn restore_faucet_identities(
                         bridge_account.storage(),
                         faucet_id,
                     ) else {
-                        continue; // native / unregistered — nothing to rebuild
+                        // All-zero conversion = the native-ETH sentinel (pre-seeded, never
+                        // rebuilt from chain) or an unregistered id. A registered NATIVE
+                        // faucet has a non-zero origin (origin_network == network_id, scale 0),
+                        // so it does NOT land here — it proceeds to classify + rebuild below.
+                        continue;
                     };
                     match crate::faucet_ops::rebuild_faucet_entry_from_chain(
                         client,
@@ -681,14 +685,31 @@ async fn restore_faucet_identities(
                             }
                         }
                         Err(e) => {
-                            ::metrics::counter!("restore_faucet_identity_rebuild_failed_total")
-                                .increment(1);
-                            tracing::warn!(
-                                faucet_id = %faucet_id,
-                                error = ?e,
-                                "Cantina #6: could not rebuild faucet row from chain; historical \
-                                 bridge-outs for this faucet stay quarantined until it is backfilled"
-                            );
+                            // An UNKNOWN faucet type registered in the bridge is a fail-LOUD
+                            // condition (malformed / hostile registration), distinct from a
+                            // recoverable metadata miss — surface it at ERROR with its own
+                            // metric so operators must investigate rather than let it pass as
+                            // a routine quarantine.
+                            if format!("{e:?}").contains("UNKNOWN faucet type") {
+                                ::metrics::counter!("restore_unknown_faucet_type_total")
+                                    .increment(1);
+                                tracing::error!(
+                                    faucet_id = %faucet_id,
+                                    error = ?e,
+                                    "restore: UNKNOWN faucet type registered in the bridge — \
+                                     matches no supported faucet kind; NOT rebuilt. Investigate: \
+                                     this should never happen for a proxy-registered faucet."
+                                );
+                            } else {
+                                ::metrics::counter!("restore_faucet_identity_rebuild_failed_total")
+                                    .increment(1);
+                                tracing::warn!(
+                                    faucet_id = %faucet_id,
+                                    error = ?e,
+                                    "Cantina #6: could not rebuild faucet row from chain; historical \
+                                     bridge-outs for this faucet stay quarantined until it is backfilled"
+                                );
+                            }
                         }
                     }
                 }

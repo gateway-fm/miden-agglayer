@@ -285,7 +285,16 @@ pub(crate) async fn worker_handle_claim_asset(
     }
 
     // Lock the claim index. All error paths after this MUST unclaim.
-    service.store.try_claim(params.globalIndex).await?;
+    //
+    // SOAK FINDING #1 (orphaned-claim wedge): a plain `try_claim` rejection here permanently
+    // wedged a deposit if the proxy died between the lock write and the CLAIM landing on
+    // Miden (chaos restart in the submit window): the persisted record survived, the R9
+    // guard never fired, and every sponsor retry was rejected forever — starving all later
+    // claims the sponsor owns. Dedup must mean "landed or genuinely in flight", not
+    // "submission was attempted once": on rejection, verify + recover via
+    // `acquire_claim_lock` (landed → hard reject; in flight (younger than TTL) → reject;
+    // orphaned (no ClaimEvent + TTL expired) → supersede the record and accept).
+    acquire_claim_lock(&service.store, params.globalIndex, claim_resubmit_ttl()).await?;
 
     // R9 — install a RAII drop guard so that even if the request future is
     // dropped (client disconnect mid-publish, panic, task cancellation), the
@@ -308,6 +317,61 @@ pub(crate) async fn worker_handle_claim_asset(
     // the guard to forget so its Drop is a no-op.
     guard.commit();
 
+    Ok(())
+}
+
+/// How long a `try_claim` record may sit WITHOUT its ClaimEvent landing before it is
+/// treated as an orphaned (crashed-mid-flight) submission and superseded on the next
+/// retry. Env-tunable via `CLAIM_RESUBMIT_TTL_SECS`; the default comfortably covers the
+/// slowest legitimate in-flight path (GER-propagation waits + Miden commit, tens of
+/// seconds) while unwedging a crash-orphaned deposit within ~2 sponsor retries.
+pub(crate) fn claim_resubmit_ttl() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = std::env::var("CLAIM_RESUBMIT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Acquire the per-`global_index` claim submission lock, with orphaned-record recovery
+/// (SOAK FINDING #1). Semantics: dedup means "landed or genuinely in flight", never
+/// "submission was attempted once".
+///
+///   1. Fresh index → lock acquired (the normal path).
+///   2. Record exists + ClaimEvent recorded for the index → hard reject ("already
+///      submitted" stays an error — the claim LANDED; dedup holds forever).
+///   3. Record exists + no ClaimEvent + record younger than `ttl` → reject (a submission
+///      is genuinely in flight; no double-submit race).
+///   4. Record exists + no ClaimEvent + `ttl` expired → ORPHANED (the proxy died between
+///      the lock write and the CLAIM landing): atomically supersede the record
+///      (`Store::try_reclaim_expired` — single UPDATE, one winner under concurrency),
+///      warn + `claim_resubmission_recovered_total`, and accept the resubmission.
+pub(crate) async fn acquire_claim_lock(
+    store: &std::sync::Arc<dyn crate::store::Store>,
+    global_index: alloy::primitives::U256,
+    ttl: std::time::Duration,
+) -> anyhow::Result<()> {
+    let Err(rejected) = store.try_claim(global_index).await else {
+        return Ok(()); // fresh index — the normal path
+    };
+    // LANDED check first: an index whose ClaimEvent exists is a hard dedup, always.
+    let gi_bytes: [u8; 32] = global_index.to_be_bytes::<32>();
+    if store.has_claim_event_for_global_index(&gi_bytes).await? {
+        return Err(rejected);
+    }
+    // Not landed. Atomically supersede IFF the record has out-lived the in-flight TTL;
+    // a fresher record means a submission is genuinely in flight — keep rejecting.
+    if !store.try_reclaim_expired(global_index, ttl).await? {
+        return Err(rejected);
+    }
+    ::metrics::counter!("claim_resubmission_recovered_total").increment(1);
+    tracing::warn!(
+        global_index = %global_index,
+        ttl_secs = ttl.as_secs(),
+        "orphaned claim submission record for global_index {global_index} (submitted but \
+         never landed — likely a crash mid-flight); accepting resubmission"
+    );
     Ok(())
 }
 
@@ -1550,5 +1614,80 @@ mod tests {
             msg.contains("--insecure-allow-any-signer"),
             "must point the operator at the explicit opt-in: {msg}"
         );
+    }
+
+    /// SOAK FINDING #1 — the orphaned-claim recovery. A `try_claim` record with NO
+    /// ClaimEvent whose TTL has expired (the proxy died between the lock write and the
+    /// CLAIM landing) must be superseded and the resubmission ACCEPTED, unwedging the
+    /// sponsor. The lock is held again afterwards (superseded, not deleted).
+    #[tokio::test]
+    async fn orphaned_claim_record_recovers_after_ttl() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let gi = U256::from(0x8000000000000028u64); // the wedged soak gi shape
+        store.try_claim(gi).await.expect("first submission locks");
+
+        // "Crash": no ClaimEvent ever lands, and the record out-lives the TTL
+        // (Duration::ZERO = instantly expired, keeps the test clock-free).
+        acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+            .await
+            .expect("orphaned record (no ClaimEvent, TTL expired) must accept resubmission");
+        assert!(
+            store.is_claimed(&gi).await.unwrap(),
+            "recovery SUPERSEDES the record (lock re-held by the new submission), not deletes it"
+        );
+    }
+
+    /// Dedup must HOLD for a landed claim: record present + ClaimEvent recorded → still
+    /// rejected, even with the TTL long expired. "Already claimed" stays an error forever.
+    #[tokio::test]
+    async fn landed_claim_stays_hard_deduped() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let gi = U256::from(77u64);
+        store.try_claim(gi).await.unwrap();
+        // The claim LANDED: a ClaimEvent exists for this global_index.
+        store
+            .commit_manual_claim_event_atomic(
+                "test-claim-note".into(),
+                "0x00000000000000000000000000000000000000aa",
+                5,
+                [0u8; 32],
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+                gi.to_be_bytes::<32>(),
+                0,
+                &[0u8; 20],
+                &[0u8; 20],
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        let err = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+            .await
+            .expect_err("a LANDED claim must stay rejected even with the TTL expired");
+        assert!(
+            err.to_string().contains("already submitted"),
+            "landed dedup keeps the original rejection: {err:#}"
+        );
+    }
+
+    /// No double-submit race: a record YOUNGER than the TTL (a submission genuinely in
+    /// flight) keeps rejecting resubmissions even though no ClaimEvent exists yet.
+    #[tokio::test]
+    async fn in_flight_claim_within_ttl_still_rejected() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let gi = U256::from(88u64);
+        store.try_claim(gi).await.unwrap();
+
+        let err = acquire_claim_lock(&store, gi, std::time::Duration::from_secs(3600))
+            .await
+            .expect_err("an in-flight record (younger than the TTL) must keep rejecting");
+        assert!(
+            err.to_string().contains("already submitted"),
+            "in-flight dedup keeps the original rejection: {err:#}"
+        );
+        assert!(store.is_claimed(&gi).await.unwrap(), "lock stays held");
     }
 }

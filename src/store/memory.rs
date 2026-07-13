@@ -45,8 +45,10 @@ pub struct InMemoryStore {
     // Nonces
     nonces: RwLock<HashMap<String, u64>>,
 
-    // Claims
-    claimed: RwLock<HashSet<U256>>,
+    // Claims — value = when `try_claim` acquired the lock, so orphaned records
+    // (crash between the lock write and the CLAIM landing) can be superseded
+    // after a TTL (`try_reclaim_expired`, SOAK FINDING #1).
+    claimed: RwLock<HashMap<U256, std::time::Instant>>,
 
     // Unclaimable claims — first-write wins per global_index (RD-860).
     unclaimable: RwLock<HashMap<U256, UnclaimableClaim>>,
@@ -119,7 +121,7 @@ impl InMemoryStore {
             injected_gers: RwLock::new(HashSet::new()),
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
-            claimed: RwLock::new(HashSet::new()),
+            claimed: RwLock::new(HashMap::new()),
             unclaimable: RwLock::new(HashMap::new()),
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
@@ -660,10 +662,28 @@ impl Store for InMemoryStore {
 
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
         let mut claimed = self.claimed.write();
-        if !claimed.insert(global_index) {
+        if claimed.contains_key(&global_index) {
             anyhow::bail!("claim already submitted for global_index {global_index}");
         }
+        claimed.insert(global_index, std::time::Instant::now());
         Ok(())
+    }
+
+    async fn try_reclaim_expired(
+        &self,
+        global_index: U256,
+        ttl: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        // One write lock end-to-end = atomic check-and-refresh: exactly one of any
+        // concurrent recoveries wins; the losers observe the refreshed timestamp.
+        let mut claimed = self.claimed.write();
+        match claimed.get_mut(&global_index) {
+            Some(acquired_at) if acquired_at.elapsed() >= ttl => {
+                *acquired_at = std::time::Instant::now();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()> {
@@ -672,7 +692,7 @@ impl Store for InMemoryStore {
     }
 
     async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool> {
-        Ok(self.claimed.read().contains(global_index))
+        Ok(self.claimed.read().contains_key(global_index))
     }
 
     async fn record_unclaimable_claim(&self, entry: UnclaimableClaim) -> anyhow::Result<bool> {

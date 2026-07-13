@@ -62,7 +62,61 @@ pub fn install_prometheus_recorder() -> anyhow::Result<metrics_exporter_promethe
 pub fn init_metrics() {
     describe_counter!("rpc_requests_total", "Total JSON-RPC requests by method");
     describe_counter!("claims_processed_total", "Total claims processed");
+    describe_counter!(
+        "claim_resubmission_recovered_total",
+        "orphaned claim submissions recovered (SOAK FINDING #1): a try_claim record with no \
+         ClaimEvent whose in-flight TTL (CLAIM_RESUBMIT_TTL_SECS, default 120s) expired — the \
+         proxy died between recording 'submitted' and the CLAIM landing on Miden — superseded, \
+         and the sponsor's resubmission accepted. Nonzero after a crash in the submit window is \
+         the recovery WORKING; a steady climb without restarts means claims are failing to land."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
+    describe_gauge!(
+        "projector_visibility_barrier_held_blocks",
+        "#30 visibility barrier: blocks the projector is holding because the reconciler \
+         sweep cursor is behind the Miden tip (0 in steady state; >0 signals reconciler lag)"
+    );
+    describe_counter!(
+        "projector_unresolved_consumed_body_total",
+        "legacy unified-projector health readout, held at 0; the live fail-close signal is now \
+         synthetic_projector_b2agg_unresolved_total"
+    );
+    describe_counter!(
+        "synthetic_projector_b2agg_authoritative_fetch_total",
+        "unified projector: bridge-consumed B2AGG bodies resolved by AUTHORITATIVE node fetch \
+         (get_notes_by_id) rather than the local cache — i.e. notes created+consumed under load \
+         before the reconciler imported them Committed (consumed unauthenticated, so the tx \
+         carries the note id). Nonzero under load is expected and healthy; it is the backstop \
+         that prevents the residual dropped-BridgeEvent."
+    );
+    describe_counter!(
+        "synthetic_projector_b2agg_authenticated_skip_total",
+        "unified projector: authenticated bridge consumptions skipped because they are not in the \
+         B2AGG-only body cache — normally a non-B2AGG note (CLAIM/GER/genesis) the store consumed \
+         feed already covers. NON-FATAL and expected-nonzero (esp. at genesis/setup); the tick \
+         never wedges on these. Only meaningful if it climbs alongside missing BridgeEvents."
+    );
+    describe_counter!(
+        "synthetic_projector_b2agg_fetch_missing_total",
+        "unified projector LOUD-SKIP: an UNAUTHENTICATED bridge-consumed note the tx feed reported \
+         but get_notes_by_id STILL did not return after the bounded retry — the tick held for the \
+         retry window (sync_transactions ahead of the note DB) then advanced to keep the tip live \
+         rather than freezing. MUST stay 0 in a healthy stack; any increment means either a node \
+         note-DB fault or a genuine dropped exit to investigate."
+    );
+    describe_counter!(
+        "synthetic_projector_completeness_missing_total",
+        "in-proxy completeness auditor: consumed B2AGG notes (past the settle margin, with the \
+         projector's own emit gates mirrored) that have NO BridgeEvent at exactly their \
+         consumption block. Detection only — getLogs immutability forbids late healing. MUST \
+         stay 0; the soak gates on it. Alarmed once per note; the counter is cumulative."
+    );
+    describe_gauge!(
+        "synthetic_projector_completeness_audit_lag",
+        "in-proxy completeness auditor liveness beacon: the highest block audited so far \
+         (projector cursor minus the settle margin). Flat while the chain advances = auditor \
+         dead."
+    );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
     describe_histogram!("rpc_request_duration_seconds", "JSON-RPC request duration");
