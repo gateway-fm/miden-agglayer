@@ -17,6 +17,47 @@ use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::{Account, AccountId};
+use miden_standards::account::faucets::FungibleFaucet;
+
+/// The faucet account types this bridge proxy SUPPORTS. Every faucet registered in the
+/// bridge must be one of these. An account that matches none is an UNKNOWN type — treated
+/// as a fail-loud condition (a malformed or hostile registration), never silently accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaucetKind {
+    /// Bridge-owned mint/burn wrapped faucet for a foreign-origin (L1/L2) token.
+    AggLayerOwned,
+    /// Operator-owned native `BasicFungibleFaucet` for a Miden-originated token (is_native).
+    NativeFungible,
+}
+
+/// Classify a faucet account against the SUPPORTED allow-list, returning its kind plus the
+/// standard fungible metadata (symbol/decimals) both kinds carry. Fails LOUDLY if the account
+/// matches no supported type — an unknown faucet registered in the bridge must never be
+/// silently rebuilt or skipped.
+///
+/// Both supported kinds expose the standard `FungibleFaucet` metadata; they differ only in
+/// whether the account also carries the AggLayer-owned bridge slots (ownership + config).
+/// `AggLayerFaucet::try_faucet_from_account` asserts those slots, so it distinguishes the two.
+pub fn classify_faucet_account(
+    faucet_account: &Account,
+) -> anyhow::Result<(FaucetKind, FungibleFaucet)> {
+    // Supported #1: bridge-owned AggLayer wrapped faucet (foreign-origin tokens).
+    if let Ok(faucet) = AggLayerFaucet::try_faucet_from_account(faucet_account) {
+        return Ok((FaucetKind::AggLayerOwned, faucet));
+    }
+    // Supported #2: native operator BasicFungibleFaucet (Miden-originated tokens). It lacks
+    // the AggLayer bridge slots but still carries the standard FungibleFaucet metadata.
+    if let Ok(faucet) = FungibleFaucet::try_from(faucet_account.storage()) {
+        return Ok((FaucetKind::NativeFungible, faucet));
+    }
+    // Neither supported type → UNKNOWN. Fail loudly; do not guess.
+    anyhow::bail!(
+        "faucet {} registered in the bridge matches NO supported faucet type \
+         (neither an AggLayer-owned wrapped faucet nor a standard native fungible faucet) — \
+         UNKNOWN faucet type; refusing to proceed",
+        faucet_account.id()
+    )
+}
 
 /// Create a faucet on Miden, deploy it, and register it in the bridge.
 ///
@@ -35,6 +76,9 @@ pub async fn create_and_register_faucet(
     service_id: AccountId,
     bridge_id: AccountId,
     metadata_hash: MetadataHash,
+    // See register_faucet_in_bridge: true = Miden-native lock/unlock faucet (external
+    // tooling only). Proxy callers pass false (bridge-owned mint/burn).
+    is_native: bool,
 ) -> anyhow::Result<Account> {
     let max_supply =
         Felt::new(u64::from(FungibleAsset::MAX_AMOUNT)).expect("value is a valid field element");
@@ -89,6 +133,7 @@ pub async fn create_and_register_faucet(
         scale,
         metadata_hash,
         symbol,
+        is_native,
     )
     .await?;
 
@@ -134,10 +179,15 @@ pub async fn rebuild_faucet_entry_from_chain(
         .map_err(|e| anyhow::anyhow!("get_account({faucet_id}): {e}"))?
         .ok_or_else(|| anyhow::anyhow!("faucet account {faucet_id} not found after import"))?;
 
-    let faucet = AggLayerFaucet::try_faucet_from_account(&faucet_account)
-        .map_err(|e| anyhow::anyhow!("account {faucet_id} is not an AggLayer faucet: {e}"))?;
+    // Classify against the SUPPORTED allow-list. AggLayer-owned (foreign) AND native operator
+    // faucets are both valid; an unknown type fails loudly here. This is what lets --restore
+    // rebuild NATIVE (is_native) faucet rows too — previously only AggLayer-owned faucets were
+    // recognized, so native operator faucets were skipped ("not an AggLayer faucet").
+    let (kind, faucet) = classify_faucet_account(&faucet_account)?;
     let miden_decimals = faucet.decimals();
     let symbol = faucet.symbol().to_string();
+    tracing::debug!(faucet_id = %faucet_id, ?kind, symbol, miden_decimals,
+        "rebuild_faucet_entry_from_chain: classified faucet");
     let scale = conversion.scale;
     let origin_decimals = miden_decimals.checked_add(scale).ok_or_else(|| {
         anyhow::anyhow!(
@@ -198,9 +248,15 @@ pub async fn register_faucet_in_bridge(
     scale: u8,
     metadata_hash: MetadataHash,
     faucet_name: &str,
+    // is_native=true registers a Miden-ORIGINATED (lock/unlock) faucet: the on-chain
+    // bridge LOCKs it on bridge-out and UNLOCKs on claim (is_faucet_native branch)
+    // instead of mint/burn. Every faucet the PROXY creates is a bridge-owned mint/burn
+    // faucet for an L1/L2B-origin token (is_native=false); only external tooling (the
+    // bridge-out app's --create-native-faucet) registers native faucets on the bridge.
+    is_native: bool,
 ) -> anyhow::Result<()> {
     tracing::info!(
-        "registering {} faucet {} in bridge {}...",
+        "registering {} faucet {} in bridge {} (is_native={is_native})...",
         faucet_name,
         AccountIdBech32(faucet_id),
         AccountIdBech32(bridge_id),
@@ -212,7 +268,7 @@ pub async fn register_faucet_in_bridge(
             origin_token_address: *origin_token_address,
             scale,
             origin_network,
-            is_native: false,
+            is_native,
             metadata_hash,
         },
         service_id,

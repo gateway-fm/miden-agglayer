@@ -52,7 +52,10 @@
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::bridge_address::get_bridge_address;
-use crate::bridge_out::is_b2agg_note;
+use crate::bridge_out::{
+    B2AggConsumerClass, classify_b2agg_consumer, derive_bridge_out_tx_hash, is_b2agg_note,
+    parse_b2agg_storage,
+};
 use crate::miden_client::{MidenClientLib, SyncListener};
 use crate::restore::{
     B2AggRestoreOutcome, ClaimProjectOutcome, GerProjectOutcome, project_b2agg_note,
@@ -100,6 +103,21 @@ const RECONCILE_CONCURRENCY_MAX: usize = 16;
 /// the budget is spent. When the sweep is caught up the budget is irrelevant —
 /// the single near-tip window completes in one iteration exactly as before.
 const RECONCILE_TICK_BUDGET_MS_DEFAULT: u64 = 2_000;
+
+/// How many ticks the projector holds (retries) for an UNAUTHENTICATED bridge-consumed note
+/// the node's `get_notes_by_id` has not returned yet (tx feed ahead of the note DB) before it
+/// gives up and loud-skips rather than freezing the tip. At the sub-second sync cadence this
+/// is ~a handful of seconds — long enough for a transient lag to clear, short enough that a
+/// genuine node fault never halts the bridge.
+const FETCH_MISS_RETRY_BOUND: u32 = 20;
+
+/// Completeness-auditor cadence: audit once every N projector ticks (~1s each → ~30s cycles).
+const AUDIT_EVERY_N_TICKS: u64 = 30;
+
+/// Completeness-auditor settle margin: only audit blocks at least this far behind the
+/// projector cursor, so the client store's (lagging) consumption view has definitely caught
+/// up on the audited range. Costs only detection latency, prevents false positives.
+const AUDIT_SETTLE_MARGIN: u64 = 10;
 
 /// Parse a `u64` tuning knob from the environment, falling back to `default`
 /// on absence or garbage (never panics at boot for a bad env var).
@@ -227,23 +245,52 @@ pub struct SyntheticProjector {
     /// Per-tick catch-up time budget (`RECONCILE_TICK_BUDGET_MS` env override,
     /// default [`RECONCILE_TICK_BUDGET_MS_DEFAULT`]).
     reconcile_budget: Duration,
-    /// Note ids already projected (or attempted) by the late-consumption sweep,
-    /// so the per-tick sweep doesn't re-issue `is_note_processed` store queries
-    /// for the whole consumed set every 5s.
-    swept: std::sync::Mutex<HashSet<[u8; 32]>>,
-    /// Spent-before-import recovery queue. External B2AGG notes that were
-    /// ALREADY CONSUMED when the reconciler imported them are silently dropped
-    /// by miden-client 0.15 (`import_note_records_by_proof` applies
-    /// `consumed_externally` to a fresh Expected-state record; the transition
-    /// fails and the record is never persisted — observed live: import returns
-    /// Ok, note absent from store, zero errors). Their BridgeEvents then never
-    /// materialize. [`Self::recover_spent_before_import`] rebuilds such notes
-    /// in-memory (full body via `get_notes_by_id`, spend block via the
-    /// nullifier feed, consumer attribution via the bridge's transaction feed —
-    /// the MA#3 gate) and queues them here; `tick` projects them through the
-    /// SAME `project_b2agg_note` derivation and removes them only after the
-    /// tick completes (mid-tick failure retries; `is_note_processed` dedups).
-    direct_recovered: std::sync::Mutex<Vec<InputNoteRecord>>,
+    /// In-flight B2AGG note BODIES keyed by nullifier — the projector's authoritative
+    /// body-resolution source, bounded to imported-but-not-yet-projected notes.
+    ///
+    /// `tick` sources B2AGG consumptions authoritatively from the bridge's transaction
+    /// feed (nullifiers) and must resolve each nullifier to its note body. It CANNOT
+    /// read the body from the live store by nullifier: [`InputNoteRecord::nullifier`]
+    /// returns `Some` only while `metadata()` is `Some`, and a note's metadata becomes
+    /// `None` the instant `sync_state` marks it `ConsumedExternal` — so the moment a
+    /// B2AGG note is consumed it drops out of any store-nullifier map, and (since the
+    /// nullifier mixes in the metadata word, [`Nullifier::new`]) it cannot be recomputed
+    /// from `NoteDetails` alone. The body must therefore be captured by nullifier WHILE
+    /// the note still has metadata, into this cache. Two feeders populate it, both
+    /// filtered to B2AGG:
+    ///
+    ///   * [`Self::cache_committed_b2agg_bodies`] — every store note whose nullifier is
+    ///     still computable (Committed etc.), refreshed at import time AND once per tick,
+    ///     so a note imported this run OR still-Committed from a prior run is captured
+    ///     before it can transition to `ConsumedExternal`.
+    ///   * [`Self::recover_dropped_note_bodies`] — spent-before-import notes miden-client
+    ///     0.15 silently drops on import (import returns Ok, note absent from store); it
+    ///     re-fetches their bodies from the node so they resolve too.
+    ///
+    /// `tick` EVICTS a nullifier once its block is projected, keeping the map bounded to
+    /// the in-flight set (imported, not-yet-projected) rather than growing without limit.
+    recovered_bodies: std::sync::Mutex<HashMap<Nullifier, (NoteDetails, NoteAttachments)>>,
+    /// Per-nullifier retry counter for the note-DB-lag backstop: an UNAUTHENTICATED
+    /// bridge-consumed note the tx feed reported but `get_notes_by_id` has not returned yet
+    /// (`sync_transactions` is eventual-consistent AHEAD of the node's note DB). The tick
+    /// holds (Errs, retries) for up to [`FETCH_MISS_RETRY_BOUND`] ticks so a transient lag
+    /// resolves correctly; past the bound it loud-skips and advances rather than freezing the
+    /// tip forever (a frozen tip is a liveness failure). Entries are cleared once the note
+    /// resolves or is skipped, so the map is bounded to the in-flight not-yet-returned set.
+    fetch_miss_attempts: std::sync::Mutex<HashMap<Nullifier, u32>>,
+    /// INSTR (observability-only): the `project_to` of the previous tick's `sync_transactions`
+    /// sourcing window, so `tick` can detect a gap/overlap between consecutive source windows
+    /// (a note whose block falls in an un-sourced gap would silently miss). Pure diagnostics —
+    /// it never influences windowing or any control flow.
+    last_source_window_to: AtomicU64,
+    /// Completeness auditor (detection only, no healing): details-commitments already
+    /// VERIFIED (BridgeEvent found at the exact consumption block) or already ALARMED
+    /// (missing — alarm once, counter cumulative). Skipping these keeps each ~30s audit
+    /// cycle O(new consumptions) and de-dupes alarms. In-memory on purpose: a restart
+    /// re-audits from scratch, which is cheap and re-surfaces any standing violation.
+    audit_resolved: std::sync::Mutex<HashSet<[u8; 32]>>,
+    /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
+    audit_tick_counter: AtomicU64,
 }
 
 impl SyntheticProjector {
@@ -322,8 +369,11 @@ impl SyntheticProjector {
             reconcile_chunk,
             reconcile_concurrency,
             reconcile_budget,
-            swept: std::sync::Mutex::new(HashSet::new()),
-            direct_recovered: std::sync::Mutex::new(Vec::new()),
+            recovered_bodies: std::sync::Mutex::new(HashMap::new()),
+            fetch_miss_attempts: std::sync::Mutex::new(HashMap::new()),
+            last_source_window_to: AtomicU64::new(0),
+            audit_resolved: std::sync::Mutex::new(HashSet::new()),
+            audit_tick_counter: AtomicU64::new(0),
         })
     }
 
@@ -573,20 +623,21 @@ impl SyntheticProjector {
                     to,
                     "note reconciler: imported network notes missed by sync"
                 );
-                // Spent-before-import recovery: `import_notes` returns Ok even
-                // for notes it silently DROPPED because they were already
-                // consumed at import time (miden-client 0.15 bug — see the
-                // `direct_recovered` field docs). Re-query which of the
-                // attempted ids actually landed; the rest must be projected
-                // directly from node data or their BridgeEvents are lost.
+                // Spent-before-import: `import_notes` returns Ok even for notes it
+                // silently DROPPED because they were already consumed at import time
+                // (miden-client 0.15 bug — see the `recovered_bodies` field docs).
+                // Re-query which attempted ids landed; cache the LANDED (Committed) B2AGG
+                // bodies by nullifier now, while their metadata is present, so they resolve
+                // in `tick` even after `sync_state` marks them ConsumedExternal; the DROPPED
+                // ones' bodies are recovered from the node by `recover_dropped_note_bodies`.
                 if !attempted.is_empty() {
-                    let landed: HashSet<NoteId> = client
+                    let landed_recs = client
                         .get_input_notes(NoteFilter::List(attempted.clone()))
                         .await
-                        .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?
-                        .into_iter()
-                        .filter_map(|rec| rec.id())
-                        .collect();
+                        .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?;
+                    self.cache_committed_b2agg_bodies(&landed_recs, "import");
+                    let landed: HashSet<NoteId> =
+                        landed_recs.iter().filter_map(|rec| rec.id()).collect();
                     let missing: Vec<NoteId> = attempted
                         .into_iter()
                         .filter(|id| !landed.contains(id))
@@ -601,7 +652,7 @@ impl SyntheticProjector {
                             "note reconciler: import silently dropped consumed notes; \
                              attempting direct projection recovery"
                         );
-                        self.recover_spent_before_import(rpc, &missing).await?;
+                        self.recover_dropped_note_bodies(rpc, &missing).await?;
                     }
                 }
             }
@@ -609,190 +660,455 @@ impl SyntheticProjector {
         Ok(())
     }
 
-    /// Direct-projection recovery for notes that were already CONSUMED when the
-    /// reconciler imported them (and were therefore silently dropped by
-    /// miden-client's import — see the [`Self::direct_recovered`] field docs).
-    /// The node still serves everything needed (`sync_notes` / `get_notes_by_id`
-    /// both return consumed notes), so bypass the client store:
+    /// Capture the bodies of the given store notes into the B2AGG body cache, keyed by
+    /// nullifier, for every note whose nullifier is still computable (metadata present —
+    /// Committed and other pre-consumption states). This is how a B2AGG body survives the
+    /// note later becoming `ConsumedExternal` (which nulls out
+    /// [`InputNoteRecord::nullifier`]); see the [`Self::recovered_bodies`] field docs.
     ///
-    /// 1. Fetch the full public note bodies via `get_notes_by_id`. Private notes
-    ///    cannot be reconstructed and B2AGG bridge-outs are public network
-    ///    notes; non-B2AGG public notes (e.g. MINTs to external wallets) derive
-    ///    no synthetic event, and CLAIM/GER notes are created by our own
-    ///    service so they always reach the store through the normal path.
-    /// 2. Resolve each note's spend block from the node's nullifier feed.
-    /// 3. **MA#3 reclaim gate** — a B2AGG can be consumed by the bridge (real
-    ///    exit → must emit) or reclaimed by its sender (asset stayed → must NOT
-    ///    emit), and the nullifier alone doesn't say who consumed. The bridge's
-    ///    LET frontier map stores only the O(log n) Merkle frontier nodes
-    ///    (overwritten as leaves append), so a direct "leaf present in LET"
-    ///    check is not implementable. Instead we use a strictly precise gate:
-    ///    the node's per-account `sync_transactions` feed for the BRIDGE
-    ///    account, whose transaction headers commit to the nullifiers of the
-    ///    notes each transaction consumed. "A bridge-executed transaction
-    ///    consumed this nullifier" is exactly the condition
-    ///    `classify_b2agg_consumer == Emit` encodes (consumer == bridge), from
-    ///    the same trust root as every other projector input (the node RPC).
-    ///    Anything else is treated as reclaim/unknown and skipped fail-closed
-    ///    with a WARN + metric.
-    /// 4. Queue an in-memory `ConsumedExternal` record (consumer = bridge) that
-    ///    `tick` runs through the SAME `project_b2agg_note` derivation as every
-    ///    other note (store dedup via `is_note_processed` keeps it idempotent).
-    async fn recover_spent_before_import(
+    /// Called at import time (freshly landed notes) AND once per tick over the whole store
+    /// (notes still Committed from a prior run), so no B2AGG note can be consumed before its
+    /// body is cached. Idempotent — re-inserting the same nullifier is a no-op. Only B2AGG
+    /// bodies are kept (CLAIM/GER ride the store's consumed feed; other notes emit no event).
+    fn cache_committed_b2agg_bodies(&self, records: &[InputNoteRecord], source: &str) {
+        let mut cache = self
+            .recovered_bodies
+            .lock()
+            .expect("recovered-bodies cache poisoned");
+        for rec in records {
+            // `nullifier()` is `Some` only while metadata is present; a note already
+            // `ConsumedExternal` returns `None` and cannot be (re)cached here — by then it
+            // must already be in the cache from an earlier Committed observation.
+            let Some(nullifier) = rec.nullifier() else {
+                continue;
+            };
+            if !is_b2agg_note(rec.details()) {
+                continue;
+            }
+            // INSTR (observability-only): trace every B2AGG body captured, keyed by nullifier.
+            let committed_block = rec
+                .inclusion_proof()
+                .map(|p| p.location().block_num().as_u64());
+            let (tag, note_type) = rec
+                .metadata()
+                .map(|m| (m.tag().as_u32(), format!("{:?}", m.note_type())))
+                .unzip();
+            tracing::info!(
+                "INSTR discover: nullifier={} note_id={} committed_block={:?} tag={:?} \
+                 note_type={:?} source={}",
+                nullifier.to_hex(),
+                rec.id()
+                    .map(|i| i.to_hex())
+                    .unwrap_or_else(|| "none".into()),
+                committed_block,
+                tag,
+                note_type,
+                source
+            );
+            if cache
+                .insert(
+                    nullifier,
+                    (rec.details().clone(), rec.attachments().clone()),
+                )
+                .is_none()
+            {
+                metrics::counter!("synthetic_reconciler_recovered_body_total").increment(1);
+            }
+        }
+    }
+
+    /// Cache the note BODIES of spent-before-import notes, keyed by nullifier.
+    ///
+    /// A B2AGG note ALREADY CONSUMED when the reconciler tries to import it is
+    /// silently dropped by miden-client 0.15 (import returns Ok, note absent from
+    /// store), so its body never lands in the client store. `tick` sources
+    /// consumptions AUTHORITATIVELY from the bridge's transaction feed and resolves
+    /// each consumed nullifier to its note body from the store — this fills the bodies
+    /// the store is missing, so a dropped-then-consumed note's BridgeEvent is still
+    /// emitted at its exact block.
+    ///
+    /// Only PUBLIC B2AGG bodies are cached: private notes can't be reconstructed,
+    /// non-B2AGG public notes derive no synthetic event, and CLAIM/GER are our own
+    /// notes that always reach the store normally. The MA#3 reclaim gate lives in
+    /// `tick` now — it only ever sources consumptions from bridge transactions, so a
+    /// reclaimed/unknown consumption is never projected (no gate needed here).
+    async fn recover_dropped_note_bodies(
         &self,
         rpc: &dyn NodeRpcClient,
         missing: &[NoteId],
     ) -> anyhow::Result<()> {
-        struct Candidate {
-            id: NoteId,
-            details: NoteDetails,
-            attachments: NoteAttachments,
-            nullifier: Nullifier,
-        }
-
         let fetched = rpc
             .get_notes_by_id(missing)
             .await
             .map_err(|e| anyhow::anyhow!("get_notes_by_id({}): {e}", missing.len()))?;
-
-        let mut candidates: Vec<Candidate> = Vec::new();
-        let mut min_inclusion = BlockNumber::from(u32::MAX);
+        let mut cache = self
+            .recovered_bodies
+            .lock()
+            .expect("recovered-bodies cache poisoned");
         for f in fetched {
             let id = f.id();
-            let FetchedNote::Public(note, inclusion_proof) = f else {
+            let FetchedNote::Public(note, _inclusion) = f else {
                 tracing::debug!(
                     note_id = %id.to_hex(),
-                    "spent-before-import recovery: skipping private note (not reconstructable)"
+                    "dropped-body recovery: skipping private note (not reconstructable)"
                 );
                 continue;
             };
-            let inclusion = inclusion_proof.location().block_num();
             let nullifier = note.nullifier();
             let attachments = note.attachments().clone();
             let details: NoteDetails = note.into();
+            // Only PUBLIC B2AGG bodies matter: non-B2AGG public notes emit no synthetic
+            // event, and CLAIM/GER are our own notes that always reach the store the normal
+            // way. The MA#3 emit gate is NOT applied here — `tick` sources consumptions from
+            // the bridge's own transaction feed, so only bridge-consumed nullifiers project.
             if !is_b2agg_note(&details) {
+                continue;
+            }
+            // INSTR (observability-only): trace recovery-sourced B2AGG bodies, keyed by nullifier.
+            tracing::info!(
+                "INSTR discover: nullifier={} note_id={} committed_block=None tag=None \
+                 note_type=None source=recovery",
+                nullifier.to_hex(),
+                id.to_hex()
+            );
+            if cache.insert(nullifier, (details, attachments)).is_none() {
+                metrics::counter!("synthetic_reconciler_recovered_body_total").increment(1);
                 tracing::debug!(
                     note_id = %id.to_hex(),
-                    "spent-before-import recovery: skipping non-B2AGG note (no synthetic event)"
+                    "dropped-body recovery: cached spent-before-import B2AGG body by nullifier"
                 );
-                continue;
             }
-            min_inclusion = min_inclusion.min(inclusion);
-            candidates.push(Candidate {
-                id,
-                details,
-                attachments,
-                nullifier,
-            });
-        }
-        if candidates.is_empty() {
-            return Ok(());
-        }
-
-        // Spend blocks: nullifier consumption can only happen at or after the
-        // note's inclusion block, so search from the batch minimum.
-        let nullifiers: BTreeSet<Nullifier> = candidates.iter().map(|c| c.nullifier).collect();
-        let heights = rpc
-            .get_nullifier_commit_heights(nullifiers, min_inclusion)
-            .await
-            .map_err(|e| anyhow::anyhow!("get_nullifier_commit_heights: {e}"))?;
-
-        // MA#3 gate data: every transaction the BRIDGE executed across the
-        // spend-block range, with the nullifiers each one consumed.
-        let spend_blocks: Vec<BlockNumber> = heights.values().flatten().copied().collect();
-        let consumed_by_bridge: HashMap<Nullifier, (u64, u32)> =
-            match (spend_blocks.iter().min(), spend_blocks.iter().max()) {
-                (Some(min_h), Some(max_h)) => {
-                    let txs = rpc
-                        .sync_transactions(*min_h, *max_h, vec![self.bridge_id])
-                        .await
-                        .map_err(|e| anyhow::anyhow!("sync_transactions({min_h}..{max_h}): {e}"))?;
-                    bridge_consumed_nullifiers(&txs, self.bridge_id)
-                }
-                _ => HashMap::new(),
-            };
-
-        let mut recovered: Vec<InputNoteRecord> = Vec::new();
-        for c in candidates {
-            let Some(spend_block) = heights.get(&c.nullifier).copied().flatten() else {
-                // Import dropped the note but its nullifier is NOT consumed —
-                // outside the known drop mode (unconsumed notes persist fine).
-                // Surface loudly; a restart re-sweeps from genesis and retries.
-                metrics::counter!("synthetic_reconciler_missing_not_consumed_total").increment(1);
-                tracing::error!(
-                    note_id = %c.id.to_hex(),
-                    "spent-before-import recovery: note missing from store but its \
-                     nullifier is unspent — unexpected import drop mode; skipping \
-                     (restart re-sweeps and retries)"
-                );
-                continue;
-            };
-            match consumed_by_bridge.get(&c.nullifier) {
-                Some((block, tx_order)) => {
-                    debug_assert_eq!(*block, spend_block.as_u64());
-                    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
-                        nullifier_block_height: spend_block,
-                        consumer_account: Some(self.bridge_id),
-                        consumed_tx_order: Some(*tx_order),
-                    });
-                    let record = InputNoteRecord::new(c.details, c.attachments, None, state);
-                    metrics::counter!("synthetic_reconciler_direct_recovered_total").increment(1);
-                    tracing::info!(
-                        note_id = %c.id.to_hex(),
-                        spend_block = spend_block.as_u64(),
-                        tx_order,
-                        "spent-before-import recovery: bridge-consumed B2AGG verified via \
-                         bridge transaction feed; queued for direct projection"
-                    );
-                    recovered.push(record);
-                }
-                None => {
-                    // Fail-closed (MA#3): the note IS consumed, but no
-                    // bridge-executed transaction at the spend block consumed
-                    // its nullifier — sender reclaim or unknown consumer.
-                    // Emitting would hand out a withdrawal for value that
-                    // never left Miden, so skip and surface.
-                    metrics::counter!("synthetic_reconciler_unverified_consumption_total")
-                        .increment(1);
-                    tracing::warn!(
-                        note_id = %c.id.to_hex(),
-                        spend_block = spend_block.as_u64(),
-                        bridge = %self.bridge_id,
-                        "spent-before-import recovery: consumed B2AGG was NOT consumed by \
-                         any bridge transaction at its spend block — treating as \
-                         reclaim/unknown consumer; skipping BridgeEvent (fail-closed, MA#3)"
-                    );
-                }
-            }
-        }
-        if !recovered.is_empty() {
-            let mut queue = self
-                .direct_recovered
-                .lock()
-                .expect("direct-recovered queue poisoned");
-            // Defensive dedup: a record already queued (not yet drained by
-            // `tick`) must not be double-projected in one block.
-            let queued: HashSet<[u8; 32]> = queue
-                .iter()
-                .map(|n| n.details_commitment().as_bytes())
-                .collect();
-            queue.extend(
-                recovered
-                    .into_iter()
-                    .filter(|n| !queued.contains(&n.details_commitment().as_bytes())),
-            );
         }
         Ok(())
     }
 
-    /// Merge the spent-before-import recovery queue snapshot into `tick`'s
-    /// per-block projection buckets. A note whose spend block is still ahead of
-    /// the cursor projects at its real Miden block (Miden-1:1); a note whose
-    /// spend block the cursor already passed projects into the FIRST block of
-    /// this tick's window, exactly like the late-consumption sweep (sealed
-    /// blocks + forward-only getLogs consumers). Notes whose spend block is
-    /// beyond `tip` stay queued for a future tick. Returns the ids that were
-    /// bucketed (to be removed from the queue once the tick completes).
+    /// Resolve the note bodies for a window's bridge-consumed nullifiers into ConsumedExternal
+    /// records to project. `bridge_consumed_nullifiers` yields EVERY bridge consumption — real
+    /// B2AGG exits AND the non-B2AGG notes the bridge routinely consumes (CLAIM, UpdateGerNote,
+    /// genesis/setup notes) — so most inputs here are legitimately NOT B2AGG exits.
+    ///
+    /// INVARIANT — the projector MUST NEVER freeze the tip (a frozen tip is a liveness failure).
+    /// Only a silent drop of a RESOLVABLE B2AGG exit is forbidden; skipping an unresolvable
+    /// non-exit, or bounded-retry-then-loud-skip of an unresolvable one, is correct. Each cache
+    /// miss is one of:
+    ///   * AUTHENTICATED (no note id in the tx) + uncached — the cache is B2AGG-only, so this is
+    ///     normally a non-B2AGG consumption (CLAIM/GER/genesis) the store consumed feed already
+    ///     covers. SAFE SKIP + non-fatal metric (NEVER wedge — the pre-unified projector also
+    ///     skipped these and passed the suite; fail-closing here froze the tip on block-13 setup).
+    ///   * UNAUTHENTICATED, node returns a public B2AGG body — resolve + emit at exact block. This
+    ///     is the acfee0cb completeness fix (note created+consumed under load before import).
+    ///   * UNAUTHENTICATED, node RETURNS it as non-public / non-b2agg — provably not an exit
+    ///     (legit CLAIM/GER) — SAFE SKIP.
+    ///   * UNAUTHENTICATED, node did NOT return it — `sync_transactions` is ahead of the node's
+    ///     note DB (eventual-consistent under load). BOUNDED RETRY: hold the tick (Err) up to
+    ///     [`FETCH_MISS_RETRY_BOUND`] ticks so a transient lag resolves the real body; past the
+    ///     bound, loud-skip + advance rather than freeze forever.
+    ///
+    /// Every resolved nullifier is recorded in `evict_by_block` so `tick` can bound the cache
+    /// after the block seals. No `await` is held under any lock.
+    async fn resolve_b2agg_consumptions(
+        &self,
+        fetcher: &dyn PublicNoteFetcher,
+        consumed_refs: HashMap<Nullifier, ConsumedRef>,
+        evict_by_block: &mut HashMap<u64, Vec<Nullifier>>,
+    ) -> anyhow::Result<Vec<InputNoteRecord>> {
+        let build = |details: NoteDetails, attachments: NoteAttachments, cref: &ConsumedRef| {
+            let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+                nullifier_block_height: BlockNumber::from(cref.block as u32),
+                consumer_account: Some(self.bridge_id),
+                consumed_tx_order: Some(cref.order),
+            });
+            InputNoteRecord::new(details, attachments, None, state)
+        };
+
+        // Phase 1 (fast path, no I/O): resolve from the cache. A cache miss WITHOUT a note id is
+        // an authenticated consumption the B2AGG-only cache can't hold — normally a legit
+        // non-B2AGG note (CLAIM/GER/genesis) covered by the store consumed feed: SAFE SKIP, never
+        // wedge. Only UNAUTHENTICATED misses (note id present) go to the authoritative fetch.
+        let mut recs: Vec<InputNoteRecord> = Vec::new();
+        let mut misses: Vec<(Nullifier, ConsumedRef)> = Vec::new();
+        {
+            let cache = self
+                .recovered_bodies
+                .lock()
+                .expect("recovered-bodies cache poisoned");
+            for (nullifier, cref) in consumed_refs {
+                if let Some((details, attachments)) = cache.get(&nullifier) {
+                    // The cache holds ONLY B2AGG bodies (both feeders filter), so a hit needs
+                    // no re-check.
+                    recs.push(build(details.clone(), attachments.clone(), &cref));
+                    evict_by_block
+                        .entry(cref.block)
+                        .or_default()
+                        .push(nullifier);
+                    tracing::info!(
+                        "INSTR resolve: nullifier={} block={} outcome=cache_hit note_id={:?}",
+                        nullifier.to_hex(),
+                        cref.block,
+                        cref.note_id.map(|i| i.to_hex())
+                    );
+                } else if cref.note_id.is_some() {
+                    misses.push((nullifier, cref));
+                } else {
+                    // Authenticated + uncached → non-B2AGG consumption (store feed covers it).
+                    metrics::counter!("synthetic_projector_b2agg_authenticated_skip_total")
+                        .increment(1);
+                    tracing::info!(
+                        "INSTR resolve: nullifier={} block={} outcome=authenticated_skip note_id=None",
+                        nullifier.to_hex(),
+                        cref.block
+                    );
+                    tracing::debug!(
+                        nullifier = %nullifier.to_hex(),
+                        block = cref.block,
+                        "projector: skipping authenticated uncached bridge consumption \
+                         (non-B2AGG — CLAIM/GER/genesis, covered by the store consumed feed)"
+                    );
+                }
+            }
+        }
+        if misses.is_empty() {
+            return Ok(recs);
+        }
+
+        // Phase 2 (authoritative backstop): fetch the uncached UNAUTHENTICATED bodies by id.
+        let fetch_ids: Vec<NoteId> = misses
+            .iter()
+            .filter_map(|(_, cref)| cref.note_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let FetchedBodies {
+            bodies,
+            returned_ids,
+        } = fetcher.fetch_public_bodies(&fetch_ids).await?;
+        let body_by_id: HashMap<NoteId, &FetchedBody> = bodies
+            .iter()
+            .filter(|b| is_b2agg_note(&b.details))
+            .map(|b| (b.id, b))
+            .collect();
+        // Track the note-DB-lag retry counters under one lock (no await in this loop). A note
+        // still under its retry bound holds the tick; past the bound it loud-skips and advances.
+        let mut attempts = self
+            .fetch_miss_attempts
+            .lock()
+            .expect("fetch-miss-attempts poisoned");
+        let mut retry_ctx: Option<(Nullifier, NoteId, u64, u32)> = None;
+        for (nullifier, cref) in &misses {
+            let Some(note_id) = cref.note_id else {
+                unreachable!("authenticated (note_id-less) misses are skipped in phase 1");
+            };
+            if let Some(body) = body_by_id.get(&note_id) {
+                recs.push(build(body.details.clone(), body.attachments.clone(), cref));
+                evict_by_block
+                    .entry(cref.block)
+                    .or_default()
+                    .push(*nullifier);
+                attempts.remove(nullifier);
+                metrics::counter!("synthetic_projector_b2agg_authoritative_fetch_total")
+                    .increment(1);
+                tracing::info!(
+                    "INSTR resolve: nullifier={} block={} outcome=authoritative_fetch note_id={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    note_id.to_hex()
+                );
+                tracing::info!(
+                    note_id = %note_id.to_hex(),
+                    block = cref.block,
+                    "projector: resolved an uncached (unauthenticated) B2AGG consumption by \
+                     authoritative fetch"
+                );
+            } else if returned_ids.contains(&note_id) {
+                // Node RETURNED it but it is non-public / non-b2agg — legit CLAIM/GER. Safe skip
+                // (must NOT fail-closed, or a legit consumption wedges the tip).
+                attempts.remove(nullifier);
+                tracing::info!(
+                    "INSTR resolve: nullifier={} block={} outcome=skip_returned_non_b2agg note_id={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    note_id.to_hex()
+                );
+                tracing::debug!(
+                    note_id = %note_id.to_hex(),
+                    block = cref.block,
+                    "authoritative fetch: node returned a non-b2agg note — safe skip (not an exit)"
+                );
+            } else {
+                // Node did NOT return the id: tx feed ahead of the note DB. Bounded retry.
+                tracing::info!(
+                    "INSTR resolve: nullifier={} block={} outcome=fail_missing_fetch note_id={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    note_id.to_hex()
+                );
+                let n = attempts.entry(*nullifier).or_insert(0);
+                *n += 1;
+                if *n > FETCH_MISS_RETRY_BOUND {
+                    // Give up rather than freeze the tip forever: loud-skip and advance. A real
+                    // b2agg exit lost here would surface as a missing BridgeEvent AND this alarm;
+                    // a permanent not-return is a node fault worth alarming, not a bridge halt.
+                    metrics::counter!("synthetic_projector_b2agg_fetch_missing_total").increment(1);
+                    tracing::error!(
+                        nullifier = %nullifier.to_hex(),
+                        note_id = %note_id.to_hex(),
+                        block = cref.block,
+                        attempts = *n,
+                        "projector: bridge-consumed note STILL not returned by get_notes_by_id \
+                         after {FETCH_MISS_RETRY_BOUND} ticks — loud-skipping to keep the tip \
+                         live (investigate: possible node note-DB fault or a genuine drop)."
+                    );
+                    attempts.remove(nullifier);
+                } else if retry_ctx.is_none() {
+                    // Within the bound: remember it to hold (Err) the tick after the loop.
+                    retry_ctx = Some((*nullifier, note_id, cref.block, *n));
+                }
+            }
+        }
+        drop(attempts);
+        if let Some((nullifier, note_id, block, n)) = retry_ctx {
+            // Hold (retry) the whole tick: nothing seals, cursor unchanged, next tick re-fetches
+            // once the note DB catches up. Bounded by FETCH_MISS_RETRY_BOUND so it can't freeze.
+            tracing::warn!(
+                nullifier = %nullifier.to_hex(),
+                note_id = %note_id.to_hex(),
+                block,
+                attempt = n,
+                bound = FETCH_MISS_RETRY_BOUND,
+                "projector: bridge-consumed note not yet in the node's note DB (tx feed ahead) — \
+                 holding the tick to retry"
+            );
+            return Err(anyhow::anyhow!(
+                "projector: bridge-consumed note not yet in the node's note DB (nullifier {}, \
+                 note_id {}, block {}, attempt {}/{}) — tx feed ahead of note DB, retry",
+                nullifier.to_hex(),
+                note_id.to_hex(),
+                block,
+                n,
+                FETCH_MISS_RETRY_BOUND
+            ));
+        }
+        Ok(recs)
+    }
+
+    /// COMPLETENESS AUDITOR — in-proxy early detection of missed BridgeEvents (the
+    /// productionized `scripts/verify-event-completeness.sh`), detection ONLY: getLogs
+    /// immutability forbids emitting into a sealed block, so a miss is alarmed loudly
+    /// (metric + error log), never healed late.
+    ///
+    /// Ground truth needs no new RPC: the miden-client STORE. The reconciler imports every
+    /// B2AGG note body and `sync_state` eventually marks it `Consumed*` with a
+    /// `consumed_block_height` — laggingly, which is fine for detection: only blocks at
+    /// least [`AUDIT_SETTLE_MARGIN`] behind the projector cursor are audited, and the full
+    /// consumed set is re-scanned each cycle (late-learned consumptions cannot escape),
+    /// de-duped via [`Self::audit_resolved`] so each cycle is O(new consumptions).
+    ///
+    /// For every consumed B2AGG note that SHOULD have emitted (mirrors the projector's own
+    /// emit gates, so legitimately-skipped notes never false-alarm):
+    ///   * reclaimed (consumer == Some(non-bridge)) → no event expected (MA#3), skip;
+    ///   * unparsable storage → quarantined, never emits, skip;
+    ///   * self-targeted (destination == local network) → poison-leaf, never emits (#13), skip;
+    ///   * consumer unknown (`None`, the common case for externally-observed consumptions) →
+    ///     INCLUDED — the log check decides (the unified projector emits from bridge-tx
+    ///     attribution, so a genuinely bridge-consumed note must have its event);
+    ///
+    /// …check the synthetic store for a BridgeEvent at EXACTLY its consumption block, via the
+    /// same join the projector writes: `derive_bridge_out_tx_hash(hex(details_commitment))`.
+    /// Missing (or present at the wrong block) → `synthetic_projector_completeness_missing_total`
+    /// (must stay 0; the soak gates on it) + a loud error, once per note.
+    ///
+    /// Returns the cycle's tallies so unit tests can assert alarm/no-alarm/dedupe directly.
+    async fn audit_completeness(
+        &self,
+        consumed: &[InputNoteRecord],
+        projector_cursor: u64,
+    ) -> anyhow::Result<AuditOutcome> {
+        let audit_to = projector_cursor.saturating_sub(AUDIT_SETTLE_MARGIN);
+        // Liveness beacon: how far the auditor has audited (0 = not yet past the margin).
+        ::metrics::gauge!("synthetic_projector_completeness_audit_lag").set(audit_to as f64);
+        let mut outcome = AuditOutcome::default();
+        if audit_to == 0 {
+            return Ok(outcome);
+        }
+        for note in consumed {
+            if !is_b2agg_note(note.details()) {
+                continue;
+            }
+            let Some(block) = note.state().consumed_block_height().map(|h| h.as_u64()) else {
+                continue;
+            };
+            if block > audit_to {
+                // Inside the settle margin — not audited yet (next cycles will catch it).
+                outcome.settling += 1;
+                continue;
+            }
+            // Mirror the projector's emit gates (see doc comment): a note the projector
+            // legitimately refuses to emit must not false-alarm.
+            if matches!(
+                classify_b2agg_consumer(note.consumer_account(), self.bridge_id),
+                B2AggConsumerClass::Reclaimed
+            ) {
+                continue;
+            }
+            let Ok((destination_network, _)) = parse_b2agg_storage(note.details().storage()) else {
+                continue; // quarantined (MA#18) — never emits
+            };
+            if destination_network == self.local_network_id {
+                continue; // self-targeted poison leaf (#13) — never emits
+            }
+            let key: [u8; 32] = note.details_commitment().as_bytes();
+            {
+                let resolved = self
+                    .audit_resolved
+                    .lock()
+                    .expect("audit-resolved set poisoned");
+                if resolved.contains(&key) {
+                    continue;
+                }
+            } // lock dropped before the await below
+            let note_id_str = hex::encode(key);
+            let tx_hash = derive_bridge_out_tx_hash(&note_id_str);
+            let logs = self.store.get_logs_for_tx(&tx_hash).await?;
+            outcome.audited += 1;
+            if logs.iter().any(|l| l.block_number == block) {
+                outcome.verified += 1;
+            } else {
+                // MISSED (or wrong-block, equally a violation). Alarm ONCE per note (the
+                // resolved-set insert below de-dupes); the counter stays cumulative.
+                outcome.missing += 1;
+                ::metrics::counter!("synthetic_projector_completeness_missing_total").increment(1);
+                tracing::error!(
+                    details_commitment = %note_id_str,
+                    nullifier = %note
+                        .nullifier()
+                        .map(|n| n.to_hex())
+                        .unwrap_or_else(|| "none(consumed)".into()),
+                    consumed_block = block,
+                    audit_to,
+                    found_at_blocks = ?logs.iter().map(|l| l.block_number).collect::<Vec<_>>(),
+                    "completeness auditor: synthetic BridgeEvent MISSING at the consumption \
+                     block — completeness violation (detection only; getLogs immutability \
+                     forbids late healing)"
+                );
+            }
+            self.audit_resolved
+                .lock()
+                .expect("audit-resolved set poisoned")
+                .insert(key);
+        }
+        if outcome.missing > 0 || outcome.audited > 0 {
+            tracing::info!(
+                audit_to,
+                audited = outcome.audited,
+                verified = outcome.verified,
+                missing = outcome.missing,
+                settling = outcome.settling,
+                "completeness auditor: cycle done"
+            );
+        }
+        Ok(outcome)
+    }
+
     /// The #30 visibility-barrier projection ceiling. With a barrier active (`has_barrier`
     /// — a reconciler is wired), never project past the reconciler's last completed sweep
     /// (`reconcile_cursor`), so a synthetic block is sealed only after its notes are
@@ -805,72 +1121,6 @@ impl SyntheticProjector {
         } else {
             tip
         }
-    }
-
-    /// Late-sweep caught-up DEFERRAL decision (#27). A note that surfaced for an
-    /// already-sealed block is bucketed for re-projection at `cursor + 1` — UNLESS the
-    /// projector is caught up to the projection ceiling (`cursor >= project_to`), in which
-    /// case it must be DEFERRED (return `None`: don't bucket, don't mark it swept) so the
-    /// NEXT block-advancing tick reprojects it. Pre-fix, a caught-up tick still marked the
-    /// late ids swept without projecting them, permanently dropping the note's BridgeEvent
-    /// (funds stranded until a restart). Returns `Some(target_block)` to bucket, or `None`
-    /// to defer. Pure so the deferral invariant is unit-testable.
-    fn late_sweep_target_block(has_late: bool, cursor: u64, project_to: u64) -> Option<u64> {
-        if !has_late || cursor >= project_to {
-            None
-        } else {
-            Some(cursor + 1)
-        }
-    }
-
-    fn bucket_direct_notes<'a>(
-        direct: &'a [InputNoteRecord],
-        by_block: &mut HashMap<u64, Vec<&'a InputNoteRecord>>,
-        cursor: u64,
-        // The projection ceiling — the visibility barrier's `project_to` (min(tip,
-        // reconcile_cursor)), NOT the raw sync tip. Named accordingly so it reads
-        // consistently with the caller and the barrier semantics.
-        project_to: u64,
-    ) -> Vec<[u8; 32]> {
-        let mut done = Vec::new();
-        for note in direct {
-            let Some(h) = note.state().consumed_block_height().map(|h| h.as_u64()) else {
-                // Defensive: the queue only ever holds ConsumedExternal records.
-                continue;
-            };
-            let target = h.max(cursor + 1);
-            if target > project_to {
-                tracing::debug!(
-                    spend_block = h,
-                    project_to,
-                    "direct projection: spend block ahead of projection ceiling — deferring to next tick"
-                );
-                continue;
-            }
-            by_block.entry(target).or_default().push(note);
-            done.push(note.details_commitment().as_bytes());
-        }
-        if !done.is_empty() {
-            tracing::info!(
-                recovered = done.len(),
-                "direct projection: projecting spent-before-import notes this tick"
-            );
-        }
-        done
-    }
-
-    /// Remove successfully-bucketed direct-recovery records from the queue —
-    /// called only AFTER the tick completed, so a mid-tick failure retries them
-    /// (idempotently, via `is_note_processed`) instead of dropping them.
-    fn complete_direct_notes(&self, done: &[[u8; 32]]) {
-        if done.is_empty() {
-            return;
-        }
-        let done: HashSet<[u8; 32]> = done.iter().copied().collect();
-        self.direct_recovered
-            .lock()
-            .expect("direct-recovered queue poisoned")
-            .retain(|n| !done.contains(&n.details_commitment().as_bytes()));
     }
 
     /// The current cursor (last projected Miden block height).
@@ -1018,6 +1268,17 @@ impl SyntheticProjector {
             .await?
                 == B2AggRestoreOutcome::Emitted
             {
+                // INSTR (observability-only): a B2AGG BridgeEvent was emitted. The reconstructed
+                // ConsumedExternal record usually has no `nullifier()` (metadata dropped), so
+                // the details-commitment is the join key back to the discover/resolve logs.
+                tracing::info!(
+                    "INSTR emit: nullifier={} details_commitment={} block={}",
+                    note.nullifier()
+                        .map(|n| n.to_hex())
+                        .unwrap_or_else(|| "none".into()),
+                    hex::encode(note.details_commitment().as_bytes()),
+                    miden_block
+                );
                 logs += 1;
                 continue;
             }
@@ -1150,10 +1411,20 @@ impl SyntheticProjector {
         // block ranges and just sees the chain pause), an event at the wrong
         // block is poison. No reconciler wired (node_rpc = None, pure unit
         // tests / a non-reconciling deployment) => no barrier, legacy behavior.
+        // Barrier = note-BODY-import gate: `reconcile_cursor` is the frontier whose note
+        // BODIES the reconciler has imported (`sync_notes`). A B2AGG note consumed at N was
+        // created at C <= N, so `reconcile_cursor >= N` guarantees its body is in the store.
+        // We do NOT gate on B2AGG consumptions here — those are sourced AUTHORITATIVELY per
+        // block from `sync_transactions` below, so there is no consumption lag and no B2AGG is
+        // ever late; CLAIM/GER ride the store's consumed feed (proxy-internal, on time).
+        let reconcile_cursor = self.reconcile_cursor.load(Ordering::Acquire);
         let project_to = if self.node_rpc.is_some() {
-            let reconcile_cursor = self.reconcile_cursor.load(Ordering::Acquire);
             let held = tip.saturating_sub(reconcile_cursor);
             ::metrics::gauge!("projector_visibility_barrier_held_blocks").set(held as f64);
+            // Keep the fail-close alarm present and readable as 0 (this design routes by note
+            // kind and skips — never wedges — a consumption whose body isn't imported, so the
+            // counter is only ever a health readout; a genuine B2AGG miss surfaces in e2e).
+            ::metrics::counter!("projector_unresolved_consumed_body_total").absolute(0);
             if held > 0 {
                 tracing::debug!(
                     tip,
@@ -1185,17 +1456,8 @@ impl SyntheticProjector {
         if cursor >= project_to {
             return Ok(cursor);
         }
-        // Perf-critical: fetch the consumed-note feed + output-note metadata ONCE
-        // per tick, NOT once per block. There is no server-side block-range filter
-        // for notes, so a per-block fetch makes tick O(blocks × notes); the
-        // projector then never catches up to the Miden tip (observed in e2e as the
-        // bridge-in deposit never becoming claimable, because its GER injection
-        // never gets projected). The feeds are owned, so `project_notes` filters
-        // them per block by `nullifier_block_height` without re-fetching.
-        let consumed = client
-            .get_input_notes(NoteFilter::Consumed)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+        // Output-note metadata (MA#28 GER provenance): our own minted notes carry the
+        // sender metadata that a bridge-consumed ConsumedExternal record drops.
         let output_metadata: HashMap<[u8; 32], NoteMetadata> = client
             .get_output_notes(NoteFilter::All)
             .await
@@ -1203,101 +1465,139 @@ impl SyntheticProjector {
             .into_iter()
             .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
             .collect();
-        // Spent-before-import recovery queue snapshot: records fabricated by
-        // `recover_spent_before_import` are NOT in the client store, so they
-        // never appear in the `consumed` feed above — merge them into the
-        // buckets below. The queue itself is only pruned after the tick
-        // completes (`complete_direct_notes`), so a mid-tick failure retries.
-        let direct_notes: Vec<InputNoteRecord> = self
-            .direct_recovered
-            .lock()
-            .expect("direct-recovered queue poisoned")
-            .clone();
-        // Pre-group the consumed feed by Miden block ONCE (not once per block): a
-        // per-block re-scan of the full feed makes catch-up O(blocks_behind ×
-        // total_consumed). Each block then projects from its precomputed bucket.
+        // Per-block consumption sourcing (docs/design/UNIFIED-PROJECTOR.md), routed by note
+        // kind because the three types surface their consumptions differently:
+        //
+        //   * CLAIM / UpdateGerNote — created AND consumed by this proxy's own operations
+        //     (the bridge consumes a GER injection roughly every block). They land in the
+        //     local store's consumed feed on time and were never the notes the late-sweep
+        //     chased, so they are sourced from the store's `Consumed` feed — the SAME source
+        //     the projector always used for them.
+        //
+        //   * B2AGG bridge-out — imported EXTERNALLY by the reconciler; the store's discovery
+        //     of its CONSUMPTION lags the chain (the bug the late-sweep fought). Sourced
+        //     AUTHORITATIVELY from the bridge's own transaction feed, which gives the
+        //     COMPLETE, FINALIZED B2AGG consumption set of [cursor+1, project_to] — so a
+        //     B2AGG consumption can never surface "late", and the late-sweep is deleted.
+        //
+        // A bridge transaction can consume any of the three; routing by kind (NOT forcing
+        // every bridge consumption through the B2AGG body path) is what keeps a GER/CLAIM
+        // consumption — whose body the authoritative feed reports before the store's B2AGG
+        // import frontier would have it — from wedging the tip.
+        let consumed = client
+            .get_input_notes(NoteFilter::Consumed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?;
+        // CLAIM / GER from the store's consumed feed, at their finalized consumption block.
+        // B2AGG is skipped here — sourced authoritatively below (keeping the two sources
+        // disjoint keeps the reasoning clean; `is_note_processed` would dedup either way).
         let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
         for note in &consumed {
+            if is_b2agg_note(note.details()) {
+                continue;
+            }
             if let Some(h) = note.state().consumed_block_height().map(|h| h.as_u64()) {
                 by_block.entry(h).or_default().push(note);
             }
         }
-        // Late-consumption sweep (completeness): notes whose consumption block
-        // the cursor already passed — discovered late (imported by the
-        // reconciler, or delivered late by sync). Their original synthetic
-        // block is sealed and downstream getLogs consumers only read forward,
-        // so project them into the FIRST block of this tick's window. The
-        // `swept` cache keeps this O(new notes); `project_*`'s own
-        // `is_note_processed` dedup keeps it idempotent (a note that was
-        // projected on time is attempted once here, then cached).
-        let late_ids: Vec<[u8; 32]> = {
-            let swept = self.swept.lock().expect("swept cache poisoned");
-            let late: Vec<&InputNoteRecord> = consumed
-                .iter()
-                .filter(|n| {
-                    n.state()
-                        .consumed_block_height()
-                        .map(|h| h.as_u64() <= cursor)
-                        .unwrap_or(false)
-                })
-                .filter(|n| !swept.contains(&n.details_commitment().as_bytes()))
-                .collect();
-            // #27 (2026-07-09): the late bucket lands at `cursor + 1`, which only
-            // the `while cursor < project_to` loop below projects. When the projector is
-            // CAUGHT UP (`cursor == tip` — true on most ticks, since ticks are ~1s
-            // and blocks ~5s), that loop never runs — pre-fix the late ids were
-            // still marked swept afterwards, permanently dropping the note's
-            // BridgeEvent (funds stranded until a restart cleared the in-memory
-            // cache and the sweep retried). Verified live: a load-delayed
-            // consumption (note fd0f5b62…, consumed block 543) sat in the store
-            // unprojected while `deposit_counter` lagged the on-chain LET by 1;
-            // restarting the proxy healed it in 11s. Fix: when caught up, DEFER —
-            // don't bucket, don't mark swept — the next block-advancing tick
-            // projects them (bounded by block cadence).
-            // With the #30 visibility barrier a note can no longer be late: its
-            // block is projected only after the reconciler swept it, so it was
-            // present on time. The sweep is kept as a fail-safe + ALARM — any
-            // non-empty `late` here means the barrier's invariant was violated
-            // (a note surfaced for an already-sealed block), which is a bug
-            // signal, not routine. Emit the anomaly metric + WARN, then still
-            // recover it (bucket at cursor+1, honoring the #27 caught-up defer
-            // against `project_to`) so no funds strand even in the anomaly case.
-            // Treat a late note as an ANOMALY only when the barrier is ACTIVE
-            // (node_rpc set): the barrier guarantees no note is late, so one here is a
-            // real invariant violation. Without the barrier (node_rpc=None — pure unit
-            // tests / a non-reconciling deployment) late notes are the legacy-expected
-            // case; recover them silently rather than firing a false alarm.
-            if !late.is_empty() && self.node_rpc.is_some() {
-                ::metrics::counter!("projector_late_sweep_anomaly_total")
-                    .increment(late.len() as u64);
-                tracing::warn!(
-                    late = late.len(),
-                    cursor,
-                    project_to,
-                    "late-consumption sweep found notes AFTER their sealed block — the \
-                     visibility barrier should make this impossible; recovering them but \
-                     investigate (projector_late_sweep_anomaly_total)"
+        // AUTHORITATIVE B2AGG: for each bridge-consumed nullifier in the window, resolve its
+        // note BODY and rebuild a ConsumedExternal record at the authoritative (block,
+        // tx_order). Resolution is cache-first (bodies captured while the note was still
+        // Committed — a B2AGG note's `InputNoteRecord::nullifier()` goes `None` the instant
+        // `sync_state` marks it ConsumedExternal, so no live-store map can find it after
+        // consumption) with an authoritative node fetch backing up any cache miss (a note
+        // created+consumed under load before import is never cached but IS consumed
+        // unauthenticated, so the tx carries its id). See `resolve_b2agg_consumptions`. A
+        // nullifier that is neither cached, fetchable, nor B2AGG is a CLAIM/GER (the store
+        // feed above covers it) or a not-yet-imported note — skipped there; an authenticated
+        // uncached one fails the tick loudly. Projected nullifiers are evicted below.
+        let mut evict_by_block: HashMap<u64, Vec<Nullifier>> = HashMap::new();
+        let auth_b2agg: Vec<InputNoteRecord> = if let Some(rpc) = self.node_rpc.as_ref() {
+            // Refresh the cache from the store's currently-resolvable (Committed) B2AGG notes
+            // so notes still Committed from a PRIOR run are captured before they can be
+            // consumed this run (import-time caching only covers notes imported THIS run).
+            let all_input = client
+                .get_input_notes(NoteFilter::All)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to get input notes: {e}"))?;
+            self.cache_committed_b2agg_bodies(&all_input, "tick_scan");
+            let txs = rpc
+                .sync_transactions(
+                    BlockNumber::from((cursor + 1) as u32),
+                    BlockNumber::from(project_to as u32),
+                    vec![self.bridge_id],
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, project_to)
+                })?;
+            // INSTR (observability-only): the sourcing window + a continuity check across ticks, so a
+            // note whose consumption block fell in an un-sourced gap is visible. Pure logging —
+            // reads/updates `last_source_window_to` but never affects windowing or control flow.
+            let source_from = cursor + 1;
+            tracing::info!(
+                "INSTR source_window: from={} to={} reconcile_cursor={} tip={} tx_count={}",
+                source_from,
+                project_to,
+                reconcile_cursor,
+                tip,
+                txs.len()
+            );
+            let prev_to = self
+                .last_source_window_to
+                .swap(project_to, Ordering::AcqRel);
+            if prev_to != 0 && source_from != prev_to + 1 {
+                tracing::info!(
+                    "INSTR WINDOW_GAP: prev_to={} this_from={} (gap/overlap of {} blocks)",
+                    prev_to,
+                    source_from,
+                    (source_from as i128) - (prev_to as i128 + 1)
                 );
             }
-            match Self::late_sweep_target_block(!late.is_empty(), cursor, project_to) {
-                // Caught up to the ceiling (or no late notes): DEFER — don't bucket, don't
-                // return ids (nothing gets marked swept), so the next block-advancing tick
-                // reprojects them instead of dropping the BridgeEvent (#27).
-                None => Vec::new(),
-                Some(target) => {
-                    let ids = late
-                        .iter()
-                        .map(|n| n.details_commitment().as_bytes())
-                        .collect();
-                    by_block.entry(target).or_default().extend(late);
-                    ids
+            for tx in &txs {
+                if tx.transaction_header.account_id() != self.bridge_id {
+                    continue;
                 }
+                let nulls: Vec<String> = tx
+                    .transaction_header
+                    .input_notes()
+                    .iter()
+                    .map(|i| i.nullifier().to_hex())
+                    .collect();
+                tracing::info!(
+                    "INSTR source_tx: tx_id={} block={} n_inputs={} nullifiers=[{}]",
+                    tx.transaction_header.id().to_hex(),
+                    tx.block_num.as_u64(),
+                    nulls.len(),
+                    nulls.join(",")
+                );
             }
+            let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id);
+            // INSTR (observability-only): every attributed bridge consumption, keyed by nullifier.
+            for (nullifier, cref) in &consumed_refs {
+                tracing::info!(
+                    "INSTR source_consumption: nullifier={} block={} order={} note_id={:?} \
+                     authenticated={}",
+                    nullifier.to_hex(),
+                    cref.block,
+                    cref.order,
+                    cref.note_id.map(|i| i.to_hex()),
+                    cref.note_id.is_none()
+                );
+            }
+            let fetcher = RpcNoteFetcher(&**rpc);
+            self.resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict_by_block)
+                .await?
+        } else {
+            // No reconciler wired (pure unit tests / non-reconciling deployment): the
+            // authoritative path is a no-op; tests drive `project_notes` directly.
+            Vec::new()
         };
-        // Direct projection of spent-before-import recoveries (same sealed-block
-        // rules as the late sweep; see `bucket_direct_notes`).
-        let direct_done =
-            Self::bucket_direct_notes(&direct_notes, &mut by_block, cursor, project_to);
+        for rec in &auth_b2agg {
+            if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
+                by_block.entry(h).or_default().push(rec);
+            }
+        }
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
         while cursor < project_to {
             let next = cursor + 1;
@@ -1310,19 +1610,39 @@ impl SyntheticProjector {
             // never runs ahead of fully-projected state.
             self.store.set_projector_cursor(next).await?;
             self.cursor.store(next, Ordering::Release);
+            // Evict this block's projected B2AGG nullifiers AFTER the cursor is persisted, so
+            // the cache stays bounded to imported-but-not-yet-projected notes. Ordering it
+            // after the persist means a crash before the persist leaves the entry in place
+            // for the idempotent re-projection; a crash after (before evict) only leaks a
+            // bounded, already-projected entry — never drops an event.
+            if let Some(nulls) = evict_by_block.get(&next) {
+                let mut cache = self
+                    .recovered_bodies
+                    .lock()
+                    .expect("recovered-bodies cache poisoned");
+                for nf in nulls {
+                    cache.remove(nf);
+                }
+            }
             cursor = next;
         }
-        // The tick completed — only NOW mark the late-swept notes as handled, so
-        // a mid-tick failure retries them next tick instead of dropping them.
-        if !late_ids.is_empty() {
-            self.swept
-                .lock()
-                .expect("swept cache poisoned")
-                .extend(late_ids);
+        // COMPLETENESS AUDITOR (detection only, every AUDIT_EVERY_N_TICKS ticks): diff the
+        // store's consumed-B2AGG view against the synthetic log store for comfortably-sealed
+        // blocks. Reuses this tick's already-fetched `consumed` feed — zero extra queries.
+        // Non-fatal by construction: an audit failure warns and retries next cycle, it never
+        // blocks projection.
+        if self.node_rpc.is_some()
+            && self
+                .audit_tick_counter
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(AUDIT_EVERY_N_TICKS)
+            && let Err(e) = self.audit_completeness(&consumed, cursor).await
+        {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "completeness auditor failed (non-fatal — retried next cycle)"
+            );
         }
-        // Same contract for the direct-recovery queue: prune only after the
-        // whole tick succeeded (retries are idempotent via `is_note_processed`).
-        self.complete_direct_notes(&direct_done);
         // Observability: the projector follows the MIDEN chain, so its progress is
         // measured against the Miden tip (NOT L1). With the #30 barrier the projector
         // catches up to `project_to = min(tip, reconcile_cursor)`, NOT necessarily the raw
@@ -1346,9 +1666,113 @@ impl SyntheticProjector {
     }
 }
 
-/// MA#3 reclaim gate for the spent-before-import recovery path: map every
-/// nullifier consumed by a BRIDGE-executed transaction to `(spend_block,
-/// per-block bridge-tx order)`.
+/// One completeness-audit cycle's tallies (see [`SyntheticProjector::audit_completeness`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuditOutcome {
+    /// Notes checked against the synthetic log store this cycle (new, past the margin).
+    pub audited: usize,
+    /// Audited notes whose BridgeEvent was found at the exact consumption block.
+    pub verified: usize,
+    /// Audited notes with NO BridgeEvent at their consumption block — violations (alarmed).
+    pub missing: usize,
+    /// Notes still inside the settle margin — deferred to a later cycle.
+    pub settling: usize,
+}
+
+/// One bridge-consumed input note, attributed from the bridge's transaction feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsumedRef {
+    /// Finalized block the bridge consumed the note in.
+    pub block: u64,
+    /// Per-block order of the consuming bridge transaction (intra-block determinism).
+    pub order: u32,
+    /// The consumed note's id — carried by the consuming transaction IFF the input was
+    /// UNAUTHENTICATED ([`InputNoteCommitment::header`] is `Some` exactly then). An
+    /// authenticated consumption carries no header, hence `None`; that is precisely the
+    /// case where the note lived long enough to be discovered and cached, so the projector
+    /// never needs to fetch it by id. When present, it lets the projector resolve a note
+    /// body the cache never captured (created+consumed under load before import) by fetching
+    /// it authoritatively from the node.
+    pub note_id: Option<NoteId>,
+}
+
+/// A public note body fetched by id from the node — enough to rebuild a ConsumedExternal
+/// record for projection. Private notes are dropped by the fetcher (a real public B2AGG
+/// exit is always public), so callers only ever see public bodies.
+#[derive(Clone)]
+pub(crate) struct FetchedBody {
+    pub id: NoteId,
+    pub details: NoteDetails,
+    pub attachments: NoteAttachments,
+}
+
+/// The result of an authoritative fetch: the decoded PUBLIC bodies AND the full set of ids
+/// the node actually RETURNED (public or private, before any filtering). The `returned_ids`
+/// set is the signal that lets the caller distinguish two very different cache-miss outcomes
+/// for a note id it asked for: RETURNED-but-not-a-public-b2agg (proven not an exit → safe
+/// skip) vs NOT-RETURNED (the node omitted it — a `sync_transactions`-ahead-of-note-DB load
+/// race → fail-closed, retry). Without it a not-yet-indexed just-consumed note would silently
+/// drop its BridgeEvent, the acfee0cb-class bug one level down.
+pub(crate) struct FetchedBodies {
+    pub bodies: Vec<FetchedBody>,
+    pub returned_ids: HashSet<NoteId>,
+}
+
+/// The single node-RPC capability the authoritative B2AGG resolution needs: fetch the note
+/// bodies for a set of ids, decoded to public [`FetchedBody`]s plus the set of ids the node
+/// returned. Narrowed to one method so it is trivially mockable in unit tests — the full
+/// [`NodeRpcClient`] has ~30 methods and needs a live node.
+#[async_trait::async_trait]
+pub(crate) trait PublicNoteFetcher: Send + Sync {
+    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<FetchedBodies>;
+}
+
+/// Production [`PublicNoteFetcher`] over a live node RPC client. A `Sized` wrapper (not a
+/// blanket `impl … for dyn NodeRpcClient`) because a `&dyn NodeRpcClient` cannot be coerced
+/// to `&dyn PublicNoteFetcher` — both are unsized, so the fat-pointer vtable can only be
+/// built from a `Sized` source.
+pub(crate) struct RpcNoteFetcher<'a>(pub &'a dyn NodeRpcClient);
+
+#[async_trait::async_trait]
+impl PublicNoteFetcher for RpcNoteFetcher<'_> {
+    async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<FetchedBodies> {
+        let fetched = self
+            .0
+            .get_notes_by_id(ids)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_notes_by_id({}): {e}", ids.len()))?;
+        let mut bodies = Vec::with_capacity(fetched.len());
+        let mut returned_ids = HashSet::with_capacity(fetched.len());
+        for f in fetched {
+            let id = f.id();
+            // Record EVERY id the node responded with (public or private) BEFORE filtering — a
+            // returned-but-non-public id is provably not an exit; a NOT-returned id is unknown.
+            returned_ids.insert(id);
+            let FetchedNote::Public(note, _inclusion) = f else {
+                tracing::debug!(
+                    note_id = %id.to_hex(),
+                    "authoritative fetch: node returned a non-public note (cannot be a real exit)"
+                );
+                continue;
+            };
+            let attachments = note.attachments().clone();
+            let details: NoteDetails = note.into();
+            bodies.push(FetchedBody {
+                id,
+                details,
+                attachments,
+            });
+        }
+        Ok(FetchedBodies {
+            bodies,
+            returned_ids,
+        })
+    }
+}
+
+/// MA#3 reclaim gate for the authoritative consumption path: map every nullifier consumed
+/// by a BRIDGE-executed transaction to a [`ConsumedRef`] (spend block, per-block bridge-tx
+/// order, and — for unauthenticated inputs — the note id).
 ///
 /// The node's `sync_transactions` feed is filtered per account and each
 /// transaction header commits to the nullifiers of the notes that transaction
@@ -1360,7 +1784,7 @@ impl SyntheticProjector {
 pub(crate) fn bridge_consumed_nullifiers(
     txs: &[TransactionRecord],
     bridge_id: AccountId,
-) -> HashMap<Nullifier, (u64, u32)> {
+) -> HashMap<Nullifier, ConsumedRef> {
     let mut per_block_order: HashMap<u64, u32> = HashMap::new();
     let mut out = HashMap::new();
     for tx in txs {
@@ -1373,7 +1797,17 @@ pub(crate) fn bridge_consumed_nullifiers(
             .and_modify(|i| *i += 1)
             .or_insert(0u32);
         for input in tx.transaction_header.input_notes().iter() {
-            out.insert(input.nullifier(), (block, order));
+            // `header()` is `Some` IFF the input is unauthenticated — then it carries the
+            // NoteId, letting `tick` fetch an uncached body authoritatively.
+            let note_id = input.header().map(|h| h.id());
+            out.insert(
+                input.nullifier(),
+                ConsumedRef {
+                    block,
+                    order,
+                    note_id,
+                },
+            );
         }
     }
     out
@@ -1411,8 +1845,8 @@ mod tests {
     use miden_protocol::asset::{Asset, FungibleAsset};
     use miden_protocol::block::BlockNumber;
     use miden_protocol::note::{
-        NoteAssets, NoteAttachment, NoteAttachments, NoteDetails, NoteMetadata, NoteRecipient,
-        NoteStorage, NoteType, PartialNoteMetadata,
+        NoteAssets, NoteAttachment, NoteAttachments, NoteDetails, NoteHeader, NoteId, NoteMetadata,
+        NoteRecipient, NoteStorage, NoteType, PartialNoteMetadata,
     };
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
@@ -1450,41 +1884,6 @@ mod tests {
         // Without a reconciler wired the projector keeps legacy behavior: project to tip.
         assert_eq!(SyntheticProjector::barrier_project_to(false, 100, 40), 100);
         assert_eq!(SyntheticProjector::barrier_project_to(false, 7, 0), 7);
-    }
-
-    // #27 regression: the late-consumption sweep must DEFER (not bucket, not mark swept)
-    // when the projector is caught up to the projection ceiling, so a load-delayed
-    // consumption's BridgeEvent is reprojected next block instead of being dropped. This
-    // pins the tick's deferral decision (the pre-fix bug marked late ids swept without
-    // projecting them, stranding funds until a restart).
-    #[test]
-    fn late_sweep_defers_when_caught_up_and_buckets_otherwise() {
-        // Caught up (cursor == ceiling): DEFER — no target block, so nothing is bucketed or
-        // marked swept this tick.
-        assert_eq!(
-            SyntheticProjector::late_sweep_target_block(true, 100, 100),
-            None,
-            "late notes must be deferred when caught up to the ceiling (#27)"
-        );
-        // Cursor even past the ceiling (barrier edge): still deferred.
-        assert_eq!(
-            SyntheticProjector::late_sweep_target_block(true, 101, 100),
-            None
-        );
-        // NOT caught up: bucket the late notes for re-projection at cursor + 1 this tick.
-        assert_eq!(
-            SyntheticProjector::late_sweep_target_block(true, 40, 100),
-            Some(41)
-        );
-        // No late notes at all: nothing to do regardless of cursor position.
-        assert_eq!(
-            SyntheticProjector::late_sweep_target_block(false, 40, 100),
-            None
-        );
-        assert_eq!(
-            SyntheticProjector::late_sweep_target_block(false, 100, 100),
-            None
-        );
     }
 
     #[test]
@@ -2296,96 +2695,6 @@ mod tests {
         );
     }
 
-    /// Direct-projection recovery (spent-before-import): consumed-external
-    /// B2AGG records fabricated by the reconciler bypass the client store —
-    /// verify they bucket per the sealed-block rules (late → first window
-    /// block, in-window → own Miden block, beyond-tip → deferred), emit a
-    /// BridgeEvent through the SAME `project_b2agg_note` derivation, and are
-    /// pruned from the queue only once projected.
-    #[tokio::test]
-    async fn direct_recovery_projects_bridge_consumed_note() {
-        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
-        register_faucet(&store).await;
-        let block_state = StdArc::new(BlockState::new());
-        let projector = test_projector(&store, &block_state).await;
-
-        // Spend block already passed by the cursor (3), inside this tick's
-        // window (8), and beyond the tip (12). Distinct amounts → distinct
-        // details commitments.
-        let n_late = b2agg_note_with_amount(3, Some(0), 51);
-        let n_exact = b2agg_note_with_amount(8, Some(0), 52);
-        let n_future = b2agg_note_with_amount(12, Some(0), 53);
-        projector.direct_recovered.lock().unwrap().extend([
-            n_late.clone(),
-            n_exact.clone(),
-            n_future.clone(),
-        ]);
-
-        // Snapshot + bucket the way `tick` does, with cursor=5, tip=10.
-        let direct: Vec<InputNoteRecord> = projector.direct_recovered.lock().unwrap().clone();
-        let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
-        let done = SyntheticProjector::bucket_direct_notes(&direct, &mut by_block, 5, 10);
-
-        assert_eq!(
-            done.len(),
-            2,
-            "late + in-window notes bucket; beyond-tip defers"
-        );
-        assert_eq!(
-            by_block.get(&6).map(Vec::len),
-            Some(1),
-            "already-passed spend block projects into the first window block"
-        );
-        assert_eq!(
-            by_block.get(&8).map(Vec::len),
-            Some(1),
-            "in-window spend block projects Miden-1:1 at its own height"
-        );
-        assert!(
-            !by_block.contains_key(&12),
-            "spend block beyond the sync tip must not bucket this tick"
-        );
-
-        // Project the buckets exactly like the tick loop.
-        let empty = HashMap::new();
-        let logs6 = projector
-            .project_block_notes(&by_block[&6], &empty, 6, None)
-            .await
-            .unwrap();
-        let logs8 = projector
-            .project_block_notes(&by_block[&8], &empty, 8, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            (logs6, logs8),
-            (1, 1),
-            "each recovered note emits one BridgeEvent"
-        );
-
-        let logs = logs_in_range(&store, 0, 10).await;
-        assert_eq!(logs.len(), 2);
-        assert_eq!(logs[0].block_number, 6);
-        assert_eq!(logs[1].block_number, 8);
-        assert_eq!(
-            logs[0].transaction_hash,
-            crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
-                n_late.details_commitment().as_bytes()
-            )),
-            "direct projection derives the SAME tx hash as every other path (dedup-stable)"
-        );
-
-        // Completion prunes only the projected notes; the deferred one stays
-        // queued for a future tick.
-        projector.complete_direct_notes(&done);
-        let remaining = projector.direct_recovered.lock().unwrap().clone();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(
-            remaining[0].details_commitment(),
-            n_future.details_commitment(),
-            "only the beyond-tip note remains queued"
-        );
-    }
-
     /// Cantina MA#28 — the projector's `ConsumedExternal` provenance fallback,
     /// fail-closed side. A GER-shaped consumed note whose details-commitment
     /// has NO matching entry in our own output-note metadata map (i.e. a note
@@ -2446,14 +2755,18 @@ mod tests {
         fn nf(byte: u64) -> Nullifier {
             Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
         }
-        fn tx(account: AccountId, block: u32, nullifier: Nullifier) -> TransactionRecord {
+        fn tx(
+            account: AccountId,
+            block: u32,
+            commitment: InputNoteCommitment,
+        ) -> TransactionRecord {
             TransactionRecord {
                 block_num: BlockNumber::from(block),
                 transaction_header: TransactionHeader::new(
                     account,
                     Word::empty(),
                     Word::empty(),
-                    InputNotes::new(vec![InputNoteCommitment::from(nullifier)]).unwrap(),
+                    InputNotes::new(vec![commitment]).unwrap(),
                     vec![],
                     FungibleAsset::new(aid(FAUCET), 0).unwrap(),
                 ),
@@ -2463,21 +2776,490 @@ mod tests {
         }
 
         let (a, b, c) = (nf(1), nf(2), nf(3));
+        // Authenticated inputs (nullifier only, no header) — the common case.
+        let auth = |n: Nullifier| InputNoteCommitment::from(n);
+        // An UNAUTHENTICATED input carries a note header → the note id is recoverable. Build a
+        // real header so its `id()` is what `bridge_consumed_nullifiers` must surface.
+        let details_commitment = b2agg_note(5, Some(0)).details_commitment();
+        let metadata = NoteMetadata::new(
+            PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+            &NoteAttachments::default(),
+        );
+        let header = NoteHeader::new(details_commitment, metadata);
+        let expected_id = header.id();
+        let unauth = InputNoteCommitment::from_parts_unchecked(nf(4), Some(header));
+
         let txs = vec![
-            tx(aid(BRIDGE), 9, a),  // bridge consumption → attributed, order 0
-            tx(aid(SERVICE), 9, b), // sender reclaim → NOT attributed
-            tx(aid(BRIDGE), 9, c),  // second bridge tx in the block → order 1
+            tx(aid(BRIDGE), 9, auth(a)),  // bridge consumption → attributed, order 0
+            tx(aid(SERVICE), 9, auth(b)), // sender reclaim → NOT attributed
+            tx(aid(BRIDGE), 9, auth(c)),  // second bridge tx in the block → order 1
+            tx(aid(BRIDGE), 9, unauth), // unauthenticated bridge consumption → order 2, id carried
         ];
         let map = bridge_consumed_nullifiers(&txs, aid(BRIDGE));
-        assert_eq!(map.get(&a), Some(&(9, 0)));
+        assert_eq!(
+            map.get(&a),
+            Some(&ConsumedRef {
+                block: 9,
+                order: 0,
+                note_id: None
+            }),
+            "authenticated input → attributed with no note id"
+        );
         assert_eq!(
             map.get(&c),
-            Some(&(9, 1)),
+            Some(&ConsumedRef {
+                block: 9,
+                order: 1,
+                note_id: None
+            }),
             "per-block bridge-tx order increments"
+        );
+        assert_eq!(
+            map.get(&nf(4)),
+            Some(&ConsumedRef {
+                block: 9,
+                order: 2,
+                note_id: Some(expected_id)
+            }),
+            "unauthenticated input must carry the consuming tx's note id (enables authoritative fetch)"
         );
         assert!(
             !map.contains_key(&b),
             "non-bridge consumption must be gated out (MA#3 fail-closed)"
+        );
+    }
+
+    /// Regression lock for the dropped-BridgeEvent bug: the reason the projector resolves
+    /// B2AGG bodies from the `recovered_bodies` cache (fed while notes are Committed) instead
+    /// of a live-store nullifier map. Once `sync_state` marks a B2AGG note ConsumedExternal,
+    /// [`InputNoteRecord::nullifier`] returns `None` (the metadata the nullifier is derived
+    /// from is gone), so the note vanishes from any store map keyed on `nullifier()` — and on
+    /// a fresh-stack catch-up the note is routinely consumed BEFORE the projector reaches its
+    /// block, which silently dropped its BridgeEvent. Two invariants pin this down:
+    ///   1. a consumed B2AGG note has no `nullifier()`, and
+    ///   2. feeding an already-consumed note to `cache_committed_b2agg_bodies` caches NOTHING
+    ///      (no key to store it under) — so bodies MUST be captured earlier, while Committed.
+    #[tokio::test]
+    async fn consumed_b2agg_note_cannot_be_cached_post_hoc() {
+        let note = b2agg_note(7, Some(0));
+        assert!(
+            note.nullifier().is_none(),
+            "a ConsumedExternal note must have no nullifier() — the exact miden-client \
+             behavior the body cache exists to work around"
+        );
+
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // An already-consumed note has no nullifier to key on → nothing is cached. This is
+        // WHY `cache_committed_b2agg_bodies` runs at import time and every tick over the
+        // still-Committed store notes, before any of them can transition to ConsumedExternal.
+        projector.cache_committed_b2agg_bodies(std::slice::from_ref(&note), "tick_scan");
+        assert!(
+            projector
+                .recovered_bodies
+                .lock()
+                .expect("cache poisoned")
+                .is_empty(),
+            "a consumed note cannot be cached post-hoc; the cache is fed while Committed"
+        );
+    }
+
+    /// A [`PublicNoteFetcher`] test double standing in for the node's `get_notes_by_id`.
+    /// `bodies` are the public B2AGG-eligible bodies the node returns; `also_returned` are ids
+    /// the node returns but WITHOUT a public b2agg body (e.g. a public CLAIM/GER or a private
+    /// note) — present in `returned_ids` but absent from `bodies`. An id in neither is one the
+    /// node did NOT return at all (the load-race case).
+    #[derive(Default)]
+    struct MockFetcher {
+        bodies: Vec<FetchedBody>,
+        also_returned: Vec<NoteId>,
+    }
+    #[async_trait::async_trait]
+    impl PublicNoteFetcher for MockFetcher {
+        async fn fetch_public_bodies(&self, ids: &[NoteId]) -> anyhow::Result<FetchedBodies> {
+            let bodies: Vec<FetchedBody> = self
+                .bodies
+                .iter()
+                .filter(|b| ids.contains(&b.id))
+                .cloned()
+                .collect();
+            let mut returned_ids: HashSet<NoteId> = bodies.iter().map(|b| b.id).collect();
+            returned_ids.extend(
+                self.also_returned
+                    .iter()
+                    .filter(|id| ids.contains(id))
+                    .copied(),
+            );
+            Ok(FetchedBodies {
+                bodies,
+                returned_ids,
+            })
+        }
+    }
+
+    fn nullifier(byte: u64) -> super::Nullifier {
+        super::Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
+    }
+
+    /// The regression for note `0xacfee0cb…` (N=30 loadtest, exactly 1 missing BridgeEvent): a
+    /// bridge consumption whose body the projector never cached — because the note was
+    /// created+consumed under load before the reconciler imported it Committed — must still be
+    /// resolved and emitted at its exact block. Such a consumption is UNAUTHENTICATED, so the
+    /// consuming tx carried the note id; `resolve_b2agg_consumptions` fetches the body by id
+    /// (authoritative backstop) instead of silently dropping it.
+    #[tokio::test]
+    async fn uncached_unauthenticated_consumption_resolves_via_authoritative_fetch() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await; // cache empty
+
+        // A real B2AGG body the node would return, and the id the consuming tx carries.
+        let body_note = b2agg_note(544, Some(0));
+        let details = body_note.details().clone();
+        let note_id = NoteId::new(
+            body_note.details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let nf = nullifier(0xac);
+
+        let consumed_refs = HashMap::from([(
+            nf,
+            ConsumedRef {
+                block: 544,
+                order: 0,
+                note_id: Some(note_id),
+            },
+        )]);
+        let fetcher = MockFetcher {
+            bodies: vec![FetchedBody {
+                id: note_id,
+                details: details.clone(),
+                attachments: NoteAttachments::default(),
+            }],
+            ..Default::default()
+        };
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let recs = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .await
+            .expect("uncached-but-unauthenticated consumption must resolve, not error");
+
+        assert_eq!(
+            recs.len(),
+            1,
+            "the uncached unauthenticated consumption must resolve via authoritative fetch"
+        );
+        assert_eq!(
+            recs[0].state().consumed_block_height().map(|h| h.as_u64()),
+            Some(544),
+            "resolved at the exact consumption block"
+        );
+        assert!(
+            is_b2agg_note(recs[0].details()),
+            "the fetched body is the B2AGG note"
+        );
+        assert_eq!(
+            evict.get(&544).map(|v| v.as_slice()),
+            Some([nf].as_slice()),
+            "the resolved nullifier is queued for post-seal eviction"
+        );
+    }
+
+    /// The block-13 un-wedge regression: an AUTHENTICATED bridge consumption (no note id in the
+    /// tx) with no cached body is NORMALLY a legit non-B2AGG note (CLAIM/GER/genesis setup) the
+    /// store consumed feed covers — the B2AGG-only cache never holds it. It must be a SAFE SKIP
+    /// (no Err, no record, tick advances); an earlier version fail-closed here and froze the
+    /// synthetic tip at 0 on the first block-13 GER/genesis consumption (244× ERROR, dead bridge).
+    #[tokio::test]
+    async fn authenticated_uncached_consumption_is_a_safe_skip_never_wedges() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Block-13-shaped: an authenticated bridge consumption, no cached body, no note id.
+        let nf = nullifier(0x64);
+        let consumed_refs = HashMap::from([(
+            nf,
+            ConsumedRef {
+                block: 13,
+                order: 0,
+                note_id: None, // authenticated: no id, and not in the B2AGG cache
+            },
+        )]);
+        let fetcher = MockFetcher::default();
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let recs = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .await
+            .expect("authenticated uncached consumption must be a safe skip, NEVER an Err");
+        assert!(
+            recs.is_empty(),
+            "an authenticated non-B2AGG consumption emits no record (store feed covers it)"
+        );
+        assert!(
+            evict.is_empty(),
+            "nothing resolved → nothing queued for eviction; the tick advances"
+        );
+    }
+
+    /// Case (B) — the acfee0cb backstop under a note-DB lag, with the un-wedge guard. A bridge
+    /// consumption that is uncached + unauthenticated (note id in the tx) but that
+    /// `get_notes_by_id` does NOT return — `sync_transactions` is ahead of the node's note DB.
+    /// The tick HOLDS (Errs, retries) for a bounded window so a transient lag can resolve the
+    /// real body; past [`FETCH_MISS_RETRY_BOUND`] it LOUD-SKIPS and advances rather than freezing
+    /// the tip forever. Both halves are asserted: it retries within the bound, then stops.
+    #[tokio::test]
+    async fn uncached_unauthenticated_fetch_omitted_retries_then_loud_skips() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let note_id = NoteId::new(
+            b2agg_note(880, Some(0)).details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let nf = nullifier(0xb0);
+        let cref = ConsumedRef {
+            block: 880,
+            order: 0,
+            note_id: Some(note_id),
+        };
+        // The node returns NOTHING for the requested id (never indexed) on every tick.
+        let fetcher = MockFetcher::default();
+
+        // Within the bound: each tick HOLDS (Err), so the block never seals without its exit.
+        for attempt in 1..=FETCH_MISS_RETRY_BOUND {
+            let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+            let err = projector
+                .resolve_b2agg_consumptions(&fetcher, HashMap::from([(nf, cref)]), &mut evict)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not yet in the node's note DB"),
+                "attempt {attempt} must hold the tick with the load-race reason: {err:#}"
+            );
+            assert!(evict.is_empty(), "a held tick queues no eviction");
+        }
+
+        // Past the bound: LOUD-SKIP + advance (Ok, no record) — the tip is never frozen forever.
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let recs = projector
+            .resolve_b2agg_consumptions(&fetcher, HashMap::from([(nf, cref)]), &mut evict)
+            .await
+            .expect("past the retry bound the tick must advance (loud-skip), never freeze");
+        assert!(
+            recs.is_empty(),
+            "the unresolvable note is skipped, not emitted"
+        );
+        assert!(evict.is_empty(), "nothing resolved → nothing to evict");
+    }
+
+    /// Case (A) — the complement: a bridge consumption the node DID return, but as a non-b2agg
+    /// note (the bridge legitimately consumes CLAIM/GER). This is provably NOT a public exit, so
+    /// it is a safe skip — no record, no error, no eviction. Skipping here (not fail-closing) is
+    /// what keeps a legit CLAIM/GER bridge consumption from wedging the tip.
+    #[tokio::test]
+    async fn returned_non_b2agg_consumption_is_a_safe_skip_not_a_wedge() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // A CLAIM note's id: the node returns it, but its body is not B2AGG.
+        let claim = claim_note(901, Some(0));
+        let note_id = NoteId::new(
+            claim.details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let nf = nullifier(0xc1);
+        let consumed_refs = HashMap::from([(
+            nf,
+            ConsumedRef {
+                block: 901,
+                order: 0,
+                note_id: Some(note_id),
+            },
+        )]);
+        // Node RETURNS the id (in returned_ids) but with no public b2agg body.
+        let fetcher = MockFetcher {
+            bodies: vec![],
+            also_returned: vec![note_id],
+        };
+        let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
+        let recs = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .await
+            .expect("a returned non-b2agg note must be a safe skip, not an error");
+        assert!(
+            recs.is_empty(),
+            "a non-b2agg bridge consumption emits no B2AGG record"
+        );
+        assert!(
+            evict.is_empty(),
+            "nothing resolved → nothing queued for eviction"
+        );
+    }
+
+    /// Completeness auditor, happy + violation paths. A consumed B2AGG note past the settle
+    /// margin WITH its BridgeEvent at the exact consumption block verifies (no alarm); one
+    /// WITHOUT is a violation (missing=1).
+    #[tokio::test]
+    async fn completeness_auditor_flags_missing_event_and_passes_present_one() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Note A: consumed at block 5 and PROJECTED (real event in the synthetic store).
+        let emitted = b2agg_note_with_amount(5, Some(0), 11);
+        assert_eq!(
+            projector
+                .project_notes(std::slice::from_ref(&emitted), &HashMap::new(), 5, None)
+                .await
+                .unwrap(),
+            1,
+            "fixture: the event must actually be emitted"
+        );
+        // Note B: consumed at block 6, NEVER projected — the drop the auditor must catch.
+        let dropped = b2agg_note_with_amount(6, Some(0), 22);
+
+        // Cursor far enough that both blocks are past the settle margin.
+        let outcome = projector
+            .audit_completeness(&[emitted.clone(), dropped.clone()], 6 + AUDIT_SETTLE_MARGIN)
+            .await
+            .unwrap();
+        assert_eq!(outcome.audited, 2);
+        assert_eq!(
+            outcome.verified, 1,
+            "the emitted note verifies at its exact block"
+        );
+        assert_eq!(
+            outcome.missing, 1,
+            "the dropped note must be flagged as a completeness violation"
+        );
+    }
+
+    /// Settle margin: a consumption newer than `audit_to` is NOT audited yet — no false
+    /// positive while the store's (lagging) consumption view catches up. It IS audited (and
+    /// flagged) once the cursor moves past the margin.
+    #[tokio::test]
+    async fn completeness_auditor_defers_consumptions_inside_settle_margin() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Consumed at block 50, never projected; cursor only 3 past it (< margin).
+        let fresh = b2agg_note_with_amount(50, Some(0), 33);
+        let outcome = projector
+            .audit_completeness(std::slice::from_ref(&fresh), 53)
+            .await
+            .unwrap();
+        assert_eq!(outcome.audited, 0, "inside the margin: not audited");
+        assert_eq!(outcome.missing, 0, "inside the margin: no false positive");
+        assert_eq!(outcome.settling, 1, "deferred, not forgotten");
+
+        // Cursor past the margin: now audited and flagged.
+        let outcome = projector
+            .audit_completeness(std::slice::from_ref(&fresh), 50 + AUDIT_SETTLE_MARGIN)
+            .await
+            .unwrap();
+        assert_eq!(outcome.audited, 1);
+        assert_eq!(outcome.missing, 1, "past the margin the drop is caught");
+    }
+
+    /// Alarm de-dupe: the same missing note alarms exactly ONCE — later cycles skip it (the
+    /// per-cycle `missing` tally returns to 0; the metric counter stays cumulative). A
+    /// verified note is equally never re-checked.
+    #[tokio::test]
+    async fn completeness_auditor_alarms_once_per_note() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let dropped = b2agg_note_with_amount(7, Some(0), 44);
+        let cursor = 7 + AUDIT_SETTLE_MARGIN;
+
+        let first = projector
+            .audit_completeness(std::slice::from_ref(&dropped), cursor)
+            .await
+            .unwrap();
+        assert_eq!(first.missing, 1, "first cycle alarms");
+
+        let second = projector
+            .audit_completeness(std::slice::from_ref(&dropped), cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.missing, 0,
+            "second cycle must NOT re-alarm (deduped)"
+        );
+        assert_eq!(second.audited, 0, "already-resolved notes are skipped");
+    }
+
+    /// Emit-gate mirroring: notes the projector legitimately refuses to emit (reclaimed by a
+    /// non-bridge consumer — MA#3; self-targeted destination — #13) must never false-alarm.
+    #[tokio::test]
+    async fn completeness_auditor_skips_legitimately_unemitted_notes() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Reclaimed: consumed by the SERVICE account, not the bridge → no event expected.
+        let reclaimed = {
+            let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
+            let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+            let asset: Asset = FungibleAsset::new(aid(FAUCET), 55).unwrap().into();
+            let assets = NoteAssets::new(vec![asset]).unwrap();
+            consumed_note(
+                NoteDetails::new(assets, recipient),
+                NoteAttachments::default(),
+                Some(aid(SERVICE)),
+                8,
+                Some(0),
+            )
+        };
+        // Self-targeted: destination_network == local (7) → poison leaf, never emits. The
+        // first storage felt encodes the destination network byte-swapped (see
+        // parse_b2agg_storage): 7u32 → swap → 0x07000000.
+        let self_targeted = {
+            let mut felts = vec![Felt::from(0u32); 6];
+            felts[0] = Felt::from(u32::from_le_bytes(7u32.to_be_bytes()));
+            let storage = NoteStorage::new(felts).unwrap();
+            let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+            let asset: Asset = FungibleAsset::new(aid(FAUCET), 66).unwrap().into();
+            let assets = NoteAssets::new(vec![asset]).unwrap();
+            consumed_note(
+                NoteDetails::new(assets, recipient),
+                NoteAttachments::default(),
+                Some(aid(BRIDGE)),
+                8,
+                Some(1),
+            )
+        };
+        let outcome = projector
+            .audit_completeness(&[reclaimed, self_targeted], 8 + AUDIT_SETTLE_MARGIN)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.missing, 0,
+            "legitimately-unemitted notes must never false-alarm"
+        );
+        assert_eq!(
+            outcome.audited, 0,
+            "gated notes are excluded before the log check"
         );
     }
 }

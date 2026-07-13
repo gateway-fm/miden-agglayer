@@ -151,6 +151,25 @@ claim_event_rows() {
     pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${gi_hex}%';"
 }
 
+# _pred_native_bridgeevent_origin <origin_addr_0x> <origin_network>
+# True iff a synthetic BridgeEvent (proxy store) encodes the given originAddress +
+# originNetwork — i.e. a Miden bridge-OUT correctly DISCOVERED the native faucet's
+# registration and emitted the CONFIGURED origin network (not a 0/2 fallback). The
+# BridgeEvent data is ABI-encoded 32-byte words (encode_bridge_event_data): word 0 =
+# leafType, word 1 = originNetwork (uint32 in the low 8 hex), word 2 = originAddress
+# (address in the low 40 hex). After the leading '0x' (chars 1-2), word 1 starts at
+# char 67 and word 2 at char 131 (1-indexed).
+_pred_native_bridgeevent_origin() {
+    local addr net n
+    addr=$(echo "${1#0x}" | tr 'A-F' 'a-f')          # 40 hex, no 0x
+    net=$(printf '%08x' "$2")                          # uint32 -> 8 hex
+    n=$(pgq "SELECT COUNT(*) FROM synthetic_logs
+             WHERE topics[1] = '${BRIDGE_EVENT_TOPIC}'
+               AND substring(lower(data) from 67 for 64) LIKE '%${net}'
+               AND substring(lower(data) from 131 for 64) LIKE '%${addr}';")
+    [[ "${n:-0}" -ge 1 ]]
+}
+
 # _pred_submit_forward_claim <fwd_cnt> <global_index> <orig_net> <orig_token> <dest_net> <dest_addr> <amount_wei> <metadata>
 # Canonical forward (L2B->Miden) claim. With per-rollup bridge-service isolation
 # (canonical kurtosis-cdk: ONE bridge-service per chain, each indexing L1 + ONLY its
@@ -212,6 +231,9 @@ print('['+','.join(p[:32])+']')" 2>/dev/null || true)
 # by e2e-l2l2-back.sh (leg 4) and e2e-loadtest-mixed.sh (back ops).
 submit_back_claim() {
     local cnt="$1" gi="$2" onet="$3" otok="$4" dnet="$5" daddr="$6" amt="$7" meta="$8"
+    # 9th arg = target chain RPC (default L2B). The Miden-origin L1 leg passes $L1_RPC to
+    # claim on L1 instead of L2B (both are real EVM chains, so EIP-1559 is fine — no --legacy).
+    local target_rpc="${9:-$L2B_RPC}"
     local tries="${BACK_CLAIM_TRIES:-30}" interval="${BACK_CLAIM_INTERVAL:-15}"
     local attempt pj mer rer smtL smtR out txh
     for attempt in $(seq 1 "$tries"); do
@@ -230,7 +252,7 @@ p=json.load(sys.stdin)['proof']['rollup_merkle_proof']
 while len(p)<32:p.append('0x'+'00'*32)
 print('['+','.join(p[:32])+']')" 2>/dev/null || true)
             if [[ -n "$smtL" && -n "$smtR" && -n "$mer" ]]; then
-                out=$(cast send --rpc-url "$L2B_RPC" --private-key "$ADMIN_KEY" --json "$BRIDGE" \
+                out=$(cast send --rpc-url "$target_rpc" --private-key "$ADMIN_KEY" --json "$BRIDGE" \
                     'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
                     "$smtL" "$smtR" "$gi" "$mer" "$rer" "$onet" "$otok" "$dnet" "$daddr" "$amt" "$meta" 2>/dev/null || true)
                 txh=$(echo "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('transactionHash','') if str(d.get('status','')) in ('0x1','1','true') else '')" 2>/dev/null || true)
@@ -238,6 +260,42 @@ print('['+','.join(p[:32])+']')" 2>/dev/null || true)
             fi
         fi
         sleep "$interval"
+    done
+    return 1
+}
+
+# wait_wrapped_mint <orig_net> <orig_addr> <holder> <want_amt> <rpc> [timeout_s]
+# Poll a destination EVM chain until the bridge-deployed wrapped ERC20 for
+# (orig_addr, orig_net) exists AND the holder's balance equals want_amt. Used for the
+# Miden->L1 leg, where the Miden<->L1 autoclaim service claims the deposit ON L1 for us
+# (racing a manual submit would double-claim). Echoes "autoclaim:<wrapped>" on success.
+wait_wrapped_mint() {
+    local onet="$1" oaddr="$2" holder="$3" want="$4" rpc="$5" timeout="${6:-1200}"
+    local waited=0 wrapped bal
+    while [[ "$waited" -lt "$timeout" ]]; do
+        wrapped=$(cast call "$BRIDGE" "getTokenWrappedAddress(uint32,address)(address)" \
+            "$onet" "$oaddr" --rpc-url "$rpc" 2>/dev/null | awk '{print $1}')
+        if [[ -n "$wrapped" && "$wrapped" != 0x0000000000000000000000000000000000000000 ]]; then
+            bal=$(cast call "$wrapped" "balanceOf(address)(uint256)" "$holder" \
+                --rpc-url "$rpc" 2>/dev/null | awk '{print $1}')
+            [[ "${bal:-0}" == "$want" ]] && { echo "autoclaim:$wrapped"; return 0; }
+        fi
+        sleep 10; waited=$((waited + 10))
+    done
+    return 1
+}
+
+# wait_native_unlock <bridge_id> <faucet_id> <want_units> [timeout_s]
+# Poll the isolated Miden wallet until its native balance for <faucet_id> is restored to
+# <want_units> — i.e. the L1->Miden claim UNLOCKED the locked native asset. Used for the
+# Miden->L1 leg, where the autoclaim service submits the claim to the proxy for us.
+wait_native_unlock() {
+    local bid="$1" fid="$2" want="$3" timeout="${4:-1200}"
+    local waited=0 bal
+    while [[ "$waited" -lt "$timeout" ]]; do
+        bal=$(iso_wallet_balance "$bid" "$fid"); bal="${bal:-0}"
+        [[ "$bal" -eq "$want" ]] && return 0
+        sleep 10; waited=$((waited + 10))
     done
     return 1
 }

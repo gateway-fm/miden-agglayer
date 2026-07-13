@@ -1098,6 +1098,27 @@ impl Store for PgStore {
         }
     }
 
+    async fn try_reclaim_expired(
+        &self,
+        global_index: U256,
+        ttl: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let key = format!("{global_index:#x}");
+        // Single UPDATE = atomic check-and-refresh (row lock): only a record older than
+        // `ttl` is superseded, and exactly one concurrent recovery wins — the loser's
+        // WHERE clause sees the refreshed created_at and matches nothing.
+        let updated = client
+            .execute(
+                "UPDATE claimed_indices SET created_at = now()
+                 WHERE global_index = $1
+                   AND created_at <= now() - make_interval(secs => $2)",
+                &[&key, &ttl.as_secs_f64()],
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
     async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         let key = format!("{global_index:#x}");

@@ -252,6 +252,10 @@ services:
       AGGLAYER_WRITER_QUEUE_DEPTH: "${AGGLAYER_WRITER_QUEUE_DEPTH:-64}"
       AGGLAYER_WRITER_TX_TTL: "${AGGLAYER_WRITER_TX_TTL:-300}"
       AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS: "${AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS:-120}"
+      # Faucet-registry security reconciler (tripwire). Defaults match the CLI (30s × 3);
+      # the tripwire e2e sets these short (e.g. 5s × 2) to observe the halt quickly.
+      FAUCET_RECONCILER_POLL_SECS: "${FAUCET_RECONCILER_POLL_SECS:-30}"
+      FAUCET_RECONCILER_GRACE_TICKS: "${FAUCET_RECONCILER_GRACE_TICKS:-3}"
     volumes:
       # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
       # shares the miden-client sqlite store + keystore + bridge_accounts.toml with
