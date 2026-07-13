@@ -143,6 +143,14 @@ pub fn init_metrics() {
          (projector cursor minus the settle margin). Flat while the chain advances = auditor \
          dead."
     );
+    describe_counter!(
+        "bridge_within_tx_order_unresolved_total",
+        "Cantina #7 FAIL-CLOSED: >=2 B2AGG notes consumed by the SAME bridge transaction \
+         whose within-tx order could not be established from the sync_transactions feed — \
+         the projection tick HALTS (nothing sealed, retried) because emitting in hash order \
+         could misnumber deposit_count/globalIndex, sealed forever by getLogs immutability. \
+         MUST stay 0; any increment means feed corruption to investigate."
+    );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
     describe_histogram!("rpc_request_duration_seconds", "JSON-RPC request duration");

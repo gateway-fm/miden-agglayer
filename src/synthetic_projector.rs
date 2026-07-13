@@ -38,7 +38,7 @@
 //! advanced to N once, **after** the block (write-before-advance) — including for
 //! EMPTY Miden blocks, so the synthetic chain mirrors Miden block-for-block and
 //! `eth_blockNumber` tracks the Miden tip. Consumed notes are ordered by
-//! `(consumed_block_height, consumed_tx_order, details_commitment)` before
+//! `(consumed_block_height, consumed_tx_order, within_tx_pos, details_commitment)` before
 //! deriving — the late-consumption sweep can fold notes from earlier (sealed)
 //! Miden blocks into one projection block, so the primary key is each note's
 //! on-chain `consumed_block_height` (not the projection block), preserving
@@ -965,6 +965,7 @@ impl SyntheticProjector {
         fetcher: &dyn PublicNoteFetcher,
         consumed_refs: HashMap<Nullifier, ConsumedRef>,
         evict_by_block: &mut HashMap<u64, Vec<Nullifier>>,
+        within_tx_pos: &mut HashMap<[u8; 32], u32>,
     ) -> anyhow::Result<Vec<InputNoteRecord>> {
         let build = |details: NoteDetails, attachments: NoteAttachments, cref: &ConsumedRef| {
             let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
@@ -990,6 +991,9 @@ impl SyntheticProjector {
                 if let Some((details, attachments)) = cache.get(&nullifier) {
                     // The cache holds ONLY B2AGG bodies (both feeders filter), so a hit needs
                     // no re-check.
+                    // Cantina #7: record the within-tx position under the resolved body's
+                    // commitment — the sort key project_block_notes breaks same-tx ties with.
+                    within_tx_pos.insert(details.commitment().as_bytes(), cref.within_tx_pos);
                     recs.push(build(details.clone(), attachments.clone(), &cref));
                     evict_by_block
                         .entry(cref.block)
@@ -1053,6 +1057,7 @@ impl SyntheticProjector {
                 unreachable!("authenticated (note_id-less) misses are skipped in phase 1");
             };
             if let Some(body) = body_by_id.get(&note_id) {
+                within_tx_pos.insert(body.details.commitment().as_bytes(), cref.within_tx_pos);
                 recs.push(build(body.details.clone(), body.attachments.clone(), cref));
                 evict_by_block
                     .entry(cref.block)
@@ -1323,13 +1328,20 @@ impl SyntheticProjector {
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
         client: Option<&mut MidenClientLib>,
+        within_tx_pos: &HashMap<[u8; 32], u32>,
     ) -> anyhow::Result<usize> {
         let block_notes: Vec<&InputNoteRecord> = consumed
             .iter()
             .filter(|n| n.state().consumed_block_height().map(|h| h.as_u64()) == Some(miden_block))
             .collect();
-        self.project_block_notes(&block_notes, output_metadata, miden_block, client)
-            .await
+        self.project_block_notes(
+            &block_notes,
+            output_metadata,
+            miden_block,
+            client,
+            within_tx_pos,
+        )
+        .await
     }
 
     /// Project the already-filtered notes consumed at `miden_block` into the
@@ -1341,8 +1353,67 @@ impl SyntheticProjector {
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
         mut client: Option<&mut MidenClientLib>,
+        within_tx_pos: &HashMap<[u8; 32], u32>,
     ) -> anyhow::Result<usize> {
         let mut notes: Vec<&InputNoteRecord> = block_notes.to_vec();
+
+        // Cantina #7 (part 1) — FAIL-CLOSED numbering guard. Two-plus B2AGG notes consumed
+        // by the SAME transaction tie on (consumed_block_height, consumed_tx_order); their
+        // relative order assigns deposit_count = the LET leaf index = the claim's
+        // globalIndex, and getLogs immutability seals whatever we emit FOREVER. If any
+        // member of such a tie group has no authoritative within-tx position, sorting would
+        // fall through to details-commitment (hash) order — arbitrary relative to the
+        // on-chain LET append order. Skip-and-continue IS the corruption here: every
+        // subsequent deposit_count in the block shifts with the wrongly ordered sibling. So
+        // HALT this projection tick (nothing sealed, cursor unchanged, retried next tick)
+        // with a standing error + metric. Unreachable in practice — the tie's tx_order and
+        // the positions come from the same sync_transactions feed — so any hit means feed
+        // corruption worth stopping the line for.
+        {
+            let mut tie_groups: HashMap<(u64, Option<u32>), Vec<&InputNoteRecord>> = HashMap::new();
+            for note in &notes {
+                if is_b2agg_note(note.details()) {
+                    let h = note
+                        .state()
+                        .consumed_block_height()
+                        .map(|h| h.as_u64())
+                        .unwrap_or(miden_block);
+                    tie_groups
+                        .entry((h, note.state().consumed_tx_order()))
+                        .or_default()
+                        .push(note);
+                }
+            }
+            for ((height, order), members) in tie_groups {
+                if members.len() < 2 {
+                    continue;
+                }
+                let unresolved: Vec<String> = members
+                    .iter()
+                    .filter(|n| !within_tx_pos.contains_key(&n.details_commitment().as_bytes()))
+                    .map(|n| hex::encode(n.details_commitment().as_bytes()))
+                    .collect();
+                if !unresolved.is_empty() {
+                    ::metrics::counter!("bridge_within_tx_order_unresolved_total").increment(1);
+                    tracing::error!(
+                        block = height,
+                        tx_order = ?order,
+                        siblings = members.len(),
+                        unresolved = ?unresolved,
+                        "Cantina #7: same-tx B2AGG siblings with UNRESOLVED within-tx order — \
+                         halting projection fail-closed (emitting in hash order could \
+                         misnumber deposit_count/globalIndex, sealed forever by getLogs \
+                         immutability)"
+                    );
+                    anyhow::bail!(
+                        "projector: {n} same-tx B2AGG siblings at block {height} (tx_order \
+                         {order:?}) lack an authoritative within-tx order — halting the tick \
+                         fail-closed rather than risking deposit_count misnumbering",
+                        n = members.len(),
+                    );
+                }
+            }
+        }
 
         // Determinism + on-chain order: order events by
         // (consumed_block_height, consumed_tx_order, note-id).
@@ -1384,6 +1455,21 @@ impl SyntheticProjector {
                     a.state()
                         .consumed_tx_order()
                         .cmp(&b.state().consumed_tx_order())
+                })
+                // Cantina #7 (part 1): same-tx siblings order by their position within the
+                // consuming tx's input_notes() — the on-chain LET append order. Notes
+                // without an entry (CLAIM/GER, which never carry deposit_count) sort as 0
+                // and keep the commitment tie-break.
+                .then_with(|| {
+                    let pa = within_tx_pos
+                        .get(&a.details_commitment().as_bytes())
+                        .copied()
+                        .unwrap_or(0);
+                    let pb = within_tx_pos
+                        .get(&b.details_commitment().as_bytes())
+                        .copied()
+                        .unwrap_or(0);
+                    pa.cmp(&pb)
                 })
                 .then_with(|| {
                     a.details_commitment()
@@ -1515,8 +1601,17 @@ impl SyntheticProjector {
             .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
             .collect();
 
-        self.project_notes(&consumed, &output_metadata, miden_block, Some(client))
-            .await
+        // No authoritative within-tx map on this legacy path (store-fed records carry
+        // consumed_tx_order = None, so same-tx B2AGG ties here hit the Cantina #7
+        // fail-closed guard in `project_block_notes` rather than wrong sorting).
+        self.project_notes(
+            &consumed,
+            &output_metadata,
+            miden_block,
+            Some(client),
+            &HashMap::new(),
+        )
+        .await
     }
 
     /// Process every Miden block from `cursor + 1` up to the #30 visibility-barrier
@@ -1674,6 +1769,11 @@ impl SyntheticProjector {
         // feed above covers it) or a not-yet-imported note — skipped there; an authenticated
         // uncached one fails the tick loudly. Projected nullifiers are evicted below.
         let mut evict_by_block: HashMap<u64, Vec<Nullifier>> = HashMap::new();
+        // Cantina #7 (part 1): details-commitment → position within the consuming tx's
+        // ordered input_notes() (the on-chain LET append order), filled by
+        // `resolve_b2agg_consumptions` from the same authoritative feed the records come
+        // from. `project_block_notes` breaks same-tx sibling ties with it.
+        let mut within_tx_pos: HashMap<[u8; 32], u32> = HashMap::new();
         let auth_b2agg: Vec<InputNoteRecord> = if let Some(rpc) = self.node_rpc.as_ref() {
             // Refresh the cache from the store's currently-resolvable (Committed) B2AGG notes
             // so notes still Committed from a PRIOR run are captured before they can be
@@ -1748,8 +1848,13 @@ impl SyntheticProjector {
                 );
             }
             let fetcher = RpcNoteFetcher(&**rpc);
-            self.resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict_by_block)
-                .await?
+            self.resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs,
+                &mut evict_by_block,
+                &mut within_tx_pos,
+            )
+            .await?
         } else {
             // No reconciler wired (pure unit tests / non-reconciling deployment): the
             // authoritative path is a no-op; tests drive `project_notes` directly.
@@ -1764,7 +1869,7 @@ impl SyntheticProjector {
         while cursor < project_to {
             let next = cursor + 1;
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
-            self.project_block_notes(bucket, &output_metadata, next, Some(client))
+            self.project_block_notes(bucket, &output_metadata, next, Some(client), &within_tx_pos)
                 .await?;
             // Advance the cursor only after the block is fully projected, so a
             // crash mid-block re-projects (idempotently) rather than skipping.
@@ -1856,6 +1961,13 @@ pub(crate) struct ConsumedRef {
     /// body the cache never captured (created+consumed under load before import) by fetching
     /// it authoritatively from the node.
     pub note_id: Option<NoteId>,
+    /// Cantina #7 (part 1): the note's position within its consuming transaction's ORDERED
+    /// `input_notes()` — the on-chain LET append order. When one bridge tx consumes several
+    /// B2AGG notes they tie on `(block, order)`, and without this the sort fell through to
+    /// details-commitment (hash) order — arbitrary relative to the on-chain append order, so
+    /// `deposit_count` could be misnumbered (wrong globalIndex in certs/L1 exit tree, sealed
+    /// forever by getLogs immutability). Authoritative: read straight from the tx header.
+    pub within_tx_pos: u32,
 }
 
 /// A public note body fetched by id from the node — enough to rebuild a ConsumedExternal
@@ -1958,7 +2070,7 @@ pub(crate) fn bridge_consumed_nullifiers(
             .entry(block)
             .and_modify(|i| *i += 1)
             .or_insert(0u32);
-        for input in tx.transaction_header.input_notes().iter() {
+        for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
             // `header()` is `Some` IFF the input is unauthenticated — then it carries the
             // NoteId, letting `tick` fetch an uncached body authoritatively.
             let note_id = input.header().map(|h| h.id());
@@ -1968,6 +2080,8 @@ pub(crate) fn bridge_consumed_nullifiers(
                     block,
                     order,
                     note_id,
+                    // Cantina #7: the header's input order IS the on-chain LET append order.
+                    within_tx_pos: pos as u32,
                 },
             );
         }
@@ -2568,7 +2682,7 @@ mod tests {
         let projector = test_projector(&store, &block_state).await;
 
         let written = projector
-            .project_notes(&notes, &output_metadata, 5, None)
+            .project_notes(&notes, &output_metadata, 5, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(written, 3, "all three derivations must emit one log each");
@@ -2625,14 +2739,14 @@ mod tests {
         let projector = test_projector(&store, &block_state).await;
 
         let first = projector
-            .project_notes(&notes, &output_metadata, 7, None)
+            .project_notes(&notes, &output_metadata, 7, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(first, 3);
         assert_eq!(store.get_latest_block_number().await.unwrap(), 7);
 
         let second = projector
-            .project_notes(&notes, &output_metadata, 7, None)
+            .project_notes(&notes, &output_metadata, 7, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(second, 0, "second projection must emit no new logs");
@@ -2664,7 +2778,7 @@ mod tests {
         // Project Miden block 3: only the B2AGG note belongs here → synthetic 3.
         assert_eq!(
             projector
-                .project_notes(&notes, &output_metadata, 3, None)
+                .project_notes(&notes, &output_metadata, 3, None, &HashMap::new())
                 .await
                 .unwrap(),
             1
@@ -2673,7 +2787,7 @@ mod tests {
         // Project Miden block 8: only the CLAIM note belongs here → synthetic 8.
         assert_eq!(
             projector
-                .project_notes(&notes, &output_metadata, 8, None)
+                .project_notes(&notes, &output_metadata, 8, None, &HashMap::new())
                 .await
                 .unwrap(),
             1
@@ -2732,7 +2846,7 @@ mod tests {
             b2agg_note_with_amount(100, Some(3), 44),
         ];
         let written = projector
-            .project_notes(&same_block, &output_metadata, 100, None)
+            .project_notes(&same_block, &output_metadata, 100, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(written, 4, "all four B2AGG notes must emit a log");
@@ -2772,7 +2886,7 @@ mod tests {
             b2agg_note_with_amount(250, Some(2), 77),
         ];
         let written_later = projector
-            .project_notes(&later_block, &output_metadata, 250, None)
+            .project_notes(&later_block, &output_metadata, 250, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(written_later, 3);
@@ -2820,7 +2934,7 @@ mod tests {
         // we do the same (project_notes would re-filter by block height).
         let notes_ref: Vec<&InputNoteRecord> = vec![&note_a, &note_b];
         projector
-            .project_block_notes(&notes_ref, &HashMap::new(), 6, None)
+            .project_block_notes(&notes_ref, &HashMap::new(), 6, None, &HashMap::new())
             .await
             .unwrap();
 
@@ -2865,7 +2979,7 @@ mod tests {
             let block_state = StdArc::new(BlockState::new());
             let projector = test_projector(&store, &block_state).await;
             let written = projector
-                .project_notes(&notes, &output_metadata, 9, None)
+                .project_notes(&notes, &output_metadata, 9, None, &HashMap::new())
                 .await
                 .unwrap();
             assert_eq!(written, 3);
@@ -2916,7 +3030,7 @@ mod tests {
         let projector = test_projector(&store, &block_state).await;
         assert_eq!(
             projector
-                .project_notes(&notes, &output_metadata, 5, None)
+                .project_notes(&notes, &output_metadata, 5, None, &HashMap::new())
                 .await
                 .unwrap(),
             1
@@ -2954,7 +3068,7 @@ mod tests {
 
         // No own output record → fail-closed skip.
         let written = projector
-            .project_notes(&notes, &HashMap::new(), 4, None)
+            .project_notes(&notes, &HashMap::new(), 4, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(
@@ -2972,7 +3086,7 @@ mod tests {
 
         // Same note, WITH the output-record metadata → verified and emitted.
         let written = projector
-            .project_notes(&notes, &HashMap::from([ger_meta]), 4, None)
+            .project_notes(&notes, &HashMap::from([ger_meta]), 4, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(
@@ -3041,7 +3155,8 @@ mod tests {
             Some(&ConsumedRef {
                 block: 9,
                 order: 0,
-                note_id: None
+                note_id: None,
+                within_tx_pos: 0
             }),
             "authenticated input → attributed with no note id"
         );
@@ -3050,7 +3165,8 @@ mod tests {
             Some(&ConsumedRef {
                 block: 9,
                 order: 1,
-                note_id: None
+                note_id: None,
+                within_tx_pos: 0
             }),
             "per-block bridge-tx order increments"
         );
@@ -3059,7 +3175,8 @@ mod tests {
             Some(&ConsumedRef {
                 block: 9,
                 order: 2,
-                note_id: Some(expected_id)
+                note_id: Some(expected_id),
+                within_tx_pos: 0
             }),
             "unauthenticated input must carry the consuming tx's note id (enables authoritative fetch)"
         );
@@ -3173,6 +3290,7 @@ mod tests {
                 block: 544,
                 order: 0,
                 note_id: Some(note_id),
+                within_tx_pos: 0,
             },
         )]);
         let fetcher = MockFetcher {
@@ -3185,7 +3303,7 @@ mod tests {
         };
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
         let recs = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict, &mut HashMap::new())
             .await
             .expect("uncached-but-unauthenticated consumption must resolve, not error");
 
@@ -3229,12 +3347,13 @@ mod tests {
                 block: 13,
                 order: 0,
                 note_id: None, // authenticated: no id, and not in the B2AGG cache
+                within_tx_pos: 0,
             },
         )]);
         let fetcher = MockFetcher::default();
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
         let recs = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict, &mut HashMap::new())
             .await
             .expect("authenticated uncached consumption must be a safe skip, NEVER an Err");
         assert!(
@@ -3271,6 +3390,7 @@ mod tests {
             block: 880,
             order: 0,
             note_id: Some(note_id),
+            within_tx_pos: 0,
         };
         // The node returns NOTHING for the requested id (never indexed) on every tick.
         let fetcher = MockFetcher::default();
@@ -3279,7 +3399,12 @@ mod tests {
         for attempt in 1..=FETCH_MISS_RETRY_BOUND {
             let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
             let err = projector
-                .resolve_b2agg_consumptions(&fetcher, HashMap::from([(nf, cref)]), &mut evict)
+                .resolve_b2agg_consumptions(
+                    &fetcher,
+                    HashMap::from([(nf, cref)]),
+                    &mut evict,
+                    &mut HashMap::new(),
+                )
                 .await
                 .unwrap_err();
             assert!(
@@ -3292,7 +3417,12 @@ mod tests {
         // Past the bound: LOUD-SKIP + advance (Ok, no record) — the tip is never frozen forever.
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
         let recs = projector
-            .resolve_b2agg_consumptions(&fetcher, HashMap::from([(nf, cref)]), &mut evict)
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                HashMap::from([(nf, cref)]),
+                &mut evict,
+                &mut HashMap::new(),
+            )
             .await
             .expect("past the retry bound the tick must advance (loud-skip), never freeze");
         assert!(
@@ -3328,6 +3458,7 @@ mod tests {
                 block: 901,
                 order: 0,
                 note_id: Some(note_id),
+                within_tx_pos: 0,
             },
         )]);
         // Node RETURNS the id (in returned_ids) but with no public b2agg body.
@@ -3337,7 +3468,7 @@ mod tests {
         };
         let mut evict: HashMap<u64, Vec<super::Nullifier>> = HashMap::new();
         let recs = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict)
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut evict, &mut HashMap::new())
             .await
             .expect("a returned non-b2agg note must be a safe skip, not an error");
         assert!(
@@ -3364,7 +3495,13 @@ mod tests {
         let emitted = b2agg_note_with_amount(5, Some(0), 11);
         assert_eq!(
             projector
-                .project_notes(std::slice::from_ref(&emitted), &HashMap::new(), 5, None)
+                .project_notes(
+                    std::slice::from_ref(&emitted),
+                    &HashMap::new(),
+                    5,
+                    None,
+                    &HashMap::new(),
+                )
                 .await
                 .unwrap(),
             1,
@@ -3741,5 +3878,203 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second, hashes[2..]);
+    }
+
+    // ── Cantina #7 (part 1): within-tx sibling ordering ──────────────────────
+
+    /// Regression (RED on pre-fix main): several B2AGG notes consumed by ONE bridge tx tie
+    /// on `consumed_tx_order`, and the old `(tx_order, details_commitment)` key fell
+    /// through to HASH order — arbitrary relative to the on-chain LET append order
+    /// (deposit_count misnumbering = wrong globalIndex, sealed by getLogs immutability).
+    /// The fix orders same-tx siblings by their position in the tx's `input_notes()`.
+    /// The pos map is constructed as the REVERSE of commitment order, so this test FAILS
+    /// on the old key by construction.
+    #[tokio::test]
+    async fn same_tx_siblings_emit_in_input_notes_order_not_commitment_order() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Three siblings, SAME block + SAME consuming tx (tx_order 0).
+        let notes = vec![
+            b2agg_note_with_amount(7, Some(0), 11),
+            b2agg_note_with_amount(7, Some(0), 22),
+            b2agg_note_with_amount(7, Some(0), 33),
+        ];
+        // Commitment (hash) order of the three — what the OLD key would emit in.
+        let mut by_commitment: Vec<[u8; 32]> = notes
+            .iter()
+            .map(|n| n.details_commitment().as_bytes())
+            .collect();
+        by_commitment.sort();
+        // Authoritative input_notes() order: the REVERSE of hash order, so the two orders
+        // provably disagree for 3 distinct commitments.
+        let input_order: Vec<[u8; 32]> = by_commitment.iter().rev().copied().collect();
+        let within_tx_pos: HashMap<[u8; 32], u32> = input_order
+            .iter()
+            .enumerate()
+            .map(|(pos, c)| (*c, pos as u32))
+            .collect();
+
+        let written = projector
+            .project_notes(&notes, &HashMap::new(), 7, None, &within_tx_pos)
+            .await
+            .unwrap();
+        assert_eq!(written, 3);
+
+        let logs = logs_in_range(&store, 0, 7).await;
+        assert_eq!(logs.len(), 3);
+        let expected: Vec<String> = input_order
+            .iter()
+            .map(|c| crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(c)))
+            .collect();
+        let got: Vec<String> = logs.iter().map(|l| l.transaction_hash.clone()).collect();
+        assert_eq!(
+            got, expected,
+            "same-tx siblings must emit in input_notes() (LET append) order — NOT \
+             commitment order (the reverse here); deposit_count follows emission order"
+        );
+        // Explicit: the old key's order provably disagrees.
+        let old_key_order: Vec<String> = by_commitment
+            .iter()
+            .map(|c| crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(c)))
+            .collect();
+        assert_ne!(
+            got, old_key_order,
+            "fixture must distinguish the two orders"
+        );
+    }
+
+    /// Full key across mixed blocks: multiple txs × multiple same-tx siblings each —
+    /// the emission order is exactly (block, tx_order, within_tx_pos, commitment),
+    /// with each tx's siblings pos-reversed from hash order to keep the tie-break honest.
+    #[tokio::test]
+    async fn mixed_txs_and_siblings_follow_the_full_projection_key() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // tx_order 0 consumes {41, 42}; tx_order 1 consumes {43, 44} — all at block 9.
+        let tx0 = vec![
+            b2agg_note_with_amount(9, Some(0), 41),
+            b2agg_note_with_amount(9, Some(0), 42),
+        ];
+        let tx1 = vec![
+            b2agg_note_with_amount(9, Some(1), 43),
+            b2agg_note_with_amount(9, Some(1), 44),
+        ];
+        let mut within_tx_pos: HashMap<[u8; 32], u32> = HashMap::new();
+        let mut expected: Vec<String> = Vec::new();
+        for tx in [&tx0, &tx1] {
+            let mut cs: Vec<[u8; 32]> = tx
+                .iter()
+                .map(|n| n.details_commitment().as_bytes())
+                .collect();
+            cs.sort();
+            cs.reverse(); // input order = reverse hash order within each tx
+            for (pos, c) in cs.iter().enumerate() {
+                within_tx_pos.insert(*c, pos as u32);
+                expected.push(crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
+                    c,
+                )));
+            }
+        }
+        // Shuffled arrival order (interleaved txs, reversed).
+        let notes = vec![
+            tx1[0].clone(),
+            tx0[1].clone(),
+            tx1[1].clone(),
+            tx0[0].clone(),
+        ];
+        let written = projector
+            .project_notes(&notes, &HashMap::new(), 9, None, &within_tx_pos)
+            .await
+            .unwrap();
+        assert_eq!(written, 4);
+        let got: Vec<String> = logs_in_range(&store, 0, 9)
+            .await
+            .iter()
+            .map(|l| l.transaction_hash.clone())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "emission must follow (block, tx_order, within_tx_pos, commitment) exactly"
+        );
+    }
+
+    /// FAIL-CLOSED: a same-tx B2AGG tie whose within-tx order is NOT resolvable must HALT
+    /// the projection tick (Err, nothing sealed) — skip-and-continue IS the corruption,
+    /// because every subsequent deposit_count depends on the siblings' relative order.
+    #[tokio::test]
+    async fn unresolved_same_tx_tie_halts_projection_fail_closed() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let notes = vec![
+            b2agg_note_with_amount(4, Some(0), 51),
+            b2agg_note_with_amount(4, Some(0), 52),
+        ];
+        // No within-tx positions available for the tie.
+        let err = projector
+            .project_notes(&notes, &HashMap::new(), 4, None, &HashMap::new())
+            .await
+            .expect_err("an unresolvable same-tx tie must halt the tick");
+        assert!(
+            format!("{err:#}").contains("within-tx"),
+            "halt must name the within-tx ordering: {err:#}"
+        );
+        assert!(
+            logs_in_range(&store, 0, 4).await.is_empty(),
+            "fail-closed: NOTHING may be sealed from the halted block"
+        );
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            0,
+            "the tip must not advance past the halted block"
+        );
+    }
+
+    /// Restore parity: `sort_consumed_for_projection_with` (the restore replay sort) given
+    /// the SAME within-tx map produces the IDENTICAL total order as live projection — so a
+    /// restore replays the same deposit_count sequence. (On this branch restore call sites
+    /// feed an empty map — the Phase 1.6 attribution on fix/synthesized-claim-calldata is
+    /// the producer at merge; this pins the shared key shape.)
+    #[tokio::test]
+    async fn restore_sort_replays_the_live_projection_order() {
+        let notes = [
+            b2agg_note_with_amount(7, Some(0), 11),
+            b2agg_note_with_amount(7, Some(0), 22),
+            b2agg_note_with_amount(7, Some(0), 33),
+            b2agg_note_with_amount(7, Some(1), 44),
+        ];
+        // Live order: tx0 siblings pos-reversed from hash order, then tx1.
+        let mut cs: Vec<[u8; 32]> = notes[..3]
+            .iter()
+            .map(|n| n.details_commitment().as_bytes())
+            .collect();
+        cs.sort();
+        cs.reverse();
+        let within_tx_pos: HashMap<[u8; 32], u32> = cs
+            .iter()
+            .enumerate()
+            .map(|(pos, c)| (*c, pos as u32))
+            .collect();
+        let mut expected: Vec<[u8; 32]> = cs.clone();
+        expected.push(notes[3].details_commitment().as_bytes());
+
+        let mut sorted: Vec<&InputNoteRecord> = notes.iter().collect();
+        crate::restore::sort_consumed_for_projection_with(&mut sorted, &within_tx_pos);
+        let got: Vec<[u8; 32]> = sorted
+            .iter()
+            .map(|n| n.details_commitment().as_bytes())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "restore's replay sort must equal the live projection order key-for-key"
+        );
     }
 }
