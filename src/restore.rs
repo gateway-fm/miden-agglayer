@@ -216,6 +216,22 @@ fn note_consumed_block(note: &InputNoteRecord, fallback: u64) -> u64 {
 /// (Byte compare on the 32-byte commitment — same order as a hex compare, no
 /// allocation.)
 fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
+    sort_consumed_for_projection_with(notes, &std::collections::HashMap::new());
+}
+
+/// Cantina #7 (part 1): the FULL projection sort key, shared shape with the live
+/// projector — `(consumed_block_height, consumed_tx_order, within_tx_pos,
+/// details_commitment)`. `within_tx_pos` (details-commitment → position within the
+/// consuming tx's ordered `input_notes()`, the on-chain LET append order) breaks
+/// same-tx sibling ties that would otherwise fall through to hash order and could
+/// misnumber `deposit_count`. Restore call sites currently pass an EMPTY map: on this
+/// branch restore has no authoritative per-input feed — the Phase 1.6 attribution
+/// (fix/synthesized-claim-calldata) is the natural producer and must populate this at
+/// merge so live and restore replay the IDENTICAL total order.
+pub(crate) fn sort_consumed_for_projection_with(
+    notes: &mut [&InputNoteRecord],
+    within_tx_pos: &std::collections::HashMap<[u8; 32], u32>,
+) {
     notes.sort_by(|a, b| {
         a.state()
             .consumed_block_height()
@@ -225,6 +241,17 @@ fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
                 a.state()
                     .consumed_tx_order()
                     .cmp(&b.state().consumed_tx_order())
+            })
+            .then_with(|| {
+                let pa = within_tx_pos
+                    .get(&a.details_commitment().as_bytes())
+                    .copied()
+                    .unwrap_or(0);
+                let pb = within_tx_pos
+                    .get(&b.details_commitment().as_bytes())
+                    .copied()
+                    .unwrap_or(0);
+                pa.cmp(&pb)
             })
             .then_with(|| {
                 a.details_commitment()
