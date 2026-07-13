@@ -60,12 +60,22 @@ req = urllib.request.Request(rpc,
     json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_getLogs",
       "params":[{"fromBlock":"0x0","toBlock":hex(cut),"topics":[topic]}]}).encode(),
     {"Content-Type":"application/json"})
-resp = json.load(urllib.request.urlopen(req, timeout=20))
-if "error" in resp or "result" not in resp:
-    # An RPC error is a READ failure, not zero logs — treating it as empty once
-    # mass-flagged every note as missing (false STOP, 2026-07-13). Abort the cycle.
-    raise RuntimeError(f"getLogs RPC error: {resp.get('error')}")
-logs = resp["result"]
+def get_logs(frm, to):
+    r = urllib.request.Request(rpc, json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_getLogs",
+        "params":[{"fromBlock":hex(frm),"toBlock":hex(to),"topics":[topic]}]}).encode(),
+        {"Content-Type":"application/json"})
+    resp = json.load(urllib.request.urlopen(r, timeout=20))
+    if "error" in resp or "result" not in resp:
+        # RPC error is a READ failure, not zero logs (false STOP, 2026-07-13); the
+        # proxy also caps the getLogs range (-32602 once the chain grew past it).
+        raise RuntimeError(f"getLogs RPC error: {resp.get('error')}")
+    return resp["result"]
+try:
+    logs = get_logs(0, cut)          # fast path while the chain is small
+except RuntimeError:
+    logs, step = [], 5000            # range-capped: chunk (same fallback as the verifier)
+    for start in range(0, cut + 1, step):
+        logs += get_logs(start, min(start + step - 1, cut))
 log_blocks = {}
 for l in logs:
     b = int(l["blockNumber"], 16)
