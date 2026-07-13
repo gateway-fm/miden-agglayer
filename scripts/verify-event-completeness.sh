@@ -48,7 +48,24 @@ GER_ROOT=$(awk -F= '$1=="ger"{print $2}' "$TMP/roots")
 #    did), so the log grep comes up empty — pass BRIDGE_ID explicitly then
 #    (recover it from bridge_accounts.toml or the node DB).
 BRIDGE_ID="${BRIDGE_ID:-$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -oE "deploying bridge account 0x[0-9a-f]+" | head -1 | awk '{print $NF}')}"
-[[ -n "$BRIDGE_ID" ]] || { echo "FAIL: bridge account id not found in proxy logs"; exit 1; }
+# Self-heal when the id is absent (recreated/upgraded container never logged the
+# deployment) or bech32 (harness shells export the toml form for miden tooling):
+# derive the HEX id from the node DB — the bridge is the target of every consumed
+# B2AGG note. Requires traffic to exist, which any completeness run implies.
+if [[ ! "$BRIDGE_ID" =~ ^0x[0-9a-fA-F]+$ ]]; then
+    docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3 > "$TMP/bid.sqlite3" 2>/dev/null
+    docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3-wal > "$TMP/bid.sqlite3-wal" 2>/dev/null || rm -f "$TMP/bid.sqlite3-wal"
+    BRIDGE_ID=$(python3 - "$TMP/bid.sqlite3" "$B2AGG_ROOT" <<'PYEOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+r = c.execute("SELECT hex(target_account_id) FROM notes WHERE consumed_at IS NOT NULL "
+              "AND hex(script_root)=upper(?) LIMIT 1", (sys.argv[2][2:] if sys.argv[2].startswith('0x') else sys.argv[2],)).fetchone()
+print('0x' + r[0].lower() if r and r[0] else '')
+PYEOF
+)
+    [[ -n "$BRIDGE_ID" ]] && echo "bridge id derived from node DB (log/env unavailable or bech32): $BRIDGE_ID"
+fi
+[[ "$BRIDGE_ID" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "FAIL: bridge account id not resolvable (logs, env, node DB)"; exit 1; }
 
 # 3. Snapshot the node DB (truth), then wait for the synthetic projector to
 #    catch up to that snapshot before reading logs. GER injections flow
