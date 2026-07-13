@@ -1253,7 +1253,7 @@ pub(crate) async fn persist_synthetic_claim_tx(
             metadata_hash = %hex::encode(full.metadata_hash),
             "synthesized claim: metadata preimage NOT recoverable from the faucet registry — \
              refusing to fabricate calldata; the tx keeps an empty input (aggkit will surface \
-             this claim as unparseable — operator action: register/repair the faucet metadata, \
+             this claim as unparsable — operator action: register/repair the faucet metadata, \
              the backfill then heals on the next tick)"
         );
         return Ok(false);

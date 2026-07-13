@@ -200,7 +200,7 @@ wait_for "aggkit L2BridgeSyncer past claim block ${CLAIM_BLOCK}" \
 # (b) ZERO calldata-parse failures — the exact soak wedge signature.
 if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
     | grep -q "input too short"; then
-    fail "aggkit logged 'input too short' — a claim tx still serves unparseable calldata"
+    fail "aggkit logged 'input too short' — a claim tx still serves unparsable calldata"
 fi
 pass "aggkit synced past block ${CLAIM_BLOCK} with zero claim-calldata parse errors"
 
