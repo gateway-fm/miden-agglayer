@@ -1206,7 +1206,12 @@ mod bind_tests {
     fn ipv6_bind_builds_valid_bracketed_url() {
         let url = build_service_url("::1", 8546).expect("::1 must build a valid URL");
         assert_eq!(url.as_str(), "http://[::1]:8546/");
-        assert_eq!(url.host_str(), Some("::1"));
+        // `host_str` bracketing for IPv6 varies across `url` crate versions
+        // ("::1" vs "[::1]") — assert the PARSED host instead, which is stable.
+        assert_eq!(
+            url.host(),
+            Some(url::Host::Ipv6("::1".parse().expect("valid IPv6")))
+        );
         assert_eq!(url.port(), Some(8546));
     }
 
