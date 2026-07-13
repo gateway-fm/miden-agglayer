@@ -57,7 +57,14 @@ pub async fn seed_test_faucets(store: &dyn Store) {
 /// paths don't each have to configure an allow-list. Production defaults remain
 /// fail-closed (`allow_any_signer = false`, `allowed_signers = None`).
 pub fn create_test_service() -> ServiceState {
-    let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+    create_test_service_with_store(Arc::new(InMemoryStore::new()))
+}
+
+/// Like [`create_test_service`], but over a caller-provided store. Lets tests
+/// keep a concrete handle (e.g. `Arc<InMemoryStore>` for its `#[cfg(test)]`
+/// helpers such as `test_backdate_claim`) while the service holds the same
+/// instance behind `Arc<dyn Store>`.
+pub fn create_test_service_with_store(store: Arc<dyn Store>) -> ServiceState {
     let block_state = Arc::new(BlockState::new());
     let miden_client = MidenClient::new_test();
     let accounts = test_accounts_config();

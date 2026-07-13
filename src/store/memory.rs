@@ -139,6 +139,26 @@ impl InMemoryStore {
         }
     }
 
+    /// Test-only: age an existing claim-lock record by `age`, so TTL-expiry
+    /// paths (`try_reclaim_expired` via `acquire_claim_lock`) can be exercised
+    /// through the full RPC pipeline without sleeping for the real
+    /// `CLAIM_RESUBMIT_TTL_SECS` or mutating process-global env (unsafe under
+    /// parallel tests on edition 2024).
+    ///
+    /// Panics if `global_index` has no record, or if the process has not been
+    /// alive long enough for `Instant::now() - age` to be representable (never
+    /// the case for the ~2 min TTLs the tests use on any real machine).
+    #[cfg(test)]
+    pub fn test_backdate_claim(&self, global_index: U256, age: std::time::Duration) {
+        let mut claimed = self.claimed.write();
+        let acquired_at = claimed
+            .get_mut(&global_index)
+            .expect("test_backdate_claim: no claim record for global_index");
+        *acquired_at = acquired_at
+            .checked_sub(age)
+            .expect("test_backdate_claim: process uptime shorter than backdate age");
+    }
+
     /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
     /// commit — it used to be a `Store` trait convenience method, but the only
     /// remaining caller is `commit_b2agg_event_atomic` below (PgStore inlines
