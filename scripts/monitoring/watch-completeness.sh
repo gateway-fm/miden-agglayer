@@ -60,7 +60,12 @@ req = urllib.request.Request(rpc,
     json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_getLogs",
       "params":[{"fromBlock":"0x0","toBlock":hex(cut),"topics":[topic]}]}).encode(),
     {"Content-Type":"application/json"})
-logs = json.load(urllib.request.urlopen(req, timeout=20)).get("result", [])
+resp = json.load(urllib.request.urlopen(req, timeout=20))
+if "error" in resp or "result" not in resp:
+    # An RPC error is a READ failure, not zero logs — treating it as empty once
+    # mass-flagged every note as missing (false STOP, 2026-07-13). Abort the cycle.
+    raise RuntimeError(f"getLogs RPC error: {resp.get('error')}")
+logs = resp["result"]
 log_blocks = {}
 for l in logs:
     b = int(l["blockNumber"], 16)
@@ -82,8 +87,14 @@ for blk, cnt in sorted(note_blocks.items()):
                     if r and r[0]: fauc = r[0][4:34].lower()
                 except Exception: pass
                 missing.append(f"{nid}@{blk} nullifier={nul} faucet={fauc}")
-print(f"OK notes={len(notes)} logs={sum(log_blocks.values())} cut={cut}" if not missing
-      else "MISSED " + " | ".join(missing))
+if notes and not log_blocks:
+    # Zero logs while consumed notes exist cannot be real (immutability: logs never
+    # vanish) — always a transient read failure. Skip, never flag.
+    print(f"WATCHER-ANOMALY zero-log read with {len(notes)} notes — cycle skipped")
+elif not missing:
+    print(f"OK notes={len(notes)} logs={sum(log_blocks.values())} cut={cut}")
+else:
+    print("MISSED " + " | ".join(missing))
 PY
 ) || continue
   case "$RES" in
