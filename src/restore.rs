@@ -298,6 +298,14 @@ pub async fn restore(
     // recorded (consumed by the bridge via network txs). Tag-scan the node and
     // import them so the Phase 2 NoteFilter::Consumed scan below can see them.
     // Best-effort: a failure must not abort restore.
+    // Authoritative bridge-consumption attribution (task #56): commitment → (block, order)
+    // for every note a BRIDGE tx consumed, so Phase 2 can attribute NTX-consumed B2AGG
+    // notes the local store reports with `consumer_account = None`. Built from the node's
+    // sync_transactions feed (+ the Phase 1.5 nullifier index for authenticated inputs).
+    // Best-effort like Phase 1.5: on failure restore proceeds with local-only attribution
+    // (pre-existing behavior), which fail-closed skips consumer-unknown notes.
+    let mut bridge_attribution: std::collections::HashMap<[u8; 32], (u64, u32)> =
+        std::collections::HashMap::new();
     if let Some(url) = node_url {
         let from_block: u32 = std::env::var("RECOVER_FROM_BLOCK")
             .ok()
@@ -307,15 +315,27 @@ pub async fn restore(
             from_block,
             "Phase 1.5: recovering missed bridge-out notes from the node..."
         );
+        let mut nullifier_index = std::collections::HashMap::new();
         match recover_missed_bridge_outs(miden_client, url, api_key, accounts.bridge.0, from_block)
             .await
         {
-            Ok(n) => {
+            Ok((n, index)) => {
+                nullifier_index = index;
                 tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node")
             }
             Err(e) => tracing::warn!(
                 err = %e,
                 "Phase 1.5 recovery scan failed; continuing with local-only restore"
+            ),
+        }
+        match authoritative_bridge_attribution(url, api_key, accounts.bridge.0, &nullifier_index)
+            .await
+        {
+            Ok(map) => bridge_attribution = map,
+            Err(e) => tracing::warn!(
+                err = %e,
+                "Phase 1.6: authoritative bridge attribution failed; consumer-unknown notes \
+                 will be fail-closed skipped (pre-existing behavior)"
             ),
         }
     } else {
@@ -347,6 +367,7 @@ pub async fn restore(
         block_state,
         miden_tip,
         l1_rpc_url.clone(),
+        bridge_attribution,
     )
     .await?;
     total_logs += logs;
@@ -479,7 +500,10 @@ async fn recover_missed_bridge_outs(
     api_key: Option<&str>,
     bridge_id: AccountId,
     from_block: u32,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(
+    usize,
+    std::collections::HashMap<miden_protocol::note::Nullifier, [u8; 32]>,
+)> {
     use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
     use miden_protocol::note::{NoteDetails, NoteFile, NoteId};
@@ -498,7 +522,7 @@ async fn recover_missed_bridge_outs(
             to_block,
             "recovery: from_block is past the chain tip; nothing to scan"
         );
-        return Ok(0);
+        return Ok((0, std::collections::HashMap::new()));
     }
 
     // Tag-independent block scan. The bridge's B2AGG notes are NOT tagged with the
@@ -511,6 +535,13 @@ async fn recover_missed_bridge_outs(
     // `consumer == bridge` gating is enforced downstream by `restore_bridge_outs`
     // once the notes are imported and observed consumed.
     let mut b2agg_ids: Vec<NoteId> = Vec::new();
+    // nullifier → details-commitment for every public B2AGG note seen on the node —
+    // computable HERE because the fetched note carries its metadata (a consumed note in
+    // the local store does not, so its nullifier is unrecoverable there). This is the
+    // join `authoritative_bridge_attribution` needs to attribute AUTHENTICATED
+    // (nullifier-only) bridge-tx inputs back to their notes.
+    let mut nullifier_index: std::collections::HashMap<miden_protocol::note::Nullifier, [u8; 32]> =
+        std::collections::HashMap::new();
     let mut scanned = 0usize;
     for b in from_block..=to_block {
         let block = match rpc.get_block_by_number(BlockNumber::from(b), false).await {
@@ -531,6 +562,8 @@ async fn recover_missed_bridge_outs(
                             let details: NoteDetails = note.clone().into();
                             if is_b2agg_note(&details) {
                                 b2agg_ids.push(note.id());
+                                nullifier_index
+                                    .insert(note.nullifier(), details.commitment().as_bytes());
                             }
                         }
                     }
@@ -563,7 +596,7 @@ async fn recover_missed_bridge_outs(
     );
 
     if b2agg_ids.is_empty() {
-        return Ok(0);
+        return Ok((0, nullifier_index));
     }
 
     let note_files: Vec<NoteFile> = b2agg_ids.iter().copied().map(NoteFile::NoteId).collect();
@@ -587,7 +620,144 @@ async fn recover_missed_bridge_outs(
         })
         .await?;
 
-    Ok(imported)
+    Ok((imported, nullifier_index))
+}
+
+/// Build the AUTHORITATIVE bridge-consumption attribution map for restore Phase 2:
+/// details-commitment → `(consumption block, per-block bridge-tx order)` for every note a
+/// BRIDGE-executed transaction consumed, sourced from the node's `sync_transactions` feed —
+/// the same on-chain attribution the live unified projector uses.
+///
+/// WHY (task #56, live-soak wedge): the local store's `consumer_account` is only known for
+/// LOCALLY-executed consumptions. A B2AGG note consumed by the bridge via a NETWORK
+/// transaction — the normal bridge-out path — comes back `consumer_account = None` after a
+/// store rebuild/resync, so the MA#3 gate fail-closed skipped it and restore ERASED a
+/// BridgeEvent that had already SETTLED on the agglayer (getLogs-immutability break via
+/// restore; aggkit halts on the inconsistent state). This map restores the attribution
+/// AUTHORITATIVELY; the MA#3 gate itself is untouched — a note genuinely consumed by a
+/// non-bridge account is not in the bridge's transaction feed and stays skipped.
+///
+/// Attribution joins, in order:
+///   * UNAUTHENTICATED inputs carry their `NoteHeader` in the consuming tx → the
+///     details-commitment is read directly from the header;
+///   * AUTHENTICATED inputs carry only the nullifier → resolved through
+///     `nullifier_index` (nullifier → commitment), built by the Phase 1.5 node scan from
+///     fetched PUBLIC notes (which carry the metadata needed to compute nullifiers —
+///     consumed local-store records do not).
+///
+/// The `(block, order)` pair reuses [`bridge_consumed_nullifiers`]' assignment — the SAME
+/// function and feed the live projector orders by — so the restored `consumed_tx_order`
+/// (hence the `(block, tx_order, commitment)` projection sort and the resulting
+/// `deposit_count` sequence) is byte-identical to the live projection that built the
+/// settled certificate's LET.
+async fn authoritative_bridge_attribution(
+    node_url: &str,
+    api_key: Option<&str>,
+    bridge_id: AccountId,
+    nullifier_index: &std::collections::HashMap<miden_protocol::note::Nullifier, [u8; 32]>,
+) -> anyhow::Result<std::collections::HashMap<[u8; 32], (u64, u32)>> {
+    use miden_protocol::block::BlockNumber;
+
+    let endpoint = crate::miden_client::parse_node_url(node_url)?;
+    let rpc = crate::miden_client::build_rpc_client(&endpoint, 30_000, api_key);
+    let (tip_header, _) = rpc
+        .get_block_header_by_number(None, false)
+        .await
+        .map_err(|e| anyhow::anyhow!("attribution: get chain tip: {e}"))?;
+    let tip = tip_header.block_num();
+    let txs = rpc
+        .sync_transactions(BlockNumber::from(0u32), tip, vec![bridge_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("attribution: sync_transactions(0..{tip}): {e}"))?;
+
+    let refs = crate::synthetic_projector::bridge_consumed_nullifiers(&txs, bridge_id);
+    let mut out: std::collections::HashMap<[u8; 32], (u64, u32)> = std::collections::HashMap::new();
+    let mut unauth_ids: Vec<(miden_protocol::note::NoteId, (u64, u32))> = Vec::new();
+    for tx in &txs {
+        if tx.transaction_header.account_id() != bridge_id {
+            continue;
+        }
+        for input in tx.transaction_header.input_notes().iter() {
+            let Some(cref) = refs.get(&input.nullifier()) else {
+                continue;
+            };
+            if let Some(header) = input.header() {
+                // Unauthenticated input: the header carries the commitment directly.
+                out.insert(
+                    header.details_commitment().as_bytes(),
+                    (cref.block, cref.order),
+                );
+            } else if let Some(commitment) = nullifier_index.get(&input.nullifier()) {
+                // Authenticated input: resolve via the Phase 1.5 nullifier index.
+                out.insert(*commitment, (cref.block, cref.order));
+            } else if let Some(id) = cref.note_id {
+                unauth_ids.push((id, (cref.block, cref.order)));
+            }
+        }
+    }
+    // Residual ids (unauthenticated refs observed without a usable header/index entry):
+    // resolve their commitments from the node. Usually empty.
+    if !unauth_ids.is_empty() {
+        let ids: Vec<miden_protocol::note::NoteId> = unauth_ids.iter().map(|(i, _)| *i).collect();
+        if let Ok(fetched) = rpc.get_notes_by_id(&ids).await {
+            let by_id: std::collections::HashMap<miden_protocol::note::NoteId, [u8; 32]> = fetched
+                .into_iter()
+                .filter_map(|f| match f {
+                    miden_client::rpc::domain::note::FetchedNote::Public(note, _) => {
+                        let id = note.id();
+                        let details: miden_protocol::note::NoteDetails = note.into();
+                        Some((id, details.commitment().as_bytes()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (id, at) in unauth_ids {
+                if let Some(c) = by_id.get(&id) {
+                    out.insert(*c, at);
+                }
+            }
+        }
+    }
+    tracing::info!(
+        bridge = %bridge_id,
+        attributed = out.len(),
+        "restore: authoritative bridge-consumption attribution built from sync_transactions"
+    );
+    Ok(out)
+}
+
+/// Rebuild a consumed note record whose consumer the LOCAL store does not know
+/// (`consumer_account = None`) but whose consumption IS authoritatively attributed to the
+/// bridge (its details-commitment appears in the [`authoritative_bridge_attribution`] map):
+/// the returned record carries `consumer_account = Some(bridge)` plus the authoritative
+/// `(block, tx_order)`, exactly like the live unified projector's reconstruction — so the
+/// MA#3 gate passes on TRUTH, not on a weakened check. Returns `None` (record unchanged)
+/// when the consumer is already known, or the note is not bridge-attributed.
+pub(crate) fn attribute_bridge_consumption(
+    note: &InputNoteRecord,
+    bridge_id: AccountId,
+    attribution: &std::collections::HashMap<[u8; 32], (u64, u32)>,
+) -> Option<InputNoteRecord> {
+    use miden_client::store::InputNoteState;
+    use miden_client::store::input_note_states::ConsumedExternalNoteState;
+    use miden_protocol::block::BlockNumber;
+
+    if note.consumer_account().is_some() {
+        return None; // consumer known (locally executed / reclaim) — nothing to attribute
+    }
+    let key: [u8; 32] = note.details_commitment().as_bytes();
+    let (block, order) = attribution.get(&key)?;
+    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+        nullifier_block_height: BlockNumber::from(*block as u32),
+        consumer_account: Some(bridge_id),
+        consumed_tx_order: Some(*order),
+    });
+    Some(InputNoteRecord::new(
+        note.details().clone(),
+        note.attachments().clone(),
+        None,
+        state,
+    ))
 }
 
 /// Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet `faucet_registry` rows
@@ -727,6 +897,7 @@ async fn restore_faucet_identities(
     Ok(n)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
@@ -735,6 +906,7 @@ async fn restore_bridge_outs(
     block_state: &Arc<BlockState>,
     restore_block: u64,
     l1_rpc_url: Option<String>,
+    bridge_attribution: std::collections::HashMap<[u8; 32], (u64, u32)>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -759,6 +931,37 @@ async fn restore_bridge_outs(
                 let bridge_address = get_bridge_address();
                 let mut count = 0usize;
                 let mut logs = 0usize;
+
+                // Authoritative consumer attribution (task #56): a note the LOCAL store
+                // reports with `consumer_account = None` (NTX-consumed — the NORMAL
+                // bridge consumption path — observed after a store rebuild/resync) is
+                // rebuilt with `Some(bridge)` + the authoritative (block, tx_order) when
+                // the bridge's on-chain transaction feed proves the bridge consumed it.
+                // Notes with a known consumer, and notes NOT in the bridge feed, pass
+                // through unchanged — the MA#3 gate below is untouched.
+                let consumed_notes: Vec<InputNoteRecord> = consumed_notes
+                    .iter()
+                    .map(|n| {
+                        match attribute_bridge_consumption(n, bridge_id, &bridge_attribution) {
+                            Some(rebuilt) => {
+                                ::metrics::counter!("restore_b2agg_authoritative_attributed_total")
+                                    .increment(1);
+                                tracing::info!(
+                                    note_id = %hex::encode(n.details_commitment().as_bytes()),
+                                    block = rebuilt
+                                        .state()
+                                        .consumed_block_height()
+                                        .map(|h| h.as_u64())
+                                        .unwrap_or_default(),
+                                    "restore: NTX-consumed note attributed to the bridge via \
+                                     sync_transactions (local store had consumer_account=None)"
+                                );
+                                rebuilt
+                            }
+                            None => n.clone(),
+                        }
+                    })
+                    .collect();
 
                 // Miden-1:1: replay each B2AGG note at its OWN Miden consumption
                 // block, in the projector's canonical (block, tx_order, note_id)
@@ -3530,6 +3733,143 @@ mod tests {
         assert!(
             data.envelope.input().len() > 4 + 64 * 32,
             "full calldata (proofs included), not a stub"
+        );
+    }
+
+    // ── Task #56: NTX-consumed B2AGG attribution (restore must not erase settled events) ──
+
+    /// RED→GREEN for the live-soak restore wedge: a B2AGG note consumed by the bridge via a
+    /// NETWORK transaction comes back from a rebuilt/resynced local store with
+    /// `consumer_account = None` — the LOCAL store only knows consumers of locally-executed
+    /// txs. Pre-fix, the MA#3 gate fail-closed skipped it and restore ERASED a BridgeEvent
+    /// that had already settled on the agglayer. With the authoritative attribution map
+    /// (from the bridge's own sync_transactions feed) the record is rebuilt with
+    /// consumer=bridge + the exact (block, tx_order), and projection emits.
+    #[tokio::test]
+    async fn ntx_consumed_b2agg_is_attributed_and_restored() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // NTX-consumed: the store does NOT know the consumer.
+        let note = ma3_b2agg_input_note(faucet_id, None);
+        let key: [u8; 32] = note.details_commitment().as_bytes();
+
+        // Pre-fix behavior still holds WITHOUT attribution: fail-closed skip.
+        let skipped = project_b2agg_note(
+            &store,
+            &note,
+            bridge_id,
+            1,
+            544,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            skipped,
+            B2AggRestoreOutcome::Skipped,
+            "without attribution the untracked consumer stays fail-closed (MA#3)"
+        );
+
+        // The bridge's on-chain tx feed attributes it: consumed at block 544, order 3.
+        let attribution = std::collections::HashMap::from([(key, (544u64, 3u32))]);
+        let rebuilt = attribute_bridge_consumption(&note, bridge_id, &attribution)
+            .expect("bridge-attributed consumer-unknown note must be rebuilt");
+        assert_eq!(rebuilt.consumer_account(), Some(bridge_id));
+        assert_eq!(
+            rebuilt.state().consumed_block_height().map(|h| h.as_u64()),
+            Some(544),
+            "authoritative consumption block"
+        );
+        assert_eq!(
+            rebuilt.state().consumed_tx_order(),
+            Some(3),
+            "authoritative per-block bridge-tx order — deposit_count sort matches the \
+             live projection that built the settled cert"
+        );
+
+        let outcome = project_b2agg_note(
+            &store,
+            &rebuilt,
+            bridge_id,
+            1,
+            544,
+            [7u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Emitted,
+            "the attributed NTX-consumed bridge-out must be restored (BridgeEvent rebuilt)"
+        );
+    }
+
+    /// The gate is NOT weakened: a consumer-unknown note that is NOT in the bridge's
+    /// transaction feed stays fail-closed skipped, and a note with a KNOWN non-bridge
+    /// consumer (reclaim) is never rewritten by attribution — even if (adversarially)
+    /// its commitment appears in the map.
+    #[tokio::test]
+    async fn foreign_consumed_b2agg_still_skipped() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, sender_id) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // (a) consumer unknown + NOT bridge-attributed → no rebuild, fail-closed skip.
+        let unknown = ma3_b2agg_input_note(faucet_id, None);
+        assert!(
+            attribute_bridge_consumption(&unknown, bridge_id, &std::collections::HashMap::new())
+                .is_none(),
+            "no attribution entry → record unchanged"
+        );
+        let outcome = project_b2agg_note(
+            &store,
+            &unknown,
+            bridge_id,
+            1,
+            5,
+            [5u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, B2AggRestoreOutcome::Skipped);
+
+        // (b) KNOWN non-bridge consumer (user reclaim): attribution must never rewrite it,
+        // and the MA#3 reclaim gate still skips.
+        let reclaimed = ma3_b2agg_input_note(faucet_id, Some(sender_id));
+        let key: [u8; 32] = reclaimed.details_commitment().as_bytes();
+        let adversarial = std::collections::HashMap::from([(key, (5u64, 0u32))]);
+        assert!(
+            attribute_bridge_consumption(&reclaimed, bridge_id, &adversarial).is_none(),
+            "a known consumer is never overwritten by the map"
+        );
+        let outcome = project_b2agg_note(
+            &store,
+            &reclaimed,
+            bridge_id,
+            1,
+            5,
+            [5u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "reclaimed note stays gated (MA#3) regardless of attribution"
         );
     }
 }

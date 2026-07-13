@@ -244,6 +244,15 @@ pub fn init_metrics() {
          (crash recovery or foreign-CLAIM observation)."
     );
     describe_counter!(
+        "restore_b2agg_authoritative_attributed_total",
+        "restore Phase 2 (task #56): consumed B2AGG notes whose consumer the LOCAL store did \
+         not know (consumer_account=None — NTX-consumed, the normal bridge path, observed \
+         after a store rebuild) but that the bridge's on-chain sync_transactions feed \
+         authoritatively attributes to the bridge — rebuilt and re-projected instead of \
+         fail-closed skipped. Without this, restore ERASED already-settled BridgeEvents \
+         (getLogs-immutability break) and halted aggkit's L2BridgeSyncer."
+    );
+    describe_counter!(
         "synthetic_claim_calldata_persisted_total",
         "synthesized (derived-hash) claims whose FULL authoritative claimAsset calldata was \
          recovered (CLAIM note storage: both SMT proofs, both exit roots, networks, addresses, \
