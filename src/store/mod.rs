@@ -466,6 +466,26 @@ pub trait Store: Send + Sync + 'static {
     async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()>;
     async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool>;
 
+    /// SOAK FINDING #1 (orphaned-claim recovery): atomically RE-ACQUIRE the claim lock for
+    /// `global_index` if and only if the existing `try_claim` record is OLDER than `ttl`.
+    ///
+    /// `try_claim` persists "submission attempted" — if the process dies between that write
+    /// and the CLAIM note landing on Miden, the record is orphaned and every resubmission is
+    /// rejected forever ("claim already submitted"), starving the claim sponsor. Callers use
+    /// this after verifying the claim did NOT land (`has_claim_event_for_global_index` ==
+    /// false): a record older than `ttl` is treated as a crashed-mid-flight submission and
+    /// superseded (timestamp refreshed = lock re-acquired by THIS caller), returning `true`.
+    /// A fresher record (a submission genuinely in flight) or an absent record returns
+    /// `false` — the caller keeps rejecting.
+    ///
+    /// MUST be atomic (single UPDATE / single lock): two concurrent recoveries for the same
+    /// index must produce exactly one winner, with the loser seeing a fresh record.
+    async fn try_reclaim_expired(
+        &self,
+        global_index: U256,
+        ttl: std::time::Duration,
+    ) -> anyhow::Result<bool>;
+
     /// Record a claim we refused to process because its destination could not be
     /// resolved. Idempotent by `global_index` — duplicate retries from aggkit must not
     /// error or duplicate rows; the first record wins. Returns `true` if this was a new

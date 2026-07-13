@@ -62,6 +62,14 @@ pub fn install_prometheus_recorder() -> anyhow::Result<metrics_exporter_promethe
 pub fn init_metrics() {
     describe_counter!("rpc_requests_total", "Total JSON-RPC requests by method");
     describe_counter!("claims_processed_total", "Total claims processed");
+    describe_counter!(
+        "claim_resubmission_recovered_total",
+        "orphaned claim submissions recovered (SOAK FINDING #1): a try_claim record with no \
+         ClaimEvent whose in-flight TTL (CLAIM_RESUBMIT_TTL_SECS, default 120s) expired — the \
+         proxy died between recording 'submitted' and the CLAIM landing on Miden — superseded, \
+         and the sponsor's resubmission accepted. Nonzero after a crash in the submit window is \
+         the recovery WORKING; a steady climb without restarts means claims are failing to land."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",
