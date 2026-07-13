@@ -48,6 +48,13 @@ case "$test_filter" in
         # tests (it needs the steady-state reconciler/projector, no restarts).
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         echo ""
+        # Manual user claim: a non-sponsor USER key claims its own deposit via
+        # raw eth_sendRawTransaction, plus the signer-agnostic dedup race
+        # against the sponsor on the same globalIndex. Steady-state (no
+        # restarts), so it runs with the other claim-path tests before the
+        # proxy-restarting group.
+        "$SCRIPT_DIR/e2e-manual-user-claim.sh"
+        echo ""
         # Proxy-restarting tests run LAST (they must not race the other
         # scripts' steady-state assumptions), in this order: the cursor test
         # does a plain restart and asserts the sweep RESUMES from the
@@ -134,6 +141,9 @@ case "$test_filter" in
         ;;
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
+        ;;
+    manual-user-claim)
+        "$SCRIPT_DIR/e2e-manual-user-claim.sh"
         ;;
     l2l2)
         # SIMPLE L2<->L2 pipeline group (NOT in `all` — needs the
