@@ -54,15 +54,24 @@ while [ ! -f "$SP/SOAK_STOP" ]; do
   RC=$?
   [ -n "$CPID" ] && wait "$CPID" 2>/dev/null
 
+  # Miden-ORIGINATED token round-trip each phase (fresh native faucet, allowlist,
+  # bridge out originNetwork=1, wrapped claim, bridge back, native unlock) —
+  # alternating destination so both L1 and L2B wrapped paths age with the chain.
+  if [ $((P % 2)) -eq 1 ]; then NDEST=l1; else NDEST=l2b; fi
+  DEST=$NDEST ./scripts/e2e-miden-origin.sh > "$SP/soak-phase-$P-native.log" 2>&1
+  NRC=$?
+  echo "[$(ts)] native($NDEST) rc=$NRC"
+
   B2ROW=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/mixed-verify.out 2>/dev/null | grep -a "B2AGG->" | tail -1 | awk '{print $2"/"$3"/"$4"/"$5"/"$6"/"$7}')
   V1=$(violations); I1=$(immut_bad)
   NEWV=$((V1 - V0)); NEWI=$((I1 - I0))
 
   VERDICT=OK
   [ "$RC" -ne 0 ] && VERDICT=PHASE-FAIL
+  [ "$NRC" -ne 0 ] && VERDICT=PHASE-FAIL
   [ "$NEWV" -gt 0 ] && VERDICT=STOP-COMPLETENESS
   [ "$NEWI" -gt 0 ] && VERDICT=STOP-IMMUTABILITY
-  echo -e "$P\t$TYPE\t$START\t$(ts)\t$RC\t${B2ROW:-?}\t$NEWV\t$NEWI\t$VERDICT" >> "$LEDGER"
+  echo -e "$P\t$TYPE\t$START\t$(ts)\t$RC\t${B2ROW:-?}\t$NEWV\t$NEWI\tnative($NDEST)=$NRC\t$VERDICT" >> "$LEDGER"
   echo "[$(ts)] phase $P: rc=$RC b2agg=${B2ROW:-?} newViolations=$NEWV newImmut=$NEWI → $VERDICT"
 
   case "$VERDICT" in
