@@ -509,6 +509,7 @@ async fn provision_faucet(
         accounts.service.0,
         accounts.bridge.0,
         metadata_hash,
+        false, // claim auto-create: bridge-owned mint/burn wrapped faucet (not Miden-native)
     )
     .await?;
 

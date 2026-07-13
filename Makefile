@@ -198,6 +198,10 @@ MIDEN_NODE_GIT_REF := v0.15.0
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
+# L2<->L2 overlay (task #25): base stack + the second-rollup overlay. The
+# generated configs it mounts must be produced by `make gen-l2b-configs` first.
+L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env
+
 .PHONY: miden-node-image-coords
 miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
 	@echo "url: $(MIDEN_NODE_GIT_URL)"
@@ -257,6 +261,31 @@ COMPOSE_ENV := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MID
 .PHONY: e2e-test
 e2e-test: ## Run E2E tests (assumes stack is already up)
 	$(COMPOSE_ENV) ./scripts/e2e-test.sh
+
+# --- L2<->L2 (second rollup) --------------------------------------------------
+.PHONY: gen-l2b-configs
+gen-l2b-configs: ## Generate the L2B overlay configs (agglayer/aggkit-l2b/bridge, taplo-normalized)
+	./scripts/gen-l2b-configs.sh
+
+.PHONY: e2e-l2l2-up
+e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay, register rollup #2 (fresh data dir)
+	# Bring everything up WITHOUT --wait: aggkit-l2b + bridge-service cannot become
+	# healthy until rollup #2 is registered below, so --wait here would deadlock and
+	# abort the target (they crash-loop / exit(1) with "invalid rollup id (0)").
+	$(L2L2_COMPOSE) up -d --build
+	@echo ">> waiting for anvil-l2b (:9545) before registering rollup #2"
+	@until cast chain-id --rpc-url http://localhost:9545 >/dev/null 2>&1; do sleep 2; done
+	L2B_RPC=http://localhost:9545 ./scripts/setup-l2b.sh
+	# Rollup #2 now exists: (re)create the network-2 services and WAIT for them to
+	# go healthy — aggkit-l2b and the ISOLATED L2B bridge-service (which must
+	# re-index network 2 now that rollup #2 + the L2B bridge/GER exist). NOT
+	# anvil-l2b (freshly-deployed in-memory L2B state) and NOT the base Miden
+	# bridge-service (indexes L1 + Miden, unaffected by rollup #2).
+	$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b
+
+.PHONY: e2e-l2l2
+e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
+	$(COMPOSE_ENV) ./scripts/e2e-test.sh l2l2
 
 .PHONY: e2e-l1-to-l2
 e2e-l1-to-l2: e2e-up ## Spin up stack + run L1→L2 deposit + claim test
@@ -436,6 +465,10 @@ e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 .PHONY: e2e-down
 e2e-down: ## Stop E2E environment
 	$(E2E_COMPOSE) down -v
+
+.PHONY: e2e-l2l2-down
+e2e-l2l2-down: ## Stop the L2<->L2 stack (base + L2B overlay). --remove-orphans so anvil-l2b/aggkit-l2b/bridge-service don't linger on a reused (self-hosted) host
+	$(L2L2_COMPOSE) down -v --remove-orphans
 
 .PHONY: e2e-logs
 e2e-logs: ## Tail all E2E service logs

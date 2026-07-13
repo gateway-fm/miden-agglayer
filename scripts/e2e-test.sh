@@ -71,6 +71,24 @@ case "$test_filter" in
         # repro), which wedges any certificate settlement that would happen
         # after it — so no settlement-dependent test may follow.
         "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
+        echo ""
+        # L2<->L2 + native Miden-originated tiers — canonical part of the full suite on
+        # this branch. They need the docker-compose.l2l2.yml overlay (postgres-l2b /
+        # bridge-service-l2b), so GUARD on the overlay being up: on the base stack they're
+        # skipped with a warning; on the l2l2 stack they run. `e2e-test.sh l2l2` runs the
+        # L2<->L2 group (forward/clash/back); the native round-trips exercise a
+        # Miden-originated token to BOTH destinations (->L2B and ->L1).
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'postgres-l2b'; then
+            echo "== L2<->L2 group (L2B overlay present) =="
+            "$SCRIPT_DIR/e2e-test.sh" l2l2
+            echo ""
+            echo "== native Miden-originated round-trips (->L2B, ->L1) =="
+            DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
+            echo ""
+            DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
+        else
+            echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
+        fi
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
@@ -117,9 +135,44 @@ case "$test_filter" in
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         ;;
+    l2l2)
+        # SIMPLE L2<->L2 pipeline group (NOT in `all` — needs the
+        # docker-compose.l2l2.yml overlay: second rollup + aggkit-l2b on top of
+        # the base stack). Ordered: forward (deploy+bridge L2B->Miden+claim,
+        # foreign-origin faucet), clash (same-address L1-vs-L2B faucet isolation,
+        # #108), then back (bridge-out Miden->L2B+claim, net-zero). forward brings
+        # the L2B overlay up idempotently (reused if already registered) and hands
+        # off a shared wallet + OPT0 state file the clash and back legs consume.
+        #
+        # Preflight ONCE up front (fail-loud: nothing runs against a
+        # half-configured/port-colliding stack), then pin ONE per-run evidence
+        # timestamp so forward+back write the SAME NDJSON file for this run (a
+        # fresh invocation => a fresh file: 3x cert => 3 evidence artifacts).
+        PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+        source "$SCRIPT_DIR/lib-l2l2.sh"
+        export EVIDENCE_RUN_TS="$(date +%s)"
+        l2l2_ensure_stack
+        l2l2_validate_stack
+        export L2L2_PREFLIGHT_DONE=1
+        "$SCRIPT_DIR/e2e-l2l2-forward.sh"
+        echo ""
+        "$SCRIPT_DIR/e2e-l2l2-clash.sh"
+        echo ""
+        "$SCRIPT_DIR/e2e-l2l2-back.sh"
+        ;;
+    l2l2-clash)
+        "$SCRIPT_DIR/e2e-l2l2-clash.sh"
+        ;;
+    l2l2-forward)
+        "$SCRIPT_DIR/e2e-l2l2-forward.sh"
+        ;;
+    l2l2-back)
+        "$SCRIPT_DIR/e2e-l2l2-back.sh"
+        ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
+        echo "       (l2l2 is optional and not part of 'all' — it needs the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;
 esac

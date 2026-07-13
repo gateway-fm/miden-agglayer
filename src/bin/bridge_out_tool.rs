@@ -167,6 +167,38 @@ struct Args {
     /// 18→8 ETH faucet created by --create-foreign-bridge).
     #[arg(long, default_value_t = 10)]
     scale_exp: u32,
+
+    /// Native-faucet provision mode (Miden-ORIGINATED token e2e): deploy an
+    /// OPERATOR-owned fungible faucet (a standalone account, NOT the proxy's service
+    /// account) with a custom symbol/decimals, mint --mint-units of it to --wallet-id,
+    /// and print `faucet-id: 0x..`. This emulates an external party minting a token
+    /// that ORIGINATES on Miden. The bridge admin (proxy) then allowlists it as native
+    /// via admin_registerNativeFaucet; only then is it bridgeable (the bridge locks it
+    /// on bridge-out / unlocks on claim-back). Requires --wallet-id.
+    #[arg(long)]
+    create_native_faucet: bool,
+
+    /// Custom token symbol for --create-native-faucet (Miden TokenSymbol: <= 6 chars).
+    #[arg(long, default_value = "MDN")]
+    native_symbol: String,
+
+    /// Custom decimals for --create-native-faucet.
+    #[arg(long, default_value_t = 8)]
+    native_decimals: u8,
+
+    /// Units of the native token to mint to --wallet-id under --create-native-faucet.
+    #[arg(long, default_value_t = 0)]
+    mint_units: u64,
+
+    /// Bridge out from the wallet vault's callbacks-DISABLED slot. AggLayer
+    /// (bridge-owned wrapped) faucets register callbacks ENABLED (the default here), so
+    /// their bridged-in assets live in the enabled slot. A Miden-NATIVE operator faucet
+    /// (--create-native-faucet) mints via `FungibleAsset::new`, which defaults callbacks
+    /// DISABLED — its assets live in the disabled slot. Set this when bridging OUT a
+    /// Miden-originated (native) token, or the b2agg tx aborts with "amount in the vault
+    /// is less than the amount to remove" (it would address the empty enabled slot).
+    #[arg(long)]
+    asset_callbacks_disabled: bool,
 }
 
 impl std::fmt::Debug for Args {
@@ -296,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
     let store_path = args.store_dir.join("store.sqlite3");
     let keystore_path = args.store_dir.join("keystore");
 
-    if args.create_wallet || args.create_foreign_bridge {
+    if args.create_wallet || args.create_foreign_bridge || args.create_native_faucet {
         // Provision modes: the store/keystore may not exist yet — create them.
         std::fs::create_dir_all(&keystore_path)
             .with_context(|| format!("creating keystore dir {}", keystore_path.display()))?;
@@ -467,6 +499,7 @@ async fn main() -> anyhow::Result<()> {
             service.id(),
             bridge.id(),
             MetadataHash::from_abi_encoded(&[]),
+            false, // foreign ETH faucet: bridge-owned mint/burn (not Miden-native)
         )
         .await
         .map_err(|e| anyhow!("foreign faucet creation/registration failed: {e:?}"))?;
@@ -487,6 +520,133 @@ async fn main() -> anyhow::Result<()> {
         println!("[foreign-bridge] faucet-id: {}", faucet.id().to_hex());
         println!("[foreign-bridge] network-id: {}", args.foreign_network_id);
         println!("[foreign-bridge] done");
+        return Ok(());
+    }
+
+    // ── Native-faucet provision mode (Miden-ORIGINATED token e2e) ─────────────
+    // Deploy an OPERATOR-owned fungible faucet (a standalone account, NOT the proxy's
+    // service account) with a custom symbol/decimals, mint --mint-units to --wallet-id,
+    // and print `faucet-id: 0x..`. The bridge admin (proxy) later allowlists it native
+    // (admin_registerNativeFaucet); only then is it bridgeable (bridge locks/unlocks).
+    if args.create_native_faucet {
+        use miden_agglayer_service::init::create_auth_component;
+        use miden_agglayer_service::miden_client::{
+            submit_new_transaction, wait_for_transaction_commit,
+        };
+        use miden_client::account::AccountBuilderSchemaCommitmentExt;
+        use miden_client::crypto::FeltRng;
+        use miden_client::keystore::Keystore;
+        use miden_client::transaction::TransactionRequestBuilder;
+        use miden_protocol::account::{Account, AccountType};
+        use miden_protocol::asset::TokenSymbol;
+        use miden_protocol::note::{Note, NoteType};
+        use miden_standards::account::faucets::{FungibleFaucet, TokenName};
+        use miden_standards::account::policies::{
+            BurnPolicyConfig, MintPolicyConfig, PolicyRegistration, TokenPolicyManager,
+        };
+
+        let wallet_hex = args
+            .wallet_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("--create-native-faucet requires --wallet-id"))?;
+        let wallet_id = AccountId::from_hex(wallet_hex)
+            .map_err(|e| anyhow!("bad --wallet-id {wallet_hex}: {e:?}"))?;
+        sync_with_retry(&mut client, "create-native-faucet").await?;
+
+        // 1. Deploy the operator-owned fungible faucet (custom symbol/decimals).
+        let symbol = TokenSymbol::new(&args.native_symbol)
+            .map_err(|e| anyhow!("invalid TokenSymbol {:?}: {e:?}", args.native_symbol))?;
+        let name =
+            TokenName::new(&symbol.to_string()).map_err(|e| anyhow!("invalid TokenName: {e:?}"))?;
+        let faucet_component = FungibleFaucet::builder()
+            .name(name)
+            .symbol(symbol)
+            .decimals(args.native_decimals)
+            .max_supply(FungibleAsset::MAX_AMOUNT)
+            .build()
+            .map_err(|e| anyhow!("faucet builder failed: {e:?}"))?;
+        // Mint/burn policies (AllowAll) — REQUIRED for the faucet to mint; without the
+        // policy slots the mint tx aborts with "storage slot ... does not exist". Only
+        // mint/burn (no transfer policies — those force AssetCallbackFlag::Enabled keys,
+        // which FungibleAsset::new does not set).
+        let policy_manager = TokenPolicyManager::new()
+            .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
+            .map_err(|e| anyhow!("mint policy failed: {e:?}"))?
+            .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
+            .map_err(|e| anyhow!("burn policy failed: {e:?}"))?;
+        let (auth_component, key_pair) = create_auth_component(&mut client)?;
+        let faucet = Account::builder(client.rng().draw_word().into())
+            .account_type(AccountType::Public)
+            .with_component(faucet_component)
+            .with_components(policy_manager)
+            .with_auth_component(auth_component)
+            .build_with_schema_commitment()
+            .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
+        keystore.add_key(&key_pair, faucet.id()).await?;
+        client.add_account(&faucet, false).await?;
+        let dummy = TransactionRequestBuilder::new().build()?;
+        let txn_id = submit_new_transaction(&mut client, faucet.id(), dummy)
+            .await
+            .map_err(|e| anyhow!("faucet deploy failed: {e:?}"))?;
+        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow!("faucet deploy commit wait failed: {e:?}"))?;
+        println!(
+            "[native-faucet] deployed operator faucet {}",
+            faucet.id().to_hex()
+        );
+
+        // 2. Mint --mint-units to the wallet (produces a P2ID note the wallet consumes).
+        if args.mint_units > 0 {
+            let asset = FungibleAsset::new(faucet.id(), args.mint_units)
+                .map_err(|e| anyhow!("FungibleAsset::new failed: {e:?}"))?;
+            let mint_req = TransactionRequestBuilder::new()
+                .build_mint_fungible_asset(asset, wallet_id, NoteType::Public, client.rng())
+                .map_err(|e| anyhow!("build_mint_fungible_asset failed: {e:?}"))?;
+            // The mint tx's own output note is the P2ID the wallet will consume — grab it
+            // before the request is moved into submit (miden's canonical mint→consume flow).
+            let mint_note: Note = mint_req
+                .expected_output_own_notes()
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("mint tx produced no output note"))?;
+            let mint_txn = submit_new_transaction(&mut client, faucet.id(), mint_req)
+                .await
+                .map_err(|e| anyhow!("mint tx failed: {e:?}"))?;
+            wait_for_transaction_commit(
+                &mut client,
+                mint_txn,
+                30,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| anyhow!("mint commit wait failed: {e:?}"))?;
+            // The wallet must CONSUME the minted note to hold the asset in its vault (a
+            // bridge-out consumes the vault). Sync so the committed note is known, then
+            // consume it into the wallet.
+            sync_with_retry(&mut client, "native-faucet post-mint").await?;
+            let consume_req = TransactionRequestBuilder::new()
+                .build_consume_notes(vec![mint_note])
+                .map_err(|e| anyhow!("build_consume_notes failed: {e:?}"))?;
+            let consume_txn = submit_new_transaction(&mut client, wallet_id, consume_req)
+                .await
+                .map_err(|e| anyhow!("consume tx failed: {e:?}"))?;
+            wait_for_transaction_commit(
+                &mut client,
+                consume_txn,
+                30,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| anyhow!("consume commit wait failed: {e:?}"))?;
+            println!(
+                "[native-faucet] minted {} units to wallet {}",
+                args.mint_units, wallet_hex
+            );
+        }
+
+        // Machine-readable output the e2e greps for.
+        println!("faucet-id: {}", faucet.id().to_hex());
         return Ok(());
     }
 
@@ -865,9 +1025,14 @@ async fn main() -> anyhow::Result<()> {
     // callbacks DISABLED, so a default-flag asset addresses a different (empty)
     // vault slot and the bridge-out tx fails with "amount in the vault is less
     // than the amount to remove". Match the vault by enabling callbacks.
+    let cb_flag = if args.asset_callbacks_disabled {
+        AssetCallbackFlag::Disabled // Miden-native operator faucet: assets in the disabled slot
+    } else {
+        AssetCallbackFlag::Enabled // AggLayer bridge-owned wrapped faucet: enabled slot
+    };
     let asset: Asset = FungibleAsset::new(faucet_id, args.amount)
         .map_err(|e| anyhow!("invalid asset: {e}"))?
-        .with_callbacks(AssetCallbackFlag::Enabled)
+        .with_callbacks(cb_flag)
         .into();
     let note_assets = NoteAssets::new(vec![asset]).map_err(|e| anyhow!("note assets: {e}"))?;
 
