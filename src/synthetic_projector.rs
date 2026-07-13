@@ -793,11 +793,44 @@ impl SyntheticProjector {
     /// blocks + forward-only getLogs consumers). Notes whose spend block is
     /// beyond `tip` stay queued for a future tick. Returns the ids that were
     /// bucketed (to be removed from the queue once the tick completes).
+    /// The #30 visibility-barrier projection ceiling. With a barrier active (`has_barrier`
+    /// — a reconciler is wired), never project past the reconciler's last completed sweep
+    /// (`reconcile_cursor`), so a synthetic block is sealed only after its notes are
+    /// visible; `reconcile_cursor > tip` (reconciler ahead) safely clamps back to `tip`.
+    /// Without a barrier, project to the raw `tip` (legacy). Pure so the barrier invariant
+    /// (ceiling never exceeds `reconcile_cursor` when active) is unit-testable.
+    fn barrier_project_to(has_barrier: bool, tip: u64, reconcile_cursor: u64) -> u64 {
+        if has_barrier {
+            tip.min(reconcile_cursor)
+        } else {
+            tip
+        }
+    }
+
+    /// Late-sweep caught-up DEFERRAL decision (#27). A note that surfaced for an
+    /// already-sealed block is bucketed for re-projection at `cursor + 1` — UNLESS the
+    /// projector is caught up to the projection ceiling (`cursor >= project_to`), in which
+    /// case it must be DEFERRED (return `None`: don't bucket, don't mark it swept) so the
+    /// NEXT block-advancing tick reprojects it. Pre-fix, a caught-up tick still marked the
+    /// late ids swept without projecting them, permanently dropping the note's BridgeEvent
+    /// (funds stranded until a restart). Returns `Some(target_block)` to bucket, or `None`
+    /// to defer. Pure so the deferral invariant is unit-testable.
+    fn late_sweep_target_block(has_late: bool, cursor: u64, project_to: u64) -> Option<u64> {
+        if !has_late || cursor >= project_to {
+            None
+        } else {
+            Some(cursor + 1)
+        }
+    }
+
     fn bucket_direct_notes<'a>(
         direct: &'a [InputNoteRecord],
         by_block: &mut HashMap<u64, Vec<&'a InputNoteRecord>>,
         cursor: u64,
-        tip: u64,
+        // The projection ceiling — the visibility barrier's `project_to` (min(tip,
+        // reconcile_cursor)), NOT the raw sync tip. Named accordingly so it reads
+        // consistently with the caller and the barrier semantics.
+        project_to: u64,
     ) -> Vec<[u8; 32]> {
         let mut done = Vec::new();
         for note in direct {
@@ -806,11 +839,11 @@ impl SyntheticProjector {
                 continue;
             };
             let target = h.max(cursor + 1);
-            if target > tip {
+            if target > project_to {
                 tracing::debug!(
                     spend_block = h,
-                    tip,
-                    "direct projection: spend block ahead of sync tip — deferring to next tick"
+                    project_to,
+                    "direct projection: spend block ahead of projection ceiling — deferring to next tick"
                 );
                 continue;
             }
@@ -1071,12 +1104,16 @@ impl SyntheticProjector {
             .await
     }
 
-    /// Process every Miden block from `cursor + 1` to the current Miden tip in
-    /// order, projecting each one and advancing the cursor. Returns the new
-    /// cursor (== the projected Miden tip).
+    /// Process every Miden block from `cursor + 1` up to the #30 visibility-barrier
+    /// projection ceiling `project_to = min(tip, reconcile_cursor)` in order, projecting
+    /// each one and advancing the cursor. Returns the new cursor (== `project_to`), which
+    /// equals the Miden tip only when the barrier is not holding (reconciler caught up); a
+    /// return value `< tip` means the barrier is holding projection at the reconcile
+    /// frontier until the reconciler catches up. With no reconciler wired (`node_rpc =
+    /// None`) `project_to == tip` and this is the legacy project-to-tip loop.
     ///
     /// This is the normal projector loop; catch-up after a restart is the same
-    /// code path (the cursor simply starts further behind the tip).
+    /// code path (the cursor simply starts further behind the ceiling).
     pub async fn tick(&self, client: &mut MidenClientLib) -> anyhow::Result<u64> {
         let tip = client
             .get_sync_height()
@@ -1096,7 +1133,56 @@ impl SyntheticProjector {
                 "note reconciler failed (transient — will retry next tick)"
             );
         }
-        if cursor >= tip {
+        // #30 VISIBILITY BARRIER: never seal a synthetic block the reconciler
+        // has not fully swept. `reconcile_notes` (above) advances
+        // `reconcile_cursor` to its last completed sweep window; every external
+        // bridge-out note at a block <= reconcile_cursor is therefore already in
+        // the client store. Capping the projection loop at `min(tip,
+        // reconcile_cursor)` makes exact-block emission a GUARANTEE for all event
+        // types: a note is always visible BEFORE its block is projected, so
+        // nothing is ever "late" (proxy-created CLAIM/GER notes are instant-
+        // visible and were never late; B2AGG lateness was purely import lag,
+        // eliminated here by construction — the late sweep below becomes an
+        // alarm). In steady state the reconciler reaches `tip` every tick
+        // (sub-second ~1000-block windows), so the barrier is a no-op; it only
+        // bites when the reconciler falls behind, and then holding is the
+        // correct failure mode — a late synthetic tip is benign (aggkit reads
+        // block ranges and just sees the chain pause), an event at the wrong
+        // block is poison. No reconciler wired (node_rpc = None, pure unit
+        // tests / a non-reconciling deployment) => no barrier, legacy behavior.
+        let project_to = if self.node_rpc.is_some() {
+            let reconcile_cursor = self.reconcile_cursor.load(Ordering::Acquire);
+            let held = tip.saturating_sub(reconcile_cursor);
+            ::metrics::gauge!("projector_visibility_barrier_held_blocks").set(held as f64);
+            if held > 0 {
+                tracing::debug!(
+                    tip,
+                    reconcile_cursor,
+                    held,
+                    "visibility barrier: holding projection at the reconcile frontier \
+                     (reconciler behind tip)"
+                );
+            } else if reconcile_cursor > tip {
+                // Reconciler swept PAST the node tip (persisted cursor ahead after a
+                // restart, or a node reorg shortened the chain). `held` saturates to 0 so
+                // the barrier projects to `tip` — which is SAFE (everything <= tip is
+                // already reconciled, nothing strands). WARN (not debug): `reconcile_cursor`
+                // is documented as the last COMPLETED sweep window, so it being ahead of the
+                // node tip is an unexpected state (likely a reorg or a stale persisted
+                // cursor) that operators should see, even though projection stays correct.
+                tracing::warn!(
+                    tip,
+                    reconcile_cursor,
+                    ahead = reconcile_cursor - tip,
+                    "visibility barrier: reconcile_cursor is AHEAD of the node tip \
+                     (reorg or stale persisted cursor?) — projecting to tip; safe but unexpected"
+                );
+            }
+            Self::barrier_project_to(true, tip, reconcile_cursor)
+        } else {
+            Self::barrier_project_to(false, tip, 0)
+        };
+        if cursor >= project_to {
             return Ok(cursor);
         }
         // Perf-critical: fetch the consumed-note feed + output-note metadata ONCE
@@ -1156,25 +1242,64 @@ impl SyntheticProjector {
                 })
                 .filter(|n| !swept.contains(&n.details_commitment().as_bytes()))
                 .collect();
-            let ids = late
-                .iter()
-                .map(|n| n.details_commitment().as_bytes())
-                .collect();
-            if !late.is_empty() {
-                tracing::info!(
+            // #27 (2026-07-09): the late bucket lands at `cursor + 1`, which only
+            // the `while cursor < project_to` loop below projects. When the projector is
+            // CAUGHT UP (`cursor == tip` — true on most ticks, since ticks are ~1s
+            // and blocks ~5s), that loop never runs — pre-fix the late ids were
+            // still marked swept afterwards, permanently dropping the note's
+            // BridgeEvent (funds stranded until a restart cleared the in-memory
+            // cache and the sweep retried). Verified live: a load-delayed
+            // consumption (note fd0f5b62…, consumed block 543) sat in the store
+            // unprojected while `deposit_counter` lagged the on-chain LET by 1;
+            // restarting the proxy healed it in 11s. Fix: when caught up, DEFER —
+            // don't bucket, don't mark swept — the next block-advancing tick
+            // projects them (bounded by block cadence).
+            // With the #30 visibility barrier a note can no longer be late: its
+            // block is projected only after the reconciler swept it, so it was
+            // present on time. The sweep is kept as a fail-safe + ALARM — any
+            // non-empty `late` here means the barrier's invariant was violated
+            // (a note surfaced for an already-sealed block), which is a bug
+            // signal, not routine. Emit the anomaly metric + WARN, then still
+            // recover it (bucket at cursor+1, honoring the #27 caught-up defer
+            // against `project_to`) so no funds strand even in the anomaly case.
+            // Treat a late note as an ANOMALY only when the barrier is ACTIVE
+            // (node_rpc set): the barrier guarantees no note is late, so one here is a
+            // real invariant violation. Without the barrier (node_rpc=None — pure unit
+            // tests / a non-reconciling deployment) late notes are the legacy-expected
+            // case; recover them silently rather than firing a false alarm.
+            if !late.is_empty() && self.node_rpc.is_some() {
+                ::metrics::counter!("projector_late_sweep_anomaly_total")
+                    .increment(late.len() as u64);
+                tracing::warn!(
                     late = late.len(),
-                    first_block = cursor + 1,
-                    "late-consumption sweep: projecting notes discovered after their block"
+                    cursor,
+                    project_to,
+                    "late-consumption sweep found notes AFTER their sealed block — the \
+                     visibility barrier should make this impossible; recovering them but \
+                     investigate (projector_late_sweep_anomaly_total)"
                 );
-                by_block.entry(cursor + 1).or_default().extend(late);
             }
-            ids
+            match Self::late_sweep_target_block(!late.is_empty(), cursor, project_to) {
+                // Caught up to the ceiling (or no late notes): DEFER — don't bucket, don't
+                // return ids (nothing gets marked swept), so the next block-advancing tick
+                // reprojects them instead of dropping the BridgeEvent (#27).
+                None => Vec::new(),
+                Some(target) => {
+                    let ids = late
+                        .iter()
+                        .map(|n| n.details_commitment().as_bytes())
+                        .collect();
+                    by_block.entry(target).or_default().extend(late);
+                    ids
+                }
+            }
         };
         // Direct projection of spent-before-import recoveries (same sealed-block
         // rules as the late sweep; see `bucket_direct_notes`).
-        let direct_done = Self::bucket_direct_notes(&direct_notes, &mut by_block, cursor, tip);
+        let direct_done =
+            Self::bucket_direct_notes(&direct_notes, &mut by_block, cursor, project_to);
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
-        while cursor < tip {
+        while cursor < project_to {
             let next = cursor + 1;
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
             self.project_block_notes(bucket, &output_metadata, next, Some(client))
@@ -1199,15 +1324,23 @@ impl SyntheticProjector {
         // whole tick succeeded (retries are idempotent via `is_note_processed`).
         self.complete_direct_notes(&direct_done);
         // Observability: the projector follows the MIDEN chain, so its progress is
-        // measured against the Miden tip (NOT L1). `projector_cursor == miden_tip`
-        // means fully caught up; `synthetic_tip` is the actual synthetic L2 block
-        // number the chain is exposing. Logged once per tick that did work.
+        // measured against the Miden tip (NOT L1). With the #30 barrier the projector
+        // catches up to `project_to = min(tip, reconcile_cursor)`, NOT necessarily the raw
+        // tip: `projector_cursor == project_to` means caught up to the projection ceiling,
+        // and `projector_cursor < miden_tip` (barrier_held > 0) means the barrier is
+        // holding until the reconciler catches up. `synthetic_tip` is the actual synthetic
+        // L2 block number the chain is exposing. Logged once per tick that did work.
         let synthetic_tip = self.store.get_latest_block_number().await?;
         tracing::info!(
             miden_tip = tip,
+            project_to,
             projector_cursor = cursor,
+            // Delta to the Miden tip — how far the projected head is lagging the chain. 0 =
+            // fully caught up; > 0 = the visibility barrier is holding at the reconcile
+            // frontier (== tip - project_to at tick end) until the reconciler catches up.
+            blocks_behind_tip = tip.saturating_sub(cursor),
             synthetic_tip,
-            "synthetic projector tick: caught up to Miden tip"
+            "synthetic projector tick: caught up to the projection ceiling (min(tip, reconcile_cursor))"
         );
         Ok(cursor)
     }
@@ -1288,6 +1421,72 @@ mod tests {
     /// rejection that froze the retroactive-heal sweep must be classified as
     /// skippable, so the reconciler drops just the private note and advances —
     /// while unrelated errors still propagate and fail the tick (stay loud).
+    // #30 visibility barrier: the projection ceiling MUST NOT advance the projector past
+    // the reconciler's last completed sweep, so a synthetic block is only ever sealed after
+    // its notes are visible. These pin the pure ceiling function that `tick` uses.
+    #[test]
+    fn barrier_never_projects_past_reconcile_cursor() {
+        // Reconciler behind the tip: ceiling is clamped to the reconcile frontier.
+        assert_eq!(
+            SyntheticProjector::barrier_project_to(true, 100, 40),
+            40,
+            "barrier must cap projection at reconcile_cursor when the reconciler is behind"
+        );
+        // Reconciler exactly at the tip: caught up, project the whole chain.
+        assert_eq!(SyntheticProjector::barrier_project_to(true, 100, 100), 100);
+        // Reconciler AHEAD of the tip (persisted cursor ahead / reorg): clamp back to tip,
+        // never project a block that doesn't exist yet.
+        assert_eq!(SyntheticProjector::barrier_project_to(true, 100, 150), 100);
+        // The invariant, stated directly: with the barrier active the ceiling is never past
+        // min(tip, reconcile_cursor) — i.e. never past reconcile_cursor while it is <= tip.
+        for (tip, rc) in [(100u64, 0u64), (100, 1), (100, 99), (5, 3), (0, 0)] {
+            assert!(SyntheticProjector::barrier_project_to(true, tip, rc) <= rc.min(tip));
+            assert!(SyntheticProjector::barrier_project_to(true, tip, rc) <= tip);
+        }
+    }
+
+    #[test]
+    fn no_barrier_projects_to_raw_tip() {
+        // Without a reconciler wired the projector keeps legacy behavior: project to tip.
+        assert_eq!(SyntheticProjector::barrier_project_to(false, 100, 40), 100);
+        assert_eq!(SyntheticProjector::barrier_project_to(false, 7, 0), 7);
+    }
+
+    // #27 regression: the late-consumption sweep must DEFER (not bucket, not mark swept)
+    // when the projector is caught up to the projection ceiling, so a load-delayed
+    // consumption's BridgeEvent is reprojected next block instead of being dropped. This
+    // pins the tick's deferral decision (the pre-fix bug marked late ids swept without
+    // projecting them, stranding funds until a restart).
+    #[test]
+    fn late_sweep_defers_when_caught_up_and_buckets_otherwise() {
+        // Caught up (cursor == ceiling): DEFER — no target block, so nothing is bucketed or
+        // marked swept this tick.
+        assert_eq!(
+            SyntheticProjector::late_sweep_target_block(true, 100, 100),
+            None,
+            "late notes must be deferred when caught up to the ceiling (#27)"
+        );
+        // Cursor even past the ceiling (barrier edge): still deferred.
+        assert_eq!(
+            SyntheticProjector::late_sweep_target_block(true, 101, 100),
+            None
+        );
+        // NOT caught up: bucket the late notes for re-projection at cursor + 1 this tick.
+        assert_eq!(
+            SyntheticProjector::late_sweep_target_block(true, 40, 100),
+            Some(41)
+        );
+        // No late notes at all: nothing to do regardless of cursor position.
+        assert_eq!(
+            SyntheticProjector::late_sweep_target_block(false, 40, 100),
+            None
+        );
+        assert_eq!(
+            SyntheticProjector::late_sweep_target_block(false, 100, 100),
+            None
+        );
+    }
+
     #[test]
     fn private_note_import_error_is_recognized() {
         // The literal error observed in prod (0.15.5).
