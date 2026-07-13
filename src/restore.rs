@@ -3054,4 +3054,114 @@ mod tests {
             "restored GER must be marked injected",
         );
     }
+
+    /// PR #127 review point 6 — link-before-projection. `insert_ger` /
+    /// `submit_update_ger_note` record the eth-tx ↔ UpdateGerNote link (and
+    /// the caller records the pending receipt) BEFORE the projector can
+    /// observe the note consumed: the link is written while the submitter
+    /// still holds the serialized Miden client, and the projector only runs
+    /// inside that same client's sync (`on_post_sync`). This test pins the
+    /// downstream contract: with the link present, the projected GER
+    /// event RETAINS the linked real Ethereum tx hash (never the derived
+    /// fallback) and the pending `insertGlobalExitRoot` receipt is finalised
+    /// at the consumption block. Pre-fix, the injection-side propagation
+    /// wait released the client before the link was recorded, so the
+    /// projector could emit under the derived hash and leave the real
+    /// receipt pending forever.
+    #[tokio::test]
+    async fn ger_projection_retains_linked_real_tx_hash_and_finalises_receipt() {
+        use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
+        use alloy::primitives::{Signature, TxHash};
+
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (note, (key, metadata), ger_bytes) = ma28_consumed_external_ger_note(0x5C);
+        let output_metadata = std::collections::HashMap::from([(key, metadata)]);
+
+        // The submitter's pre-projection state: link + pending receipt.
+        let real_tx = TxHash::from([0xEEu8; 32]);
+        let real_tx_str = format!("{real_tx:#x}");
+        let note_commitment = hex::encode(note.details_commitment().as_bytes());
+        store
+            .record_tx_note_link(&real_tx_str, &note_commitment)
+            .await
+            .unwrap();
+        let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy {
+                chain_id: Some(1),
+                ..Default::default()
+            },
+            Signature::test_signature(),
+            real_tx,
+        ));
+        let signer = alloy::primitives::Address::from([0x42u8; 20]);
+        store
+            .txn_begin(
+                real_tx,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.txn_receipt(real_tx).await.unwrap().is_none(),
+            "receipt must be pending before projection",
+        );
+
+        // The projector observes the consumption.
+        let consumption_block = 9u64;
+        let outcome = project_ger_note(
+            &store,
+            &note,
+            &output_metadata,
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            consumption_block,
+            [9u8; 32],
+            1_234,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, GerProjectOutcome::Emitted);
+        assert!(store.is_ger_injected(&ger_bytes).await.unwrap());
+
+        // The GER log rides the REAL linked tx hash, not the derived fallback.
+        let logs = store
+            .get_logs(
+                &crate::log_synthesis::LogFilter {
+                    from_block: Some("0x0".into()),
+                    to_block: Some("0x64".into()),
+                    ..Default::default()
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let ger_log = logs
+            .iter()
+            .find(|l| {
+                l.topics.first().map(|t| t.as_str())
+                    == Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .expect("projection must emit the GER log");
+        assert_eq!(
+            ger_log.transaction_hash.to_lowercase(),
+            real_tx_str,
+            "GER event must retain the linked real Ethereum tx hash",
+        );
+
+        // The pending receipt is finalised at the consumption block —
+        // receipt block == GER-log block.
+        let (status, block) = store
+            .txn_receipt(real_tx)
+            .await
+            .unwrap()
+            .expect("projection must finalise the linked pending receipt");
+        assert!(status.is_ok(), "receipt must be a success receipt");
+        assert_eq!(block, consumption_block);
+    }
 }

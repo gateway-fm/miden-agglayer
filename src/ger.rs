@@ -1,11 +1,9 @@
-use crate::miden_client::{MidenClient, MidenClientLib};
+use crate::miden_client::MidenClient;
 use alloy::primitives::TxHash;
-use miden_base_agglayer::{AggLayerBridge, ExitRoot, UpdateGerNote};
+use miden_base_agglayer::{ExitRoot, UpdateGerNote};
 use miden_client::transaction::TransactionRequestBuilder;
-use miden_protocol::account::AccountId;
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
-use std::time::Duration;
 
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/sovereignChains/GlobalExitRootManagerL2SovereignChain.sol#L166
@@ -27,89 +25,6 @@ pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Boxed future returned by a [`poll_until_ready`] check. Mirrors the crate's
-/// `MidenClient::with` factory shape (`Box<dyn Future + 'a>` awaited via
-/// `Box::into_pin`) so a per-poll closure can borrow `&mut MidenClientLib`.
-type PollFuture<'a> = Box<dyn std::future::Future<Output = anyhow::Result<bool>> + 'a>;
-
-/// Cantina #21 — bounded condition poll with early-exit.
-///
-/// Calls `check` up to `max_polls` times, sleeping `interval` between attempts,
-/// and returns `Ok(true)` the INSTANT `check` reports the condition holds — so a
-/// condition that is already satisfied costs a single check and zero sleeps.
-/// Returns `Ok(false)` when the budget is exhausted, and propagates the first
-/// `Err` a `check` produces.
-///
-/// Extracted from [`wait_for_ger_on_bridge`] so the early-exit semantics are
-/// unit-testable without a live Miden client. `check` receives `&mut C` per call
-/// (the borrow is released between polls), which is what lets the real caller
-/// re-`sync_state` and re-read the bridge account each iteration.
-async fn poll_until_ready<C, F>(
-    subject: &mut C,
-    max_polls: u32,
-    interval: Duration,
-    mut check: F,
-) -> anyhow::Result<bool>
-where
-    F: for<'a> FnMut(&'a mut C) -> PollFuture<'a>,
-{
-    for attempt in 0..max_polls {
-        if Box::into_pin(check(subject)).await? {
-            return Ok(true);
-        }
-        // No sleep after the FINAL failed poll (PR #127 review): the caller's
-        // wall-clock budget is (max_polls - 1) * interval between polls, not
-        // max_polls * interval — a trailing sleep would delay the timeout
-        // verdict by one interval for nothing.
-        if attempt + 1 < max_polls {
-            tokio::time::sleep(interval).await;
-        }
-    }
-    Ok(false)
-}
-
-/// Cantina #21 — bounded, condition-based wait until the bridge account's GER
-/// storage map reflects `ger`.
-///
-/// The `UpdateGerNote` is submitted by the ger_manager but CONSUMED
-/// asynchronously by the network-transaction (NTX) builder on the bridge
-/// account. A CLAIM's FPI runs `assert_valid_ger` against that map, so a CLAIM
-/// must not execute until the bridge account carries the GER. Historically the
-/// claim path padded a blind 5×3s = 15s sleep on EVERY claim to let this
-/// consumption happen; this instead does the wait as a REAL condition check
-/// (`AggLayerBridge::is_ger_registered` — exactly the value `assert_valid_ger`
-/// asserts, `[1,0,0,0]` at `poseidon2::merge(GER)` in the `ger_map` slot),
-/// re-`sync_state`-ing each poll and early-exiting the instant the GER appears.
-///
-/// Returns `Ok(true)` if the GER became visible within the budget, `Ok(false)`
-/// on timeout. Callers treat a timeout as advisory: the on-chain MASM
-/// `assert_valid_ger` is the hard gate, so a CLAIM submitted without the GER
-/// fails closed with `ERR_GER_NOT_FOUND` rather than minting.
-pub(crate) async fn wait_for_ger_on_bridge(
-    client: &mut MidenClientLib,
-    bridge_id: AccountId,
-    ger: ExitRoot,
-    max_polls: u32,
-    interval: Duration,
-) -> anyhow::Result<bool> {
-    // `bridge_id` and `ger` are `Copy`, so this `FnMut` can re-capture them each
-    // poll while `c` (the client borrow) is handed in per call.
-    poll_until_ready(client, max_polls, interval, move |c| {
-        Box::new(async move {
-            // Refresh this client's view so the read reflects any bridge-account
-            // consumption the NTX builder has committed since the last poll.
-            c.sync_state().await?;
-            let present = c
-                .get_account(bridge_id)
-                .await?
-                .map(|acct| AggLayerBridge::is_ger_registered(ger, &acct).unwrap_or(false))
-                .unwrap_or(false);
-            Ok(present)
-        })
-    })
-    .await
-}
-
 /// Submit the actual UpdateGerNote Miden transaction. Factored out of
 /// `insert_ger` so the caller can run it twice — once eagerly, then again
 /// after `reimport_account` if the first attempt failed with a recoverable
@@ -125,22 +40,36 @@ pub(crate) async fn wait_for_ger_on_bridge(
 /// the UpdateGerNote. The main client's subsequent sync_nullifiers only
 /// queries [current_cursor, tip], so those consumption events were never
 /// discovered and `NoteFilter::Consumed` returned nothing in restore.
-/// Submit the `UpdateGerNote` to Miden and return the on-chain note's
-/// `details_commitment` (hex), encoded identically to how the projector keys
-/// consumed notes (`InputNoteRecord::details_commitment()`) — so `insert_ger`
-/// can tie the real `insertGlobalExitRoot` eth-tx to this note via
-/// `record_tx_note_link`. Returns `None` only when the submit closure did not
-/// execute (a stubbed MidenClient in unit tests).
+///
+/// Also records the eth-tx ↔ note link (`record_tx_note_link`) that ties the
+/// real `insertGlobalExitRoot` eth-tx to the on-chain note, keyed by the
+/// note's `details_commitment` (hex, encoded identically to how the projector
+/// keys consumed notes — `InputNoteRecord::details_commitment()`).
+///
+/// Link-before-projection (PR #127 review, point 6): the link is written
+/// INSIDE this closure, immediately after the Miden tx commits and strictly
+/// BEFORE the serialized `MidenClient::with` slot is released. The
+/// SyntheticProjector observes note consumption through the same serialized
+/// client, so it cannot tick between the note landing and the link existing —
+/// the GER event/receipt therefore always rides the REAL eth-tx hash, never
+/// the derived fallback. (Pre-fix, the link was recorded by `insert_ger`
+/// AFTER an in-closure propagation wait released the client, leaving a window
+/// where the projector emitted under the derived hash and the real receipt
+/// stayed pending forever.)
+///
+/// Cantina #21 (PR #127 review, points 1/4): this function deliberately does
+/// NOT wait for the NTX builder to consume the note into the bridge account.
+/// GER propagation is fail-fast/retry-later: `eth_estimateGas` and the C6
+/// pre-admission gate reject claims until the projector publishes the GER,
+/// and the on-chain MASM `assert_valid_ger` remains the final safety gate.
 async fn submit_update_ger_note(
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
+    store: Arc<dyn crate::store::Store>,
     ger_bytes: [u8; 32],
-) -> anyhow::Result<Option<String>> {
+    txn_hash: TxHash,
+) -> anyhow::Result<()> {
     let inner_accounts = accounts.0.clone();
-    // `MidenClient::with` closures resolve to `Result<()>`; surface the note
-    // commitment through a captured slot (same pattern as `publish_claim`).
-    let commitment_slot = Arc::new(std::sync::OnceLock::<String>::new());
-    let commitment_inner = commitment_slot.clone();
     miden_client
         .with(move |client| {
             Box::new(async move {
@@ -160,7 +89,6 @@ async fn submit_update_ger_note(
                         .commitment()
                         .as_bytes(),
                 );
-                let _ = commitment_inner.set(note_commitment);
                 tracing::info!(
                     note_id = %note.id(),
                     ger = %hex::encode(ger_bytes),
@@ -192,46 +120,19 @@ async fn submit_update_ger_note(
                 }
                 tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
 
-                // Cantina #21 — await GER propagation to the bridge account HERE,
-                // once, at injection time, instead of padding every CLAIM with a
-                // blind 15s sleep. The NTX builder consumes this UpdateGerNote on
-                // the bridge account ASYNCHRONOUSLY (the commit above only lands the
-                // note); block until the account actually reflects the GER (bounded,
-                // early-exiting), so by the time any CLAIM for this GER arrives the
-                // bridge account already carries it and the claim-side poll returns
-                // on its first iteration. A timeout is non-fatal: the claim-side
-                // safety poll and the MASM `assert_valid_ger` gate still enforce
-                // correctness.
-                match wait_for_ger_on_bridge(
-                    client,
-                    bridge_id,
-                    ger,
-                    20,
-                    std::time::Duration::from_secs(1),
-                )
-                .await
-                {
-                    Ok(true) => tracing::info!(
-                        ger = %hex::encode(ger_bytes),
-                        "Cantina #21: GER now reflected on bridge account (consumed by NTX builder)"
-                    ),
-                    Ok(false) => tracing::warn!(
-                        ger = %hex::encode(ger_bytes),
-                        "Cantina #21: GER not yet reflected on bridge account within injection \
-                         wait budget; claims will re-poll before submitting"
-                    ),
-                    Err(e) => tracing::warn!(
-                        ger = %hex::encode(ger_bytes),
-                        error = ?e,
-                        "Cantina #21: error awaiting GER propagation to bridge account; \
-                         claims will re-poll before submitting"
-                    ),
-                }
+                // Record the link WHILE STILL HOLDING the serialized client —
+                // see the function docstring (link-before-projection). Recording
+                // after the commit (not before the submit) keeps the
+                // recoverable-retry path in `insert_ger` correct: a failed
+                // attempt records nothing, so the retry's fresh note gets the
+                // first (and only) link for this eth-tx.
+                store
+                    .record_tx_note_link(&format!("{txn_hash:#x}"), &note_commitment)
+                    .await?;
                 Ok(())
             })
         })
-        .await?;
-    Ok(commitment_slot.get().cloned())
+        .await
 }
 
 /// Submit a GER injection to Miden. Returns `true` if a new `UpdateGerNote` was
@@ -269,14 +170,22 @@ pub async fn insert_ger(
         // the node's view), reimport the ger_manager account from the
         // live Miden node and retry once. See `src/account_recovery.rs`
         // for the analysis — this is the actual bali production cure.
-        let note_commitment = match submit_update_ger_note(
+        //
+        // The eth-tx ↔ UpdateGerNote link (which lets the SyntheticProjector
+        // finalise THIS receipt and emit the GER log under the real tx hash on
+        // consumption, making receipt block == GER-log block) is recorded by
+        // `submit_update_ger_note` itself, while it still holds the serialized
+        // Miden client — see its docstring (link-before-projection).
+        match submit_update_ger_note(
             miden_client,
             accounts.clone(),
+            store.clone(),
             ger_bytes,
+            txn_hash,
         )
         .await
         {
-            Ok(commitment) => commitment,
+            Ok(()) => {}
             Err(err) if crate::account_recovery::is_recoverable_account_error(&err) => {
                 tracing::warn!(
                     err = %err,
@@ -295,22 +204,17 @@ pub async fn insert_ger(
                     "ger_manager",
                 )
                 .await?;
-                submit_update_ger_note(miden_client, accounts.clone(), ger_bytes).await?
+                submit_update_ger_note(
+                    miden_client,
+                    accounts.clone(),
+                    store.clone(),
+                    ger_bytes,
+                    txn_hash,
+                )
+                .await?
             }
             Err(err) => return Err(err),
         };
-
-        // Tie the real `insertGlobalExitRoot` eth-tx to the on-chain UpdateGerNote so
-        // the SyntheticProjector finalises THIS receipt (and emits the GER log) under
-        // the real tx hash when it observes the note consumed — making the receipt
-        // block == the GER-log block. No synthetic log / tip advance / receipt
-        // completion happens in this path. (`note_commitment` is `None` only under a
-        // stubbed test client; the projector then falls back to the derived hash.)
-        if let Some(note_commitment) = note_commitment {
-            store
-                .record_tx_note_link(&format!("{txn_hash:#x}"), &note_commitment)
-                .await?;
-        }
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),
@@ -353,109 +257,5 @@ mod tests {
         let a = [0x01u8; 32];
         let b = [0x02u8; 32];
         assert_ne!(combined_ger(&a, &b), combined_ger(&b, &a));
-    }
-
-    /// Probe standing in for "the bridge account, checked each poll". `ready_at`
-    /// is the poll index (0-based) at which the condition first holds.
-    struct Probe {
-        polls: u32,
-        ready_at: u32,
-    }
-
-    /// Cantina #21 — a GER already present on the bridge account (the common case
-    /// once `insert_ger` has awaited propagation) must early-exit on the FIRST
-    /// poll with zero sleeps. This is the whole point of moving the wait to
-    /// injection time: the per-claim path no longer pays the old 15s pad.
-    #[tokio::test]
-    async fn poll_until_ready_early_exits_on_first_poll_when_condition_holds() {
-        let mut probe = Probe {
-            polls: 0,
-            ready_at: 0,
-        };
-        let out = poll_until_ready(&mut probe, 5, Duration::from_millis(0), |p| {
-            Box::new(async move {
-                let i = p.polls;
-                p.polls += 1;
-                Ok(i >= p.ready_at)
-            })
-        })
-        .await
-        .unwrap();
-        assert!(out);
-        assert_eq!(probe.polls, 1, "must early-exit on the first poll");
-    }
-
-    /// When the GER is not yet present it must keep polling and return the instant
-    /// the condition flips true (here: the 3rd poll).
-    #[tokio::test]
-    async fn poll_until_ready_polls_until_condition_becomes_true() {
-        let mut probe = Probe {
-            polls: 0,
-            ready_at: 2,
-        };
-        let out = poll_until_ready(&mut probe, 10, Duration::from_millis(0), |p| {
-            Box::new(async move {
-                let i = p.polls;
-                p.polls += 1;
-                Ok(i >= p.ready_at)
-            })
-        })
-        .await
-        .unwrap();
-        assert!(out);
-        assert_eq!(probe.polls, 3, "returns as soon as the condition holds");
-    }
-
-    /// On budget exhaustion it checks exactly `max_polls` times then returns
-    /// `false` (advisory timeout — the caller submits anyway and the MASM
-    /// `assert_valid_ger` remains the hard gate).
-    #[tokio::test]
-    async fn poll_until_ready_returns_false_on_budget_exhaustion() {
-        let mut probe = Probe {
-            polls: 0,
-            ready_at: u32::MAX,
-        };
-        let out = poll_until_ready(&mut probe, 4, Duration::from_millis(0), |p| {
-            Box::new(async move {
-                p.polls += 1;
-                Ok(false)
-            })
-        })
-        .await
-        .unwrap();
-        assert!(!out);
-        assert_eq!(
-            probe.polls, 4,
-            "checks exactly max_polls times then gives up"
-        );
-    }
-
-    /// PR #127 review — no sleep after the FINAL failed poll: the timeout
-    /// verdict must arrive after (max_polls - 1) * interval of waiting, not
-    /// max_polls * interval. Paused-clock test: tokio auto-advances virtual
-    /// time on sleep, so elapsed time counts exactly the sleeps performed.
-    #[tokio::test(start_paused = true)]
-    async fn poll_until_ready_does_not_sleep_after_last_attempt() {
-        let mut probe = Probe {
-            polls: 0,
-            ready_at: u32::MAX,
-        };
-        let interval = Duration::from_secs(1);
-        let t0 = tokio::time::Instant::now();
-        let out = poll_until_ready(&mut probe, 3, interval, |p| {
-            Box::new(async move {
-                p.polls += 1;
-                Ok(false)
-            })
-        })
-        .await
-        .unwrap();
-        assert!(!out);
-        assert_eq!(probe.polls, 3);
-        assert_eq!(
-            t0.elapsed(),
-            interval * 2,
-            "3 polls must sleep exactly twice (between polls), never after the last"
-        );
     }
 }

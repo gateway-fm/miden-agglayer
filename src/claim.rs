@@ -838,61 +838,19 @@ async fn publish_claim_internal(
 
     let expires_at = latest_block_num + claim_receipt_expiration_blocks();
 
-    // Cantina #21 — the GER→bridge-account propagation wait now happens ONCE,
-    // synchronously, at injection time (`ger::insert_ger` blocks in
-    // `wait_for_ger_on_bridge` until the bridge account's GER map reflects the
-    // GER). The CLAIM note's FPI calls `assert_valid_ger`, which checks that same
-    // bridge-account GER storage, so by the time a CLAIM referencing that GER
-    // reaches here the account already carries it and this bounded poll early-exits
-    // on its FIRST iteration (~0s) — replacing the old unconditional 5×3s = 15s
-    // sleep that fired on EVERY claim (manual and auto-claim paths alike) even when
-    // the GER was already present.
-    //
-    // We keep a short bounded safety poll for the rare case where THIS process did
-    // not inject the GER (e.g. it was injected by a prior instance and is not yet
-    // reflected in this client's synced view of the bridge account): the poll
-    // early-exits the instant the condition holds. On timeout we submit anyway —
-    // the on-chain MASM `assert_valid_ger` is the hard gate, so a CLAIM without the
-    // GER fails closed with `ERR_GER_NOT_FOUND` rather than minting (identical to
-    // the old best-effort behaviour, which also submitted unconditionally after the
-    // pad).
-    //
-    // (This poll subsumes main's earlier G6 `is_injected` early-exit: it checks
-    // the authoritative condition — the GER in the bridge ACCOUNT's storage,
-    // exactly what the MASM asserts — rather than the proxy-side injected flag,
-    // and still exits in ~0s in the common already-present case.)
-    let claim_ger = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
-    tracing::info!(
-        "Cantina #21: awaiting GER on bridge account before submitting CLAIM (early-exits when \
-         already present)..."
-    );
-    match crate::ger::wait_for_ger_on_bridge(
-        client,
-        accounts.bridge.0,
-        ExitRoot::new(claim_ger),
-        15,
-        std::time::Duration::from_secs(1),
-    )
-    .await
-    {
-        Ok(true) => {
-            tracing::info!("Cantina #21: GER present on bridge account; submitting CLAIM note")
-        }
-        Ok(false) => {
-            ::metrics::counter!("rpc_claim_ger_wait_timeout_total").increment(1);
-            tracing::warn!(
-                "Cantina #21: GER not observed on bridge account within wait budget; submitting \
-                 CLAIM anyway (fails closed with ERR_GER_NOT_FOUND if genuinely absent)"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = ?e,
-                "Cantina #21: error awaiting GER on bridge account; submitting CLAIM anyway"
-            );
-        }
-    }
-
+    // Cantina #21 — NO GER-propagation sleep/poll here (PR #127 review):
+    // GER readiness is fail-fast/retry-later, mirroring the real EVM bridge
+    // (AgglayerBridge._verifyLeaf reads globalExitRootMap once and reverts
+    // GlobalExitRootInvalid() when absent — it never waits). By the time a
+    // CLAIM reaches this point it has already passed the C6 pre-admission
+    // gate (`is_ger_injected`, checked before any nonce/lock/receipt
+    // side-effect) and, for the official ClaimTxManager flow, the
+    // claim-aware `eth_estimateGas` probe. The on-chain MASM
+    // `assert_valid_ger` against the bridge account's storage remains the
+    // final race/security gate: a CLAIM racing GER consumption fails closed
+    // with `ERR_GER_NOT_FOUND` rather than minting, and the caller retries
+    // after publication. Polling here would stall the serialized
+    // `MidenClient::with` slot for every queued write.
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![claim_note])
         .build()?;
