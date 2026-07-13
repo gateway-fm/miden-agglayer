@@ -118,6 +118,14 @@ const RECONCILE_TICK_BUDGET_MS_DEFAULT: u64 = 2_000;
 /// genuine node fault never halts the bridge.
 const FETCH_MISS_RETRY_BOUND: u32 = 20;
 
+/// Cantina #7 (part 2): consecutive DIVERGED at-tip evaluations of the LET cardinality
+/// gate tolerated before the halt goes loud (`LET_GATE_RETRY_TICKS` env override). An
+/// InvisibleGap is usually a visibility race (sync/feed lag — the same class the barrier
+/// exists for) and heals within a tick or two; the budget bounds how long the gate waits
+/// before declaring it real. Emission is BLOCKED from the FIRST diverged tick either way
+/// — the budget only delays the loud standing error, never the safety.
+const LET_GATE_RETRY_TICKS_DEFAULT: u64 = 5;
+
 /// Completeness-auditor cadence: audit once every N projector ticks (~1s each → ~30s cycles).
 const AUDIT_EVERY_N_TICKS: u64 = 30;
 
@@ -307,6 +315,15 @@ pub struct SyntheticProjector {
     audit_resolved: std::sync::Mutex<HashSet<[u8; 32]>>,
     /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
     audit_tick_counter: AtomicU64,
+    /// Cantina #7 (part 2): pre-seal LET cardinality gate state (see [`LetGateState`]).
+    let_gate: std::sync::Mutex<LetGateState>,
+    /// Cantina #7 (part 2): emission choke point — while the gate is diverged NOTHING may
+    /// be sealed. Enforced at the top of `project_block_notes` (defense in depth against
+    /// any future caller bypassing the tick's early return).
+    let_gate_blocked: std::sync::atomic::AtomicBool,
+    /// Bounded-retry budget in ticks for an InvisibleGap before the halt goes loud
+    /// (`LET_GATE_RETRY_TICKS`, default [`LET_GATE_RETRY_TICKS_DEFAULT`]).
+    let_gate_retry_budget: u64,
 }
 
 impl SyntheticProjector {
@@ -391,6 +408,9 @@ impl SyntheticProjector {
             last_source_window_to: AtomicU64::new(0),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
+            let_gate: std::sync::Mutex::new(LetGateState::new()),
+            let_gate_blocked: std::sync::atomic::AtomicBool::new(false),
+            let_gate_retry_budget: env_u64("LET_GATE_RETRY_TICKS", LET_GATE_RETRY_TICKS_DEFAULT),
         })
     }
 
@@ -1355,6 +1375,20 @@ impl SyntheticProjector {
         mut client: Option<&mut MidenClientLib>,
         within_tx_pos: &HashMap<[u8; 32], u32>,
     ) -> anyhow::Result<usize> {
+        // Cantina #7 (part 2) — emission choke point: while the LET cardinality gate is
+        // diverged NOTHING may be sealed, whichever path got here. `tick` already returns
+        // early on a diverged verdict; this is fail-closed defense in depth (and the
+        // mutation-honesty target: with the gate removed, a misnumbered emission would
+        // sail through this exact line).
+        if self
+            .let_gate_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            anyhow::bail!(
+                "LET cardinality gate is diverged — refusing to seal block {miden_block} \
+                 (see docs/operations/let-cardinality-gate.md)"
+            );
+        }
         let mut notes: Vec<&InputNoteRecord> = block_notes.to_vec();
 
         // Cantina #7 (part 1) — FAIL-CLOSED numbering guard. Two-plus B2AGG notes consumed
@@ -1865,6 +1899,89 @@ impl SyntheticProjector {
                 by_block.entry(h).or_default().push(rec);
             }
         }
+        // ── Cantina #7 (part 2): pre-seal LET cardinality gate ─────────────────────
+        // Before sealing ANY of this window's blocks, check that the bridge's on-chain
+        // Local Exit Tree leaf count is fully accounted for by the feed-visible B2AGG
+        // consumptions (see `LetGateState` for the identity, the baseline that absorbs
+        // pre-boot history, and the quarantine/deferral awareness — those classes are
+        // COUNTED, so they can never trip the gate). While diverged: never emit — a
+        // stalled tick is recoverable, a misnumbered deposit_count/globalIndex is sealed
+        // forever by getLogs immutability. InvisibleGap gets a bounded retry (visibility
+        // races heal); LocalAhead halts immediately (corruption; retry cannot heal it).
+        //
+        // Per-block feed-visible B2AGG counts for the window about to be sealed —
+        // recounted fresh every attempt so a heal (a note resolving on retry) clears the
+        // gap; folded into the cumulative total ONLY as each block actually seals.
+        let mut pending_b2agg: HashMap<u64, u64> = HashMap::new();
+        for rec in &auth_b2agg {
+            if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
+                *pending_b2agg.entry(h).or_default() += 1;
+            }
+        }
+        if self.node_rpc.is_some() {
+            let bridge_account = client
+                .get_account(self.bridge_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("LET gate: get_account({}): {e}", self.bridge_id))?;
+            if let Some(bridge_account) = bridge_account {
+                let on_chain =
+                    miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
+                let pending_total: u64 = pending_b2agg.values().sum();
+                let at_tip = project_to == tip;
+                let verdict = self
+                    .let_gate
+                    .lock()
+                    .expect("LET gate state poisoned")
+                    .evaluate(on_chain, pending_total, at_tip, self.let_gate_retry_budget);
+                match verdict {
+                    LetGateVerdict::Proceed => {
+                        self.let_gate_blocked.store(false, Ordering::Release);
+                    }
+                    LetGateVerdict::Diverged { kind, gap } => {
+                        self.let_gate_blocked.store(true, Ordering::Release);
+                        tracing::warn!(
+                            kind,
+                            gap,
+                            on_chain,
+                            pending_total,
+                            "Cantina #7 LET cardinality gate: diverged — emission blocked, \
+                             retrying (visibility races usually heal within a tick; halts \
+                             loud after LET_GATE_RETRY_TICKS)"
+                        );
+                        // Quiet stall: nothing seals, cursor unchanged, retried next tick.
+                        return Ok(cursor);
+                    }
+                    LetGateVerdict::Halt { kind, gap } => {
+                        self.let_gate_blocked.store(true, Ordering::Release);
+                        ::metrics::counter!(
+                            "bridge_let_assignment_gate_halted_total",
+                            "kind" => kind
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            kind,
+                            gap,
+                            on_chain,
+                            pending_total,
+                            "Cantina #7 LET cardinality gate: HALTED — the bridge's on-chain \
+                             LET and the visible B2AGG consumption set disagree and the retry \
+                             budget is exhausted. Refusing to seal: a misnumbered \
+                             deposit_count is poison (wrong globalIndex, sealed forever). \
+                             See docs/operations/let-cardinality-gate.md"
+                        );
+                        anyhow::bail!(
+                            "LET cardinality gate halted ({kind}, gap {gap}): on-chain leaves \
+                             {on_chain} vs visible accounting — projection fail-closed; see \
+                             docs/operations/let-cardinality-gate.md"
+                        );
+                    }
+                }
+            } else {
+                // Bridge account not yet in the local store (first boot before import):
+                // nothing can have been bridge-consumed either — the gate arms later.
+                tracing::debug!("LET gate: bridge account not yet tracked — skipped");
+            }
+        }
         let no_notes: Vec<&InputNoteRecord> = Vec::new();
         while cursor < project_to {
             let next = cursor + 1;
@@ -1877,6 +1994,15 @@ impl SyntheticProjector {
             // never runs ahead of fully-projected state.
             self.store.set_projector_cursor(next).await?;
             self.cursor.store(next, Ordering::Release);
+            // Cantina #7 (part 2): fold this block's feed-visible B2AGG count into the
+            // gate's cumulative sealed total — only NOW that the block is durably sealed,
+            // so a halted/blocked attempt recounts the same window next tick.
+            if let Some(n) = pending_b2agg.get(&next) {
+                self.let_gate
+                    .lock()
+                    .expect("LET gate state poisoned")
+                    .commit_sealed(*n);
+            }
             // Evict this block's projected B2AGG nullifiers AFTER the cursor is persisted, so
             // the cache stays bounded to imported-but-not-yet-projected notes. Ordering it
             // after the persist means a crash before the persist leaves the entry in place
@@ -2087,6 +2213,146 @@ pub(crate) fn bridge_consumed_nullifiers(
         }
     }
     out
+}
+
+/// Cantina #7 (part 2) — verdict of one pre-seal LET cardinality gate evaluation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LetGateVerdict {
+    /// Aligned (or not evaluable this tick — arming / barrier lag): emission allowed.
+    Proceed,
+    /// Diverged within the retry budget: emission BLOCKED, tick stalls quietly and
+    /// retries — an InvisibleGap is usually a visibility race that heals in a tick.
+    Diverged { kind: &'static str, gap: u64 },
+    /// Diverged past the budget, or LocalAhead (corruption — retry cannot heal it):
+    /// HALT loud. Emission blocked, standing error + metric, cursor unmoved.
+    Halt { kind: &'static str, gap: u64 },
+}
+
+/// Cantina #7 (part 2) — state of the pre-seal LET cardinality gate.
+///
+/// THE IDENTITY. Only a bridge-executed consumption of a B2AGG note appends a Local Exit
+/// Tree leaf (emit-class, quarantine-class, metadata-deferred and self-targeted alike —
+/// the on-chain append happens at consumption, before any of our emit gates run; reclaims
+/// never touch bridge storage). So, measured at the chain tip:
+///
+///     read_let_num_leaves(bridge) == baseline + visible
+///
+/// where `visible` counts the B2AGG records the AUTHORITATIVE feed (sync_transactions →
+/// resolve) produced for blocks the projector has sealed or is about to seal, and
+/// `baseline` is the leaf count attributed to PRE-BOOT history, captured once at arming.
+///
+/// WHY A BASELINE (honesty note): history cannot be re-derived exactly from durable local
+/// state — quarantined exits have rows, but metadata-deferred (`EmitMetadata::
+/// Unrecoverable`) and self-targeted (#13) skips deliberately leave NO row, and emitted
+/// counts alone undercount them. Rather than false-halt on those by-design states (the
+/// THE-verifier lesson), the gate arms by absorbing all pre-boot history into `baseline`
+/// and is EXACT for everything after: post-arming, deferral/quarantine/self-target are all
+/// counted (they are resolved B2AGG records — classification happens downstream of the
+/// count), so none of them can trip it. The cost: an invisible leaf that predates boot is
+/// absorbed silently — the post-emit Cantina #9 monitor remains the detector for that.
+///
+/// CATCH-UP SAFETY: the gate compares like with like — both sides are chain-tip
+/// quantities. It EVALUATES only when the projection ceiling reaches the tip
+/// (`project_to == tip`, the steady-state norm); while arming or while the visibility
+/// barrier holds it stays out of the way (Proceed, no strikes), so a fresh restore or a
+/// long catch-up can never halt. Detection during a barrier-lag window is deferred to the
+/// next at-tip evaluation (tip-state reads have no historical form) — the #9 monitor
+/// covers the interim.
+pub(crate) struct LetGateState {
+    /// On-chain leaves attributed to pre-boot history; `None` = not yet armed.
+    baseline: Option<u64>,
+    /// Cumulative feed-visible B2AGG consumptions in SEALED blocks since boot.
+    visible_sealed: u64,
+    /// Consecutive diverged at-tip evaluations (bounded retry).
+    strikes: u64,
+}
+
+impl LetGateState {
+    pub(crate) fn new() -> Self {
+        Self {
+            baseline: None,
+            visible_sealed: 0,
+            strikes: 0,
+        }
+    }
+
+    /// One pre-seal evaluation. `pending_visible` = feed-visible B2AGG count of the
+    /// blocks about to be sealed THIS tick (recounted fresh every attempt, so a
+    /// visibility heal — a note resolving on retry — is picked up); `at_tip` = the
+    /// projection ceiling reached the chain tip, i.e. `on_chain` and the visible count
+    /// describe the same frontier and the identity is checkable.
+    pub(crate) fn evaluate(
+        &mut self,
+        on_chain: u64,
+        pending_visible: u64,
+        at_tip: bool,
+        retry_budget: u64,
+    ) -> LetGateVerdict {
+        let visible_now = self.visible_sealed + pending_visible;
+        let Some(baseline) = self.baseline else {
+            if !at_tip {
+                // Arming deferred: mid-catch-up / barrier lag. Never strikes, never halts
+                // (requirement: a fresh restore or long catch-up must not halt).
+                return LetGateVerdict::Proceed;
+            }
+            if visible_now > on_chain {
+                // More visible consumptions than on-chain leaves BEFORE arming: local
+                // corruption — a baseline cannot be negative. Fail closed immediately.
+                return LetGateVerdict::Halt {
+                    kind: "local_ahead",
+                    gap: visible_now - on_chain,
+                };
+            }
+            self.baseline = Some(on_chain - visible_now);
+            self.strikes = 0;
+            return LetGateVerdict::Proceed;
+        };
+        if !at_tip {
+            // Not evaluable: leaves are a tip quantity, the visible count only reaches the
+            // projection ceiling. No strike — barrier lag is a legitimate state.
+            return LetGateVerdict::Proceed;
+        }
+        let expected = baseline + visible_now;
+        match on_chain.cmp(&expected) {
+            std::cmp::Ordering::Equal => {
+                self.strikes = 0;
+                LetGateVerdict::Proceed
+            }
+            std::cmp::Ordering::Greater => {
+                // Chain has leaves the feed cannot account for: an exit we cannot see.
+                // Usually a visibility race — bounded retry; persistent = the finding.
+                self.strikes += 1;
+                let gap = on_chain - expected;
+                if self.strikes > retry_budget {
+                    LetGateVerdict::Halt {
+                        kind: "invisible_gap",
+                        gap,
+                    }
+                } else {
+                    LetGateVerdict::Diverged {
+                        kind: "invisible_gap",
+                        gap,
+                    }
+                }
+            }
+            std::cmp::Ordering::Less => {
+                // We are about to emit more exits than the chain has leaves: impossible
+                // by construction, so it is data corruption — retry cannot heal it.
+                LetGateVerdict::Halt {
+                    kind: "local_ahead",
+                    gap: expected - on_chain,
+                }
+            }
+        }
+    }
+
+    /// Fold the freshly-SEALED blocks' visible count into the cumulative total. Called
+    /// only after the tick's projection loop completes — a halted/blocked tick folds
+    /// nothing, so the next attempt recounts the same window (that is what lets a
+    /// visibility heal clear the gap).
+    pub(crate) fn commit_sealed(&mut self, pending_visible: u64) {
+        self.visible_sealed += pending_visible;
+    }
 }
 
 #[async_trait::async_trait]
@@ -4075,6 +4341,193 @@ mod tests {
         assert_eq!(
             got, expected,
             "restore's replay sort must equal the live projection order key-for-key"
+        );
+    }
+
+    // ── Cantina #7 (part 2): LET cardinality gate ─────────────────────────────
+
+    /// The gate's pure state machine: arming defers off-tip (catch-up safe), the baseline
+    /// absorbs pre-boot history, InvisibleGap blocks-then-halts on the bounded budget with
+    /// strike reset on heal, and LocalAhead halts immediately (incl. at arming).
+    #[test]
+    fn cantina7_let_gate_verdict_state_machine() {
+        let budget = 3u64;
+
+        // Arming: not at tip → Proceed forever, never armed, never a strike (a fresh
+        // restore / long catch-up must not halt).
+        let mut g = LetGateState::new();
+        for _ in 0..20 {
+            assert_eq!(g.evaluate(100, 0, false, budget), LetGateVerdict::Proceed);
+        }
+        // Arms at tip; baseline absorbs 97 leaves of unaccountable pre-boot history.
+        assert_eq!(g.evaluate(100, 3, true, budget), LetGateVerdict::Proceed);
+        // Aligned steady state after sealing those 3.
+        g.commit_sealed(3);
+        assert_eq!(g.evaluate(100, 0, true, budget), LetGateVerdict::Proceed);
+        // New exit appears on chain and in the feed together: aligned.
+        assert_eq!(g.evaluate(101, 1, true, budget), LetGateVerdict::Proceed);
+        g.commit_sealed(1);
+
+        // InvisibleGap: chain appended a leaf the feed cannot account for.
+        for i in 1..=budget {
+            assert_eq!(
+                g.evaluate(102, 0, true, budget),
+                LetGateVerdict::Diverged {
+                    kind: "invisible_gap",
+                    gap: 1
+                },
+                "strike {i} must stay within the retry budget"
+            );
+        }
+        assert_eq!(
+            g.evaluate(102, 0, true, budget),
+            LetGateVerdict::Halt {
+                kind: "invisible_gap",
+                gap: 1
+            },
+            "budget exhausted → loud halt"
+        );
+
+        // Heal (the missing consumption resolves on retry): aligned again, strikes reset.
+        assert_eq!(g.evaluate(102, 1, true, budget), LetGateVerdict::Proceed);
+        g.commit_sealed(1);
+        assert_eq!(
+            g.evaluate(103, 0, true, budget),
+            LetGateVerdict::Diverged {
+                kind: "invisible_gap",
+                gap: 1
+            },
+            "post-heal strikes restart from zero"
+        );
+
+        // Off-tip while armed: not evaluable, no strike accrual (barrier lag is legit).
+        assert_eq!(g.evaluate(103, 0, false, budget), LetGateVerdict::Proceed);
+
+        // LocalAhead halts immediately — no retry can heal corruption.
+        let mut g2 = LetGateState::new();
+        assert_eq!(g2.evaluate(5, 0, true, budget), LetGateVerdict::Proceed); // arm, baseline 5
+        assert_eq!(
+            g2.evaluate(5, 6, true, budget),
+            LetGateVerdict::Halt {
+                kind: "local_ahead",
+                gap: 6
+            }
+        );
+        // LocalAhead at ARMING (visible > on_chain before a baseline exists) also halts.
+        let mut g3 = LetGateState::new();
+        assert_eq!(
+            g3.evaluate(2, 3, true, budget),
+            LetGateVerdict::Halt {
+                kind: "local_ahead",
+                gap: 1
+            }
+        );
+    }
+
+    /// THE false-positive test (requirement 1): a QUARANTINED exit occupies an on-chain
+    /// LET leaf but deliberately emits NO BridgeEvent. The gate counts LET-appending
+    /// consumptions UPSTREAM of the emit gates, so the quarantine must not trip it —
+    /// checkers that don't mirror emit gates halt on by-design states.
+    #[tokio::test]
+    async fn let_gate_quarantined_exit_does_not_trip() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        // Deliberately NO register_faucet: the exit quarantines as UnknownFaucet.
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let mut gate = LetGateState::new();
+        assert_eq!(gate.evaluate(0, 0, true, 3), LetGateVerdict::Proceed); // arm at 0
+
+        // The bridge consumes the (quarantine-class) B2AGG: one on-chain leaf, one
+        // feed-visible pending consumption — the identity HOLDS.
+        let note = b2agg_note(5, Some(0));
+        assert_eq!(
+            gate.evaluate(1, 1, true, 3),
+            LetGateVerdict::Proceed,
+            "a quarantine-class consumption is COUNTED as visible — no divergence"
+        );
+        let written = projector
+            .project_notes(
+                std::slice::from_ref(&note),
+                &HashMap::new(),
+                5,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, 0, "quarantined: no BridgeEvent emitted");
+        assert_eq!(
+            store.count_unbridgeable_bridge_outs().await.unwrap(),
+            1,
+            "the exit is quarantined, not dropped"
+        );
+        gate.commit_sealed(1);
+        // Steady state after the quarantine: still aligned — no false halt, ever.
+        assert_eq!(gate.evaluate(1, 0, true, 3), LetGateVerdict::Proceed);
+    }
+
+    /// Requirement 3 + halt seals nothing: while the gate is blocked, project_notes
+    /// refuses to seal anything — nothing written, tip unmoved — and unblocking resumes
+    /// emission at the exact block. This is also the MUTATION-HONESTY target: remove the
+    /// gate's choke point in `project_block_notes` and the blocked emission sails
+    /// through, failing this test.
+    #[tokio::test]
+    async fn let_gate_blocks_emission_and_heals_mutation_target() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // The gate diverged (as tick would set it): emission must be refused.
+        projector
+            .let_gate_blocked
+            .store(true, std::sync::atomic::Ordering::Release);
+        let note = b2agg_note(6, Some(0));
+        let err = projector
+            .project_notes(
+                std::slice::from_ref(&note),
+                &HashMap::new(),
+                6,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .expect_err("blocked gate must refuse to seal");
+        assert!(
+            format!("{err:#}").contains("LET cardinality gate"),
+            "refusal must name the gate: {err:#}"
+        );
+        assert!(
+            logs_in_range(&store, 0, 6).await.is_empty(),
+            "nothing may be sealed while diverged"
+        );
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            0,
+            "tip must not advance while diverged"
+        );
+
+        // Heal: unblock → the SAME note emits at its exact block.
+        projector
+            .let_gate_blocked
+            .store(false, std::sync::atomic::Ordering::Release);
+        let written = projector
+            .project_notes(
+                std::slice::from_ref(&note),
+                &HashMap::new(),
+                6,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, 1, "healed gate resumes emission");
+        let logs = logs_in_range(&store, 0, 6).await;
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].block_number, 6,
+            "emitted at the exact block after the stall"
         );
     }
 }

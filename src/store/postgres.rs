@@ -2142,6 +2142,14 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
+    async fn count_unbridgeable_bridge_outs(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one("SELECT COUNT(*) FROM unbridgeable_bridge_outs", &[])
+            .await?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
     async fn get_unbridgeable_bridge_out(
         &self,
         note_id: &str,

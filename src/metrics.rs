@@ -144,6 +144,17 @@ pub fn init_metrics() {
          dead."
     );
     describe_counter!(
+        "bridge_let_assignment_gate_halted_total",
+        "Cantina #7 (part 2): projector ticks HALTED by the pre-seal LET cardinality gate \
+         after the bounded retry (LET_GATE_RETRY_TICKS) — the bridge's on-chain Local Exit \
+         Tree leaf count and the feed-visible B2AGG consumption accounting disagree, so \
+         sealing would risk a misnumbered deposit_count/globalIndex (poison, sealed forever \
+         by getLogs immutability). kind=invisible_gap: on-chain leaves no visible consumption \
+         accounts for (erased/unseen exits); kind=local_ahead: more visible consumptions than \
+         leaves (local corruption; halts immediately, no retry). MUST stay 0; see \
+         docs/operations/let-cardinality-gate.md."
+    );
+    describe_counter!(
         "bridge_within_tx_order_unresolved_total",
         "Cantina #7 FAIL-CLOSED: >=2 B2AGG notes consumed by the SAME bridge transaction \
          whose within-tx order could not be established from the sync_transactions feed — \

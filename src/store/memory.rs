@@ -1601,6 +1601,10 @@ impl Store for InMemoryStore {
         }
     }
 
+    async fn count_unbridgeable_bridge_outs(&self) -> anyhow::Result<u64> {
+        Ok(self.unbridgeable_bridge_outs.read().len() as u64)
+    }
+
     async fn get_unbridgeable_bridge_out(
         &self,
         note_id: &str,

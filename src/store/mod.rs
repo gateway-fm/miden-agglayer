@@ -892,6 +892,12 @@ pub trait Store: Send + Sync + 'static {
         Ok(true)
     }
 
+    /// Number of quarantined (unbridgeable) B2AGG rows — each one occupies an on-chain
+    /// LET leaf that deliberately has NO emitted BridgeEvent, so honest LET accounting is
+    /// `deposit_count + this` (Cantina #7/#9). Kept a COUNT (not a list fetch): it is read
+    /// on every divergence-monitor pass.
+    async fn count_unbridgeable_bridge_outs(&self) -> anyhow::Result<u64>;
+
     /// Look up an unbridgeable B2AGG by `note_id`. `None` if not quarantined.
     ///
     /// Default impl returns `None` so stores without the quarantine table
