@@ -717,7 +717,16 @@ impl BridgeOutScanner {
             return Ok(());
         };
         let on_chain = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
-        let aggkit = self.store.get_deposit_count().await?;
+        // Quarantine-aware accounting (Cantina #7 alignment): a quarantined/unbridgeable
+        // exit occupies an on-chain LET leaf but deliberately has NO emitted BridgeEvent,
+        // so the honest local view is emitted + quarantined — counting deposit_count alone
+        // false-alarms on every by-design quarantine. (Metadata-deferred and self-targeted
+        // skips leave no durable row, so a standing on_chain_ahead alarm can still be one
+        // of those — see docs/operations/let-cardinality-gate.md for triage.) This monitor
+        // stays alarm-only, post-emit — the pre-seal LET cardinality gate in the projector
+        // is the enforcing view (two independent views, outside-checker doctrine).
+        let aggkit = self.store.get_deposit_count().await?
+            + self.store.count_unbridgeable_bridge_outs().await?;
         match crate::let_divergence::compare_let_state(on_chain, aggkit) {
             crate::let_divergence::LetDivergence::InSync => {}
             crate::let_divergence::LetDivergence::OnChainAhead { gap } => {
