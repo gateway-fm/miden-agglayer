@@ -143,9 +143,17 @@ log "  wiped (incl. transactions + tx_note_links)"
 # ── Step 3: run --restore, restart the proxy ─────────────────────────────────
 step "3/6: running --restore (re-synthesizes ClaimEvents under derived hashes)"
 docker stop "$PROXY_CONTAINER" >/dev/null
+# One-shot restore container: compose gives it volumes/network, but NOT the service's
+# command-line args — the node URL must be passed explicitly or the binary dials its
+# 127.0.0.1 default and retries forever (same wiring as e2e-restore.sh).
 docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
-    run --rm --no-deps miden-agglayer --restore 2>&1 | strip_ansi \
+    run --rm --no-deps miden-agglayer \
+    --miden-node=http://miden-node:57291 \
+    --miden-store-dir=/var/lib/miden-agglayer-service \
+    --restore 2>&1 | strip_ansi \
     | while IFS= read -r line; do echo "  [restore] $line"; done
+RESTORE_EXIT=${PIPESTATUS[0]}
+[[ "$RESTORE_EXIT" -eq 0 ]] || fail "--restore exited with code $RESTORE_EXIT"
 docker start "$PROXY_CONTAINER" >/dev/null
 wait_for "proxy back up" \
     "curl -sf $L2_RPC -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}' >/dev/null" \
