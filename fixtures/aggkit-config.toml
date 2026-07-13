@@ -15,7 +15,7 @@ rollupManagerCreationBlockNumber = 1
 genesisBlockNumber = 1
 
 [Log]
-Level = "debug"
+Level = "info"
 
 [L1Config]
 URL = "http://anvil:8545"
