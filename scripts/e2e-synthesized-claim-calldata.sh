@@ -222,9 +222,12 @@ step "6b: driving a bridge-out so a fresh certificate must build over the claim 
     | while IFS= read -r line; do echo "  [l2-to-l1] $line"; done
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "post-restore bridge-out (e2e-l2-to-l1.sh) failed"
 
+# NB: a settled cert line carries BOTH roots — a fresh chain's PreviousLocalExitRoot is
+# the empty-tree root, so a line-level `grep -v $EMPTY_LER` deletes the very line that
+# proves settlement. Extract the NEW root and test it alone (the 9ac5c0e lesson).
 EMPTY_LER="0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"
 wait_for "certificate settled with non-empty exit root" \
-    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'changed status.*Settled' | grep 'NewLocalExitRoot' | grep -qv '$EMPTY_LER'" \
+    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'changed status.*Settled' | grep -oE 'NewLocalExitRoot: 0x[0-9a-fA-F]{64}' | grep -qv '$EMPTY_LER'" \
     "$AGGKIT_SYNC_TIMEOUT" 10
 # The wedge signature must STILL be absent after the full cert build consumed the claim.
 if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
