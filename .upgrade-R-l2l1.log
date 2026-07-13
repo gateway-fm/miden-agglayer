@@ -1,0 +1,52 @@
+[0;32m[22:54:15][0m ======================================================================
+[0;32m[22:54:15][0m   L2→L1 Bridge-Out
+[0;32m[22:54:15][0m ======================================================================
+[0;32m[22:54:15][0m Wallet:  0x9db37899673f9f3129fe22eba486cb (isolated store: /home/mandrigin/miden-agglayer/.claude/worktrees/miden-origin/.b2agg-store/e2e-suite)
+[0;32m[22:54:15][0m Bridge:  mcst1apg6gs2uetyrk5gs6p7xqzk7eyat49gl
+[0;32m[22:54:15][0m Faucet:  mcst1ar747nrtu5tffutstrtmpkvvsv77xrnl
+[0;32m[22:54:15][0m L1 dest: 0xE34aaF64b29273B7D567FCFc40544c014EEe9970
+[0;32m[22:54:15][0m Checking wallet balance...
+[0;32m[22:54:15][0m Wallet balance: 1000
+[0;32m[22:54:15][0m Bridge-out amount: 500 Miden units (expect +5000000000000 wei on L1)
+[0;32m[22:54:15][0m L1 balance before bridge-out: 10999999895458131925381408
+[0;32m[22:54:15][0m Deposit-cnt baseline (this destination, pre-bridge-out): -1
+[0;32m[22:54:15][0m Step 1/4: Creating B2AGG bridge-out note (isolated client)...
+[bridge-out] using remote transaction prover (timeout 120s)
+[bridge-out] wallet:  0x9db37899673f9f3129fe22eba486cb
+[bridge-out] bridge:  0x51a4415ccac83b5110d07c600adec9
+[bridge-out] faucet:  0xfd5f4c6be51694f17058d7b0d98c83
+[bridge-out] amount:  500
+[bridge-out] dest:    0xE34aaF64b29273B7D567FCFc40544c014EEe9970 (network 0)
+[bridge-out] syncing state...
+[bridge-out] sync complete
+[bridge-out] notes: 0 expected, 0 committed
+[bridge-out] wallet balance: 1000
+[bridge-out] B2AGG note created: 0x79ecae4d15709b2104e3f17f3c8f7da41ed50dfc53b3b7f27b70cc0cdef1fcb1
+[bridge-out] submitting transaction (attempt 1/4)...
+[bridge-out] transaction submitted: 0xe862546f6fb5565c7d2572c92f53a6803ad45657cf727b1ce91c80d9e6efe64f
+[bridge-out] waiting for B2AGG consumption (note 0x79ecae4d15709b2104e3f17f3c8f7da41ed50dfc53b3b7f27b70cc0cdef1fcb1, up to 180s)...
+[bridge-out] B2AGG consumed
+[bridge-out] wallet balance after: 500
+[bridge-out] done
+[0;32m[22:54:43] PASS:[0m B2AGG note created
+[0;32m[22:54:43][0m Step 2/4: Waiting for BridgeEvent in L2 proxy (timeout 120s)...
+[0;32m[22:54:43][0m Waiting: BridgeEvent in eth_getLogs (timeout: 120s)...
+.
+[0;32m[22:54:48] PASS:[0m BridgeEvent detected in L2
+[0;32m[22:54:48][0m Step 3/5: Waiting for certificate settlement on AggLayer...
+[0;32m[22:54:48][0m Waiting: certificate settled (timeout: 900s)...
+...
+[0;32m[22:55:18] PASS:[0m Certificate settled on L1!
+[0;32m[22:55:18][0m Step 4/5: Waiting for bridge-service to sync L2→L1 deposit...
+[0;32m[22:55:18][0m Waiting: L2 deposit in bridge-service (timeout: 120s)...
+
+[0;32m[22:55:18] PASS:[0m L2→L1 deposit synced and ready_for_claim
+[0;32m[22:55:18][0m Step 5/5: Claiming deposit on L1...
+[0;32m[22:55:19][0m Deposit #0: amount=5000000000000, globalIndex=0
+[0;32m[22:55:19][0m Deposit claimed on L1 by the autoclaim service (tx 0xba34aaf3b87cc58038eaef304774f5d0ea27de881e07dcc105f2502a3370e315); verifying...
+[0;32m[22:55:19] PASS:[0m L1 claim transaction succeeded (via autoclaim service)!
+[0;32m[22:55:19] PASS:[0m L2→L1 COMPLETE! L1 balance: 10999999895458131925381408 → 10999999895463131925381408 (+5000000000000 wei, autoclaimed)
+
+[0;32m[22:55:19][0m ======================================================================
+[0;32m[22:55:19][0m   L2→L1 TEST DONE
+[0;32m[22:55:19][0m ======================================================================

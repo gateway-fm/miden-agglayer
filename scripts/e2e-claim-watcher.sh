@@ -37,13 +37,15 @@ fail() { echo -e "${RED}[$(date +%H:%M:%S)] FAIL:${NC} $*" >&2; exit 1; }
 
 # Pull a Prometheus counter value (single un-labeled sample). Returns 0 if absent.
 counter() {
-    local name="$1"
-    local value
-    value=$(curl -s "${L2_RPC}/metrics" | awk -v n="$name" '
+    local name="$1" body value
+    # STOPPER on unreachable /metrics (task #26 sweep): pre-fix, a down proxy
+    # read as 0 — a baseline taken against a dead endpoint could false-PASS
+    # delta assertions. Absent metric stays a legit 0 (never-incremented).
+    body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
+    value=$(awk -v n="$name" '
         $0 ~ ("^" n " ") { print $2; found=1; exit }
         END { if (!found) print 0 }
-    ')
-    # Strip the .0 suffix Prometheus adds to integer counters.
+    ' <<<"$body")
     echo "${value%.*}"
 }
 

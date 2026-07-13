@@ -26,6 +26,7 @@ pub(crate) enum ServiceErrorCode {
     SendRawTransaction = 1,
     GetTransactionReceipt,
     AdminRegisterFaucet,
+    AdminRegisterNativeFaucet,
 }
 
 impl From<ServiceErrorCode> for JsonRpcErrorReason {

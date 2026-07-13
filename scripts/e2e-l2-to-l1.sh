@@ -94,6 +94,20 @@ log "Bridge-out amount: $BRIDGE_AMOUNT Miden units (expect +$EXPECTED_L1_CHANGE 
 L1_BAL_BEFORE=$(cast balance --rpc-url "$L1_RPC" "$L1_DEST")
 log "L1 balance before bridge-out: $L1_BAL_BEFORE"
 
+# Baseline the newest existing L2->L1 deposit for this destination BEFORE the
+# bridge-out, so the waits below latch onto THE DEPOSIT THIS RUN CREATES and not
+# a leftover from an earlier run on the same chain (stack-reuse: the first-match
+# lookup used to grab the already-claimed deposit #0 and read a 0 balance delta).
+BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"
+BASELINE_CNT=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$L1_DEST" 2>/dev/null | python3 -c "
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+cnts = [dep.get('deposit_cnt', -1) for dep in d.get('deposits', []) if dep.get('network_id') == 1]
+print(max(cnts) if cnts else -1)
+" 2>/dev/null); BASELINE_CNT=${BASELINE_CNT:--1}
+log "Deposit-cnt baseline (this destination, pre-bridge-out): $BASELINE_CNT"
+
 # ── Step 1: Create B2AGG note (bridge-out) ────────────────────────────────────
 log "Step 1/4: Creating B2AGG bridge-out note (isolated client)..."
 iso_tool \
@@ -124,7 +138,7 @@ log "Step 3/5: Waiting for certificate settlement on AggLayer..."
 # settle in ~20s, well inside the original window. Keep the timeout wide so
 # cold first-runs don't trip a regression false alarm.
 wait_for "certificate settled" \
-    "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
+    "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep 'changed status.*Settled' | grep -vE 'NewLocalExitRoot: (0x0+,|0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757)' | grep -q 'NewLocalExitRoot'" \
     900 10
 pass "Certificate settled on L1!"
 
@@ -133,7 +147,7 @@ BRIDGE_SERVICE_URL="http://localhost:18080"
 log "Step 4/5: Waiting for bridge-service to sync L2→L1 deposit..."
 # L2 deposits have network_id=1 (logged on L2 chain) and dest_net=0 (going to L1)
 wait_for "L2 deposit in bridge-service" \
-    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 for dep in d.get('deposits',[])) else 1)\"" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$L1_DEST' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); exit(0 if any(dep.get('ready_for_claim') and dep.get('network_id')==1 and dep.get('deposit_cnt',-1)>$BASELINE_CNT for dep in d.get('deposits',[])) else 1)\"" \
     120 5
 pass "L2→L1 deposit synced and ready_for_claim"
 
@@ -146,10 +160,12 @@ DEPOSITS_JSON=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$L1_DEST")
 DEPOSIT_INFO=$(echo "$DEPOSITS_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-for dep in d.get('deposits', []):
-    if dep.get('ready_for_claim') and dep.get('network_id') == 1:
-        print(json.dumps(dep))
-        break
+# THIS run's deposit: newer than the pre-bridge-out baseline (stack-reuse safe)
+cands = [dep for dep in d.get('deposits', [])
+         if dep.get('ready_for_claim') and dep.get('network_id') == 1
+         and dep.get('deposit_cnt', -1) > $BASELINE_CNT]
+if cands:
+    print(json.dumps(max(cands, key=lambda x: x.get('deposit_cnt', -1))))
 ")
 [[ -z "$DEPOSIT_INFO" ]] && fail "Could not find ready L2→L1 deposit"
 

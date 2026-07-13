@@ -167,6 +167,38 @@ struct Args {
     /// 18→8 ETH faucet created by --create-foreign-bridge).
     #[arg(long, default_value_t = 10)]
     scale_exp: u32,
+
+    /// Native-faucet provision mode (Miden-ORIGINATED token e2e): deploy an
+    /// OPERATOR-owned fungible faucet (a standalone account, NOT the proxy's service
+    /// account) with a custom symbol/decimals, mint --mint-units of it to --wallet-id,
+    /// and print `faucet-id: 0x..`. This emulates an external party minting a token
+    /// that ORIGINATES on Miden. The bridge admin (proxy) then allowlists it as native
+    /// via admin_registerNativeFaucet; only then is it bridgeable (the bridge locks it
+    /// on bridge-out / unlocks on claim-back). Requires --wallet-id.
+    #[arg(long)]
+    create_native_faucet: bool,
+
+    /// Custom token symbol for --create-native-faucet (Miden TokenSymbol: <= 6 chars).
+    #[arg(long, default_value = "MDN")]
+    native_symbol: String,
+
+    /// Custom decimals for --create-native-faucet.
+    #[arg(long, default_value_t = 8)]
+    native_decimals: u8,
+
+    /// Units of the native token to mint to --wallet-id under --create-native-faucet.
+    #[arg(long, default_value_t = 0)]
+    mint_units: u64,
+
+    /// Bridge out from the wallet vault's callbacks-DISABLED slot. AggLayer
+    /// (bridge-owned wrapped) faucets register callbacks ENABLED (the default here), so
+    /// their bridged-in assets live in the enabled slot. A Miden-NATIVE operator faucet
+    /// (--create-native-faucet) mints via `FungibleAsset::new`, which defaults callbacks
+    /// DISABLED — its assets live in the disabled slot. Set this when bridging OUT a
+    /// Miden-originated (native) token, or the b2agg tx aborts with "amount in the vault
+    /// is less than the amount to remove" (it would address the empty enabled slot).
+    #[arg(long)]
+    asset_callbacks_disabled: bool,
 }
 
 impl std::fmt::Debug for Args {
@@ -207,6 +239,71 @@ fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
     Err(anyhow!("cannot parse account ID: {s}"))
 }
 
+/// Sync the client to the node tip, surviving transient per-request RPC
+/// failures — the fix for the deterministic-in-suite `e2e-claim-provenance`
+/// failure (task #26: 7/7 cert runs died at `--create-foreign-bridge` on a
+/// single unretried `sync_state()`).
+///
+/// Why a progress gate instead of a fixed retry count: `sync_state()` loops
+/// internally in bounded steps (one gRPC request per step, each under the
+/// tool's 10s per-request deadline) and PERSISTS partial progress in the
+/// client store — a failed call resumes where it left off, not from genesis.
+/// So the correct wait condition is "keep going while the sync height still
+/// advances between attempts"; only K consecutive attempts with zero forward
+/// progress indicate a genuine stall (node down / unreachable) worth failing
+/// on. A fixed count would give up mid-catch-up on a long chain even though
+/// every attempt was making progress.
+///
+/// Errors are printed with `{e:?}` deliberately: `ClientError`'s Display is
+/// the bare string "RPC error" (miden-client 0.15 `errors.rs`), which is what
+/// left the suite failure undiagnosable — the gRPC status (DeadlineExceeded /
+/// ResourceExhausted / Unavailable, each with retry guidance) lives in the
+/// source chain that only Debug formatting surfaces.
+async fn sync_with_retry(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    label: &str,
+) -> anyhow::Result<()> {
+    const MAX_STALLED: u32 = 5;
+    const RETRY_DELAY_SECS: u64 = 3;
+    let mut last_height: Option<u64> = None;
+    let mut stalled: u32 = 0;
+    loop {
+        let err = match client.sync_state().await {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        let height = client.get_sync_height().await.ok().map(|h| h.as_u64());
+        let progressed = matches!((last_height, height), (Some(prev), Some(now)) if now > prev);
+        // First successfully-read height establishes the BASELINE — that
+        // attempt is not a stall datapoint (nothing to compare against). A
+        // failed height read PRESERVES the previous baseline (overwriting it
+        // with None would blind progress detection on every later attempt)
+        // and counts toward the stall window fail-closed.
+        let baseline_established = last_height.is_none() && height.is_some();
+        if height.is_some() {
+            last_height = height;
+        }
+        if progressed || baseline_established {
+            // Forward progress (or first baseline) — this attempt does NOT
+            // count toward the stall window; fully reset the counter.
+            stalled = 0;
+        } else {
+            stalled += 1;
+        }
+        if stalled >= MAX_STALLED {
+            return Err(anyhow!(
+                "[{label}] sync stalled: {MAX_STALLED} consecutive attempts without \
+                 progress (sync height {height:?}); last error: {err:?}"
+            ));
+        }
+        eprintln!(
+            "[{label}] sync attempt failed at height {height:?} \
+             ({stalled}/{MAX_STALLED} without progress), retrying in {RETRY_DELAY_SECS}s: {err:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -231,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
     let store_path = args.store_dir.join("store.sqlite3");
     let keystore_path = args.store_dir.join("keystore");
 
-    if args.create_wallet || args.create_foreign_bridge {
+    if args.create_wallet || args.create_foreign_bridge || args.create_native_faucet {
         // Provision modes: the store/keystore may not exist yet — create them.
         std::fs::create_dir_all(&keystore_path)
             .with_context(|| format!("creating keystore dir {}", keystore_path.display()))?;
@@ -296,7 +393,7 @@ async fn main() -> anyhow::Result<()> {
     let mut client = builder
         .build()
         .await
-        .map_err(|e| anyhow!("failed to build miden client: {e}"))?;
+        .map_err(|e| anyhow!("failed to build miden client: {e:?}"))?;
 
     // ── Provision mode ────────────────────────────────────────────────────────
     // Create a fully independent bridge-out wallet in THIS store (separate from
@@ -306,18 +403,17 @@ async fn main() -> anyhow::Result<()> {
             "[create-wallet] provisioning independent wallet in {}",
             store_path.display()
         );
-        client
-            .sync_state()
-            .await
-            .map_err(|e| anyhow!("initial sync failed: {e}"))?;
+        sync_with_retry(&mut client, "create-wallet").await?;
         let wallet =
             miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
                 .await
-                .map_err(|e| anyhow!("wallet creation failed: {e}"))?;
+                .map_err(|e| anyhow!("wallet creation failed: {e:?}"))?;
         // Settle the new account on the node before it can receive deposits.
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            client.sync_state().await.ok();
+            if let Err(e) = client.sync_state().await {
+                eprintln!("[settle] sync failed (non-fatal, retried next tick): {e:?}");
+            }
         }
         println!("[create-wallet] wallet-id: {}", wallet.id().to_hex());
         println!("[create-wallet] done");
@@ -341,28 +437,25 @@ async fn main() -> anyhow::Result<()> {
             store_path.display(),
             args.foreign_network_id
         );
-        client
-            .sync_state()
-            .await
-            .map_err(|e| anyhow!("initial sync failed: {e}"))?;
+        sync_with_retry(&mut client, "foreign-bridge").await?;
 
         let service =
             miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
                 .await
-                .map_err(|e| anyhow!("foreign service wallet creation failed: {e}"))?;
+                .map_err(|e| anyhow!("foreign service wallet creation failed: {e:?}"))?;
         let ger_manager =
             miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
                 .await
-                .map_err(|e| anyhow!("foreign ger_manager wallet creation failed: {e}"))?;
+                .map_err(|e| anyhow!("foreign ger_manager wallet creation failed: {e:?}"))?;
 
         // Deploy ger_manager via dummy txn (mirrors init.rs::deploy_account).
         let dummy = TransactionRequestBuilder::new().build()?;
         let txn_id = submit_new_transaction(&mut client, ger_manager.id(), dummy)
             .await
-            .map_err(|e| anyhow!("foreign ger_manager deploy failed: {e}"))?;
+            .map_err(|e| anyhow!("foreign ger_manager deploy failed: {e:?}"))?;
         wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
             .await
-            .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e}"))?;
+            .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e:?}"))?;
 
         // Foreign bridge (mirrors init.rs::add_bridge).
         let bridge = create_bridge_account(
@@ -374,20 +467,22 @@ async fn main() -> anyhow::Result<()> {
         client
             .add_account(&bridge, false)
             .await
-            .map_err(|e| anyhow!("adding foreign bridge account failed: {e}"))?;
+            .map_err(|e| anyhow!("adding foreign bridge account failed: {e:?}"))?;
         let dummy = TransactionRequestBuilder::new().build()?;
         let txn_id = submit_new_transaction(&mut client, bridge.id(), dummy)
             .await
-            .map_err(|e| anyhow!("foreign bridge deploy failed: {e}"))?;
+            .map_err(|e| anyhow!("foreign bridge deploy failed: {e:?}"))?;
         wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
             .await
-            .map_err(|e| anyhow!("foreign bridge deploy commit wait failed: {e}"))?;
+            .map_err(|e| anyhow!("foreign bridge deploy commit wait failed: {e:?}"))?;
 
         // Settle accounts before the faucet registration note targets the bridge
         // (mirrors init.rs's NTX-builder settlement wait).
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            client.sync_state().await.ok();
+            if let Err(e) = client.sync_state().await {
+                eprintln!("[settle] sync failed (non-fatal, retried next tick): {e:?}");
+            }
         }
 
         // Foreign ETH faucet, registered in the FOREIGN bridge's on-chain
@@ -404,12 +499,15 @@ async fn main() -> anyhow::Result<()> {
             service.id(),
             bridge.id(),
             MetadataHash::from_abi_encoded(&[]),
+            false, // foreign ETH faucet: bridge-owned mint/burn (not Miden-native)
         )
         .await
-        .map_err(|e| anyhow!("foreign faucet creation/registration failed: {e}"))?;
+        .map_err(|e| anyhow!("foreign faucet creation/registration failed: {e:?}"))?;
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            client.sync_state().await.ok();
+            if let Err(e) = client.sync_state().await {
+                eprintln!("[settle] sync failed (non-fatal, retried next tick): {e:?}");
+            }
         }
 
         // Stable, machine-parseable output — e2e-claim-provenance.sh greps these.
@@ -422,6 +520,133 @@ async fn main() -> anyhow::Result<()> {
         println!("[foreign-bridge] faucet-id: {}", faucet.id().to_hex());
         println!("[foreign-bridge] network-id: {}", args.foreign_network_id);
         println!("[foreign-bridge] done");
+        return Ok(());
+    }
+
+    // ── Native-faucet provision mode (Miden-ORIGINATED token e2e) ─────────────
+    // Deploy an OPERATOR-owned fungible faucet (a standalone account, NOT the proxy's
+    // service account) with a custom symbol/decimals, mint --mint-units to --wallet-id,
+    // and print `faucet-id: 0x..`. The bridge admin (proxy) later allowlists it native
+    // (admin_registerNativeFaucet); only then is it bridgeable (bridge locks/unlocks).
+    if args.create_native_faucet {
+        use miden_agglayer_service::init::create_auth_component;
+        use miden_agglayer_service::miden_client::{
+            submit_new_transaction, wait_for_transaction_commit,
+        };
+        use miden_client::account::AccountBuilderSchemaCommitmentExt;
+        use miden_client::crypto::FeltRng;
+        use miden_client::keystore::Keystore;
+        use miden_client::transaction::TransactionRequestBuilder;
+        use miden_protocol::account::{Account, AccountType};
+        use miden_protocol::asset::TokenSymbol;
+        use miden_protocol::note::{Note, NoteType};
+        use miden_standards::account::faucets::{FungibleFaucet, TokenName};
+        use miden_standards::account::policies::{
+            BurnPolicyConfig, MintPolicyConfig, PolicyRegistration, TokenPolicyManager,
+        };
+
+        let wallet_hex = args
+            .wallet_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("--create-native-faucet requires --wallet-id"))?;
+        let wallet_id = AccountId::from_hex(wallet_hex)
+            .map_err(|e| anyhow!("bad --wallet-id {wallet_hex}: {e:?}"))?;
+        sync_with_retry(&mut client, "create-native-faucet").await?;
+
+        // 1. Deploy the operator-owned fungible faucet (custom symbol/decimals).
+        let symbol = TokenSymbol::new(&args.native_symbol)
+            .map_err(|e| anyhow!("invalid TokenSymbol {:?}: {e:?}", args.native_symbol))?;
+        let name =
+            TokenName::new(&symbol.to_string()).map_err(|e| anyhow!("invalid TokenName: {e:?}"))?;
+        let faucet_component = FungibleFaucet::builder()
+            .name(name)
+            .symbol(symbol)
+            .decimals(args.native_decimals)
+            .max_supply(FungibleAsset::MAX_AMOUNT)
+            .build()
+            .map_err(|e| anyhow!("faucet builder failed: {e:?}"))?;
+        // Mint/burn policies (AllowAll) — REQUIRED for the faucet to mint; without the
+        // policy slots the mint tx aborts with "storage slot ... does not exist". Only
+        // mint/burn (no transfer policies — those force AssetCallbackFlag::Enabled keys,
+        // which FungibleAsset::new does not set).
+        let policy_manager = TokenPolicyManager::new()
+            .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
+            .map_err(|e| anyhow!("mint policy failed: {e:?}"))?
+            .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
+            .map_err(|e| anyhow!("burn policy failed: {e:?}"))?;
+        let (auth_component, key_pair) = create_auth_component(&mut client)?;
+        let faucet = Account::builder(client.rng().draw_word().into())
+            .account_type(AccountType::Public)
+            .with_component(faucet_component)
+            .with_components(policy_manager)
+            .with_auth_component(auth_component)
+            .build_with_schema_commitment()
+            .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
+        keystore.add_key(&key_pair, faucet.id()).await?;
+        client.add_account(&faucet, false).await?;
+        let dummy = TransactionRequestBuilder::new().build()?;
+        let txn_id = submit_new_transaction(&mut client, faucet.id(), dummy)
+            .await
+            .map_err(|e| anyhow!("faucet deploy failed: {e:?}"))?;
+        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow!("faucet deploy commit wait failed: {e:?}"))?;
+        println!(
+            "[native-faucet] deployed operator faucet {}",
+            faucet.id().to_hex()
+        );
+
+        // 2. Mint --mint-units to the wallet (produces a P2ID note the wallet consumes).
+        if args.mint_units > 0 {
+            let asset = FungibleAsset::new(faucet.id(), args.mint_units)
+                .map_err(|e| anyhow!("FungibleAsset::new failed: {e:?}"))?;
+            let mint_req = TransactionRequestBuilder::new()
+                .build_mint_fungible_asset(asset, wallet_id, NoteType::Public, client.rng())
+                .map_err(|e| anyhow!("build_mint_fungible_asset failed: {e:?}"))?;
+            // The mint tx's own output note is the P2ID the wallet will consume — grab it
+            // before the request is moved into submit (miden's canonical mint→consume flow).
+            let mint_note: Note = mint_req
+                .expected_output_own_notes()
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("mint tx produced no output note"))?;
+            let mint_txn = submit_new_transaction(&mut client, faucet.id(), mint_req)
+                .await
+                .map_err(|e| anyhow!("mint tx failed: {e:?}"))?;
+            wait_for_transaction_commit(
+                &mut client,
+                mint_txn,
+                30,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| anyhow!("mint commit wait failed: {e:?}"))?;
+            // The wallet must CONSUME the minted note to hold the asset in its vault (a
+            // bridge-out consumes the vault). Sync so the committed note is known, then
+            // consume it into the wallet.
+            sync_with_retry(&mut client, "native-faucet post-mint").await?;
+            let consume_req = TransactionRequestBuilder::new()
+                .build_consume_notes(vec![mint_note])
+                .map_err(|e| anyhow!("build_consume_notes failed: {e:?}"))?;
+            let consume_txn = submit_new_transaction(&mut client, wallet_id, consume_req)
+                .await
+                .map_err(|e| anyhow!("consume tx failed: {e:?}"))?;
+            wait_for_transaction_commit(
+                &mut client,
+                consume_txn,
+                30,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| anyhow!("consume commit wait failed: {e:?}"))?;
+            println!(
+                "[native-faucet] minted {} units to wallet {}",
+                args.mint_units, wallet_hex
+            );
+        }
+
+        // Machine-readable output the e2e greps for.
+        println!("faucet-id: {}", faucet.id().to_hex());
         return Ok(());
     }
 
@@ -469,10 +694,7 @@ async fn main() -> anyhow::Result<()> {
             call.originNetwork, call.destinationNetwork, call.amount
         );
 
-        client
-            .sync_state()
-            .await
-            .map_err(|e| anyhow!("initial sync failed: {e}"))?;
+        sync_with_retry(&mut client, "foreign-claim").await?;
 
         // Wait for an OUTPUT note (by id) to be consumed on-chain, mirroring
         // the B2AGG wait_consumed loop below.
@@ -485,7 +707,9 @@ async fn main() -> anyhow::Result<()> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
             while std::time::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                client.sync_state().await.ok();
+                if let Err(e) = client.sync_state().await {
+                    eprintln!("[settle] sync failed (non-fatal, retried next tick): {e:?}");
+                }
                 let recs = client
                     .get_output_notes(NoteFilter::Consumed)
                     .await
@@ -521,7 +745,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?;
         let txn_id = submit_new_transaction(&mut client, ger_manager_id, tx_request)
             .await
-            .map_err(|e| anyhow!("foreign GER inject submit failed: {e}"))?;
+            .map_err(|e| anyhow!("foreign GER inject submit failed: {e:?}"))?;
         println!("[foreign-claim] GER inject transaction submitted: {txn_id}");
         wait_output_consumed(&mut client, ger_note_id, "foreign UpdateGer", 240).await?;
         println!("[foreign-claim] GER injected (UpdateGerNote consumed by foreign bridge)");
@@ -550,7 +774,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?;
         let txn_id = submit_new_transaction(&mut client, service_id, tx_request)
             .await
-            .map_err(|e| anyhow!("foreign CLAIM submit failed: {e}"))?;
+            .map_err(|e| anyhow!("foreign CLAIM submit failed: {e:?}"))?;
         println!("[foreign-claim] CLAIM transaction submitted: {txn_id}");
         wait_output_consumed(&mut client, note_id, "foreign CLAIM", 300).await?;
 
@@ -583,10 +807,7 @@ async fn main() -> anyhow::Result<()> {
         println!("[private-note] wallet: {wallet_id}");
 
         println!("[private-note] syncing state...");
-        client
-            .sync_state()
-            .await
-            .map_err(|e| anyhow!("sync failed: {e}"))?;
+        sync_with_retry(&mut client, "private-note").await?;
 
         // P2ID recipient targeting the wallet itself; PRIVATE note type; note
         // tag left at the default (0) so `sync_notes(tags={0})` lists it — the
@@ -625,7 +846,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) if attempt < ATTEMPTS => {
                     eprintln!(
-                        "[private-note] submit attempt {attempt} failed: {e}; retrying in 10s"
+                        "[private-note] submit attempt {attempt} failed: {e:?}; retrying in 10s"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 }
@@ -640,7 +861,9 @@ async fn main() -> anyhow::Result<()> {
         let mut commit_block: Option<u32> = None;
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            client.sync_state().await.ok();
+            if let Err(e) = client.sync_state().await {
+                eprintln!("[settle] sync failed (non-fatal, retried next tick): {e:?}");
+            }
             let recs = client
                 .get_output_notes(miden_client::store::NoteFilter::Committed)
                 .await
@@ -693,21 +916,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Sync state — retry on transient errors (concurrent SQLite access with
-    // the running service can cause "failed to convert note record" errors).
+    // the running service can cause "failed to convert note record" errors;
+    // node RPC under suite load returns transient gRPC failures).
     println!("[bridge-out] syncing state...");
-    for sync_attempt in 0..5u32 {
-        match client.sync_state().await {
-            Ok(_) => break,
-            Err(e) if sync_attempt < 4 => {
-                eprintln!(
-                    "[bridge-out] sync attempt {} failed: {e}, retrying...",
-                    sync_attempt + 1
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            Err(e) => return Err(anyhow!("sync failed after 5 attempts: {e}")),
-        }
-    }
+    sync_with_retry(&mut client, "bridge-out").await?;
     println!("[bridge-out] sync complete");
 
     // Try to consume any Expected/Committed notes for the wallet
@@ -735,7 +947,13 @@ async fn main() -> anyhow::Result<()> {
             println!("[bridge-out] consuming {} notes...", consumable.len());
             let notes: Vec<miden_protocol::note::Note> = consumable
                 .into_iter()
-                .filter_map(|(rec, _)| rec.try_into().ok())
+                .filter_map(|(rec, _)| match rec.try_into() {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        eprintln!("[bridge-out] SKIPPING unconvertible note record (was silently dropped pre-#128): {e:?}");
+                        None
+                    }
+                })
                 .collect();
             if !notes.is_empty() {
                 match TransactionRequestBuilder::new().build_consume_notes(notes) {
@@ -750,11 +968,15 @@ async fn main() -> anyhow::Result<()> {
                                 println!("[bridge-out] consumed notes: {tx}");
                                 for _ in 0..10 {
                                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                    client.sync_state().await.ok();
+                                    if let Err(e) = client.sync_state().await {
+                                        eprintln!(
+                                            "[settle] sync failed (non-fatal, retried next tick): {e:?}"
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
-                                println!("[bridge-out] consume failed: {e}");
+                                println!("[bridge-out] consume failed: {e:?}");
                             }
                         }
                     }
@@ -768,7 +990,7 @@ async fn main() -> anyhow::Result<()> {
                             miden_agglayer_service::metrics::ProofKind::BridgeOut,
                             miden_agglayer_service::metrics::ProofOutcome::BuildFailed,
                         );
-                        println!("[bridge-out] build consume req failed: {e}");
+                        println!("[bridge-out] build consume req failed: {e:?}");
                     }
                 }
             }
@@ -780,7 +1002,7 @@ async fn main() -> anyhow::Result<()> {
         .account_reader(wallet_id)
         .get_balance(faucet_id)
         .await
-        .map_err(|e| anyhow!("failed to get balance: {e}"))?;
+        .map_err(|e| anyhow!("failed to get balance: {e:?}"))?;
     println!("[bridge-out] wallet balance: {balance}");
 
     if balance < args.amount {
@@ -803,9 +1025,14 @@ async fn main() -> anyhow::Result<()> {
     // callbacks DISABLED, so a default-flag asset addresses a different (empty)
     // vault slot and the bridge-out tx fails with "amount in the vault is less
     // than the amount to remove". Match the vault by enabling callbacks.
+    let cb_flag = if args.asset_callbacks_disabled {
+        AssetCallbackFlag::Disabled // Miden-native operator faucet: assets in the disabled slot
+    } else {
+        AssetCallbackFlag::Enabled // AggLayer bridge-owned wrapped faucet: enabled slot
+    };
     let asset: Asset = FungibleAsset::new(faucet_id, args.amount)
         .map_err(|e| anyhow!("invalid asset: {e}"))?
-        .with_callbacks(AssetCallbackFlag::Enabled)
+        .with_callbacks(cb_flag)
         .into();
     let note_assets = NoteAssets::new(vec![asset]).map_err(|e| anyhow!("note assets: {e}"))?;
 
@@ -829,10 +1056,7 @@ async fn main() -> anyhow::Result<()> {
     for attempt in 1..=SUBMIT_ATTEMPTS {
         // Sync right before each attempt to minimize the window where the
         // service's background sync loop can change our shared SQLite state.
-        client
-            .sync_state()
-            .await
-            .map_err(|e| anyhow!("pre-submit sync failed: {e}"))?;
+        sync_with_retry(&mut client, "bridge-out pre-submit").await?;
 
         let b2agg = B2AggNote::create(
             args.dest_network,
@@ -842,7 +1066,7 @@ async fn main() -> anyhow::Result<()> {
             wallet_id,
             client.rng(),
         )
-        .map_err(|e| anyhow!("B2AGG creation failed: {e}"))?;
+        .map_err(|e| anyhow!("B2AGG creation failed: {e:?}"))?;
         let b2agg_note_id = b2agg.id();
         println!("[bridge-out] B2AGG note created: {b2agg_note_id}");
 
@@ -912,7 +1136,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) if attempt < SUBMIT_ATTEMPTS => {
                 eprintln!(
-                    "[bridge-out] submit attempt {attempt} failed: {e}; retrying in 10s \
+                    "[bridge-out] submit attempt {attempt} failed: {e:?}; retrying in 10s \
                      (prover backpressure is the common cause)"
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -942,7 +1166,9 @@ async fn main() -> anyhow::Result<()> {
         let mut consumed = false;
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            client.sync_state().await.ok();
+            if let Err(e) = client.sync_state().await {
+                eprintln!("[settle] sync failed (non-fatal, retried next tick): {e:?}");
+            }
             let recs = client
                 .get_output_notes(miden_client::store::NoteFilter::Consumed)
                 .await
@@ -964,7 +1190,9 @@ async fn main() -> anyhow::Result<()> {
         println!("[bridge-out] waiting for confirmation...");
         for i in 1..=5 {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            client.sync_state().await.ok();
+            if let Err(e) = client.sync_state().await {
+                eprintln!("[settle] sync failed (non-fatal, retried next tick): {e:?}");
+            }
             println!("[bridge-out] sync cycle {i}/5");
         }
     }

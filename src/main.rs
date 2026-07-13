@@ -111,6 +111,21 @@ struct Command {
     #[arg(long, env = "L1_INDEXER_FROM_BLOCK")]
     l1_indexer_from_block: Option<u64>,
 
+    /// Faucet-registry security reconciler poll interval, in seconds. The reconciler is
+    /// a TRIPWIRE: it scans the bridge's on-chain faucet registrations and halts the
+    /// proxy (fail-closed) if it finds one with no local `faucet_registry` row — the
+    /// bridge admin key having been used outside the proxy is a compromise signal. Set
+    /// to `0` to disable (NOT recommended in production). Default 30s.
+    #[arg(long, env = "FAUCET_RECONCILER_POLL_SECS", default_value_t = 30)]
+    faucet_reconciler_poll_secs: u64,
+
+    /// Consecutive reconciler scans an unknown bridge faucet must survive before it
+    /// halts the proxy. The grace window (poll_secs × grace_ticks) tolerates the brief
+    /// gap between the proxy's own on-chain registration note and its store-row commit,
+    /// so a registration in flight never false-halts. Default 3.
+    #[arg(long, env = "FAUCET_RECONCILER_GRACE_TICKS", default_value_t = 3)]
+    faucet_reconciler_grace_ticks: u32,
+
     /// Enable Miden VM debug mode (verbose execution traces). Disable in production.
     #[arg(long, env = "MIDEN_DEBUG")]
     miden_debug: bool,
@@ -696,8 +711,8 @@ async fn main() -> anyhow::Result<()> {
     // an `AccountDataNotFound` or `IncorrectAccountInitialCommitment` error,
     // the caller reimports the affected account from the live Miden node and
     // retries once. We deliberately do NOT brick the proxy at startup over
-    // locally-deployed-but-not-yet-network-tracked accounts (e.g. service,
-    // wallet_hardhat) — those are healthy until first use, at which point
+    // locally-deployed-but-not-yet-network-tracked accounts (e.g. service)
+    // — those are healthy until first use, at which point
     // their initial `submit_new_transaction` deploys them on-chain.
     // Run restore if requested
     if command.restore {
@@ -839,6 +854,34 @@ async fn main() -> anyhow::Result<()> {
              Without it, GER orphan resolution falls back to the racing view-call path \
              in service_send_raw_txn.rs and may produce orphan GERs under deposit load."
         );
+    }
+
+    // Faucet-registry security reconciler (tripwire). Only the proxy (bridge admin) may
+    // register a faucet, and it writes the local row alongside the on-chain note; a
+    // bridge registration with no local row means the admin key was used elsewhere.
+    // The reconciler halts the proxy fail-closed if it sees one. `--restore` is the only
+    // sanctioned way to import externally-registered faucets, and it runs (and populates
+    // the store) before this loop's first delayed scan, so it never fights recovery.
+    if command.faucet_reconciler_poll_secs == 0 {
+        tracing::warn!(
+            "faucet-registry security reconciler DISABLED (--faucet-reconciler-poll-secs 0). \
+             An admin-key registration outside the proxy will NOT be detected."
+        );
+    } else {
+        let reconciler =
+            miden_agglayer_service::faucet_registry_reconciler::FaucetRegistryReconciler::new(
+                state.miden_client.clone(),
+                state.store.clone(),
+                state.accounts.0.bridge.0,
+            )
+            .with_poll_interval(std::time::Duration::from_secs(
+                command.faucet_reconciler_poll_secs,
+            ))
+            .with_grace_ticks(command.faucet_reconciler_grace_ticks);
+        // Runs for the lifetime of the runtime; leak the shutdown sender (same rationale
+        // as the L1 indexer above — no graceful-shutdown path holds it).
+        std::mem::forget(reconciler.spawn());
+        tracing::info!("FaucetRegistryReconciler spawned");
     }
 
     // (Metrics recorder + `init_metrics` are installed at the very top of
@@ -1045,6 +1088,8 @@ mod hardening_tests {
             l1_rpc_url: None,
             ger_l1_address: None,
             l1_indexer_from_block: None,
+            faucet_reconciler_poll_secs: 30,
+            faucet_reconciler_grace_ticks: 3,
             miden_debug: false,
             cors_allowed_origins: cors,
             admin_api_key: admin,
@@ -1197,7 +1242,12 @@ mod bind_tests {
     fn ipv6_bind_builds_valid_bracketed_url() {
         let url = build_service_url("::1", 8546).expect("::1 must build a valid URL");
         assert_eq!(url.as_str(), "http://[::1]:8546/");
-        assert_eq!(url.host_str(), Some("::1"));
+        // `host_str` bracketing for IPv6 varies across `url` crate versions
+        // ("::1" vs "[::1]") — assert the PARSED host instead, which is stable.
+        assert_eq!(
+            url.host(),
+            Some(url::Host::Ipv6("::1".parse().expect("valid IPv6")))
+        );
         assert_eq!(url.port(), Some(8546));
     }
 

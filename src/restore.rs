@@ -275,9 +275,9 @@ pub async fn restore(
     // the recovery flags.
     //
     // Best-effort: per-account failures are logged + counted but do not
-    // abort restore. Locally-deployed-but-not-network-tracked accounts
-    // (`service`, `wallet_hardhat`) will return `AccountNotFoundOnChain`
-    // here and that's fine — they're healthy until first use.
+    // abort restore. The locally-deployed-but-not-network-tracked account
+    // (`service`) will return `AccountNotFoundOnChain` here and that's
+    // fine — it's healthy until first use.
     tracing::info!("Phase 0: re-importing bridge accounts from Miden node...");
     crate::account_recovery::reimport_known_accounts(miden_client, accounts).await;
     tracing::info!("Phase 0 complete: bridge account reimport pass done");
@@ -650,7 +650,11 @@ async fn restore_faucet_identities(
                         bridge_account.storage(),
                         faucet_id,
                     ) else {
-                        continue; // native / unregistered — nothing to rebuild
+                        // All-zero conversion = the native-ETH sentinel (pre-seeded, never
+                        // rebuilt from chain) or an unregistered id. A registered NATIVE
+                        // faucet has a non-zero origin (origin_network == network_id, scale 0),
+                        // so it does NOT land here — it proceeds to classify + rebuild below.
+                        continue;
                     };
                     match crate::faucet_ops::rebuild_faucet_entry_from_chain(
                         client,
@@ -681,14 +685,31 @@ async fn restore_faucet_identities(
                             }
                         }
                         Err(e) => {
-                            ::metrics::counter!("restore_faucet_identity_rebuild_failed_total")
-                                .increment(1);
-                            tracing::warn!(
-                                faucet_id = %faucet_id,
-                                error = ?e,
-                                "Cantina #6: could not rebuild faucet row from chain; historical \
-                                 bridge-outs for this faucet stay quarantined until it is backfilled"
-                            );
+                            // An UNKNOWN faucet type registered in the bridge is a fail-LOUD
+                            // condition (malformed / hostile registration), distinct from a
+                            // recoverable metadata miss — surface it at ERROR with its own
+                            // metric so operators must investigate rather than let it pass as
+                            // a routine quarantine.
+                            if format!("{e:?}").contains("UNKNOWN faucet type") {
+                                ::metrics::counter!("restore_unknown_faucet_type_total")
+                                    .increment(1);
+                                tracing::error!(
+                                    faucet_id = %faucet_id,
+                                    error = ?e,
+                                    "restore: UNKNOWN faucet type registered in the bridge — \
+                                     matches no supported faucet kind; NOT rebuilt. Investigate: \
+                                     this should never happen for a proxy-registered faucet."
+                                );
+                            } else {
+                                ::metrics::counter!("restore_faucet_identity_rebuild_failed_total")
+                                    .increment(1);
+                                tracing::warn!(
+                                    faucet_id = %faucet_id,
+                                    error = ?e,
+                                    "Cantina #6: could not rebuild faucet row from chain; historical \
+                                     bridge-outs for this faucet stay quarantined until it is backfilled"
+                                );
+                            }
                         }
                     }
                 }
@@ -1077,10 +1098,16 @@ pub(crate) async fn project_b2agg_note(
     // (dedup-stable).
     let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
 
-    let deposit_count = store.mark_note_processed(note_id_str.clone()).await?;
-
-    if let Err(err) = store
-        .add_bridge_event(
+    // H1 — atomic B2AGG commit. The legacy two-step mark-processed +
+    // emit-bridge-event sequence left a crash window: a process kill between
+    // the steps recorded the note as processed (deposit_counter bumped) with
+    // NO matching BridgeEvent, silently stranding the exit.
+    // `commit_b2agg_event_atomic` folds both into a single DB transaction and
+    // is idempotent on retry (reuses the original deposit_count, emits no
+    // duplicate log — H3).
+    let deposit_count = store
+        .commit_b2agg_event_atomic(
+            note_id_str.clone(),
             bridge_address,
             restore_block,
             block_hash,
@@ -1092,13 +1119,8 @@ pub(crate) async fn project_b2agg_note(
             &destination_address,
             origin_amount,
             &emit_metadata,
-            deposit_count,
         )
-        .await
-    {
-        let _ = store.unmark_note_processed(&note_id_str).await;
-        return Err(err);
-    }
+        .await?;
 
     // "emitted BridgeEvent" is the production signal a bridge-out was projected —
     // both the live projector and the startup restore replay reach here, and both
@@ -2305,10 +2327,27 @@ mod tests {
         let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
         ma3_register_faucet(&store, faucet_id).await;
 
-        // Reclaim consumer, but a pre-fix run already marked it processed.
+        // Reclaim consumer, but a pre-fix run already marked it processed
+        // (seeded via the sole processed-set write path).
         let note = ma3_b2agg_input_note(faucet_id, Some(id(TEST_SENDER_MANAGER)));
         let note_id = hex::encode(note.details_commitment().as_bytes());
-        store.mark_note_processed(note_id.clone()).await.unwrap();
+        store
+            .commit_b2agg_event_atomic(
+                note_id.clone(),
+                get_bridge_address(),
+                1,
+                [7u8; 32],
+                "0xtx-legacy",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0u8; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
 
         let outcome = project_b2agg_note(
             &store,
@@ -2339,9 +2378,26 @@ mod tests {
         let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
         ma3_register_faucet(&store, faucet_id).await;
 
+        // An earlier run committed this note through the atomic write path.
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
         let note_id = hex::encode(note.details_commitment().as_bytes());
-        store.mark_note_processed(note_id.clone()).await.unwrap();
+        store
+            .commit_b2agg_event_atomic(
+                note_id.clone(),
+                get_bridge_address(),
+                1,
+                [7u8; 32],
+                "0xtx-earlier",
+                0,
+                1,
+                &[0u8; 20],
+                0,
+                &[0u8; 20],
+                1_000,
+                &[0u8; 0],
+            )
+            .await
+            .unwrap();
 
         let outcome = project_b2agg_note(
             &store,

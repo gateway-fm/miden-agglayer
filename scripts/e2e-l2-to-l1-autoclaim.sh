@@ -120,7 +120,7 @@ pass "BridgeEvent detected in L2"
 # ── Step 3: Wait for certificate settlement on L1 ────────────────────────────
 log "Step 3/5: Waiting for certificate settlement on AggLayer..."
 wait_for "certificate settled" \
-    "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
+    "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep 'changed status.*Settled' | grep -vE 'NewLocalExitRoot: (0x0+,|0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757)' | grep -q 'NewLocalExitRoot'" \
     900 10
 pass "Certificate settled on L1!"
 

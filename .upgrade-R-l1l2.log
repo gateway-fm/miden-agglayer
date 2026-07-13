@@ -1,0 +1,36 @@
+[0;32m[22:52:54][0m ======================================================================
+[0;32m[22:52:54][0m   L1→L2 Deposit + Claim
+[0;32m[22:52:54][0m ======================================================================
+[0;32m[22:52:54][0m Wallet:  0x9db37899673f9f3129fe22eba486cb (isolated store: /home/mandrigin/miden-agglayer/.claude/worktrees/miden-origin/.b2agg-store/e2e-suite)
+[0;32m[22:52:54][0m Dest:    0x000000009db37899673f9f3129fe22eba486cb00 (zero-padded, network 1)
+[0;32m[22:52:54][0m Amount:  10000000000000 wei (expect 1000 Miden units)
+[0;32m[22:52:55][0m L2 balance before deposit: 0
+[0;32m[22:52:55][0m Step 1/5: Depositing on L1...
+[0;32m[22:52:56] PASS:[0m L1 deposit succeeded
+[0;32m[22:52:56][0m Step 2/5: Waiting for bridge-service sync + GER injection...
+[0;32m[22:52:56][0m Waiting: deposit ready_for_claim (stall_timeout=90s, max_total=600s)...
+
+[0;32m[22:53:01][0m   progress: L1=220 L2_synth=53 deposits_seen=1
+
+[0;32m[22:53:06][0m   progress: L1=225 L2_synth=57 deposits_seen=1
+
+[0;32m[22:53:11][0m   progress: L1=230 L2_synth=58 deposits_seen=1
+
+[0;32m[22:53:16][0m   progress: L1=235 L2_synth=58 deposits_seen=1
+
+[0;32m[22:53:16] PASS:[0m Deposit is ready_for_claim
+[0;32m[22:53:16][0m Step 3/5: Waiting for ClaimTxManager auto-claim...
+[0;32m[22:53:16][0m Waiting: claim tx submitted (timeout: 120s)...
+..
+[0;32m[22:53:27] PASS:[0m CLAIM note submitted to Miden
+[0;32m[22:53:27][0m Step 4/5: Waiting for CLAIM commit + NTX builder processing...
+[0;32m[22:53:27][0m Waiting: claim tx committed (timeout: 60s)...
+
+[0;32m[22:53:27] PASS:[0m CLAIM committed — waiting for NTX builder to create P2ID...
+[0;32m[22:53:27][0m Step 5/5: Checking wallet balance (sync + consume P2ID notes, isolated store)...
+[0;32m[22:54:14][0m Attempt 1/15: balance = 1000 (was 0)
+[0;32m[22:54:14] PASS:[0m L1→L2 COMPLETE! Wallet balance: 0 → 1000 (+1000, expected +1000)
+
+[0;32m[22:54:14][0m ======================================================================
+[0;32m[22:54:14][0m   L1→L2 TEST DONE
+[0;32m[22:54:14][0m ======================================================================

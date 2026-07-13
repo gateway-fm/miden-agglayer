@@ -198,6 +198,10 @@ MIDEN_NODE_GIT_REF := v0.15.0
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
+# L2<->L2 overlay (task #25): base stack + the second-rollup overlay. The
+# generated configs it mounts must be produced by `make gen-l2b-configs` first.
+L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env
+
 .PHONY: miden-node-image-coords
 miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
 	@echo "url: $(MIDEN_NODE_GIT_URL)"
@@ -208,7 +212,7 @@ e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
 	./scripts/setup-fixtures.sh
 
 .PHONY: e2e-clean-data
-e2e-clean-data: ## Wipe .miden-agglayer-data/ + node_data volume so the stack re-inits against fresh genesis
+e2e-clean-data: ## Wipe .miden-agglayer-data/ + .b2agg-store/ + node_data volume so the stack re-inits against fresh genesis
 	# Proto 0.15: the node is a microservice stack whose state (genesis block,
 	# store, validator + ntx-builder DBs) lives in the `node_data` Docker volume,
 	# and the proxy's genesis pin lives in .miden-agglayer-data/store.sqlite3.
@@ -216,12 +220,32 @@ e2e-clean-data: ## Wipe .miden-agglayer-data/ + node_data volume so the stack re
 	# client's sync fail ("accept header validation failed"), so wipe BOTH for a
 	# clean slate. The bootstrap services rebuild genesis (deterministic from the
 	# vendored agglayer .mac files) and the proxy's --init redeploys accounts in
-	# ~45s — acceptable for E2E. The volume rm is guarded so it no-ops when the
-	# volume is absent or still in use (containers must be down first, which the
-	# regression harness guarantees via `make e2e-down`).
-	rm -rf .miden-agglayer-data
+	# ~45s — acceptable for E2E.
+	#
+	# Task #26 hardening — three closed holes:
+	#  (1) .b2agg-store/ (the tests' ISOLATED miden-client stores) is wiped too:
+	#      an isolated store surviving a stack recreation carries the OLD chain's
+	#      genesis commitment in its gRPC Accept header and the new node refuses
+	#      the connection (AcceptHeaderError, shown as a bare "RPC error") — one
+	#      such store wedged e2e-claim-provenance on 7 consecutive cert runs.
+	#      Fresh stack ⇒ no isolated store may outlive it, ever.
+	#  (2) Containers create root-owned files in these dirs; a plain `rm -rf` as
+	#      the invoking user fails on them and historically failed SILENTLY —
+	#      stale "fresh" stacks cost a night of debugging. Fall back to a root
+	#      container, then ASSERT the dirs are actually empty (wipe-that-didn't-
+	#      wipe is a hard stop, not a warning).
+	#  (3) The node_data volume rm distinguishes "absent" (fine) from "in use"
+	#      (a live container still mounts it ⇒ `make e2e-down` was not run ⇒
+	#      stale node state would survive under a "fresh" stack — hard stop).
+	rm -rf .miden-agglayer-data .b2agg-store 2>/dev/null || \
+		docker run --rm -v "$(CURDIR):/work" alpine sh -c 'rm -rf /work/.miden-agglayer-data /work/.b2agg-store'
+	@if [ -e .miden-agglayer-data ] || [ -e .b2agg-store ]; then \
+		echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
+		ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; fi
 	mkdir -p .miden-agglayer-data/tmp
-	-docker volume rm miden-agglayer_node_data 2>/dev/null || true
+	@out=$$(docker volume rm miden-agglayer_node_data 2>&1) || { \
+		echo "$$out" | grep -qi "no such volume" || { \
+			echo "e2e-clean-data: cannot remove node_data volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)
@@ -237,6 +261,31 @@ COMPOSE_ENV := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MID
 .PHONY: e2e-test
 e2e-test: ## Run E2E tests (assumes stack is already up)
 	$(COMPOSE_ENV) ./scripts/e2e-test.sh
+
+# --- L2<->L2 (second rollup) --------------------------------------------------
+.PHONY: gen-l2b-configs
+gen-l2b-configs: ## Generate the L2B overlay configs (agglayer/aggkit-l2b/bridge, taplo-normalized)
+	./scripts/gen-l2b-configs.sh
+
+.PHONY: e2e-l2l2-up
+e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay, register rollup #2 (fresh data dir)
+	# Bring everything up WITHOUT --wait: aggkit-l2b + bridge-service cannot become
+	# healthy until rollup #2 is registered below, so --wait here would deadlock and
+	# abort the target (they crash-loop / exit(1) with "invalid rollup id (0)").
+	$(L2L2_COMPOSE) up -d --build
+	@echo ">> waiting for anvil-l2b (:9545) before registering rollup #2"
+	@until cast chain-id --rpc-url http://localhost:9545 >/dev/null 2>&1; do sleep 2; done
+	L2B_RPC=http://localhost:9545 ./scripts/setup-l2b.sh
+	# Rollup #2 now exists: (re)create the network-2 services and WAIT for them to
+	# go healthy — aggkit-l2b and the ISOLATED L2B bridge-service (which must
+	# re-index network 2 now that rollup #2 + the L2B bridge/GER exist). NOT
+	# anvil-l2b (freshly-deployed in-memory L2B state) and NOT the base Miden
+	# bridge-service (indexes L1 + Miden, unaffected by rollup #2).
+	$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b
+
+.PHONY: e2e-l2l2
+e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
+	$(COMPOSE_ENV) ./scripts/e2e-test.sh l2l2
 
 .PHONY: e2e-l1-to-l2
 e2e-l1-to-l2: e2e-up ## Spin up stack + run L1→L2 deposit + claim test
@@ -416,6 +465,10 @@ e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 .PHONY: e2e-down
 e2e-down: ## Stop E2E environment
 	$(E2E_COMPOSE) down -v
+
+.PHONY: e2e-l2l2-down
+e2e-l2l2-down: ## Stop the L2<->L2 stack (base + L2B overlay). --remove-orphans so anvil-l2b/aggkit-l2b/bridge-service don't linger on a reused (self-hosted) host
+	$(L2L2_COMPOSE) down -v --remove-orphans
 
 .PHONY: e2e-logs
 e2e-logs: ## Tail all E2E service logs

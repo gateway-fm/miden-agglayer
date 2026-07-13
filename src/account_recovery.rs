@@ -31,8 +31,8 @@
 //! ## Why NOT startup verification (the design we deleted)
 //!
 //! Not every account in `bridge_accounts.toml` is fully tracked by the
-//! node at every moment. Locally-deployed `service` and `wallet_hardhat`
-//! are created by `add_wallet` (`init.rs:125-153`) but never get an
+//! node at every moment. The locally-deployed `service` account
+//! is created by `add_wallet` (`init.rs:125-153`) but never gets an
 //! explicit `deploy_account` call — they exist locally until first use,
 //! at which point `submit_new_transaction` deploys them on-chain. A
 //! startup `verify_or_reimport_or_fail` call against those accounts
@@ -168,7 +168,7 @@ pub async fn reimport_account(
 /// Re-import every account in `bridge_accounts.toml`. Per-account
 /// failures are logged but NOT propagated — callers want this to be
 /// best-effort idempotent before retrying a submission. The locally-
-/// only accounts (e.g. `wallet_hardhat`, `service`) that aren't
+/// only accounts (e.g. `service`) that aren't
 /// network-deployed will fail here with `AccountNotFoundOnChain` and
 /// that's fine: if the next submission succeeds, those accounts get
 /// deployed implicitly by the tx.
@@ -177,7 +177,6 @@ pub async fn reimport_known_accounts(client: &MidenClient, accounts: &AccountsCo
         let mut v = vec![
             ("service", accounts.service.0),
             ("bridge", accounts.bridge.0),
-            ("wallet_hardhat", accounts.wallet_hardhat.0),
         ];
         if let Some(g) = &accounts.ger_manager {
             v.push(("ger_manager", g.0));

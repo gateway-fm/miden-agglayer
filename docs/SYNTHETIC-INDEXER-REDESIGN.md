@@ -49,6 +49,30 @@ Catch-up (cursor → tip) **is** recovery **is** the normal loop.
 - **Mapping.** synthetic block `N` ⟷ Miden block `N`. An empty Miden block → an empty synthetic
   block (monotonic, gap-free).
 
+### STRONG invariants (getLogs correctness — do not weaken)
+
+- **`getLogs` immutability.** `eth_getLogs([m, N])` MUST be immutable: once synthetic block `N` is
+  exposed, its log set never changes — no event is ever added, moved, or removed from an
+  already-exposed block. aggkit/agglayer re-query block ranges and must get byte-identical results
+  every time. Adding an event to a sealed block, or emitting it "late" into a later block, both
+  violate this and are forbidden.
+- **Reconcile-before-project, per block.** Block `N` is projected ONLY after it is *fully*
+  reconciled — every note consumed at `N` is known. Critically, "reconciled" means the block's
+  consumptions are **authoritatively confirmed from the node's finalized block**, not inferred from
+  the lagging local `sync_state` feed. Foundation: once `N ≤ miden_tip` the node holds `N`'s
+  complete, immutable consumption set (every nullifier spent in `N` is baked into the block); always
+  read consumptions from the finalized node block, never a partial local view. Formally
+  `projected ≤ reconciled`, where `reconciled` = the frontier whose consumptions the node has
+  confirmed — NOT the note-creation sweep frontier (that was the #30 bug: the cursor advanced on
+  `sync_notes` creation, silently excluding consumptions).
+- **Zero late notes (STRONG).** The late-consumption sweep MUST NEVER fire, for notes of **any**
+  kind. A non-empty `late` set means a block was sealed before it was fully reconciled — a
+  correctness violation even if that particular note emits no synthetic event, because it proves the
+  reconcile-before-project invariant did not hold and the B2AGG case is then only "accidentally"
+  safe. `projector_late_sweep_anomaly_total` MUST be 0 in steady state; a non-zero value is a bug to
+  fix at the barrier, not a routine recovery to paper over. The sweep is a fail-closed ALARM, not a
+  load-bearing recovery path.
+
 ## Event derivations (all already exist)
 
 | Synthetic event | Source on Miden chain          | Existing code                          |

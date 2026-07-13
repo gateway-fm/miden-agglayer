@@ -124,11 +124,7 @@ pub async fn detect_locked_accounts(
     client: &MidenClient,
     accounts: &AccountsConfig,
 ) -> Result<Vec<AccountId>> {
-    let mut ids: Vec<AccountId> = vec![
-        accounts.service.0,
-        accounts.bridge.0,
-        accounts.wallet_hardhat.0,
-    ];
+    let mut ids: Vec<AccountId> = vec![accounts.service.0, accounts.bridge.0];
     if let Some(f) = &accounts.faucet_eth {
         ids.push(f.0);
     }

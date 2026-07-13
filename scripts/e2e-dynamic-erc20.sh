@@ -255,7 +255,7 @@ pass "BridgeEvent emitted for TestToken bridge-out"
 log "Step 7/7: Waiting for certificate settlement on L1..."
 
 wait_for "certificate settled" \
-    "docker logs $AGGKIT_CONTAINER 2>&1 | grep -q 'changed status.*Settled.*NewLocalExitRoot: 0x[^2]'" \
+    "docker logs $AGGKIT_CONTAINER 2>&1 | grep 'changed status.*Settled' | grep -vE 'NewLocalExitRoot: (0x0+,|0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757)' | grep -q 'NewLocalExitRoot'" \
     900 10
 pass "Certificate settled on L1"
 

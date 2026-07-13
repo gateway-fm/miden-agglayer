@@ -17,7 +17,6 @@ pub struct AccountsConfig {
     /// Legacy field — kept for backward compatibility with existing TOML configs.
     #[serde(default)]
     pub faucet_agg: Option<AccountIdBech32>,
-    pub wallet_hardhat: AccountIdBech32,
     /// Dedicated account for GER injection. Separate from `service` so the
     /// NTX builder's modifications to the service account don't cause stale
     /// state errors when submitting UpdateGerNotes.
@@ -83,7 +82,6 @@ struct AccountsConfigOnDisk {
     faucet_eth: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     faucet_agg: Option<String>,
-    wallet_hardhat: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ger_manager: Option<String>,
 }
@@ -96,7 +94,6 @@ impl AccountsConfigOnDisk {
             bridge: enc(&config.bridge),
             faucet_eth: config.faucet_eth.as_ref().map(&enc),
             faucet_agg: config.faucet_agg.as_ref().map(&enc),
-            wallet_hardhat: enc(&config.wallet_hardhat),
             ger_manager: config.ger_manager.as_ref().map(&enc),
         }
     }
@@ -409,7 +406,6 @@ mod tests {
             bridge: dummy(),
             faucet_eth: Some(dummy()),
             faucet_agg: None,
-            wallet_hardhat: dummy(),
             ger_manager: Some(dummy()),
         };
         save_config(cfg, &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
@@ -433,10 +429,7 @@ mod tests {
         let id = AccountId::from_hex(TEST_ACCOUNT_HEX).unwrap();
         let local_hrp = NetworkId::new("mlcl").unwrap();
         let legacy_bech32 = id.to_bech32(local_hrp);
-        let toml_body = format!(
-            "service = \"{b}\"\nbridge = \"{b}\"\nwallet_hardhat = \"{b}\"\n",
-            b = legacy_bech32
-        );
+        let toml_body = format!("service = \"{b}\"\nbridge = \"{b}\"\n", b = legacy_bech32);
         fs::write(dir.path().join("bridge_accounts.toml"), toml_body).unwrap();
         let loaded = load_config(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(loaded.bridge.0, id);
@@ -450,7 +443,6 @@ mod tests {
             bridge: dummy(),
             faucet_eth: None,
             faucet_agg: None,
-            wallet_hardhat: dummy(),
             ger_manager: None,
         };
         save_config(cfg, &NetworkId::Testnet, Some(dir.path().to_path_buf())).unwrap();
@@ -467,7 +459,6 @@ mod tests {
             bridge: dummy(),
             faucet_eth: Some(dummy()),
             faucet_agg: Some(dummy()),
-            wallet_hardhat: dummy(),
             ger_manager: Some(dummy()),
         }
     }

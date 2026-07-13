@@ -1,0 +1,15 @@
+# Release-phase override for the in-place upgrade test (scripts/e2e-upgrade-test.sh).
+# Pins the proxy to the RELEASE image and the RELEASE command line (older binaries
+# reject flags added since — e.g. the native-faucet flags), while every other service
+# and the bind-mounted store stay identical. Generated from the v0.15.7 tag's compose.
+services:
+  miden-agglayer:
+    image: miden-agglayer-e2e:v0.15.7
+    build: null
+    command:
+    - --port=8546
+    - --miden-node=http://miden-node:57291
+    - --miden-store-dir=/var/lib/miden-agglayer-service
+    - --l1-rpc-url=http://anvil:8545
+    - --ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674
+    - --l1-indexer-from-block=1
