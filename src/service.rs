@@ -575,8 +575,28 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .map_err(|e| store_error(answer_id.clone(), e))?;
             if let Some(log) = logs.first() {
                 tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
-                let synthetic_tx =
-                    build_synthetic_tx_json(txn_hash, log, service.chain_id, service.network_id);
+                // A ClaimEvent-bearing tx should have been served by the stored-envelope
+                // path above (its full authoritative claimAsset calldata is persisted
+                // under the derived hash — `restore::persist_synthetic_claim_tx` + the
+                // projector backfill). Reaching this fallback means the calldata is
+                // UNRECOVERABLE (or the backfill hasn't caught up yet): alarm loudly —
+                // aggkit will fail to parse the empty input and stall on this claim —
+                // but do NOT fabricate fields it would persist as claim truth.
+                if log.topics.first().map(String::as_str)
+                    == Some(crate::log_synthesis::CLAIM_EVENT_TOPIC)
+                {
+                    ::metrics::counter!("synthetic_claim_tx_missing_calldata_total").increment(1);
+                    tracing::error!(
+                        tx_hash = %tx_hash_str,
+                        block = log.block_number,
+                        "eth_getTransactionByHash: ClaimEvent-bearing synthetic tx has NO \
+                         persisted claimAsset calldata — serving empty input (aggkit will \
+                         stall on this claim); check \
+                         synthetic_claim_calldata_unrecoverable_total / faucet registry \
+                         metadata"
+                    );
+                }
+                let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
                 return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
             }
 

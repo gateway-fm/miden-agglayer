@@ -244,6 +244,27 @@ pub fn init_metrics() {
          (crash recovery or foreign-CLAIM observation)."
     );
     describe_counter!(
+        "synthetic_claim_calldata_persisted_total",
+        "synthesized (derived-hash) claims whose FULL authoritative claimAsset calldata was \
+         recovered (CLAIM note storage: both SMT proofs, both exit roots, networks, addresses, \
+         amount; faucet registry: hash-verified metadata preimage) and persisted under the \
+         derived tx hash for eth_getTransactionByHash / aggkit's full-claim parser."
+    );
+    describe_counter!(
+        "synthetic_claim_calldata_unrecoverable_total",
+        "synthesized claims whose metadata preimage could NOT be recovered authoritatively \
+         (no registry entry hashing to the note's metadata_hash) — calldata deliberately NOT \
+         fabricated; the tx keeps an empty input and aggkit will stall on it. Operator action: \
+         register/repair the faucet metadata; the per-tick backfill then self-heals. MUST stay \
+         0 in a healthy stack."
+    );
+    describe_counter!(
+        "synthetic_claim_tx_missing_calldata_total",
+        "ClaimEvent-bearing synthetic txs served with EMPTY input by eth_getTransactionByHash \
+         (no persisted calldata record — unrecoverable, or the backfill has not caught up). \
+         Every increment stalls aggkit on that claim; must stay 0 in steady state."
+    );
+    describe_counter!(
         "claim_event_foreign_skipped_total",
         "A consumed CLAIM-shaped note was NOT provably ours (consumer is not \
          our bridge, and it was not minted by our service targeting our \
