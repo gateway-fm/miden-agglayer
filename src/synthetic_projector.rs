@@ -293,7 +293,7 @@ pub struct SyntheticProjector {
     ///
     /// `tick` EVICTS a nullifier once its block is projected, keeping the map bounded to
     /// the in-flight set (imported, not-yet-projected) rather than growing without limit.
-    recovered_bodies: std::sync::Mutex<HashMap<Nullifier, (NoteDetails, NoteAttachments)>>,
+    recovered_bodies: std::sync::Mutex<HashMap<Nullifier, (NoteId, NoteDetails, NoteAttachments)>>,
     /// Per-nullifier retry counter for the note-DB-lag backstop: an UNAUTHENTICATED
     /// bridge-consumed note the tx feed reported but `get_notes_by_id` has not returned yet
     /// (`sync_transactions` is eventual-consistent AHEAD of the node's note DB). The tick
@@ -363,6 +363,10 @@ impl SyntheticProjector {
             .map(|a| a.0)
             .unwrap_or(accounts.service.0);
         let start_cursor = store.get_projector_cursor().await?;
+        // Cantina #7 (part 2): resume the LET cardinality gate from its PERSISTED state —
+        // the baseline is never re-absorbed on restart, and a persisted halt comes back as
+        // a standing (blocked) divergence re-evaluated against that same baseline.
+        let (let_gate_baseline, let_gate_halted) = store.get_let_gate_state().await?;
         // Same pattern for the reconciler's sweep cursor (migration 010): a
         // restart resumes the sweep after the last persisted window instead of
         // re-walking from genesis (prod: ~3h resync per restart pre-fix). 0
@@ -408,8 +412,11 @@ impl SyntheticProjector {
             last_source_window_to: AtomicU64::new(0),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
-            let_gate: std::sync::Mutex::new(LetGateState::new()),
-            let_gate_blocked: std::sync::atomic::AtomicBool::new(false),
+            let_gate: std::sync::Mutex::new(LetGateState::from_persisted(
+                let_gate_baseline,
+                let_gate_halted,
+            )),
+            let_gate_blocked: std::sync::atomic::AtomicBool::new(let_gate_halted),
             let_gate_retry_budget: env_u64("LET_GATE_RETRY_TICKS", LET_GATE_RETRY_TICKS_DEFAULT),
         })
     }
@@ -856,6 +863,12 @@ impl SyntheticProjector {
             let Some(nullifier) = rec.nullifier() else {
                 continue;
             };
+            // Unique-identity requirement (Cantina #7 review): the NoteId — not the
+            // details commitment, which distinct notes can share — keys every downstream
+            // ordering/dedup decision. id() is Some exactly when nullifier() is.
+            let Some(note_id) = rec.id() else {
+                continue;
+            };
             if !is_b2agg_note(rec.details()) {
                 continue;
             }
@@ -882,7 +895,7 @@ impl SyntheticProjector {
             if cache
                 .insert(
                     nullifier,
-                    (rec.details().clone(), rec.attachments().clone()),
+                    (note_id, rec.details().clone(), rec.attachments().clone()),
                 )
                 .is_none()
             {
@@ -945,7 +958,10 @@ impl SyntheticProjector {
                 nullifier.to_hex(),
                 id.to_hex()
             );
-            if cache.insert(nullifier, (details, attachments)).is_none() {
+            if cache
+                .insert(nullifier, (id, details, attachments))
+                .is_none()
+            {
                 metrics::counter!("synthetic_reconciler_recovered_body_total").increment(1);
                 tracing::debug!(
                     note_id = %id.to_hex(),
@@ -985,8 +1001,8 @@ impl SyntheticProjector {
         fetcher: &dyn PublicNoteFetcher,
         consumed_refs: HashMap<Nullifier, ConsumedRef>,
         evict_by_block: &mut HashMap<u64, Vec<Nullifier>>,
-        within_tx_pos: &mut HashMap<[u8; 32], u32>,
-    ) -> anyhow::Result<Vec<InputNoteRecord>> {
+        within_tx_pos: &mut HashMap<NoteId, u32>,
+    ) -> anyhow::Result<Vec<(NoteId, InputNoteRecord)>> {
         let build = |details: NoteDetails, attachments: NoteAttachments, cref: &ConsumedRef| {
             let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
                 nullifier_block_height: BlockNumber::from(cref.block as u32),
@@ -1000,7 +1016,7 @@ impl SyntheticProjector {
         // an authenticated consumption the B2AGG-only cache can't hold — normally a legit
         // non-B2AGG note (CLAIM/GER/genesis) covered by the store consumed feed: SAFE SKIP, never
         // wedge. Only UNAUTHENTICATED misses (note id present) go to the authoritative fetch.
-        let mut recs: Vec<InputNoteRecord> = Vec::new();
+        let mut recs: Vec<(NoteId, InputNoteRecord)> = Vec::new();
         let mut misses: Vec<(Nullifier, ConsumedRef)> = Vec::new();
         {
             let cache = self
@@ -1008,13 +1024,14 @@ impl SyntheticProjector {
                 .lock()
                 .expect("recovered-bodies cache poisoned");
             for (nullifier, cref) in consumed_refs {
-                if let Some((details, attachments)) = cache.get(&nullifier) {
+                if let Some((note_id, details, attachments)) = cache.get(&nullifier) {
                     // The cache holds ONLY B2AGG bodies (both feeders filter), so a hit needs
                     // no re-check.
-                    // Cantina #7: record the within-tx position under the resolved body's
-                    // commitment — the sort key project_block_notes breaks same-tx ties with.
-                    within_tx_pos.insert(details.commitment().as_bytes(), cref.within_tx_pos);
-                    recs.push(build(details.clone(), attachments.clone(), &cref));
+                    // Cantina #7 (review): keyed by the UNIQUE NoteId — distinct notes can
+                    // share a details commitment, and a commitment-keyed map would silently
+                    // overwrite one sibling's position.
+                    within_tx_pos.insert(*note_id, cref.within_tx_pos);
+                    recs.push((*note_id, build(details.clone(), attachments.clone(), &cref)));
                     evict_by_block
                         .entry(cref.block)
                         .or_default()
@@ -1077,8 +1094,11 @@ impl SyntheticProjector {
                 unreachable!("authenticated (note_id-less) misses are skipped in phase 1");
             };
             if let Some(body) = body_by_id.get(&note_id) {
-                within_tx_pos.insert(body.details.commitment().as_bytes(), cref.within_tx_pos);
-                recs.push(build(body.details.clone(), body.attachments.clone(), cref));
+                within_tx_pos.insert(note_id, cref.within_tx_pos);
+                recs.push((
+                    note_id,
+                    build(body.details.clone(), body.attachments.clone(), cref),
+                ));
                 evict_by_block
                     .entry(cref.block)
                     .or_default()
@@ -1348,11 +1368,12 @@ impl SyntheticProjector {
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
         client: Option<&mut MidenClientLib>,
-        within_tx_pos: &HashMap<[u8; 32], u32>,
+        within_tx_pos: &HashMap<NoteId, u32>,
     ) -> anyhow::Result<usize> {
-        let block_notes: Vec<&InputNoteRecord> = consumed
+        let block_notes: Vec<(Option<NoteId>, &InputNoteRecord)> = consumed
             .iter()
             .filter(|n| n.state().consumed_block_height().map(|h| h.as_u64()) == Some(miden_block))
+            .map(|n| (n.id(), n))
             .collect();
         self.project_block_notes(
             &block_notes,
@@ -1369,11 +1390,11 @@ impl SyntheticProjector {
     /// after the block (write-before-advance), even when there are zero notes.
     async fn project_block_notes(
         &self,
-        block_notes: &[&InputNoteRecord],
+        block_notes: &[(Option<NoteId>, &InputNoteRecord)],
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
         mut client: Option<&mut MidenClientLib>,
-        within_tx_pos: &HashMap<[u8; 32], u32>,
+        within_tx_pos: &HashMap<NoteId, u32>,
     ) -> anyhow::Result<usize> {
         // Cantina #7 (part 2) — emission choke point: while the LET cardinality gate is
         // diverged NOTHING may be sealed, whichever path got here. `tick` already returns
@@ -1389,7 +1410,7 @@ impl SyntheticProjector {
                  (see docs/operations/let-cardinality-gate.md)"
             );
         }
-        let mut notes: Vec<&InputNoteRecord> = block_notes.to_vec();
+        let mut notes: Vec<(Option<NoteId>, &InputNoteRecord)> = block_notes.to_vec();
 
         // Cantina #7 (part 1) — FAIL-CLOSED numbering guard. Two-plus B2AGG notes consumed
         // by the SAME transaction tie on (consumed_block_height, consumed_tx_order); their
@@ -1404,8 +1425,10 @@ impl SyntheticProjector {
         // the positions come from the same sync_transactions feed — so any hit means feed
         // corruption worth stopping the line for.
         {
-            let mut tie_groups: HashMap<(u64, Option<u32>), Vec<&InputNoteRecord>> = HashMap::new();
-            for note in &notes {
+            type TiePair<'p, 'r> = &'p (Option<NoteId>, &'r InputNoteRecord);
+            let mut tie_groups: HashMap<(u64, Option<u32>), Vec<TiePair>> = HashMap::new();
+            for pair in &notes {
+                let (_, note) = pair;
                 if is_b2agg_note(note.details()) {
                     let h = note
                         .state()
@@ -1415,17 +1438,26 @@ impl SyntheticProjector {
                     tie_groups
                         .entry((h, note.state().consumed_tx_order()))
                         .or_default()
-                        .push(note);
+                        .push(pair);
                 }
             }
             for ((height, order), members) in tie_groups {
                 if members.len() < 2 {
                     continue;
                 }
+                // Unresolved = a tied B2AGG sibling whose UNIQUE NoteId is unknown or has no
+                // authoritative within-tx position. (Identity is the NoteId — two distinct
+                // notes may share a details commitment, so a commitment key could mask one.)
                 let unresolved: Vec<String> = members
                     .iter()
-                    .filter(|n| !within_tx_pos.contains_key(&n.details_commitment().as_bytes()))
-                    .map(|n| hex::encode(n.details_commitment().as_bytes()))
+                    .filter(|(id, _)| !id.is_some_and(|i| within_tx_pos.contains_key(&i)))
+                    .map(|(id, n)| match id {
+                        Some(i) => i.to_hex(),
+                        None => format!(
+                            "commitment:{}",
+                            hex::encode(n.details_commitment().as_bytes())
+                        ),
+                    })
                     .collect();
                 if !unresolved.is_empty() {
                     ::metrics::counter!("bridge_within_tx_order_unresolved_total").increment(1);
@@ -1470,7 +1502,7 @@ impl SyntheticProjector {
         // ordering to the old hex-string compare, but no per-comparison
         // allocation (matters when many notes share a block).
         let miden_block_height = miden_block;
-        notes.sort_by(|a, b| {
+        notes.sort_by(|(ida, a), (idb, b)| {
             // Late-swept notes carry their ORIGINAL (earlier) consumed_block_height;
             // fall back to the projection block for notes without a recorded height
             // (should not happen for Consumed state, but keeps the sort total).
@@ -1491,16 +1523,17 @@ impl SyntheticProjector {
                         .cmp(&b.state().consumed_tx_order())
                 })
                 // Cantina #7 (part 1): same-tx siblings order by their position within the
-                // consuming tx's input_notes() — the on-chain LET append order. Notes
-                // without an entry (CLAIM/GER, which never carry deposit_count) sort as 0
-                // and keep the commitment tie-break.
+                // consuming tx's input_notes() — the on-chain LET append order — looked up
+                // by the UNIQUE NoteId (distinct notes can share a details commitment).
+                // Notes without an id/entry (CLAIM/GER, which never carry deposit_count)
+                // sort as 0 and keep the commitment tie-break.
                 .then_with(|| {
-                    let pa = within_tx_pos
-                        .get(&a.details_commitment().as_bytes())
+                    let pa = ida
+                        .and_then(|i| within_tx_pos.get(&i))
                         .copied()
                         .unwrap_or(0);
-                    let pb = within_tx_pos
-                        .get(&b.details_commitment().as_bytes())
+                    let pb = idb
+                        .and_then(|i| within_tx_pos.get(&i))
                         .copied()
                         .unwrap_or(0);
                     pa.cmp(&pb)
@@ -1510,6 +1543,10 @@ impl SyntheticProjector {
                         .as_bytes()
                         .cmp(&b.details_commitment().as_bytes())
                 })
+                // Final total-order tie-break for two records SHARING a details commitment:
+                // the unique NoteId (arbitrary but stable; their positions above already
+                // ordered them if both were bridge-consumed B2AGG).
+                .then_with(|| ida.map(|i| i.as_bytes()).cmp(&idb.map(|i| i.as_bytes())))
         });
 
         let bridge_address = get_bridge_address();
@@ -1522,13 +1559,16 @@ impl SyntheticProjector {
         let timestamp = self.block_state.get_block_timestamp(miden_block);
 
         let mut logs = 0usize;
-        for note in notes {
+        for (note_id, note) in notes {
             // A consumed note matches at most one of the three script roots, so
             // trying all three derivations emits at most one synthetic log per
             // note — the three restore derivations unified into one per-note loop.
             if project_b2agg_note(
                 &self.store,
                 note,
+                // The bucket's authoritative unique id (Some for feed-resolved B2AGG; the
+                // record's own id() is None once ConsumedExternal drops the metadata).
+                note_id,
                 self.bridge_id,
                 self.local_network_id,
                 miden_block,
@@ -1782,13 +1822,17 @@ impl SyntheticProjector {
         // CLAIM / GER from the store's consumed feed, at their finalized consumption block.
         // B2AGG is skipped here — sourced authoritatively below (keeping the two sources
         // disjoint keeps the reasoning clean; `is_note_processed` would dedup either way).
-        let mut by_block: HashMap<u64, Vec<&InputNoteRecord>> = HashMap::new();
+        // Buckets carry the note's UNIQUE NoteId alongside the record when known (the
+        // authoritative B2AGG path always knows it; store-fed CLAIM/GER records in
+        // ConsumedExternal have lost their metadata, hence `None`) — the id is the
+        // ordering/dedup identity, because distinct notes can share a details commitment.
+        let mut by_block: HashMap<u64, Vec<(Option<NoteId>, &InputNoteRecord)>> = HashMap::new();
         for note in &consumed {
             if is_b2agg_note(note.details()) {
                 continue;
             }
             if let Some(h) = note.state().consumed_block_height().map(|h| h.as_u64()) {
-                by_block.entry(h).or_default().push(note);
+                by_block.entry(h).or_default().push((note.id(), note));
             }
         }
         // AUTHORITATIVE B2AGG: for each bridge-consumed nullifier in the window, resolve its
@@ -1807,8 +1851,8 @@ impl SyntheticProjector {
         // ordered input_notes() (the on-chain LET append order), filled by
         // `resolve_b2agg_consumptions` from the same authoritative feed the records come
         // from. `project_block_notes` breaks same-tx sibling ties with it.
-        let mut within_tx_pos: HashMap<[u8; 32], u32> = HashMap::new();
-        let auth_b2agg: Vec<InputNoteRecord> = if let Some(rpc) = self.node_rpc.as_ref() {
+        let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
+        let auth_b2agg: Vec<(NoteId, InputNoteRecord)> = if let Some(rpc) = self.node_rpc.as_ref() {
             // Refresh the cache from the store's currently-resolvable (Committed) B2AGG notes
             // so notes still Committed from a PRIOR run are captured before they can be
             // consumed this run (import-time caching only covers notes imported THIS run).
@@ -1894,9 +1938,9 @@ impl SyntheticProjector {
             // authoritative path is a no-op; tests drive `project_notes` directly.
             Vec::new()
         };
-        for rec in &auth_b2agg {
+        for (id, rec) in &auth_b2agg {
             if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
-                by_block.entry(h).or_default().push(rec);
+                by_block.entry(h).or_default().push((Some(*id), rec));
             }
         }
         // ── Cantina #7 (part 2): pre-seal LET cardinality gate ─────────────────────
@@ -1913,7 +1957,7 @@ impl SyntheticProjector {
         // recounted fresh every attempt so a heal (a note resolving on retry) clears the
         // gap; folded into the cumulative total ONLY as each block actually seals.
         let mut pending_b2agg: HashMap<u64, u64> = HashMap::new();
-        for rec in &auth_b2agg {
+        for (_, rec) in &auth_b2agg {
             if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
                 *pending_b2agg.entry(h).or_default() += 1;
             }
@@ -1926,16 +1970,56 @@ impl SyntheticProjector {
             if let Some(bridge_account) = bridge_account {
                 let on_chain =
                     miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
+                // visible = durable reserved-leaf counter + this window's not-yet-reserved
+                // feed-visible B2AGG records (crash-replayed blocks are already in the
+                // counter via their reservations — checking each record's reservation keeps
+                // the recount from double-counting them).
+                let reserved_total = self.store.get_deposit_count().await?;
+                let mut pending_unreserved: u64 = 0;
+                for (id, _) in &auth_b2agg {
+                    if self
+                        .store
+                        .get_reserved_deposit_index(&id.to_hex())
+                        .await?
+                        .is_none()
+                    {
+                        pending_unreserved += 1;
+                    }
+                }
+                let visible_now = reserved_total + pending_unreserved;
                 let pending_total: u64 = pending_b2agg.values().sum();
                 let at_tip = project_to == tip;
-                let verdict = self
-                    .let_gate
-                    .lock()
-                    .expect("LET gate state poisoned")
-                    .evaluate(on_chain, pending_total, at_tip, self.let_gate_retry_budget);
+                let (verdict, newly_armed, was_halted) = {
+                    let mut gate = self.let_gate.lock().expect("LET gate state poisoned");
+                    let armed_before = gate.baseline();
+                    let was_diverged = gate.is_diverged();
+                    let v =
+                        gate.evaluate(on_chain, visible_now, at_tip, self.let_gate_retry_budget);
+                    let newly_armed = match (armed_before, gate.baseline()) {
+                        (None, Some(b)) => Some(b),
+                        _ => None,
+                    };
+                    (v, newly_armed, was_diverged)
+                };
+                // Persist the arming exactly once — a restart must re-evaluate against THIS
+                // baseline, never re-absorb a standing gap into a fresh one.
+                if let Some(baseline) = newly_armed {
+                    self.store.set_let_gate_baseline(baseline).await?;
+                    tracing::info!(
+                        baseline,
+                        on_chain,
+                        visible_now,
+                        "Cantina #7 LET cardinality gate ARMED (baseline persisted)"
+                    );
+                }
                 match verdict {
                     LetGateVerdict::Proceed => {
                         self.let_gate_blocked.store(false, Ordering::Release);
+                        // A previously-persisted halt heals only via an at-tip aligned
+                        // evaluation (this Proceed) — clear the durable flag.
+                        if was_halted && at_tip {
+                            self.store.set_let_gate_halted(false).await?;
+                        }
                     }
                     LetGateVerdict::Diverged { kind, gap } => {
                         self.let_gate_blocked.store(true, Ordering::Release);
@@ -1953,6 +2037,9 @@ impl SyntheticProjector {
                     }
                     LetGateVerdict::Halt { kind, gap } => {
                         self.let_gate_blocked.store(true, Ordering::Release);
+                        // Persist the halt: a restart comes back halted and re-evaluates
+                        // against the persisted baseline (review blocker 4).
+                        self.store.set_let_gate_halted(true).await?;
                         ::metrics::counter!(
                             "bridge_let_assignment_gate_halted_total",
                             "kind" => kind
@@ -1982,7 +2069,7 @@ impl SyntheticProjector {
                 tracing::debug!("LET gate: bridge account not yet tracked — skipped");
             }
         }
-        let no_notes: Vec<&InputNoteRecord> = Vec::new();
+        let no_notes: Vec<(Option<NoteId>, &InputNoteRecord)> = Vec::new();
         while cursor < project_to {
             let next = cursor + 1;
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
@@ -1994,15 +2081,6 @@ impl SyntheticProjector {
             // never runs ahead of fully-projected state.
             self.store.set_projector_cursor(next).await?;
             self.cursor.store(next, Ordering::Release);
-            // Cantina #7 (part 2): fold this block's feed-visible B2AGG count into the
-            // gate's cumulative sealed total — only NOW that the block is durably sealed,
-            // so a halted/blocked attempt recounts the same window next tick.
-            if let Some(n) = pending_b2agg.get(&next) {
-                self.let_gate
-                    .lock()
-                    .expect("LET gate state poisoned")
-                    .commit_sealed(*n);
-            }
             // Evict this block's projected B2AGG nullifiers AFTER the cursor is persisted, so
             // the cache stays bounded to imported-but-not-yet-projected notes. Ordering it
             // after the persist means a crash before the persist leaves the entry in place
@@ -2231,64 +2309,75 @@ pub(crate) enum LetGateVerdict {
 /// Cantina #7 (part 2) — state of the pre-seal LET cardinality gate.
 ///
 /// THE IDENTITY. Only a bridge-executed consumption of a B2AGG note appends a Local Exit
-/// Tree leaf (emit-class, quarantine-class, metadata-deferred and self-targeted alike —
-/// the on-chain append happens at consumption, before any of our emit gates run; reclaims
-/// never touch bridge storage). So, measured at the chain tip:
+/// Tree leaf, and (post the reservation fix) EVERY such leaf reserves a `deposit_counter`
+/// index at projection time — emitted, quarantined, metadata-deferred and self-targeted
+/// alike. So, measured at the chain tip:
 ///
-///     read_let_num_leaves(bridge) == baseline + visible
+/// ```text
+/// read_let_num_leaves(bridge) == baseline + deposit_counter + pending_unreserved
+/// ```
 ///
-/// where `visible` counts the B2AGG records the AUTHORITATIVE feed (sync_transactions →
-/// resolve) produced for blocks the projector has sealed or is about to seal, and
-/// `baseline` is the leaf count attributed to PRE-BOOT history, captured once at arming.
+/// where `deposit_counter` is the DURABLE store counter (restart-safe by construction),
+/// `pending_unreserved` counts this tick's feed-visible B2AGG records that have no
+/// reservation yet (recounted fresh every attempt, already-reserved crash-replays
+/// excluded), and `baseline` absorbs pre-fix history — leaves consumed before the
+/// reservation semantics existed (their skipped classes never advanced the counter).
 ///
-/// WHY A BASELINE (honesty note): history cannot be re-derived exactly from durable local
-/// state — quarantined exits have rows, but metadata-deferred (`EmitMetadata::
-/// Unrecoverable`) and self-targeted (#13) skips deliberately leave NO row, and emitted
-/// counts alone undercount them. Rather than false-halt on those by-design states (the
-/// THE-verifier lesson), the gate arms by absorbing all pre-boot history into `baseline`
-/// and is EXACT for everything after: post-arming, deferral/quarantine/self-target are all
-/// counted (they are resolved B2AGG records — classification happens downstream of the
-/// count), so none of them can trip it. The cost: an invisible leaf that predates boot is
-/// absorbed silently — the post-emit Cantina #9 monitor remains the detector for that.
+/// PERSISTENCE (review blocker 4): the baseline is captured ONCE at first arming and
+/// PERSISTED (`Store::set_let_gate_baseline`); a restart loads it and re-evaluates against
+/// it — never re-absorbs, so a standing unsafe gap cannot be converted into accepted
+/// history by bouncing the process. A halt is persisted too and the gate comes back
+/// halted.
 ///
-/// CATCH-UP SAFETY: the gate compares like with like — both sides are chain-tip
-/// quantities. It EVALUATES only when the projection ceiling reaches the tip
-/// (`project_to == tip`, the steady-state norm); while arming or while the visibility
-/// barrier holds it stays out of the way (Proceed, no strikes), so a fresh restore or a
-/// long catch-up can never halt. Detection during a barrier-lag window is deferred to the
-/// next at-tip evaluation (tip-state reads have no historical form) — the #9 monitor
-/// covers the interim.
+/// STANDING DIVERGENCE (review blocker 1): once diverged, the gate stays blocked until an
+/// AT-TIP aligned evaluation — an off-tip tick (barrier lag) can neither evaluate nor
+/// clear it, so a diverged window cannot be sealed by racing the barrier.
+///
+/// CATCH-UP SAFETY: evaluation happens only at-tip (`project_to == tip`); while arming or
+/// during barrier lag with no standing divergence the gate stays out of the way.
 pub(crate) struct LetGateState {
-    /// On-chain leaves attributed to pre-boot history; `None` = not yet armed.
+    /// On-chain leaves attributed to pre-fix history; `None` = not yet armed.
     baseline: Option<u64>,
-    /// Cumulative feed-visible B2AGG consumptions in SEALED blocks since boot.
-    visible_sealed: u64,
+    /// Standing divergence: set on any gap/local-ahead, cleared ONLY by an at-tip
+    /// aligned evaluation. While set, emission stays blocked (off-tip included).
+    diverged: bool,
     /// Consecutive diverged at-tip evaluations (bounded retry).
     strikes: u64,
 }
 
 impl LetGateState {
-    pub(crate) fn new() -> Self {
+    /// Prime from the persisted store state (`Store::get_let_gate_state`): a restart
+    /// resumes with the original baseline (never re-arms/re-absorbs) and a persisted
+    /// halt comes back as a standing divergence.
+    pub(crate) fn from_persisted(baseline: Option<u64>, halted: bool) -> Self {
         Self {
-            baseline: None,
-            visible_sealed: 0,
+            baseline,
+            diverged: halted,
             strikes: 0,
         }
     }
 
-    /// One pre-seal evaluation. `pending_visible` = feed-visible B2AGG count of the
-    /// blocks about to be sealed THIS tick (recounted fresh every attempt, so a
-    /// visibility heal — a note resolving on retry — is picked up); `at_tip` = the
-    /// projection ceiling reached the chain tip, i.e. `on_chain` and the visible count
+    /// The baseline, for arming-transition detection + persistence by the caller.
+    pub(crate) fn baseline(&self) -> Option<u64> {
+        self.baseline
+    }
+
+    /// Whether a divergence is standing (drives the emission block across ticks).
+    pub(crate) fn is_diverged(&self) -> bool {
+        self.diverged
+    }
+
+    /// One pre-seal evaluation. `visible_now` = durable `deposit_counter` (every reserved
+    /// leaf) + this tick's not-yet-reserved feed-visible B2AGG count; `at_tip` = the
+    /// projection ceiling reached the chain tip, i.e. `on_chain` and `visible_now`
     /// describe the same frontier and the identity is checkable.
     pub(crate) fn evaluate(
         &mut self,
         on_chain: u64,
-        pending_visible: u64,
+        visible_now: u64,
         at_tip: bool,
         retry_budget: u64,
     ) -> LetGateVerdict {
-        let visible_now = self.visible_sealed + pending_visible;
         let Some(baseline) = self.baseline else {
             if !at_tip {
                 // Arming deferred: mid-catch-up / barrier lag. Never strikes, never halts
@@ -2298,6 +2387,7 @@ impl LetGateState {
             if visible_now > on_chain {
                 // More visible consumptions than on-chain leaves BEFORE arming: local
                 // corruption — a baseline cannot be negative. Fail closed immediately.
+                self.diverged = true;
                 return LetGateVerdict::Halt {
                     kind: "local_ahead",
                     gap: visible_now - on_chain,
@@ -2305,22 +2395,32 @@ impl LetGateState {
             }
             self.baseline = Some(on_chain - visible_now);
             self.strikes = 0;
+            self.diverged = false;
             return LetGateVerdict::Proceed;
         };
         if !at_tip {
-            // Not evaluable: leaves are a tip quantity, the visible count only reaches the
-            // projection ceiling. No strike — barrier lag is a legitimate state.
+            // Not evaluable: leaves are a tip quantity. A STANDING divergence stays
+            // blocked (review blocker 1 — an off-tip tick must not clear it and seal
+            // through the lagging window); a clean gate stays out of the way.
+            if self.diverged {
+                return LetGateVerdict::Diverged {
+                    kind: "invisible_gap",
+                    gap: 0,
+                };
+            }
             return LetGateVerdict::Proceed;
         }
         let expected = baseline + visible_now;
         match on_chain.cmp(&expected) {
             std::cmp::Ordering::Equal => {
                 self.strikes = 0;
+                self.diverged = false;
                 LetGateVerdict::Proceed
             }
             std::cmp::Ordering::Greater => {
-                // Chain has leaves the feed cannot account for: an exit we cannot see.
+                // Chain has leaves the accounting cannot explain: an exit we cannot see.
                 // Usually a visibility race — bounded retry; persistent = the finding.
+                self.diverged = true;
                 self.strikes += 1;
                 let gap = on_chain - expected;
                 if self.strikes > retry_budget {
@@ -2336,22 +2436,15 @@ impl LetGateState {
                 }
             }
             std::cmp::Ordering::Less => {
-                // We are about to emit more exits than the chain has leaves: impossible
-                // by construction, so it is data corruption — retry cannot heal it.
+                // About to emit more exits than the chain has leaves: impossible by
+                // construction — data corruption; retry cannot heal it.
+                self.diverged = true;
                 LetGateVerdict::Halt {
                     kind: "local_ahead",
                     gap: expected - on_chain,
                 }
             }
         }
-    }
-
-    /// Fold the freshly-SEALED blocks' visible count into the cumulative total. Called
-    /// only after the tick's projection loop completes — a halted/blocked tick folds
-    /// nothing, so the next attempt recounts the same window (that is what lets a
-    /// visibility heal clear the gap).
-    pub(crate) fn commit_sealed(&mut self, pending_visible: u64) {
-        self.visible_sealed += pending_visible;
     }
 }
 
@@ -2498,6 +2591,29 @@ mod tests {
     /// Like [`b2agg_note`] but with a caller-chosen asset amount, so tests
     /// needing several DISTINCT B2AGG notes (distinct details commitments) can
     /// vary the amount.
+    /// A B2AGG note carrying an asset from a CALLER-CHOSEN faucet — for tests that need one
+    /// registered (emits) and one UNregistered (quarantines as UnknownFaucet) leaf, both
+    /// still reserving their LET deposit index (Cantina #7 review blocker 7).
+    fn b2agg_note_faucet(
+        block: u32,
+        tx_order: Option<u32>,
+        faucet_id: AccountId,
+        amount: u64,
+    ) -> InputNoteRecord {
+        let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
+        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+        let asset: Asset = FungibleAsset::new(faucet_id, amount).unwrap().into();
+        let assets = NoteAssets::new(vec![asset]).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+        consumed_note(
+            details,
+            NoteAttachments::default(),
+            Some(aid(BRIDGE)),
+            block,
+            tx_order,
+        )
+    }
+
     fn b2agg_note_with_amount(block: u32, tx_order: Option<u32>, amount: u64) -> InputNoteRecord {
         // B2AGG storage: 6 felts (network + 5 address limbs); zeros parse fine.
         let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
@@ -3198,7 +3314,8 @@ mod tests {
         // was swept forward because its real block 3 is sealed behind the cursor).
         // `tick()` calls `project_block_notes` directly with the mixed bucket, so
         // we do the same (project_notes would re-filter by block height).
-        let notes_ref: Vec<&InputNoteRecord> = vec![&note_a, &note_b];
+        let notes_ref: Vec<(Option<NoteId>, &InputNoteRecord)> =
+            vec![(None, &note_a), (None, &note_b)];
         projector
             .project_block_notes(&notes_ref, &HashMap::new(), 6, None, &HashMap::new())
             .await
@@ -3522,6 +3639,12 @@ mod tests {
         }
     }
 
+    /// Distinct synthetic NoteIds for id-keyed ordering/dedup tests (the ordering map is
+    /// keyed by the unique NoteId, not the shareable details commitment).
+    fn test_note_id(byte: u64) -> NoteId {
+        NoteId::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
+    }
+
     fn nullifier(byte: u64) -> super::Nullifier {
         super::Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
     }
@@ -3579,12 +3702,20 @@ mod tests {
             "the uncached unauthenticated consumption must resolve via authoritative fetch"
         );
         assert_eq!(
-            recs[0].state().consumed_block_height().map(|h| h.as_u64()),
+            recs[0]
+                .1
+                .state()
+                .consumed_block_height()
+                .map(|h| h.as_u64()),
             Some(544),
             "resolved at the exact consumption block"
         );
+        assert_eq!(
+            recs[0].0, note_id,
+            "the resolved record carries its unique NoteId (the ordering/dedup identity)"
+        );
         assert!(
-            is_b2agg_note(recs[0].details()),
+            is_b2agg_note(recs[0].1.details()),
             "the fetched body is the B2AGG note"
         );
         assert_eq!(
@@ -4163,7 +4294,7 @@ mod tests {
         let projector = test_projector(&store, &block_state).await;
 
         // Three siblings, SAME block + SAME consuming tx (tx_order 0).
-        let notes = vec![
+        let notes = [
             b2agg_note_with_amount(7, Some(0), 11),
             b2agg_note_with_amount(7, Some(0), 22),
             b2agg_note_with_amount(7, Some(0), 33),
@@ -4175,16 +4306,25 @@ mod tests {
             .collect();
         by_commitment.sort();
         // Authoritative input_notes() order: the REVERSE of hash order, so the two orders
-        // provably disagree for 3 distinct commitments.
+        // provably disagree for 3 distinct commitments. Each note gets a UNIQUE NoteId —
+        // the map key — with its position in the (reversed) input order.
         let input_order: Vec<[u8; 32]> = by_commitment.iter().rev().copied().collect();
-        let within_tx_pos: HashMap<[u8; 32], u32> = input_order
+        let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
+        let pairs: Vec<(Option<NoteId>, &InputNoteRecord)> = notes
             .iter()
-            .enumerate()
-            .map(|(pos, c)| (*c, pos as u32))
+            .map(|n| {
+                let pos = input_order
+                    .iter()
+                    .position(|c| *c == n.details_commitment().as_bytes())
+                    .unwrap() as u32;
+                let id = test_note_id(100 + pos as u64);
+                within_tx_pos.insert(id, pos);
+                (Some(id), n)
+            })
             .collect();
 
         let written = projector
-            .project_notes(&notes, &HashMap::new(), 7, None, &within_tx_pos)
+            .project_block_notes(&pairs, &HashMap::new(), 7, None, &within_tx_pos)
             .await
             .unwrap();
         assert_eq!(written, 3);
@@ -4231,8 +4371,12 @@ mod tests {
             b2agg_note_with_amount(9, Some(1), 43),
             b2agg_note_with_amount(9, Some(1), 44),
         ];
-        let mut within_tx_pos: HashMap<[u8; 32], u32> = HashMap::new();
+        // Per tx: input order = reverse hash order; each note gets a unique NoteId keyed
+        // to its position — commitment→id assignment recorded for the pair construction.
+        let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
+        let mut id_of: HashMap<[u8; 32], NoteId> = HashMap::new();
         let mut expected: Vec<String> = Vec::new();
+        let mut next_id = 200u64;
         for tx in [&tx0, &tx1] {
             let mut cs: Vec<[u8; 32]> = tx
                 .iter()
@@ -4241,21 +4385,28 @@ mod tests {
             cs.sort();
             cs.reverse(); // input order = reverse hash order within each tx
             for (pos, c) in cs.iter().enumerate() {
-                within_tx_pos.insert(*c, pos as u32);
+                let id = test_note_id(next_id);
+                next_id += 1;
+                within_tx_pos.insert(id, pos as u32);
+                id_of.insert(*c, id);
                 expected.push(crate::bridge_out::derive_bridge_out_tx_hash(&hex::encode(
                     c,
                 )));
             }
         }
         // Shuffled arrival order (interleaved txs, reversed).
-        let notes = vec![
+        let notes = [
             tx1[0].clone(),
             tx0[1].clone(),
             tx1[1].clone(),
             tx0[0].clone(),
         ];
+        let pairs: Vec<(Option<NoteId>, &InputNoteRecord)> = notes
+            .iter()
+            .map(|n| (id_of.get(&n.details_commitment().as_bytes()).copied(), n))
+            .collect();
         let written = projector
-            .project_notes(&notes, &HashMap::new(), 9, None, &within_tx_pos)
+            .project_block_notes(&pairs, &HashMap::new(), 9, None, &within_tx_pos)
             .await
             .unwrap();
         assert_eq!(written, 4);
@@ -4304,11 +4455,12 @@ mod tests {
         );
     }
 
-    /// Restore parity: `sort_consumed_for_projection_with` (the restore replay sort) given
-    /// the SAME within-tx map produces the IDENTICAL total order as live projection — so a
-    /// restore replays the same deposit_count sequence. (On this branch restore call sites
-    /// feed an empty map — the Phase 1.6 attribution on fix/synthesized-claim-calldata is
-    /// the producer at merge; this pins the shared key shape.)
+    /// Restore parity: `sort_consumed_for_projection_with` (the restore replay sort, a
+    /// deliberate second implementation of the projector's comparator) given the SAME
+    /// unique-id-keyed within-tx map produces the IDENTICAL total order as live projection
+    /// — so a restore replays the same deposit_count sequence. The production feed is
+    /// `restore_bridge_positions` (Phase 1.6 on this branch); PR #136's attribution re-keys
+    /// to this same shape at merge (#136 merges first).
     #[tokio::test]
     async fn restore_sort_replays_the_live_projection_order() {
         let notes = [
@@ -4317,26 +4469,32 @@ mod tests {
             b2agg_note_with_amount(7, Some(0), 33),
             b2agg_note_with_amount(7, Some(1), 44),
         ];
-        // Live order: tx0 siblings pos-reversed from hash order, then tx1.
+        // Live order: tx0 siblings pos-reversed from hash order, then tx1. Unique NoteIds
+        // key the map (the identity — commitments are shareable).
         let mut cs: Vec<[u8; 32]> = notes[..3]
             .iter()
             .map(|n| n.details_commitment().as_bytes())
             .collect();
         cs.sort();
         cs.reverse();
-        let within_tx_pos: HashMap<[u8; 32], u32> = cs
-            .iter()
-            .enumerate()
-            .map(|(pos, c)| (*c, pos as u32))
-            .collect();
+        let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
+        let mut id_of: HashMap<[u8; 32], NoteId> = HashMap::new();
+        for (pos, c) in cs.iter().enumerate() {
+            let id = test_note_id(300 + pos as u64);
+            within_tx_pos.insert(id, pos as u32);
+            id_of.insert(*c, id);
+        }
         let mut expected: Vec<[u8; 32]> = cs.clone();
         expected.push(notes[3].details_commitment().as_bytes());
 
-        let mut sorted: Vec<&InputNoteRecord> = notes.iter().collect();
+        let mut sorted: Vec<(Option<NoteId>, &InputNoteRecord)> = notes
+            .iter()
+            .map(|n| (id_of.get(&n.details_commitment().as_bytes()).copied(), n))
+            .collect();
         crate::restore::sort_consumed_for_projection_with(&mut sorted, &within_tx_pos);
         let got: Vec<[u8; 32]> = sorted
             .iter()
-            .map(|n| n.details_commitment().as_bytes())
+            .map(|(_, n)| n.details_commitment().as_bytes())
             .collect();
         assert_eq!(
             got, expected,
@@ -4355,23 +4513,26 @@ mod tests {
 
         // Arming: not at tip → Proceed forever, never armed, never a strike (a fresh
         // restore / long catch-up must not halt).
-        let mut g = LetGateState::new();
+        let mut g = LetGateState::from_persisted(None, false);
         for _ in 0..20 {
             assert_eq!(g.evaluate(100, 0, false, budget), LetGateVerdict::Proceed);
         }
-        // Arms at tip; baseline absorbs 97 leaves of unaccountable pre-boot history.
+        // Arms at tip; baseline absorbs 97 leaves of pre-fix history (visible_now = the
+        // durable reserved-leaf counter + this window's unreserved pending = 3).
         assert_eq!(g.evaluate(100, 3, true, budget), LetGateVerdict::Proceed);
-        // Aligned steady state after sealing those 3.
-        g.commit_sealed(3);
-        assert_eq!(g.evaluate(100, 0, true, budget), LetGateVerdict::Proceed);
-        // New exit appears on chain and in the feed together: aligned.
-        assert_eq!(g.evaluate(101, 1, true, budget), LetGateVerdict::Proceed);
-        g.commit_sealed(1);
+        assert_eq!(
+            g.baseline(),
+            Some(97),
+            "baseline = on_chain - visible at arming"
+        );
+        // Aligned steady state; new exit appears on chain and in the counter together.
+        assert_eq!(g.evaluate(100, 3, true, budget), LetGateVerdict::Proceed);
+        assert_eq!(g.evaluate(101, 4, true, budget), LetGateVerdict::Proceed);
 
-        // InvisibleGap: chain appended a leaf the feed cannot account for.
+        // InvisibleGap: chain appended a leaf the accounting cannot explain.
         for i in 1..=budget {
             assert_eq!(
-                g.evaluate(102, 0, true, budget),
+                g.evaluate(102, 4, true, budget),
                 LetGateVerdict::Diverged {
                     kind: "invisible_gap",
                     gap: 1
@@ -4379,8 +4540,20 @@ mod tests {
                 "strike {i} must stay within the retry budget"
             );
         }
+        // REVIEW BLOCKER 1: an OFF-TIP tick while diverged must NOT clear the divergence
+        // — it stays blocked (Diverged), never Proceed, so the lagging window cannot be
+        // sealed past a standing gap.
         assert_eq!(
-            g.evaluate(102, 0, true, budget),
+            g.evaluate(102, 4, false, budget),
+            LetGateVerdict::Diverged {
+                kind: "invisible_gap",
+                gap: 0
+            },
+            "off-tip must keep a standing divergence blocked"
+        );
+        assert!(g.is_diverged());
+        assert_eq!(
+            g.evaluate(102, 4, true, budget),
             LetGateVerdict::Halt {
                 kind: "invisible_gap",
                 gap: 1
@@ -4388,23 +4561,36 @@ mod tests {
             "budget exhausted → loud halt"
         );
 
-        // Heal (the missing consumption resolves on retry): aligned again, strikes reset.
-        assert_eq!(g.evaluate(102, 1, true, budget), LetGateVerdict::Proceed);
-        g.commit_sealed(1);
+        // Heal (the missing consumption resolves on retry): at-tip aligned clears the
+        // standing divergence and resets strikes.
+        assert_eq!(g.evaluate(102, 5, true, budget), LetGateVerdict::Proceed);
+        assert!(!g.is_diverged(), "at-tip aligned clears the standing flag");
         assert_eq!(
-            g.evaluate(103, 0, true, budget),
+            g.evaluate(103, 5, true, budget),
             LetGateVerdict::Diverged {
                 kind: "invisible_gap",
                 gap: 1
             },
             "post-heal strikes restart from zero"
         );
+        // Off-tip with the divergence standing again: still blocked.
+        assert_eq!(
+            g.evaluate(103, 5, false, budget),
+            LetGateVerdict::Diverged {
+                kind: "invisible_gap",
+                gap: 0
+            }
+        );
 
-        // Off-tip while armed: not evaluable, no strike accrual (barrier lag is legit).
-        assert_eq!(g.evaluate(103, 0, false, budget), LetGateVerdict::Proceed);
+        // Off-tip while armed and CLEAN: not evaluable, stays out of the way.
+        let mut clean = LetGateState::from_persisted(Some(97), false);
+        assert_eq!(
+            clean.evaluate(103, 0, false, budget),
+            LetGateVerdict::Proceed
+        );
 
         // LocalAhead halts immediately — no retry can heal corruption.
-        let mut g2 = LetGateState::new();
+        let mut g2 = LetGateState::from_persisted(None, false);
         assert_eq!(g2.evaluate(5, 0, true, budget), LetGateVerdict::Proceed); // arm, baseline 5
         assert_eq!(
             g2.evaluate(5, 6, true, budget),
@@ -4414,7 +4600,7 @@ mod tests {
             }
         );
         // LocalAhead at ARMING (visible > on_chain before a baseline exists) also halts.
-        let mut g3 = LetGateState::new();
+        let mut g3 = LetGateState::from_persisted(None, false);
         assert_eq!(
             g3.evaluate(2, 3, true, budget),
             LetGateVerdict::Halt {
@@ -4422,6 +4608,36 @@ mod tests {
                 gap: 1
             }
         );
+    }
+
+    /// REVIEW BLOCKER 4 — restart after a halt must come back HALTED and re-evaluate
+    /// against the PERSISTED baseline, never re-arm/re-absorb the gap into fresh history.
+    #[test]
+    fn let_gate_restart_after_halt_stays_halted_until_true_heal() {
+        let budget = 2u64;
+        // "Restart": the store carried baseline=97 and halted=true.
+        let mut g = LetGateState::from_persisted(Some(97), true);
+        assert!(g.is_diverged(), "comes back halted (blocked)");
+        // Off-tip ticks keep it blocked.
+        assert_eq!(
+            g.evaluate(103, 5, false, budget),
+            LetGateVerdict::Diverged {
+                kind: "invisible_gap",
+                gap: 0
+            }
+        );
+        // At-tip with the gap STILL standing (103 vs 97+5=102): diverges against the
+        // ORIGINAL baseline — the restart did not absorb the unsafe leaf.
+        assert_eq!(
+            g.evaluate(103, 5, true, budget),
+            LetGateVerdict::Diverged {
+                kind: "invisible_gap",
+                gap: 1
+            }
+        );
+        // Only a TRUE heal (accounting catches up) unblocks.
+        assert_eq!(g.evaluate(103, 6, true, budget), LetGateVerdict::Proceed);
+        assert!(!g.is_diverged());
     }
 
     /// THE false-positive test (requirement 1): a QUARANTINED exit occupies an on-chain
@@ -4435,11 +4651,11 @@ mod tests {
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
 
-        let mut gate = LetGateState::new();
+        let mut gate = LetGateState::from_persisted(None, false);
         assert_eq!(gate.evaluate(0, 0, true, 3), LetGateVerdict::Proceed); // arm at 0
 
         // The bridge consumes the (quarantine-class) B2AGG: one on-chain leaf, one
-        // feed-visible pending consumption — the identity HOLDS.
+        // feed-visible pending (unreserved) consumption — the identity HOLDS pre-seal.
         let note = b2agg_note(5, Some(0));
         assert_eq!(
             gate.evaluate(1, 1, true, 3),
@@ -4462,9 +4678,154 @@ mod tests {
             1,
             "the exit is quarantined, not dropped"
         );
-        gate.commit_sealed(1);
-        // Steady state after the quarantine: still aligned — no false halt, ever.
-        assert_eq!(gate.evaluate(1, 0, true, 3), LetGateVerdict::Proceed);
+        // REVIEW BLOCKER 7: the quarantined leaf RESERVED its LET index — the durable
+        // counter advanced with no event, so post-seal accounting still balances.
+        assert_eq!(
+            store.get_deposit_count().await.unwrap(),
+            1,
+            "quarantined leaf reserves its deposit index (no event, index taken)"
+        );
+        // Steady state after the quarantine: counter(1) + pending(0) vs leaves(1) —
+        // aligned. No false halt, ever.
+        assert_eq!(gate.evaluate(1, 1, true, 3), LetGateVerdict::Proceed);
+    }
+
+    /// REVIEW BLOCKER 7 — the Cantina #7 core: a SKIPPED LET leaf must RESERVE its
+    /// deposit index. LET leaf 0 quarantines (no event); leaf 1 is valid and must emit
+    /// with deposit_count = 1 — its true LET index — not 0 (the pre-fix emitted-only
+    /// counter would hand it 0 → wrong globalIndex, sealed forever). Stable across
+    /// retry/restart: re-projection reuses the reservations.
+    #[tokio::test]
+    async fn skipped_let_leaf_reserves_its_deposit_index() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Leaf 0: a DISTINCT, unregistered faucet → quarantines as UnknownFaucet
+        // (reserves index 0, emits nothing). Leaf 1: the registered FAUCET → emits.
+        let unregistered_faucet = aid("0xaa0000000000bc110000bc000000de");
+        let quarantined = b2agg_note_faucet(5, Some(0), unregistered_faucet, 71);
+        register_faucet(&store).await;
+        let valid = b2agg_note_with_amount(5, Some(1), 72);
+
+        let written = projector
+            .project_notes(
+                &[quarantined.clone(), valid.clone()],
+                &HashMap::new(),
+                5,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, 1, "only the valid leaf emits");
+        assert_eq!(
+            store.get_deposit_count().await.unwrap(),
+            2,
+            "both leaves indexed"
+        );
+
+        let quarantined_key = hex::encode(quarantined.details_commitment().as_bytes());
+        let valid_key = hex::encode(valid.details_commitment().as_bytes());
+        assert_eq!(
+            store
+                .get_reserved_deposit_index(&quarantined_key)
+                .await
+                .unwrap(),
+            Some(0),
+            "the quarantined leaf RESERVED index 0"
+        );
+        assert_eq!(
+            store.get_reserved_deposit_index(&valid_key).await.unwrap(),
+            Some(1),
+            "the valid exit carries its TRUE LET index 1, not the emitted-only 0"
+        );
+        // The emitted event's data must encode deposit_count=1 (the globalIndex source).
+        let logs = logs_in_range(&store, 0, 5).await;
+        assert_eq!(logs.len(), 1);
+
+        // Retry/restart: a fresh projector over the SAME store re-projects idempotently —
+        // indices are stable, nothing double-allocates, no second event.
+        let projector2 = test_projector(&store, &block_state).await;
+        let rewritten = projector2
+            .project_notes(
+                &[quarantined.clone(), valid.clone()],
+                &HashMap::new(),
+                5,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 0, "replay emits nothing new");
+        assert_eq!(
+            store.get_deposit_count().await.unwrap(),
+            2,
+            "no re-allocation"
+        );
+        assert_eq!(
+            store.get_reserved_deposit_index(&valid_key).await.unwrap(),
+            Some(1),
+            "index stable across restart/retry"
+        );
+    }
+
+    /// REVIEW BLOCKER 5 — unique-identity collision: two DISTINCT notes sharing one
+    /// details commitment are two real LET leaves. Commitment-keyed dedup collapsed the
+    /// second (one event for two leaves, gate 'aligned' while an exit was silently
+    /// dropped); NoteId-keyed dedup emits BOTH with distinct deposit counts.
+    #[tokio::test]
+    async fn same_commitment_distinct_notes_both_emit() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Two records with IDENTICAL details (same commitment) — distinct on-chain notes
+        // (differing metadata), distinct unique ids, consumed by the same bridge tx.
+        let note_a = b2agg_note_with_amount(6, Some(0), 55);
+        let note_b = b2agg_note_with_amount(6, Some(0), 55);
+        assert_eq!(
+            note_a.details_commitment().as_bytes(),
+            note_b.details_commitment().as_bytes(),
+            "fixture: the two notes share a details commitment"
+        );
+        let id_a = test_note_id(401);
+        let id_b = test_note_id(402);
+        let within_tx_pos: HashMap<NoteId, u32> = [(id_a, 0), (id_b, 1)].into_iter().collect();
+        let pairs: Vec<(Option<NoteId>, &InputNoteRecord)> =
+            vec![(Some(id_a), &note_a), (Some(id_b), &note_b)];
+
+        let written = projector
+            .project_block_notes(&pairs, &HashMap::new(), 6, None, &within_tx_pos)
+            .await
+            .unwrap();
+        assert_eq!(
+            written, 2,
+            "BOTH leaves must emit — dedup is by unique NoteId"
+        );
+        assert_eq!(store.get_deposit_count().await.unwrap(), 2);
+        assert_eq!(
+            store
+                .get_reserved_deposit_index(&id_a.to_hex())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            store
+                .get_reserved_deposit_index(&id_b.to_hex())
+                .await
+                .unwrap(),
+            Some(1),
+            "distinct reservations, ordered by within-tx position"
+        );
+        let logs = logs_in_range(&store, 0, 6).await;
+        assert_eq!(
+            logs.len(),
+            2,
+            "two events (shared tx hash, distinct deposit counts)"
+        );
     }
 
     /// Requirement 3 + halt seals nothing: while the gate is blocked, project_notes

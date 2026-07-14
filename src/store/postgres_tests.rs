@@ -2249,3 +2249,120 @@ async fn test_pgstore_different_tx_cannot_take_over() {
         NonceReservation::Won { .. }
     ));
 }
+/// Cantina #7 (review blockers 6 + 7) — PostgreSQL reservation + emitted accounting.
+/// EVERY Emit-class bridge-consumed leaf reserves its LET deposit index; a quarantined /
+/// deferred leaf reserves WITHOUT emitting (emitted=false, is_note_processed=false so it
+/// stays re-attemptable), and the durable deposit_counter counts ALL reserved leaves — so
+/// it is directly comparable to the on-chain LET leaf count with no quarantine-row
+/// arithmetic (blocker 6: no double count). A later successful emission REUSES the reserved
+/// index and flips emitted=true (blocker 7: the valid leaf keeps its TRUE index across the
+/// skipped one, stable over retry/restart).
+#[tokio::test]
+async fn cantina7_pg_reservation_and_emitted_accounting() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let leaf0 = format!("resv0-{:x}", rand_u64()); // skipped/quarantined leaf
+    let leaf1 = format!("resv1-{:x}", rand_u64()); // valid leaf
+
+    // Leaf 0 reserves index 0 WITHOUT emitting.
+    let i0 = store.reserve_deposit_index(&leaf0).await.unwrap();
+    assert_eq!(
+        store.get_reserved_deposit_index(&leaf0).await.unwrap(),
+        Some(i0)
+    );
+    assert!(
+        !store.is_note_processed(&leaf0).await.unwrap(),
+        "a reservation with no emission is NOT processed — stays re-attemptable"
+    );
+    // Idempotent: re-reserving returns the same index, no double-allocation.
+    assert_eq!(store.reserve_deposit_index(&leaf0).await.unwrap(), i0);
+
+    // Leaf 1 reserves index i0+1 then EMITS (commit reuses the reservation).
+    let i1 = store.reserve_deposit_index(&leaf1).await.unwrap();
+    assert_eq!(
+        i1,
+        i0 + 1,
+        "the valid leaf carries its TRUE LET index, not the skipped 0"
+    );
+    let dc = store
+        .commit_b2agg_event_atomic(
+            leaf1.clone(),
+            "0x00000000000000000000000000000000000000aa",
+            9,
+            [0u8; 32],
+            &format!("0x{:064x}", rand_u64()),
+            0,
+            0,
+            &[0u8; 20],
+            1,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dc, i1,
+        "commit REUSES the reserved index (no re-allocation)"
+    );
+    assert!(
+        store.is_note_processed(&leaf1).await.unwrap(),
+        "an emitted leaf is processed"
+    );
+
+    // Blocker 6: deposit_counter counts BOTH reserved leaves (no quarantine-row add-on).
+    assert!(
+        store.get_deposit_count().await.unwrap() >= i1 as u64 + 1,
+        "durable counter reflects every reserved leaf directly"
+    );
+
+    // Retry/restart idempotence: re-committing leaf1 reuses the index, no second event.
+    let dc2 = store
+        .commit_b2agg_event_atomic(
+            leaf1.clone(),
+            "0x00000000000000000000000000000000000000aa",
+            9,
+            [0u8; 32],
+            &format!("0x{:064x}", rand_u64()),
+            0,
+            0,
+            &[0u8; 20],
+            1,
+            &[0u8; 20],
+            1_000,
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(dc2, i1, "index stable across retry");
+    assert_eq!(
+        store.get_reserved_deposit_index(&leaf0).await.unwrap(),
+        Some(i0),
+        "the skipped leaf keeps its reserved index"
+    );
+}
+
+/// Cantina #7 (review blocker 4) — persisted LET gate state survives a restart.
+#[tokio::test]
+async fn cantina7_pg_gate_state_persists() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    // Fresh: unarmed, not halted.
+    let (b0, h0) = store.get_let_gate_state().await.unwrap();
+    assert_eq!((b0, h0), (None, false));
+    // Arm + halt.
+    store.set_let_gate_baseline(97).await.unwrap();
+    store.set_let_gate_halted(true).await.unwrap();
+    let (b1, h1) = store.get_let_gate_state().await.unwrap();
+    assert_eq!((b1, h1), (Some(97), true), "baseline + halt are durable");
+    // Heal clears the halt but NOT the baseline (never re-absorbed).
+    store.set_let_gate_halted(false).await.unwrap();
+    let (b2, h2) = store.get_let_gate_state().await.unwrap();
+    assert_eq!(
+        (b2, h2),
+        (Some(97), false),
+        "baseline persists across a heal"
+    );
+}

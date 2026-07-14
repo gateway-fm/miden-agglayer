@@ -123,6 +123,16 @@ pub trait SyncListener: Send + Sync {
     }
 }
 
+/// The RESOLVED node URL `MidenClient::new` will actually connect to for the given CLI
+/// option — `Endpoint::localhost()` when absent. Subsystems that build their OWN node RPC
+/// (the projector's reconciler, the LET cardinality gate, restore's recovery scans) MUST
+/// derive their URL from this instead of the raw `Option`: mapping an absent option to
+/// "no RPC" silently disabled all of them in the default/documented launch (Cantina #7
+/// review blocker 3).
+pub fn effective_node_url(node_url: Option<String>) -> String {
+    node_url.unwrap_or_else(|| Endpoint::localhost().to_string())
+}
+
 /// Shared node-URL resolver used by both the persistent `MidenClient` (background sync,
 /// GER injection) and the fresh-client path in `src/claim.rs::publish_claim`. Both code
 /// paths must dial the same node — funneling through this single function guarantees the
@@ -821,6 +831,24 @@ pub async fn wait_for_transaction_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cantina #7 review blocker 3 — DEFAULT-launch arming. With no `--miden-node`, the
+    /// projector's node URL (which arms the reconciler AND the LET cardinality gate) must
+    /// resolve to the SAME localhost `MidenClient::new` connects to — never `None`, which
+    /// silently disabled both.
+    #[test]
+    fn effective_node_url_defaults_to_localhost() {
+        let default = effective_node_url(None);
+        assert_eq!(
+            default,
+            Endpoint::localhost().to_string(),
+            "absent --miden-node must resolve to the same localhost the client uses"
+        );
+        assert!(!default.is_empty(), "the resolved URL is never empty/None");
+        // An explicit URL passes through unchanged.
+        let explicit = "http://node.example:57291".to_string();
+        assert_eq!(effective_node_url(Some(explicit.clone())), explicit);
+    }
 
     #[tokio::test]
     async fn test_miden_client_test_tracks_calls() {

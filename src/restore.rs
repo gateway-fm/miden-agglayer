@@ -216,22 +216,6 @@ fn note_consumed_block(note: &InputNoteRecord, fallback: u64) -> u64 {
 /// (Byte compare on the 32-byte commitment — same order as a hex compare, no
 /// allocation.)
 fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
-    sort_consumed_for_projection_with(notes, &std::collections::HashMap::new());
-}
-
-/// Cantina #7 (part 1): the FULL projection sort key, shared shape with the live
-/// projector — `(consumed_block_height, consumed_tx_order, within_tx_pos,
-/// details_commitment)`. `within_tx_pos` (details-commitment → position within the
-/// consuming tx's ordered `input_notes()`, the on-chain LET append order) breaks
-/// same-tx sibling ties that would otherwise fall through to hash order and could
-/// misnumber `deposit_count`. Restore call sites currently pass an EMPTY map: on this
-/// branch restore has no authoritative per-input feed — the Phase 1.6 attribution
-/// (fix/synthesized-claim-calldata) is the natural producer and must populate this at
-/// merge so live and restore replay the IDENTICAL total order.
-pub(crate) fn sort_consumed_for_projection_with(
-    notes: &mut [&InputNoteRecord],
-    within_tx_pos: &std::collections::HashMap<[u8; 32], u32>,
-) {
     notes.sort_by(|a, b| {
         a.state()
             .consumed_block_height()
@@ -243,12 +227,44 @@ pub(crate) fn sort_consumed_for_projection_with(
                     .cmp(&b.state().consumed_tx_order())
             })
             .then_with(|| {
-                let pa = within_tx_pos
-                    .get(&a.details_commitment().as_bytes())
+                a.details_commitment()
+                    .as_bytes()
+                    .cmp(&b.details_commitment().as_bytes())
+            })
+    });
+}
+
+/// Cantina #7: the FULL projection sort key, shared shape with the live projector —
+/// `(consumed_block_height, consumed_tx_order, within_tx_pos, details_commitment,
+/// NoteId)`, where `within_tx_pos` is looked up by the note's UNIQUE NoteId (distinct
+/// notes can share a details commitment — the id is the ordering identity) and is the
+/// position within the consuming tx's ordered `input_notes()` = the on-chain LET
+/// append order. Restore's B2AGG replay MUST use this with the authoritative position
+/// feed ([`restore_bridge_positions`]) so its `deposit_count` sequence is
+/// byte-identical to the live projection. This is a deliberate second implementation
+/// of the projector's comparator, pinned identical by the
+/// `restore_sort_replays_the_live_projection_order` test.
+pub(crate) fn sort_consumed_for_projection_with(
+    notes: &mut [(Option<miden_protocol::note::NoteId>, &InputNoteRecord)],
+    within_tx_pos: &std::collections::HashMap<miden_protocol::note::NoteId, u32>,
+) {
+    notes.sort_by(|(ida, a), (idb, b)| {
+        a.state()
+            .consumed_block_height()
+            .map(|h| h.as_u64())
+            .cmp(&b.state().consumed_block_height().map(|h| h.as_u64()))
+            .then_with(|| {
+                a.state()
+                    .consumed_tx_order()
+                    .cmp(&b.state().consumed_tx_order())
+            })
+            .then_with(|| {
+                let pa = ida
+                    .and_then(|i| within_tx_pos.get(&i))
                     .copied()
                     .unwrap_or(0);
-                let pb = within_tx_pos
-                    .get(&b.details_commitment().as_bytes())
+                let pb = idb
+                    .and_then(|i| within_tx_pos.get(&i))
                     .copied()
                     .unwrap_or(0);
                 pa.cmp(&pb)
@@ -258,6 +274,7 @@ pub(crate) fn sort_consumed_for_projection_with(
                     .as_bytes()
                     .cmp(&b.details_commitment().as_bytes())
             })
+            .then_with(|| ida.map(|i| i.as_bytes()).cmp(&idb.map(|i| i.as_bytes())))
     });
 }
 
@@ -322,6 +339,13 @@ pub async fn restore(
     // recorded (consumed by the bridge via network txs). Tag-scan the node and
     // import them so the Phase 2 NoteFilter::Consumed scan below can see them.
     // Best-effort: a failure must not abort restore.
+    //
+    // Cantina #7: `bridge_positions` (unique NoteId → (commitment, block, tx_order,
+    // within_tx_pos)) is the authoritative ordering feed for Phase 2's replay.
+    let mut bridge_positions: std::collections::HashMap<
+        miden_protocol::note::NoteId,
+        ([u8; 32], u64, u32, u32),
+    > = std::collections::HashMap::new();
     if let Some(url) = node_url {
         let from_block: u32 = std::env::var("RECOVER_FROM_BLOCK")
             .ok()
@@ -331,15 +355,29 @@ pub async fn restore(
             from_block,
             "Phase 1.5: recovering missed bridge-out notes from the node..."
         );
+        let mut identity_index = std::collections::HashMap::new();
         match recover_missed_bridge_outs(miden_client, url, api_key, accounts.bridge.0, from_block)
             .await
         {
-            Ok(n) => {
+            Ok((n, index)) => {
+                identity_index = index;
                 tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node")
             }
             Err(e) => tracing::warn!(
                 err = %e,
                 "Phase 1.5 recovery scan failed; continuing with local-only restore"
+            ),
+        }
+        // Cantina #7 — Phase 1.6: the authoritative per-exit position feed for the Phase 2
+        // B2AGG replay ordering. Best-effort like 1.5: on failure restore proceeds with the
+        // legacy order (and the projector's tie-halt guard fail-closes any same-tx sibling
+        // ambiguity rather than hash-sorting it).
+        match restore_bridge_positions(url, api_key, accounts.bridge.0, &identity_index).await {
+            Ok(map) => bridge_positions = map,
+            Err(e) => tracing::warn!(
+                err = %e,
+                "Phase 1.6: authoritative position feed failed; same-tx sibling ordering \
+                 will fail closed rather than guess"
             ),
         }
     } else {
@@ -371,6 +409,7 @@ pub async fn restore(
         block_state,
         miden_tip,
         l1_rpc_url.clone(),
+        bridge_positions,
     )
     .await?;
     total_logs += logs;
@@ -503,7 +542,13 @@ async fn recover_missed_bridge_outs(
     api_key: Option<&str>,
     bridge_id: AccountId,
     from_block: u32,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(
+    usize,
+    std::collections::HashMap<
+        miden_protocol::note::Nullifier,
+        (miden_protocol::note::NoteId, [u8; 32]),
+    >,
+)> {
     use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
     use miden_protocol::note::{NoteDetails, NoteFile, NoteId};
@@ -522,7 +567,7 @@ async fn recover_missed_bridge_outs(
             to_block,
             "recovery: from_block is past the chain tip; nothing to scan"
         );
-        return Ok(0);
+        return Ok((0, std::collections::HashMap::new()));
     }
 
     // Tag-independent block scan. The bridge's B2AGG notes are NOT tagged with the
@@ -535,6 +580,14 @@ async fn recover_missed_bridge_outs(
     // `consumer == bridge` gating is enforced downstream by `restore_bridge_outs`
     // once the notes are imported and observed consumed.
     let mut b2agg_ids: Vec<NoteId> = Vec::new();
+    // Identity index for restore's authoritative ordering (Cantina #7): nullifier →
+    // (unique NoteId, details commitment) for every public B2AGG note on the node.
+    // Computable HERE because the fetched note carries its metadata; a consumed
+    // local-store record does not (its nullifier AND id are both unrecoverable there).
+    let mut identity_index: std::collections::HashMap<
+        miden_protocol::note::Nullifier,
+        (NoteId, [u8; 32]),
+    > = std::collections::HashMap::new();
     let mut scanned = 0usize;
     for b in from_block..=to_block {
         let block = match rpc.get_block_by_number(BlockNumber::from(b), false).await {
@@ -555,6 +608,10 @@ async fn recover_missed_bridge_outs(
                             let details: NoteDetails = note.clone().into();
                             if is_b2agg_note(&details) {
                                 b2agg_ids.push(note.id());
+                                identity_index.insert(
+                                    note.nullifier(),
+                                    (note.id(), details.commitment().as_bytes()),
+                                );
                             }
                         }
                     }
@@ -587,7 +644,7 @@ async fn recover_missed_bridge_outs(
     );
 
     if b2agg_ids.is_empty() {
-        return Ok(0);
+        return Ok((0, identity_index));
     }
 
     let note_files: Vec<NoteFile> = b2agg_ids.iter().copied().map(NoteFile::NoteId).collect();
@@ -611,7 +668,85 @@ async fn recover_missed_bridge_outs(
         })
         .await?;
 
-    Ok(imported)
+    Ok((imported, identity_index))
+}
+
+/// Cantina #7 (review blocker 2) — the AUTHORITATIVE per-exit position feed for restore's
+/// B2AGG replay, SHARED KEY SHAPE with the live projector (and with PR #136's Phase 1.6
+/// attribution, which re-keys to the same shape — merge #136 first, then unify):
+///
+/// ```text
+/// unique NoteId -> (consumption block, per-block bridge-tx order, within-tx position)
+/// ```
+///
+/// Sourced from the bridge's own `sync_transactions` feed: UNAUTHENTICATED inputs carry
+/// their `NoteHeader` (id direct); AUTHENTICATED inputs carry only the nullifier and are
+/// resolved through the Phase 1.5 identity index (nullifier → NoteId, built from fetched
+/// PUBLIC notes, which carry the metadata needed to compute both). The within-tx position
+/// is the input's index in the tx header's ordered `input_notes()` — the on-chain LET
+/// append order — so restore's `(block, tx_order, within_tx_pos, commitment, id)` sort
+/// replays the exact deposit_count sequence the live projection produced.
+async fn restore_bridge_positions(
+    node_url: &str,
+    api_key: Option<&str>,
+    bridge_id: AccountId,
+    identity_index: &std::collections::HashMap<
+        miden_protocol::note::Nullifier,
+        (miden_protocol::note::NoteId, [u8; 32]),
+    >,
+) -> anyhow::Result<
+    std::collections::HashMap<miden_protocol::note::NoteId, ([u8; 32], u64, u32, u32)>,
+> {
+    use miden_protocol::block::BlockNumber;
+
+    let endpoint = crate::miden_client::parse_node_url(node_url)?;
+    let rpc = crate::miden_client::build_rpc_client(&endpoint, 30_000, api_key);
+    let (tip_header, _) = rpc
+        .get_block_header_by_number(None, false)
+        .await
+        .map_err(|e| anyhow::anyhow!("positions: get chain tip: {e}"))?;
+    let tip = tip_header.block_num();
+    let txs = rpc
+        .sync_transactions(BlockNumber::from(0u32), tip, vec![bridge_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("positions: sync_transactions(0..{tip}): {e}"))?;
+
+    let mut out: std::collections::HashMap<
+        miden_protocol::note::NoteId,
+        ([u8; 32], u64, u32, u32),
+    > = std::collections::HashMap::new();
+    let mut per_block_order: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for tx in &txs {
+        if tx.transaction_header.account_id() != bridge_id {
+            continue;
+        }
+        let block = tx.block_num.as_u64();
+        let order = *per_block_order
+            .entry(block)
+            .and_modify(|i| *i += 1)
+            .or_insert(0u32);
+        for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
+            if let Some(header) = input.header() {
+                out.insert(
+                    header.id(),
+                    (
+                        header.details_commitment().as_bytes(),
+                        block,
+                        order,
+                        pos as u32,
+                    ),
+                );
+            } else if let Some((id, commitment)) = identity_index.get(&input.nullifier()) {
+                out.insert(*id, (*commitment, block, order, pos as u32));
+            }
+        }
+    }
+    tracing::info!(
+        bridge = %bridge_id,
+        positions = out.len(),
+        "restore: authoritative per-exit positions built from sync_transactions"
+    );
+    Ok(out)
 }
 
 /// Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet `faucet_registry` rows
@@ -751,6 +886,7 @@ async fn restore_faucet_identities(
     Ok(n)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
@@ -759,6 +895,10 @@ async fn restore_bridge_outs(
     block_state: &Arc<BlockState>,
     restore_block: u64,
     l1_rpc_url: Option<String>,
+    bridge_positions: std::collections::HashMap<
+        miden_protocol::note::NoteId,
+        ([u8; 32], u64, u32, u32),
+    >,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -790,15 +930,47 @@ async fn restore_bridge_outs(
                 // restore runs AND byte-identical to a fresh live projection —
                 // the Miden client returns consumed notes in store-arrival order,
                 // which varies between runs.
-                let mut sorted: Vec<&_> = consumed_notes.iter().collect();
-                sort_consumed_for_projection(&mut sorted);
+                // Pair each consumed record with its UNIQUE NoteId via the authoritative
+                // position feed. A consumed record has lost both its id and its nullifier
+                // (metadata gone), so the join is by details commitment — and because
+                // distinct notes CAN share one, each commitment keeps a QUEUE of candidate
+                // ids (sorted for determinism) and every matching record pops one: both
+                // siblings get distinct ids/positions, none is collapsed or double-assigned.
+                let mut ids_by_commitment: std::collections::HashMap<
+                    [u8; 32],
+                    Vec<miden_protocol::note::NoteId>,
+                > = std::collections::HashMap::new();
+                for (id, (commitment, _, _, _)) in &bridge_positions {
+                    ids_by_commitment.entry(*commitment).or_default().push(*id);
+                }
+                for ids in ids_by_commitment.values_mut() {
+                    ids.sort_by_key(|i| i.as_bytes());
+                    ids.reverse(); // pop() takes the smallest first
+                }
+                let within_tx_pos: std::collections::HashMap<miden_protocol::note::NoteId, u32> =
+                    bridge_positions
+                        .iter()
+                        .map(|(id, (_, _, _, pos))| (*id, *pos))
+                        .collect();
+                let mut sorted: Vec<(Option<miden_protocol::note::NoteId>, &InputNoteRecord)> =
+                    consumed_notes
+                        .iter()
+                        .map(|note| {
+                            let id = ids_by_commitment
+                                .get_mut(&note.details_commitment().as_bytes())
+                                .and_then(|q| q.pop());
+                            (id, note)
+                        })
+                        .collect();
+                sort_consumed_for_projection_with(&mut sorted, &within_tx_pos);
 
-                for note in sorted {
+                for (note_unique_id, note) in sorted {
                     let blk = note_consumed_block(note, restore_block);
                     let block_hash = block_state_clone.get_block_hash(blk);
                     let outcome = project_b2agg_note(
                         &store_clone,
                         note,
+                        note_unique_id,
                         bridge_id,
                         local_network_id,
                         blk,
@@ -851,6 +1023,12 @@ pub(crate) enum B2AggRestoreOutcome {
 pub(crate) async fn project_b2agg_note(
     store: &Arc<dyn Store>,
     note: &InputNoteRecord,
+    // The note's UNIQUE on-chain NoteId when the caller knows it (the authoritative
+    // projector path always does; store-fed ConsumedExternal records and legacy restore
+    // replays don't — their metadata is gone). Identity blocker (Cantina #7 review):
+    // distinct notes CAN share a details commitment, and commitment-keyed dedup would
+    // collapse two real LET leaves into one emitted event.
+    unique_id: Option<miden_protocol::note::NoteId>,
     bridge_id: AccountId,
     local_network_id: u32,
     restore_block: u64,
@@ -864,7 +1042,14 @@ pub(crate) async fn project_b2agg_note(
         return Ok(B2AggRestoreOutcome::Skipped);
     }
 
+    // The EMISSION identity string: derived tx hashes, deposit rows and legacy dedup rows
+    // all key on the details-commitment hex (immutable history — never change it). The
+    // DEDUP identity is the unique NoteId when known, with the commitment as the legacy
+    // fallback so pre-fix rows keep deduping historical replays.
     let note_id_str = hex::encode(note.details_commitment().as_bytes());
+    let dedup_key = unique_id
+        .map(|i| i.to_hex())
+        .unwrap_or_else(|| note_id_str.clone());
 
     // Cantina MA#3 — reclaim gate. A B2AGG note has a reclaim branch (consumer ==
     // sender, asset stays on Miden) and a bridge branch (consumer == bridge, asset
@@ -879,7 +1064,15 @@ pub(crate) async fn project_b2agg_note(
     // BridgeEvent for a reclaim/untracked consumption. Surface it (warn + metric)
     // rather than silently skipping, so operators can detect legacy bad state and
     // reset/rebuild. We do not auto-remove the stale event here.
-    if store.is_note_processed(&note_id_str).await? {
+    // Dual-key check: the unique-id key (new events) OR the legacy commitment key
+    // (historical events emitted before unique-identity dedup) — either one means this
+    // exact consumption was already handled. Two distinct notes sharing a commitment are
+    // NOT collapsed: the first emits under its id key; the second's id key is unseen and
+    // the legacy key only matches rows written by PRE-fix builds (a documented one-time
+    // migration edge, preferred over double-emitting all historical replays).
+    let processed = store.is_note_processed(&dedup_key).await?
+        || (dedup_key != note_id_str && store.is_note_processed(&note_id_str).await?);
+    if processed {
         if !matches!(class, B2AggConsumerClass::Emit) {
             ::metrics::counter!("restore_b2agg_legacy_processed_gated_total").increment(1);
             tracing::warn!(
@@ -896,7 +1089,16 @@ pub(crate) async fn project_b2agg_note(
     }
 
     match class {
-        B2AggConsumerClass::Emit => {}
+        B2AggConsumerClass::Emit => {
+            // Cantina #7 — RESERVE the authoritative LET deposit index for this leaf NOW,
+            // before any downstream gate can skip it. The bridge's consumption already
+            // appended the on-chain LET leaf; whether we end up emitting, quarantining,
+            // deferring (metadata) or refusing (self-target), the leaf's index is TAKEN —
+            // an unreserved skip would hand this index to the NEXT exit and shift every
+            // deposit_count after it off its true LET position (wrong globalIndex, sealed
+            // forever by getLogs immutability). Idempotent: retries/restarts reuse the row.
+            store.reserve_deposit_index(&dedup_key).await?;
+        }
         B2AggConsumerClass::Reclaimed => {
             ::metrics::counter!("bridge_out_reclaimed_b2agg_total").increment(1);
             tracing::info!(
@@ -1134,7 +1336,9 @@ pub(crate) async fn project_b2agg_note(
     // duplicate log — H3).
     let deposit_count = store
         .commit_b2agg_event_atomic(
-            note_id_str.clone(),
+            // Processed/dedup key: the UNIQUE id when known (commitment only as legacy
+            // fallback) — the tx hash above stays commitment-derived for history compat.
+            dedup_key.clone(),
             bridge_address,
             restore_block,
             block_hash,
@@ -2149,6 +2353,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2187,6 +2392,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2231,6 +2437,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             0, // local_network_id == dest-network 0 → self-target
             1,
@@ -2268,6 +2475,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2308,6 +2516,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2365,6 +2574,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2415,6 +2625,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2460,6 +2671,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
+            note.id(),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2535,6 +2747,7 @@ mod tests {
         let outcome = project_b2agg_note(
             store,
             note,
+            note.id(),
             bridge_id,
             7, // local_network_id (well-formed test notes target dest-network 0)
             42,

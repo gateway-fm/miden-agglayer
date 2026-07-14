@@ -2229,13 +2229,94 @@ impl Store for PgStore {
 
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;
+        // emitted=false rows are RESERVATIONS (deferred/quarantined leaves) — not
+        // "processed": a later replay must still attempt emission with the same index.
         let rows = client
             .query(
-                "SELECT 1 FROM bridge_out_processed WHERE note_id = $1",
+                "SELECT 1 FROM bridge_out_processed WHERE note_id = $1 AND emitted",
                 &[&note_id],
             )
             .await?;
         Ok(!rows.is_empty())
+    }
+
+    async fn get_let_gate_state(&self) -> anyhow::Result<(Option<u64>, bool)> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT let_gate_baseline, let_gate_halted FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        let baseline: Option<i64> = row.get(0);
+        let halted: bool = row.get(1);
+        Ok((baseline.map(|b| b as u64), halted))
+    }
+
+    async fn set_let_gate_baseline(&self, baseline: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET let_gate_baseline = $1, updated_at = now() WHERE id = 1",
+                &[&(baseline as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn set_let_gate_halted(&self, halted: bool) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET let_gate_halted = $1, updated_at = now() WHERE id = 1",
+                &[&halted],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn reserve_deposit_index(&self, note_key: &str) -> anyhow::Result<u32> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let idx: i32 = if let Some(row) = txn
+            .query_opt(
+                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                &[&note_key],
+            )
+            .await?
+        {
+            row.get(0)
+        } else {
+            let row = txn
+                .query_one(
+                    "UPDATE service_state
+                     SET deposit_counter = deposit_counter + 1, updated_at = now()
+                     WHERE id = 1
+                     RETURNING deposit_counter - 1",
+                    &[],
+                )
+                .await?;
+            let dc: i32 = row.get(0);
+            txn.execute(
+                "INSERT INTO bridge_out_processed (note_id, deposit_count, emitted)                  VALUES ($1, $2, FALSE)",
+                &[&note_key, &dc],
+            )
+            .await?;
+            dc
+        };
+        txn.commit().await?;
+        Ok(idx as u32)
+    }
+
+    async fn get_reserved_deposit_index(&self, note_key: &str) -> anyhow::Result<Option<u32>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                &[&note_key],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, i32>(0) as u32))
     }
 
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
@@ -2298,14 +2379,23 @@ impl Store for PgStore {
         // 1. Reuse-or-allocate deposit_count. Idempotent: a retry after a
         //    committed txn finds the existing row and reuses its count, so the
         //    counter never advances twice for one note (no gap — H3).
-        let deposit_count: i32 = if let Some(row) = txn
+        let (deposit_count, already_emitted): (i32, bool) = if let Some(row) = txn
             .query_opt(
-                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                "SELECT deposit_count, emitted FROM bridge_out_processed WHERE note_id = $1                  FOR UPDATE",
                 &[&note_id],
             )
             .await?
         {
-            row.get(0)
+            // Reuse the reservation (a deferred/quarantined leaf being emitted now, or a
+            // retry of a committed note) and flip it emitted.
+            let dc: i32 = row.get(0);
+            let was_emitted: bool = row.get(1);
+            txn.execute(
+                "UPDATE bridge_out_processed SET emitted = TRUE WHERE note_id = $1",
+                &[&note_id],
+            )
+            .await?;
+            (dc, was_emitted)
         } else {
             let row = txn
                 .query_one(
@@ -2318,24 +2408,17 @@ impl Store for PgStore {
                 .await?;
             let dc: i32 = row.get(0);
             txn.execute(
-                "INSERT INTO bridge_out_processed (note_id, deposit_count) VALUES ($1, $2)",
+                "INSERT INTO bridge_out_processed (note_id, deposit_count, emitted)                  VALUES ($1, $2, TRUE)",
                 &[&note_id, &dc],
             )
             .await?;
-            dc
+            (dc, false)
         };
 
-        // 2. Idempotent log emission. tx_hash is derived deterministically from
-        //    note_id, so a retry produces the same tx_hash — skip the insert if
-        //    a row already exists for it (no duplicate BridgeEvent, no gap in
-        //    log_index).
-        let already_emitted = txn
-            .query_opt(
-                "SELECT 1 FROM synthetic_logs WHERE transaction_hash = $1 LIMIT 1",
-                &[&tx_hash],
-            )
-            .await?
-            .is_some();
+        // 2. Idempotent log emission, keyed on THIS note's own emitted flag — NOT the
+        //    tx hash: two DISTINCT notes sharing a details commitment share the derived
+        //    tx hash, and both of their leaves must emit (with distinct deposit counts).
+        //    A retry of an already-committed note skips (emitted was already TRUE).
         if !already_emitted {
             let row = txn
                 .query_one(

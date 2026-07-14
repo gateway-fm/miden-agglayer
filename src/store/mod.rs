@@ -822,6 +822,31 @@ pub trait Store: Send + Sync + 'static {
 
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
+
+    /// Cantina #7 — reserve the AUTHORITATIVE LET deposit index for a bridge-consumed
+    /// B2AGG leaf WITHOUT emitting an event (quarantined / metadata-deferred /
+    /// self-targeted classes occupy an on-chain LET leaf by consumption, so skipping them
+    /// without reserving shifts every later exit's deposit_count off its true LET index —
+    /// wrong globalIndex, sealed forever). Reuse-or-allocate, atomic and idempotent: an
+    /// existing reservation (emitted or not) returns its original index, so retries,
+    /// restarts and a later successful emission (`commit_b2agg_event_atomic` with the same
+    /// key) all see ONE stable index. Does NOT mark the note processed — a deferred leaf
+    /// must remain re-attemptable.
+    async fn reserve_deposit_index(&self, note_key: &str) -> anyhow::Result<u32>;
+
+    /// The reserved LET index for `note_key`, if any (emitted or not). Used by the LET
+    /// cardinality gate to compute the window's not-yet-reserved pending count without
+    /// double-counting crash-replayed blocks.
+    async fn get_reserved_deposit_index(&self, note_key: &str) -> anyhow::Result<Option<u32>>;
+
+    /// Cantina #7 (part 2): persisted LET cardinality gate state — `(baseline, halted)`.
+    /// The baseline is captured ONCE at first arming and never re-absorbed (a restart that
+    /// re-baselined would convert a standing unsafe gap into accepted history), and a halt
+    /// survives restarts (the gate comes back halted and re-evaluates against the
+    /// persisted baseline).
+    async fn get_let_gate_state(&self) -> anyhow::Result<(Option<u64>, bool)>;
+    async fn set_let_gate_baseline(&self, baseline: u64) -> anyhow::Result<()>;
+    async fn set_let_gate_halted(&self, halted: bool) -> anyhow::Result<()>;
     /// Read the current deposit_counter (number of B2AGG-out notes aggkit has
     /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
     /// to compare against the bridge account's `let_num_leaves` storage slot.

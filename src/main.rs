@@ -866,7 +866,13 @@ async fn main() -> anyhow::Result<()> {
             &accounts.0,
             local_network_id_u32,
             command.l1_rpc_url.clone(),
-            command.miden_node.clone(),
+            // The RESOLVED node URL (Cantina #7 review blocker 3): with no explicit
+            // --miden-node, MidenClient connects to localhost — the projector's
+            // reconciler AND the LET cardinality gate must run against that same node,
+            // not silently disable themselves because the Option was None.
+            Some(miden_agglayer_service::miden_client::effective_node_url(
+                command.miden_node.clone(),
+            )),
             command.miden_api_key.clone(),
         )
         .await?,

@@ -123,7 +123,13 @@ pub struct InMemoryStore {
     address_mappings: RwLock<HashMap<Address, AccountId>>,
 
     // Bridge-out
-    processed_notes: RwLock<HashMap<String, u32>>,
+    // note_key -> (reserved LET deposit index, emitted). Cantina #7: EVERY Emit-class
+    // bridge-consumed B2AGG leaf reserves its index here (emitted=false for
+    // quarantined/deferred/self-targeted classes — they occupy a LET leaf with no event);
+    // the atomic commit reuses the reservation and flips emitted=true.
+    processed_notes: RwLock<HashMap<String, (u32, bool)>>,
+    // Cantina #7 (part 2): persisted-equivalent gate state (baseline, halted).
+    let_gate_state: RwLock<(Option<u64>, bool)>,
     deposit_counter: RwLock<u32>,
 
     // Claim watcher (independent from bridge-out so CLAIM observations do not
@@ -211,6 +217,7 @@ impl InMemoryStore {
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashMap::new()),
+            let_gate_state: RwLock::new((None, false)),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             #[cfg(test)]
@@ -1626,7 +1633,44 @@ impl Store for InMemoryStore {
     // ── Bridge-out ───────────────────────────────────────────────
 
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
-        Ok(self.processed_notes.read().contains_key(note_id))
+        // A reservation with emitted=false (deferred/quarantined leaf) is NOT "processed":
+        // a later replay (e.g. restore after a metadata backfill) must still attempt
+        // emission — and will reuse the reserved index.
+        Ok(self
+            .processed_notes
+            .read()
+            .get(note_id)
+            .is_some_and(|(_, emitted)| *emitted))
+    }
+
+    async fn get_let_gate_state(&self) -> anyhow::Result<(Option<u64>, bool)> {
+        Ok(*self.let_gate_state.read())
+    }
+
+    async fn set_let_gate_baseline(&self, baseline: u64) -> anyhow::Result<()> {
+        self.let_gate_state.write().0 = Some(baseline);
+        Ok(())
+    }
+
+    async fn set_let_gate_halted(&self, halted: bool) -> anyhow::Result<()> {
+        self.let_gate_state.write().1 = halted;
+        Ok(())
+    }
+
+    async fn reserve_deposit_index(&self, note_key: &str) -> anyhow::Result<u32> {
+        let mut processed = self.processed_notes.write();
+        if let Some(&(existing, _)) = processed.get(note_key) {
+            return Ok(existing);
+        }
+        let mut counter = self.deposit_counter.write();
+        let dc = *counter;
+        *counter += 1;
+        processed.insert(note_key.to_string(), (dc, false));
+        Ok(dc)
+    }
+
+    async fn get_reserved_deposit_index(&self, note_key: &str) -> anyhow::Result<Option<u32>> {
+        Ok(self.processed_notes.read().get(note_key).map(|(i, _)| *i))
     }
 
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
@@ -1666,44 +1710,35 @@ impl Store for InMemoryStore {
         amount: u128,
         metadata: &[u8],
     ) -> anyhow::Result<u32> {
-        // 1. Allocate / reuse deposit_count atomically.
-        let deposit_count = {
+        // 1. Allocate / reuse the reserved deposit index atomically, and mark it emitted.
+        //    `already_emitted` (a prior successful commit for THIS note key) drives the
+        //    log-emission idempotence — NOT the tx hash, which two distinct notes sharing
+        //    a details commitment legitimately share (the unique-identity blocker: both
+        //    leaves must emit, with distinct deposit counts).
+        let (deposit_count, already_emitted) = {
             let mut processed = self.processed_notes.write();
-            if let Some(&existing) = processed.get(&note_id) {
-                existing
-            } else {
-                let mut counter = self.deposit_counter.write();
-                let dc = *counter;
-                *counter += 1;
-                processed.insert(note_id.clone(), dc);
-                dc
+            match processed.get_mut(&note_id) {
+                Some((existing, emitted)) => {
+                    let was = *emitted;
+                    *emitted = true;
+                    (*existing, was)
+                }
+                None => {
+                    let mut counter = self.deposit_counter.write();
+                    let dc = *counter;
+                    *counter += 1;
+                    processed.insert(note_id.clone(), (dc, true));
+                    (dc, false)
+                }
             }
         };
 
-        // 2. Emit the BridgeEvent. Idempotent on retry: the projector derives
-        //    tx_hash deterministically from note_id, so a second emit would
-        //    only duplicate the log. The InMemoryStore has no tx_hash unique
-        //    constraint, so guard by checking the existing logs_by_block entry
-        //    for the same tx_hash before emitting. This read-then-insert is race
-        //    free under the single-writer serial invariant documented above (the
+        // 2. Emit the BridgeEvent. Idempotence is keyed on THIS note's reservation state
+        //    (`already_emitted` above): a retry of a committed note skips, while a DISTINCT
+        //    note that happens to share the derived tx_hash (same details commitment —
+        //    the unique-identity blocker) still emits its own event with its own reserved
+        //    deposit_count. Race-free under the single-writer serial invariant (the
         //    projector is the only, strictly-serial caller).
-        //
-        //    Per-block scope is sufficient — this check only inspects
-        //    `logs_by_block[block_number]`, NOT every block. That is not a
-        //    cross-block dedup hole: a given note only ever projects to one
-        //    block, and cross-block RE-projection is already fenced off upstream
-        //    by the GLOBAL processed-note set. The projector consults
-        //    `is_note_processed(note_id)` before it ever calls this method, so
-        //    once a note is committed at block A it can never re-enter here for a
-        //    later block B. The only way we reach this point twice for the same
-        //    note is a same-block retry (same `block_number`, same derived
-        //    `tx_hash`), which this per-block scan catches exactly.
-        let already_emitted = self
-            .logs_by_block
-            .read()
-            .get(&block_number)
-            .map(|logs| logs.iter().any(|l| l.transaction_hash == tx_hash))
-            .unwrap_or(false);
         if !already_emitted {
             self.add_bridge_event(
                 bridge_address,
