@@ -196,7 +196,10 @@ source "$SCRIPT_DIR/lib-isolated-wallet.sh"
 
 SPONSOR_VERIFIED_AT_EXIT=0
 cleanup() {
-    local rc=$?
+    # rc from the first arg when a re-installed trap passes it explicitly (a bare
+    # `(exit "$rc")` before cleanup aborts the trap under `set -e` on failure —
+    # skipping cleanup exactly when it matters); otherwise fall back to $?.
+    local rc=${1:-$?}
     # Best-effort: never leave the shared stack with a wedged sponsor if the
     # script died before the epilogue heal (subshell so any `fail` inside the
     # heal cannot mask the original exit code).
@@ -905,9 +908,14 @@ print('\n'.join(out))
     read -r -a compose <<<"$ALLOWLIST_COMPOSE_CMD"
 
     ALLOWLIST_ACTIVE=1
-    # Preserve the failing command's exit code across the best-effort restore
-    # so cleanup() still sees it.
-    trap 'rc=$?; if [[ "$ALLOWLIST_ACTIVE" == "1" ]]; then ( restore_proxy_config ) || true; fi; (exit "$rc"); cleanup' EXIT
+    # This optional phase can itself re-wedge the sponsor; clear the "verified at
+    # exit" flag so cleanup's best-effort heal runs again if this phase fails.
+    SPONSOR_VERIFIED_AT_EXIT=0
+    # Preserve the failing command's exit code and pass it to cleanup EXPLICITLY.
+    # A bare `(exit "$rc")` before cleanup aborts the trap under `set -e` on a
+    # nonzero status, so cleanup (wallet wipe + sponsor heal) would be skipped
+    # exactly on failure. Passing $rc as an arg avoids that.
+    trap 'rc=$?; if [[ "$ALLOWLIST_ACTIVE" == "1" ]]; then ( restore_proxy_config ) || true; fi; cleanup "$rc"' EXIT
     "${compose[@]}" -f "$ALLOWLIST_OVERRIDE" up -d --no-deps --force-recreate miden-agglayer \
         || fail "could not recreate the proxy with the allow-list override"
     wait_for "proxy healthy with allow-list config" "rpc eth_chainId '[]' | grep -q '\"result\"'" 300 5
