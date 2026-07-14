@@ -2206,11 +2206,17 @@ mod tests {
     /// store, exactly the state `service_send_raw_txn` holds between
     /// `acquire_claim_lock` and publish completion). Signer B — a DIFFERENT
     /// key — submits a full valid claimAsset for the SAME gi:
-    ///   1. within the TTL → rejected on the "already submitted" path, with
-    ///      ZERO side effects for B (no publish, no nonce advance, no tx);
-    ///   2. after A's claim LANDS (ClaimEvent recorded) → B stays HARD
-    ///      rejected, even with the TTL treated as expired — landed dedup
-    ///      holds forever, for any signer.
+    ///   1. IN FLIGHT (no ClaimEvent yet), within the TTL → rejected on the
+    ///      "already submitted" path, with ZERO side effects for B (no publish,
+    ///      no nonce advance, no tx). accept-and-revert does NOT fire here
+    ///      because the gi has not LANDED (no ClaimEvent).
+    ///   2. after A's claim LANDS (ClaimEvent recorded) → #55 accept-and-revert:
+    ///      B's full-RPC resubmission is ACCEPTED with a reverted (status 0x0)
+    ///      receipt (nonce consumed, NO new ClaimEvent, no Miden publish) — the
+    ///      geth-faithful AlreadyClaimed, so a cross-signer's nonce never
+    ///      desyncs. The claim-lock PRIMITIVE (`acquire_claim_lock`) is
+    ///      unchanged and still hard-rejects a LANDED gi — accept-and-revert
+    ///      lives in the RPC handler ABOVE the lock, not in the lock itself.
     #[tokio::test]
     async fn user_sponsor_double_submit_same_global_index() {
         let service = create_test_service();
@@ -2266,19 +2272,46 @@ mod tests {
             .await
             .unwrap();
 
-        // B retries the same tx — still hard-rejected (LANDED beats everything).
-        let err = service_send_raw_txn(service, input_b)
+        // #55 — B retries the same tx. Now that gi has LANDED, B's full-RPC
+        // submission is ACCEPT-AND-REVERTED (geth-faithful AlreadyClaimed): it
+        // is ACCEPTED (nonce consumed) with a reverted (status 0x0) receipt and
+        // NO new ClaimEvent — instead of the old hard "already submitted"
+        // reject — so a cross-signer's nonce sequence never desyncs.
+        let claim_events_before = count_claim_events(&store).await;
+        let accepted = service_send_raw_txn(service, input_b)
             .await
-            .expect_err("a landed gi must stay rejected for any signer");
-        assert!(
-            err.to_string().contains("already submitted"),
-            "landed dedup keeps the original rejection: {err:#}"
+            .expect("a landed gi from a DIFFERENT tx is accept-and-reverted (#55), not rejected");
+        assert_eq!(accepted, tx_b, "accept-and-revert returns B's own tx hash");
+        assert_eq!(
+            store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(),
+            1,
+            "accept-and-revert must CONSUME B's nonce, exactly like a normal accept"
         );
-        // ...and even with the TTL forced to zero (i.e. long expired), the
+        let (result, _blk) = store
+            .txn_receipt(tx_b)
+            .await
+            .unwrap()
+            .expect("accept-and-revert writes a durable receipt");
+        assert!(
+            result.is_err(),
+            "the accept-and-revert receipt is status 0x0 (reverted)"
+        );
+        assert_eq!(
+            count_claim_events(&store).await,
+            claim_events_before,
+            "accept-and-revert must NOT emit a second ClaimEvent"
+        );
+        assert!(
+            !miden.test_was_called(),
+            "accept-and-revert must not publish a second CLAIM to Miden"
+        );
+
+        // The claim-lock PRIMITIVE is unchanged: a direct acquire_claim_lock on
+        // a LANDED gi still hard-rejects even with the TTL forced to zero — the
         // LANDED check wins over orphan recovery, regardless of submitter.
         let err = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
             .await
-            .expect_err("LANDED must beat TTL-expiry recovery");
+            .expect_err("LANDED must beat TTL-expiry recovery at the lock primitive");
         assert!(err.to_string().contains("already submitted"));
     }
 
@@ -2531,9 +2564,9 @@ mod tests {
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
-        let accepted = service_send_raw_txn(service.clone(), input_b)
-            .await
-            .expect("a landed-gi claim from a different signer must be ACCEPTED (accept-and-revert)");
+        let accepted = service_send_raw_txn(service.clone(), input_b).await.expect(
+            "a landed-gi claim from a different signer must be ACCEPTED (accept-and-revert)",
+        );
         assert_eq!(accepted, tx_b, "must return B's own tx hash");
 
         // (1) B's nonce is CONSUMED — exactly like a normal accept.
@@ -2544,11 +2577,13 @@ mod tests {
         );
 
         // (2) A durable REVERTED receipt is retrievable, status 0x0, empty logs.
-        let receipt =
-            crate::service_get_txn_receipt::service_get_txn_receipt(service.clone(), format!("{tx_b:#x}"))
-                .await
-                .unwrap()
-                .expect("eth_getTransactionReceipt must return a non-null receipt");
+        let receipt = crate::service_get_txn_receipt::service_get_txn_receipt(
+            service.clone(),
+            format!("{tx_b:#x}"),
+        )
+        .await
+        .unwrap()
+        .expect("eth_getTransactionReceipt must return a non-null receipt");
         assert!(
             matches!(
                 receipt.inner.as_receipt().unwrap().status,
@@ -2564,7 +2599,10 @@ mod tests {
             receipt.from, addr_b,
             "receipt.from must be the submitting signer"
         );
-        assert_eq!(receipt.block_number, Some(store.get_latest_block_number().await.unwrap()));
+        assert_eq!(
+            receipt.block_number,
+            Some(store.get_latest_block_number().await.unwrap())
+        );
 
         // (3) NO new ClaimEvent was emitted — the real landed one is authoritative.
         assert_eq!(
@@ -2630,7 +2668,8 @@ mod tests {
         // the unit harness completes it synchronously via the RD-860 swallow).
         // The point is it PASSES the R4 nonce gate (nonce 1 == expected 1).
         let gi_y = U256::from(0x5503u64);
-        let calldata_y = claim_calldata(gi_y, Address::from([0x99u8; 20]), U256::from(1_000_000u64));
+        let calldata_y =
+            claim_calldata(gi_y, Address::from([0x99u8; 20]), U256::from(1_000_000u64));
         let (input_y, _tx_y) = encode_tx_signed_with_nonce(&key_s, calldata_y, 1);
         let res_y = service_send_raw_txn(service.clone(), input_y).await;
         assert!(
@@ -2724,7 +2763,9 @@ mod tests {
 
         let err = service_send_raw_txn(service.clone(), input_b)
             .await
-            .expect_err("a stale-nonce landed claim must be rejected by R4, not accept-and-reverted");
+            .expect_err(
+                "a stale-nonce landed claim must be rejected by R4, not accept-and-reverted",
+            );
         assert!(
             err.to_string().contains("nonce mismatch"),
             "must be the R4 nonce-mismatch rejection, not an accept: {err:#}"
