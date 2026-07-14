@@ -92,6 +92,12 @@ pub struct L1InfoTreeIndexer {
     /// cursor advances forward normally; remove the flag for subsequent
     /// boots.
     from_block_override: Option<u64>,
+    /// Strict-H6 evidence qualification tag (audit H6 BLOCKER 3). When a
+    /// finality tag (`finalized`/`safe`) is configured, each poll also fetches
+    /// that L1 block and persists its number via `set_l1_finalized_block`, which
+    /// the strict gate uses to qualify evidence. In `Confirmations` mode the
+    /// indexer does no extra work (the gate uses the head cursor + depth).
+    evidence_tag: crate::ger::EvidenceTag,
 }
 
 impl L1InfoTreeIndexer {
@@ -103,6 +109,48 @@ impl L1InfoTreeIndexer {
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_range: DEFAULT_MAX_RANGE,
             from_block_override: None,
+            evidence_tag: crate::ger::EvidenceTag::default(),
+        }
+    }
+
+    /// Configure the strict-H6 evidence tag. In `Finalized`/`Safe` mode the
+    /// indexer tracks the corresponding L1 finality block (BLOCKER 3).
+    pub fn with_evidence_tag(mut self, tag: crate::ger::EvidenceTag) -> Self {
+        self.evidence_tag = tag;
+        self
+    }
+
+    /// The L1 block tag to poll for finality tracking, or `None` in
+    /// confirmation-depth mode (no finality block needed).
+    fn finality_block_tag(&self) -> Option<BlockNumberOrTag> {
+        match self.evidence_tag {
+            crate::ger::EvidenceTag::Confirmations => None,
+            crate::ger::EvidenceTag::Finalized => Some(BlockNumberOrTag::Finalized),
+            crate::ger::EvidenceTag::Safe => Some(BlockNumberOrTag::Safe),
+        }
+    }
+
+    /// Best-effort refresh of the persisted L1 finality-tag block (BLOCKER 3).
+    /// A no-op in confirmation-depth mode. A fetch/persist failure just leaves
+    /// the previous value — the strict gate stays fail-closed (never
+    /// over-authorizes on a stale finality block).
+    async fn refresh_finality_block<P: Provider>(&self, provider: &P) {
+        let Some(tag) = self.finality_block_tag() else {
+            return;
+        };
+        match provider.get_block_by_number(tag).await {
+            Ok(Some(block)) => {
+                let n = block.header.number;
+                if let Err(e) = self.store.set_l1_finalized_block(n).await {
+                    tracing::warn!(error = %e, tag = ?tag, "L1InfoTreeIndexer: failed to persist L1 finality block");
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(tag = ?tag, "L1InfoTreeIndexer: L1 finality block not available yet");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, tag = ?tag, "L1InfoTreeIndexer: failed to fetch L1 finality block");
+            }
         }
     }
 
@@ -227,6 +275,11 @@ impl L1InfoTreeIndexer {
         provider: &P,
         last_processed: &mut u64,
     ) -> anyhow::Result<()> {
+        // BLOCKER 3 — keep the L1 finality-tag block fresh for the strict gate
+        // (no-op in confirmation-depth mode). Done before the head check so it
+        // still advances while the head is idle.
+        self.refresh_finality_block(provider).await;
+
         let head = provider.get_block_number().await?;
         if head <= *last_processed {
             return Ok(());
@@ -559,9 +612,16 @@ mod tests {
             .expect("decomposition must be recorded immediately (no delay for normal ops)");
         assert!(entry.mainnet_exit_root.is_some() && entry.rollup_exit_root.is_some());
 
-        let err = crate::ger::ensure_ger_l1_observed(&store, &ger, true, CONF, tx)
-            .await
-            .expect_err("strict gate must refuse a not-yet-confirmation-deep observation");
+        let err = crate::ger::ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            crate::ger::EvidenceTag::Confirmations,
+            CONF,
+            tx,
+        )
+        .await
+        .expect_err("strict gate must refuse a not-yet-confirmation-deep observation");
         assert!(
             err.to_string().contains("not yet"),
             "must cite the finality guard: {err:#}"
@@ -576,9 +636,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(last_processed, 80, "cursor advanced to the new head");
-        crate::ger::ensure_ger_l1_observed(&store, &ger, true, CONF, tx)
-            .await
-            .expect("strict gate must authorize once the observation is confirmation-deep");
+        crate::ger::ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            crate::ger::EvidenceTag::Confirmations,
+            CONF,
+            tx,
+        )
+        .await
+        .expect("strict gate must authorize once the observation is confirmation-deep");
     }
 
     /// BLOCKER 3 (retryable batch) — a durable evidence-write failure must keep

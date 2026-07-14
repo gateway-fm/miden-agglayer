@@ -86,6 +86,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "010_reconcile_cursor.sql",
         include_str!("../../migrations/010_reconcile_cursor.sql"),
     ),
+    (
+        "011_l1_finalized_block.sql",
+        include_str!("../../migrations/011_l1_finalized_block.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

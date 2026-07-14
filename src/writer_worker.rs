@@ -614,9 +614,16 @@ impl WriterWorker {
                         "TTL expired (>{}s in non-terminal state)",
                         sweeper_ttl.as_secs()
                     );
-                    if let Err(e) =
-                        write_failure_receipt(&sweeper_service, *hash, &reason, inflight_envelope)
-                            .await
+                    if let Err(e) = write_failure_receipt(
+                        &sweeper_service,
+                        *hash,
+                        &reason,
+                        inflight_envelope,
+                        // BLOCKER 1 — the sweeper runs CONCURRENTLY with a live
+                        // submit/handoff; it must NOT seed a competing row.
+                        false,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             target: "writer_worker::ttl",
@@ -793,7 +800,11 @@ impl WriterWorker {
                     .get(&hash)
                     .map(|entry| (entry.envelope.clone(), entry.signer));
                 if let Err(store_err) =
-                    write_failure_receipt(&self.service, hash, &err, inflight_envelope).await
+                    // The worker owns this job here (dispatch_job has returned,
+                    // so no live handoff is concurrent) — seeding a missing row
+                    // is race-free, so allow it.
+                    write_failure_receipt(&self.service, hash, &err, inflight_envelope, true)
+                            .await
                 {
                     tracing::error!(
                         target: "writer_worker",
@@ -876,11 +887,25 @@ async fn dispatch_job(service: &ServiceState, job: WriteJob) -> anyhow::Result<(
 /// downstream effect is that `eth_getTransactionReceipt(hash)` transitions
 /// from JSON `null` (not-yet-mined) to `status:0x0` (failed) — the contract
 /// aggkit's ethtxmanager needs to move the tx out of its retry loop.
+///
+/// `allow_seed` gates whether a MISSING receipt row may be seeded here
+/// (BLOCKER 1, re-review). Only the OWNER of a job may seed — the worker's own
+/// terminal-failure path (`allow_seed = true`), which runs AFTER `dispatch_job`
+/// has returned, so no live submit/handoff is concurrent. The TTL sweeper runs
+/// CONCURRENTLY with an in-flight submit and passes `allow_seed = false`: it
+/// must NOT seed a competing row, because the live claim/GER handoff creates the
+/// receipt row and the tx↔note link together, and a sweeper seed interleaving
+/// there would steal the row (making the live `txn_begin` fail and the
+/// `record_tx_note_link` never run — the projector could then never finalise the
+/// receipt under the real tx hash). With no row and `allow_seed = false` the
+/// sweeper defers: the live handoff (or the worker's own failure path) creates
+/// the row, and a real Miden landing then wins via success-always-wins.
 async fn write_failure_receipt(
     service: &ServiceState,
     hash: TxHash,
     err: &anyhow::Error,
     inflight_envelope: Option<(TxEnvelope, Address)>,
+    allow_seed: bool,
 ) -> anyhow::Result<()> {
     let reason = format!("writer_worker: {err:#}");
 
@@ -890,18 +915,19 @@ async fn write_failure_receipt(
     let block_num = service.store.get_latest_block_number().await.unwrap_or(0);
     let block_hash = service.block_state.get_block_hash(block_num);
 
-    // txn_commit is an UPDATE keyed on tx_hash. Post-#127 both stores ERROR when
-    // it affects zero rows (a missing prior txn_begin), so without a pending row
-    // the failure receipt would never be written and eth_getTransactionReceipt
-    // would stay null forever (PR #121 review — the aggoracle/ethtxmanager wedge
-    // mechanism). Most worker failures fire BEFORE the dispatcher reaches its
-    // `record_local_pending_tx` step, so seed the pending row from the inflight
-    // cache's retained envelope first. Only when the envelope has already been
-    // evicted from the inflight cache do we fall back to a bare txn_commit
-    // (which then surfaces the missing-row error).
-    if service.store.txn_get(hash).await?.is_none()
-        && let Some((envelope, signer)) = inflight_envelope
-    {
+    if service.store.txn_get(hash).await?.is_none() {
+        // No receipt row yet. Seed one ONLY if this path owns the job (see the
+        // `allow_seed` contract above); otherwise defer so the live handoff's
+        // txn_begin + note↔tx link are not raced/stolen.
+        let Some((envelope, signer)) = inflight_envelope.filter(|_| allow_seed) else {
+            tracing::debug!(
+                %hash,
+                allow_seed,
+                "failure receipt deferred: no row yet and seeding is not owned by this path \
+                 (the live handoff owns row creation)"
+            );
+            return Ok(());
+        };
         // Best-effort seed: txn_begin is an INSERT and errors on an existing row.
         // If a concurrent task won the race and already seeded the row, ignore
         // the duplicate — the row now exists, so the txn_commit below finalises
@@ -984,6 +1010,7 @@ mod tests {
             hash,
             &anyhow::anyhow!("indexer-lag rejection"),
             Some((envelope, signer)),
+            true, // worker-owned failure path may seed a missing row
         )
         .await
         .expect("failure receipt must be writable without a prior txn_begin");
@@ -1040,6 +1067,7 @@ mod tests {
             hash,
             &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
             Some((envelope, signer)),
+            false, // sweeper path
         )
         .await
         .expect("failure-receipt write must succeed as a no-op, not error");
@@ -1093,12 +1121,14 @@ mod tests {
             .await
             .unwrap();
 
-        // TTL sweeper fails the still-running job (the real sweeper call path).
+        // TTL sweeper fails the still-running job (the real sweeper call path,
+        // allow_seed = false — the row already exists here).
         write_failure_receipt(
             &service,
             hash,
             &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
             Some((envelope, signer)),
+            false,
         )
         .await
         .unwrap();
@@ -1121,6 +1151,99 @@ mod tests {
             1,
             "the ClaimEvent must be emitted on the landing"
         );
+    }
+
+    /// BLOCKER 1 (re-review) — the sweeper (`allow_seed = false`) must NOT seed a
+    /// competing receipt row while the live submit path is mid-handoff. It
+    /// defers (returns Ok, no row) so the live handoff's txn_begin + note↔tx link
+    /// run cleanly and the projector can finalise the receipt under the real tx
+    /// hash. Simulates the interleaving: sweeper fires BEFORE the live handoff.
+    ///
+    /// Mutation check: letting the sweeper seed (drop the `allow_seed` gate)
+    /// creates a competing row here → the live `txn_begin` below fails and the
+    /// link is never recorded, failing this test's post-handoff assertions.
+    #[tokio::test]
+    async fn sweeper_does_not_seed_a_row_racing_the_live_handoff() {
+        let service = crate::test_helpers::create_test_service();
+        let store = service.store.clone();
+        let (envelope, signer) = fake_envelope(0);
+        let hash = *envelope.tx_hash();
+        let note_commitment = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        // Sweeper fires first, no row yet: it must DEFER (no seed), returning Ok.
+        write_failure_receipt(
+            &service,
+            hash,
+            &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
+            Some((envelope.clone(), signer)),
+            false,
+        )
+        .await
+        .expect("sweeper deferral must be Ok");
+        assert!(
+            store.txn_get(hash).await.unwrap().is_none(),
+            "the sweeper must NOT have seeded a competing row"
+        );
+
+        // The live handoff (claim/GER ordering: pending row + note↔tx link) now
+        // runs UNraced.
+        store
+            .txn_begin(
+                hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .expect("live txn_begin must not conflict with a sweeper seed");
+        store
+            .record_tx_note_link(&format!("{hash:#x}"), note_commitment)
+            .await
+            .unwrap();
+
+        // The projector's critical datum — the real tx↔note link — is intact.
+        assert_eq!(
+            store
+                .get_tx_for_note(note_commitment)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(format!("{hash:#x}").as_str()),
+            "the note must link back to the REAL tx hash"
+        );
+    }
+
+    /// BLOCKER 1 (re-review) — the worker's OWN failure path (`allow_seed =
+    /// true`) still seeds a missing row: it runs after dispatch_job returned, so
+    /// no live handoff is concurrent, and a genuine pre-handoff failure must
+    /// still surface a status:0x0 receipt so aggkit stops polling.
+    #[tokio::test]
+    async fn worker_own_failure_path_seeds_missing_row() {
+        let service = crate::test_helpers::create_test_service();
+        let store = service.store.clone();
+        let (envelope, signer) = fake_envelope(1);
+        let hash = *envelope.tx_hash();
+
+        write_failure_receipt(
+            &service,
+            hash,
+            &anyhow::anyhow!("miden submission failed pre-handoff"),
+            Some((envelope, signer)),
+            true,
+        )
+        .await
+        .expect("worker-owned seed must write a real failure receipt");
+
+        let (result, _block) = store
+            .txn_receipt(hash)
+            .await
+            .unwrap()
+            .expect("a real failure receipt must exist");
+        assert!(result.is_err(), "receipt must be status:0x0");
     }
 
     fn fake_ger_job(nonce: u64) -> WriteJob {

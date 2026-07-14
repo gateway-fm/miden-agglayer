@@ -34,6 +34,54 @@ alloy_core::sol! {
 /// epochs / 64 slots).
 pub const DEFAULT_CONFIRMATIONS: u64 = 64;
 
+/// How the strict-H6 gate qualifies an L1 observation as final enough to
+/// authorize an irreversible GER injection (audit H6, re-review BLOCKER 3).
+/// Normal decomposition (`zkevm_getExitRootsByGER`) never consults this — it
+/// reads the evidence row directly, so ordinary bridge readiness is unaffected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EvidenceTag {
+    /// Depth-based: the observation must be `l1_confirmations` blocks below the
+    /// indexer's head cursor. The configurable option for strict-but-NOT-hardened
+    /// deployments; NOT permitted under `--require-hardening`.
+    #[default]
+    Confirmations,
+    /// The observation's L1 block must be at or below the L1 `finalized` block.
+    /// MANDATORY under `--require-hardening` — a finalized block cannot be
+    /// reorged, so this is the strongest evidence qualification.
+    Finalized,
+    /// The observation's L1 block must be at or below the L1 `safe` block
+    /// (justified but not yet finalized — weaker than `finalized`). Allowed for
+    /// strict-non-hardened; NOT sufficient for hardened.
+    Safe,
+}
+
+impl EvidenceTag {
+    /// True for the L1 finality-tag modes (`finalized` / `safe`), which qualify
+    /// evidence against a separately-tracked finality block rather than a
+    /// confirmation depth below head.
+    pub fn is_finality_tag(self) -> bool {
+        matches!(self, Self::Finalized | Self::Safe)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmations => "confirmations",
+            Self::Finalized => "finalized",
+            Self::Safe => "safe",
+        }
+    }
+
+    /// Parse a CLI/env value; `None` on an unrecognised token.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "confirmations" | "depth" | "confirmation" => Some(Self::Confirmations),
+            "finalized" | "finalised" => Some(Self::Finalized),
+            "safe" => Some(Self::Safe),
+            _ => None,
+        }
+    }
+}
+
 /// Minimum confirmation depth strict H6 will boot with. Zero would authorize an
 /// irreversible injection from a 0-confirmation (freely reorg-able) observation,
 /// defeating the finality guarantee — so strict mode refuses to start with
@@ -262,6 +310,7 @@ pub async fn insert_ger(
     store: &Arc<dyn crate::store::Store>,
     txn_hash: TxHash,
     require_l1_observed: bool,
+    evidence_tag: EvidenceTag,
     confirmations: u64,
     txn_envelope: TxEnvelope,
     signer: Address,
@@ -275,12 +324,13 @@ pub async fn insert_ger(
         store,
         &ger_bytes,
         require_l1_observed,
+        evidence_tag,
         confirmations,
         txn_hash,
     )
     .await?;
 
-    // Check dedup before doing any work.
+    // Dedup: decide whether this is a NEW injection.
     //
     // Use `is_ger_injected` (not `has_seen_ger`) because the L1InfoTreeIndexer
     // pre-creates ger_entries rows for every L1 InfoTree pair as it observes
@@ -289,7 +339,10 @@ pub async fn insert_ger(
     // and the synthetic L2 event would never be emitted, leaving deposits
     // stuck `ready_for_claim=false`. Gating on `is_injected = TRUE` correctly
     // reflects "have we already submitted the Miden tx and committed the
-    // synthetic event for this GER?".
+    // synthetic event for this GER?". (`ensure_ger_l1_observed` above already
+    // short-circuits on the same `is_ger_injected` check, so an already-injected
+    // GER never reaches the gate's finality logic — this read then just decides
+    // the duplicate no-op return value.)
     let is_new = !store.is_ger_injected(&ger_bytes).await?;
 
     if is_new {
@@ -410,6 +463,7 @@ pub async fn ensure_ger_l1_observed(
     store: &Arc<dyn crate::store::Store>,
     ger_bytes: &[u8; 32],
     require_l1_observed: bool,
+    evidence_tag: EvidenceTag,
     confirmations: u64,
     txn_hash: TxHash,
 ) -> anyhow::Result<()> {
@@ -427,19 +481,30 @@ pub async fn ensure_ger_l1_observed(
     // ordinary decomposition / bridge readiness (`zkevm_getExitRootsByGER`, which
     // reads `get_ger_entry` directly and does NOT call this gate) is never
     // delayed. Only strict authorization of an IRREVERSIBLE injection
-    // additionally requires the observation to be confirmation-deep on L1:
-    //   l1_head - evidence_block >= confirmations,
-    // using the indexer's persisted cursor as the observed L1 head. An evidence
-    // row with NO recorded L1 block (`block_number == 0`: a legacy/pre-guard row,
-    // or one seeded by a non-indexer write path) is treated as NOT final —
-    // fail-closed — which also closes the upgrade-state gap for rows written
-    // before this guard existed. Lenient mode never gates on finality.
+    // additionally requires the observation to be final by the configured
+    // `evidence_tag` (BLOCKER 3):
+    //   - Confirmations: `l1_head - evidence_block >= confirmations`, using the
+    //     indexer's persisted head cursor (strict-non-hardened only).
+    //   - Finalized / Safe: `evidence_block <= l1_finalized_block`, where the
+    //     indexer separately tracks the L1 `finalized`/`safe` block (MANDATORY
+    //     under --require-hardening: a finalized block cannot be reorged).
+    // An evidence row with NO recorded L1 block (`block_number == 0`: a
+    // legacy/pre-guard row, or one seeded by a non-indexer write path) is treated
+    // as NOT final — fail-closed — closing the upgrade-state gap. Likewise a
+    // finality-tag mode with no finality block recorded yet fails closed. Lenient
+    // mode never gates on finality.
     let final_enough = if require_l1_observed {
         match entry.as_ref() {
-            Some(e) if e.block_number > 0 => {
-                let l1_head = store.get_l1_indexer_cursor().await.unwrap_or(0);
-                l1_head.saturating_sub(e.block_number) >= confirmations
-            }
+            Some(e) if e.block_number > 0 => match evidence_tag {
+                EvidenceTag::Confirmations => {
+                    let l1_head = store.get_l1_indexer_cursor().await.unwrap_or(0);
+                    l1_head.saturating_sub(e.block_number) >= confirmations
+                }
+                EvidenceTag::Finalized | EvidenceTag::Safe => {
+                    let finality_block = store.get_l1_finalized_block().await.unwrap_or(0);
+                    finality_block > 0 && e.block_number <= finality_block
+                }
+            },
             _ => false,
         }
     } else {
@@ -453,14 +518,15 @@ pub async fn ensure_ger_l1_observed(
             // A resolved-but-not-yet-final observation is a DISTINCT transient
             // state from an unresolved one; surface it plainly. ("not observed
             // on L1" stays the stable substring for the unresolved case that the
-            // e2e / callers match.)
+            // e2e / callers match; "not yet" for the not-final case.)
             if roots_observed {
                 anyhow::bail!(
-                    "GER {} was observed on L1 but is not yet {confirmations} confirmations \
-                     deep (finality guard, audit H6); refusing injection under \
+                    "GER {} was observed on L1 but is not yet final by the `{}` evidence tag \
+                     (finality guard, audit H6); refusing injection under \
                      --reject-unverified-ger-injection. Transient — retry once the L1 \
                      observation finalizes.",
-                    hex::encode(ger_bytes)
+                    hex::encode(ger_bytes),
+                    evidence_tag.as_str(),
                 );
             }
             anyhow::bail!(
@@ -474,6 +540,7 @@ pub async fn ensure_ger_l1_observed(
             ger = %hex::encode(ger_bytes),
             tx = %txn_hash,
             roots_observed,
+            evidence_tag = evidence_tag.as_str(),
             "GER injection not yet corroborated/finalized by the L1 InfoTree indexer; \
              allowing through but unverified (lenient mode)"
         );
@@ -567,7 +634,8 @@ mod tests {
             &store,
             tx_hash,
             true, // require_l1_observed
-            0,    // confirmations (irrelevant: no roots observed)
+            EvidenceTag::Confirmations,
+            0, // confirmations (irrelevant: no roots observed)
             env.clone(),
             signer,
         )
@@ -591,7 +659,8 @@ mod tests {
             &store,
             tx_hash,
             false, // lenient
-            0,     // confirmations (lenient never gates on finality)
+            EvidenceTag::Confirmations,
+            0, // confirmations (lenient never gates on finality)
             env,
             signer,
         )
@@ -637,6 +706,7 @@ mod tests {
             &store,
             tx_hash,
             true,
+            EvidenceTag::Confirmations,
             0, // confirmations (dedup precedence returns before the finality check)
             env,
             signer,
@@ -680,6 +750,7 @@ mod tests {
             &store,
             tx_hash,
             true,
+            EvidenceTag::Confirmations,
             0, // confirmations (finality asserted separately below)
             env,
             signer,
@@ -716,9 +787,16 @@ mod tests {
 
         // Cursor at 140 → only 40 deep, < 64 confirmations → refused (transient).
         store.set_l1_indexer_cursor(140).await.unwrap();
-        let err = ensure_ger_l1_observed(&store, &ger, true, DEFAULT_CONFIRMATIONS, tx_hash)
-            .await
-            .expect_err("a not-yet-confirmation-deep observation must be refused under strict");
+        let err = ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            EvidenceTag::Confirmations,
+            DEFAULT_CONFIRMATIONS,
+            tx_hash,
+        )
+        .await
+        .expect_err("a not-yet-confirmation-deep observation must be refused under strict");
         assert!(
             err.to_string().contains("not yet"),
             "must cite the finality guard, not unresolved roots: {err}"
@@ -728,9 +806,16 @@ mod tests {
 
         // Cursor advances to 170 → 70 deep, >= 64 → authorized.
         store.set_l1_indexer_cursor(170).await.unwrap();
-        ensure_ger_l1_observed(&store, &ger, true, DEFAULT_CONFIRMATIONS, tx_hash)
-            .await
-            .expect("a confirmation-deep observation must pass the strict gate");
+        ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            EvidenceTag::Confirmations,
+            DEFAULT_CONFIRMATIONS,
+            tx_hash,
+        )
+        .await
+        .expect("a confirmation-deep observation must pass the strict gate");
     }
 
     /// Audit H6 (BLOCKER 1) — a legacy / pre-guard evidence row that carries NO
@@ -762,16 +847,74 @@ mod tests {
         // Even with a huge cursor, block 0 means "no recorded L1 block" → refused.
         store.set_l1_indexer_cursor(10_000_000).await.unwrap();
         let tx_hash = TxHash::from([0x45u8; 32]);
-        let err = ensure_ger_l1_observed(&store, &ger, true, DEFAULT_CONFIRMATIONS, tx_hash)
-            .await
-            .expect_err("a block-less legacy row must be refused under strict");
+        let err = ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            EvidenceTag::Confirmations,
+            DEFAULT_CONFIRMATIONS,
+            tx_hash,
+        )
+        .await
+        .expect_err("a block-less legacy row must be refused under strict");
         assert!(
             err.to_string().contains("not yet"),
             "finality-guard refusal: {err}"
         );
         // Lenient mode lets it through (no bail).
-        ensure_ger_l1_observed(&store, &ger, false, DEFAULT_CONFIRMATIONS, tx_hash)
+        ensure_ger_l1_observed(
+            &store,
+            &ger,
+            false,
+            EvidenceTag::Confirmations,
+            DEFAULT_CONFIRMATIONS,
+            tx_hash,
+        )
+        .await
+        .expect("lenient mode must not refuse a block-less row");
+    }
+
+    /// Audit H6 (BLOCKER 3) — the `finalized` evidence tag qualifies an
+    /// observation by the separately-tracked L1 finalized block, NOT by
+    /// confirmation depth: a resolved row authorizes iff `evidence_block <=
+    /// finalized_block`. With no finalized block yet (0), or one below the
+    /// evidence block, it fail-closes; once the finalized block reaches the
+    /// evidence block it authorizes. The head cursor is irrelevant in this mode.
+    ///
+    /// Mutation check: dropping the `evidence_block <= finality_block` clause
+    /// (always final) makes the not-yet-finalized case wrongly authorize.
+    #[tokio::test]
+    async fn h6_finalized_tag_gate_requires_finalized_block() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let ger = combined_ger(&[0x1Au8; 32], &[0x1Bu8; 32]);
+        let tx_hash = TxHash::from([0x46u8; 32]);
+        // Observed at L1 block 100. Head cursor set high to prove it's ignored
+        // in finalized mode (a depth check would wrongly pass).
+        store
+            .set_ger_exit_roots(&ger, [0x1Au8; 32], [0x1Bu8; 32], 100, 1_700_000_000)
             .await
-            .expect("lenient mode must not refuse a block-less row");
+            .unwrap();
+        store.set_l1_indexer_cursor(10_000).await.unwrap();
+
+        // No finalized block yet → fail-closed.
+        let err = ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, 0, tx_hash)
+            .await
+            .expect_err("finalized mode with no finalized block must refuse");
+        assert!(
+            err.to_string().contains("not yet"),
+            "finality-guard refusal: {err}"
+        );
+
+        // Finalized block below the evidence block → still not final.
+        store.set_l1_finalized_block(90).await.unwrap();
+        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, 0, tx_hash)
+            .await
+            .expect_err("evidence above the finalized block must refuse");
+
+        // Finalized block reaches/passes the evidence block → authorized.
+        store.set_l1_finalized_block(120).await.unwrap();
+        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, 0, tx_hash)
+            .await
+            .expect("a finalized observation must pass the strict gate");
     }
 }

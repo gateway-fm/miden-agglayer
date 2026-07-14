@@ -106,6 +106,12 @@ pub struct InMemoryStore {
     // `get_l1_indexer_cursor` even on an in-memory deployment.
     l1_indexer_cursor: RwLock<u64>,
 
+    // Last observed L1 `finalized`/`safe` block (audit H6 BLOCKER 3) — tracked
+    // separately from the head cursor so the strict gate can qualify evidence by
+    // finality tag. Field-backed mirror of the PgStore `l1_indexer_state
+    // .finalized_block` column (migration 011).
+    l1_finalized_block: RwLock<u64>,
+
     // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
     // first-write-wins evm_tx_hash -> note_commitment, with the reverse index
     // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
@@ -153,6 +159,7 @@ impl InMemoryStore {
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
             l1_indexer_cursor: RwLock::new(0),
+            l1_finalized_block: RwLock::new(0),
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
         }
@@ -293,6 +300,15 @@ impl Store for InMemoryStore {
 
     async fn set_l1_indexer_cursor(&self, block: u64) -> anyhow::Result<()> {
         *self.l1_indexer_cursor.write() = block;
+        Ok(())
+    }
+
+    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
+        Ok(*self.l1_finalized_block.read())
+    }
+
+    async fn set_l1_finalized_block(&self, block: u64) -> anyhow::Result<()> {
+        *self.l1_finalized_block.write() = block;
         Ok(())
     }
 

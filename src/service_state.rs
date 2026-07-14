@@ -113,6 +113,10 @@ pub struct ServiceState {
     /// cursor, so ordinary decomposition is never delayed. Defaults to
     /// `ger::DEFAULT_CONFIRMATIONS`.
     pub l1_confirmations: u64,
+    /// Audit H6 (BLOCKER 3) — how the strict gate qualifies an L1 observation as
+    /// final: confirmation depth, or an L1 `finalized`/`safe` tag (mandatory
+    /// `finalized` under `--require-hardening`). Defaults to `Confirmations`.
+    pub l1_evidence_tag: crate::ger::EvidenceTag,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one
     /// signer cannot both pass the equality check before either increments.
@@ -193,6 +197,7 @@ impl ServiceState {
             allow_any_signer: false,
             reject_unverified_ger: false,
             l1_confirmations: crate::ger::DEFAULT_CONFIRMATIONS,
+            l1_evidence_tag: crate::ger::EvidenceTag::default(),
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,

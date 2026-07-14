@@ -123,6 +123,28 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT finalized_block FROM l1_indexer_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
+    }
+
+    async fn set_l1_finalized_block(&self, block: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE l1_indexer_state SET finalized_block = $1, updated_at = now() WHERE id = 1",
+                &[&(block as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── Synthetic projector cursor (Phase 2a) ────────────────────
     //
     // Persisted as a column on the single-row service_state table, mirroring
@@ -773,68 +795,69 @@ impl Store for PgStore {
         // any partial log inserts.
         let tx = client.transaction().await?;
 
-        // BLOCKER 2 — success-always-wins terminal CAS, identical to
-        // `InMemoryStore::txn_commit`. A REAL Miden landing must always beat a
-        // failure/timeout guess, and a landed success must never be clobbered.
-        // Encoded via the UPDATE predicate:
-        //   - a SUCCESS commit updates any row that is not already 'success'
-        //     (`status <> 'success'`) — so it supersedes a prior 'failed'
-        //     (e.g. a TTL sweeper that failed a still-running job which then
-        //     committed on Miden; the projector's later success overrides the
-        //     provisional failure and re-materialises the ClaimEvent below);
-        //   - a FAILURE commit updates only a still-'pending' row
-        //     (`status = 'pending'`) — so it never clobbers a success and a
-        //     first failure wins over a later failure.
-        let cas_predicate = if result.is_ok() {
-            "status <> 'success'"
-        } else {
-            "status = 'pending'"
-        };
-        let updated = tx
-            .execute(
-                &format!(
-                    "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4 AND {cas_predicate}"
-                ),
-                &[
-                    &status,
-                    &error_msg as &(dyn ToSql + Sync),
-                    &(block_num as i64),
-                    &hash_str,
-                ],
+        // BLOCKER 2 (re-review) — SINGLE-SNAPSHOT success-always-wins CAS. Pin
+        // the row with `SELECT ... FOR UPDATE` inside this transaction so the
+        // "absent vs present" classification AND the conditional UPDATE both
+        // come from ONE consistent, row-locked snapshot. The previous
+        // UPDATE-then-separate-SELECT could, under READ COMMITTED, observe two
+        // DIFFERENT committed snapshots: a concurrent `txn_begin` committing
+        // between the UPDATE and the existence SELECT was visible only to the
+        // SELECT, so a row genuinely missing at decision time was misclassified
+        // as an existing terminal and wrongly returned Ok (the caller's
+        // failure/success was silently dropped, leaving the receipt pending).
+        // FOR UPDATE takes the decision off ONE read; the subsequent UPDATE
+        // runs against the locked row, so no interleaving can flip the class.
+        let current_status: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM transactions WHERE tx_hash = $1 FOR UPDATE",
+                &[&hash_str],
             )
-            .await?;
+            .await?
+            .map(|r| r.get::<_, String>(0));
 
-        // A zero-row UPDATE means one of two things, told apart below:
-        //   - the row exists but the CAS predicate excluded it (already-success
-        //     for either flavour, or already-terminal for a failure commit) →
-        //     no-op: leave it untouched, return Ok (do NOT re-materialise logs
-        //     / re-bump counters).
-        //   - the row DOES NOT EXIST → contract error, matching
-        //     `InMemoryStore::txn_commit` ("transaction not found"). PR #127:
-        //     finalising a receipt that was never durably begun must fail so a
-        //     projector racing a submitter cannot silently "finalise" a phantom.
-        // Every caller either creates the row first or explicitly tolerates the
-        // not-found error (`project_ger_note` / `project_claim_note` use
-        // `let _ = ... inspect_err`; the pending/expiry sweeps log and continue).
-        // Rolling back (drop/rollback of `tx`) guarantees no partial writes
-        // escape in either branch.
-        if updated == 0 {
-            let exists = tx
-                .query_opt(
-                    "SELECT 1 FROM transactions WHERE tx_hash = $1",
-                    &[&hash_str],
-                )
-                .await?
-                .is_some();
+        let Some(current_status) = current_status else {
+            // No row at the locked snapshot → contract error (PR #127):
+            // finalising a receipt that was never durably begun must fail so a
+            // projector racing a submitter cannot silently "finalise" a phantom.
+            // A concurrent `txn_begin` that commits AFTER this read cannot flip
+            // us to a wrong Ok — the classification is fixed here. Callers either
+            // create the row first or tolerate this error (`project_ger_note` /
+            // `project_claim_note` use `let _ = ... inspect_err`; the
+            // pending/expiry sweeps log and continue).
             tx.rollback().await?;
-            if exists {
-                tracing::debug!(
-                    "PgStore: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
-                );
-                return Ok(());
-            }
             anyhow::bail!("PgStore: transaction {tx_hash} not found");
+        };
+
+        // success-always-wins terminal CAS, identical to `InMemoryStore`:
+        //   success           + any → protected no-op (never clobber a landing)
+        //   {pending,failed}   + Ok → apply (a real landing supersedes a prior
+        //                              failure and re-materialises its ClaimEvent)
+        //   pending            + Err → apply (pending → failed)
+        //   failed             + Err → keep the first failure (no-op)
+        let apply = match (current_status.as_str(), result.is_ok()) {
+            ("success", _) => false,
+            (_, true) => true,
+            ("pending", false) => true,
+            (_, false) => false,
+        };
+        if !apply {
+            tx.rollback().await?;
+            tracing::debug!(
+                "PgStore: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
+            );
+            return Ok(());
         }
+
+        tx.execute(
+            "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
+            &[
+                &status,
+                &error_msg as &(dyn ToSql + Sync),
+                &(block_num as i64),
+                &hash_str,
+            ],
+        )
+        .await?;
 
         if result.is_ok() {
             // C11 — fold the latest_block_number advance into the same

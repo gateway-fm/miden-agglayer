@@ -547,6 +547,85 @@ async fn test_pgstore_success_supersedes_prior_failure() {
     );
 }
 
+/// BLOCKER 2 (re-review) — single-snapshot CAS under concurrency. Many
+/// `txn_commit`s race `txn_begin`s for distinct hashes. The invariant that the
+/// old UPDATE-then-separate-SELECT could violate under READ COMMITTED: a
+/// `txn_commit` returning Ok must correspond to a row that is ACTUALLY terminal
+/// (never a silent wrong-Ok that leaves the row pending). The SELECT ... FOR
+/// UPDATE takes the classify + update off one locked snapshot, so this holds.
+/// PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_txn_commit_concurrent_begin_single_snapshot() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+    let store = std::sync::Arc::new(store);
+
+    let mut handles = Vec::new();
+    for i in 0..64u8 {
+        let store = store.clone();
+        handles.push(tokio::spawn(async move {
+            let tx_hash = TxHash::from([i; 32]);
+            // Racer A: begin then a failure commit.
+            let a = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store.txn_begin(tx_hash, dummy_txn_entry()).await.ok();
+                    store
+                        .txn_commit(tx_hash, Err("x".into()), 1, [0u8; 32])
+                        .await
+                })
+            };
+            // Racer B: a failure commit that may observe the row missing or present.
+            let b = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .txn_commit(tx_hash, Err("y".into()), 1, [0u8; 32])
+                        .await
+                })
+            };
+            let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+            // INVARIANT: any commit that returned Ok must have left a terminal
+            // receipt — never a wrong-Ok over a still-pending/absent row.
+            if ra.is_ok() || rb.is_ok() {
+                let receipt = store.txn_receipt(tx_hash).await.unwrap();
+                assert!(
+                    receipt.is_some(),
+                    "a committed-Ok hash must have a terminal receipt (no wrong-Ok): {tx_hash}"
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+/// BLOCKER 3 — the L1 finalized/safe block round-trips through the new
+/// `l1_indexer_state.finalized_block` column (migration 011), separate from the
+/// head cursor. PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_l1_finalized_block_roundtrip() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    assert_eq!(
+        store.get_l1_finalized_block().await.unwrap(),
+        0,
+        "default 0"
+    );
+    store.set_l1_finalized_block(12_345).await.unwrap();
+    assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
+    // Independent of the head cursor.
+    store.set_l1_indexer_cursor(99).await.unwrap();
+    assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
+    assert_eq!(store.get_l1_indexer_cursor().await.unwrap(), 99);
+}
+
 // ── Nonces ───────────────────────────────────────────────────
 
 #[tokio::test]

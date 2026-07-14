@@ -300,6 +300,22 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Last observed L1 `finalized` (or `safe`) block number — tracked SEPARATELY
+    /// from the head cursor (audit H6 BLOCKER 3). The `L1InfoTreeIndexer` updates
+    /// this each poll when configured with a finality evidence tag; the strict-H6
+    /// gate (`ger::ensure_ger_l1_observed`) qualifies an evidence row as final
+    /// when `evidence_block <= finalized_block`. Returns 0 if never recorded
+    /// (fresh deployment or confirmation-depth mode) — the gate then fail-closes.
+    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    /// Persist the last observed L1 finality-tag block. Written best-effort by
+    /// the indexer; a stale value only ever DELAYS strict authorization
+    /// (fail-closed), never over-authorizes.
+    async fn set_l1_finalized_block(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
     /// Last fully-projected Miden block height owned by the `SyntheticProjector`
     /// (`docs/SYNTHETIC-INDEXER-REDESIGN.md`). Returns 0 if the projector has
