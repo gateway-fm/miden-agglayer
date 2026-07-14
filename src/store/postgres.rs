@@ -2287,22 +2287,27 @@ impl Store for PgStore {
         {
             row.get(0)
         } else {
+            // ABSOLUTE LET index = persisted gate baseline + raw counter (review blocker 2):
+            // the emitted deposit_count then equals the leaf's true on-chain LET index even
+            // with a non-zero baseline (0 for a clean genesis replay → no-op).
             let row = txn
                 .query_one(
                     "UPDATE service_state
                      SET deposit_counter = deposit_counter + 1, updated_at = now()
                      WHERE id = 1
-                     RETURNING deposit_counter - 1",
+                     RETURNING (deposit_counter - 1) + COALESCE(let_gate_baseline, 0)",
                     &[],
                 )
                 .await?;
-            let dc: i32 = row.get(0);
+            let absolute: i64 = row.get(0);
+            let absolute_i32 = i32::try_from(absolute)
+                .map_err(|_| anyhow::anyhow!("deposit index {absolute} exceeds i32"))?;
             txn.execute(
                 "INSERT INTO bridge_out_processed (note_id, deposit_count, emitted)                  VALUES ($1, $2, FALSE)",
-                &[&note_key, &dc],
+                &[&note_key, &absolute_i32],
             )
             .await?;
-            dc
+            absolute_i32
         };
         txn.commit().await?;
         Ok(idx as u32)

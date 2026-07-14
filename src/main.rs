@@ -909,6 +909,12 @@ async fn main() -> anyhow::Result<()> {
     // their initial `submit_new_transaction` deploys them on-chain.
     // Run restore if requested
     if command.restore {
+        // Review blocker 3: restore must build its authoritative identity/position feed
+        // against the SAME node the client connects to — with no explicit --miden-node the
+        // client defaults to localhost, so passing the raw Option (None) would leave restore
+        // without a feed and (now fail-closed) refuse to run in the documented default launch.
+        let restore_node_url =
+            miden_agglayer_service::miden_client::effective_node_url(command.miden_node.clone());
         let result = miden_agglayer_service::restore::restore(
             &store,
             &client,
@@ -916,7 +922,7 @@ async fn main() -> anyhow::Result<()> {
             local_network_id_u32,
             &block_state,
             command.l1_rpc_url.clone(),
-            command.miden_node.as_deref(),
+            Some(restore_node_url.as_str()),
             command.miden_api_key.as_deref(),
         )
         .await?;

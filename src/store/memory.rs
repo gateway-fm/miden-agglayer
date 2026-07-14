@@ -1662,11 +1662,17 @@ impl Store for InMemoryStore {
         if let Some(&(existing, _)) = processed.get(note_key) {
             return Ok(existing);
         }
+        // Cantina #7 (review blocker 2): the ABSOLUTE LET index = baseline + raw counter.
+        // The persisted gate baseline absorbs pre-fix leaves the raw counter never counted;
+        // adding it makes each new leaf's emitted deposit_count == its true on-chain LET
+        // index / globalIndex (baseline is 0 for a clean genesis replay, so no-op there).
+        let baseline = self.let_gate_state.read().0.unwrap_or(0) as u32;
         let mut counter = self.deposit_counter.write();
-        let dc = *counter;
+        let raw = *counter;
         *counter += 1;
-        processed.insert(note_key.to_string(), (dc, false));
-        Ok(dc)
+        let absolute = baseline + raw;
+        processed.insert(note_key.to_string(), (absolute, false));
+        Ok(absolute)
     }
 
     async fn get_reserved_deposit_index(&self, note_key: &str) -> anyhow::Result<Option<u32>> {

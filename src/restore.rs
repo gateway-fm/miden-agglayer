@@ -244,6 +244,32 @@ fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
 /// byte-identical to the live projection. This is a deliberate second implementation
 /// of the projector's comparator, pinned identical by the
 /// `restore_sort_replays_the_live_projection_order` test.
+/// Rebuild a consumer-unknown consumed record with the AUTHORITATIVE (block, tx_order) in
+/// its `ConsumedExternal` state + `consumer = Some(bridge)` — so restore's sort and
+/// projection read authoritative order (imported/historical records carry neither locally).
+/// The identity-through-join (#136) rebuilds the same way; the shapes unify at merge.
+pub(crate) fn rebuild_consumed_external(
+    note: &InputNoteRecord,
+    bridge_id: AccountId,
+    block: u64,
+    tx_order: u32,
+) -> InputNoteRecord {
+    use miden_client::store::InputNoteState;
+    use miden_client::store::input_note_states::ConsumedExternalNoteState;
+    use miden_protocol::block::BlockNumber;
+    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+        nullifier_block_height: BlockNumber::from(block as u32),
+        consumer_account: Some(bridge_id),
+        consumed_tx_order: Some(tx_order),
+    });
+    InputNoteRecord::new(
+        note.details().clone(),
+        note.attachments().clone(),
+        None,
+        state,
+    )
+}
+
 pub(crate) fn sort_consumed_for_projection_with(
     notes: &mut [(Option<miden_protocol::note::NoteId>, &InputNoteRecord)],
     within_tx_pos: &std::collections::HashMap<miden_protocol::note::NoteId, u32>,
@@ -341,12 +367,13 @@ pub async fn restore(
     // Best-effort: a failure must not abort restore.
     //
     // Cantina #7: `bridge_positions` (unique NoteId → (commitment, block, tx_order,
-    // within_tx_pos)) is the authoritative ordering feed for Phase 2's replay.
-    let mut bridge_positions: std::collections::HashMap<
+    // within_tx_pos)) is the authoritative ordering feed for Phase 2's replay. Built
+    // fail-closed (review blocker 5): a scan error or an absent node URL aborts restore
+    // rather than replaying with a partial/local-only view.
+    let bridge_positions: std::collections::HashMap<
         miden_protocol::note::NoteId,
         ([u8; 32], u64, u32, u32),
-    > = std::collections::HashMap::new();
-    if let Some(url) = node_url {
+    > = if let Some(url) = node_url {
         let from_block: u32 = std::env::var("RECOVER_FROM_BLOCK")
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -355,34 +382,44 @@ pub async fn restore(
             from_block,
             "Phase 1.5: recovering missed bridge-out notes from the node..."
         );
-        let mut identity_index = std::collections::HashMap::new();
-        match recover_missed_bridge_outs(miden_client, url, api_key, accounts.bridge.0, from_block)
-            .await
-        {
-            Ok((n, index)) => {
-                identity_index = index;
-                tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node")
-            }
-            Err(e) => tracing::warn!(
-                err = %e,
-                "Phase 1.5 recovery scan failed; continuing with local-only restore"
-            ),
-        }
+        // Review blocker 5: FAIL CLOSED on an incomplete authoritative scan. A node URL is
+        // present, so the identity + position feeds MUST be recoverable; a scan error means
+        // we cannot establish authoritative identity/order for the B2AGG replay, and
+        // proceeding with a partial/local-only view risks misattributed consumers and
+        // misnumbered deposit_counts (sealed forever). Abort restore and retry rather than
+        // silently produce a wrong projection.
+        let (n, identity_index) =
+            recover_missed_bridge_outs(miden_client, url, api_key, accounts.bridge.0, from_block)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "restore Phase 1.5 recovery scan failed — refusing to restore with \
+                         incomplete authoritative identity (fail-closed): {e:#}"
+                    )
+                })?;
+        tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node");
         // Cantina #7 — Phase 1.6: the authoritative per-exit position feed for the Phase 2
-        // B2AGG replay ordering. Best-effort like 1.5: on failure restore proceeds with the
-        // legacy order (and the projector's tie-halt guard fail-closes any same-tx sibling
-        // ambiguity rather than hash-sorting it).
-        match restore_bridge_positions(url, api_key, accounts.bridge.0, &identity_index).await {
-            Ok(map) => bridge_positions = map,
-            Err(e) => tracing::warn!(
-                err = %e,
-                "Phase 1.6: authoritative position feed failed; same-tx sibling ordering \
-                 will fail closed rather than guess"
-            ),
-        }
+        // B2AGG replay ordering. Also fail-closed: without it, same-block multi-tx ordering
+        // and same-tx sibling ordering cannot be established authoritatively.
+        restore_bridge_positions(url, api_key, accounts.bridge.0, &identity_index)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "restore Phase 1.6 authoritative position feed failed — refusing to restore \
+                     with incomplete order (fail-closed): {e:#}"
+                )
+            })?
     } else {
-        tracing::warn!("Phase 1.5 skipped: no --miden-node URL available to restore()");
-    }
+        // No node URL: authoritative identity/order cannot be built. Fail closed rather than
+        // silently restore B2AGG with local-only (metadata-lost) identity. The documented
+        // launch always resolves a URL (MidenClient::effective_node_url), so this only fires
+        // on a genuine misconfiguration.
+        anyhow::bail!(
+            "restore: no --miden-node URL — cannot build the authoritative identity/position \
+             feed for the B2AGG replay; refusing to restore with local-only identity \
+             (fail-closed). Pass the resolved node URL (MidenClient::effective_node_url)."
+        );
+    };
 
     // Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet identity rows from the
     // bridge's authoritative `faucet_metadata_map` BEFORE replaying bridge-outs.
@@ -947,24 +984,47 @@ async fn restore_bridge_outs(
                     ids.sort_by_key(|i| i.as_bytes());
                     ids.reverse(); // pop() takes the smallest first
                 }
+                // Review blocker 4: carry the FULL authoritative tuple (block, tx_order,
+                // within_tx_pos) — imported/historical consumed records lack a local order,
+                // so taking block/tx_order from the local state would fall through to
+                // position/hash order for multi-tx blocks. Rebuild each bridge-attributed
+                // consumer-unknown record with the authoritative (block, tx_order) in its
+                // ConsumedExternal state (so the sort reads authoritative values), keep the
+                // within_tx_pos map for the sibling tie-break, and project at the
+                // authoritative block.
                 let within_tx_pos: std::collections::HashMap<miden_protocol::note::NoteId, u32> =
                     bridge_positions
                         .iter()
                         .map(|(id, (_, _, _, pos))| (*id, *pos))
                         .collect();
-                let mut sorted: Vec<(Option<miden_protocol::note::NoteId>, &InputNoteRecord)> =
+                // Owned rebuilt records + their resolved id + authoritative block.
+                // Attributed consumer-unknown records are rebuilt with the authoritative
+                // (block, tx_order) IN their ConsumedExternal state — so both the sort AND
+                // `note_consumed_block` (the projection block) read authoritative values, no
+                // separate block-tracking needed.
+                let rebuilt: Vec<(Option<miden_protocol::note::NoteId>, InputNoteRecord)> =
                     consumed_notes
                         .iter()
                         .map(|note| {
                             let id = ids_by_commitment
                                 .get_mut(&note.details_commitment().as_bytes())
                                 .and_then(|q| q.pop());
-                            (id, note)
+                            match id.and_then(|i| bridge_positions.get(&i)) {
+                                Some((_, block, order, _)) => (
+                                    id,
+                                    rebuild_consumed_external(note, bridge_id, *block, *order),
+                                ),
+                                None => (id, note.clone()),
+                            }
                         })
                         .collect();
+                let mut sorted: Vec<(Option<miden_protocol::note::NoteId>, &InputNoteRecord)> =
+                    rebuilt.iter().map(|(id, note)| (*id, note)).collect();
                 sort_consumed_for_projection_with(&mut sorted, &within_tx_pos);
 
                 for (note_unique_id, note) in sorted {
+                    // Authoritative block for a rebuilt record (nullifier_block_height); local
+                    // fallback for an unattributed one.
                     let blk = note_consumed_block(note, restore_block);
                     let block_hash = block_state_clone.get_block_hash(blk);
                     let outcome = project_b2agg_note(
@@ -1928,10 +1988,16 @@ mod tests {
     use crate::store::Store;
     use crate::store::memory::InMemoryStore;
     use miden_protocol::note::{
-        NoteAttachment, NoteAttachments, NoteMetadata, NoteType, PartialNoteMetadata,
+        NoteAttachment, NoteAttachments, NoteId, NoteMetadata, NoteType, PartialNoteMetadata,
     };
+    use miden_protocol::{Felt, Word};
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
+
+    /// Distinct synthetic NoteIds for identity-keyed ordering tests.
+    fn test_note_id(byte: u64) -> NoteId {
+        NoteId::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
+    }
 
     // Test AccountIds — four distinct, valid protocol-0.15 (version-1) ids.
     // Protocol 0.15 dropped the 0.14 v0 id encoding (and folded the old
@@ -2293,6 +2359,35 @@ mod tests {
     /// STATE), so only `faucet_id` and `consumer` matter here. The asset is
     /// present so restore's emit path is actually reached when the gate is
     /// absent — i.e. the RED test fails on the missing gate, not a no-asset skip.
+    /// Like [`ma3_b2agg_input_note`] but with a caller-chosen amount → DISTINCT commitment.
+    fn ma3_b2agg_note_amount(
+        faucet_id: AccountId,
+        consumer: Option<AccountId>,
+        amount: u64,
+    ) -> InputNoteRecord {
+        use miden_base_agglayer::B2AggNote;
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::asset::{Asset, FungibleAsset};
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{
+            NoteAssets, NoteAttachments, NoteDetails, NoteRecipient, NoteStorage,
+        };
+        use miden_protocol::{Felt, Word};
+
+        let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
+        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+        let asset: Asset = FungibleAsset::new(faucet_id, amount).unwrap().into();
+        let assets = NoteAssets::new(vec![asset]).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: consumer,
+            consumed_tx_order: None,
+        });
+        InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
     fn ma3_b2agg_input_note(faucet_id: AccountId, consumer: Option<AccountId>) -> InputNoteRecord {
         use miden_base_agglayer::B2AggNote;
         use miden_client::store::InputNoteState;
@@ -3521,6 +3616,108 @@ mod tests {
             store.txn_receipt(real_tx).await.unwrap().is_none(),
             "contract half 2: a row begun after projection stays pending forever — \
              which is why txn_begin must be inside the serialized-client handoff",
+        );
+    }
+
+    /// REVIEW BLOCKER 4 (re-review) — imported/historical consumed records carry NO local
+    /// order (consumed_tx_order = None), so taking block/tx_order from the LOCAL state would
+    /// collapse a multi-tx block to hash order. `rebuild_consumed_external` must fold the
+    /// AUTHORITATIVE (block, tx_order) into each record's state so the shared sort orders by
+    /// it. This is the production-shape regression the parity test (which fabricates local
+    /// order fields) misses.
+    #[tokio::test]
+    async fn imported_records_missing_local_order_sort_by_authoritative_tuple() {
+        let (faucet_id, bridge_id, _sender) = ma3_accounts();
+        // Two DISTINCT records (distinct commitments), both consumed in block 9 by different
+        // bridge txs, both imported-shape: consumer=None, consumed_tx_order=None.
+        let a = ma3_b2agg_note_amount(faucet_id, None, 11);
+        let b = ma3_b2agg_note_amount(faucet_id, None, 22);
+        assert_eq!(
+            a.state().consumed_tx_order(),
+            None,
+            "imported: no local order"
+        );
+        assert_eq!(b.state().consumed_tx_order(), None);
+
+        // Authoritative feed: `a` is tx_order 1, `b` is tx_order 0 — i.e. b BEFORE a on-chain.
+        let ra = rebuild_consumed_external(&a, bridge_id, 9, 1);
+        let rb = rebuild_consumed_external(&b, bridge_id, 9, 0);
+        // The rebuilt records now carry authoritative block + order in their state.
+        assert_eq!(
+            ra.state().consumed_block_height().map(|h| h.as_u64()),
+            Some(9)
+        );
+        assert_eq!(ra.state().consumed_tx_order(), Some(1));
+        assert_eq!(rb.state().consumed_tx_order(), Some(0));
+
+        let id_a = test_note_id(0xAA);
+        let id_b = test_note_id(0xBB);
+        let within_tx_pos: std::collections::HashMap<miden_protocol::note::NoteId, u32> =
+            [(id_a, 0), (id_b, 0)].into_iter().collect();
+        // Feed in the WRONG (arrival) order to prove the sort, not arrival, decides.
+        let mut sorted: Vec<(Option<miden_protocol::note::NoteId>, &InputNoteRecord)> =
+            vec![(Some(id_a), &ra), (Some(id_b), &rb)];
+        sort_consumed_for_projection_with(&mut sorted, &within_tx_pos);
+
+        // b (authoritative tx_order 0) must sort BEFORE a (tx_order 1) — authoritative order,
+        // NOT the commitment/hash order.
+        assert_eq!(
+            sorted[0].1.details_commitment().as_bytes(),
+            rb.details_commitment().as_bytes(),
+            "the authoritative-earlier tx (order 0) sorts first, from the rebuilt state"
+        );
+        assert_eq!(
+            sorted[1].1.details_commitment().as_bytes(),
+            ra.details_commitment().as_bytes()
+        );
+    }
+
+    /// REVIEW BLOCKER 5 (re-review) — fail-closed FLOOR at the join: a consumer-unknown
+    /// record with NO authoritative position entry (an incomplete/partial scan, or a
+    /// genuine non-bridge consumption) is NEVER given a fabricated bridge identity/order —
+    /// it is left untouched, so `project_b2agg_note` skips it fail-closed (MA#3
+    /// UntrackedConsumer). (The restore()-level guard is stronger: a scan ERROR or an absent
+    /// node URL aborts restore entirely — `?`-propagated Err — rather than replaying with a
+    /// partial feed; that path is exercised by the restore e2e.)
+    #[tokio::test]
+    async fn incomplete_scan_leaves_records_unattributed_no_fabrication() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (faucet_id, bridge_id, _sender) = ma3_accounts();
+        ma3_register_faucet(&store, faucet_id).await;
+
+        // Consumer-unknown record; EMPTY position map (simulating a scan that recovered
+        // nothing for it — the incomplete-scan case reaching the join).
+        let note = ma3_b2agg_input_note(faucet_id, None);
+        let positions: std::collections::HashMap<NoteId, ([u8; 32], u64, u32, u32)> =
+            std::collections::HashMap::new();
+        let resolved_id = positions.keys().find(|_| false).copied(); // no id resolves from an empty map
+        assert!(resolved_id.is_none());
+
+        // Not attributed → the record is NOT rebuilt (no consumer=bridge fabricated).
+        assert_eq!(
+            note.consumer_account(),
+            None,
+            "an unattributed consumer-unknown record keeps consumer=None"
+        );
+        // project_b2agg_note (unique_id=None, no known consumer) fail-closed skips it.
+        let outcome = project_b2agg_note(
+            &store,
+            &note,
+            None,
+            bridge_id,
+            1,
+            5,
+            [5u8; 32],
+            get_bridge_address(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            B2AggRestoreOutcome::Skipped,
+            "no authoritative identity → fail-closed skip, never a guessed emission"
         );
     }
 }

@@ -4770,6 +4770,66 @@ mod tests {
         );
     }
 
+    /// REVIEW BLOCKER 2 (re-review) — a NON-ZERO persisted gate baseline must be folded
+    /// into the deposit index, so a leaf reserved after arming gets its TRUE absolute LET
+    /// index (baseline + raw counter), not the raw counter alone. Pre-fix the emitted event
+    /// carried `deposit_counter` → wrong globalIndex whenever baseline S > 0.
+    #[tokio::test]
+    async fn nonzero_baseline_folds_into_deposit_index() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Store carries a baseline of 97 (98 on-chain leaves the raw counter never counted).
+        store.set_let_gate_baseline(97).await.unwrap();
+
+        // Project the NEXT bridge-out: its reserved/emitted deposit index must be
+        // baseline(97) + raw(0) = 97 — its true on-chain LET index / globalIndex.
+        let leaf = b2agg_note_with_amount(5, Some(0), 71);
+        let key = hex::encode(leaf.details_commitment().as_bytes());
+        let written = projector
+            .project_notes(
+                std::slice::from_ref(&leaf),
+                &HashMap::new(),
+                5,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, 1, "the leaf emits");
+        assert_eq!(
+            store.get_reserved_deposit_index(&key).await.unwrap(),
+            Some(97),
+            "emitted deposit_count = baseline(97) + raw(0) = the leaf's true LET index"
+        );
+
+        // The reserved index IS the deposit_count `commit_b2agg_event_atomic` encodes into
+        // the BridgeEvent (it reuses the reservation), so 97 above is the emitted globalIndex
+        // leaf. One event was written.
+        assert_eq!(logs_in_range(&store, 0, 5).await.len(), 1);
+
+        // A SECOND leaf → baseline(97) + raw(1) = 98.
+        let leaf2 = b2agg_note_with_amount(6, Some(0), 72);
+        let key2 = hex::encode(leaf2.details_commitment().as_bytes());
+        projector
+            .project_notes(
+                std::slice::from_ref(&leaf2),
+                &HashMap::new(),
+                6,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_reserved_deposit_index(&key2).await.unwrap(),
+            Some(98),
+            "monotonic absolute indices: 97, 98, …"
+        );
+    }
+
     /// REVIEW BLOCKER 5 — unique-identity collision: two DISTINCT notes sharing one
     /// details commitment are two real LET leaves. Commitment-keyed dedup collapsed the
     /// second (one event for two leaves, gate 'aligned' while an exit was silently

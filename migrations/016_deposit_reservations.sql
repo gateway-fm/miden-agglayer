@@ -1,4 +1,4 @@
--- Cantina #7: LET deposit-index RESERVATIONS. Every Emit-class bridge-consumed B2AGG
+-- Migration 016 / Cantina #7: LET deposit-index reservations. Every Emit-class B2AGG
 -- leaf reserves its authoritative LET index in bridge_out_processed at projection time —
 -- including quarantined / metadata-deferred / self-targeted classes, which occupy an
 -- on-chain LET leaf but deliberately emit no BridgeEvent. `emitted = FALSE` marks such a
