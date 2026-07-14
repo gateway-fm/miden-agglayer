@@ -234,11 +234,16 @@ pass "aggkit reset to block 0 and re-processed the exact claim block ${CLAIM_BLO
 # (a2) EXACT-HASH FETCH (hard, positive, schema-free): re-processing block ${CLAIM_BLOCK}
 # from the reset, aggkit MUST fetch THIS claim's calldata by its derived hash. The proxy
 # logs every stored tx it serves by exact hash; the #136 fix serves the persisted claim from
-# the durable store (the 'served stored tx <hash>' branch). Assert OUR derived hash appears —
-# a reset aggkit that skipped the claim would never request it, so this can't false-pass.
+# the durable store (the 'served stored tx <hash>' branch). Assert OUR derived hash appears.
+# NB use `docker logs --tail` (NOT `--since $TIMESTAMP`): `--since` with a host timestamp is
+# a truncation trap — clock/format skew can make it return nothing → a false FAIL. The proxy
+# is NOT reset (unlike aggkit), so its logs retain the serve; and gate (a) already proved the
+# reprocessing is POST-reset via aggkit's OWN reset-to-0 + block-reprocessed logs, so a
+# hash-exact serve anywhere in the recent proxy log corroborates the fetch un-false-passably.
 DERIVED_HASH_LC=$(echo "$DERIVED_HASH" | tr '[:upper:]' '[:lower:]')
+PROXY_LOG_TAIL="${PROXY_LOG_TAIL:-20000}"
 wait_for "proxy served the EXACT derived-hash claim tx to aggkit (${DERIVED_HASH_LC:0:18}…)" \
-    "docker logs --since $AGGKIT_START $PROXY_CONTAINER 2>&1 | strip_ansi | grep -iF 'served stored tx' | grep -iqF '$DERIVED_HASH_LC'" \
+    "docker logs --tail $PROXY_LOG_TAIL $PROXY_CONTAINER 2>&1 | strip_ansi | grep -iF 'served stored tx' | grep -iqF '$DERIVED_HASH_LC'" \
     "$AGGKIT_SYNC_TIMEOUT" 5
 pass "aggkit fetched the EXACT derived-hash detailed claim (${DERIVED_HASH_LC:0:18}…) from the durable store"
 
