@@ -411,6 +411,25 @@ mod tests {
     use crate::store::memory::InMemoryStore;
     use std::str::FromStr;
     use std::sync::Arc;
+
+    /// Minimal signed legacy envelope + signer for `insert_ger` calls (the H6
+    /// gate runs before Miden submission, so the stub client never executes the
+    /// envelope — only its shape/signer matter). Keyed to `tx_hash` so the
+    /// handoff records the real linked hash. Mirrors `restore::test_ger_envelope`.
+    fn h6_test_envelope(tx_hash: TxHash) -> (TxEnvelope, Address) {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let env = TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy {
+                chain_id: Some(1),
+                ..Default::default()
+            },
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        (env, Address::ZERO)
+    }
+
     #[test]
     fn test_combined_ger_keccak256() {
         let mainnet = [0x01u8; 32];
@@ -464,6 +483,7 @@ mod tests {
         let forged_ger = [0xCDu8; 32]; // no ger_entries row → mainnet_exit_root unset
 
         // Strict mode: the unverified GER must be refused before Miden submission.
+        let (env, signer) = h6_test_envelope(tx_hash);
         let err = insert_ger(
             forged_ger,
             &miden_client,
@@ -471,6 +491,8 @@ mod tests {
             &store,
             tx_hash,
             true, // require_l1_observed
+            env.clone(),
+            signer,
         )
         .await
         .expect_err("unverified GER must be refused under require_l1_observed");
@@ -492,6 +514,8 @@ mod tests {
             &store,
             tx_hash,
             false, // lenient
+            env,
+            signer,
         )
         .await;
         if let Err(err) = lenient {
@@ -527,7 +551,8 @@ mod tests {
             .await
             .unwrap();
 
-        let result = insert_ger(ger, &miden_client, accounts, &store, tx_hash, true)
+        let (env, signer) = h6_test_envelope(tx_hash);
+        let result = insert_ger(ger, &miden_client, accounts, &store, tx_hash, true, env, signer)
             .await
             .expect("already-injected GER must be a duplicate no-op, not an H6 refusal");
         assert!(
@@ -559,7 +584,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = insert_ger(ger, &miden_client, accounts, &store, tx_hash, true).await;
+        let (env, signer) = h6_test_envelope(tx_hash);
+        let result =
+            insert_ger(ger, &miden_client, accounts, &store, tx_hash, true, env, signer).await;
         if let Err(err) = result {
             assert!(
                 !err.to_string().contains("not observed on L1"),
