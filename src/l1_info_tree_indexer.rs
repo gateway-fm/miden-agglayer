@@ -77,37 +77,12 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(1_000);
 /// otherwise overwhelm a single `eth_getLogs`.
 const DEFAULT_MAX_RANGE: u64 = 1_000;
 
-/// Default confirmation depth for H6 GER evidence (audit H6 / reorg safety).
-///
-/// A Miden GER injection is IRREVERSIBLE, and the strict `--reject-unverified-
-/// ger-injection` gate authorizes an injection once the indexer has recorded
-/// the `(mainnet, rollup)` decomposition. The indexer therefore MUST NOT record
-/// evidence that a reorg could still orphan: `set_ger_exit_roots` is UPSERT-only
-/// (no delete / no `invalidated` state), so a stale "observed" row from a
-/// reorged-away fork would permanently authorize a GER that never truly landed
-/// on the canonical L1. We close this at the SOURCE by only ever indexing
-/// evidence at least `confirmations` blocks below `latest` — a not-yet-final
-/// GER is simply never recorded, so the strict gate fail-closes (retryable)
-/// until finality is reached, and no rollback of an orphaned row is needed.
-///
-/// 64 mirrors the startup `REORG_MARGIN` and sits at/above realistic Sepolia
-/// reorg depth (justification lands ~1 epoch, finality ~2 epochs / 64 slots).
-/// Operators can raise it (or, in a future extension, point the indexer at the
-/// `finalized`/`safe` block tag) via `--l1-indexer-confirmations`.
-pub const DEFAULT_CONFIRMATIONS: u64 = 64;
-
 pub struct L1InfoTreeIndexer {
     rpc_url: String,
     contract_address: Address,
     store: Arc<dyn Store>,
     poll_interval: Duration,
     max_range: u64,
-    /// Confirmation depth below `latest` at which an observed exit-root pair is
-    /// considered final enough to record as H6 GER evidence. See
-    /// [`DEFAULT_CONFIRMATIONS`]. Evidence at a shallower depth is deliberately
-    /// NOT recorded, so a short-lived reorg can never leave a stale "observed"
-    /// row that permanently authorizes an irreversible strict-mode injection.
-    confirmations: u64,
     /// Optional operator override: force the indexer to start polling from
     /// this L1 block on the next boot, ignoring any persisted cursor.
     /// Used to backfill historic orphan GERs whose `UpdateL1InfoTree` events
@@ -127,39 +102,8 @@ impl L1InfoTreeIndexer {
             store,
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_range: DEFAULT_MAX_RANGE,
-            confirmations: DEFAULT_CONFIRMATIONS,
             from_block_override: None,
         }
-    }
-
-    /// Override the H6 evidence confirmation depth (audit H6 / reorg safety).
-    /// A larger value is strictly safer (evidence is only recorded deeper below
-    /// `latest`); a value of 0 disables the guard entirely (indexes up to
-    /// `latest`) and reintroduces the reorg exposure — do not use in production
-    /// with strict GER injection enabled.
-    pub fn with_confirmations(mut self, confirmations: u64) -> Self {
-        self.confirmations = confirmations;
-        self
-    }
-
-    /// The confirmed batch window `[from, to]` this poll may process, or `None`
-    /// when nothing new is final yet. `to` never exceeds `latest -
-    /// confirmations`, so only evidence at least `confirmations` blocks deep is
-    /// ever recorded (audit H6): a not-yet-final `(mainnet, rollup)` pair is
-    /// never written, the strict gate stays fail-closed on it, and a short-lived
-    /// reorg cannot leave a stale row that authorizes an irreversible injection.
-    /// Pure + total so the finality decision is unit-testable without a live L1.
-    fn confirmed_window(&self, head: u64, last_processed: u64) -> Option<(u64, u64)> {
-        // Highest block final enough to trust. `checked_sub` yields None when
-        // the chain is shorter than the confirmation depth (fresh testnet) —
-        // nothing is final yet.
-        let confirmed = head.checked_sub(self.confirmations)?;
-        if confirmed <= last_processed {
-            return None;
-        }
-        let from = last_processed + 1;
-        let to = confirmed.min(from + self.max_range - 1);
-        Some((from, to))
     }
 
     /// Operator override for the indexer start block. Overrides both the
@@ -284,13 +228,19 @@ impl L1InfoTreeIndexer {
         last_processed: &mut u64,
     ) -> anyhow::Result<()> {
         let head = provider.get_block_number().await?;
-        // Audit H6 / BLOCKER 1 — only ever consider evidence that is at least
-        // `confirmations` blocks deep. A not-yet-final pair is not fetched, so
-        // it is never recorded and the strict gate fail-closes on it until it
-        // finalizes. Returns None (skip this tick) when nothing new is final.
-        let Some((from, to)) = self.confirmed_window(head, *last_processed) else {
+        if head <= *last_processed {
             return Ok(());
-        };
+        }
+
+        // Index the `(mainnet, rollup)` decomposition up to LATEST — ordinary
+        // decomposition / bridge readiness (`zkevm_getExitRootsByGER`) must not
+        // be delayed. H6 reorg-safety for the IRREVERSIBLE strict injection is
+        // enforced at the gate instead (`ger::ensure_ger_l1_observed` requires
+        // the observation to be `confirmations`-deep on L1, using this indexer's
+        // persisted cursor as the head), so a not-yet-final observation is
+        // recorded for normal use but not trusted for strict authorization.
+        let from = *last_processed + 1;
+        let to = head.min(from + self.max_range - 1);
 
         // Single filter matching either event signature; the topic-OR is
         // expressed by passing both signature hashes in topic[0].
@@ -529,15 +479,14 @@ mod tests {
 
     // ── H6 reorg-safety + retryable-batch regressions (PR #121 re-review) ──
 
-    /// Construct a bare indexer over `store` with a chosen confirmation depth.
-    /// The RPC URL is never dialled (poll_once is driven with a mock provider).
-    fn test_indexer(store: Arc<dyn Store>, confirmations: u64) -> L1InfoTreeIndexer {
+    /// Construct a bare indexer over `store`. The RPC URL is never dialled
+    /// (poll_once is driven with a mock provider).
+    fn test_indexer(store: Arc<dyn Store>) -> L1InfoTreeIndexer {
         L1InfoTreeIndexer::new(
             "http://mock.invalid".to_string(),
             Address::from([0x99u8; 20]),
             store,
         )
-        .with_confirmations(confirmations)
     }
 
     /// Build an `UpdateL1InfoTree` log carrying the `(mainnet, rollup)` pair at
@@ -563,106 +512,73 @@ mod tests {
         }
     }
 
-    /// BLOCKER 1 — `confirmed_window` is the finality gate: it never returns a
-    /// `to` above `head - confirmations`, so evidence shallower than the
-    /// confirmation depth is never fetched (and thus never recorded). Pure, so
-    /// the finality decision is pinned without a live L1.
-    #[test]
-    fn confirmed_window_excludes_unconfirmed_tail() {
-        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-        let ix = test_indexer(store, 64);
-        // Chain shorter than the depth → nothing is final yet.
-        assert_eq!(ix.confirmed_window(10, 0), None);
-        // head - depth == 0, already covered by cursor 0 → nothing new.
-        assert_eq!(ix.confirmed_window(64, 0), None);
-        // head 100, depth 64 → only [1, 36] is final.
-        assert_eq!(ix.confirmed_window(100, 0), Some((1, 36)));
-        // Cursor already at/after the confirmed head → nothing new.
-        assert_eq!(ix.confirmed_window(100, 36), None);
-        assert_eq!(ix.confirmed_window(100, 40), None);
-        // Partial progress resumes just past the cursor.
-        assert_eq!(ix.confirmed_window(100, 10), Some((11, 36)));
-        // max_range still caps a large confirmed span.
-        assert_eq!(ix.confirmed_window(10_000, 0), Some((1, 1_000)));
-    }
-
-    /// BLOCKER 1 — depth 0 disables the guard (indexes up to `latest`); kept as
-    /// an explicit escape-hatch contract so a future refactor can't silently
-    /// change it.
-    #[test]
-    fn confirmed_window_zero_depth_tracks_head() {
-        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-        let ix = test_indexer(store, 0);
-        assert_eq!(ix.confirmed_window(10, 0), Some((1, 10)));
-    }
-
-    /// BLOCKER 1 (reorg regression) — evidence from a NON-FINAL L1 block must
-    /// NOT authorize a strict-mode GER injection; once the block is
-    /// `confirmations`-deep it does. Drives the REAL `poll_once` with a mock L1:
-    /// while the pair's block is within the confirmation window the indexer
-    /// records nothing and `ensure_ger_l1_observed` (strict) fail-closes; after
-    /// the head advances past the depth the pair is recorded and the gate
-    /// authorizes it. This is what makes a short-lived reorg unable to leave a
-    /// stale "observed" row that permanently authorizes an irreversible inject.
+    /// BLOCKER 1 — the indexer records the decomposition up to LATEST (NO
+    /// confirmation delay for ordinary decomposition), while the STRICT gate
+    /// enforces finality using the indexer cursor as the L1 head. Drives the
+    /// REAL `poll_once` with a mock L1: a pair only 2 blocks deep is recorded
+    /// immediately (so `get_ger_entry` / `zkevm_getExitRootsByGER` see it with no
+    /// delay), yet the strict gate REFUSES it until the cursor advances past the
+    /// confirmation depth — which is exactly what keeps a short-lived reorg from
+    /// authorizing an irreversible injection while never delaying normal ops.
     ///
-    /// Mutation check: setting `confirmations` to 0 (or removing the
-    /// `confirmed_window` clamp) makes phase 1 record the pair and the strict
-    /// gate wrongly authorize the unconfirmed GER — this test fails.
+    /// Mutation check: dropping the gate's `l1_head - block >= confirmations`
+    /// clause makes the shallow observation wrongly authorize (phase-1 pass).
     #[tokio::test]
-    async fn h6_nonfinal_evidence_not_authorized_until_confirmed() {
+    async fn h6_indexes_to_latest_but_strict_gate_waits_for_finality() {
         let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-        let indexer = test_indexer(store.clone(), 64);
+        let indexer = test_indexer(store.clone());
 
         let mainnet = B256::from([0x0Au8; 32]);
         let rollup = B256::from([0x0Bu8; 32]);
         let ger = combined_ger(&mainnet.0, &rollup.0);
         let tx = TxHash::from([0x01u8; 32]);
+        const CONF: u64 = 64;
 
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let mut last_processed = 0u64;
 
-        // Phase 1 — L1 head 10, depth 64: the pair's block (8) is not final.
-        // poll_once fetches only the head, records nothing, cursor stays put.
+        // Phase 1 — L1 head 10: poll_once indexes the pair at block 8 IMMEDIATELY
+        // (only 2 deep) and advances the cursor to head. Ordinary decomposition
+        // sees it at once; the strict gate refuses it (2 < 64) — transiently.
         asserter.push_success(&U64::from(10u64));
-        indexer
-            .poll_once(&provider, &mut last_processed)
-            .await
-            .unwrap();
-        assert_eq!(last_processed, 0, "no confirmed range → cursor unchanged");
-        assert!(
-            store.get_ger_entry(&ger).await.unwrap().is_none(),
-            "non-final evidence must NOT be recorded"
-        );
-        let refused = crate::ger::ensure_ger_l1_observed(&store, &ger, true, tx).await;
-        let err = refused.expect_err("strict gate must refuse an unconfirmed GER");
-        assert!(
-            err.to_string().contains("not observed on L1"),
-            "must cite L1 non-observation: {err:#}"
-        );
-
-        // Phase 2 — head advances to 100: block 8 is now 92 deep (> 64). The
-        // confirmed window [1, 36] is fetched, the pair recorded, gate passes.
-        asserter.push_success(&U64::from(100u64));
         asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
         asserter.push_success(&Option::<serde_json::Value>::None); // block ts → 0
         indexer
             .poll_once(&provider, &mut last_processed)
             .await
             .unwrap();
-        assert_eq!(last_processed, 36, "cursor advances to the confirmed head");
+        assert_eq!(
+            last_processed, 10,
+            "cursor tracks latest (no confirmation delay)"
+        );
         let entry = store
             .get_ger_entry(&ger)
             .await
             .unwrap()
-            .expect("confirmed evidence must be recorded");
-        assert!(
-            entry.mainnet_exit_root.is_some() && entry.rollup_exit_root.is_some(),
-            "both roots must be resolved once confirmed"
-        );
-        crate::ger::ensure_ger_l1_observed(&store, &ger, true, tx)
+            .expect("decomposition must be recorded immediately (no delay for normal ops)");
+        assert!(entry.mainnet_exit_root.is_some() && entry.rollup_exit_root.is_some());
+
+        let err = crate::ger::ensure_ger_l1_observed(&store, &ger, true, CONF, tx)
             .await
-            .expect("strict gate must authorize a confirmed GER");
+            .expect_err("strict gate must refuse a not-yet-confirmation-deep observation");
+        assert!(
+            err.to_string().contains("not yet"),
+            "must cite the finality guard: {err:#}"
+        );
+
+        // Phase 2 — L1 advances to 80: poll_once moves the cursor to 80, so the
+        // block-8 observation is now 72 deep (>= 64) and the strict gate passes.
+        asserter.push_success(&U64::from(80u64));
+        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new()); // no new events
+        indexer
+            .poll_once(&provider, &mut last_processed)
+            .await
+            .unwrap();
+        assert_eq!(last_processed, 80, "cursor advanced to the new head");
+        crate::ger::ensure_ger_l1_observed(&store, &ger, true, CONF, tx)
+            .await
+            .expect("strict gate must authorize once the observation is confirmation-deep");
     }
 
     /// BLOCKER 3 (retryable batch) — a durable evidence-write failure must keep
@@ -679,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn h6_evidence_write_failure_leaves_batch_retryable() {
         let store: Arc<dyn Store> = Arc::new(FailingGerStore::new());
-        let indexer = test_indexer(store, 64);
+        let indexer = test_indexer(store);
 
         let mainnet = B256::from([0x0Cu8; 32]);
         let rollup = B256::from([0x0Du8; 32]);

@@ -18,6 +18,30 @@ alloy_core::sol! {
     function updateExitRoot(bytes32 newRollupExitRoot, bytes32 newMainnetExitRoot);
 }
 
+/// Default L1 confirmation depth for STRICT H6 GER authorization (audit H6).
+///
+/// A Miden GER injection is IRREVERSIBLE and the evidence store has no
+/// revoke/rollback, so under strict `--reject-unverified-ger-injection` an
+/// observation must be at least this many L1 blocks deep before it authorizes an
+/// injection — a short-lived reorg then cannot leave a stale "observed" row that
+/// permanently authorizes a GER that never truly landed on canonical L1.
+///
+/// This depth is enforced AT THE GATE (`ensure_ger_l1_observed`), NOT at the
+/// indexer cursor: the indexer records the `(mainnet, rollup)` decomposition up
+/// to LATEST so ordinary decomposition / bridge readiness
+/// (`zkevm_getExitRootsByGER`) is never delayed. Only strict authorization waits
+/// for finality. 64 ≈ Sepolia finality (justification ~1 epoch, finality ~2
+/// epochs / 64 slots).
+pub const DEFAULT_CONFIRMATIONS: u64 = 64;
+
+/// Minimum confirmation depth strict H6 will boot with. Zero would authorize an
+/// irreversible injection from a 0-confirmation (freely reorg-able) observation,
+/// defeating the finality guarantee — so strict mode refuses to start with
+/// `L1_INDEXER_CONFIRMATIONS < MIN_STRICT_CONFIRMATIONS` (see
+/// `check_h6_evidence_source`). Production should use `DEFAULT_CONFIRMATIONS` or
+/// higher; the floor merely forbids the outright-unsafe zero.
+pub const MIN_STRICT_CONFIRMATIONS: u64 = 1;
+
 /// Compute the combined GER from mainnet and rollup exit roots.
 pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Keccak256::new();
@@ -238,6 +262,7 @@ pub async fn insert_ger(
     store: &Arc<dyn crate::store::Store>,
     txn_hash: TxHash,
     require_l1_observed: bool,
+    confirmations: u64,
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<bool> {
@@ -246,7 +271,14 @@ pub async fn insert_ger(
     // `try_enqueue`/`nonce_increment` (PR #121 review); this run is the sync
     // path's primary admission decision and the writer path's
     // defense-in-depth.
-    ensure_ger_l1_observed(store, &ger_bytes, require_l1_observed, txn_hash).await?;
+    ensure_ger_l1_observed(
+        store,
+        &ger_bytes,
+        require_l1_observed,
+        confirmations,
+        txn_hash,
+    )
+    .await?;
 
     // Check dedup before doing any work.
     //
@@ -378,19 +410,59 @@ pub async fn ensure_ger_l1_observed(
     store: &Arc<dyn crate::store::Store>,
     ger_bytes: &[u8; 32],
     require_l1_observed: bool,
+    confirmations: u64,
     txn_hash: TxHash,
 ) -> anyhow::Result<()> {
     // Dedup precedence — duplicates never reach Miden; see doc above.
     if store.is_ger_injected(ger_bytes).await? {
         return Ok(());
     }
-    let l1_observed = store
-        .get_ger_entry(ger_bytes)
-        .await?
+    let entry = store.get_ger_entry(ger_bytes).await?;
+    let roots_observed = entry
+        .as_ref()
         .is_some_and(|e| e.mainnet_exit_root.is_some() && e.rollup_exit_root.is_some());
-    if !l1_observed {
+
+    // Finality is checked HERE (at the strict gate), NOT at the indexer cursor.
+    // The indexer records the `(mainnet, rollup)` decomposition up to LATEST, so
+    // ordinary decomposition / bridge readiness (`zkevm_getExitRootsByGER`, which
+    // reads `get_ger_entry` directly and does NOT call this gate) is never
+    // delayed. Only strict authorization of an IRREVERSIBLE injection
+    // additionally requires the observation to be confirmation-deep on L1:
+    //   l1_head - evidence_block >= confirmations,
+    // using the indexer's persisted cursor as the observed L1 head. An evidence
+    // row with NO recorded L1 block (`block_number == 0`: a legacy/pre-guard row,
+    // or one seeded by a non-indexer write path) is treated as NOT final —
+    // fail-closed — which also closes the upgrade-state gap for rows written
+    // before this guard existed. Lenient mode never gates on finality.
+    let final_enough = if require_l1_observed {
+        match entry.as_ref() {
+            Some(e) if e.block_number > 0 => {
+                let l1_head = store.get_l1_indexer_cursor().await.unwrap_or(0);
+                l1_head.saturating_sub(e.block_number) >= confirmations
+            }
+            _ => false,
+        }
+    } else {
+        true
+    };
+
+    let l1_verified = roots_observed && final_enough;
+    if !l1_verified {
         ::metrics::counter!("ger_injection_unverified_total").increment(1);
         if require_l1_observed {
+            // A resolved-but-not-yet-final observation is a DISTINCT transient
+            // state from an unresolved one; surface it plainly. ("not observed
+            // on L1" stays the stable substring for the unresolved case that the
+            // e2e / callers match.)
+            if roots_observed {
+                anyhow::bail!(
+                    "GER {} was observed on L1 but is not yet {confirmations} confirmations \
+                     deep (finality guard, audit H6); refusing injection under \
+                     --reject-unverified-ger-injection. Transient — retry once the L1 \
+                     observation finalizes.",
+                    hex::encode(ger_bytes)
+                );
+            }
             anyhow::bail!(
                 "GER {} was not observed on L1 by the indexer (exit-root decomposition \
                  unresolved); refusing injection under --reject-unverified-ger-injection \
@@ -401,8 +473,9 @@ pub async fn ensure_ger_l1_observed(
         tracing::warn!(
             ger = %hex::encode(ger_bytes),
             tx = %txn_hash,
-            "GER injection not yet corroborated by the L1 InfoTree indexer \
-             (exit-root decomposition unresolved); allowing through but unverified"
+            roots_observed,
+            "GER injection not yet corroborated/finalized by the L1 InfoTree indexer; \
+             allowing through but unverified (lenient mode)"
         );
     }
     Ok(())
@@ -494,6 +567,7 @@ mod tests {
             &store,
             tx_hash,
             true, // require_l1_observed
+            0,    // confirmations (irrelevant: no roots observed)
             env.clone(),
             signer,
         )
@@ -517,6 +591,7 @@ mod tests {
             &store,
             tx_hash,
             false, // lenient
+            0,     // confirmations (lenient never gates on finality)
             env,
             signer,
         )
@@ -562,6 +637,7 @@ mod tests {
             &store,
             tx_hash,
             true,
+            0, // confirmations (dedup precedence returns before the finality check)
             env,
             signer,
         )
@@ -604,6 +680,7 @@ mod tests {
             &store,
             tx_hash,
             true,
+            0, // confirmations (finality asserted separately below)
             env,
             signer,
         )
@@ -614,5 +691,87 @@ mod tests {
                 "a fully-resolved GER must pass the strict H6 gate: {err}"
             );
         }
+    }
+
+    /// Audit H6 (BLOCKER 1) — finality is enforced AT THE GATE. A resolved
+    /// observation must be at least `confirmations` L1 blocks deep (indexer
+    /// cursor as head) before strict mode authorizes the irreversible injection.
+    /// A not-yet-deep observation is refused (transient), and once the cursor
+    /// advances past the confirmation depth it passes. Ordinary decomposition
+    /// (`get_ger_entry`, unchanged) sees the row regardless — this delay applies
+    /// ONLY to strict authorization.
+    ///
+    /// Mutation check: dropping the `l1_head - block >= confirmations` clause
+    /// (always `final_enough = true`) makes the not-yet-deep case wrongly pass.
+    #[tokio::test]
+    async fn h6_strict_gate_requires_confirmation_depth() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let ger = combined_ger(&[0x0Au8; 32], &[0x0Bu8; 32]);
+        let tx_hash = TxHash::from([0x44u8; 32]);
+        // Indexer recorded the pair at L1 block 100 (roots resolved immediately).
+        store
+            .set_ger_exit_roots(&ger, [0x0Au8; 32], [0x0Bu8; 32], 100, 1_700_000_000)
+            .await
+            .unwrap();
+
+        // Cursor at 140 → only 40 deep, < 64 confirmations → refused (transient).
+        store.set_l1_indexer_cursor(140).await.unwrap();
+        let err = ensure_ger_l1_observed(&store, &ger, true, DEFAULT_CONFIRMATIONS, tx_hash)
+            .await
+            .expect_err("a not-yet-confirmation-deep observation must be refused under strict");
+        assert!(
+            err.to_string().contains("not yet"),
+            "must cite the finality guard, not unresolved roots: {err}"
+        );
+        // Normal decomposition is unaffected: the row is present immediately.
+        assert!(store.get_ger_entry(&ger).await.unwrap().is_some());
+
+        // Cursor advances to 170 → 70 deep, >= 64 → authorized.
+        store.set_l1_indexer_cursor(170).await.unwrap();
+        ensure_ger_l1_observed(&store, &ger, true, DEFAULT_CONFIRMATIONS, tx_hash)
+            .await
+            .expect("a confirmation-deep observation must pass the strict gate");
+    }
+
+    /// Audit H6 (BLOCKER 1) — a legacy / pre-guard evidence row that carries NO
+    /// recorded L1 block (`block_number == 0`) but somehow has both roots must be
+    /// treated as unverified under strict (fail-closed), closing the
+    /// upgrade-state gap. Lenient mode still lets it through.
+    ///
+    /// Mutation check: treating a block-less row as final (removing the
+    /// `block_number > 0` guard) makes the strict case wrongly pass.
+    #[tokio::test]
+    async fn h6_strict_gate_refuses_blockless_legacy_row() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let ger = [0x77u8; 32];
+        // A row with both roots but block_number 0 (e.g. seeded by a non-indexer
+        // path before this guard existed). commit_ger_event_atomic sets roots +
+        // block 0 here and does NOT set is_injected... so use mark_ger_seen shape.
+        store
+            .mark_ger_seen(
+                &ger,
+                crate::log_synthesis::GerEntry {
+                    mainnet_exit_root: Some([0x01u8; 32]),
+                    rollup_exit_root: Some([0x02u8; 32]),
+                    block_number: 0,
+                    timestamp: 0,
+                },
+            )
+            .await
+            .unwrap();
+        // Even with a huge cursor, block 0 means "no recorded L1 block" → refused.
+        store.set_l1_indexer_cursor(10_000_000).await.unwrap();
+        let tx_hash = TxHash::from([0x45u8; 32]);
+        let err = ensure_ger_l1_observed(&store, &ger, true, DEFAULT_CONFIRMATIONS, tx_hash)
+            .await
+            .expect_err("a block-less legacy row must be refused under strict");
+        assert!(
+            err.to_string().contains("not yet"),
+            "finality-guard refusal: {err}"
+        );
+        // Lenient mode lets it through (no bail).
+        ensure_ger_l1_observed(&store, &ger, false, DEFAULT_CONFIRMATIONS, tx_hash)
+            .await
+            .expect("lenient mode must not refuse a block-less row");
     }
 }

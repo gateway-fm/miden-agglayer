@@ -288,15 +288,15 @@ services:
       # deterministic 0x133e6a88… orphan). Anvil's history is ~100s of blocks
       # so a from-genesis scan is trivial (max_range chunks it).
       - "--l1-indexer-from-block=1"
-      # Audit H6 — L1 evidence confirmation depth. Production defaults to 64 so a
-      # short-lived L1 reorg can never leave a stale "observed" row that
-      # permanently authorizes an IRREVERSIBLE strict-mode GER injection. The e2e
-      # L1 is a single-node anvil with no reorgs and instant finality, and
-      # Phase A of e2e-ger-l1-verification.sh mints a FRESH GER at the current
-      # head that must be corroborated within seconds — waiting 64 blocks would
-      # stall it. So drop the depth to 0 here (index up to latest). Override via
+      # Audit H6 — L1 confirmation depth the STRICT gate requires before it
+      # authorizes an irreversible GER injection (enforced at the gate, not the
+      # indexer cursor: ordinary decomposition is never delayed). Production
+      # defaults to 64 (≈ Sepolia finality). The e2e L1 is a single-node anvil
+      # with instant finality and no reorgs, so use the safe MINIMUM of 1 (strict
+      # mode refuses 0). Phase A of e2e-ger-l1-verification.sh waits for the fresh
+      # GER to reach this depth before submitting. Override via
       # L1_INDEXER_CONFIRMATIONS to exercise the production posture.
-      - "--l1-indexer-confirmations=${L1_INDEXER_CONFIRMATIONS:-0}"
+      - "--l1-indexer-confirmations=${L1_INDEXER_CONFIRMATIONS:-1}"
       # Audit C2 — the signer default is now fail-closed: with no
       # `--allowed-signers` configured, `eth_sendRawTransaction` rejects EVERY
       # signer. The e2e stack's legitimate submitters (aggoracle/aggsender GER +

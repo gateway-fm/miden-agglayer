@@ -106,6 +106,13 @@ pub struct ServiceState {
     /// `ger_injection_unverified_total` metric) to tolerate indexer lag;
     /// `--require-hardening` implies true.
     pub reject_unverified_ger: bool,
+    /// Audit H6 (BLOCKER 1) — L1 confirmation depth the STRICT gate requires
+    /// before authorizing an irreversible GER injection: an observation must be
+    /// `l1_confirmations` blocks deep (indexer cursor as head) to be trusted.
+    /// Checked at the gate (`ger::ensure_ger_l1_observed`), NOT at the indexer
+    /// cursor, so ordinary decomposition is never delayed. Defaults to
+    /// `ger::DEFAULT_CONFIRMATIONS`.
+    pub l1_confirmations: u64,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one
     /// signer cannot both pass the equality check before either increments.
@@ -185,6 +192,7 @@ impl ServiceState {
             allowed_signers: None,
             allow_any_signer: false,
             reject_unverified_ger: false,
+            l1_confirmations: crate::ger::DEFAULT_CONFIRMATIONS,
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,

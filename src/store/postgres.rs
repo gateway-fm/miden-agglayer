@@ -773,17 +773,28 @@ impl Store for PgStore {
         // any partial log inserts.
         let tx = client.transaction().await?;
 
-        // BLOCKER 2 — first-terminal-wins CAS. The `AND status = 'pending'`
-        // predicate makes the terminal transition a compare-and-set: only a
-        // still-pending row is updated. This closes the race where the TTL
-        // sweeper's `write_failure_receipt` runs against a job whose worker
-        // already committed SUCCESS — the Err UPDATE now matches zero rows and
-        // the landed success (status 0x1) is preserved instead of being
-        // clobbered to 0x0 (which would make aggkit resubmit an op that already
-        // landed). Identical semantics to `InMemoryStore::txn_commit`.
+        // BLOCKER 2 — success-always-wins terminal CAS, identical to
+        // `InMemoryStore::txn_commit`. A REAL Miden landing must always beat a
+        // failure/timeout guess, and a landed success must never be clobbered.
+        // Encoded via the UPDATE predicate:
+        //   - a SUCCESS commit updates any row that is not already 'success'
+        //     (`status <> 'success'`) — so it supersedes a prior 'failed'
+        //     (e.g. a TTL sweeper that failed a still-running job which then
+        //     committed on Miden; the projector's later success overrides the
+        //     provisional failure and re-materialises the ClaimEvent below);
+        //   - a FAILURE commit updates only a still-'pending' row
+        //     (`status = 'pending'`) — so it never clobbers a success and a
+        //     first failure wins over a later failure.
+        let cas_predicate = if result.is_ok() {
+            "status <> 'success'"
+        } else {
+            "status = 'pending'"
+        };
         let updated = tx
             .execute(
-                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4 AND status = 'pending'",
+                &format!(
+                    "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4 AND {cas_predicate}"
+                ),
                 &[
                     &status,
                     &error_msg as &(dyn ToSql + Sync),
@@ -793,11 +804,11 @@ impl Store for PgStore {
             )
             .await?;
 
-        // A zero-row UPDATE now means one of two things, which must be told
-        // apart:
-        //   - the row is ALREADY TERMINAL (success/failed) → first-terminal-wins
-        //     no-op: leave it untouched and return Ok (do NOT re-materialise
-        //     logs / re-bump counters).
+        // A zero-row UPDATE means one of two things, told apart below:
+        //   - the row exists but the CAS predicate excluded it (already-success
+        //     for either flavour, or already-terminal for a failure commit) →
+        //     no-op: leave it untouched, return Ok (do NOT re-materialise logs
+        //     / re-bump counters).
         //   - the row DOES NOT EXIST → contract error, matching
         //     `InMemoryStore::txn_commit` ("transaction not found"). PR #127:
         //     finalising a receipt that was never durably begun must fail so a
@@ -808,18 +819,17 @@ impl Store for PgStore {
         // Rolling back (drop/rollback of `tx`) guarantees no partial writes
         // escape in either branch.
         if updated == 0 {
-            let already_terminal = tx
+            let exists = tx
                 .query_opt(
-                    "SELECT 1 FROM transactions WHERE tx_hash = $1 AND status <> 'pending'",
+                    "SELECT 1 FROM transactions WHERE tx_hash = $1",
                     &[&hash_str],
                 )
                 .await?
                 .is_some();
             tx.rollback().await?;
-            if already_terminal {
+            if exists {
                 tracing::debug!(
-                    "PgStore: txn {tx_hash} already terminal; ignoring subsequent commit \
-                     (first-terminal-wins CAS)"
+                    "PgStore: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
                 );
                 return Ok(());
             }

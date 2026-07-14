@@ -111,16 +111,18 @@ struct Command {
     #[arg(long, env = "L1_INDEXER_FROM_BLOCK")]
     l1_indexer_from_block: Option<u64>,
 
-    /// Audit H6 — confirmation depth below L1 `latest` at which an observed
-    /// `(mainnet, rollup)` exit-root pair is trusted as GER evidence. Because a
-    /// Miden GER injection is IRREVERSIBLE and the evidence store has no
-    /// revoke/rollback, the indexer only records evidence this many blocks deep
-    /// so a short-lived reorg can never leave a stale row that permanently
-    /// authorizes a strict-mode injection. A not-yet-final GER stays unverified
-    /// (fail-closed, retryable) until it finalizes. Default 64 (≈ Sepolia
-    /// finality). Raise for extra safety; 0 disables the guard (unsafe with
-    /// `--reject-unverified-ger-injection`).
-    #[arg(long, env = "L1_INDEXER_CONFIRMATIONS", default_value_t = miden_agglayer_service::l1_info_tree_indexer::DEFAULT_CONFIRMATIONS)]
+    /// Audit H6 — L1 confirmation depth the STRICT gate requires before
+    /// authorizing an irreversible GER injection: an observation must be this
+    /// many blocks deep (`l1_head - evidence_block >= depth`, indexer cursor as
+    /// head) to be trusted, so a short-lived reorg cannot authorize a GER that
+    /// never truly landed. Enforced AT THE GATE, not the indexer cursor — the
+    /// indexer still records the decomposition up to `latest`, so ordinary
+    /// decomposition / bridge readiness (`zkevm_getExitRootsByGER`) is NOT
+    /// delayed. A not-yet-deep observation stays unverified (fail-closed,
+    /// retryable) for strict authorization only. Default 64 (≈ Sepolia finality).
+    /// Under `--reject-unverified-ger-injection` / `--require-hardening` the
+    /// value must be ≥ the safe minimum (nonzero) or the service refuses to boot.
+    #[arg(long, env = "L1_INDEXER_CONFIRMATIONS", default_value_t = miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS)]
     l1_indexer_confirmations: u64,
 
     /// Faucet-registry security reconciler poll interval, in seconds. The reconciler is
@@ -420,6 +422,22 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
                  temporarily-unreachable http(s) endpoint is fine; fix the URL before boot."
             ));
         }
+    }
+    // BLOCKER 1 — strict mode must NOT authorize an irreversible injection from a
+    // zero-confirmation (freely reorg-able) observation. Refuse to boot with a
+    // sub-minimum confirmation depth so an operator can't disable the finality
+    // guard while leaving strict on (a silent reorg exposure).
+    if command.l1_indexer_confirmations < miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS {
+        return Err(format!(
+            "strict H6 GER corroboration is enabled via {trigger}, but \
+             --l1-indexer-confirmations (L1_INDEXER_CONFIRMATIONS) is {} — below the safe \
+             minimum of {}. A zero/sub-minimum depth would authorize an IRREVERSIBLE GER \
+             injection from a 0-confirmation, freely reorg-able L1 observation, defeating \
+             the finality guard. Set it to {} (≈ Sepolia finality) or higher.",
+            command.l1_indexer_confirmations,
+            miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS,
+            miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS,
+        ));
     }
     Ok(())
 }
@@ -943,6 +961,10 @@ async fn main() -> anyhow::Result<()> {
     state.allow_any_signer = command.insecure_allow_any_signer;
     // H6 — strict L1 GER corroboration is implied by --require-hardening.
     state.reject_unverified_ger = command.reject_unverified_ger || command.require_hardening;
+    // H6 (BLOCKER 1) — confirmation depth the strict gate enforces (at the gate,
+    // not the indexer cursor). `check_h6_evidence_source` already refused a
+    // sub-minimum depth under strict, so this value is safe by the time we boot.
+    state.l1_confirmations = command.l1_indexer_confirmations;
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
     state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
@@ -1020,7 +1042,6 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(from_block) = command.l1_indexer_from_block {
                     indexer = indexer.with_from_block_override(from_block);
                 }
-                indexer = indexer.with_confirmations(command.l1_indexer_confirmations);
                 match indexer.spawn() {
                     Ok(shutdown_tx) => {
                         // The indexer runs for the lifetime of the tokio
@@ -1304,8 +1325,7 @@ mod hardening_tests {
             l1_rpc_url: None,
             ger_l1_address: None,
             l1_indexer_from_block: None,
-            l1_indexer_confirmations:
-                miden_agglayer_service::l1_info_tree_indexer::DEFAULT_CONFIRMATIONS,
+            l1_indexer_confirmations: miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS,
             faucet_reconciler_poll_secs: 30,
             faucet_reconciler_grace_ticks: 3,
             miden_debug: false,
@@ -1514,6 +1534,33 @@ mod hardening_tests {
         c.reject_unverified_ger = true;
         c.l1_rpc_url = Some("http://anvil:8545".into());
         c.ger_l1_address = Some("0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674".into());
+        assert!(check_h6_evidence_source(&c).is_ok());
+    }
+
+    /// BLOCKER 1 (re-review) — strict mode must REFUSE to boot with a
+    /// zero/sub-minimum confirmation depth: it would authorize an irreversible
+    /// injection from a 0-confirmation, freely reorg-able observation, silently
+    /// disabling the finality guard while leaving strict on. An otherwise-valid
+    /// evidence source does not save it.
+    #[test]
+    fn h6_strict_with_zero_confirmations_refused_at_startup() {
+        let mut c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        c.reject_unverified_ger = true;
+        c.l1_rpc_url = Some("http://anvil:8545".into());
+        c.ger_l1_address = Some("0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674".into());
+        c.l1_indexer_confirmations = 0;
+        let reason = check_h6_evidence_source(&c).unwrap_err();
+        assert!(
+            reason.contains("--l1-indexer-confirmations"),
+            "must name the depth flag: {reason}"
+        );
+        // A nonzero depth (the safe minimum) with the same evidence source boots.
+        c.l1_indexer_confirmations = miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS;
         assert!(check_h6_evidence_source(&c).is_ok());
     }
 

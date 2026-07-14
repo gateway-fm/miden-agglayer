@@ -99,6 +99,13 @@ pub struct InMemoryStore {
     // Store::get_reconcile_cursor.
     reconcile_cursor: RwLock<u64>,
 
+    // L1 InfoTree indexer cursor — last L1 block the indexer processed
+    // (field-backed mirror of the PgStore `l1_indexer_state.last_processed`
+    // column, migration 005). Persisted here (not left on the default no-op
+    // impl) so the strict-H6 finality gate can read the observed L1 head via
+    // `get_l1_indexer_cursor` even on an in-memory deployment.
+    l1_indexer_cursor: RwLock<u64>,
+
     // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
     // first-write-wins evm_tx_hash -> note_commitment, with the reverse index
     // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
@@ -145,6 +152,7 @@ impl InMemoryStore {
             monitor_expected_mints: RwLock::new(HashMap::new()),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
+            l1_indexer_cursor: RwLock::new(0),
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
         }
@@ -274,6 +282,17 @@ impl Store for InMemoryStore {
 
     async fn set_reconcile_cursor(&self, block: u64) -> anyhow::Result<()> {
         *self.reconcile_cursor.write() = block;
+        Ok(())
+    }
+
+    // ── L1 InfoTree indexer cursor ───────────────────────────────
+
+    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+        Ok(*self.l1_indexer_cursor.read())
+    }
+
+    async fn set_l1_indexer_cursor(&self, block: u64) -> anyhow::Result<()> {
+        *self.l1_indexer_cursor.write() = block;
         Ok(())
     }
 
@@ -566,42 +585,58 @@ impl Store for InMemoryStore {
             let Some(receipt) = txns.get_mut(&tx_hash) else {
                 anyhow::bail!("Store: transaction {tx_hash} not found");
             };
-            // BLOCKER 2 — first-terminal-wins CAS. A receipt whose `result` is
-            // already `Some(_)` is terminal; a later commit MUST NOT overwrite
-            // it. This closes the race where the TTL sweeper's
-            // `write_failure_receipt` runs against a job whose worker already
-            // committed SUCCESS: without this guard the Err would clobber the
-            // landed success (status 0x1 → 0x0) and aggkit would resubmit a
-            // Miden op that already landed. Ignored idempotently for ANY
-            // terminal→terminal transition (success- or failure-first), and it
-            // also stops the pre-existing double-log-emission on a repeated
-            // success commit.
-            if receipt.result.is_some() {
-                tracing::debug!(
-                    "Store: txn {tx_hash} already terminal; ignoring subsequent commit \
-                     (first-terminal-wins CAS)"
-                );
-                None
-            } else {
-                receipt.result = Some(result);
-                receipt.block_num = block_num;
-
-                match &receipt.result {
-                    Some(Ok(_)) => {
-                        tracing::info!(
-                            "Store: committed txn {tx_hash}; miden txn: {:?}",
-                            receipt.id
-                        );
-                        Some(receipt.logs.clone())
+            // BLOCKER 2 — success-always-wins terminal CAS. A REAL Miden landing
+            // must always beat a failure/timeout guess, and a landed success
+            // must never be clobbered into failure. So:
+            //   pending      + Ok  → success (materialise logs incl. ClaimEvent)
+            //   pending      + Err → failure
+            //   failure      + Ok  → OVERRIDE to success (the op actually landed;
+            //                        e.g. the TTL sweeper failed a still-running
+            //                        job that then committed on Miden — the
+            //                        projector's later success supersedes the
+            //                        provisional failure and re-materialises the
+            //                        ClaimEvent that the failure had suppressed)
+            //   failure      + Err → keep first failure (idempotent no-op)
+            //   success      + any → protected no-op (never clobber a landing;
+            //                        also stops the old double-log-emission on a
+            //                        repeated success commit)
+            enum Cas {
+                NoOp,
+                Commit,
+            }
+            let decision = match (&receipt.result, result.is_ok()) {
+                (Some(Ok(_)), _) => Cas::NoOp,
+                (Some(Err(_)), true) => Cas::Commit, // real landing supersedes failure
+                (Some(Err(_)), false) => Cas::NoOp,  // first failure wins
+                (None, _) => Cas::Commit,
+            };
+            match decision {
+                Cas::NoOp => {
+                    tracing::debug!(
+                        "Store: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
+                    );
+                    None
+                }
+                Cas::Commit => {
+                    receipt.result = Some(result);
+                    receipt.block_num = block_num;
+                    match &receipt.result {
+                        Some(Ok(_)) => {
+                            tracing::info!(
+                                "Store: committed txn {tx_hash}; miden txn: {:?}",
+                                receipt.id
+                            );
+                            Some(receipt.logs.clone())
+                        }
+                        Some(Err(err)) => {
+                            tracing::error!(
+                                "Store: failed txn {tx_hash}; miden txn: {:?}; reason: {err}",
+                                receipt.id
+                            );
+                            None
+                        }
+                        None => None,
                     }
-                    Some(Err(err)) => {
-                        tracing::error!(
-                            "Store: failed txn {tx_hash}; miden txn: {:?}; reason: {err}",
-                            receipt.id
-                        );
-                        None
-                    }
-                    None => None,
                 }
             }
         }; // Mutex dropped before any .await
@@ -1772,14 +1807,14 @@ mod tests {
             .unwrap();
     }
 
-    /// BLOCKER 2 (first-terminal-wins CAS) — a SUCCESS receipt must survive a
+    /// BLOCKER 2 (success-always-wins CAS) — a SUCCESS receipt must survive a
     /// later failure commit. Models the TTL-sweeper race: the worker commits
     /// SUCCESS (status 0x1) first, then the sweeper's `write_failure_receipt`
     /// fires `txn_commit(Err)` for the same hash. Pre-fix the Err overwrote the
     /// success (status 0x1 → 0x0) and aggkit resubmitted a Miden op that had
     /// already landed. The success must be preserved verbatim.
     ///
-    /// Mutation check: deleting the `receipt.result.is_some()` guard in
+    /// Mutation check: dropping the `(Some(Ok(_)), _) => Cas::NoOp` arm in
     /// `txn_commit` makes this assertion fail (the failure clobbers success).
     #[tokio::test]
     async fn test_txn_commit_terminal_success_not_clobbered_by_failure() {
@@ -1813,30 +1848,84 @@ mod tests {
         assert_eq!(block_num, 7, "success block must be preserved");
     }
 
-    /// BLOCKER 2 (first-terminal-wins CAS) — the reverse ordering. If a failure
-    /// lands first (e.g. TTL sweeper marks a stuck job failed) a later success
-    /// commit for the same hash is a no-op: the FIRST terminal wins, so the
-    /// receipt stays failed. This keeps terminal transitions monotonic and
-    /// deterministic across both stores.
+    /// BLOCKER 2 (success-always-wins CAS) — a REAL Miden landing supersedes a
+    /// prior (TTL/timeout) FAILURE, and the ClaimEvent the failure suppressed is
+    /// re-materialised. Models the reverse race: the TTL sweeper commits a
+    /// terminal FAILURE for a job whose worker is still running; Miden then
+    /// LANDS; the projector's later `txn_commit(Ok)` must win so the durable
+    /// receipt ends SUCCESS (status 0x1) WITH its ClaimEvent — never a stuck
+    /// TTL-failure for a claim that actually landed.
+    ///
+    /// Mutation check: revert the override (make `(Some(Err(_)), true)` a
+    /// `Cas::NoOp` / first-terminal-wins) → the receipt stays failed and the
+    /// ClaimEvent is missing, failing both assertions.
     #[tokio::test]
-    async fn test_txn_commit_terminal_failure_not_clobbered_by_success() {
+    async fn test_txn_commit_success_supersedes_prior_failure_with_claimevent() {
+        use alloy::primitives::{B256, Bytes, LogData};
         let store = InMemoryStore::new();
         let tx_hash = TxHash::from([0x52u8; 32]);
-        seed_pending_txn(&store, tx_hash).await;
 
+        // Pending row carrying a ClaimEvent-shaped attached log.
+        let claim_topic = B256::from([0xC1u8; 32]);
+        let envelope =
+            alloy::consensus::TxEnvelope::Legacy(alloy::consensus::Signed::new_unchecked(
+                alloy::consensus::TxLegacy::default(),
+                alloy::primitives::Signature::test_signature(),
+                tx_hash,
+            ));
         store
-            .txn_commit(tx_hash, Err("first terminal".to_string()), 3, [0u8; 32])
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::ZERO,
+                    expires_at: None,
+                    logs: vec![LogData::new_unchecked(
+                        vec![claim_topic],
+                        Bytes::from(vec![0xAB]),
+                    )],
+                },
+            )
             .await
             .unwrap();
+
+        // TTL sweeper fails the still-running job first.
+        store
+            .txn_commit(tx_hash, Err("TTL expired".to_string()), 3, [0u8; 32])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_logs_for_tx(&format!("{tx_hash:#x}"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failure must NOT materialise the ClaimEvent"
+        );
+
+        // Miden actually landed → the projector commits success for the SAME hash.
         store
             .txn_commit(tx_hash, Ok(()), 5, [0u8; 32])
             .await
-            .expect("late success commit must be an accepted no-op, not an error");
+            .expect("a real landing must supersede the provisional failure");
 
         let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
-        let err = res.expect_err("first terminal (failure) must win");
-        assert!(err.contains("first terminal"), "reason preserved: {err}");
-        assert_eq!(block_num, 3, "failure block must be preserved");
+        assert!(
+            res.is_ok(),
+            "success must supersede the TTL failure; got {res:?}"
+        );
+        assert_eq!(block_num, 5, "success block must win");
+        let logs = store
+            .get_logs_for_tx(&format!("{tx_hash:#x}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "the ClaimEvent the failure suppressed must be materialised on the success override"
+        );
+        assert_eq!(logs[0].topics[0], format!("{claim_topic:#x}"));
     }
 
     #[tokio::test]

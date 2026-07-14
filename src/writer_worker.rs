@@ -1006,9 +1006,8 @@ mod tests {
     /// subsequent failure commit must be a no-op and leave
     /// `eth_getTransactionReceipt` at status 0x1.
     ///
-    /// Mutation check: reverting the store CAS (memory `is_some()` guard or the
-    /// pg `AND status = 'pending'` predicate) makes this fail — the failure
-    /// overwrites success.
+    /// Mutation check: reverting the store CAS (dropping the success-protected
+    /// arm) makes this fail — the failure overwrites success.
     #[tokio::test]
     async fn write_failure_receipt_does_not_clobber_committed_success() {
         let service = crate::test_helpers::create_test_service();
@@ -1055,6 +1054,73 @@ mod tests {
             "success (status 0x1) must be preserved; failure must not clobber it: {result:?}"
         );
         assert_eq!(block, 12, "the success block must be unchanged");
+    }
+
+    /// BLOCKER 2 (sweeper/worker coordination) — the reverse race, end to end
+    /// through the sweeper's real `write_failure_receipt` path: a job's worker is
+    /// still Submitting, the TTL sweeper commits a terminal FAILURE, THEN Miden
+    /// lands and the projector commits SUCCESS for the same hash. The durable
+    /// receipt must end SUCCESS (0x1) with the ClaimEvent it carried — a claim
+    /// that actually landed must never be left stuck at a TTL-failure.
+    ///
+    /// Mutation check: revert the success-always-wins override in `txn_commit`
+    /// (make failure→success a no-op) → the receipt stays failed and the
+    /// ClaimEvent is never emitted, failing this test.
+    #[tokio::test]
+    async fn ttl_failure_is_superseded_by_a_real_landing() {
+        use alloy::primitives::{B256, Bytes, LogData};
+        let service = crate::test_helpers::create_test_service();
+        let store = service.store.clone();
+        let (envelope, signer) = fake_envelope(0);
+        let hash = *envelope.tx_hash();
+
+        // Pending row carrying the ClaimEvent, as the submit path would create it.
+        let claim_topic = B256::from([0xC1u8; 32]);
+        store
+            .txn_begin(
+                hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope: envelope.clone(),
+                    signer,
+                    expires_at: None,
+                    logs: vec![LogData::new_unchecked(
+                        vec![claim_topic],
+                        Bytes::from(vec![0xAB]),
+                    )],
+                },
+            )
+            .await
+            .unwrap();
+
+        // TTL sweeper fails the still-running job (the real sweeper call path).
+        write_failure_receipt(
+            &service,
+            hash,
+            &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
+            Some((envelope, signer)),
+        )
+        .await
+        .unwrap();
+
+        // Miden lands → the projector finalises the SAME pending row as success.
+        store
+            .txn_commit(hash, Ok(()), 20, [0xEEu8; 32])
+            .await
+            .unwrap();
+
+        let (result, block) = store.txn_receipt(hash).await.unwrap().unwrap();
+        assert!(
+            result.is_ok(),
+            "a claim that landed must end SUCCESS, not stuck at TTL-failure: {result:?}"
+        );
+        assert_eq!(block, 20, "the landing block must win");
+        let logs = store.get_logs_for_tx(&format!("{hash:#x}")).await.unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "the ClaimEvent must be emitted on the landing"
+        );
     }
 
     fn fake_ger_job(nonce: u64) -> WriteJob {

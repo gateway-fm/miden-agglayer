@@ -450,13 +450,13 @@ async fn test_pgstore_txn_commit_missing_row_errors() {
     assert!(err.to_string().contains("not found"));
 }
 
-/// BLOCKER 2 (first-terminal-wins CAS) — PG twin of
+/// BLOCKER 2 (success-always-wins CAS) — PG twin of
 /// `memory::tests::test_txn_commit_terminal_success_not_clobbered_by_failure`.
-/// Once a receipt is terminal (success), the `AND status = 'pending'` predicate
-/// makes a later failure commit a zero-row no-op that returns Ok, preserving
-/// status 0x1. Models the TTL sweeper racing a worker that already landed the
-/// Miden op — the pre-fix overwrite made aggkit resubmit a landed op.
-/// PG-gated: skips when `DATABASE_URL` is unset.
+/// Once a receipt is 'success', the failure-commit CAS predicate
+/// (`status = 'pending'`) excludes it, so a later failure is a zero-row no-op
+/// that returns Ok, preserving status 0x1. Models the TTL sweeper racing a
+/// worker that already landed the Miden op — the pre-fix overwrite made aggkit
+/// resubmit a landed op. PG-gated: skips when `DATABASE_URL` is unset.
 #[tokio::test]
 async fn test_pgstore_terminal_success_not_clobbered_by_failure() {
     let Some(store) = pg_store().await else {
@@ -488,33 +488,63 @@ async fn test_pgstore_terminal_success_not_clobbered_by_failure() {
     assert_eq!(block, 12, "success block preserved");
 }
 
-/// BLOCKER 2 (first-terminal-wins CAS) — PG twin of
-/// `memory::tests::test_txn_commit_terminal_failure_not_clobbered_by_success`.
-/// First terminal wins regardless of ordering: a failure that lands first is
-/// not overwritten by a later success commit.
-/// PG-gated: skips when `DATABASE_URL` is unset.
+/// BLOCKER 2 (success-always-wins CAS) — PG twin of
+/// `memory::tests::test_txn_commit_success_supersedes_prior_failure_with_claimevent`.
+/// A real Miden landing supersedes a prior (TTL) failure: the success-commit CAS
+/// predicate (`status <> 'success'`) updates the 'failed' row to 'success' and
+/// materialises the attached ClaimEvent. Guarantees a claim that actually landed
+/// never ends stuck at a TTL-failure. PG-gated: skips when `DATABASE_URL` unset.
 #[tokio::test]
-async fn test_pgstore_terminal_failure_not_clobbered_by_success() {
+async fn test_pgstore_success_supersedes_prior_failure() {
     let Some(store) = pg_store().await else {
         return;
     };
     reset_state(&store).await;
 
     let tx_hash = TxHash::from([0x5Bu8; 32]);
-    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    // Attach a ClaimEvent-shaped log so the override's materialisation is checked.
+    let mut entry = dummy_txn_entry();
+    entry.logs = vec![alloy::primitives::LogData::new_unchecked(
+        vec![alloy::primitives::B256::from([0xC1u8; 32])],
+        alloy::primitives::Bytes::from(vec![0xAB]),
+    )];
+    store.txn_begin(tx_hash, entry).await.unwrap();
+
+    // TTL sweeper fails the still-running job first (no logs materialised).
     store
-        .txn_commit(tx_hash, Err("first terminal".to_string()), 3, [0u8; 32])
+        .txn_commit(tx_hash, Err("TTL expired".to_string()), 3, [0u8; 32])
         .await
         .unwrap();
+    assert!(
+        store
+            .get_logs_for_tx(&format!("{tx_hash:#x}"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a failure must NOT materialise the ClaimEvent"
+    );
+
+    // Miden landed → projector commits success for the same hash → override.
     store
         .txn_commit(tx_hash, Ok(()), 5, [0u8; 32])
         .await
-        .expect("late success commit must be an accepted no-op, not an error");
+        .expect("a real landing must supersede the provisional failure");
 
     let (res, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
-    let err = res.expect_err("first terminal (failure) must win");
-    assert!(err.contains("first terminal"), "reason preserved: {err}");
-    assert_eq!(block, 3, "failure block preserved");
+    assert!(
+        res.is_ok(),
+        "success must supersede the TTL failure; got {res:?}"
+    );
+    assert_eq!(block, 5, "success block wins");
+    assert_eq!(
+        store
+            .get_logs_for_tx(&format!("{tx_hash:#x}"))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the ClaimEvent must be materialised on the success override"
+    );
 }
 
 // ── Nonces ───────────────────────────────────────────────────

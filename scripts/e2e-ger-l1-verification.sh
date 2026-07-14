@@ -206,6 +206,32 @@ while true; do
 done
 pass "indexer corroborated the fresh L1 GER (zkevm_getExitRootsByGER non-null)"
 
+# ── A.3b Wait for the fresh GER to reach the strict finality depth ──────────
+# BLOCKER 1 (re-review): finality is enforced AT THE GATE. Strict mode
+# authorizes the irreversible injection only once the observation is
+# CONFIRMATIONS L1 blocks deep (indexer cursor - evidence block >= depth);
+# ordinary decomposition (asserted above) is NOT delayed. Nudge anvil forward so
+# the indexer's persisted cursor advances past the GER's block (single-node
+# anvil has instant finality; mining empty blocks is harmless).
+CONFIRMATIONS="${L1_INDEXER_CONFIRMATIONS:-1}"
+GER_BLOCK=$(pgquery "SELECT block_number FROM ger_entries WHERE ger_hash = decode('${COMB_HEX}', 'hex')")
+step "A.3b waiting for GER $COMB to reach $CONFIRMATIONS L1 confirmation(s) (evidence block ${GER_BLOCK:-?})"
+ELAPSED=0; TIMEOUT=120
+while true; do
+    CURSOR=$(pgquery "SELECT last_processed FROM l1_indexer_state WHERE id = 1" || echo "")
+    if [[ -n "$GER_BLOCK" && -n "$CURSOR" && $((CURSOR - GER_BLOCK)) -ge $CONFIRMATIONS ]]; then
+        break
+    fi
+    # Mine an empty L1 block so the indexer's next poll advances its cursor.
+    cast rpc anvil_mine 1 --rpc-url "$L1_RPC_URL" >/dev/null 2>&1 \
+        || cast rpc evm_mine --rpc-url "$L1_RPC_URL" >/dev/null 2>&1 || true
+    ELAPSED=$((ELAPSED + 2))
+    [[ $ELAPSED -ge $TIMEOUT ]] \
+        && fail "GER $COMB did not reach $CONFIRMATIONS confirmation(s) after ${TIMEOUT}s (indexer cursor '${CURSOR}' vs evidence block '${GER_BLOCK}')"
+    sleep 2
+done
+pass "GER reached the strict finality depth ($CONFIRMATIONS confirmation(s))"
+
 # ── A.4 ASSERT the not-yet-injected precondition ───────────────────────────
 # THE adversarial guard: if this GER were already injected, the whole positive
 # test would be meaningless (dedup would wave a foreign injection through). So

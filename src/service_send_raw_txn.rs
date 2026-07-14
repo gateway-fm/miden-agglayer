@@ -557,6 +557,7 @@ pub(crate) async fn worker_handle_ger_insert(
             &service.store,
             txn_hash,
             service.reject_unverified_ger,
+            service.l1_confirmations,
             // The envelope + signer ride into `insert_ger` so the pending
             // receipt row is created INSIDE the serialized Miden-client
             // closure, together with the tx↔note link (handoff-before-
@@ -868,7 +869,14 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         if service.reject_unverified_ger
             && let crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } = &decoded
         {
-            crate::ger::ensure_ger_l1_observed(&service.store, ger_bytes, true, txn_hash).await?;
+            crate::ger::ensure_ger_l1_observed(
+                &service.store,
+                ger_bytes,
+                true,
+                service.l1_confirmations,
+                txn_hash,
+            )
+            .await?;
         }
 
         // C6 on the REQUEST path (PR #127 review point 3). Pre-fix, with the
@@ -1428,12 +1436,14 @@ mod tests {
         );
 
         // The indexer catches up (writes the (mainnet, rollup) decomposition
-        // it observed on L1) — the IDENTICAL signed transaction, same nonce,
-        // must now be accepted.
+        // it observed on L1 at block 100, and its cursor advances past the
+        // strict confirmation depth) — the IDENTICAL signed transaction, same
+        // nonce, must now be accepted.
         store
             .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
             .await
             .unwrap();
+        store.set_l1_indexer_cursor(1_000).await.unwrap();
         let accepted_hash = service_send_raw_txn(service.clone(), input_hex)
             .await
             .expect("the identical signed tx must be accepted after the indexer catches up");
@@ -1531,11 +1541,13 @@ mod tests {
             "H6 rejection must not create a receipt"
         );
 
-        // Indexer catches up → the identical signed tx (same nonce) succeeds.
+        // Indexer catches up (decomposition at block 100, cursor advances past
+        // the strict confirmation depth) → the identical tx (same nonce) succeeds.
         store
             .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
             .await
             .unwrap();
+        store.set_l1_indexer_cursor(1_000).await.unwrap();
         let accepted_hash = service_send_raw_txn(service.clone(), input_hex)
             .await
             .expect("the identical signed tx must be accepted after the indexer catches up");
