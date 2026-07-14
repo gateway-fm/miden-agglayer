@@ -1452,3 +1452,157 @@ fn rand_u64() -> u64 {
         .unwrap_or(0)
         ^ (std::process::id() as u64).wrapping_mul(2_654_435_761)
 }
+
+// ── #55 accept-and-revert — BLOCKER 1 & 2 regressions on the real store ──────
+//
+// PG-gated (skip when DATABASE_URL is unset; run in the postgres-feature CI).
+// The service-level routing logic (`acquire_claim_lock` typed outcome, the
+// crash-gap nonce repair) is exercised against a genuine PgStore so the atomic
+// landed classification and the nonce-repair primitive are proven on BOTH stores.
+
+/// BLOCKER 1 — `acquire_claim_lock` classifies a claim submission atomically on
+/// PgStore: fresh → Acquired; locked+no-event(in TTL) → InFlight; locked+ClaimEvent
+/// → Landed (the authoritative landed detection that closes the TOCTOU); orphaned
+/// (locked+no-event, TTL expired) → Acquired. LANDED beats TTL-expiry recovery.
+#[tokio::test]
+async fn test_pgstore_acquire_claim_lock_outcomes() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store);
+    use crate::service_send_raw_txn::{ClaimLockOutcome, acquire_claim_lock};
+    let ttl = std::time::Duration::from_secs(3600);
+
+    let base = rand_u64();
+    let gi_fresh = U256::from(base.wrapping_add(1));
+    let gi_inflight = U256::from(base.wrapping_add(2));
+    let gi_landed = U256::from(base.wrapping_add(3));
+    let gi_orphan = U256::from(base.wrapping_add(4));
+
+    // 1. Fresh index → Acquired.
+    assert_eq!(
+        acquire_claim_lock(&store, gi_fresh, ttl).await.unwrap(),
+        ClaimLockOutcome::Acquired
+    );
+
+    // 2. Locked, no ClaimEvent, within TTL → InFlight.
+    store.try_claim(gi_inflight).await.unwrap();
+    assert_eq!(
+        acquire_claim_lock(&store, gi_inflight, ttl).await.unwrap(),
+        ClaimLockOutcome::InFlight
+    );
+
+    // 3. Locked + ClaimEvent → Landed (BLOCKER 1: atomic landed classification).
+    store.try_claim(gi_landed).await.unwrap();
+    store
+        .commit_manual_claim_event_atomic(
+            format!("pg-landed-note-{base}"),
+            "0xbridge",
+            base % 1_000_000,
+            [0u8; 32],
+            "0xwatchertx",
+            gi_landed.to_be_bytes::<32>(),
+            0,
+            &[0u8; 20],
+            &[0u8; 20],
+            1234,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        acquire_claim_lock(&store, gi_landed, ttl).await.unwrap(),
+        ClaimLockOutcome::Landed
+    );
+    // LANDED beats TTL-expiry recovery.
+    assert_eq!(
+        acquire_claim_lock(&store, gi_landed, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::Landed
+    );
+
+    // 4. Orphaned (locked, no ClaimEvent, TTL expired) → Acquired (superseded).
+    store.try_claim(gi_orphan).await.unwrap();
+    assert_eq!(
+        acquire_claim_lock(&store, gi_orphan, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::Acquired
+    );
+}
+
+/// BLOCKER 2 — the crash-gap nonce repair on PgStore, via a PgStore-backed
+/// service. Simulate the exact durable state a crash between the receipt write and
+/// `nonce_increment` leaves (a known tx row, but a STALE expected nonce), then run
+/// the repair: the nonce advances exactly once (idempotent), so a rebroadcast heals
+/// the nonce rather than serving stale forever — the sponsor is not wedged.
+#[tokio::test]
+async fn test_pgstore_crash_gap_nonce_repair() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store);
+    let service = crate::test_helpers::create_test_service_with_store(store.clone());
+
+    let signer = Address::from([0x5au8; 20]);
+    let signer_str = format!("{signer:#x}");
+    let tx_hash = TxHash::from([0x5bu8; 32]);
+
+    // Precondition: expected nonce starts at 0.
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+    // Simulate the crash-gap durable state: a KNOWN tx (receipt persisted) at nonce
+    // 0, with the nonce NOT advanced.
+    store
+        .txn_begin(tx_hash, dummy_txn_entry_for(signer))
+        .await
+        .unwrap();
+    store
+        .txn_commit(tx_hash, Err("crash-gap".into()), 0, [0u8; 32])
+        .await
+        .unwrap();
+    assert!(store.txn_get(tx_hash).await.unwrap().is_some());
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+
+    // The repair (crash-gap signature: expected == tx.nonce == 0) advances once.
+    let repaired =
+        crate::service_send_raw_txn::repair_commit_gap_nonce(&service, signer, &signer_str, 0)
+            .await
+            .unwrap();
+    assert!(repaired, "the crash-gap must be repaired");
+    assert_eq!(
+        store.nonce_get(&signer_str).await.unwrap(),
+        1,
+        "crash-gap nonce advanced to complete the interrupted accept"
+    );
+
+    // Idempotent: a further repair for the same tx.nonce is a no-op (expected 1 != 0).
+    let repaired_again =
+        crate::service_send_raw_txn::repair_commit_gap_nonce(&service, signer, &signer_str, 0)
+            .await
+            .unwrap();
+    assert!(!repaired_again, "repair must be idempotent");
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+
+    // A normally-advanced tx (expected 1 > tx.nonce 0) is never repaired.
+    assert!(
+        !crate::service_send_raw_txn::repair_commit_gap_nonce(&service, signer, &signer_str, 0)
+            .await
+            .unwrap()
+    );
+}
+
+/// A TxnEntry carrying a real signer for the crash-gap fixture.
+fn dummy_txn_entry_for(signer: Address) -> TxnEntry {
+    let tx = TxEip1559::default();
+    TxnEntry {
+        id: None,
+        envelope: TxEnvelope::Eip1559(alloy::consensus::Signed::new_unchecked(
+            tx,
+            Signature::test_signature(),
+            TxHash::default(),
+        )),
+        signer,
+        expires_at: None,
+        logs: vec![],
+    }
+}

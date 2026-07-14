@@ -214,6 +214,47 @@ async fn record_local_immediate_reverted(
         .await
 }
 
+/// BLOCKER-2 (#55 review) — idempotent crash-gap nonce repair.
+///
+/// On the sync accept path the durable receipt write (`txn_begin` + `txn_commit`)
+/// and the per-signer `nonce_increment` are SEPARATE steps; a crash / store error
+/// BETWEEN them leaves the tx KNOWN (receipt persisted) but the signer's expected
+/// nonce STALE at that tx's nonce. Called from the RD-940 same-hash dedup path on a
+/// rebroadcast: if the expected nonce still equals `tx_nonce` — the crash-gap
+/// signature; a normally-advanced tx has `expected > tx.nonce`, and async mode
+/// advances at enqueue so likewise `expected > tx.nonce` — it advances the nonce
+/// exactly once, completing the interrupted accept, so the rebroadcast HEALS the
+/// nonce rather than serving stale forever.
+///
+/// Cheap unlocked pre-check first (the common rebroadcast is `expected > tx.nonce`
+/// → no lock taken); the per-signer lock + re-read make the advance atomic against a
+/// concurrent accept/repair. Returns `true` iff it advanced the nonce.
+pub(crate) async fn repair_commit_gap_nonce(
+    service: &ServiceState,
+    signer: Address,
+    signer_str: &str,
+    tx_nonce: u64,
+) -> anyhow::Result<bool> {
+    if service.store.nonce_get(signer_str).await? != tx_nonce {
+        return Ok(false);
+    }
+    let _lock = service.per_signer_locks.lock(signer).await;
+    if service.store.nonce_get(signer_str).await? != tx_nonce {
+        return Ok(false);
+    }
+    service.store.nonce_increment(signer_str).await?;
+    ::metrics::counter!("rpc_nonce_repaired_after_commit_gap_total").increment(1);
+    tracing::warn!(
+        target: "rpc::nonce_repair",
+        signer = %signer_str,
+        nonce = tx_nonce,
+        "healed a stale signer nonce on rebroadcast: a known tx's receipt was persisted but its \
+         nonce advance was lost to a crash in the commit gap; advanced the expected nonce to \
+         complete the interrupted accept (#55 BLOCKER-2)"
+    );
+    Ok(true)
+}
+
 /// Handle a `claimAsset` transaction: skip zero-amount or publish the claim.
 ///
 /// RD-940 Phase 1: this is the unified dispatcher for both the legacy sync
@@ -256,73 +297,18 @@ pub(crate) async fn worker_handle_claim_asset(
         return Ok(());
     }
 
-    // #55 — ACCEPT-AND-REVERT for an already-LANDED globalIndex (geth-faithful).
-    //
-    // Claims are permissionless: destination + amount are bound by the
-    // merkle-proven claimAsset calldata, so the sponsor (aggkit ClaimTxManager
-    // autoclaim) and a user (manual eth_sendRawTransaction) can BOTH target the
-    // same globalIndex, and dedup is keyed by globalIndex only (signer-agnostic).
-    // When a USER front-runs a gi the sponsor has already signed + persisted a
-    // monitored tx for, the sponsor later submits that (DIFFERENT-hash) tx. If we
-    // hard-reject it at the JSON-RPC layer ("already submitted"), the reject does
-    // NOT consume the sponsor's nonce: the proxy's expected-nonce and the
-    // sponsor's sequence permanently desync, ClaimTxManager re-broadcasts the
-    // pinned tx forever ("nonce mismatch"), every later sponsor claim queues
-    // behind it, and autoclaim dies un-healably (the monitored tx survives
-    // restarts).
-    //
-    // On real geth this never happens: the doomed claim MINES, reverts with
-    // `AlreadyClaimed`, and CONSUMES its nonce + gas, so ClaimTxManager marks it
-    // final and advances. Mirror that here: if a real ClaimEvent already exists
-    // for this globalIndex, ACCEPT the tx, write a durable REVERTED receipt
-    // (status 0x0, empty logs, NO new ClaimEvent), and return Ok so the caller
-    // CONSUMES the signer's nonce exactly like a normal accept — keeping the
-    // sponsor's sequence in lockstep.
-    //
-    // Scope / coexistence:
-    //   - This is reached ONLY after the RD-940 tx-hash dedup early-return (a
-    //     SAME-hash rebroadcast — including a resubmit of the REAL landed claim's
-    //     own tx — was already short-circuited to Ok(hash) upstream WITHOUT a new
-    //     receipt). So this fires only for a DIFFERENT tx (other signer/nonce)
-    //     targeting an already-landed gi.
-    //   - It is reached ONLY after the R4 nonce gate admitted the tx
-    //     (tx.nonce == expected). A future/stale-nonce landed claim never gets
-    //     here — it is waited/rejected by R4 first — so accept-and-revert can
-    //     NEVER paper over a real nonce gap.
-    //   - It runs BEFORE `acquire_claim_lock`: it neither takes nor releases the
-    //     claim lock, so the real landed claim's LANDED lock + ClaimEvent +
-    //     receipt are UNTOUCHED. `acquire_claim_lock`'s own LANDED hard-reject
-    //     stays as defense-in-depth for the narrow TOCTOU where a claim lands
-    //     between this check and the lock.
-    let gi_bytes: [u8; 32] = params.globalIndex.to_be_bytes::<32>();
-    if service
-        .store
-        .has_claim_event_for_global_index(&gi_bytes)
-        .await?
-    {
-        ::metrics::counter!("claim_landed_dedup_reverted_total").increment(1);
-        tracing::warn!(
-            global_index = %params.globalIndex,
-            eth_tx = %txn_hash,
-            signer = %signer,
-            "claim targets an already-landed globalIndex (a ClaimEvent already exists); \
-             accepting and writing a REVERTED receipt (status 0x0, no new event) so the \
-             submitter's nonce is consumed — geth-faithful AlreadyClaimed revert (#55). \
-             The real landed claim is untouched."
-        );
-        record_local_immediate_reverted(
-            service,
-            txn_hash,
-            txn_envelope,
-            signer,
-            format!(
-                "claim for globalIndex {} already landed (AlreadyClaimed); reverted (#55)",
-                params.globalIndex
-            ),
-        )
-        .await?;
-        return Ok(());
-    }
+    // NOTE (#55): the geth-faithful ACCEPT-AND-REVERT for an already-LANDED
+    // globalIndex is NOT a separate pre-check here. Detecting "landed" and
+    // deciding accept-and-revert are now ONE authoritative, atomic step inside
+    // `acquire_claim_lock` (its `ClaimLockOutcome::Landed`), below. A standalone
+    // pre-check would reopen a TOCTOU: it could observe "not landed", the real
+    // claim could LAND, and `acquire_claim_lock` would then hard-reject — the
+    // exact nonce-desync wedge #55 fixes. Routing landed→accept-and-revert
+    // through the lock's own classification closes that window (there is no
+    // interleaving in which a landed gi is hard-rejected). A landed gi
+    // necessarily passes RD-860 (its destination was resolvable when it landed;
+    // address mappings are monotonic) and C6 (its GER is injected; injection is
+    // monotonic), so those checks never fire for it before the lock.
 
     // RD-860 — swallow unresolvable-destination claims permanently. If the
     // destination address can't be resolved to a Miden AccountId, record the
@@ -394,17 +380,73 @@ pub(crate) async fn worker_handle_claim_asset(
     // See `ensure_claim_ger_published` for the full rationale.
     ensure_claim_ger_published(&service.store, &params).await?;
 
-    // Lock the claim index. All error paths after this MUST unclaim.
+    // Lock the claim index — the AUTHORITATIVE, atomic classification of this
+    // submission against the per-globalIndex lock + landed state. All error
+    // paths after an `Acquired` MUST unclaim.
     //
     // SOAK FINDING #1 (orphaned-claim wedge): a plain `try_claim` rejection here permanently
     // wedged a deposit if the proxy died between the lock write and the CLAIM landing on
     // Miden (chaos restart in the submit window): the persisted record survived, the R9
     // guard never fired, and every sponsor retry was rejected forever — starving all later
     // claims the sponsor owns. Dedup must mean "landed or genuinely in flight", not
-    // "submission was attempted once": on rejection, verify + recover via
-    // `acquire_claim_lock` (landed → hard reject; in flight (younger than TTL) → reject;
-    // orphaned (no ClaimEvent + TTL expired) → supersede the record and accept).
-    acquire_claim_lock(&service.store, params.globalIndex, claim_resubmit_ttl()).await?;
+    // "submission was attempted once".
+    match acquire_claim_lock(&service.store, params.globalIndex, claim_resubmit_ttl()).await? {
+        // #55 — geth-faithful ACCEPT-AND-REVERT for an already-LANDED globalIndex.
+        //
+        // Claims are permissionless: destination + amount are bound by the
+        // merkle-proven calldata, so the sponsor (aggkit ClaimTxManager autoclaim)
+        // and a user can BOTH target the same gi; dedup is keyed by globalIndex
+        // only (signer-agnostic). When a user front-runs a gi the sponsor already
+        // signed + persisted a monitored tx for, hard-rejecting the sponsor's
+        // later (different-hash) tx would NOT consume its nonce: its sequence and
+        // the proxy's expected-nonce desync, ClaimTxManager re-broadcasts forever
+        // ("nonce mismatch"), and autoclaim dies un-healably. On real geth the
+        // doomed claim MINES, reverts with AlreadyClaimed, and CONSUMES its nonce
+        // + gas. Mirror that: ACCEPT the tx, write a durable REVERTED receipt
+        // (status 0x0, empty logs, NO new ClaimEvent), and return Ok so the caller
+        // CONSUMES the signer's nonce exactly like a normal accept.
+        //
+        // `Landed` is decided INSIDE `acquire_claim_lock` at the lock boundary
+        // (the authoritative `has_claim_event_for_global_index`), so there is no
+        // pre-check→lock interleaving in which a landed gi is hard-rejected.
+        ClaimLockOutcome::Landed => {
+            ::metrics::counter!("claim_landed_dedup_reverted_total").increment(1);
+            tracing::warn!(
+                global_index = %params.globalIndex,
+                eth_tx = %txn_hash,
+                signer = %signer,
+                "claim targets an already-landed globalIndex (a ClaimEvent already exists); \
+                 accepting and writing a REVERTED receipt (status 0x0, no new event) so the \
+                 submitter's nonce is consumed — geth-faithful AlreadyClaimed revert (#55). \
+                 The real landed claim is untouched."
+            );
+            record_local_immediate_reverted(
+                service,
+                txn_hash,
+                txn_envelope,
+                signer,
+                format!(
+                    "claim for globalIndex {} already landed (AlreadyClaimed); reverted (#55)",
+                    params.globalIndex
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        // A genuine concurrent submission for this gi is in flight (locked, no
+        // ClaimEvent yet, within TTL). Hard-reject — must not double-publish. In
+        // sync mode this returns Err WITHOUT the caller advancing the nonce (a
+        // genuine retry, nonce not consumed); once the in-flight claim LANDS, the
+        // retry re-enters and takes the `Landed` accept-and-revert arm above.
+        ClaimLockOutcome::InFlight => {
+            anyhow::bail!(
+                "claim already submitted for global_index {}",
+                params.globalIndex
+            );
+        }
+        // Fresh lock (or an orphaned record superseded) — proceed to publish.
+        ClaimLockOutcome::Acquired => {}
+    }
 
     // R9 — install a RAII drop guard so that even if the request future is
     // dropped (client disconnect mid-publish, panic, task cancellation), the
@@ -492,45 +534,87 @@ pub(crate) fn claim_resubmit_ttl() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Acquire the per-`global_index` claim submission lock, with orphaned-record recovery
-/// (SOAK FINDING #1). Semantics: dedup means "landed or genuinely in flight", never
-/// "submission was attempted once".
+/// Typed, AUTHORITATIVE outcome of [`acquire_claim_lock`]. Landed detection and the
+/// #55 accept-and-revert decision are ONE step here (no separate pre-check→lock
+/// window), so there is no interleaving in which a claim for an already-landed
+/// globalIndex is hard-rejected — the exact nonce-desync wedge #55 fixes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClaimLockOutcome {
+    /// The submission lock is now held by THIS caller (fresh index, or an orphaned
+    /// record superseded — SOAK FINDING #1). Proceed to publish; the caller MUST
+    /// arrange `unclaim` on any later failure (via `ClaimGuard`).
+    Acquired,
+    /// A genuine concurrent submission for the same gi is in flight (locked, no
+    /// ClaimEvent yet, record younger than `ttl`). The caller hard-rejects
+    /// ("already submitted") — no double publish, and no nonce is consumed.
+    InFlight,
+    /// A real `ClaimEvent` already exists for this globalIndex — the claim LANDED.
+    /// The caller routes this to #55 accept-and-revert (consume the nonce + write a
+    /// reverted receipt), NEVER a hard reject. Any lock this call transiently took
+    /// has been released before returning.
+    Landed,
+}
+
+/// Classify a claim submission against the per-`global_index` submission lock and the
+/// authoritative landed state, with orphaned-record recovery (SOAK FINDING #1).
 ///
-///   1. Fresh index → lock acquired (the normal path).
-///   2. Record exists + ClaimEvent recorded for the index → hard reject ("already
-///      submitted" stays an error — the claim LANDED; dedup holds forever).
-///   3. Record exists + no ClaimEvent + record younger than `ttl` → reject (a submission
-///      is genuinely in flight; no double-submit race).
-///   4. Record exists + no ClaimEvent + `ttl` expired → ORPHANED (the proxy died between
-///      the lock write and the CLAIM landing): atomically supersede the record
-///      (`Store::try_reclaim_expired` — single UPDATE, one winner under concurrency),
-///      warn + `claim_resubmission_recovered_total`, and accept the resubmission.
+/// This is the SINGLE authoritative step for landed detection: whatever the
+/// interleaving, an index whose `ClaimEvent` already exists is classified `Landed`
+/// (→ #55 accept-and-revert), never hard-rejected. Cases:
+///
+///   1. `try_claim` succeeds (fresh) + no ClaimEvent → `Acquired` (normal path).
+///   2. `try_claim` succeeds (fresh) + a ClaimEvent already exists (e.g. a restore
+///      wrote the event without a submission lock) → release the spurious lock and
+///      return `Landed` — never double-publish onto a landed gi.
+///   3. `try_claim` fails + a ClaimEvent exists → `Landed`. This is the closed
+///      TOCTOU: even if the claim LANDED after some earlier read, the landed
+///      classification is made here, at the lock decision, and routes to
+///      accept-and-revert rather than a hard reject.
+///   4. `try_claim` fails + no ClaimEvent + record younger than `ttl` → `InFlight`.
+///   5. `try_claim` fails + no ClaimEvent + `ttl` expired → ORPHANED: atomically
+///      supersede (`Store::try_reclaim_expired` — single UPDATE, one winner under
+///      concurrency), warn + `claim_resubmission_recovered_total`, return `Acquired`.
 pub(crate) async fn acquire_claim_lock(
     store: &std::sync::Arc<dyn crate::store::Store>,
     global_index: alloy::primitives::U256,
     ttl: std::time::Duration,
-) -> anyhow::Result<()> {
-    let Err(rejected) = store.try_claim(global_index).await else {
-        return Ok(()); // fresh index — the normal path
-    };
-    // LANDED check first: an index whose ClaimEvent exists is a hard dedup, always.
+) -> anyhow::Result<ClaimLockOutcome> {
     let gi_bytes: [u8; 32] = global_index.to_be_bytes::<32>();
-    if store.has_claim_event_for_global_index(&gi_bytes).await? {
-        return Err(rejected);
+    match store.try_claim(global_index).await {
+        Ok(()) => {
+            // Fresh lock acquired. Guard the rare "ClaimEvent exists but no lock"
+            // (e.g. a restore populated the event without a submission lock): if a
+            // ClaimEvent already exists, this is LANDED — release the lock we just
+            // took and route to accept-and-revert rather than double-publishing.
+            if store.has_claim_event_for_global_index(&gi_bytes).await? {
+                store.unclaim(&global_index).await?;
+                return Ok(ClaimLockOutcome::Landed);
+            }
+            Ok(ClaimLockOutcome::Acquired)
+        }
+        Err(_rejected) => {
+            // LANDED is authoritative and checked AT the lock decision — there is
+            // no separate pre-check window in which a landed gi could be routed to
+            // a hard reject.
+            if store.has_claim_event_for_global_index(&gi_bytes).await? {
+                return Ok(ClaimLockOutcome::Landed);
+            }
+            // Not landed. Atomically supersede IFF the record has out-lived the
+            // in-flight TTL; a fresher record means a submission is genuinely in
+            // flight — keep rejecting.
+            if !store.try_reclaim_expired(global_index, ttl).await? {
+                return Ok(ClaimLockOutcome::InFlight);
+            }
+            ::metrics::counter!("claim_resubmission_recovered_total").increment(1);
+            tracing::warn!(
+                global_index = %global_index,
+                ttl_secs = ttl.as_secs(),
+                "orphaned claim submission record for global_index {global_index} (submitted but \
+                 never landed — likely a crash mid-flight); accepting resubmission"
+            );
+            Ok(ClaimLockOutcome::Acquired)
+        }
     }
-    // Not landed. Atomically supersede IFF the record has out-lived the in-flight TTL;
-    // a fresher record means a submission is genuinely in flight — keep rejecting.
-    if !store.try_reclaim_expired(global_index, ttl).await? {
-        return Err(rejected);
-    }
-    ::metrics::counter!("claim_resubmission_recovered_total").increment(1);
-    tracing::warn!(
-        global_index = %global_index,
-        ttl_secs = ttl.as_secs(),
-        "orphaned claim submission record for global_index {global_index} (submitted but \
-         never landed — likely a crash mid-flight); accepting resubmission"
-    );
-    Ok(())
 }
 
 /// RAII guard that releases a `try_claim` lock if the holding future is dropped
@@ -732,6 +816,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let txn = unwrap_txn_envelope(txn_envelope.clone())?;
     let txn_hash = txn.hash;
     let signer = txn_envelope.recover_signer()?;
+    let signer_str = format!("{signer:#x}");
     let tx_nonce = envelope_nonce(&txn_envelope);
     let selector = calldata_selector(&txn.input);
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
@@ -797,6 +882,18 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             %txn_hash,
             "tx-hash dedup (committed): returning OK without re-running R4"
         );
+        // BLOCKER-2 (#55 review) — crash-gap nonce REPAIR. On the sync accept
+        // path the durable receipt write (`txn_begin` + `txn_commit`) and the
+        // per-signer `nonce_increment` are SEPARATE steps; a crash / store error
+        // BETWEEN them leaves this tx KNOWN (receipt persisted) while the
+        // signer's expected nonce stays STALE at this tx's nonce. Without repair
+        // this rebroadcast is served as success forever while the nonce never
+        // advances, and the signer's NEXT tx (nonce+1) fails the R4 gate — the
+        // exact wedge #55 fixes, reintroduced by a crash in the commit gap.
+        //
+        // Heal it idempotently via `repair_commit_gap_nonce` (extracted so both
+        // stores can regression-test the repair directly).
+        repair_commit_gap_nonce(&service, signer, &signer_str, tx_nonce).await?;
         return Ok(txn_hash);
     }
 
@@ -810,7 +907,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // nonce N, release the lock, wait briefly for N to be accepted, then
     // re-check. This is a small in-process txpool behavior; stale/replay nonces
     // still fail immediately, and missing gaps still fail after the bound.
-    let signer_str = format!("{signer:#x}");
     let future_nonce_wait_max = std::time::Duration::from_secs(30);
     let future_nonce_poll = std::time::Duration::from_millis(50);
     let future_nonce_wait_started = tokio::time::Instant::now();
@@ -1990,19 +2086,26 @@ mod tests {
 
         // "Crash": no ClaimEvent ever lands, and the record out-lives the TTL
         // (Duration::ZERO = instantly expired, keeps the test clock-free).
-        acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
             .await
-            .expect("orphaned record (no ClaimEvent, TTL expired) must accept resubmission");
+            .expect("orphaned record classification must not error");
+        assert_eq!(
+            outcome,
+            ClaimLockOutcome::Acquired,
+            "orphaned record (no ClaimEvent, TTL expired) must be superseded → Acquired"
+        );
         assert!(
             store.is_claimed(&gi).await.unwrap(),
             "recovery SUPERSEDES the record (lock re-held by the new submission), not deletes it"
         );
     }
 
-    /// Dedup must HOLD for a landed claim: record present + ClaimEvent recorded → still
-    /// rejected, even with the TTL long expired. "Already claimed" stays an error forever.
+    /// A LANDED claim is classified `Landed` (→ #55 accept-and-revert), NOT a hard
+    /// reject — even with the TTL long expired, the LANDED classification wins over
+    /// orphan recovery, for any submitter. (Pre-#55 this returned an "already
+    /// submitted" error; the accept-and-revert routing replaces that at the lock.)
     #[tokio::test]
-    async fn landed_claim_stays_hard_deduped() {
+    async fn landed_claim_classified_as_landed() {
         let store: std::sync::Arc<dyn crate::store::Store> =
             std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
         let gi = U256::from(77u64);
@@ -2024,12 +2127,14 @@ mod tests {
             .await
             .unwrap();
 
-        let err = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
             .await
-            .expect_err("a LANDED claim must stay rejected even with the TTL expired");
-        assert!(
-            err.to_string().contains("already submitted"),
-            "landed dedup keeps the original rejection: {err:#}"
+            .expect("landed classification must not error");
+        assert_eq!(
+            outcome,
+            ClaimLockOutcome::Landed,
+            "a LANDED gi must classify as Landed (→ accept-and-revert), never a hard reject, \
+             even with the TTL expired"
         );
     }
 
@@ -2306,13 +2411,18 @@ mod tests {
             "accept-and-revert must not publish a second CLAIM to Miden"
         );
 
-        // The claim-lock PRIMITIVE is unchanged: a direct acquire_claim_lock on
-        // a LANDED gi still hard-rejects even with the TTL forced to zero — the
-        // LANDED check wins over orphan recovery, regardless of submitter.
-        let err = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+        // The claim-lock classification: a direct acquire_claim_lock on a LANDED
+        // gi returns `Landed` even with the TTL forced to zero — the LANDED check
+        // wins over orphan recovery, regardless of submitter (routes to
+        // accept-and-revert, never a hard reject).
+        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
             .await
-            .expect_err("LANDED must beat TTL-expiry recovery at the lock primitive");
-        assert!(err.to_string().contains("already submitted"));
+            .expect("landed classification must not error");
+        assert_eq!(
+            outcome,
+            ClaimLockOutcome::Landed,
+            "LANDED beats TTL-expiry recovery"
+        );
     }
 
     /// TTL takeover by a DIFFERENT signer — PINS CURRENT (deliberate) BEHAVIOR:
@@ -2869,8 +2979,188 @@ mod tests {
         let _ = shutdown.send(());
     }
 
+    /// BLOCKER 1 (landed-state TOCTOU) — deterministic race, at the lock boundary.
+    ///
+    /// Pre-fix a standalone `has_claim_event` pre-check ran BEFORE the lock: it
+    /// could read "not landed", the real claim could LAND, and `acquire_claim_lock`
+    /// would then hard-reject → the sponsor's nonce is NOT consumed → wedge. The
+    /// fix makes "landed" a TYPED, ATOMIC outcome of `acquire_claim_lock` itself.
+    ///
+    /// This models the exact interleaving deterministically: the same lock record
+    /// classifies `InFlight` while in flight (no ClaimEvent) and flips to `Landed`
+    /// the instant the ClaimEvent is recorded — the landed detection is atomic with
+    /// the lock decision, so there is NO interleaving in which a landed gi is
+    /// hard-rejected.
+    #[tokio::test]
+    async fn blocker1_landed_at_lock_boundary_flips_inflight_to_landed() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let gi = U256::from(0x550au64);
+        // Signer A's claim is IN FLIGHT: locked, NO ClaimEvent yet — the exact state
+        // a pre-check would read as "not landed".
+        store.try_claim(gi).await.expect("A locks gi");
+        assert_eq!(
+            acquire_claim_lock(&store, gi, claim_resubmit_ttl())
+                .await
+                .expect("classify must not error"),
+            ClaimLockOutcome::InFlight,
+            "in flight (no ClaimEvent) → InFlight — a pre-check here would read 'not landed'"
+        );
+
+        // The racing interleaving: A's claim LANDS (ClaimEvent recorded) in the
+        // window a pre-check-then-lock design would have left open.
+        store
+            .commit_manual_claim_event_atomic(
+                "toctou-note".into(),
+                "0x00000000000000000000000000000000000000aa",
+                5,
+                [0u8; 32],
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+                gi.to_be_bytes::<32>(),
+                0,
+                &[0u8; 20],
+                &[0u8; 20],
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        // The SAME lock call now classifies `Landed` — routed to accept-and-revert,
+        // NEVER a hard reject. The TOCTOU window is closed.
+        assert_eq!(
+            acquire_claim_lock(&store, gi, claim_resubmit_ttl())
+                .await
+                .expect("classify must not error"),
+            ClaimLockOutcome::Landed,
+            "once landed, the lock classifies Landed (→ accept-and-revert), never hard-reject"
+        );
+    }
+
+    /// BLOCKER 1 — end-to-end: a landed-at-lock-boundary claim from a DIFFERENT
+    /// signer goes through the FULL RPC path and is accept-and-reverted (nonce
+    /// consumed, reverted receipt), never hard-rejected — no nonce desync.
+    #[tokio::test]
+    async fn blocker1_landed_at_lock_boundary_accept_and_reverts_e2e() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        seed_zero_ger(&store).await;
+        let gi = U256::from(0x550bu64);
+        // The landed state (locked + ClaimEvent) is present before B's submission
+        // classifies it — i.e. A's claim has LANDED by the time B reaches the lock.
+        land_claim_for(&store, gi).await;
+
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        let accepted = service_send_raw_txn(service.clone(), input_b)
+            .await
+            .expect("landed-at-lock-boundary must accept-and-revert, not hard-reject");
+        assert_eq!(accepted, tx_b);
+        assert_eq!(
+            store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(),
+            1,
+            "nonce consumed — no desync (the wedge is unreachable)"
+        );
+        let (result, _blk) = store
+            .txn_receipt(tx_b)
+            .await
+            .unwrap()
+            .expect("reverted receipt written");
+        assert!(result.is_err(), "status 0x0 reverted");
+    }
+
+    /// BLOCKER 2 (sync-path crash/error atomicity) — deterministic crash-boundary.
+    ///
+    /// On the sync accept path the durable receipt write and the per-signer
+    /// `nonce_increment` are separate steps; a crash BETWEEN them leaves the tx
+    /// KNOWN (receipt persisted) but the nonce STALE. We simulate exactly that
+    /// durable state (persist the reverted receipt WITHOUT advancing the nonce),
+    /// then rebroadcast the same tx: the RD-940 same-hash dedup path REPAIRS the
+    /// nonce (advances it, completing the interrupted accept), and the signer's
+    /// NEXT tx (nonce+1) then passes R4 — the sponsor is NOT left wedged.
+    #[tokio::test]
+    async fn blocker2_crash_gap_rebroadcast_repairs_stale_nonce() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        seed_zero_ger(&store).await;
+
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        let signer_str = format!("{addr_b:#x}");
+        let gi = U256::from(0x550cu64);
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        // Reconstruct the envelope and persist the reverted receipt for B's tx at
+        // nonce 0 WITHOUT advancing the nonce — the exact durable state a crash in
+        // the record→nonce_increment gap leaves.
+        let payload = crate::hex::hex_decode_prefixed(&input_b).unwrap();
+        let mut slice = payload.as_slice();
+        let env = TxEnvelope::decode_2718(&mut slice).unwrap();
+        record_local_immediate_reverted(
+            &service,
+            tx_b,
+            env,
+            addr_b,
+            "simulated crash-gap reverted receipt".into(),
+        )
+        .await
+        .unwrap();
+        // Precondition: tx KNOWN, nonce STALE at 0.
+        assert!(
+            store.txn_get(tx_b).await.unwrap().is_some(),
+            "receipt persisted"
+        );
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "nonce not yet advanced"
+        );
+
+        // REBROADCAST the same tx → dedup path detects expected(0) == tx.nonce(0)
+        // and repairs the nonce.
+        let res = service_send_raw_txn(service.clone(), input_b.clone())
+            .await
+            .expect("rebroadcast returns the known hash");
+        assert_eq!(res, tx_b);
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            1,
+            "crash-gap nonce REPAIRED on rebroadcast — the interrupted accept completed"
+        );
+
+        // Idempotent: a further rebroadcast does NOT advance again (expected 1 != 0).
+        service_send_raw_txn(service.clone(), input_b)
+            .await
+            .expect("second rebroadcast still Ok");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            1,
+            "repair is idempotent — no double advance"
+        );
+
+        // The signer's NEXT tx (nonce 1) now passes R4 — NOT wedged. Use an
+        // unresolvable destination so it completes synchronously (RD-860 swallow).
+        let calldata_next = claim_calldata(
+            U256::from(0x550du64),
+            Address::from([0x99u8; 20]),
+            U256::from(1u64),
+        );
+        let (input_next, _) = encode_tx_signed_with_nonce(&key_b, calldata_next, 1);
+        service_send_raw_txn(service, input_next)
+            .await
+            .expect("next tx at nonce 1 must be accepted — the sponsor is not wedged");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "sequence stays in lockstep after crash-gap recovery"
+        );
+    }
+
     /// No double-submit race: a record YOUNGER than the TTL (a submission genuinely in
-    /// flight) keeps rejecting resubmissions even though no ClaimEvent exists yet.
+    /// flight, no ClaimEvent yet) classifies as `InFlight` — the caller hard-rejects.
     #[tokio::test]
     async fn in_flight_claim_within_ttl_still_rejected() {
         let store: std::sync::Arc<dyn crate::store::Store> =
@@ -2878,12 +3168,13 @@ mod tests {
         let gi = U256::from(88u64);
         store.try_claim(gi).await.unwrap();
 
-        let err = acquire_claim_lock(&store, gi, std::time::Duration::from_secs(3600))
+        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::from_secs(3600))
             .await
-            .expect_err("an in-flight record (younger than the TTL) must keep rejecting");
-        assert!(
-            err.to_string().contains("already submitted"),
-            "in-flight dedup keeps the original rejection: {err:#}"
+            .expect("in-flight classification must not error");
+        assert_eq!(
+            outcome,
+            ClaimLockOutcome::InFlight,
+            "an in-flight record (younger than the TTL, no ClaimEvent) must classify InFlight"
         );
         assert!(store.is_claimed(&gi).await.unwrap(), "lock stays held");
     }

@@ -79,6 +79,15 @@ pub fn init_metrics() {
          nonce sequence was kept in lockstep (autoclaim NOT wedged). A steady climb means heavy \
          claim front-running, not a bug."
     );
+    describe_counter!(
+        "rpc_nonce_repaired_after_commit_gap_total",
+        "#55 BLOCKER-2 crash-gap repair: on a same-hash rebroadcast, the signer's expected \
+         nonce was still equal to the known tx's nonce — meaning the tx's durable receipt was \
+         persisted but its nonce advance was lost to a crash BETWEEN the two on the sync accept \
+         path — so the nonce was advanced to complete the interrupted accept. Nonzero after a \
+         crash in the receipt→nonce window is the recovery WORKING (the signer is NOT wedged); a \
+         steady climb without restarts would signal a store that is losing nonce writes."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",
