@@ -244,6 +244,12 @@ pub fn init_metrics() {
          (crash recovery or foreign-CLAIM observation)."
     );
     describe_counter!(
+        "synthetic_claim_calldata_finalized_pending_total",
+        "synthesized-claim calldata rows found PENDING (txn_begin ran, txn_commit did not — a \
+         crash between them) and finalized by a later persist pass, rather than being stranded \
+         pending forever (review blocker 3)."
+    );
+    describe_counter!(
         "restore_b2agg_authoritative_attributed_total",
         "restore Phase 2 (task #56): consumed B2AGG notes whose consumer the LOCAL store did \
          not know (consumer_account=None — NTX-consumed, the normal bridge path, observed \

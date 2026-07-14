@@ -250,17 +250,29 @@ pub struct TxnData {
 }
 
 impl TxnData {
-    /// Build an `alloy::rpc::types::Transaction` for JSON-RPC responses.
+    /// Build the `eth_getTransactionByHash` JSON for a stored tx. Returns a
+    /// `serde_json::Value` (not the raw `alloy::rpc::types::Transaction`) so the `hash`
+    /// field can be pinned to the STORE KEY.
+    ///
+    /// Why pin the hash (review blocker 4): a client that fetched by hash `H` MUST get back
+    /// `.hash == H`. For a real `eth_sendRawTransaction` tx the key equals the envelope's
+    /// RLP hash, so this is a no-op. But a SYNTHESIZED claim tx is stored under its DERIVED
+    /// hash (`keccak(tag || note_id)`, NOT an RLP hash) while PG persists only the
+    /// EIP-2718/RLP bytes — so after a round-trip `txn_get` decodes the envelope and its
+    /// hash is RECOMPUTED as the RLP hash, which differs from the derived key. Serializing
+    /// the envelope's hash would return an object whose `.hash` mismatches what aggkit
+    /// asked for. Re-asserting the key as `.hash` here makes the lookup identity hold
+    /// across the PG round-trip.
     pub fn to_rpc_transaction(
         &self,
-        _tx_hash: TxHash,
+        tx_hash: TxHash,
         block_state: &BlockState,
-    ) -> alloy::rpc::types::Transaction {
+    ) -> serde_json::Value {
         use alloy::consensus::transaction::Recovered;
         use alloy::primitives::B256;
 
         let is_confirmed = self.result.is_some();
-        alloy::rpc::types::Transaction {
+        let txn = alloy::rpc::types::Transaction {
             inner: Recovered::new_unchecked(self.envelope.clone(), self.signer),
             block_hash: if is_confirmed {
                 Some(B256::from(block_state.get_block_hash(self.block_num)))
@@ -274,7 +286,15 @@ impl TxnData {
             },
             transaction_index: if is_confirmed { Some(0) } else { None },
             effective_gas_price: Some(0),
+        };
+        let mut value = serde_json::to_value(&txn).unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "hash".to_string(),
+                serde_json::Value::String(format!("{tx_hash:#x}")),
+            );
         }
+        value
     }
 }
 

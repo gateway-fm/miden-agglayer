@@ -538,6 +538,19 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?
             {
+                // Observability + e2e gate (review blocker 2): log the EXACT hash served from
+                // the durable store. A persisted synthesized-claim tx is served here (the
+                // store-first branch), NOT via the `found synthetic tx` log-reconstruction
+                // fallback below — so this is the only positive, hash-exact proof that aggkit
+                // fetched THIS derived-hash claim's calldata.
+                let input_len = {
+                    use alloy::consensus::Transaction;
+                    data.envelope.input().len()
+                };
+                tracing::info!(
+                    "eth_getTransactionByHash: served stored tx {} (input_len={input_len})",
+                    format!("{txn_hash:#x}")
+                );
                 let txn = data.to_rpc_transaction(txn_hash, &service.block_state);
                 return Ok(JsonRpcResponse::success(answer_id, txn));
             }

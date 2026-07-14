@@ -766,6 +766,73 @@ pub(crate) fn attribute_bridge_consumption(
     ))
 }
 
+/// The restore attribution JOIN (pure + testable — the production path, not a bypass): pair
+/// every consumed record with the record to project, preserving authoritative NoteId
+/// identity through metadata loss.
+///
+/// Identity-through-the-join invariants (review blocker 1):
+///   * Only consumer-UNKNOWN records are attribution candidates. A record whose consumer
+///     the local store DOES know — a reclaim `Some(sender)` or a locally-executed
+///     `Some(bridge)` — passes through UNCHANGED and NEVER consumes an authoritative slot,
+///     so it can't starve the real bridge record that shares its details commitment
+///     (the reclaim-first bug: a reclaim iterated first used to pop and discard the id).
+///   * A details commitment maps to a QUEUE of the authoritative bridge-consumed NoteIds
+///     with that commitment (deterministic order); each consumer-unknown record pops one.
+///     N on-chain leaves with a commitment therefore attribute exactly N records, and a
+///     candidate with no remaining slot is left unattributed → `project_b2agg_note` skips
+///     it fail-closed (MA#3 UntrackedConsumer). Same-commitment notes are byte-identical
+///     (commitment == recipient+assets), so WHICH record pops WHICH id is immaterial: the
+///     emitted SET is exactly the on-chain leaf set, one event per authoritative slot.
+///     A foreign record can only pop a slot if its commitment equals a real bridge
+///     consumption's — i.e. it IS that note — so it can never spuriously emit.
+pub(crate) fn attribute_consumed_records(
+    records: &[InputNoteRecord],
+    bridge_id: AccountId,
+    attribution: &BridgePositionMap,
+) -> Vec<InputNoteRecord> {
+    let mut ids_by_commitment: std::collections::HashMap<
+        [u8; 32],
+        Vec<miden_protocol::note::NoteId>,
+    > = std::collections::HashMap::new();
+    for (id, (commitment, _, _, _)) in attribution {
+        ids_by_commitment.entry(*commitment).or_default().push(*id);
+    }
+    for ids in ids_by_commitment.values_mut() {
+        ids.sort_by_key(|i| i.as_bytes());
+        ids.reverse(); // pop() takes the smallest first (deterministic assignment)
+    }
+    records
+        .iter()
+        .map(|n| {
+            // Known consumer → pass through, never touch the queue.
+            if n.consumer_account().is_some() {
+                return n.clone();
+            }
+            let unique_id = ids_by_commitment
+                .get_mut(&n.details_commitment().as_bytes())
+                .and_then(|q| q.pop());
+            match attribute_bridge_consumption(n, unique_id, bridge_id, attribution) {
+                Some(rebuilt) => {
+                    ::metrics::counter!("restore_b2agg_authoritative_attributed_total")
+                        .increment(1);
+                    tracing::info!(
+                        note_id = ?unique_id,
+                        block = rebuilt
+                            .state()
+                            .consumed_block_height()
+                            .map(|h| h.as_u64())
+                            .unwrap_or_default(),
+                        "restore: NTX-consumed note attributed to the bridge via \
+                         sync_transactions (local store had consumer_account=None)"
+                    );
+                    rebuilt
+                }
+                None => n.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet `faucet_registry` rows
 /// from the bridge's authoritative `faucet_metadata_map`.
 ///
@@ -938,61 +1005,15 @@ async fn restore_bridge_outs(
                 let mut count = 0usize;
                 let mut logs = 0usize;
 
-                // Authoritative consumer attribution (task #56): a note the LOCAL store
-                // reports with `consumer_account = None` (NTX-consumed — the NORMAL
-                // bridge consumption path — observed after a store rebuild/resync) is
-                // rebuilt with `Some(bridge)` + the authoritative (block, tx_order) when
-                // the bridge's on-chain transaction feed proves the bridge consumed it.
-                // Notes with a known consumer, and notes NOT in the bridge feed, pass
-                // through unchanged — the MA#3 gate below is untouched.
-                // Resolve each consumed record's UNIQUE NoteId from the attribution map.
-                // A consumed local-store record has lost its id (metadata gone), so the join
-                // is by details commitment — and because distinct notes CAN share one, each
-                // commitment keeps a QUEUE of candidate ids (sorted for determinism) that
-                // every matching record pops from: same-commitment siblings resolve to
-                // DISTINCT ids, so no note is cross-attributed or collapsed.
-                let mut ids_by_commitment: std::collections::HashMap<
-                    [u8; 32],
-                    Vec<miden_protocol::note::NoteId>,
-                > = std::collections::HashMap::new();
-                for (id, (commitment, _, _, _)) in &bridge_attribution {
-                    ids_by_commitment.entry(*commitment).or_default().push(*id);
-                }
-                for ids in ids_by_commitment.values_mut() {
-                    ids.sort_by_key(|i| i.as_bytes());
-                    ids.reverse(); // pop() takes the smallest first
-                }
-                let consumed_notes: Vec<InputNoteRecord> = consumed_notes
-                    .iter()
-                    .map(|n| {
-                        let unique_id = ids_by_commitment
-                            .get_mut(&n.details_commitment().as_bytes())
-                            .and_then(|q| q.pop());
-                        match attribute_bridge_consumption(
-                            n,
-                            unique_id,
-                            bridge_id,
-                            &bridge_attribution,
-                        ) {
-                            Some(rebuilt) => {
-                                ::metrics::counter!("restore_b2agg_authoritative_attributed_total")
-                                    .increment(1);
-                                tracing::info!(
-                                    note_id = ?unique_id,
-                                    block = rebuilt
-                                        .state()
-                                        .consumed_block_height()
-                                        .map(|h| h.as_u64())
-                                        .unwrap_or_default(),
-                                    "restore: NTX-consumed note attributed to the bridge via \
-                                     sync_transactions (local store had consumer_account=None)"
-                                );
-                                rebuilt
-                            }
-                            None => n.clone(),
-                        }
-                    })
-                    .collect();
+                // Authoritative consumer attribution (task #56 + review blocker 1): a
+                // note the LOCAL store reports with `consumer_account = None` (NTX-consumed,
+                // the NORMAL bridge path, observed after a store rebuild/resync) is rebuilt
+                // with `Some(bridge)` + the authoritative (block, tx_order) IFF the bridge's
+                // on-chain tx feed proves it. Identity is preserved through the join (only
+                // consumer-unknown records are candidates; per-commitment queue assignment;
+                // fail-closed on ambiguity) — see `attribute_consumed_records`.
+                let consumed_notes: Vec<InputNoteRecord> =
+                    attribute_consumed_records(&consumed_notes, bridge_id, &bridge_attribution);
 
                 // Miden-1:1: replay each B2AGG note at its OWN Miden consumption
                 // block, in the projector's canonical (block, tx_order, note_id)
@@ -1463,10 +1484,30 @@ pub(crate) async fn persist_synthetic_claim_tx(
     let tx_hash: TxHash = tx_hash_str
         .parse()
         .map_err(|e| anyhow::anyhow!("derived claim tx hash {tx_hash_str}: {e}"))?;
-    // Idempotent: synthesis re-runs (restore replay, projector re-observation) and the
-    // live backfill all funnel here; the first persisted record wins.
-    if store.txn_get(tx_hash).await?.is_some() {
-        return Ok(true);
+    // Idempotent AND crash-safe (review blocker 3): synthesis re-runs (restore replay,
+    // projector re-observation) and the live backfill all funnel here.
+    //   * A fully-COMMITTED row (result present) → done, first writer won.
+    //   * A PENDING row (txn_begin ran, txn_commit did not — a crash BETWEEN them) must be
+    //     FINALIZED, not treated as complete: the old `is_some()` short-circuit stranded it
+    //     pending forever (no block/receipt), so every later backfill saw the row and
+    //     skipped. The envelope (with calldata) is already persisted, so we only need the
+    //     commit. txn_commit is idempotent on a re-run.
+    match store.txn_get(tx_hash).await? {
+        Some(data) if data.result.is_some() => return Ok(true),
+        Some(_) => {
+            store
+                .txn_commit(tx_hash, Ok(()), block_number, block_hash)
+                .await?;
+            ::metrics::counter!("synthetic_claim_calldata_finalized_pending_total").increment(1);
+            tracing::info!(
+                note_id = %note_id_str,
+                tx_hash = %tx_hash_str,
+                "synthesized claim: finalized a PENDING calldata row (crash between begin and \
+                 commit) rather than stranding it"
+            );
+            return Ok(true);
+        }
+        None => {}
     }
 
     let full = parse_full_claim_from_storage(note_storage)?;
@@ -2514,6 +2555,37 @@ mod tests {
     /// STATE), so only `faucet_id` and `consumer` matter here. The asset is
     /// present so restore's emit path is actually reached when the gate is
     /// absent — i.e. the RED test fails on the missing gate, not a no-asset skip.
+    /// Like [`ma3_b2agg_input_note`] but with a caller-chosen asset amount, so a test can
+    /// build notes with DISTINCT details commitments (distinct amount → distinct asset
+    /// commitment). Used by the production-path attribution regressions.
+    fn ma3_b2agg_note_amount(
+        faucet_id: AccountId,
+        consumer: Option<AccountId>,
+        amount: u64,
+    ) -> InputNoteRecord {
+        use miden_base_agglayer::B2AggNote;
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::asset::{Asset, FungibleAsset};
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{
+            NoteAssets, NoteAttachments, NoteDetails, NoteRecipient, NoteStorage,
+        };
+        use miden_protocol::{Felt, Word};
+
+        let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
+        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
+        let asset: Asset = FungibleAsset::new(faucet_id, amount).unwrap().into();
+        let assets = NoteAssets::new(vec![asset]).unwrap();
+        let details = NoteDetails::new(assets, recipient);
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(0u32),
+            consumer_account: consumer,
+            consumed_tx_order: None,
+        });
+        InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
     fn ma3_b2agg_input_note(faucet_id: AccountId, consumer: Option<AccountId>) -> InputNoteRecord {
         use miden_base_agglayer::B2AggNote;
         use miden_client::store::InputNoteState;
@@ -3717,6 +3789,82 @@ mod tests {
         );
     }
 
+    /// Review blocker 3 — CRASH IDEMPOTENCY: a crash BETWEEN txn_begin and txn_commit leaves
+    /// a PENDING calldata row. The old `if txn_get(...).is_some()` short-circuit treated it
+    /// as complete, so every later backfill skipped it and the tx was stranded pending
+    /// forever (no block, no receipt). A later persist pass must FINALIZE the pending row.
+    #[tokio::test]
+    async fn persist_synthetic_claim_tx_finalizes_pending_after_crash() {
+        use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
+        use alloy::primitives::{Address, Signature, TxKind, U256};
+
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let storage = full_claim_fixture(&[]); // empty metadata → truthful by hash
+        let note_id = "crash-window";
+        let derived = derive_manual_claim_tx_hash(note_id);
+        let tx_hash: alloy::primitives::TxHash = derived.parse().unwrap();
+
+        // Simulate the crash: txn_begin ran (full calldata envelope persisted under the
+        // derived hash) but txn_commit did not — a PENDING row with no block/receipt.
+        let full = parse_full_claim_from_storage(&storage).unwrap();
+        let input =
+            alloy_core::sol_types::SolCall::abi_encode(&build_claim_asset_call(&full, vec![]));
+        let bridge_addr: Address = get_bridge_address().parse().unwrap();
+        let tx = TxLegacy {
+            chain_id: None,
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 0,
+            to: TxKind::Call(bridge_addr),
+            value: U256::ZERO,
+            input: input.into(),
+        };
+        let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            tx,
+            Signature::new(U256::from(1), U256::from(1), false),
+            tx_hash,
+        ));
+        store
+            .txn_begin(
+                tx_hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: bridge_addr,
+                    expires_at: None,
+                    logs: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_none(),
+            "pending: begin ran, commit did not — no receipt yet"
+        );
+
+        // A later persist pass FINALIZES the pending row (does not skip it).
+        let ok = persist_synthetic_claim_tx(&store, &storage, note_id, &derived, 8831, [0xAA; 32])
+            .await
+            .unwrap();
+        assert!(ok);
+        let (result, block) = store
+            .txn_receipt(tx_hash)
+            .await
+            .unwrap()
+            .expect("the pending row must now be COMMITTED (finalized), not stranded");
+        assert!(result.is_ok());
+        assert_eq!(block, 8831, "finalized at the ClaimEvent block");
+
+        // The calldata is intact and still keyed under the derived hash.
+        use alloy::consensus::Transaction;
+        use alloy_core::sol_types::SolCall;
+        let data = store.txn_get(tx_hash).await.unwrap().unwrap();
+        assert!(
+            crate::claim::claimAssetCall::abi_decode(data.envelope.input()).is_ok(),
+            "the pending row's full claimAsset calldata survived finalization"
+        );
+    }
+
     /// Review req 5 — stored envelopes precede the synthetic fallback. Both records exist
     /// for the SAME derived hash (the persisted full-calldata envelope AND the ClaimEvent
     /// synthetic log); `eth_getTransactionByHash` serves branches in order `txn_get` →
@@ -3974,6 +4122,121 @@ mod tests {
             )
             .is_none(),
             "attribution is keyed by unique id, not the shared commitment"
+        );
+    }
+
+    // ── Production-path regressions (review blocker 1): drive attribute_consumed_records,
+    //    the SAME join restore_bridge_outs runs — not attribute_bridge_consumption directly.
+
+    /// RECLAIM-FIRST: a reclaim (consumer=Some(sender)) shares a commitment with the real
+    /// bridge consumption (consumer=None). Pre-fix, iterating the reclaim first POPPED and
+    /// discarded the id, leaving the real bridge record unattributed → lost BridgeEvent.
+    /// A consumer-known record must NEVER consume a slot; the bridge record gets it.
+    #[tokio::test]
+    async fn attribute_join_reclaim_first_does_not_starve_bridge_record() {
+        let (faucet_id, bridge_id, sender_id) = ma3_accounts();
+        // Same amount → SAME commitment for both.
+        let reclaim = ma3_b2agg_note_amount(faucet_id, Some(sender_id), 50);
+        let bridge = ma3_b2agg_note_amount(faucet_id, None, 50);
+        let commitment: [u8; 32] = bridge.details_commitment().as_bytes();
+        assert_eq!(reclaim.details_commitment().as_bytes(), commitment);
+
+        // ONE authoritative bridge entry for that commitment.
+        let attribution: BridgePositionMap =
+            std::collections::HashMap::from([(test_note_id(1), (commitment, 7u64, 0u32, 0u32))]);
+
+        // Reclaim iterated FIRST.
+        let out = attribute_consumed_records(&[reclaim, bridge], bridge_id, &attribution);
+        assert_eq!(out.len(), 2);
+        // out[0] = the reclaim, unchanged (still its sender consumer, NOT the bridge).
+        assert_eq!(out[0].consumer_account(), Some(sender_id));
+        // out[1] = the real bridge record, ATTRIBUTED (it got the slot the reclaim did not steal).
+        assert_eq!(out[1].consumer_account(), Some(bridge_id));
+        assert_eq!(
+            out[1].state().consumed_block_height().map(|h| h.as_u64()),
+            Some(7)
+        );
+    }
+
+    /// FOREIGN-FIRST: a consumer-unknown record whose commitment is NOT in the bridge feed
+    /// (a genuine non-bridge consumption) must never receive the bridge id — even iterated
+    /// before the real bridge record with a DIFFERENT commitment.
+    #[tokio::test]
+    async fn attribute_join_foreign_first_never_receives_bridge_id() {
+        let (faucet_id, bridge_id, _sender) = ma3_accounts();
+        // Distinct commitments (distinct amounts): foreign is NOT bridge-consumed.
+        let foreign = ma3_b2agg_note_amount(faucet_id, None, 11);
+        let bridge = ma3_b2agg_note_amount(faucet_id, None, 22);
+        let foreign_c: [u8; 32] = foreign.details_commitment().as_bytes();
+        let bridge_c: [u8; 32] = bridge.details_commitment().as_bytes();
+        assert_ne!(foreign_c, bridge_c);
+
+        // Only the bridge note is in the feed.
+        let attribution: BridgePositionMap =
+            std::collections::HashMap::from([(test_note_id(2), (bridge_c, 9u64, 1u32, 0u32))]);
+
+        let out = attribute_consumed_records(&[foreign, bridge], bridge_id, &attribution);
+        assert_eq!(out.len(), 2);
+        // Foreign (no feed entry) → unchanged, consumer still None → project skips it.
+        assert_eq!(out[0].consumer_account(), None);
+        // Bridge note → attributed with its own authoritative (block, order).
+        assert_eq!(out[1].consumer_account(), Some(bridge_id));
+        assert_eq!(
+            out[1].state().consumed_tx_order(),
+            Some(1),
+            "bridge record keeps its own authoritative order"
+        );
+    }
+
+    /// SAME-COMMITMENT SIBLINGS: two consumer-unknown records sharing a commitment with TWO
+    /// authoritative leaves → BOTH attributed with DISTINCT (order) slots; the emitted set
+    /// is exactly the on-chain leaf set (one per slot), regardless of assignment.
+    #[tokio::test]
+    async fn attribute_join_same_commitment_siblings_both_attributed() {
+        let (faucet_id, bridge_id, _sender) = ma3_accounts();
+        let a = ma3_b2agg_note_amount(faucet_id, None, 50);
+        let b = ma3_b2agg_note_amount(faucet_id, None, 50);
+        let commitment: [u8; 32] = a.details_commitment().as_bytes();
+        assert_eq!(b.details_commitment().as_bytes(), commitment);
+
+        let attribution: BridgePositionMap = std::collections::HashMap::from([
+            (test_note_id(3), (commitment, 100u64, 0u32, 0u32)),
+            (test_note_id(4), (commitment, 100u64, 1u32, 0u32)),
+        ]);
+
+        let out = attribute_consumed_records(&[a, b], bridge_id, &attribution);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|r| r.consumer_account() == Some(bridge_id)));
+        // Both authoritative orders (0 and 1) are present exactly once across the two.
+        let mut orders: Vec<u32> = out
+            .iter()
+            .filter_map(|r| r.state().consumed_tx_order())
+            .collect();
+        orders.sort_unstable();
+        assert_eq!(
+            orders,
+            vec![0, 1],
+            "each leaf's distinct order slot is assigned once"
+        );
+
+        // A THIRD sibling with no remaining slot → unattributed (fail-closed skip).
+        let c = ma3_b2agg_note_amount(faucet_id, None, 50);
+        let out3 = attribute_consumed_records(
+            &[
+                ma3_b2agg_note_amount(faucet_id, None, 50),
+                ma3_b2agg_note_amount(faucet_id, None, 50),
+                c,
+            ],
+            bridge_id,
+            &attribution,
+        );
+        let attributed = out3
+            .iter()
+            .filter(|r| r.consumer_account() == Some(bridge_id))
+            .count();
+        assert_eq!(
+            attributed, 2,
+            "exactly N leaves attribute N records; the excess is skipped"
         );
     }
 }

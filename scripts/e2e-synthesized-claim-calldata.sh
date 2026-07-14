@@ -231,6 +231,17 @@ wait_for "aggkit re-PROCESSED the exact claim block ${CLAIM_BLOCK} from the rese
     "$AGGKIT_SYNC_TIMEOUT" 5
 pass "aggkit reset to block 0 and re-processed the exact claim block ${CLAIM_BLOCK} — no stale cursor"
 
+# (a2) EXACT-HASH FETCH (hard, positive, schema-free): re-processing block ${CLAIM_BLOCK}
+# from the reset, aggkit MUST fetch THIS claim's calldata by its derived hash. The proxy
+# logs every stored tx it serves by exact hash; the #136 fix serves the persisted claim from
+# the durable store (the 'served stored tx <hash>' branch). Assert OUR derived hash appears —
+# a reset aggkit that skipped the claim would never request it, so this can't false-pass.
+DERIVED_HASH_LC=$(echo "$DERIVED_HASH" | tr '[:upper:]' '[:lower:]')
+wait_for "proxy served the EXACT derived-hash claim tx to aggkit (${DERIVED_HASH_LC:0:18}…)" \
+    "docker logs --since $AGGKIT_START $PROXY_CONTAINER 2>&1 | strip_ansi | grep -iF 'served stored tx' | grep -iqF '$DERIVED_HASH_LC'" \
+    "$AGGKIT_SYNC_TIMEOUT" 5
+pass "aggkit fetched the EXACT derived-hash detailed claim (${DERIVED_HASH_LC:0:18}…) from the durable store"
+
 # (b) PERSIST PROOF: from the reset state, aggkit must re-process PAST the claim block —
 # meaning it parsed the derived-hash calldata and PERSISTED the claim (on the pre-fix
 # build it wedges at ${CLAIM_BLOCK} on 'input too short' and never advances).
@@ -238,22 +249,37 @@ wait_for "aggkit L2BridgeSyncer re-processed PAST claim block ${CLAIM_BLOCK}" \
     "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep -oE 'L2BridgeSyncer.*block[ =:]+[0-9]+' | grep -oE '[0-9]+$' | sort -n | tail -1 | awk '{exit !(\$1 > ${CLAIM_BLOCK})}'" \
     "$AGGKIT_SYNC_TIMEOUT" 10
 
-# (b2) Best-effort bridgesync DB probe (extra positive persist evidence when the aggkit
-# image ships sqlite3): the claim's global_index must appear in a bridgesync table. Skips
-# with a note if the DB/tooling layout differs — the fetch + re-sync gates above are the
-# hard proof.
+# (b2) DURABLE CLAIM ROW — HARD gate (review blocker 2: the probe must not merely warn).
+# The claim aggkit parsed from the derived-hash calldata must be PERSISTED in its bridgesync
+# DB. We locate the claim table schema-tolerantly (sqlite_master), then require the claim's
+# global_index (decimal, 0x-hex, or bare-hex form) to be present. Only a genuine absence of
+# sqlite3/DB in the image degrades to a skip; a discoverable claim table WITHOUT the row is
+# a hard FAIL — the exact-hash fetch (a2) is proven above, so a missing persist is a real bug.
 GI_DEC=$(cast to-dec "0x${GI_HEX}" 2>/dev/null || echo "")
-DBF=$(docker exec "$AGGKIT_CONTAINER" sh -c 'ls /tmp/*.sqlite* /tmp/*bridge*l2* 2>/dev/null | head -1' 2>/dev/null || true)
-if [[ -n "$DBF" ]] && docker exec "$AGGKIT_CONTAINER" sh -c 'command -v sqlite3' >/dev/null 2>&1 && [[ -n "$GI_DEC" ]]; then
-    HITS=$(docker exec "$AGGKIT_CONTAINER" sh -c \
-        "sqlite3 '$DBF' \"SELECT count(*) FROM claim WHERE global_index='$GI_DEC';\"" 2>/dev/null || echo "0")
-    if [[ "${HITS:-0}" -ge 1 ]]; then
-        pass "bridgesync DB persisted the claim (global_index=$GI_DEC present in $DBF)"
+if docker exec "$AGGKIT_CONTAINER" sh -c 'command -v sqlite3' >/dev/null 2>&1; then
+    CLAIM_ROW_FOUND=0
+    CLAIM_TABLE_SEEN=0
+    for DBF in $(docker exec "$AGGKIT_CONTAINER" sh -c 'ls /tmp/*.sqlite* /tmp/*.db 2>/dev/null' 2>/dev/null); do
+        # Any table whose name mentions "claim".
+        for T in $(docker exec "$AGGKIT_CONTAINER" sh -c \
+            "sqlite3 '$DBF' \"SELECT name FROM sqlite_master WHERE type='table' AND lower(name) LIKE '%claim%';\"" 2>/dev/null); do
+            CLAIM_TABLE_SEEN=1
+            # Dump the table and look for the gi in any of its textual/blob forms.
+            DUMP=$(docker exec "$AGGKIT_CONTAINER" sh -c "sqlite3 '$DBF' '.dump $T'" 2>/dev/null || true)
+            if [[ -n "$GI_DEC" ]] && grep -qiE "(^|[^0-9])${GI_DEC}([^0-9]|\$)" <<<"$DUMP"; then CLAIM_ROW_FOUND=1; fi
+            grep -qiF "${GI_HEX}" <<<"$DUMP" && CLAIM_ROW_FOUND=1
+            grep -qiF "0x${GI_HEX}" <<<"$DUMP" && CLAIM_ROW_FOUND=1
+        done
+    done
+    if [[ "$CLAIM_TABLE_SEEN" -eq 1 ]]; then
+        [[ "$CLAIM_ROW_FOUND" -eq 1 ]] \
+            || fail "bridgesync DB has a claim table but NO durable row for the recovered claim (gi=0x${GI_HEX}) — persist gate failed"
+        pass "bridgesync DB durably persisted the recovered claim (gi=0x${GI_HEX:0:16}…)"
     else
-        warn "bridgesync DB probe found no claim row for global_index=$GI_DEC in $DBF (schema may differ); relying on the fetch + re-sync gates"
+        warn "no claim table found in aggkit /tmp DBs (schema differs); exact-hash fetch (a2) + re-sync gates are the hard proof"
     fi
 else
-    warn "bridgesync DB probe skipped (no sqlite3/db in aggkit image); fetch + re-sync gates are the hard proof"
+    warn "durable-claim-row probe skipped (no sqlite3 in aggkit image); exact-hash fetch (a2) + re-sync gates are the hard proof"
 fi
 
 # (c) ZERO calldata-parse failures — now MEANINGFUL because aggkit genuinely re-parsed.
@@ -263,11 +289,14 @@ if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
 fi
 pass "aggkit re-synced past block ${CLAIM_BLOCK} (claim persisted) with zero parse errors"
 
-# (c) certificate pipeline alive THROUGH the recovered claim's window. A settled cert
-# needs something to certify: with no new bridge activity aggsender (correctly) builds
-# nothing and any wait here times out against a healthy stack. So drive one real
-# Miden→L1 bridge-out; aggsender must then build a NEW certificate over the window
-# containing the derived-hash claim and settle it with a non-empty exit root.
+# (d) CERTIFICATE PIPELINE liveness THROUGH the recovered claim's window. The recovered
+# claim is an IMPORTED exit (an L1->L2 claim), tracked in aggkit's bridgesync DB — its
+# durable persistence is the HARD proof above (b2), and its exact-hash fetch is (a2); a
+# ClaimEvent is NOT itself a Local Exit Tree leaf, so the certificate's LocalExitRoot is
+# not expected to encode it. What we assert here is that the pipeline stays LIVE across the
+# claim window: aggsender needs a fresh L2->L1 exit to certify, so drive one bridge-out and
+# require a certificate to settle AFTER the claim was persisted (temporal binding), with
+# zero parse errors throughout — i.e. the recovered claim did not wedge the pipeline.
 step "6b: driving a bridge-out so a fresh certificate must build over the claim window"
 "$SCRIPT_DIR/e2e-l2-to-l1.sh" 2>&1 | strip_ansi | tail -5 \
     | while IFS= read -r line; do echo "  [l2-to-l1] $line"; done
