@@ -117,14 +117,44 @@ assert_reject "full SHA resolves != HEAD"  "RELEASE_REF=$OTHER_SHA_FIX MOCK_SHA_
 assert_reject "tag peels != HEAD"          "RELEASE_REF=v0.15.5 MOCK_TAG_SHA=$OTHER_SHA_FIX; verify_exact_ref"
 assert_reject "git HEAD resolution failure" "RELEASE_REF=$HEAD_SHA_FIX MOCK_HEAD_FAIL=1; verify_exact_ref"
 
-echo "── verify_running_image ───────────────────────────────────────────────"
+echo "── verify_running_image (verifies + echoes id; does NOT tag) ──────────"
 assert_accept "running == built"           'MOCK_RUNNING_ID="sha256:x" MOCK_BUILT_ID="sha256:x"; verify_running_image'
 assert_reject "docker inspect fails"       'MOCK_DOCKER_INSPECT_FAIL=1; verify_running_image'
 assert_reject "running ID empty"           'MOCK_RUNNING_ID=""; verify_running_image'
 assert_reject "docker image inspect fails" 'MOCK_IMG_INSPECT_FAIL=1; verify_running_image'
 assert_reject "built ID empty"             'MOCK_BUILT_ID=""; verify_running_image'
 assert_reject "running != built mismatch"  'MOCK_RUNNING_ID="sha256:a" MOCK_BUILT_ID="sha256:b"; verify_running_image'
-assert_reject "docker tag fails"           'MOCK_DOCKER_TAG_FAIL=1; verify_running_image'
+# verify_running_image must echo the verified id on success (caller captures it).
+assert_accept "echoes verified id"         '[ "$(MOCK_RUNNING_ID=sha256:zz MOCK_BUILT_ID=sha256:zz verify_running_image)" = "sha256:zz" ]'
+
+echo "── tag_release_image (only after every gate passes) ───────────────────"
+assert_accept "tags accepted build"        'RUNNING_ID="sha256:x"; tag_release_image'
+assert_reject "docker tag fails"           'RUNNING_ID="sha256:x" MOCK_DOCKER_TAG_FAIL=1; tag_release_image'
+assert_reject "no verified id to tag"      'RUNNING_ID=""; tag_release_image'
+
+echo "── verify_monitor_evidence (positive evidence + no fail-open) ─────────"
+TDIR="$(mktemp -d)"; trap 'rm -rf "$TDIR"' EXIT
+printf '%s\n' '[12:00:00] completeness watcher up: project=proj' 'OK notes=5 logs=5 cut=40' > "$TDIR/watch.ok"
+printf '%s\n' '[12:00:00] completeness watcher up: project=proj' > "$TDIR/watch.nocycle"
+printf '%s\n' 'OK notes=5 logs=5 cut=40' > "$TDIR/watch.nostart"
+printf '%s\n' '[12:00:00] completeness watcher up: project=proj' 'OK notes=5 logs=5 cut=40' \
+       '[12:01:00] ████ COMPLETENESS VIOLATION DETECTED ████' > "$TDIR/watch.viol"
+printf '%s\n' '════ IMMUTABILITY: polls=7 blocks_tracked=3 resets=0 VIOLATIONS=0 (0=immutable) ════' > "$TDIR/immut.ok"
+printf '%s\n' 'immutability monitor: track ... dur=21600s' > "$TDIR/immut.nosummary"
+printf '%s\n' '════ IMMUTABILITY: polls=0 blocks_tracked=0 resets=0 VIOLATIONS=0 (0=immutable) ════' > "$TDIR/immut.zeropolls"
+printf '%s\n' '════ IMMUTABILITY: polls=7 blocks_tracked=3 resets=0 VIOLATIONS=2 (0=immutable) ════' > "$TDIR/immut.viol"
+: > "$TDIR/empty"
+assert_accept "healthy monitors"           "verify_monitor_evidence $TDIR/watch.ok $TDIR/immut.ok"
+assert_reject "watcher output missing"     "verify_monitor_evidence $TDIR/does-not-exist $TDIR/immut.ok"
+assert_reject "watcher output empty"       "verify_monitor_evidence $TDIR/empty $TDIR/immut.ok"
+assert_reject "immut output missing"       "verify_monitor_evidence $TDIR/watch.ok $TDIR/does-not-exist"
+assert_reject "immut output empty"         "verify_monitor_evidence $TDIR/watch.ok $TDIR/empty"
+assert_reject "watcher never started"      "verify_monitor_evidence $TDIR/watch.nostart $TDIR/immut.ok"
+assert_reject "watcher no diff cycle"      "verify_monitor_evidence $TDIR/watch.nocycle $TDIR/immut.ok"
+assert_reject "immut no summary (crashed)" "verify_monitor_evidence $TDIR/watch.ok $TDIR/immut.nosummary"
+assert_reject "immut polls=0"              "verify_monitor_evidence $TDIR/watch.ok $TDIR/immut.zeropolls"
+assert_reject "watcher violation"          "verify_monitor_evidence $TDIR/watch.viol $TDIR/immut.ok"
+assert_reject "immut violation"            "verify_monitor_evidence $TDIR/watch.ok $TDIR/immut.viol"
 
 echo "───────────────────────────────────────────────────────────────────────"
 if [ "$RC" -eq 0 ]; then echo "ALL GUARD TESTS PASSED"; else echo "GUARD TESTS FAILED"; fi
