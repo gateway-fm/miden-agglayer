@@ -445,7 +445,7 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
             command.l1_evidence_tag
         ));
     };
-    if false && command.require_hardening && tag != EvidenceTag::Finalized {
+    if command.require_hardening && tag != EvidenceTag::Finalized {
         return Err(format!(
             "--require-hardening MANDATES the `finalized` L1 evidence tag, but \
              --l1-evidence-tag (L1_EVIDENCE_TAG) is `{}`. A finalized L1 block cannot be \
