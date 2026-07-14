@@ -395,8 +395,7 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
         // UNREACHABLE http(s) endpoint still passes (it spawns and retries — the
         // intended fail-closed posture).
         let usable_http = rpc.parse::<Url>().ok().is_some_and(|u| {
-            matches!(u.scheme(), "http" | "https")
-                && u.host_str().is_some_and(|h| !h.is_empty())
+            matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
         });
         if !usable_http {
             return Err(format!(

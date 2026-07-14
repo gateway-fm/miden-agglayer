@@ -552,9 +552,18 @@ mod tests {
             .unwrap();
 
         let (env, signer) = h6_test_envelope(tx_hash);
-        let result = insert_ger(ger, &miden_client, accounts, &store, tx_hash, true, env, signer)
-            .await
-            .expect("already-injected GER must be a duplicate no-op, not an H6 refusal");
+        let result = insert_ger(
+            ger,
+            &miden_client,
+            accounts,
+            &store,
+            tx_hash,
+            true,
+            env,
+            signer,
+        )
+        .await
+        .expect("already-injected GER must be a duplicate no-op, not an H6 refusal");
         assert!(
             !result,
             "duplicate injection must return false (no new note)"
@@ -585,8 +594,17 @@ mod tests {
             .unwrap();
 
         let (env, signer) = h6_test_envelope(tx_hash);
-        let result =
-            insert_ger(ger, &miden_client, accounts, &store, tx_hash, true, env, signer).await;
+        let result = insert_ger(
+            ger,
+            &miden_client,
+            accounts,
+            &store,
+            tx_hash,
+            true,
+            env,
+            signer,
+        )
+        .await;
         if let Err(err) = result {
             assert!(
                 !err.to_string().contains("not observed on L1"),
