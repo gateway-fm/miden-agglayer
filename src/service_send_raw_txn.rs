@@ -75,13 +75,45 @@ async fn handle_ger_result(
             let _ = ger_bytes; // kept for backward-compat; unused here.
             tracing::info!("inserted GER with eth txn: {txn_hash}");
             if is_new {
-                // New GER: insert_ger recorded the eth-tx ↔ UpdateGerNote link. Record
-                // ONLY a pending receipt; the SyntheticProjector finalises it (txn_commit)
-                // at the Miden block where it consumes the note — receipt block == GER-log
-                // block. eth_getTransactionReceipt returns null until then (mined-when-
-                // consumed), which aggkit tolerates.
-                record_local_pending_tx(service, txn_hash, txn_envelope, signer, None, vec![])
-                    .await?;
+                // New GER: insert_ger's serialized-client closure
+                // (`ger::record_ger_submission_handoff`) records BOTH the
+                // eth-tx ↔ UpdateGerNote link AND the pending receipt
+                // (txn_begin) behind the projection-exclusion boundary — so
+                // the SyntheticProjector can never resolve a consumed note's
+                // real linked hash to a receipt that was never durably begun
+                // (the review guarantee; pre-fix the pending row was created
+                // out here, AFTER the client was released, and the projector
+                // could tick in that gap, silently finalise zero rows on
+                // PostgreSQL, and the late row then stayed pending forever).
+                // The projector finalises the receipt (txn_commit) at the
+                // Miden block where it consumes the note — receipt block ==
+                // GER-log block; eth_getTransactionReceipt returns null until
+                // then (mined-when-consumed), which aggkit tolerates.
+                //
+                // RD-940 Decision 3 dedup independence: that handoff runs
+                // INSIDE the serialized Miden client, so its row is not
+                // guaranteed to be `txn_get`-findable on the accept path by
+                // the time we return the hash (the writer worker runs the
+                // closure asynchronously; the client stub in tests skips the
+                // closure body entirely). The tx-hash dedup early-return reads
+                // `txn_get` on the accept path, so we GUARANTEE a dedup-serving
+                // pending row exists synchronously here, before
+                // service_send_raw_txn returns — otherwise an aggkit
+                // re-broadcast racing the closure would miss dedup, hit the R4
+                // nonce check against the already-advanced nonce, and wedge
+                // ethtxmanager. Idempotent: a no-op when the closure already
+                // produced the row (production sync mode, and the writer path
+                // once the worker has run it — where the inflight cache covers
+                // the accept-path gap regardless); it materialises the row
+                // only when the boundary handoff hasn't. Production therefore
+                // always writes link+receipt behind the boundary; this is a
+                // synchronous dedup safety net, never a second write.
+                if service.store.txn_get(txn_hash).await?.is_none() {
+                    record_local_pending_tx(service, txn_hash, txn_envelope, signer, None, vec![])
+                        .await?;
+                } else {
+                    drop(txn_envelope);
+                }
             } else {
                 // Duplicate GER (already injected): no new UpdateGerNote will be consumed,
                 // so the projector has nothing to finalise — complete the receipt now at
@@ -524,6 +556,12 @@ pub(crate) async fn worker_handle_ger_insert(
             service.accounts.clone(),
             &service.store,
             txn_hash,
+            // The envelope + signer ride into `insert_ger` so the pending
+            // receipt row is created INSIDE the serialized Miden-client
+            // closure, together with the tx↔note link (handoff-before-
+            // projection — see `ger::record_ger_submission_handoff`).
+            txn_envelope.clone(),
+            signer,
         )
         .await,
         txn_hash,
