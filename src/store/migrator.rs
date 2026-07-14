@@ -86,6 +86,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "010_reconcile_cursor.sql",
         include_str!("../../migrations/010_reconcile_cursor.sql"),
     ),
+    // NOTE: 011_claim_mint_serials.sql belongs to PR #123 (independent branch); this
+    // branch's migration is 012 to avoid the number collision. Non-contiguous numbering is
+    // fine — the migrator applies in list order and records each name idempotently.
+    (
+        "012_deposit_reservations.sql",
+        include_str!("../../migrations/012_deposit_reservations.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be
