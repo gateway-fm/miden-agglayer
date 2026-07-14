@@ -162,9 +162,14 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "bridge_mint_target_mismatch_total",
-        "MINT note consumed by a faucet other than its NetworkAccountTarget \
-         attachment (Cantina #2). The claimant is about to receive the \
-         wrong wrapped asset. Page critical."
+        "Cantina #2 mint-target alert, one-shot per MINT note id: either the \
+         consuming faucet differs from the MINT's NetworkAccountTarget \
+         (cross-faucet exploit — the claimant receives the wrong wrapped \
+         asset), or the intended faucet is not in aggkit's registry \
+         (cross-faucet exploit against an unregistered faucet, or operator \
+         misregistration). Only fires for MINTs attributable to OUR \
+         deployment (foreign deployments' notes are counted in \
+         bridge_mint_foreign_skipped_total instead). Page critical."
     );
     describe_counter!(
         "bridge_faucet_ownership_drift_total",
@@ -175,37 +180,52 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "bridge_forged_mint_total",
-        "MINT note observed on-chain that does not correspond to any \
-         aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge \
-         note authorship. Page critical, freeze claim processing."
+        "MINT note observed consumed that corresponds to NO aggkit-recorded \
+         claim (Cantina #4): its serial number matches no recorded claim's \
+         PROOF_DATA_KEY (the bridge MASM derives every legitimate MINT's \
+         serial from its producing claim's proof data). Forged via NoAuth \
+         bridge note authorship. One-shot per MINT note id, after a short \
+         grace window that absorbs cross-tick note-import ordering. Page \
+         critical, freeze claim processing."
     );
     describe_counter!(
         "bridge_mint_foreign_skipped_total",
-        "MINT note observed consumed that is NOT attributable to our \
-         deployment — neither consumed by our bridge/registered faucet nor \
-         targeting a registered faucet. It belongs to a FOREIGN agglayer \
-         deployment sharing the chain (the note scripts are \
-         deployment-independent). Skipped by the #2/#4 provenance gate \
-         instead of raising a false cross-faucet/forged alert. Do NOT page; \
+        "UNIQUE consumed MINT notes positively attributed to a FOREIGN \
+         agglayer deployment sharing the chain (created by a non-ours bridge \
+         and referencing no registered faucet — the note scripts and the \
+         tag-0 family the reconciler sweeps are deployment-independent). \
+         Skipped by the #2/#4 provenance gate instead of raising a false \
+         cross-faucet/forged alert. Deduplicated by note id per process \
+         lifetime (counts foreign notes, not sync ticks). Do NOT page; \
          informational/audit only."
     );
     describe_counter!(
         "bridge_twin_note_foreign_skipped_total",
-        "Consumed note skipped by the twin-detector (Cantina #6) because it was \
-         consumed by a KNOWN account that is none of OURS — neither the bridge, \
-         a registered faucet, nor a known-local account (service, ger_manager) \
-         — i.e. it provably belongs to another deployment. Keeps \
-         another deployment's note-graph out of our twin tracker. \
-         Informational/audit."
+        "UNIQUE consumed notes (any monitored script) excluded from the \
+         twin-detector (Cantina #6) because the note's own content — creator, \
+         NetworkAccountTarget, or carried asset — positively names another \
+         deployment's bridge/faucet and nothing of ours. Keeps another \
+         deployment's note-graph out of our twin tracker. Deduplicated by \
+         note id per process lifetime. Informational/audit."
     );
     describe_counter!(
         "bridge_burn_foreign_skipped_total",
-        "BURN note skipped by the serial-collision tracker (Cantina #5) because \
-         it was consumed by a KNOWN account that is none of OURS — neither the \
-         bridge, a registered faucet, nor a known-local account (service, \
-         ger_manager) — i.e. it provably belongs to another \
-         deployment. Keeps another deployment's serials out of our collision \
-         tracker. Informational/audit."
+        "UNIQUE consumed BURN notes excluded from the serial-collision \
+         tracker (Cantina #5) because the note positively belongs to another \
+         deployment (non-ours creator bridge / burned asset issued by a \
+         non-registered faucet). Keeps another deployment's serials out of \
+         our collision tracker. Deduplicated by note id per process \
+         lifetime. Informational/audit."
+    );
+    describe_counter!(
+        "bridge_monitor_registry_unavailable_total",
+        "Sync ticks on which the faucet registry (list_faucets) could not be \
+         read by the consumed-note monitors. The provenance gates fail \
+         CLOSED for the tick: NOTHING is skipped as foreign (no alert can be \
+         suppressed by a store outage) and the registry-membership Cantina \
+         #2 signal pauses. A sustained rate means the store is unhealthy — \
+         investigate; monitors are running in degraded (noisier, never \
+         blinder) mode."
     );
     describe_counter!(
         "bridge_expected_mint_stale_total",

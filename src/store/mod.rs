@@ -569,6 +569,25 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Record a legitimate expected-MINT serial derived from a consumed CLAIM
+    /// note's storage (Cantina #4 reconciliation history — see
+    /// `migrations/011_claim_mint_serials.sql`). PERMANENT, unlike the
+    /// Cantina #7 `expected_mint_*` staleness rows: the forged-MINT monitor
+    /// reconciles every observed MINT against this set forever. Idempotent
+    /// (re-recording the same serial is a no-op).
+    async fn claim_mint_serial_record(&self, _serial: &[u8; 32]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Does a recorded claim's expected-MINT serial match this serial?
+    /// `false` means NO recorded claim produced a MINT with this serial —
+    /// the Cantina #4 forged signature (after the scanner's cross-tick
+    /// import-ordering grace). Default `false` is the fail-CLOSED direction
+    /// for a security monitor: a store that doesn't persist the history
+    /// alerts rather than suppresses.
+    async fn claim_mint_serial_seen(&self, _serial: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
     /// Read the current deposit_counter (number of B2AGG-out notes aggkit has

@@ -1794,6 +1794,29 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
+    async fn claim_mint_serial_record(&self, serial: &[u8; 32]) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO monitor_claim_mint_serials (serial) VALUES ($1) \
+                 ON CONFLICT (serial) DO NOTHING",
+                &[&serial.as_slice()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn claim_mint_serial_seen(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT 1 FROM monitor_claim_mint_serials WHERE serial = $1 LIMIT 1",
+                &[&serial.as_slice()],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
     async fn expected_mint_record(
         &self,
         global_index: &[u8; 32],

@@ -77,6 +77,13 @@ pub struct InMemoryStore {
     monitor_burn_serials: RwLock<HashSet<[u8; 32]>>,
     monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
     monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
+    // Cantina #4 — permanent claim→expected-MINT-serial reconciliation history
+    // (mirror of monitor_claim_mint_serials).
+    monitor_claim_mint_serials: RwLock<HashSet<[u8; 32]>>,
+    // Test hook: force `list_faucets` to fail so scanner tests can drive the
+    // registry-degraded fail-closed path (`bridge_out::note_positively_foreign`
+    // with `registered_faucets == None`). Never set outside tests.
+    fail_list_faucets: std::sync::atomic::AtomicBool,
 
     // Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) —
     // last fully-projected Miden block height. Field-backed mirror of the
@@ -108,6 +115,14 @@ const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<InMemoryStore>();
 
 impl InMemoryStore {
+    /// Test hook — see the `fail_list_faucets` field. Makes every subsequent
+    /// `list_faucets()` call fail until reset, so tests can drive the
+    /// registry-degraded fail-closed monitor path.
+    pub fn set_fail_list_faucets(&self, fail: bool) {
+        self.fail_list_faucets
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn new() -> Self {
         Self {
             latest_block_number: RwLock::new(0),
@@ -132,6 +147,8 @@ impl InMemoryStore {
             monitor_burn_serials: RwLock::new(HashSet::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
+            monitor_claim_mint_serials: RwLock::new(HashSet::new()),
+            fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
             tx_note_links: RwLock::new(HashMap::new()),
@@ -977,6 +994,12 @@ impl Store for InMemoryStore {
     }
 
     async fn list_faucets(&self) -> anyhow::Result<Vec<FaucetEntry>> {
+        if self
+            .fail_list_faucets
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            anyhow::bail!("injected list_faucets failure (test hook)");
+        }
         Ok(self.faucets.read().clone())
     }
 
@@ -1013,6 +1036,15 @@ impl Store for InMemoryStore {
             entry.push(*commitment);
             Ok(true)
         }
+    }
+
+    async fn claim_mint_serial_record(&self, serial: &[u8; 32]) -> anyhow::Result<()> {
+        self.monitor_claim_mint_serials.write().insert(*serial);
+        Ok(())
+    }
+
+    async fn claim_mint_serial_seen(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.monitor_claim_mint_serials.read().contains(serial))
     }
 
     async fn expected_mint_record(
