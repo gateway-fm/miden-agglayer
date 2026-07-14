@@ -144,7 +144,14 @@ pub async fn insert_ger(
     txn_hash: TxHash,
     require_l1_observed: bool,
 ) -> anyhow::Result<bool> {
-    // Check dedup before doing any work (and before the H6 gate — see doc).
+    // Audit H6 gate (dedup-first — see `ensure_ger_l1_observed`). In writer
+    // mode the SAME gate already ran on the request path before
+    // `try_enqueue`/`nonce_increment` (PR #121 review); this run is the sync
+    // path's primary admission decision and the writer path's
+    // defense-in-depth.
+    ensure_ger_l1_observed(store, &ger_bytes, require_l1_observed, txn_hash).await?;
+
+    // Check dedup before doing any work.
     //
     // Use `is_ger_injected` (not `has_seen_ger`) because the L1InfoTreeIndexer
     // pre-creates ger_entries rows for every L1 InfoTree pair as it observes
@@ -155,40 +162,6 @@ pub async fn insert_ger(
     // reflects "have we already submitted the Miden tx and committed the
     // synthetic event for this GER?".
     let is_new = !store.is_ger_injected(&ger_bytes).await?;
-
-    // Audit H6 — verify the GER was observed on L1 by the independent
-    // L1InfoTreeIndexer (it writes the (mainnet, rollup) decomposition via
-    // set_ger_exit_roots). "Observed" means BOTH roots resolved — the same
-    // predicate `zkevm_getExitRootsByGER` uses (ger_entries rows exist in
-    // partial states: the indexer pre-creates them with roots to be filled in
-    // later). A GER with no resolved decomposition was supplied only by the
-    // aggoracle and never corroborated by an L1 observation — a forged-GER
-    // injection signal. Only gate NEW injections: duplicates never reach
-    // Miden, and a strict-mode refusal must stay transient (aggoracle retries
-    // next cycle; the indexer catches up).
-    if is_new {
-        let l1_observed = store
-            .get_ger_entry(&ger_bytes)
-            .await?
-            .is_some_and(|e| e.mainnet_exit_root.is_some() && e.rollup_exit_root.is_some());
-        if !l1_observed {
-            ::metrics::counter!("ger_injection_unverified_total").increment(1);
-            if require_l1_observed {
-                anyhow::bail!(
-                    "GER {} was not observed on L1 by the indexer (exit-root decomposition \
-                     unresolved); refusing injection under --reject-unverified-ger-injection \
-                     (audit H6)",
-                    hex::encode(ger_bytes)
-                );
-            }
-            tracing::warn!(
-                ger = %hex::encode(ger_bytes),
-                tx = %txn_hash,
-                "GER injection not yet corroborated by the L1 InfoTree indexer \
-                 (exit-root decomposition unresolved); allowing through but unverified"
-            );
-        }
-    }
 
     if is_new {
         tracing::info!(
@@ -252,6 +225,77 @@ pub async fn insert_ger(
     }
 
     Ok(is_new)
+}
+
+/// Audit H6 — the pre-admission L1-corroboration gate for GER injections
+/// (PR #121 review: the gate MUST run before every enqueue path, nonce
+/// increment, txn_begin, or receipt creation).
+///
+/// Verifies the GER was observed on L1 by the independent L1InfoTreeIndexer
+/// (it writes the `(mainnet, rollup)` decomposition via `set_ger_exit_roots`).
+/// "Observed" means BOTH roots resolved — the same predicate
+/// `zkevm_getExitRootsByGER` uses (ger_entries rows exist in partial states:
+/// the indexer pre-creates them with roots to be filled in later). A GER with
+/// no resolved decomposition was supplied only by the aggoracle and never
+/// corroborated by an L1 observation — a forged-GER injection signal.
+///
+/// The duplicate check runs FIRST: an already-injected GER never reaches
+/// Miden, so the gate has nothing to stop — and refusing it would break
+/// idempotency (the aggoracle re-submits GERs it cannot confirm after a
+/// restart or restore replay, and an error here would wedge it in a permanent
+/// retry loop over an injection that already happened).
+///
+/// Call sites (mirroring the C6 claim gate's two-path layout):
+///   - sync path: `insert_ger` calls it at the top, before any Miden
+///     submission; the dispatcher returns the error before `nonce_increment`
+///     and before any `txn_begin`, so a strict-mode rejection is
+///     side-effect-free.
+///   - writer path: `service_send_raw_txn` calls it on the REQUEST thread
+///     before `try_enqueue` (which would otherwise consume the nonce, admit
+///     the hash into the inflight dedup cache, and return a hash whose
+///     receipt could never be written — the aggoracle/ethtxmanager wedge).
+///     The `insert_ger` call inside the worker remains as defense-in-depth.
+///
+/// A strict-mode refusal must stay TRANSIENT: no nonce is consumed, no tx
+/// row/receipt is created, no job is queued — the identical signed
+/// transaction (same nonce) is accepted verbatim once the indexer catches up.
+///
+/// Metric discipline: `ger_injection_unverified_total` increments on every
+/// unverified sighting this function makes. The writer-mode request path only
+/// invokes it under strict mode (where a failed gate bails before the worker
+/// ever runs), so the counter never double-counts one submission.
+pub async fn ensure_ger_l1_observed(
+    store: &Arc<dyn crate::store::Store>,
+    ger_bytes: &[u8; 32],
+    require_l1_observed: bool,
+    txn_hash: TxHash,
+) -> anyhow::Result<()> {
+    // Dedup precedence — duplicates never reach Miden; see doc above.
+    if store.is_ger_injected(ger_bytes).await? {
+        return Ok(());
+    }
+    let l1_observed = store
+        .get_ger_entry(ger_bytes)
+        .await?
+        .is_some_and(|e| e.mainnet_exit_root.is_some() && e.rollup_exit_root.is_some());
+    if !l1_observed {
+        ::metrics::counter!("ger_injection_unverified_total").increment(1);
+        if require_l1_observed {
+            anyhow::bail!(
+                "GER {} was not observed on L1 by the indexer (exit-root decomposition \
+                 unresolved); refusing injection under --reject-unverified-ger-injection \
+                 (audit H6). Retry after the L1 InfoTree indexer catches up.",
+                hex::encode(ger_bytes)
+            );
+        }
+        tracing::warn!(
+            ger = %hex::encode(ger_bytes),
+            tx = %txn_hash,
+            "GER injection not yet corroborated by the L1 InfoTree indexer \
+             (exit-root decomposition unresolved); allowing through but unverified"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

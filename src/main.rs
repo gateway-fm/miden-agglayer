@@ -163,8 +163,14 @@ struct Command {
     /// was NOT corroborated by the independent L1 InfoTree indexer (i.e. a GER
     /// supplied only by the aggoracle with no matching on-chain observation).
     /// Defends against a compromised aggoracle key forging a GER onto Miden.
-    /// Default false to tolerate indexer lag; `--require-hardening` implies
-    /// true. Unverified GERs always increment `ger_injection_unverified_total`.
+    ///
+    /// PRODUCTION MUST ENABLE THIS. The default is false (lenient: allow
+    /// through + warn + `ger_injection_unverified_total`) only to tolerate
+    /// indexer lag on dev/e2e stacks — merging the H6 code without setting
+    /// `REJECT_UNVERIFIED_GER_INJECTION=true` (or `REQUIRE_HARDENING=true`,
+    /// which implies it) does NOT close audit finding H6. Strict mode
+    /// requires the L1 evidence source (`--l1-rpc-url` + `--ger-l1-address`)
+    /// at startup — see `check_h6_evidence_source`.
     ///
     /// The long flag is spelled `--reject-unverified-ger-injection` (matching
     /// the bail message in `ger.rs`, the e2e script, and the env var) rather
@@ -313,6 +319,57 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
     }
 }
 
+/// Audit H6 startup invariant (PR #121 review point 2). Strict H6 refuses any
+/// GER the L1 InfoTree indexer has not corroborated — the indexer IS the
+/// evidence source. If strict mode boots with the indexer disabled (missing
+/// L1 RPC / GER address), the proxy "fails closed" by rejecting EVERY new GER
+/// injection: technically safe, but an avoidable production outage that only
+/// surfaces when the first aggoracle injection arrives. Make the evidence
+/// source a startup invariant instead: refuse to boot with a clear error.
+///
+/// Covers BOTH strict triggers: the explicit
+/// `--reject-unverified-ger-injection` flag and `--require-hardening` (which
+/// implies it). Also validates the GER address parses — the indexer spawn
+/// only warns on a bad address and continues without it, which under strict
+/// mode would be the same silent outage.
+fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
+    let strict = command.reject_unverified_ger || command.require_hardening;
+    if !strict {
+        return Ok(());
+    }
+    let trigger = if command.reject_unverified_ger {
+        "--reject-unverified-ger-injection (REJECT_UNVERIFIED_GER_INJECTION)"
+    } else {
+        "--require-hardening (which implies strict H6 GER corroboration)"
+    };
+    if command.l1_rpc_url.is_none() || command.ger_l1_address.is_none() {
+        return Err(format!(
+            "strict H6 GER corroboration is enabled via {trigger}, but its evidence \
+             source — the L1 InfoTree indexer — is not configured: set BOTH \
+             --l1-rpc-url (L1_RPC_URL) and --ger-l1-address (GER_L1_ADDRESS). \
+             Without the indexer no GER can ever be corroborated, so EVERY new GER \
+             injection would be rejected: a fail-closed production outage. \
+             Cursor/backfill posture: on a fresh database also set \
+             --l1-indexer-from-block (L1_INDEXER_FROM_BLOCK) to a block at or before \
+             the rollup deployment so historic UpdateL1InfoTree leaves are indexed — \
+             GERs older than the indexer's first scanned block would otherwise stay \
+             unverified and be refused."
+        ));
+    }
+    if let Some(addr) = command.ger_l1_address.as_deref()
+        && addr.parse::<alloy::primitives::Address>().is_err()
+    {
+        return Err(format!(
+            "strict H6 GER corroboration is enabled via {trigger}, but --ger-l1-address \
+             `{addr}` is not a valid EVM address. The L1 InfoTree indexer would fail to \
+             start (it only WARNS and continues), leaving strict mode with no evidence \
+             source — every new GER injection would be rejected (fail-closed outage). \
+             Fix the address before boot."
+        ));
+    }
+    Ok(())
+}
+
 /// clap value parser for `--bind`: validate the value as a bare IP address
 /// (`0.0.0.0`, `127.0.0.1`, `::1`, …) at the CLI boundary. The service port is
 /// a *separate* `--port` arg, so a `host:port` form (`127.0.0.1:8546`) or a
@@ -374,6 +431,7 @@ impl std::fmt::Debug for Command {
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
             .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
+            .field("reject_unverified_ger", &self.reject_unverified_ger)
             .field("require_hardening", &self.require_hardening)
             .field(
                 "miden_api_key",
@@ -431,6 +489,14 @@ async fn main() -> anyhow::Result<()> {
              Either set the listed flags or drop --require-hardening for dev mode.",
             reasons.join("\n")
         );
+    }
+
+    // Audit H6 startup invariant — strict GER corroboration requires its
+    // evidence source (the L1 InfoTree indexer) to be configured, or every
+    // new GER injection would be rejected (fail-closed outage). See
+    // `check_h6_evidence_source`.
+    if let Err(reason) = check_h6_evidence_source(&command) {
+        anyhow::bail!("{reason}");
     }
 
     // Startup probe — when --require-hardening is set AND a remote prover is
@@ -1204,6 +1270,99 @@ mod hardening_tests {
             c.reject_unverified_ger,
             "the documented long flag must set reject_unverified_ger"
         );
+    }
+
+    // ── Audit H6 startup invariant (PR #121 review point 2) ────────────────
+
+    /// Lenient mode (neither strict trigger) needs no L1 evidence source.
+    #[test]
+    fn h6_evidence_source_not_required_when_lenient() {
+        let c = cmd(false, None, None, None);
+        assert!(check_h6_evidence_source(&c).is_ok());
+    }
+
+    /// Strict H6 via the explicit flag with NO L1 indexer configured must be
+    /// a startup failure (previously it booted and rejected every GER —
+    /// a fail-closed production outage discovered only at the first
+    /// injection).
+    #[test]
+    fn h6_strict_flag_without_l1_indexer_refused_at_startup() {
+        let mut c = cmd(false, None, None, None);
+        c.reject_unverified_ger = true;
+        let reason = check_h6_evidence_source(&c).unwrap_err();
+        assert!(
+            reason.contains("--l1-rpc-url"),
+            "must name the fix: {reason}"
+        );
+        assert!(
+            reason.contains("--ger-l1-address"),
+            "must name the fix: {reason}"
+        );
+        assert!(
+            reason.contains("--reject-unverified-ger-injection"),
+            "must name the trigger: {reason}"
+        );
+        assert!(
+            reason.contains("--l1-indexer-from-block"),
+            "must state the cursor/backfill posture: {reason}"
+        );
+    }
+
+    /// `--require-hardening` implies strict H6, so it too requires the
+    /// evidence source — even with every classic hardening flag satisfied.
+    #[test]
+    fn h6_require_hardening_without_l1_indexer_refused_at_startup() {
+        let c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        let reason = check_h6_evidence_source(&c).unwrap_err();
+        assert!(
+            reason.contains("--require-hardening"),
+            "must name the trigger: {reason}"
+        );
+    }
+
+    /// Half a configuration (RPC without the GER address) is still refused.
+    #[test]
+    fn h6_strict_with_only_l1_rpc_refused_at_startup() {
+        let mut c = cmd(false, None, None, None);
+        c.reject_unverified_ger = true;
+        c.l1_rpc_url = Some("http://anvil:8545".into());
+        assert!(check_h6_evidence_source(&c).is_err());
+    }
+
+    /// A GER address that does not parse would leave the indexer unspawned
+    /// (its runtime path only WARNS) — under strict mode that is the same
+    /// silent outage, so it must fail at startup.
+    #[test]
+    fn h6_strict_with_unparsable_ger_address_refused_at_startup() {
+        let mut c = cmd(false, None, None, None);
+        c.reject_unverified_ger = true;
+        c.l1_rpc_url = Some("http://anvil:8545".into());
+        c.ger_l1_address = Some("not-an-address".into());
+        let reason = check_h6_evidence_source(&c).unwrap_err();
+        assert!(
+            reason.contains("not a valid EVM address"),
+            "must cite the parse failure: {reason}"
+        );
+    }
+
+    /// Fully configured evidence source passes under both strict triggers.
+    #[test]
+    fn h6_strict_with_l1_indexer_configured_passes() {
+        let mut c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        c.reject_unverified_ger = true;
+        c.l1_rpc_url = Some("http://anvil:8545".into());
+        c.ger_l1_address = Some("0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674".into());
+        assert!(check_h6_evidence_source(&c).is_ok());
     }
 }
 

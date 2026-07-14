@@ -603,20 +603,20 @@ impl WriterWorker {
                         entry.state = JobState::Failed;
                         entry.terminal_at = Some(now);
                     }
-                    let block_num = sweeper_service
-                        .store
-                        .get_latest_block_number()
-                        .await
-                        .unwrap_or(0);
-                    let block_hash = sweeper_service.block_state.get_block_hash(block_num);
-                    let reason = format!(
-                        "writer_worker: TTL expired (>{}s in non-terminal state)",
+                    // Route through `write_failure_receipt` so a job that
+                    // never reached `record_local_pending_tx` still gets a
+                    // real receipt row (txn_commit alone updates zero rows
+                    // when no txn_begin ran — PR #121 review).
+                    let inflight_envelope = sweeper_inflight
+                        .get(hash)
+                        .map(|entry| (entry.envelope.clone(), entry.signer));
+                    let reason = anyhow::anyhow!(
+                        "TTL expired (>{}s in non-terminal state)",
                         sweeper_ttl.as_secs()
                     );
-                    if let Err(e) = sweeper_service
-                        .store
-                        .txn_commit(*hash, Err(reason), block_num, block_hash)
-                        .await
+                    if let Err(e) =
+                        write_failure_receipt(&sweeper_service, *hash, &reason, inflight_envelope)
+                            .await
                     {
                         tracing::warn!(
                             target: "writer_worker::ttl",
@@ -788,7 +788,13 @@ impl WriterWorker {
                 // tx to Failed instead of polling forever. Errors here are
                 // logged but cannot themselves fail the worker — if the
                 // store is sick the next sync will retry.
-                if let Err(store_err) = write_failure_receipt(&self.service, hash, &err).await {
+                let inflight_envelope = self
+                    .inflight
+                    .get(&hash)
+                    .map(|entry| (entry.envelope.clone(), entry.signer));
+                if let Err(store_err) =
+                    write_failure_receipt(&self.service, hash, &err, inflight_envelope).await
+                {
                     tracing::error!(
                         target: "writer_worker",
                         %hash,
@@ -874,6 +880,7 @@ async fn write_failure_receipt(
     service: &ServiceState,
     hash: TxHash,
     err: &anyhow::Error,
+    inflight_envelope: Option<(TxEnvelope, Address)>,
 ) -> anyhow::Result<()> {
     let reason = format!("writer_worker: {err:#}");
 
@@ -883,13 +890,33 @@ async fn write_failure_receipt(
     let block_num = service.store.get_latest_block_number().await.unwrap_or(0);
     let block_hash = service.block_state.get_block_hash(block_num);
 
-    // txn_commit asserts a prior txn_begin row. If the failure happened before
-    // the dispatcher reached the `record_local_pending_tx` step, no row
-    // exists — txn_commit would error. We don't have the original envelope
-    // here (it's been moved into the dispatch), but the inflight cache does;
-    // for Phase 1 we accept that "no prior begin" is best-effort recoverable
-    // by the future txn_commit_pending sweep at sync time. Phase 4 lands the
-    // proper TTL→status:0x0 path that always writes both rows.
+    // txn_commit is an UPDATE keyed on tx_hash: with no prior txn_begin row
+    // it affects ZERO rows and the store still returns Ok, so the "failure
+    // receipt" silently never existed and eth_getTransactionReceipt stayed
+    // null forever (PR #121 review — the aggoracle/ethtxmanager wedge
+    // mechanism). Most worker failures fire BEFORE the dispatcher reaches
+    // its `record_local_pending_tx` step, so seed the pending row from the
+    // inflight cache's retained envelope first (guarded by txn_get —
+    // txn_begin is a plain INSERT and would error on an existing row). Only
+    // when the envelope has already been evicted from the inflight cache do
+    // we fall back to the old best-effort bare txn_commit.
+    if service.store.txn_get(hash).await?.is_none()
+        && let Some((envelope, signer)) = inflight_envelope
+    {
+        service
+            .store
+            .txn_begin(
+                hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await?;
+    }
     service
         .store
         .txn_commit(hash, Err(reason), block_num, block_hash)
@@ -925,6 +952,43 @@ mod tests {
         let signed = tx.into_signed(signature);
         let env: TxEnvelope = signed.into();
         (env, from)
+    }
+
+    /// PR #121 review — the failure-receipt wedge mechanism. `txn_commit` is
+    /// an UPDATE: with no prior `txn_begin` row it affects ZERO rows (postgres
+    /// happily returns Ok), so pre-fix a job that failed before the dispatcher
+    /// reached `record_local_pending_tx` never got a receipt and
+    /// `eth_getTransactionReceipt` stayed null forever. The writer must seed
+    /// the tx row from the inflight cache's retained envelope so the failure
+    /// receipt (status:0x0) actually exists.
+    #[tokio::test]
+    async fn write_failure_receipt_seeds_missing_tx_row_from_inflight_envelope() {
+        let service = crate::test_helpers::create_test_service();
+        let store = service.store.clone();
+        let (envelope, signer) = fake_envelope(0);
+        let hash = *envelope.tx_hash();
+
+        // Precondition: no txn_begin ever ran for this hash.
+        assert!(store.txn_get(hash).await.unwrap().is_none());
+
+        write_failure_receipt(
+            &service,
+            hash,
+            &anyhow::anyhow!("indexer-lag rejection"),
+            Some((envelope, signer)),
+        )
+        .await
+        .expect("failure receipt must be writable without a prior txn_begin");
+
+        let (result, _block) =
+            store.txn_receipt(hash).await.unwrap().expect(
+                "a REAL failure receipt must exist (pre-fix: zero-row UPDATE, null forever)",
+            );
+        let reason = result.expect_err("receipt must be status:0x0 (failed)");
+        assert!(
+            reason.contains("indexer-lag rejection"),
+            "failure reason must be preserved: {reason}"
+        );
     }
 
     fn fake_ger_job(nonce: u64) -> WriteJob {

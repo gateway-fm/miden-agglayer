@@ -43,8 +43,8 @@ its shape for new environments.
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
-| `--l1-rpc-url` | `L1_RPC_URL` | unset | L1 RPC for resolving exit roots. Without it, GERs injected via legacy `insertGlobalExitRoot` store `(NULL, NULL)` roots (see [`../ger-decomposition.md`](../ger-decomposition.md)). |
-| `--ger-l1-address` | `GER_L1_ADDRESS` | unset | L1 GER contract address the indexer scrapes for `UpdateL1InfoTree`. |
+| `--l1-rpc-url` | `L1_RPC_URL` | unset | L1 RPC for resolving exit roots. Without it, GERs injected via legacy `insertGlobalExitRoot` store `(NULL, NULL)` roots (see [`../ger-decomposition.md`](../ger-decomposition.md)). Required at startup when strict H6 (`REJECT_UNVERIFIED_GER_INJECTION` / `REQUIRE_HARDENING`) is on. |
+| `--ger-l1-address` | `GER_L1_ADDRESS` | unset | L1 GER contract address the indexer scrapes for `UpdateL1InfoTree`. Required at startup when strict H6 is on. |
 | `--l1-indexer-from-block` | `L1_INDEXER_FROM_BLOCK` | unset | Operator override: force a forward walk from this L1 block on next boot (STATE-C orphan backfill — Part 3, failure mode F). Remove once the cursor has walked past it. |
 
 ### Miden proving
@@ -66,7 +66,8 @@ its shape for new environments.
 | `--rate-limit-per-second` / `--rate-limit-burst` | `RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST` | `500` / `500` | Per-IP rate limit. |
 | `--reject-zero-padding-addresses` | `REJECT_ZERO_PADDING_ADDRESSES` | `false` | Refuse the address-mapper zero-padding fallback (production posture). |
 | `--disable-hardhat-alias` | `DISABLE_HARDHAT_ALIAS` | `false` | Refuse the well-known Hardhat address remap (Cantina MA#8). **MUST be set in production.** |
-| `--require-hardening` | `REQUIRE_HARDENING` | `false` | Startup invariant: refuse to boot unless `ADMIN_API_KEY`, `ALLOWED_SIGNERS`, `MIDEN_PROVER_URL`, `DISABLE_HARDHAT_ALIAS` are set and CORS is not `*`. Set it on any internet-adjacent deployment. |
+| `--reject-unverified-ger-injection` | `REJECT_UNVERIFIED_GER_INJECTION` | `false` | Audit H6: refuse to inject a GER whose `(mainnet, rollup)` decomposition the L1 InfoTree indexer never observed on L1 (compromised-aggoracle forged-GER defense). **MUST be set in production (or use `REQUIRE_HARDENING`, which implies it) — the code being merged does NOT close H6 while this is `false`.** Lenient default exists only for dev/e2e indexer lag (unverified GERs pass with a warn + `ger_injection_unverified_total`). Strict mode requires `L1_RPC_URL` + `GER_L1_ADDRESS` at startup (the boot fails loudly without them), and on a fresh database `L1_INDEXER_FROM_BLOCK` must cover deployment history or pre-boot GERs stay unverified. Rejections are side-effect-free and transient: no nonce/receipt is consumed and the aggoracle's identical retry succeeds once the indexer catches up. |
+| `--require-hardening` | `REQUIRE_HARDENING` | `false` | Startup invariant: refuse to boot unless `ADMIN_API_KEY`, `ALLOWED_SIGNERS`, `MIDEN_PROVER_URL`, `DISABLE_HARDHAT_ALIAS` are set and CORS is not `*`. Also implies `REJECT_UNVERIFIED_GER_INJECTION` (audit H6), so it additionally requires the L1 indexer evidence source (`L1_RPC_URL` + `GER_L1_ADDRESS`) at boot. Set it on any internet-adjacent deployment. |
 | `--miden-debug` | `MIDEN_DEBUG` | `false` | Verbose Miden VM traces. Disable in production. |
 
 ### Writer worker (RD-940)

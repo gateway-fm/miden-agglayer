@@ -256,6 +256,15 @@ services:
       # the tripwire e2e sets these short (e.g. 5s × 2) to observe the halt quickly.
       FAUCET_RECONCILER_POLL_SECS: "${FAUCET_RECONCILER_POLL_SECS:-30}"
       FAUCET_RECONCILER_GRACE_TICKS: "${FAUCET_RECONCILER_GRACE_TICKS:-3}"
+      # Audit H6 — strict L1 GER corroboration, ON by default in the e2e stack
+      # (the required production posture; merging the H6 code with the flag
+      # off does not close the finding). Rejections are side-effect-free and
+      # transient — the aggoracle's retry succeeds once the from-genesis L1
+      # indexer (--l1-indexer-from-block=1 below) catches up, which on anvil
+      # is seconds. e2e-ger-l1-verification.sh asserts both phases; override
+      # with REJECT_UNVERIFIED_GER_INJECTION=false to run the lenient
+      # (warn + metric only) mode, which makes that script SKIP itself.
+      REJECT_UNVERIFIED_GER_INJECTION: "${REJECT_UNVERIFIED_GER_INJECTION:-true}"
     volumes:
       # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
       # shares the miden-client sqlite store + keystore + bridge_accounts.toml with
