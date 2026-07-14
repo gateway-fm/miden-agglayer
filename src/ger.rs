@@ -228,6 +228,9 @@ pub(crate) async fn record_ger_submission_handoff(
 /// would break idempotency: the aggoracle re-submits GERs it cannot confirm
 /// (restart with a stale view, restore replay), and an error here would put it
 /// in a permanent retry loop over an injection that already happened.
+// Two review threads (H6 `require_l1_observed` from #121, envelope+signer handoff
+// from #127) each added a parameter to this already-wide submission entry point.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
     miden_client: &MidenClient,
