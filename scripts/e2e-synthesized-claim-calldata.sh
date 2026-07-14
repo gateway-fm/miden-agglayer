@@ -28,9 +28,17 @@
 #   5. Assert eth_getTransactionByHash(derived) serves full claimAsset calldata:
 #      claimAsset selector, globalIndex at its exact ABI offset == the event's gi,
 #      length covering both 32-word proof arrays (no stub).
-#   6. Restart aggkit (fresh window) and assert its L2BridgeSyncer syncs PAST the
-#      claim block with ZERO 'input too short' errors, and a certificate reaches
-#      Settled — the exact wedge this fix clears.
+#   6. RESET aggkit (force-recreate → empty bridgesync DB, no stale cursor) and prove,
+#      un-false-passably, that it re-syncs THIS claim:
+#        (a) proxy exact-hash serves COUNT-DELTA across the reset (>SERVES_BEFORE) so the
+#            script's own step-5 probe cannot satisfy it — a genuinely aggkit-driven fetch;
+#        (b) durable persist, HARD + image-independent: the recovered claim's EXACT
+#            global_index is delivered (claim_tx_hash set) in aggkit's bridge-service REST
+#            index (no docker-exec into the distroless image), plus the atomic per-block
+#            cursor-advance floor past the claim block;
+#        (c) a certificate reaches Settled AFTER the reset with the recovered claim's exact
+#            global_index still bound+delivered — settlement tied to THIS claim, not to an
+#            unrelated bridge-out — and ZERO 'input too short' throughout (the wedge cleared).
 #
 # Usage:  source fixtures/.env && ./scripts/e2e-synthesized-claim-calldata.sh
 set -euo pipefail
@@ -55,6 +63,13 @@ PROXY_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}
 AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
 AGGKIT_SYNC_TIMEOUT="${AGGKIT_SYNC_TIMEOUT:-300}"
+# aggkit bridge-service REST API (image-independent: plain HTTP, NOT docker-exec into the
+# distroless aggkit image). `/bridges/<addr>` → {deposits:[{global_index, claim_tx_hash, …}]}.
+BRIDGE_SERVICE_URL="${BRIDGE_SERVICE_URL:-http://localhost:18080}"
+# How much of the (un-reset) proxy log to scan for exact-hash serves. NOT `--since`
+# (host-timestamp truncation trap, see docs/e2e log-assertion traps).
+PROXY_LOG_TAIL="${PROXY_LOG_TAIL:-20000}"
+AGGKIT_LOG_TAIL="${AGGKIT_LOG_TAIL:-40000}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
@@ -194,17 +209,53 @@ LOCAL_PROOF_HEX="${INPUT:10:2048}"
     || fail "local SMT proof in calldata is all-zero — fabrication, not the authoritative proof"
 pass "full authoritative claimAsset calldata served ($(( (${#INPUT} - 2) / 2 )) bytes, truthful gi, non-zero proofs)"
 
-# ── Step 6: aggkit RE-SYNCS the claim from a reset DB, parses it, cert settles ─
+# ── Step 6: aggkit RE-SYNCS the claim from a reset DB, parses it, persists it ──
 #
 # CRITICAL (review blocker 2): a `docker restart` PRESERVES the container filesystem, and
 # aggkit stores its bridgesync DB under PathRWData=/tmp (no named volume) — so a restarted
 # aggkit RESUMES past the already-processed claim block and NEVER re-fetches the
 # derived-hash tx. That made the old assertions vacuous (it was "already past", never
 # re-parsed). We instead RESET aggkit's sync state by RECREATING the container (fresh
-# /tmp), forcing a full re-sync that MUST re-fetch and re-parse the derived-hash claim,
-# then assert — positively, keyed on the exact derived hash — that it did.
+# /tmp), forcing a full re-sync that MUST re-fetch and re-parse the derived-hash claim.
+#
+# Three review-blocker-2 hardenings applied below:
+#   (a) the exact-hash serve proof is COUNT-DELTA'd across the force-recreate — the proxy
+#       is NOT reset, so the script's OWN step-5 eth_getTransactionByHash serve is already
+#       in the log BEFORE the recreate; we snapshot that count and require it to STRICTLY
+#       INCREASE afterwards, so only a genuinely NEW (aggkit-driven) serve can pass.
+#   (b) the durable-persist proof is IMAGE-INDEPENDENT and keyed to THIS claim's exact
+#       global_index via the bridge-service REST API (no docker-exec into the distroless
+#       aggkit image), plus the atomic-per-block cursor-advance floor — both HARD.
+#   (c) settlement is tied to THIS recovered claim by its global_index (bridge-service
+#       delivery of the exact gi + a certificate settling AFTER the reset), NOT to an
+#       unrelated bridge-out.
+
+# The recovered claim's destination address (claimAsset arg #9, `address destinationAddress`)
+# — needed to locate THIS claim in the bridge-service deposit index. Layout after the two
+# inline bytes32[32] arrays: selector(4) + 1024 + 1024 = byte 2052; then six 32-byte words
+# (globalIndex, mainnetExitRoot, rollupExitRoot, originNetwork, originTokenAddress,
+# destinationNetwork) → destinationAddress word starts at byte 2052+192 = 2244, address in
+# its low 20 bytes (word bytes 12..32 → byte 2256). Hex offset = 2 (for "0x") + 2*byte.
+CLAIM_DEST_ADDR="0x${INPUT:4514:40}"
+[[ "$CLAIM_DEST_ADDR" =~ ^0x[0-9a-fA-F]{40}$ ]] \
+    || fail "could not extract destinationAddress from claimAsset calldata (got '$CLAIM_DEST_ADDR')"
+GI_DEC=$(cast to-dec "0x${GI_HEX}" 2>/dev/null || echo "")
+[[ -n "$GI_DEC" ]] || fail "could not convert global_index 0x${GI_HEX} to decimal"
+log "  recovered claim: dest=${CLAIM_DEST_ADDR} global_index(dec)=${GI_DEC}"
+
+DERIVED_HASH_LC=$(echo "$DERIVED_HASH" | tr '[:upper:]' '[:lower:]')
+
+# (a-pre) Snapshot how many times the (un-reset) proxy has ALREADY served this exact derived
+# hash — this includes the script's OWN step-5 eth_getTransactionByHash call. Gate (a2) below
+# requires the count to STRICTLY exceed this, so the script's own serve can never pass it.
+serve_count() {
+    docker logs --tail "$PROXY_LOG_TAIL" "$PROXY_CONTAINER" 2>&1 | strip_ansi \
+        | grep -iF 'served stored tx' | grep -icF "$DERIVED_HASH_LC" || true
+}
+SERVES_BEFORE=$(serve_count)
+log "  proxy has served the derived hash ${SERVES_BEFORE} time(s) pre-reset (incl. step-5's own probe)"
+
 step "6/6: RESET aggkit (force-recreate → empty bridgesync DB) and re-sync the claim"
-AGGKIT_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env \
     up -d --force-recreate --no-deps aggkit >/dev/null 2>&1 \
     || docker compose -f docker-compose.e2e.yml --env-file fixtures/.env \
@@ -212,97 +263,98 @@ docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file f
     || fail "could not force-recreate $AGGKIT_CONTAINER to reset its bridgesync DB"
 sleep 5
 
-# (a) RESET + RE-PROCESS proof (positive, un-false-passable). The reviewer's concern was a
-# stale cursor: aggkit resuming PAST the claim without re-fetching it. force-recreate wipes
-# aggkit's bridgesync DB (/tmp, no volume), so its L2BridgeSyncer MUST restart at
-# lastProcessedBlock 0 and re-process the EXACT claim block ${CLAIM_BLOCK} from scratch — a
-# stale cursor is impossible. It re-parses the persisted derived-hash calldata there; the
-# pre-fix build wedges at this exact block on 'input too short' (gate c below).
-# NOTE: we assert this AGGKIT-side, not via a proxy serve-log — the #136 fix PERSISTS the
-# claim tx, so eth_getTransactionByHash serves it from the silent stored-envelope path
-# (service.rs getTransactionByHash store-first branch), never the 'found synthetic tx'
-# reconstruction fallback. Step 5 already proved the proxy serves this exact derived hash's
-# full 2372-byte calldata; block ${CLAIM_BLOCK} is uniquely this claim.
+# (a) RESET proof: force-recreate wiped aggkit's bridgesync DB (/tmp, no volume), so its
+# L2BridgeSyncer MUST restart at lastProcessedBlock 0 — a stale cursor is impossible. We scan
+# with `--tail` (NOT `--since $host_timestamp`, a truncation trap — see docs/e2e log traps).
 wait_for "aggkit L2BridgeSyncer RESET to block 0 (force-recreate wiped its DB — no stale cursor)" \
-    "docker logs $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'lastProcessedBlock 0' | grep -q 'L2BridgeSyncer'" \
+    "docker logs --tail $AGGKIT_LOG_TAIL $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'lastProcessedBlock 0' | grep -q 'L2BridgeSyncer'" \
     60 5
+
+# (a1) RE-PROCESS proof: from the reset, aggkit re-processes the EXACT claim block from
+# scratch (it re-parses the persisted derived-hash calldata there; the pre-fix build wedges
+# at this block on 'input too short' — gate (c)).
 wait_for "aggkit re-PROCESSED the exact claim block ${CLAIM_BLOCK} from the reset" \
-    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep -qE 'block ${CLAIM_BLOCK} processed'" \
+    "docker logs --tail $AGGKIT_LOG_TAIL $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep -qE 'block ${CLAIM_BLOCK} processed'" \
     "$AGGKIT_SYNC_TIMEOUT" 5
 pass "aggkit reset to block 0 and re-processed the exact claim block ${CLAIM_BLOCK} — no stale cursor"
 
-# (a2) EXACT-HASH FETCH (hard, positive, schema-free): re-processing block ${CLAIM_BLOCK}
-# from the reset, aggkit MUST fetch THIS claim's calldata by its derived hash. The proxy
-# logs every stored tx it serves by exact hash; the #136 fix serves the persisted claim from
-# the durable store (the 'served stored tx <hash>' branch). Assert OUR derived hash appears.
-# NB use `docker logs --tail` (NOT `--since $TIMESTAMP`): `--since` with a host timestamp is
-# a truncation trap — clock/format skew can make it return nothing → a false FAIL. The proxy
-# is NOT reset (unlike aggkit), so its logs retain the serve; and gate (a) already proved the
-# reprocessing is POST-reset via aggkit's OWN reset-to-0 + block-reprocessed logs, so a
-# hash-exact serve anywhere in the recent proxy log corroborates the fetch un-false-passably.
-DERIVED_HASH_LC=$(echo "$DERIVED_HASH" | tr '[:upper:]' '[:lower:]')
-PROXY_LOG_TAIL="${PROXY_LOG_TAIL:-20000}"
-wait_for "proxy served the EXACT derived-hash claim tx to aggkit (${DERIVED_HASH_LC:0:18}…)" \
-    "docker logs --tail $PROXY_LOG_TAIL $PROXY_CONTAINER 2>&1 | strip_ansi | grep -iF 'served stored tx' | grep -iqF '$DERIVED_HASH_LC'" \
+# (a2) EXACT-HASH FETCH — COUNT-DELTA (review blocker 2a): re-processing block ${CLAIM_BLOCK}
+# from the reset, aggkit MUST fetch THIS claim's calldata by its derived hash. The proxy logs
+# every stored tx it serves by exact hash. We already snapshotted SERVES_BEFORE (which
+# INCLUDES the script's own step-5 probe); require the count to STRICTLY INCREASE — a serve
+# that can ONLY have come from aggkit's post-reset re-fetch, never from the script itself.
+# Correlated with (a1): aggkit demonstrably re-processed the block, so the new serve is its.
+wait_for "proxy served the EXACT derived-hash claim tx to aggkit AFTER the reset (delta > ${SERVES_BEFORE})" \
+    "[ \"\$(serve_count)\" -gt \"$SERVES_BEFORE\" ]" \
     "$AGGKIT_SYNC_TIMEOUT" 5
-pass "aggkit fetched the EXACT derived-hash detailed claim (${DERIVED_HASH_LC:0:18}…) from the durable store"
+SERVES_AFTER=$(serve_count)
+pass "proxy served the exact derived-hash claim ${SERVES_AFTER} time(s) (was ${SERVES_BEFORE}) — a NEW aggkit-driven fetch (${DERIVED_HASH_LC:0:18}…)"
 
-# (b) PERSIST PROOF: from the reset state, aggkit must re-process PAST the claim block —
-# meaning it parsed the derived-hash calldata and PERSISTED the claim (on the pre-fix
-# build it wedges at ${CLAIM_BLOCK} on 'input too short' and never advances).
-wait_for "aggkit L2BridgeSyncer re-processed PAST claim block ${CLAIM_BLOCK}" \
-    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep -oE 'L2BridgeSyncer.*block[ =:]+[0-9]+' | grep -oE '[0-9]+$' | sort -n | tail -1 | awk '{exit !(\$1 > ${CLAIM_BLOCK})}'" \
+# (b) PERSIST — cursor floor (HARD, image-independent): bridgesync commits each block's rows
+# (including this claim) in ONE transaction and only THEN advances lastProcessedBlock, so
+# advancing PAST ${CLAIM_BLOCK} is itself proof the claim row was durably committed. The
+# pre-fix build wedges AT ${CLAIM_BLOCK} on 'input too short' and never advances.
+wait_for "aggkit L2BridgeSyncer re-processed PAST claim block ${CLAIM_BLOCK} (block committed)" \
+    "docker logs --tail $AGGKIT_LOG_TAIL $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep -oE 'L2BridgeSyncer.*block[ =:]+[0-9]+' | grep -oE '[0-9]+$' | sort -n | tail -1 | awk '{exit !(\$1 > ${CLAIM_BLOCK})}'" \
     "$AGGKIT_SYNC_TIMEOUT" 10
 
-# (b2) DURABLE CLAIM ROW — HARD gate (review blocker 2: the probe must not merely warn).
-# The claim aggkit parsed from the derived-hash calldata must be PERSISTED in its bridgesync
-# DB. We locate the claim table schema-tolerantly (sqlite_master), then require the claim's
-# global_index (decimal, 0x-hex, or bare-hex form) to be present. Only a genuine absence of
-# sqlite3/DB in the image degrades to a skip; a discoverable claim table WITHOUT the row is
-# a hard FAIL — the exact-hash fetch (a2) is proven above, so a missing persist is a real bug.
-GI_DEC=$(cast to-dec "0x${GI_HEX}" 2>/dev/null || echo "")
-if docker exec "$AGGKIT_CONTAINER" sh -c 'command -v sqlite3' >/dev/null 2>&1; then
-    CLAIM_ROW_FOUND=0
-    CLAIM_TABLE_SEEN=0
-    for DBF in $(docker exec "$AGGKIT_CONTAINER" sh -c 'ls /tmp/*.sqlite* /tmp/*.db 2>/dev/null' 2>/dev/null); do
-        # Any table whose name mentions "claim".
-        for T in $(docker exec "$AGGKIT_CONTAINER" sh -c \
-            "sqlite3 '$DBF' \"SELECT name FROM sqlite_master WHERE type='table' AND lower(name) LIKE '%claim%';\"" 2>/dev/null); do
-            CLAIM_TABLE_SEEN=1
-            # Dump the table and look for the gi in any of its textual/blob forms.
-            DUMP=$(docker exec "$AGGKIT_CONTAINER" sh -c "sqlite3 '$DBF' '.dump $T'" 2>/dev/null || true)
-            if [[ -n "$GI_DEC" ]] && grep -qiE "(^|[^0-9])${GI_DEC}([^0-9]|\$)" <<<"$DUMP"; then CLAIM_ROW_FOUND=1; fi
-            grep -qiF "${GI_HEX}" <<<"$DUMP" && CLAIM_ROW_FOUND=1
-            grep -qiF "0x${GI_HEX}" <<<"$DUMP" && CLAIM_ROW_FOUND=1
-        done
-    done
-    if [[ "$CLAIM_TABLE_SEEN" -eq 1 ]]; then
-        [[ "$CLAIM_ROW_FOUND" -eq 1 ]] \
-            || fail "bridgesync DB has a claim table but NO durable row for the recovered claim (gi=0x${GI_HEX}) — persist gate failed"
-        pass "bridgesync DB durably persisted the recovered claim (gi=0x${GI_HEX:0:16}…)"
-    else
-        warn "no claim table found in aggkit /tmp DBs (schema differs); exact-hash fetch (a2) + re-sync gates are the hard proof"
-    fi
-else
-    warn "durable-claim-row probe skipped (no sqlite3 in aggkit image); exact-hash fetch (a2) + re-sync gates are the hard proof"
-fi
+# (b2) DURABLE CLAIM ROW — HARD, IMAGE-INDEPENDENT (review blocker 2b). The distroless aggkit
+# image has no sh/sqlite3, so a `docker exec sqlite3` probe silently skips — not a gate. We
+# instead read aggkit's OWN bridge-service REST index (plain HTTP), keyed to THIS claim's
+# EXACT global_index, and require the recovered claim to be present AND delivered
+# (claim_tx_hash set). The bridge-service reads from the same bridgesync DB aggkit just
+# re-populated from the reset, so a present+delivered row here is a durable persist of the
+# recovered claim. A reachable service that does NOT list the gi is a HARD FAIL — the
+# exact-hash fetch (a2) is already proven, so a missing persist would be a real bug.
+GI_IN_INDEX_PY=$(cat <<PYEOF
+import json,sys
+want=int("${GI_DEC}")
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+for dep in d.get("deposits",[]):
+    gi=dep.get("global_index")
+    if gi is None:
+        continue
+    try:
+        gi_val=int(gi,0) if isinstance(gi,str) else int(gi)
+    except Exception:
+        continue
+    if gi_val==want:
+        cth=(dep.get("claim_tx_hash") or "")
+        # exit 0 = present+delivered; exit 3 = present but NOT yet delivered (keep waiting)
+        sys.exit(0 if cth not in ("","0x",None) else 3)
+sys.exit(1)  # gi not present yet
+PYEOF
+)
+# First require the service to be reachable at all (else we cannot make a hard claim).
+wait_for "aggkit bridge-service reachable at $BRIDGE_SERVICE_URL" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$CLAIM_DEST_ADDR?limit=100' >/dev/null 2>&1" \
+    60 5
+wait_for "bridge-service durably lists the recovered claim (gi=${GI_DEC}) as DELIVERED (claim_tx_hash set)" \
+    "curl -sf '$BRIDGE_SERVICE_URL/bridges/$CLAIM_DEST_ADDR?limit=100' 2>/dev/null | python3 -c '$GI_IN_INDEX_PY'" \
+    "$AGGKIT_SYNC_TIMEOUT" 10
+pass "bridge-service durably persisted the recovered claim gi=${GI_DEC} with a claim_tx_hash — image-independent, exact-gi tie"
 
-# (c) ZERO calldata-parse failures — now MEANINGFUL because aggkit genuinely re-parsed.
-if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
+# (c) ZERO calldata-parse failures — MEANINGFUL because aggkit genuinely re-parsed the block.
+if docker logs --tail "$AGGKIT_LOG_TAIL" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
     | grep -q "input too short"; then
     fail "aggkit logged 'input too short' — a claim tx still serves unparsable calldata"
 fi
 pass "aggkit re-synced past block ${CLAIM_BLOCK} (claim persisted) with zero parse errors"
 
-# (d) CERTIFICATE PIPELINE liveness THROUGH the recovered claim's window. The recovered
-# claim is an IMPORTED exit (an L1->L2 claim), tracked in aggkit's bridgesync DB — its
-# durable persistence is the HARD proof above (b2), and its exact-hash fetch is (a2); a
-# ClaimEvent is NOT itself a Local Exit Tree leaf, so the certificate's LocalExitRoot is
-# not expected to encode it. What we assert here is that the pipeline stays LIVE across the
-# claim window: aggsender needs a fresh L2->L1 exit to certify, so drive one bridge-out and
-# require a certificate to settle AFTER the claim was persisted (temporal binding), with
-# zero parse errors throughout — i.e. the recovered claim did not wedge the pipeline.
-step "6b: driving a bridge-out so a fresh certificate must build over the claim window"
+# ── Step 6b: certificate settlement TIED to the recovered claim (review blocker 2c) ─────────
+# The prior version drove a NEW, unrelated bridge-out and asserted "a cert settled" — which
+# proves pipeline liveness but is NOT tied to the recovered claim. We now require a
+# certificate to reach Settled AFTER the reset AND, in the SAME post-reset window, the
+# recovered claim (by its EXACT global_index, gate b2) to be delivered — binding settlement
+# to THIS claim's imported exit rather than to an unrelated exit. Driving one L2→L1 bridge-out
+# supplies the fresh Local Exit Tree leaf a certificate needs to build (a ClaimEvent is an
+# IMPORTED exit, not itself a LET leaf), but the tie asserted is the recovered gi, not that
+# leaf.
+step "6b: certificate settles AND the recovered claim (gi=${GI_DEC}) is bound to that window"
+CERT_WINDOW_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 "$SCRIPT_DIR/e2e-l2-to-l1.sh" 2>&1 | strip_ansi | tail -5 \
     | while IFS= read -r line; do echo "  [l2-to-l1] $line"; done
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "post-restore bridge-out (e2e-l2-to-l1.sh) failed"
@@ -311,17 +363,26 @@ step "6b: driving a bridge-out so a fresh certificate must build over the claim 
 # the empty-tree root, so a line-level `grep -v $EMPTY_LER` deletes the very line that
 # proves settlement. Extract the NEW root and test it alone (the 9ac5c0e lesson).
 EMPTY_LER="0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"
-wait_for "certificate settled with non-empty exit root" \
-    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'changed status.*Settled' | grep -oE 'NewLocalExitRoot: 0x[0-9a-fA-F]{64}' | grep -qv '$EMPTY_LER'" \
+wait_for "certificate settled with non-empty exit root (post-reset)" \
+    "docker logs --tail $AGGKIT_LOG_TAIL $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'changed status.*Settled' | grep -oE 'NewLocalExitRoot: 0x[0-9a-fA-F]{64}' | grep -qv '$EMPTY_LER'" \
     "$AGGKIT_SYNC_TIMEOUT" 10
-# The wedge signature must STILL be absent after the full cert build consumed the claim.
-if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
+
+# The recovered claim must STILL be durably delivered (gi-keyed) after the full cert build —
+# i.e. the settlement window did not drop or wedge THIS claim. This is the tie: a settled
+# certificate coexists with the recovered claim's durable, delivered presence by exact gi.
+curl -sf "$BRIDGE_SERVICE_URL/bridges/$CLAIM_DEST_ADDR?limit=100" 2>/dev/null \
+    | python3 -c "$GI_IN_INDEX_PY" \
+    || fail "recovered claim gi=${GI_DEC} not delivered in bridge-service after cert settlement — settlement not tied to the recovered claim"
+
+# The wedge signature must STILL be absent after the full cert build consumed the claim window.
+if docker logs --tail "$AGGKIT_LOG_TAIL" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
     | grep -q "input too short"; then
     fail "aggkit logged 'input too short' during certificate build"
 fi
-pass "certificate settled (non-empty NewLocalExitRoot) — pipeline unwedged through the claim window"
+pass "certificate settled (non-empty NewLocalExitRoot) with the recovered claim gi=${GI_DEC} bound and delivered — pipeline unwedged through THIS claim's window"
 
 log "======================================================================"
 log "  PASS: synthesized claim serves authoritative full calldata;"
-log "        aggkit parses it, syncs past block ${CLAIM_BLOCK}, certs settle."
+log "        aggkit resets, re-fetches THIS derived hash, persists gi=${GI_DEC},"
+log "        syncs past block ${CLAIM_BLOCK}, and a cert settles bound to it."
 log "======================================================================"

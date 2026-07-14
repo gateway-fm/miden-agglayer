@@ -222,6 +222,15 @@ pub enum UnbridgeableBridgeOutReason {
     /// silently skipped) so the note is recorded as a permanent skip and is not
     /// re-attempted every sync tick / restore run.
     MetadataTooLarge,
+    /// SAME-DETAILS MULTIPLICITY (review): the authoritative bridge-tx feed shows ≥2
+    /// DISTINCT on-chain B2AGG consumptions that share a `details_commitment` (same details,
+    /// different metadata → different NoteId/nullifier). The miden-client SQLite store keys
+    /// input notes by `details_commitment`, so it CANNOT represent them distinctly, and the
+    /// synthetic BridgeEvent's tx_hash is derived from the commitment (shared) — so restore
+    /// cannot emit a correct, distinct event per leaf without collapsing/misnumbering. Rather
+    /// than guess, quarantine ALL such exits fail-closed; recover via --restore/admin once the
+    /// authoritative per-note bodies can be sourced.
+    SameDetailsMultiplicity,
 }
 
 impl UnbridgeableBridgeOutReason {
@@ -233,6 +242,7 @@ impl UnbridgeableBridgeOutReason {
             Self::AmountOverflow => "amount_overflow",
             Self::AtomicCommitFailed => "atomic_commit_failed",
             Self::MetadataTooLarge => "metadata_too_large",
+            Self::SameDetailsMultiplicity => "same_details_multiplicity",
         }
     }
 }

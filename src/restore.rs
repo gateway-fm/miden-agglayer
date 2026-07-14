@@ -785,11 +785,37 @@ pub(crate) fn attribute_bridge_consumption(
 ///     emitted SET is exactly the on-chain leaf set, one event per authoritative slot.
 ///     A foreign record can only pop a slot if its commitment equals a real bridge
 ///     consumption's — i.e. it IS that note — so it can never spuriously emit.
+///
+/// Outcome of classifying one consumed record for restore projection.
+pub(crate) enum RestoreAttribution {
+    /// Project this (possibly bridge-rebuilt) record through the normal path.
+    Project(InputNoteRecord),
+    /// FAIL CLOSED (review blocker — same-details multiplicity): the authoritative feed shows
+    /// ≥2 DISTINCT on-chain consumptions sharing this record's details_commitment, which the
+    /// commitment-keyed client store cannot disambiguate AND whose synthetic BridgeEvent
+    /// tx_hash (derived from the commitment) would collide — so restore cannot emit a correct,
+    /// distinct event per leaf. Quarantine instead of guessing (never a wrong/collapsed event).
+    QuarantineMultiplicity(InputNoteRecord),
+}
+
+/// Number of DISTINCT authoritative on-chain B2AGG consumptions per details_commitment.
+/// `> 1` is the same-details multiplicity the collapsed store can't represent.
+pub(crate) fn feed_multiplicity_by_commitment(
+    attribution: &BridgePositionMap,
+) -> std::collections::HashMap<[u8; 32], usize> {
+    let mut m: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+    for (commitment, _, _, _) in attribution.values() {
+        *m.entry(*commitment).or_default() += 1;
+    }
+    m
+}
+
 pub(crate) fn attribute_consumed_records(
     records: &[InputNoteRecord],
     bridge_id: AccountId,
     attribution: &BridgePositionMap,
-) -> Vec<InputNoteRecord> {
+) -> Vec<RestoreAttribution> {
+    let multiplicity = feed_multiplicity_by_commitment(attribution);
     let mut ids_by_commitment: std::collections::HashMap<
         [u8; 32],
         Vec<miden_protocol::note::NoteId>,
@@ -804,13 +830,20 @@ pub(crate) fn attribute_consumed_records(
     records
         .iter()
         .map(|n| {
+            let commitment = n.details_commitment().as_bytes();
+            // SAME-DETAILS MULTIPLICITY (fail-closed): ≥2 distinct on-chain leaves share this
+            // commitment. The store can't disambiguate them and the derived tx_hash would
+            // collide, so restore cannot emit a correct distinct event per leaf — quarantine.
+            // This is checked BEFORE the consumer gate so a collapsed record is never emitted,
+            // whether the store surfaced it as bridge-consumed or consumer-unknown.
+            if multiplicity.get(&commitment).copied().unwrap_or(0) > 1 {
+                return RestoreAttribution::QuarantineMultiplicity(n.clone());
+            }
             // Known consumer → pass through, never touch the queue.
             if n.consumer_account().is_some() {
-                return n.clone();
+                return RestoreAttribution::Project(n.clone());
             }
-            let unique_id = ids_by_commitment
-                .get_mut(&n.details_commitment().as_bytes())
-                .and_then(|q| q.pop());
+            let unique_id = ids_by_commitment.get_mut(&commitment).and_then(|q| q.pop());
             match attribute_bridge_consumption(n, unique_id, bridge_id, attribution) {
                 Some(rebuilt) => {
                     ::metrics::counter!("restore_b2agg_authoritative_attributed_total")
@@ -825,9 +858,9 @@ pub(crate) fn attribute_consumed_records(
                         "restore: NTX-consumed note attributed to the bridge via \
                          sync_transactions (local store had consumer_account=None)"
                     );
-                    rebuilt
+                    RestoreAttribution::Project(rebuilt)
                 }
-                None => n.clone(),
+                None => RestoreAttribution::Project(n.clone()),
             }
         })
         .collect()
@@ -1012,8 +1045,45 @@ async fn restore_bridge_outs(
                 // on-chain tx feed proves it. Identity is preserved through the join (only
                 // consumer-unknown records are candidates; per-commitment queue assignment;
                 // fail-closed on ambiguity) — see `attribute_consumed_records`.
-                let consumed_notes: Vec<InputNoteRecord> =
+                // Classify: Project (normal) vs QuarantineMultiplicity (fail-closed on
+                // same-details multiplicity the collapsed store can't disambiguate).
+                let classified =
                     attribute_consumed_records(&consumed_notes, bridge_id, &bridge_attribution);
+                let mut consumed_notes: Vec<InputNoteRecord> = Vec::with_capacity(classified.len());
+                for a in classified {
+                    match a {
+                        RestoreAttribution::Project(r) => consumed_notes.push(r),
+                        RestoreAttribution::QuarantineMultiplicity(r) => {
+                            let note_id_str = hex::encode(r.details_commitment().as_bytes());
+                            ::metrics::counter!(
+                                "restore_b2agg_same_details_multiplicity_quarantined_total"
+                            )
+                            .increment(1);
+                            tracing::error!(
+                                note_id = %note_id_str,
+                                "restore: FAIL-CLOSED — ≥2 distinct on-chain B2AGG consumptions \
+                                 share this details_commitment; the commitment-keyed store cannot \
+                                 disambiguate and the derived tx_hash would collide. Quarantining \
+                                 (unbridgeable) rather than emitting a wrong/collapsed BridgeEvent. \
+                                 Recover via authoritative per-note sourcing (--restore/admin)."
+                            );
+                            let blk = note_consumed_block(&r, restore_block);
+                            crate::bridge_out::quarantine_unbridgeable_b2agg(
+                                &*store_clone,
+                                bridge_id,
+                                &note_id_str,
+                                &r,
+                                blk,
+                                crate::store::UnbridgeableBridgeOutReason::SameDetailsMultiplicity,
+                                "≥2 distinct on-chain bridge consumptions share this \
+                                 details_commitment; commitment-keyed store cannot disambiguate \
+                                 (fail-closed)"
+                                    .to_string(),
+                            )
+                            .await;
+                        }
+                    }
+                }
 
                 // Miden-1:1: replay each B2AGG note at its OWN Miden consumption
                 // block, in the projector's canonical (block, tx_order, note_id)
@@ -4128,6 +4198,16 @@ mod tests {
     // ── Production-path regressions (review blocker 1): drive attribute_consumed_records,
     //    the SAME join restore_bridge_outs runs — not attribute_bridge_consumption directly.
 
+    /// The consumed record inside a classification (either variant carries one).
+    fn ra_record(a: &RestoreAttribution) -> &InputNoteRecord {
+        match a {
+            RestoreAttribution::Project(r) | RestoreAttribution::QuarantineMultiplicity(r) => r,
+        }
+    }
+    fn ra_is_quarantine(a: &RestoreAttribution) -> bool {
+        matches!(a, RestoreAttribution::QuarantineMultiplicity(_))
+    }
+
     /// RECLAIM-FIRST: a reclaim (consumer=Some(sender)) shares a commitment with the real
     /// bridge consumption (consumer=None). Pre-fix, iterating the reclaim first POPPED and
     /// discarded the id, leaving the real bridge record unattributed → lost BridgeEvent.
@@ -4148,12 +4228,17 @@ mod tests {
         // Reclaim iterated FIRST.
         let out = attribute_consumed_records(&[reclaim, bridge], bridge_id, &attribution);
         assert_eq!(out.len(), 2);
+        // Single authoritative leaf → NOT multiplicity → neither quarantined.
+        assert!(!out.iter().any(ra_is_quarantine));
         // out[0] = the reclaim, unchanged (still its sender consumer, NOT the bridge).
-        assert_eq!(out[0].consumer_account(), Some(sender_id));
+        assert_eq!(ra_record(&out[0]).consumer_account(), Some(sender_id));
         // out[1] = the real bridge record, ATTRIBUTED (it got the slot the reclaim did not steal).
-        assert_eq!(out[1].consumer_account(), Some(bridge_id));
+        assert_eq!(ra_record(&out[1]).consumer_account(), Some(bridge_id));
         assert_eq!(
-            out[1].state().consumed_block_height().map(|h| h.as_u64()),
+            ra_record(&out[1])
+                .state()
+                .consumed_block_height()
+                .map(|h| h.as_u64()),
             Some(7)
         );
     }
@@ -4177,67 +4262,89 @@ mod tests {
 
         let out = attribute_consumed_records(&[foreign, bridge], bridge_id, &attribution);
         assert_eq!(out.len(), 2);
+        assert!(!out.iter().any(ra_is_quarantine));
         // Foreign (no feed entry) → unchanged, consumer still None → project skips it.
-        assert_eq!(out[0].consumer_account(), None);
+        assert_eq!(ra_record(&out[0]).consumer_account(), None);
         // Bridge note → attributed with its own authoritative (block, order).
-        assert_eq!(out[1].consumer_account(), Some(bridge_id));
+        assert_eq!(ra_record(&out[1]).consumer_account(), Some(bridge_id));
         assert_eq!(
-            out[1].state().consumed_tx_order(),
+            ra_record(&out[1]).state().consumed_tx_order(),
             Some(1),
             "bridge record keeps its own authoritative order"
         );
     }
 
-    /// SAME-COMMITMENT SIBLINGS: two consumer-unknown records sharing a commitment with TWO
-    /// authoritative leaves → BOTH attributed with DISTINCT (order) slots; the emitted set
-    /// is exactly the on-chain leaf set (one per slot), regardless of assignment.
+    /// SAME-COMMITMENT MULTIPLICITY (review blocker — fail-closed): the authoritative feed shows
+    /// TWO DISTINCT on-chain leaves sharing one details_commitment. On #136 the synthetic
+    /// BridgeEvent tx_hash is DERIVED from the commitment, so both leaves would derive the SAME
+    /// hash and `commit_b2agg_event_atomic` would dedup them to a SINGLE event — a collapsed /
+    /// missing BridgeEvent, exactly what the reviewer forbids. So restore must NOT attribute
+    /// them: every record whose commitment has feed-multiplicity > 1 is QUARANTINED
+    /// (unbridgeable), recoverable via authoritative per-note sourcing, never emitted.
+    ///
+    /// Mutation-honesty: delete the `multiplicity.get(...) > 1` guard in
+    /// `attribute_consumed_records` and both records fall through to `Project(bridge_id)` — the
+    /// `all quarantine` / `none attributed` assertions below then FAIL, re-exposing the collapse.
     #[tokio::test]
-    async fn attribute_join_same_commitment_siblings_both_attributed() {
+    async fn attribute_join_same_commitment_multiplicity_fails_closed() {
         let (faucet_id, bridge_id, _sender) = ma3_accounts();
         let a = ma3_b2agg_note_amount(faucet_id, None, 50);
         let b = ma3_b2agg_note_amount(faucet_id, None, 50);
         let commitment: [u8; 32] = a.details_commitment().as_bytes();
         assert_eq!(b.details_commitment().as_bytes(), commitment);
 
+        // TWO distinct authoritative leaves under ONE commitment = multiplicity 2.
         let attribution: BridgePositionMap = std::collections::HashMap::from([
             (test_note_id(3), (commitment, 100u64, 0u32, 0u32)),
             (test_note_id(4), (commitment, 100u64, 1u32, 0u32)),
         ]);
+        assert_eq!(
+            feed_multiplicity_by_commitment(&attribution)[&commitment],
+            2
+        );
 
         let out = attribute_consumed_records(&[a, b], bridge_id, &attribution);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|r| r.consumer_account() == Some(bridge_id)));
-        // Both authoritative orders (0 and 1) are present exactly once across the two.
-        let mut orders: Vec<u32> = out
-            .iter()
-            .filter_map(|r| r.state().consumed_tx_order())
-            .collect();
-        orders.sort_unstable();
-        assert_eq!(
-            orders,
-            vec![0, 1],
-            "each leaf's distinct order slot is assigned once"
+        // Fail-closed: BOTH quarantined, NEITHER attributed to the bridge (no collapsed emit).
+        assert!(
+            out.iter().all(ra_is_quarantine),
+            "same-details multiplicity must quarantine every sharing record, not attribute it"
         );
+        assert!(
+            out.iter()
+                .all(|a| ra_record(a).consumer_account().is_none()),
+            "a quarantined record is never handed the bridge id (would let projection emit it)"
+        );
+    }
 
-        // A THIRD sibling with no remaining slot → unattributed (fail-closed skip).
-        let c = ma3_b2agg_note_amount(faucet_id, None, 50);
-        let out3 = attribute_consumed_records(
-            &[
-                ma3_b2agg_note_amount(faucet_id, None, 50),
-                ma3_b2agg_note_amount(faucet_id, None, 50),
-                c,
-            ],
-            bridge_id,
-            &attribution,
+    /// STORE-COLLAPSE (the reviewer's exact scenario): the real miden-client SQLite store keys
+    /// input notes by details_commitment, so two on-chain leaves with the same details but
+    /// DIFFERENT metadata surface as a SINGLE local record. The feed still knows there were TWO
+    /// distinct consumptions. That single collapsed record MUST be quarantined — emitting it
+    /// would produce one BridgeEvent for what were two exits (a missing/wrong event).
+    ///
+    /// Mutation-honesty: drop the multiplicity guard and the lone collapsed record is
+    /// `Project(bridge_id)`-attributed → the `is_quarantine` assertion FAILS.
+    #[tokio::test]
+    async fn attribute_join_store_collapsed_multiplicity_quarantined() {
+        let (faucet_id, bridge_id, _sender) = ma3_accounts();
+        // The store surfaced ONE record for the shared commitment (metadata dropped on collapse).
+        let collapsed = ma3_b2agg_note_amount(faucet_id, None, 77);
+        let commitment: [u8; 32] = collapsed.details_commitment().as_bytes();
+
+        // The authoritative feed knows there were TWO distinct leaves at that commitment.
+        let attribution: BridgePositionMap = std::collections::HashMap::from([
+            (test_note_id(8), (commitment, 200u64, 0u32, 0u32)),
+            (test_note_id(9), (commitment, 200u64, 1u32, 0u32)),
+        ]);
+
+        let out = attribute_consumed_records(&[collapsed], bridge_id, &attribution);
+        assert_eq!(out.len(), 1);
+        assert!(
+            ra_is_quarantine(&out[0]),
+            "a store-collapsed record whose commitment maps to >1 leaf must fail closed"
         );
-        let attributed = out3
-            .iter()
-            .filter(|r| r.consumer_account() == Some(bridge_id))
-            .count();
-        assert_eq!(
-            attributed, 2,
-            "exactly N leaves attribute N records; the excess is skipped"
-        );
+        assert!(ra_record(&out[0]).consumer_account().is_none());
     }
 
     /// Test-local mirror of the eth envelope aggkit signs for

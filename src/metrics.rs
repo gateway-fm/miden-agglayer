@@ -247,6 +247,13 @@ pub fn init_metrics() {
          (crash recovery or foreign-CLAIM observation)."
     );
     describe_counter!(
+        "restore_b2agg_same_details_multiplicity_quarantined_total",
+        "restore FAIL-CLOSED: B2AGG exits quarantined because the authoritative feed shows ≥2 \
+         distinct on-chain consumptions sharing a details_commitment that the commitment-keyed \
+         client store cannot disambiguate — quarantined rather than emit a wrong/collapsed \
+         BridgeEvent (review). MUST be rare; each is an operator-recoverable exit."
+    );
+    describe_counter!(
         "synthetic_claim_calldata_finalized_pending_total",
         "synthesized-claim calldata rows found PENDING (txn_begin ran, txn_commit did not — a \
          crash between them) and finalized by a later persist pass, rather than being stranded \
