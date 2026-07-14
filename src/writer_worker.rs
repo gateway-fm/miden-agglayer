@@ -890,20 +890,24 @@ async fn write_failure_receipt(
     let block_num = service.store.get_latest_block_number().await.unwrap_or(0);
     let block_hash = service.block_state.get_block_hash(block_num);
 
-    // txn_commit is an UPDATE keyed on tx_hash: with no prior txn_begin row
-    // it affects ZERO rows and the store still returns Ok, so the "failure
-    // receipt" silently never existed and eth_getTransactionReceipt stayed
-    // null forever (PR #121 review — the aggoracle/ethtxmanager wedge
-    // mechanism). Most worker failures fire BEFORE the dispatcher reaches
-    // its `record_local_pending_tx` step, so seed the pending row from the
-    // inflight cache's retained envelope first (guarded by txn_get —
-    // txn_begin is a plain INSERT and would error on an existing row). Only
-    // when the envelope has already been evicted from the inflight cache do
-    // we fall back to the old best-effort bare txn_commit.
+    // txn_commit is an UPDATE keyed on tx_hash. Post-#127 both stores ERROR when
+    // it affects zero rows (a missing prior txn_begin), so without a pending row
+    // the failure receipt would never be written and eth_getTransactionReceipt
+    // would stay null forever (PR #121 review — the aggoracle/ethtxmanager wedge
+    // mechanism). Most worker failures fire BEFORE the dispatcher reaches its
+    // `record_local_pending_tx` step, so seed the pending row from the inflight
+    // cache's retained envelope first. Only when the envelope has already been
+    // evicted from the inflight cache do we fall back to a bare txn_commit
+    // (which then surfaces the missing-row error).
     if service.store.txn_get(hash).await?.is_none()
         && let Some((envelope, signer)) = inflight_envelope
     {
-        service
+        // Best-effort seed: txn_begin is an INSERT and errors on an existing row.
+        // If a concurrent task won the race and already seeded the row, ignore
+        // the duplicate — the row now exists, so the txn_commit below finalises
+        // it. Propagating the error here would return early WITHOUT writing the
+        // receipt even though the row is present.
+        if let Err(e) = service
             .store
             .txn_begin(
                 hash,
@@ -915,7 +919,10 @@ async fn write_failure_receipt(
                     logs: vec![],
                 },
             )
-            .await?;
+            .await
+        {
+            tracing::debug!(%hash, error = %e, "failure-receipt seed lost the txn_begin race (row already exists); finalising the existing row");
+        }
     }
     service
         .store
@@ -955,10 +962,11 @@ mod tests {
     }
 
     /// PR #121 review — the failure-receipt wedge mechanism. `txn_commit` is
-    /// an UPDATE: with no prior `txn_begin` row it affects ZERO rows (postgres
-    /// happily returns Ok), so pre-fix a job that failed before the dispatcher
-    /// reached `record_local_pending_tx` never got a receipt and
-    /// `eth_getTransactionReceipt` stayed null forever. The writer must seed
+    /// an UPDATE keyed on tx_hash; post-#127 both stores ERROR when it affects
+    /// zero rows (no prior `txn_begin`). Pre-fix, a job that failed before the
+    /// dispatcher reached `record_local_pending_tx` therefore never got a
+    /// receipt and `eth_getTransactionReceipt` stayed null forever. The writer
+    /// must seed
     /// the tx row from the inflight cache's retained envelope so the failure
     /// receipt (status:0x0) actually exists.
     #[tokio::test]

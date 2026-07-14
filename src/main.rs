@@ -1558,8 +1558,7 @@ mod hardening_tests {
     fn h6_strict_with_hostless_or_custom_scheme_refused_at_startup() {
         // `anvil:8545` parses as a custom scheme with host=None; `https://` and
         // `http://` are special schemes with an empty authority → url rejects
-        // them (no host). (Note `http:///x` is NOT hostless — url reads `x` as the
-        // host — so it is legitimately accepted and is not tested here.)
+        // them (no host).
         for bad in ["anvil:8545", "https://", "http://"] {
             let c = strict_cmd_with_rpc(bad);
             let reason = check_h6_evidence_source(&c).expect_err(bad);
