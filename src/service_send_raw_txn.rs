@@ -148,6 +148,40 @@ async fn record_local_success_at_block(
         .await
 }
 
+/// Write a durable REVERTED receipt (status `0x0`) for `tx_hash` at the current
+/// tip, with EMPTY logs. Used by the #55 "accept-and-revert" path: a claimAsset
+/// that targets an already-landed globalIndex is accepted (its nonce is
+/// consumed by the caller, exactly like a normal accept) but records a failed
+/// receipt instead of publishing a second CLAIM — the geth-faithful equivalent
+/// of the doomed tx MINING and reverting with `AlreadyClaimed`.
+///
+/// The receipt is shaped identically to the writer-worker's failure receipt
+/// (`writer_worker::write_failure_receipt`) — `txn_begin` (so `eth_getTransaction*`
+/// resolves the real tx + signer) followed by `txn_commit(Err(..))`, which
+/// `service_get_txn_receipt` renders as `status: 0x0` with every numeric field
+/// present (blockNumber/blockHash/transactionIndex/gasUsed/cumulativeGasUsed/
+/// effectiveGasPrice/from/to/logs=[]/logsBloom/type). aggkit's Go
+/// ethtxmanager/receipt unmarshaller then sees the monitored tx as MINED-but-
+/// failed and advances instead of re-broadcasting forever.
+///
+/// Crucially it emits NO ClaimEvent and NO synthetic log (the real landed
+/// claim's event is authoritative; getLogs immutability forbids a second event).
+async fn record_local_immediate_reverted(
+    service: &ServiceState,
+    tx_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    reason: String,
+) -> anyhow::Result<()> {
+    let block_num = service.store.get_latest_block_number().await?;
+    record_local_pending_tx(service, tx_hash, txn_envelope, signer, None, vec![]).await?;
+    let block_hash = service.block_state.get_block_hash(block_num);
+    service
+        .store
+        .txn_commit(tx_hash, Err(reason), block_num, block_hash)
+        .await
+}
+
 /// Handle a `claimAsset` transaction: skip zero-amount or publish the claim.
 ///
 /// RD-940 Phase 1: this is the unified dispatcher for both the legacy sync
@@ -187,6 +221,74 @@ pub(crate) async fn worker_handle_claim_asset(
     if params.amount.is_zero() {
         tracing::info!("skipping zero-amount claim (genesis batch)");
         record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![]).await?;
+        return Ok(());
+    }
+
+    // #55 — ACCEPT-AND-REVERT for an already-LANDED globalIndex (geth-faithful).
+    //
+    // Claims are permissionless: destination + amount are bound by the
+    // merkle-proven claimAsset calldata, so the sponsor (aggkit ClaimTxManager
+    // autoclaim) and a user (manual eth_sendRawTransaction) can BOTH target the
+    // same globalIndex, and dedup is keyed by globalIndex only (signer-agnostic).
+    // When a USER front-runs a gi the sponsor has already signed + persisted a
+    // monitored tx for, the sponsor later submits that (DIFFERENT-hash) tx. If we
+    // hard-reject it at the JSON-RPC layer ("already submitted"), the reject does
+    // NOT consume the sponsor's nonce: the proxy's expected-nonce and the
+    // sponsor's sequence permanently desync, ClaimTxManager re-broadcasts the
+    // pinned tx forever ("nonce mismatch"), every later sponsor claim queues
+    // behind it, and autoclaim dies un-healably (the monitored tx survives
+    // restarts).
+    //
+    // On real geth this never happens: the doomed claim MINES, reverts with
+    // `AlreadyClaimed`, and CONSUMES its nonce + gas, so ClaimTxManager marks it
+    // final and advances. Mirror that here: if a real ClaimEvent already exists
+    // for this globalIndex, ACCEPT the tx, write a durable REVERTED receipt
+    // (status 0x0, empty logs, NO new ClaimEvent), and return Ok so the caller
+    // CONSUMES the signer's nonce exactly like a normal accept — keeping the
+    // sponsor's sequence in lockstep.
+    //
+    // Scope / coexistence:
+    //   - This is reached ONLY after the RD-940 tx-hash dedup early-return (a
+    //     SAME-hash rebroadcast — including a resubmit of the REAL landed claim's
+    //     own tx — was already short-circuited to Ok(hash) upstream WITHOUT a new
+    //     receipt). So this fires only for a DIFFERENT tx (other signer/nonce)
+    //     targeting an already-landed gi.
+    //   - It is reached ONLY after the R4 nonce gate admitted the tx
+    //     (tx.nonce == expected). A future/stale-nonce landed claim never gets
+    //     here — it is waited/rejected by R4 first — so accept-and-revert can
+    //     NEVER paper over a real nonce gap.
+    //   - It runs BEFORE `acquire_claim_lock`: it neither takes nor releases the
+    //     claim lock, so the real landed claim's LANDED lock + ClaimEvent +
+    //     receipt are UNTOUCHED. `acquire_claim_lock`'s own LANDED hard-reject
+    //     stays as defense-in-depth for the narrow TOCTOU where a claim lands
+    //     between this check and the lock.
+    let gi_bytes: [u8; 32] = params.globalIndex.to_be_bytes::<32>();
+    if service
+        .store
+        .has_claim_event_for_global_index(&gi_bytes)
+        .await?
+    {
+        ::metrics::counter!("claim_landed_dedup_reverted_total").increment(1);
+        tracing::warn!(
+            global_index = %params.globalIndex,
+            eth_tx = %txn_hash,
+            signer = %signer,
+            "claim targets an already-landed globalIndex (a ClaimEvent already exists); \
+             accepting and writing a REVERTED receipt (status 0x0, no new event) so the \
+             submitter's nonce is consumed — geth-faithful AlreadyClaimed revert (#55). \
+             The real landed claim is untouched."
+        );
+        record_local_immediate_reverted(
+            service,
+            txn_hash,
+            txn_envelope,
+            signer,
+            format!(
+                "claim for globalIndex {} already landed (AlreadyClaimed); reverted (#55)",
+                params.globalIndex
+            ),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2116,6 +2218,355 @@ mod tests {
             rec.destination_address, someone_else,
             "funds are bound to the calldata's destination regardless of submitter"
         );
+    }
+
+    // ── #55 ACCEPT-AND-REVERT tests ─────────────────────────────────────
+    //
+    // A claimAsset targeting an already-LANDED globalIndex (a real ClaimEvent
+    // exists) from a DIFFERENT tx must be ACCEPTED with a reverted (status 0x0)
+    // receipt so the submitter's nonce is consumed — the geth-faithful
+    // AlreadyClaimed revert. This is what keeps the aggkit sponsor's nonce
+    // sequence in lockstep after a user front-runs a gi (#55).
+
+    /// Land a claim for `gi` directly on the store (lock + ClaimEvent), exactly
+    /// the state left behind by signer A's successful claim.
+    async fn land_claim_for(store: &std::sync::Arc<dyn crate::store::Store>, gi: U256) {
+        store.try_claim(gi).await.expect("A's submission locks gi");
+        store
+            .commit_manual_claim_event_atomic(
+                "accept-revert-landed-note".into(),
+                "0x00000000000000000000000000000000000000aa",
+                5,
+                [0u8; 32],
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+                gi.to_be_bytes::<32>(),
+                0,
+                &[0u8; 20],
+                &[0u8; 20],
+                1_000,
+            )
+            .await
+            .expect("landing A's ClaimEvent");
+    }
+
+    /// Test 1 — landed globalIndex + matching nonce + DIFFERENT signer →
+    /// ACCEPTED, hash returned, signer nonce consumed, a status-0x0 receipt is
+    /// retrievable via `eth_getTransactionReceipt` with EMPTY logs, NO new
+    /// ClaimEvent, and the real landed claim is untouched.
+    #[tokio::test]
+    async fn landed_gi_different_signer_accept_and_reverts() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let miden = service.miden_client.clone();
+        seed_zero_ger(&store).await;
+
+        let gi = U256::from(0x5501u64);
+        land_claim_for(&store, gi).await;
+        assert_eq!(count_claim_events(&store).await, 1, "A's ClaimEvent landed");
+
+        // Signer B — a DIFFERENT key — submits a full valid claim for the SAME
+        // gi at its expected nonce (0). Its hash is not in the store, so the
+        // RD-940 tx-hash dedup does not fire; it reaches the accept-and-revert.
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        let accepted = service_send_raw_txn(service.clone(), input_b)
+            .await
+            .expect("a landed-gi claim from a different signer must be ACCEPTED (accept-and-revert)");
+        assert_eq!(accepted, tx_b, "must return B's own tx hash");
+
+        // (1) B's nonce is CONSUMED — exactly like a normal accept.
+        assert_eq!(
+            store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(),
+            1,
+            "accept-and-revert must consume the signer's nonce"
+        );
+
+        // (2) A durable REVERTED receipt is retrievable, status 0x0, empty logs.
+        let receipt =
+            crate::service_get_txn_receipt::service_get_txn_receipt(service.clone(), format!("{tx_b:#x}"))
+                .await
+                .unwrap()
+                .expect("eth_getTransactionReceipt must return a non-null receipt");
+        assert!(
+            matches!(
+                receipt.inner.as_receipt().unwrap().status,
+                alloy::consensus::Eip658Value::Eip658(false)
+            ),
+            "receipt status must be 0x0 (reverted)"
+        );
+        assert!(
+            receipt.inner.as_receipt().unwrap().logs.is_empty(),
+            "the reverted receipt must carry EMPTY logs (no second event)"
+        );
+        assert_eq!(
+            receipt.from, addr_b,
+            "receipt.from must be the submitting signer"
+        );
+        assert_eq!(receipt.block_number, Some(store.get_latest_block_number().await.unwrap()));
+
+        // (3) NO new ClaimEvent was emitted — the real landed one is authoritative.
+        assert_eq!(
+            count_claim_events(&store).await,
+            1,
+            "accept-and-revert must NOT emit a second ClaimEvent"
+        );
+
+        // (4) B never reached the Miden publish, and the real claim's lock stands.
+        assert!(
+            !miden.test_was_called(),
+            "accept-and-revert must not publish a second CLAIM to Miden"
+        );
+        assert!(
+            store.is_claimed(&gi).await.unwrap(),
+            "the real landed claim's lock is untouched"
+        );
+        assert!(
+            store
+                .has_claim_event_for_global_index(&gi.to_be_bytes::<32>())
+                .await
+                .unwrap(),
+            "the real landed claim's ClaimEvent is untouched"
+        );
+    }
+
+    /// Test 2 — THE ANTI-WEDGE SEQUENCE (the core #55 regression). Signer S
+    /// submits gi=X (already landed) at nonce N → accepted+reverted, its
+    /// expected nonce advances to N+1; S then submits gi=Y (a normal,
+    /// not-yet-landed claim) at nonce N+1 → accepted normally. No desync / wedge.
+    ///
+    /// Without accept-and-revert the first tx would HARD-REJECT without
+    /// consuming the nonce, S's expected nonce would stay N, and the second tx
+    /// (nonce N+1) would fail the R4 gate with "nonce mismatch" forever — the
+    /// permanent autoclaim wedge. See the mutation-check note in the PR report.
+    #[tokio::test]
+    async fn anti_wedge_sequence_landed_then_normal_stays_in_lockstep() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        seed_zero_ger(&store).await;
+
+        // The sponsor key S.
+        let key_s = alloy::signers::local::PrivateKeySigner::random();
+        let addr_s = key_s.address();
+
+        // gi=X is already landed (a user front-ran it).
+        let gi_x = U256::from(0x5502u64);
+        land_claim_for(&store, gi_x).await;
+
+        // S submits its (persisted) monitored tx for gi=X at nonce 0.
+        let calldata_x = claim_calldata(gi_x, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_x, _tx_x) = encode_tx_signed_with_nonce(&key_s, calldata_x, 0);
+        service_send_raw_txn(service.clone(), input_x)
+            .await
+            .expect("landed gi=X must be accept-and-reverted, not rejected");
+        assert_eq!(
+            store.nonce_get(&format!("{addr_s:#x}")).await.unwrap(),
+            1,
+            "S's expected nonce must advance to 1 after accept-and-revert"
+        );
+
+        // S's NEXT claim gi=Y at nonce 1 — a normal claim (unresolvable dest so
+        // the unit harness completes it synchronously via the RD-860 swallow).
+        // The point is it PASSES the R4 nonce gate (nonce 1 == expected 1).
+        let gi_y = U256::from(0x5503u64);
+        let calldata_y = claim_calldata(gi_y, Address::from([0x99u8; 20]), U256::from(1_000_000u64));
+        let (input_y, _tx_y) = encode_tx_signed_with_nonce(&key_s, calldata_y, 1);
+        let res_y = service_send_raw_txn(service.clone(), input_y).await;
+        assert!(
+            res_y.is_ok(),
+            "S's next claim at nonce 1 must be accepted (NO wedge): {res_y:?}"
+        );
+        assert!(
+            !format!("{:?}", res_y).contains("nonce mismatch"),
+            "the sequence must not produce a nonce-mismatch wedge"
+        );
+        assert_eq!(
+            store.nonce_get(&format!("{addr_s:#x}")).await.unwrap(),
+            2,
+            "S's nonce advances to 2 — perfectly in lockstep, no desync"
+        );
+    }
+
+    /// Test 3 — RD-940 idempotent rebroadcast in the accept-and-revert context:
+    /// resubmitting the SAME tx-hash (the aggkit ethtxmanager re-broadcast) must
+    /// return the same hash via the tx-hash dedup and must NOT create a second /
+    /// new receipt or advance the nonce again.
+    #[tokio::test]
+    async fn accept_and_revert_rebroadcast_same_hash_no_duplicate_receipt() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        seed_zero_ger(&store).await;
+
+        let gi = U256::from(0x5504u64);
+        land_claim_for(&store, gi).await;
+
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        // First submission → accept-and-revert (reverted receipt written).
+        let first = service_send_raw_txn(service.clone(), input_b.clone())
+            .await
+            .expect("first submit accept-and-reverts");
+        assert_eq!(first, tx_b);
+        assert_eq!(store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(), 1);
+        let (r1, _b1) = store
+            .txn_receipt(tx_b)
+            .await
+            .unwrap()
+            .expect("a receipt exists after accept-and-revert");
+        assert!(r1.is_err(), "the receipt is a revert (status 0x0)");
+
+        // Re-broadcast the SAME wire bytes → RD-940 tx-hash dedup returns the
+        // same hash WITHOUT a new accept-and-revert (nonce unchanged, still one
+        // receipt, still exactly one ClaimEvent).
+        let second = service_send_raw_txn(service.clone(), input_b)
+            .await
+            .expect("re-broadcast must dedup to the same hash");
+        assert_eq!(second, tx_b, "dedup returns the original hash");
+        assert_eq!(
+            store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(),
+            1,
+            "a same-hash rebroadcast must NOT advance the nonce again"
+        );
+        assert_eq!(
+            count_claim_events(&store).await,
+            1,
+            "no second ClaimEvent from the rebroadcast"
+        );
+    }
+
+    /// Test 4a — a landed-gi claim whose nonce is STALE must still be rejected by
+    /// the R4 gate (NOT accept-and-reverted). accept-and-revert must never paper
+    /// over a real nonce gap.
+    #[tokio::test]
+    async fn landed_gi_stale_nonce_still_rejected_not_reverted() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        seed_zero_ger(&store).await;
+
+        let gi = U256::from(0x5505u64);
+        land_claim_for(&store, gi).await;
+
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        // Advance B's tracked nonce so a nonce-0 tx is stale.
+        for _ in 0..5 {
+            store
+                .nonce_increment(&format!("{addr_b:#x}"))
+                .await
+                .unwrap();
+        }
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        let err = service_send_raw_txn(service.clone(), input_b)
+            .await
+            .expect_err("a stale-nonce landed claim must be rejected by R4, not accept-and-reverted");
+        assert!(
+            err.to_string().contains("nonce mismatch"),
+            "must be the R4 nonce-mismatch rejection, not an accept: {err:#}"
+        );
+        // No receipt was written (it was rejected, not accept-and-reverted).
+        assert!(
+            store.txn_receipt(tx_b).await.unwrap().is_none(),
+            "a rejected stale-nonce claim must NOT leave a receipt"
+        );
+    }
+
+    /// Test 4b — a landed-gi claim whose nonce is in the FUTURE (writer-worker
+    /// mode) must take the normal R4 retryable future-nonce WAIT, not
+    /// accept-and-revert immediately. Proves accept-and-revert only fires for a
+    /// tx the R4 gate would otherwise admit (nonce == expected).
+    #[tokio::test]
+    async fn landed_gi_future_nonce_waits_not_reverted() {
+        let mut service = create_test_service();
+        let store = service.store.clone();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service.enable_writer_worker = true;
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+        seed_zero_ger(&store).await;
+
+        let gi = U256::from(0x5506u64);
+        land_claim_for(&store, gi).await;
+
+        // Submit at nonce 1 while expected is 0 → future nonce → must WAIT.
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, _tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 1);
+
+        let svc = service.clone();
+        let pending = tokio::spawn(async move { service_send_raw_txn(svc, input_b).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !pending.is_finished(),
+            "a future-nonce landed claim must WAIT on R4, not short-circuit to accept-and-revert"
+        );
+        pending.abort();
+        let _ = shutdown.send(());
+    }
+
+    /// Test 5 — async-writer-mode variant of Test 1: a landed-gi claim from a
+    /// DIFFERENT signer, enqueued to the writer worker, is accept-and-reverted
+    /// by the worker (reverted receipt, no second ClaimEvent), and the nonce is
+    /// consumed at enqueue time (RD-940 flow).
+    #[tokio::test]
+    async fn landed_gi_accept_and_revert_async_writer_mode() {
+        let mut service = create_test_service();
+        let store = service.store.clone();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service.enable_writer_worker = true;
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+        seed_zero_ger(&store).await;
+
+        let gi = U256::from(0x5507u64);
+        land_claim_for(&store, gi).await;
+        assert_eq!(count_claim_events(&store).await, 1);
+
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        let accepted = service_send_raw_txn(service.clone(), input_b)
+            .await
+            .expect("enqueue must return the tx hash");
+        assert_eq!(accepted, tx_b);
+        // Nonce consumed at enqueue (RD-940 flow).
+        assert_eq!(store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(), 1);
+
+        // Poll for the worker to write the reverted receipt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some((result, _b)) = store.txn_receipt(tx_b).await.unwrap() {
+                assert!(
+                    result.is_err(),
+                    "the async accept-and-revert receipt must be status 0x0"
+                );
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("worker did not write the reverted receipt within 10s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            count_claim_events(&store).await,
+            1,
+            "async accept-and-revert must NOT emit a second ClaimEvent"
+        );
+        let _ = shutdown.send(());
     }
 
     /// No double-submit race: a record YOUNGER than the TTL (a submission genuinely in

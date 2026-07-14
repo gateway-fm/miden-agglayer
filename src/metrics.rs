@@ -70,6 +70,15 @@ pub fn init_metrics() {
          and the sponsor's resubmission accepted. Nonzero after a crash in the submit window is \
          the recovery WORKING; a steady climb without restarts means claims are failing to land."
     );
+    describe_counter!(
+        "claim_landed_dedup_reverted_total",
+        "#55 accept-and-revert: a claimAsset targeting an ALREADY-LANDED globalIndex (a real \
+         ClaimEvent already exists) was ACCEPTED with a reverted (status 0x0) receipt instead of \
+         hard-rejected at the JSON-RPC layer — so the submitter's nonce is consumed, geth-faithful \
+         AlreadyClaimed. Nonzero means a sponsor/user cross-claimed the same gi and the sponsor's \
+         nonce sequence was kept in lockstep (autoclaim NOT wedged). A steady climb means heavy \
+         claim front-running, not a bug."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",

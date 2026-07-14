@@ -519,6 +519,21 @@ sponsor_nonce() {
         | python3 -c "import json,sys; print(int(json.load(sys.stdin)['result'],16))"
 }
 
+# ── #55 accept-and-revert observability ──────────────────────────────────────
+# The proxy exposes Prometheus counters on the L2_RPC port's /metrics. The
+# `claim_landed_dedup_reverted_total` counter increments each time a claimAsset
+# targeting an ALREADY-LANDED globalIndex is ACCEPTED with a reverted (status
+# 0x0) receipt instead of hard-rejected — the geth-faithful AlreadyClaimed that
+# keeps the sponsor's nonce sequence in lockstep. metric_value reads it (missing
+# => 0, it is only emitted after the first increment); an unreachable /metrics is
+# a HARD fail — a down proxy must not read as "0" (task #26 sweep lesson).
+DEDUP_METRIC="claim_landed_dedup_reverted_total"
+metric_value() { # <metric-name>
+    local body
+    body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
+    awk -v n="$1" '$1==n{print $2; f=1; exit} END{if(!f)print 0}' <<<"$body" | sed 's/\..*//'
+}
+
 # send_sponsor_noop <nonce> — consume one sponsor nonce with a ZERO-AMOUNT
 # claimAsset. The proxy accepts zero-amount claims synchronously and RPC-only
 # (worker_handle_claim_asset: "skipping zero-amount claim" — no Miden publish,
@@ -630,9 +645,88 @@ verify_sponsor_functional() {
     pass "sponsor is functional ($label): fresh deposit gi=$vgi autoclaimed by the sponsor (tx $t)"
 }
 
+# verify_sponsor_recovers_automatically <label> — the HARD #55 regression. After
+# the user front-ran a globalIndex the sponsor had already signed + persisted a
+# monitored tx for, the sponsor is wedged PRE-FIX: its doomed tx is hard-rejected
+# at RPC ("already submitted") without consuming its nonce, so ClaimTxManager
+# re-broadcasts forever ("nonce mismatch") and every later claim queues behind
+# it. WITH the #55 accept-and-revert fix the sponsor recovers on its own: when it
+# re-broadcasts the doomed tx (the gi has since LANDED), the proxy ACCEPTS it and
+# writes a reverted (status 0x0) receipt, consuming the nonce, so ethtxmanager
+# marks it mined-failed and advances — geth-faithful AlreadyClaimed.
+#
+# This asserts that recovery WITHOUT ANY MANUAL HEAL (deliberately NO
+# drain_sponsor_wedge / zero-amount no-ops — the whole point is the fix heals it
+# for us):
+#   1. a fresh deposit the user never touches is autoclaimed BY THE SPONSOR
+#      within a bound (pre-fix this hangs forever → the regression);
+#   2. no PERMANENT nonce-mismatch wedge — after a settle window the sponsor's
+#      account nonce has advanced and there is ZERO fresh sponsor nonce-mismatch
+#      spam in the most recent proxy-log window (transient mismatches DURING the
+#      heal are expected; a permanent wedge is a continuous stream);
+#   3. the `claim_landed_dedup_reverted_total` metric incremented over the run —
+#      positive proof the recovery came via accept-and-revert, not luck.
+verify_sponsor_recovers_automatically() {
+    local label="$1" vgi deadline now c t nonce_a nonce_b settle_ts fresh_mismatch dedup_after
+    step "Sponsor AUTO-recovery ($label) — #55: fresh deposit MUST autoclaim with NO manual heal"
+    do_l1_deposit
+    fetch_deposit_json "$L1_DEP_CNT" 300
+    vgi=$(echo "$DEP_JSON" | dep_field global_index)
+    log "auto-recovery deposit: cnt=$L1_DEP_CNT gi=$vgi (user will NOT claim it; NO nonce drain will be issued)"
+
+    # NO drain_sponsor_wedge here — the fix must heal the sponsor by itself.
+    deadline=$(( $(date +%s) + 600 ))
+    while :; do
+        read -r c t <<<"$(claim_events_for_gi "$vgi" || echo "0 -")"
+        [[ "${c:-0}" -ge 1 ]] && break
+        now=$(date +%s)
+        (( now >= deadline )) \
+            && fail "sponsor never autoclaimed gi=$vgi within 600s WITHOUT a manual heal — sponsor did NOT auto-recover from the front-run wedge (#55 regression)"
+        log "auto-recovery claim not landed yet — waiting on the sponsor to self-heal ($(( deadline - now ))s left)"
+        sleep 10
+    done
+
+    read -r c t <<<"$(claim_events_for_gi "$vgi")"
+    [[ "$c" == "1" ]] || fail "expected exactly 1 ClaimEvent for auto-recovery gi=$vgi, got $c"
+    wait_for "auto-recovery claim receipt (status 0x1)" "receipt_status_ok '$t'" 300 5
+    assert_receipt_signer "$t" "$SPONSOR_ADDR_LC" "SPONSOR"
+    pass "sponsor AUTO-recovered ($label): fresh deposit gi=$vgi autoclaimed by the sponsor (tx $t), NO manual heal"
+
+    # (2) No PERMANENT nonce-mismatch wedge. Settle, then require ZERO fresh
+    # sponsor nonce-mismatch lines in the most-recent window (ANSI-strip;
+    # `--tail` seeks from the END — reliable on long-lived stacks, unlike
+    # `--since` which can truncate at a corrupt entry).
+    nonce_a=$(sponsor_nonce)
+    sleep 15
+    nonce_b=$(sponsor_nonce)
+    settle_ts=$(date -u +%Y-%m-%dT%H:%M:%S)
+    sleep 15
+    fresh_mismatch=$(docker logs --tail 8000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
+        | awk -v ts="$settle_ts" '$1 >= ts' \
+        | grep -cE "nonce mismatch for $SPONSOR_ADDR_LC" || true)
+    log "sponsor nonce: before-settle=$nonce_a after-settle=$nonce_b; fresh nonce-mismatch lines since settle=$fresh_mismatch"
+    [[ "${fresh_mismatch:-0}" -eq 0 ]] \
+        || fail "sponsor STILL emitting nonce-mismatch spam ($fresh_mismatch lines in ~15s after a settle) — permanent wedge NOT healed (#55 regression)"
+    pass "no permanent sponsor nonce-mismatch wedge ($label): 0 fresh mismatch lines since settle"
+
+    # (3) The accept-and-revert metric incremented over the run — positive proof
+    # the sponsor's doomed tx was accept-and-reverted (nonce consumed), i.e. the
+    # recovery came through the #55 fix.
+    dedup_after=$(metric_value "$DEDUP_METRIC")
+    log "$DEDUP_METRIC: baseline=$DEDUP_BEFORE now=$dedup_after"
+    [[ "$dedup_after" -gt "$DEDUP_BEFORE" ]] \
+        || fail "$DEDUP_METRIC did not increment ($DEDUP_BEFORE → $dedup_after) — the sponsor's already-landed claim was NOT accept-and-reverted; recovery was not via the #55 fix"
+    pass "$DEDUP_METRIC incremented ($DEDUP_BEFORE → $dedup_after): sponsor's landed-gi claim was accepted-and-reverted"
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Leg 1 — manual user claim (user submits instead of waiting for the sponsor)
 # ══════════════════════════════════════════════════════════════════════════════
+# #55 — snapshot the accept-and-revert counter BEFORE any front-run so the
+# inter-leg auto-recovery assertion can prove it incremented.
+DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
+log "baseline $DEDUP_METRIC = $DEDUP_BEFORE"
+
 step "Leg 1 — deposit L1→L2, then the USER claims it manually"
 
 LEG1_GI=""; LEG1_TX=""
@@ -686,13 +780,14 @@ assert_receipt_signer "$LEG1_TX" "$USER_ADDR_LC" "USER"
 wait_balance_exact "$((DEPOSITS_SENT * EXPECTED_UNITS_PER_DEPOSIT))"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Between the legs — heal the sponsor the leg-1 front-run just wedged, and
-# HARD-verify it works, so leg 2 races a live sponsor (not a corpse whose head
-# nonce is stuck on the leg-1 gi).
+# Between the legs — #55 REGRESSION: the leg-1 front-run wedged the sponsor's
+# head nonce (it signed + persisted its own claim tx for the raced gi). PRE-FIX
+# this was un-healable without operator intervention (drain_sponsor_wedge
+# consuming the wedged nonces by hand). WITH the accept-and-revert fix the
+# sponsor RECOVERS AUTOMATICALLY — HARD-assert that, WITHOUT any manual heal, so
+# leg 2 races a genuinely self-healed sponsor (and #55 stays fixed forever).
 # ══════════════════════════════════════════════════════════════════════════════
-step "Inter-leg sponsor heal — leg 2 needs a LIVE sponsor to race"
-drain_sponsor_wedge 10
-verify_sponsor_functional "inter-leg"
+verify_sponsor_recovers_automatically "inter-leg"
 wait_balance_exact "$((DEPOSITS_SENT * EXPECTED_UNITS_PER_DEPOSIT))"
 
 # ══════════════════════════════════════════════════════════════════════════════
