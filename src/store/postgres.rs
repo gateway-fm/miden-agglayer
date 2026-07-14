@@ -773,16 +773,34 @@ impl Store for PgStore {
         // any partial log inserts.
         let tx = client.transaction().await?;
 
-        tx.execute(
-            "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
-            &[
-                &status,
-                &error_msg as &(dyn ToSql + Sync),
-                &(block_num as i64),
-                &hash_str,
-            ],
-        )
-        .await?;
+        let updated = tx
+            .execute(
+                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
+                &[
+                    &status,
+                    &error_msg as &(dyn ToSql + Sync),
+                    &(block_num as i64),
+                    &hash_str,
+                ],
+            )
+            .await?;
+
+        // PR #127 review — finalising a transaction that has no `txn_begin`
+        // row must be an ERROR, matching `InMemoryStore::txn_commit`
+        // ("transaction {tx_hash} not found"). Pre-fix this UPDATE silently
+        // affected zero rows and the method still committed the synthetic
+        // logs below and returned Ok — so a projector racing a submitter
+        // could "finalise" a receipt that was never durably begun, and the
+        // late `txn_begin` would then park the real receipt as pending
+        // forever. Every caller either creates the row first or explicitly
+        // tolerates this error (`project_ger_note` / `project_claim_note`
+        // use `let _ = ... inspect_err`, the pending/expiry sweeps log and
+        // continue), so erroring here is safe and makes the two stores
+        // behave identically. Bailing before `tx.commit()` rolls the whole
+        // transaction back — no partial log/counter writes escape.
+        if updated == 0 {
+            anyhow::bail!("PgStore: transaction {tx_hash} not found");
+        }
 
         if result.is_ok() {
             // C11 — fold the latest_block_number advance into the same

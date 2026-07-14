@@ -1707,6 +1707,29 @@ mod tests {
         assert_eq!(block_num, 42);
     }
 
+    /// PR #127 follow-up — the memory/postgres `txn_commit` contract:
+    /// finalising a transaction that has no `txn_begin` row is an ERROR, not
+    /// a silent no-op. The PgStore twin lives in
+    /// `postgres_tests::test_pgstore_txn_commit_missing_row_errors`; the two
+    /// stores must behave identically so a projector racing a submitter can
+    /// never "finalise" zero rows and leave a late-begun receipt pending
+    /// forever.
+    #[tokio::test]
+    async fn test_txn_commit_missing_row_errors() {
+        let store = InMemoryStore::new();
+        let tx_hash = TxHash::from([0x77u8; 32]);
+        let err = store
+            .txn_commit(tx_hash, Ok(()), 42, [0u8; 32])
+            .await
+            .expect_err("txn_commit without a prior txn_begin must error");
+        assert!(
+            err.to_string().contains("not found"),
+            "error must identify the missing row, got: {err:#}"
+        );
+        // And it must not have invented a receipt.
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn test_address_mappings() {
         let store = InMemoryStore::new();
