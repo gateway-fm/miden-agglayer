@@ -413,6 +413,43 @@ async fn test_pgstore_txn_failure() {
     assert_eq!(receipt.0.unwrap_err(), "test error");
 }
 
+/// PR #127 follow-up — `txn_commit` on a tx_hash with no `txn_begin` row must
+/// ERROR (matching `InMemoryStore::txn_commit`), not silently update zero
+/// rows and return Ok. Pre-fix the zero-row UPDATE was invisible: a projector
+/// racing the GER submitter could "finalise" a receipt whose row didn't exist
+/// yet, and the late `txn_begin` then left the real receipt pending forever.
+/// Memory twin: `memory::tests::test_txn_commit_missing_row_errors`.
+/// PG-gated: skips when `DATABASE_URL` is unset; runs in the postgres-feature CI.
+#[tokio::test]
+async fn test_pgstore_txn_commit_missing_row_errors() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let tx_hash = TxHash::from([0xDDu8; 32]);
+    // No txn_begin for this hash.
+    let err = store
+        .txn_commit(tx_hash, Ok(()), 7, [0u8; 32])
+        .await
+        .expect_err("txn_commit without a prior txn_begin must error");
+    assert!(
+        err.to_string().contains("not found"),
+        "error must identify the missing row, got: {err:#}"
+    );
+    // The bail happens before tx.commit(): no receipt, no leaked synthetic
+    // logs or log-counter advance from the rolled-back transaction.
+    assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+    assert!(store.txn_get(tx_hash).await.unwrap().is_none());
+
+    // The failure-status flavour must error identically (same UPDATE).
+    let err = store
+        .txn_commit(tx_hash, Err("boom".to_string()), 7, [0u8; 32])
+        .await
+        .expect_err("failed-status txn_commit without a row must also error");
+    assert!(err.to_string().contains("not found"));
+}
+
 // ── Nonces ───────────────────────────────────────────────────
 
 #[tokio::test]
