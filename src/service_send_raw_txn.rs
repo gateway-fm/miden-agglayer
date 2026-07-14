@@ -607,15 +607,29 @@ async fn dispatch_after_reservation(
             ensure_claim_ger_published(&service.store, params).await?;
         }
 
+        // BLOCKER B — order MUST be reserve → nonce_advance_cas → enqueue. If the
+        // CAS ran AFTER a successful `try_enqueue`, a CAS store error would leave the
+        // job LIVE (enqueued, will execute) with a STALE nonce, and the outer
+        // reservation would be marked `released_failure` — so an immediate same-hash
+        // retry could retake the lease and enqueue DUPLICATE work. Advancing the
+        // nonce FIRST means a CAS failure aborts admission with NO enqueued job and
+        // NO nonce change.
+        //
+        // To keep genuine backpressure retryable with the SAME nonce, fast-fail
+        // QueueFull BEFORE the CAS when the queue is already full (the common case);
+        // only a rare fill-in-the-gap TOCTOU (queue fills between this check and
+        // try_enqueue) consumes the nonce — the geth-like consumed-nonce semantics,
+        // never an enqueue-then-fail-the-nonce.
+        if handle.available_capacity() == 0 {
+            return Err(crate::writer_worker::WriterQueueSaturatedError.into());
+        }
+        let _ = service
+            .store
+            .nonce_advance_cas(signer_str, tx_nonce)
+            .await?;
         let job = decoded.into_job(txn_envelope, signer, txn_hash);
         match handle.try_enqueue(job) {
-            Ok(()) => {
-                let _ = service
-                    .store
-                    .nonce_advance_cas(signer_str, tx_nonce)
-                    .await?;
-                Ok(txn_hash)
-            }
+            Ok(()) => Ok(txn_hash),
             Err(crate::writer_worker::TryEnqueueError::QueueFull) => {
                 Err(crate::writer_worker::WriterQueueSaturatedError.into())
             }
@@ -3644,6 +3658,153 @@ mod tests {
         );
         // Did NOT execute: nonce not advanced.
         assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+    }
+
+    /// BLOCKER A — state-FIRST takeover: a DIFFERENT tx may take over a slot whose
+    /// holder FAILED or whose lease EXPIRED (nonce NOT consumed), but is HARD-rejected
+    /// while the holder is executing under a valid lease or already released_success
+    /// (nonce consumed / in flight).
+    #[tokio::test]
+    async fn blocker_a_different_tx_takes_over_failed_or_expired_slot() {
+        use crate::store::NonceReservation;
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let addr = "0x00000000000000000000000000000000000000aa";
+        let ha = TxHash::from([0xa1u8; 32]);
+        let hb = TxHash::from([0xb2u8; 32]);
+        let lease = std::time::Duration::from_secs(90);
+
+        // (1) released_FAILURE slot → a DIFFERENT tx takes over (fence bumps).
+        let NonceReservation::Won { fence } =
+            store.reserve_nonce(addr, 1, ha, lease).await.unwrap()
+        else {
+            panic!("fresh must Win");
+        };
+        store
+            .release_reservation(addr, 1, ha, fence, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                store.reserve_nonce(addr, 1, hb, lease).await.unwrap(),
+                NonceReservation::Won { .. }
+            ),
+            "a DIFFERENT tx must take over a released_failure slot (nonce not consumed)"
+        );
+
+        // (2) EXPIRED lease → a DIFFERENT tx takes over.
+        assert!(matches!(
+            store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
+        concrete.test_expire_reservation_lease(addr, 2);
+        assert!(
+            matches!(
+                store.reserve_nonce(addr, 2, hb, lease).await.unwrap(),
+                NonceReservation::Won { .. }
+            ),
+            "a DIFFERENT tx must take over an EXPIRED slot (owner crashed, nonce not consumed)"
+        );
+
+        // (3) executing + VALID lease → a DIFFERENT tx is HARD-REJECTED (in flight).
+        assert!(matches!(
+            store.reserve_nonce(addr, 3, ha, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
+        assert_eq!(
+            store.reserve_nonce(addr, 3, hb, lease).await.unwrap(),
+            NonceReservation::HeldByOther(ha),
+            "a valid/executing holder must still reject a different tx"
+        );
+
+        // (4) released_SUCCESS → a DIFFERENT tx is HARD-REJECTED (nonce consumed).
+        let NonceReservation::Won { fence: f4 } =
+            store.reserve_nonce(addr, 4, ha, lease).await.unwrap()
+        else {
+            panic!("fresh must Win");
+        };
+        store
+            .release_reservation(addr, 4, ha, f4, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.reserve_nonce(addr, 4, hb, lease).await.unwrap(),
+            NonceReservation::HeldByOther(ha),
+            "a released_success holder (nonce consumed) must reject a different tx"
+        );
+    }
+
+    /// BLOCKER B — writer mode advances the nonce (CAS) BEFORE enqueue. A nonce-CAS
+    /// store FAILURE must leave NO enqueued job and the nonce UNCHANGED; a successful
+    /// admission advances the nonce exactly once AND enqueues the job.
+    #[tokio::test]
+    async fn blocker_b_writer_cas_before_enqueue() {
+        // Happy path: exactly-once advance + job enqueued.
+        let mut service = create_test_service();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        let handle = std::sync::Arc::new(handle);
+        service.enable_writer_worker = true;
+        service.writer_handle = Some(handle.clone());
+        let store = service.store.clone();
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xB1u8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+        let signer_str = format!("{signer:#x}");
+        let tx_hash = service_send_raw_txn(service, input_hex)
+            .await
+            .expect("enqueue must succeed");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            1,
+            "a won CAS advances the nonce exactly once"
+        );
+        assert!(handle.is_inflight(&tx_hash), "the job must be enqueued");
+        let _ = shutdown.send(());
+
+        // CAS-FAILURE path: no enqueued job, nonce unchanged.
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let mut service2 = crate::test_helpers::create_test_service_with_store(concrete.clone());
+        let (handle2, shutdown2) = crate::writer_worker::WriterWorker::spawn(
+            service2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        let handle2 = std::sync::Arc::new(handle2);
+        service2.enable_writer_worker = true;
+        service2.writer_handle = Some(handle2.clone());
+
+        // Arm a one-shot CAS store failure.
+        concrete.test_fail_next_nonce_cas();
+        let calldata2 = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xB2u8; 32]),
+        }
+        .abi_encode();
+        let (input_hex2, signer2) = encode_legacy_tx(calldata2);
+        let err = service_send_raw_txn(service2, input_hex2)
+            .await
+            .expect_err("a nonce-CAS store failure must abort admission");
+        assert!(
+            err.to_string().contains("simulated nonce_advance_cas"),
+            "unexpected: {err:#}"
+        );
+        assert_eq!(
+            concrete.nonce_get(&format!("{signer2:#x}")).await.unwrap(),
+            0,
+            "the nonce must be UNCHANGED after a pre-enqueue CAS failure"
+        );
+        assert_eq!(
+            handle2.inflight_len(),
+            0,
+            "NO job may be enqueued when the CAS failed before enqueue"
+        );
+        let _ = shutdown2.send(());
     }
 
     /// BLOCKER 2 — the reclaim-SUCCESS window. A gi whose lock is EXPIRED but which

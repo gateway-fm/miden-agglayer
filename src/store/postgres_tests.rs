@@ -1877,3 +1877,61 @@ async fn test_pgstore_reverted_receipt_conditional() {
         "an absent hash gets the reverted (status 0x0) receipt"
     );
 }
+
+/// BLOCKER A — state-FIRST takeover on PgStore: a DIFFERENT tx takes over a
+/// released_failure or EXPIRED slot (nonce not consumed), but is hard-rejected while
+/// the holder is executing under a valid lease or released_success.
+#[tokio::test]
+async fn test_pgstore_different_tx_takeover() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let lease = std::time::Duration::from_secs(90);
+    let base = rand_u64();
+    let addr = format!("0x{:040x}", base as u128);
+    let ha = TxHash::from([(base % 251) as u8 + 10; 32]);
+    let hb = TxHash::from([(base % 241) as u8 + 11; 32]);
+
+    // released_FAILURE → a DIFFERENT tx takes over.
+    let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 1, ha, lease).await.unwrap()
+    else {
+        panic!("fresh must Win");
+    };
+    store
+        .release_reservation(&addr, 1, ha, fence, false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store.reserve_nonce(&addr, 1, hb, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ),
+        "a DIFFERENT tx must take over a released_failure slot"
+    );
+
+    // executing + VALID lease → a DIFFERENT tx is HARD-REJECTED.
+    assert!(matches!(
+        store.reserve_nonce(&addr, 2, ha, lease).await.unwrap(),
+        NonceReservation::Won { .. }
+    ));
+    assert_eq!(
+        store.reserve_nonce(&addr, 2, hb, lease).await.unwrap(),
+        NonceReservation::HeldByOther(ha)
+    );
+
+    // released_SUCCESS → a DIFFERENT tx is HARD-REJECTED (nonce consumed).
+    let NonceReservation::Won { fence: f3 } =
+        store.reserve_nonce(&addr, 3, ha, lease).await.unwrap()
+    else {
+        panic!("fresh must Win");
+    };
+    store
+        .release_reservation(&addr, 3, ha, f3, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reserve_nonce(&addr, 3, hb, lease).await.unwrap(),
+        NonceReservation::HeldByOther(ha)
+    );
+}

@@ -64,6 +64,10 @@ pub struct InMemoryStore {
     // #55 BLOCKER 1 — (signer, nonce) → fenced admission-lease reservations.
     nonce_reservations: RwLock<HashMap<(String, u64), Reservation>>,
 
+    // #55 BLOCKER B test hook: when true, the NEXT `nonce_advance_cas` returns a
+    // store error (simulating a DB failure on the CAS). Always false in production.
+    test_fail_next_nonce_cas: std::sync::atomic::AtomicBool,
+
     // Claims — value = when `try_claim` acquired the lock (as read from
     // `claim_clock_now`), so orphaned records (crash between the lock write and
     // the CLAIM landing) can be superseded after a TTL (`try_reclaim_expired`,
@@ -158,6 +162,7 @@ impl InMemoryStore {
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
             nonce_reservations: RwLock::new(HashMap::new()),
+            test_fail_next_nonce_cas: std::sync::atomic::AtomicBool::new(false),
             claimed: RwLock::new(HashMap::new()),
             #[cfg(test)]
             claim_clock_skew: RwLock::new(std::time::Duration::ZERO),
@@ -221,6 +226,14 @@ impl InMemoryStore {
     #[cfg(test)]
     pub fn test_land_gi_after_next_has_claim_miss(&self, global_index: [u8; 32]) {
         *self.test_land_after_next_has_claim_miss.write() = Some(global_index);
+    }
+
+    /// Test hook (#55 BLOCKER B): arm the store so the NEXT `nonce_advance_cas`
+    /// returns a store error, simulating a DB failure on the nonce CAS.
+    #[cfg(test)]
+    pub fn test_fail_next_nonce_cas(&self) {
+        self.test_fail_next_nonce_cas
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test hook (#55 BLOCKER 1): force the admission lease for `(addr, nonce)` to
@@ -756,6 +769,13 @@ impl Store for InMemoryStore {
     }
 
     async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool> {
+        // BLOCKER B test hook — one-shot simulated CAS store failure.
+        if self
+            .test_fail_next_nonce_cas
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated nonce_advance_cas store failure (test hook)");
+        }
         let key = addr.to_lowercase();
         let mut nonces = self.nonces.write();
         let cur = nonces.entry(key).or_insert(0);
@@ -778,7 +798,8 @@ impl Store for InMemoryStore {
         let key = (addr.to_lowercase(), nonce);
         let now = std::time::Instant::now();
         let mut reservations = self.nonce_reservations.write();
-        match reservations.get(&key) {
+        let existing = reservations.get(&key).cloned();
+        match existing {
             None => {
                 reservations.insert(
                     key,
@@ -791,10 +812,12 @@ impl Store for InMemoryStore {
                 );
                 Ok(NonceReservation::Won { fence: 1 })
             }
-            Some(r) if r.tx_hash != tx_hash => Ok(NonceReservation::HeldByOther(r.tx_hash)),
             Some(r) => {
-                // Same tx. Owned+executing under a valid lease, or released_success →
-                // dedup. Expired lease or released_failure → takeover (fence++).
+                // STATE-FIRST (BLOCKER A): a holder that FAILED or whose lease EXPIRED
+                // consumed NO nonce, so the slot is free for takeover by ANY tx — the
+                // SAME tx (retry) OR a DIFFERENT tx. A holder that is executing under a
+                // valid lease, or already released_success, has consumed the nonce / is
+                // in flight, so a DIFFERENT tx hard-rejects and the SAME tx dedups.
                 let takeover = matches!(r.state, ReservationState::ReleasedFailure)
                     || (r.state == ReservationState::Executing && r.lease_expires_at <= now);
                 if takeover {
@@ -809,8 +832,10 @@ impl Store for InMemoryStore {
                         },
                     );
                     Ok(NonceReservation::Won { fence })
-                } else {
+                } else if r.tx_hash == tx_hash {
                     Ok(NonceReservation::OwnedBySame)
+                } else {
+                    Ok(NonceReservation::HeldByOther(r.tx_hash))
                 }
             }
         }

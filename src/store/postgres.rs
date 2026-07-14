@@ -1161,31 +1161,47 @@ impl Store for PgStore {
             }
             Some(row) => {
                 let row_hash: String = row.get(0);
-                if !row_hash.eq_ignore_ascii_case(&hash_str) {
-                    let other =
-                        <TxHash as std::str::FromStr>::from_str(&row_hash).unwrap_or_default();
-                    NonceReservation::HeldByOther(other)
-                } else {
-                    let state: String = row.get(1);
-                    let expired: bool = row.get(2);
-                    let fence: i64 = row.get(3);
-                    let takeover = state == "released_failure" || (state == "executing" && expired);
-                    if takeover {
-                        let new_fence = fence + 1;
-                        tx.execute(
-                            "UPDATE nonce_reservations SET state = 'executing',
-                             lease_expires_at = now() + ($3 || ' seconds')::interval,
-                             fence_token = $4
-                             WHERE signer = $1 AND nonce = $2",
-                            &[&key, &(nonce as i64), &lease_secs.to_string(), &new_fence],
-                        )
-                        .await?;
-                        NonceReservation::Won {
-                            fence: new_fence as u64,
-                        }
-                    } else {
-                        NonceReservation::OwnedBySame
+                let state: String = row.get(1);
+                let expired: bool = row.get(2);
+                let fence: i64 = row.get(3);
+                // STATE-FIRST (BLOCKER A): a holder that FAILED or whose lease EXPIRED
+                // consumed NO nonce, so the slot is free for takeover by ANY tx (the
+                // SAME tx retrying OR a DIFFERENT tx). Executing-under-valid-lease or
+                // released_success means the nonce is consumed / in flight → a
+                // DIFFERENT tx hard-rejects, the SAME tx dedups.
+                let takeover = state == "released_failure" || (state == "executing" && expired);
+                if takeover {
+                    let new_fence = fence + 1;
+                    tx.execute(
+                        "UPDATE nonce_reservations SET tx_hash = $5, state = 'executing',
+                         lease_expires_at = now() + ($3 || ' seconds')::interval,
+                         fence_token = $4
+                         WHERE signer = $1 AND nonce = $2",
+                        &[
+                            &key,
+                            &(nonce as i64),
+                            &lease_secs.to_string(),
+                            &new_fence,
+                            &hash_str,
+                        ],
+                    )
+                    .await?;
+                    NonceReservation::Won {
+                        fence: new_fence as u64,
                     }
+                } else if row_hash.eq_ignore_ascii_case(&hash_str) {
+                    NonceReservation::OwnedBySame
+                } else {
+                    // NIT — propagate a parse error WITH context instead of
+                    // substituting the zero hash.
+                    let other =
+                        <TxHash as std::str::FromStr>::from_str(&row_hash).map_err(|e| {
+                            anyhow::anyhow!(
+                                "nonce_reservations row for signer {key} nonce {nonce} has an \
+                             unparsable tx_hash {row_hash:?}: {e}"
+                            )
+                        })?;
+                    NonceReservation::HeldByOther(other)
                 }
             }
         };
