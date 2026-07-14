@@ -3055,61 +3055,77 @@ mod tests {
         );
     }
 
-    /// PR #127 review point 6 — link-before-projection. `insert_ger` /
-    /// `submit_update_ger_note` record the eth-tx ↔ UpdateGerNote link (and
-    /// the caller records the pending receipt) BEFORE the projector can
-    /// observe the note consumed: the link is written while the submitter
-    /// still holds the serialized Miden client, and the projector only runs
-    /// inside that same client's sync (`on_post_sync`). This test pins the
-    /// downstream contract: with the link present, the projected GER
-    /// event RETAINS the linked real Ethereum tx hash (never the derived
-    /// fallback) and the pending `insertGlobalExitRoot` receipt is finalised
-    /// at the consumption block. Pre-fix, the injection-side propagation
-    /// wait released the client before the link was recorded, so the
-    /// projector could emit under the derived hash and leave the real
-    /// receipt pending forever.
-    #[tokio::test]
-    async fn ger_projection_retains_linked_real_tx_hash_and_finalises_receipt() {
+    /// Test-local mirror of the eth envelope aggkit signs for
+    /// `insertGlobalExitRoot` — only the fields the store round-trips matter.
+    fn test_ger_envelope(real_tx: alloy::primitives::TxHash) -> alloy::consensus::TxEnvelope {
         use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
-        use alloy::primitives::{Signature, TxHash};
-
-        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
-        let (note, (key, metadata), ger_bytes) = ma28_consumed_external_ger_note(0x5C);
-        let output_metadata = std::collections::HashMap::from([(key, metadata)]);
-
-        // The submitter's pre-projection state: link + pending receipt.
-        let real_tx = TxHash::from([0xEEu8; 32]);
-        let real_tx_str = format!("{real_tx:#x}");
-        let note_commitment = hex::encode(note.details_commitment().as_bytes());
-        store
-            .record_tx_note_link(&real_tx_str, &note_commitment)
-            .await
-            .unwrap();
-        let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+        use alloy::primitives::Signature;
+        TxEnvelope::Legacy(Signed::new_unchecked(
             TxLegacy {
                 chain_id: Some(1),
                 ..Default::default()
             },
             Signature::test_signature(),
             real_tx,
-        ));
+        ))
+    }
+
+    /// PR #127 review point 6 + follow-up — handoff-before-projection. This
+    /// drives the REAL GER submission ordering rather than pre-seeding the
+    /// desired store state: it calls `ger::record_ger_submission_handoff` —
+    /// the exact production code `submit_update_ger_note` executes inside the
+    /// serialized `MidenClient::with` closure after the Miden tx commits —
+    /// and only THEN lets projection observe the consumed note, exactly as
+    /// production interleaves them (the projector can only acquire the
+    /// serialized client after the closure, handoff included, has finished).
+    ///
+    /// Pins the downstream contract: the projected GER event RETAINS the
+    /// linked real Ethereum tx hash (never the derived fallback) and the
+    /// pending `insertGlobalExitRoot` receipt — created by the handoff, NOT
+    /// by a post-`insert_ger` caller — is finalised at the consumption block,
+    /// never left pending. Pre-fix, the pending row was created by
+    /// `handle_ger_result` only after `insert_ger` released the client; the
+    /// projector could tick in that gap, silently finalise zero rows
+    /// (PostgreSQL), and the late row then stayed pending forever. If the
+    /// `txn_begin` ever moves back out of the handoff, this test fails at
+    /// the "receipt must be finalised" assertion.
+    #[tokio::test]
+    async fn ger_real_submission_handoff_then_projection_finalises_receipt() {
+        use alloy::primitives::TxHash;
+
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (note, (key, metadata), ger_bytes) = ma28_consumed_external_ger_note(0x5C);
+        let output_metadata = std::collections::HashMap::from([(key, metadata)]);
+
+        // The real submission handoff, as run inside the serialized-client
+        // closure: link + pending receipt, both durable before the client
+        // (and hence projection) can proceed.
+        let real_tx = TxHash::from([0xEEu8; 32]);
+        let real_tx_str = format!("{real_tx:#x}");
+        let note_commitment = hex::encode(note.details_commitment().as_bytes());
         let signer = alloy::primitives::Address::from([0x42u8; 20]);
-        store
-            .txn_begin(
-                real_tx,
-                crate::store::TxnEntry {
-                    id: None,
-                    envelope,
-                    signer,
-                    expires_at: None,
-                    logs: vec![],
-                },
-            )
-            .await
-            .unwrap();
+        crate::ger::record_ger_submission_handoff(
+            &*store,
+            real_tx,
+            &note_commitment,
+            test_ger_envelope(real_tx),
+            signer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.get_note_link_for_tx(&real_tx_str).await.unwrap(),
+            Some(note_commitment.clone()),
+            "handoff must record the tx↔note link",
+        );
         assert!(
             store.txn_receipt(real_tx).await.unwrap().is_none(),
-            "receipt must be pending before projection",
+            "receipt must be pending (not finalised) right after the handoff",
+        );
+        assert!(
+            store.txn_get(real_tx).await.unwrap().is_some(),
+            "the pending row must exist BEFORE projection can run — \
+             it is part of the serialized-client handoff",
         );
 
         // The projector observes the consumption.
@@ -3155,13 +3171,127 @@ mod tests {
         );
 
         // The pending receipt is finalised at the consumption block —
-        // receipt block == GER-log block.
-        let (status, block) = store
-            .txn_receipt(real_tx)
-            .await
-            .unwrap()
-            .expect("projection must finalise the linked pending receipt");
+        // receipt block == GER-log block — and is never left pending.
+        let (status, block) =
+            store.txn_receipt(real_tx).await.unwrap().expect(
+                "projection must finalise the linked pending receipt — never leave it pending",
+            );
         assert!(status.is_ok(), "receipt must be a success receipt");
         assert_eq!(block, consumption_block);
+    }
+
+    /// PR #127 follow-up review — the exact pre-fix interleaving, pinned as a
+    /// store-contract regression. Pre-fix, `submit_update_ger_note` recorded
+    /// only the LINK inside the serialized-client closure; the pending row
+    /// was created by `handle_ger_result` after the client was released. The
+    /// projector could tick in that gap: resolve the real linked hash, call
+    /// `txn_commit` — which on PostgreSQL silently updated zero rows and
+    /// still committed the GER event — and the late `txn_begin` then left the
+    /// real receipt pending FOREVER (nothing ever finalises it again).
+    ///
+    /// This test replays that interleaving (link → projection → late
+    /// txn_begin) and asserts the two halves of the contract that make the
+    /// fix sound:
+    ///   1. projection in the gap must NOT invent a receipt (`txn_commit` on
+    ///      a missing row errors — identically on both stores now — and
+    ///      `project_ger_note` tolerates it while still emitting the GER
+    ///      event under the real linked hash);
+    ///   2. a row begun AFTER projection is unrecoverable — it stays pending,
+    ///      which is precisely why `txn_begin` must live INSIDE the
+    ///      serialized-client handoff next to the link
+    ///      (`ger::record_ger_submission_handoff`), where this gap cannot
+    ///      exist.
+    #[tokio::test]
+    async fn ger_projection_in_pre_fix_gap_cannot_finalise_late_pending_row() {
+        use alloy::primitives::TxHash;
+
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (note, (key, metadata), ger_bytes) = ma28_consumed_external_ger_note(0x5D);
+        let output_metadata = std::collections::HashMap::from([(key, metadata)]);
+
+        // Pre-fix closure contents: ONLY the link.
+        let real_tx = TxHash::from([0xEFu8; 32]);
+        let real_tx_str = format!("{real_tx:#x}");
+        let note_commitment = hex::encode(note.details_commitment().as_bytes());
+        store
+            .record_tx_note_link(&real_tx_str, &note_commitment)
+            .await
+            .unwrap();
+
+        // The projector acquires the client in the gap and observes the
+        // consumed note. It resolves the REAL linked hash but there is no
+        // pending row to finalise.
+        let consumption_block = 11u64;
+        let outcome = project_ger_note(
+            &store,
+            &note,
+            &output_metadata,
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            consumption_block,
+            [11u8; 32],
+            1_235,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            GerProjectOutcome::Emitted,
+            "projection still emits the GER event (final gate is the note itself)",
+        );
+        assert!(store.is_ger_injected(&ger_bytes).await.unwrap());
+        assert!(
+            store.txn_receipt(real_tx).await.unwrap().is_none(),
+            "contract half 1: txn_commit on a missing row must NOT invent a receipt",
+        );
+        // The store itself must surface the zero-row finalise as an error —
+        // this is the memory-store behavior PostgreSQL now matches (pre-fix
+        // PgStore returned Ok while updating zero rows). The PgStore twin of
+        // this assertion lives in
+        // `postgres_tests::test_pgstore_txn_commit_missing_row_errors`.
+        assert!(
+            store
+                .txn_commit(real_tx, Ok(()), consumption_block, [11u8; 32])
+                .await
+                .is_err(),
+            "contract half 1b: finalising a never-begun tx must error, not silently no-op",
+        );
+
+        // Pre-fix `handle_ger_result` then created the pending row — too
+        // late: projection has already passed and nothing ever finalises it.
+        let signer = alloy::primitives::Address::from([0x43u8; 20]);
+        store
+            .txn_begin(
+                real_tx,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope: test_ger_envelope(real_tx),
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        // Re-projection is a no-op (GER already injected) — the late row is
+        // stuck pending forever. THIS is the wedge the handoff closes.
+        let outcome = project_ger_note(
+            &store,
+            &note,
+            &output_metadata,
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            consumption_block + 1,
+            [12u8; 32],
+            1_236,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, GerProjectOutcome::Skipped);
+        assert!(
+            store.txn_receipt(real_tx).await.unwrap().is_none(),
+            "contract half 2: a row begun after projection stays pending forever — \
+             which is why txn_begin must be inside the serialized-client handoff",
+        );
     }
 }
