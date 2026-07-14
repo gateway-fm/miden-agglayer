@@ -236,15 +236,18 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "rpc_claim_ger_not_seen_total",
-        "Claim submission rejected because the referenced GER was not \
-         yet in `has_seen_ger` (C6). Caller should retry after the GER \
-         is injected; the lock is NOT acquired so retries are cheap."
+        "Claim submission rejected at the C6 pre-admission gate because \
+         the referenced GER was not yet published (`is_ger_injected`). \
+         Caller should retry after the GER is injected; no nonce, lock, \
+         receipt, or queued job is consumed, so retries are cheap."
     );
     describe_counter!(
-        "rpc_claim_ger_wait_short_circuit_total",
-        "Claim submission's GER-propagation wait exited early because \
-         the GER was already recorded as injected by the proxy (G6). \
-         Saves up to 12s per claim in the common case."
+        "rpc_estimate_gas_ger_not_ready_total",
+        "eth_estimateGas(claimAsset) answered with `execution reverted: \
+         GlobalExitRootInvalid()` because the claim's combined GER is not \
+         yet published (Cantina #21). Mirrors the EVM bridge's fail-fast \
+         _verifyLeaf revert so the ClaimTxManager retries before ever \
+         allocating a nonce."
     );
     describe_counter!(
         "claim_watcher_synthesised_total",

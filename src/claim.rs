@@ -838,35 +838,19 @@ async fn publish_claim_internal(
 
     let expires_at = latest_block_num + claim_receipt_expiration_blocks();
 
-    // Wait for the NTX builder to consume the UpdateGerNote on the bridge account.
-    // The CLAIM note's FPI calls assert_valid_ger which checks the bridge account's
-    // GER storage. If we submit the CLAIM before the GER is stored, it will fail.
-    // Typically the GER note is consumed within ~5s (2-3 blocks). We wait up to 5
-    // cycles of 3s (15s total) which gives the NTX builder plenty of time.
-    //
-    // G6 — early-exit when aggkit already records the GER as injected. The
-    // `is_injected` flag is set (by `commit_ger_event_atomic`) when the proxy
-    // submits the GER inject tx; for any GER that's been through aggkit's own submit path within this
-    // process's lifetime, the bridge has already consumed it (or will within
-    // milliseconds). We still sync_state once to refresh, but skip the
-    // 4×3s = 12s of additional waiting in the common case.
-    let claim_ger = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
-    tracing::info!("waiting for GER to propagate to bridge account before submitting CLAIM...");
-    for i in 0..5 {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        client.sync_state().await?;
-        tracing::debug!(cycle = i, "GER propagation sync cycle");
-        if store.is_ger_injected(&claim_ger).await.unwrap_or(false) {
-            tracing::info!(
-                cycle = i,
-                "G6: GER recorded as injected by proxy — skipping remaining wait cycles"
-            );
-            ::metrics::counter!("rpc_claim_ger_wait_short_circuit_total").increment(1);
-            break;
-        }
-    }
-    tracing::info!("GER propagation wait complete, submitting CLAIM note");
-
+    // Cantina #21 — NO GER-propagation sleep/poll here (PR #127 review):
+    // GER readiness is fail-fast/retry-later, mirroring the real EVM bridge
+    // (AgglayerBridge._verifyLeaf reads globalExitRootMap once and reverts
+    // GlobalExitRootInvalid() when absent — it never waits). By the time a
+    // CLAIM reaches this point it has already passed the C6 pre-admission
+    // gate (`is_ger_injected`, checked before any nonce/lock/receipt
+    // side-effect) and, for the official ClaimTxManager flow, the
+    // claim-aware `eth_estimateGas` probe. The on-chain MASM
+    // `assert_valid_ger` against the bridge account's storage remains the
+    // final race/security gate: a CLAIM racing GER consumption fails closed
+    // with `ERR_GER_NOT_FOUND` rather than minting, and the caller retries
+    // after publication. Polling here would stall the serialized
+    // `MidenClient::with` slot for every queued write.
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![claim_note])
         .build()?;
