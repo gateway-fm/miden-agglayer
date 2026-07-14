@@ -69,6 +69,12 @@ test: test-unit test-e2e ## Run everything: unit tests, then spin up stack and r
 test-unit: ## Run unit tests (no docker needed)
 	cargo test --workspace --profile=$(CARGO_PROFILE) --lib
 
+.PHONY: test-scripts
+test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker needed)
+	bash -n scripts/release-acceptance.sh
+	bash -n scripts/release-acceptance-guards.test.sh
+	bash scripts/release-acceptance-guards.test.sh
+
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
 	@echo "╔══════════════════════════════════════════════════════════════╗"
