@@ -461,6 +461,42 @@ pub trait Store: Send + Sync + 'static {
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;
 
+    /// #55 BLOCKER D — COMPARE-AND-SWAP nonce advance. Advance the stored nonce to
+    /// `expected + 1` **iff** the current stored value equals `expected` (a fresh
+    /// address is treated as nonce 0). Returns `true` iff it won the CAS (advanced).
+    ///
+    /// MUST be atomic at the store level (single conditional UPDATE / lock-guarded
+    /// CAS), so that under a shared PostgreSQL with rolling replicas two replicas
+    /// that both read expected nonce `N` cannot BOTH advance (`N → N+2`, skipping a
+    /// nonce → wedge). The process-local `per_signer_lock` only serialises within
+    /// one replica; this CAS is the cross-replica guarantee. Used on the accept
+    /// path (in place of the unconditional `nonce_increment`) and by the crash-gap
+    /// repair.
+    async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool>;
+
+    /// #55 BLOCKER C — atomically persist a REVERTED receipt (status 0x0, EMPTY
+    /// logs, no ClaimEvent) for `tx_hash` **and** CAS-advance the signer's nonce, in
+    /// ONE store transaction, so a crash can never leave a half state — no
+    /// pending-forever receipt (the row is written already committed-`failed`, never
+    /// a separate `txn_begin`→`txn_commit`) and no stale nonce.
+    ///
+    /// The nonce CAS advances iff the current nonce == `expected_nonce` (the sync
+    /// accept path, where the nonce has not yet advanced). In async-writer mode the
+    /// enqueue already CAS-advanced it, so this CAS is a no-op and only the receipt
+    /// is written. Idempotent on `tx_hash` (a rebroadcast/re-entry re-affirms the
+    /// same committed-reverted row). Returns whether the nonce advanced here.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_reverted_receipt_and_advance_nonce(
+        &self,
+        tx_hash: TxHash,
+        entry: TxnEntry,
+        reason: String,
+        block_num: u64,
+        block_hash: [u8; 32],
+        addr: &str,
+        expected_nonce: u64,
+    ) -> anyhow::Result<bool>;
+
     // === Claims ===
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()>;
     async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()>;

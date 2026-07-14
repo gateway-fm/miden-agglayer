@@ -76,6 +76,14 @@ pub struct InMemoryStore {
     // consume B2AGG `deposit_counter` slots — see commit_manual_claim_event_atomic).
     claim_watcher_processed: RwLock<HashMap<String, [u8; 32]>>,
 
+    /// Test hook (#55 BLOCKER B): when set to `Some(gi)`, the next
+    /// `has_claim_event_for_global_index(gi)` call that would report NO event
+    /// instead LANDS the claim (records a watcher ClaimEvent) as a side effect and
+    /// still reports the miss — so the FOLLOWING call observes it. Deterministically
+    /// models "the racing claim commits its ClaimEvent between `acquire_claim_lock`'s
+    /// two landed reads." Always `None` in production (zero behavioural impact).
+    test_land_after_next_has_claim_miss: RwLock<Option<[u8; 32]>>,
+
     // Faucet registry
     faucets: RwLock<Vec<FaucetEntry>>,
 
@@ -139,6 +147,7 @@ impl InMemoryStore {
             processed_notes: RwLock::new(HashMap::new()),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
+            test_land_after_next_has_claim_miss: RwLock::new(None),
             faucets: RwLock::new(Vec::new()),
             monitor_burn_serials: RwLock::new(HashSet::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
@@ -183,6 +192,15 @@ impl InMemoryStore {
             "test_backdate_claim: no claim record for global_index {global_index}"
         );
         *self.claim_clock_skew.write() += age;
+    }
+
+    /// Test hook (#55 BLOCKER B): arm the store so the NEXT
+    /// `has_claim_event_for_global_index(gi)` that finds no event lands the claim as
+    /// a side effect (see the field doc). Used to deterministically drive the
+    /// try_claim-Err → reclaim-fail → re-read-landed interleaving.
+    #[cfg(test)]
+    pub fn test_land_gi_after_next_has_claim_miss(&self, global_index: [u8; 32]) {
+        *self.test_land_after_next_has_claim_miss.write() = Some(global_index);
     }
 
     /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
@@ -704,6 +722,57 @@ impl Store for InMemoryStore {
         Ok(prev)
     }
 
+    async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool> {
+        let key = addr.to_lowercase();
+        let mut nonces = self.nonces.write();
+        let cur = nonces.entry(key).or_insert(0);
+        if *cur == expected {
+            *cur = expected + 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn commit_reverted_receipt_and_advance_nonce(
+        &self,
+        tx_hash: TxHash,
+        entry: TxnEntry,
+        reason: String,
+        block_num: u64,
+        _block_hash: [u8; 32],
+        addr: &str,
+        expected_nonce: u64,
+    ) -> anyhow::Result<bool> {
+        // BLOCKER C — receipt + nonce in one atomic step: hold BOTH the
+        // transactions and nonces locks so a reader can never observe the
+        // receipt committed with the nonce not yet advanced (or vice versa).
+        // The row is inserted already committed-`failed` (empty logs, no
+        // synthetic ClaimEvent), so there is no pending window.
+        let mut txns = self.transactions.lock();
+        let mut nonces = self.nonces.write();
+        let receipt = TxnReceipt {
+            id: entry.id,
+            envelope: entry.envelope,
+            signer: entry.signer,
+            expires_at: entry.expires_at,
+            result: Some(Err(reason)),
+            block_num,
+            logs: vec![],
+        };
+        // Idempotent on tx_hash: a rebroadcast/re-entry re-affirms the same
+        // committed-reverted row rather than erroring.
+        let _ = txns.put(tx_hash, receipt);
+        let cur = nonces.entry(addr.to_lowercase()).or_insert(0);
+        let advanced = if *cur == expected_nonce {
+            *cur = expected_nonce + 1;
+            true
+        } else {
+            false
+        };
+        Ok(advanced)
+    }
+
     // ── Claims ───────────────────────────────────────────────────
 
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
@@ -943,6 +1012,19 @@ impl Store for InMemoryStore {
                 {
                     return Ok(true);
                 }
+            }
+        }
+        drop(logs);
+        // Test hook (BLOCKER B): this call found NO event. If armed for this gi, LAND
+        // it now so the NEXT call observes it, and still report this miss.
+        {
+            let mut armed = self.test_land_after_next_has_claim_miss.write();
+            if armed.as_ref() == Some(global_index) {
+                *armed = None;
+                drop(armed);
+                self.claim_watcher_processed
+                    .write()
+                    .insert("blockerB-race-land".to_string(), *global_index);
             }
         }
         Ok(false)

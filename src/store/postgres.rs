@@ -1098,6 +1098,89 @@ impl Store for PgStore {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
+    async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        // BLOCKER D — atomic conditional advance. A fresh address (no row) is
+        // nonce 0: for `expected == 0` create/advance to 1 only while the current
+        // value is still 0; otherwise advance only WHERE the stored nonce equals
+        // `expected`. Postgres row-locking on the conflict/UPDATE serialises
+        // concurrent replicas, so exactly one wins the CAS.
+        let n = if expected == 0 {
+            client
+                .execute(
+                    "INSERT INTO nonces (address, nonce) VALUES ($1, 1)
+                     ON CONFLICT (address) DO UPDATE SET nonce = 1 WHERE nonces.nonce = 0",
+                    &[&key],
+                )
+                .await?
+        } else {
+            client
+                .execute(
+                    "UPDATE nonces SET nonce = nonce + 1 WHERE address = $1 AND nonce = $2",
+                    &[&key, &(expected as i64)],
+                )
+                .await?
+        };
+        Ok(n == 1)
+    }
+
+    async fn commit_reverted_receipt_and_advance_nonce(
+        &self,
+        tx_hash: TxHash,
+        entry: TxnEntry,
+        reason: String,
+        block_num: u64,
+        _block_hash: [u8; 32],
+        addr: &str,
+        expected_nonce: u64,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let hash_str = format!("{tx_hash:#x}");
+        let miden_id = entry.id.map(|id| id.to_hex());
+        let signer_str = format!("{:#x}", entry.signer);
+        let mut envelope_bytes = Vec::new();
+        entry.envelope.encode_2718(&mut envelope_bytes);
+        let key = addr.to_lowercase();
+
+        // BLOCKER C — receipt + nonce in ONE transaction. The tx row is inserted
+        // already committed-`failed` (status 0x0, no attached logs → no ClaimEvent),
+        // so there is no `txn_begin`→`txn_commit` pending window a crash could freeze
+        // forever. Idempotent on tx_hash (a re-entry re-affirms the reverted row).
+        let tx = client.transaction().await?;
+        tx.execute(
+            "INSERT INTO transactions (tx_hash, miden_tx_id, envelope_bytes, signer, expires_at, status, error_message, block_number)
+             VALUES ($1, $2, $3, $4, $5, 'failed', $6, $7)
+             ON CONFLICT (tx_hash) DO UPDATE SET status = 'failed', error_message = $6, block_number = $7, updated_at = now()",
+            &[
+                &hash_str,
+                &miden_id as &(dyn ToSql + Sync),
+                &envelope_bytes,
+                &signer_str,
+                &entry.expires_at.map(|v| v as i64) as &(dyn ToSql + Sync),
+                &reason,
+                &(block_num as i64),
+            ],
+        )
+        .await?;
+        let n = if expected_nonce == 0 {
+            tx.execute(
+                "INSERT INTO nonces (address, nonce) VALUES ($1, 1)
+                 ON CONFLICT (address) DO UPDATE SET nonce = 1 WHERE nonces.nonce = 0",
+                &[&key],
+            )
+            .await?
+        } else {
+            tx.execute(
+                "UPDATE nonces SET nonce = nonce + 1 WHERE address = $1 AND nonce = $2",
+                &[&key, &(expected_nonce as i64)],
+            )
+            .await?
+        };
+        tx.commit().await?;
+        Ok(n == 1)
+    }
+
     // ── Claims ───────────────────────────────────────────────────
 
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {

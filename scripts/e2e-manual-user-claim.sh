@@ -417,10 +417,25 @@ submit_user_claim() {
         result=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or '')" 2>/dev/null || true)
         errmsg=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',{}).get('message') or '')" 2>/dev/null || true)
         if [[ -n "$result" ]]; then
-            SUBMIT_OUTCOME="user_won"; USER_TX="$result"; return 0
+            USER_TX="$result"
+            # #55 — a returned hash is NOT automatically a user win. If the sponsor
+            # already LANDED this gi, the proxy ACCEPTS the user's tx and writes an
+            # IMMEDIATE status-0x0 (reverted) receipt with EMPTY logs / NO ClaimEvent
+            # (geth-faithful AlreadyClaimed) — the user did NOT win. A genuine win's
+            # receipt is null (pending) here and finalises to status 0x1 later.
+            # accept-and-revert's receipt is written synchronously; one re-check
+            # covers RPC propagation.
+            local st; st=$(receipt_status "$result")
+            [[ -z "$st" ]] && { sleep 1; st=$(receipt_status "$result"); }
+            if [[ "$st" == "0x0" ]]; then
+                SUBMIT_OUTCOME="accept_reverted"; return 0
+            fi
+            SUBMIT_OUTCOME="user_won"; return 0
         fi
         LAST_ERR="$errmsg"
         if [[ "$errmsg" == *"already submitted"* ]]; then
+            # Sponsor's claim is IN FLIGHT (no ClaimEvent yet): the proxy hard-rejects
+            # a second submitter (InFlight). Once it LANDS, a resubmit accept-reverts.
             SUBMIT_OUTCOME="dedup_rejected"; return 0
         fi
         # C6 GER-not-seen and transient rejections: retry quickly.
@@ -472,6 +487,21 @@ PY
 receipt_status_ok() { # <tx-hash>
     rpc eth_getTransactionReceipt "[\"$1\"]" \
         | python3 -c "import json,sys; r=json.load(sys.stdin).get('result'); exit(0 if r and r.get('status')=='0x1' else 1)"
+}
+
+# receipt_status <tx-hash> → raw status ("0x0" | "0x1") or "" when the receipt is
+# still null (pending). #55: accept-and-revert writes an IMMEDIATE status-0x0
+# receipt; a genuine claim is null until the projector finalises it, then 0x1.
+receipt_status() { # <tx-hash>
+    rpc eth_getTransactionReceipt "[\"$1\"]" \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result') or {}; print(r.get('status') or '')"
+}
+
+# receipt_logs_empty <tx-hash> → exit 0 iff the receipt exists and carries ZERO
+# logs (the accept-and-revert shape: no ClaimEvent). Non-existent/1+ logs → non-zero.
+receipt_logs_empty() { # <tx-hash>
+    rpc eth_getTransactionReceipt "[\"$1\"]" \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result'); exit(0 if r and len(r.get('logs') or [])==0 else 1)"
 }
 
 receipt_from() { # <tx-hash> → lowercase from address (empty if absent)
@@ -750,8 +780,14 @@ for attempt in $(seq 1 "$MAX_LEG1_ATTEMPTS"); do
             break
             ;;
         dedup_rejected)
-            warn "sponsor won the claim for gi=$GI (user got the dedup rejection: '$LAST_ERR')"
+            warn "sponsor's claim is in flight for gi=$GI (user got the dedup rejection: '$LAST_ERR')"
             warn "retrying leg 1 with a fresh deposit"
+            ;;
+        accept_reverted)
+            # #55 — the sponsor already LANDED this gi; the user's tx was
+            # accept-and-reverted (status-0x0 receipt). The user did NOT win —
+            # retry with a fresh deposit to demonstrate the manual-win path.
+            warn "sponsor already landed gi=$GI; user's tx was accept-and-reverted (tx $USER_TX) — retrying with a fresh deposit"
             ;;
         timeout)
             fail "user claim never accepted nor dedup-rejected within 420s (last error: '$LAST_ERR')"
@@ -820,6 +856,10 @@ pass "race deposit is ready_for_claim"
 # END and stays reliable; ISO-8601 timestamps compare lexicographically.
 RACE_START_TS=$(date -u +%Y-%m-%dT%H:%M:%S)
 
+# #55 — snapshot the accept-and-revert metric before the race so the
+# sponsor-participation proof (user-won branch) can assert it increments as the
+# sponsor's own gi2 retries get accept-and-reverted after the gi lands.
+DEDUP_BEFORE_RACE=$(metric_value "$DEDUP_METRIC")
 submit_user_claim "$DEP_JSON" 420
 WINNER=""; WINNER_TX=""
 case "$SUBMIT_OUTCOME" in
@@ -828,13 +868,26 @@ case "$SUBMIT_OUTCOME" in
         pass "race: USER won (tx=$USER_TX); sponsor is the loser"
         ;;
     dedup_rejected)
+        # Sponsor's claim was IN FLIGHT (locked, no ClaimEvent yet) when the user
+        # submitted → InFlight hard-reject. The sponsor won the lock.
         WINNER="sponsor"
         [[ "$LAST_ERR" == *"already submitted"* ]] \
-            || fail "loser's rejection is not the dedup path: '$LAST_ERR'"
-        pass "race: SPONSOR won; user (loser) got the dedup rejection: '$LAST_ERR'"
+            || fail "loser's rejection is not the in-flight dedup path: '$LAST_ERR'"
+        pass "race: SPONSOR won (in-flight lock); user (loser) got the dedup rejection: '$LAST_ERR'"
+        ;;
+    accept_reverted)
+        # #55 — the sponsor had already LANDED gi2 when the user submitted; the
+        # user's tx was ACCEPT-AND-REVERTED (status-0x0 receipt, empty logs, NO
+        # ClaimEvent). The SPONSOR won.
+        WINNER="sponsor"
+        [[ "$(receipt_status "$USER_TX")" == "0x0" ]] \
+            || fail "accept_reverted outcome but user tx $USER_TX receipt is not status 0x0"
+        receipt_logs_empty "$USER_TX" \
+            || fail "accept-and-revert receipt for $USER_TX must carry EMPTY logs (no ClaimEvent)"
+        pass "race: SPONSOR won (already landed); user's tx accept-and-reverted (status-0x0, no ClaimEvent): $USER_TX"
         ;;
     timeout)
-        fail "race leg: user claim neither accepted nor dedup-rejected in 420s (last: '$LAST_ERR')"
+        fail "race leg: user claim neither accepted, dedup-rejected, nor accept-and-reverted in 420s (last: '$LAST_ERR')"
         ;;
 esac
 
@@ -862,46 +915,57 @@ if [[ "$WINNER" == "sponsor" ]]; then
     assert_receipt_signer "$WINNER_TX" "$SPONSOR_ADDR_LC" "SPONSOR"
     pass "sponsor participation proven: the sponsor's own tx won gi=$GI2"
 else
-    # User won → first force the DETERMINISTIC loser: one more user submission
-    # for the same (now claimed) gi must be dedup-rejected...
+    # User won → force the DETERMINISTIC loser. #55: the user's claim has LANDED
+    # (its receipt is status 0x1, ClaimEvent exists — asserted above), so ONE more
+    # user submission for the SAME gi is now ACCEPT-AND-REVERTED (geth-faithful
+    # AlreadyClaimed): it returns a hash with a status-0x0 receipt, EMPTY logs, NO
+    # new ClaimEvent, and increments the dedup-reverted metric — it is NOT a hard
+    # "already submitted" error anymore.
+    DEDUP_BEFORE_RESUB=$(metric_value "$DEDUP_METRIC")
     RAW=$(build_user_claim_raw "$DEP_JSON")
-    [[ -n "$RAW" ]] || fail "could not rebuild the user claim for the deterministic dedup check"
+    [[ -n "$RAW" ]] || fail "could not rebuild the user claim for the deterministic accept-and-revert check"
     RESP=$(rpc eth_sendRawTransaction "[\"$RAW\"]")
-    ERRMSG=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',{}).get('message') or '')" 2>/dev/null || true)
-    [[ "$ERRMSG" == *"already submitted"* ]] \
-        || fail "post-race user resubmission for gi=$GI2 was not dedup-rejected (got: '$ERRMSG', resp: $RESP)"
-    pass "post-race user resubmission dedup-rejected: '$ERRMSG'"
+    RESUB_TX=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or '')" 2>/dev/null || true)
+    RESUB_ERR=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',{}).get('message') or '')" 2>/dev/null || true)
+    [[ -n "$RESUB_TX" ]] \
+        || fail "post-race user resubmission for gi=$GI2 was NOT accepted — expected #55 accept-and-revert, got error '$RESUB_ERR' (resp: $RESP)"
+    # Its receipt must be an immediate status-0x0 revert with empty logs.
+    wait_for "resubmission accept-and-revert receipt (status 0x0)" \
+        "[[ \"\$(receipt_status '$RESUB_TX')\" == '0x0' ]]" 60 2
+    receipt_logs_empty "$RESUB_TX" \
+        || fail "accept-and-revert receipt for the resubmission $RESUB_TX must carry EMPTY logs (no ClaimEvent)"
+    DEDUP_AFTER_RESUB=$(metric_value "$DEDUP_METRIC")
+    [[ "$DEDUP_AFTER_RESUB" -gt "$DEDUP_BEFORE_RESUB" ]] \
+        || fail "$DEDUP_METRIC did not increment on the post-win user resubmission ($DEDUP_BEFORE_RESUB → $DEDUP_AFTER_RESUB) — accept-and-revert did not fire"
+    # Still exactly ONE ClaimEvent for gi2 (accept-and-revert emits none).
+    read -r EV2B_COUNT _ <<<"$(claim_events_for_gi "$GI2")"
+    [[ "$EV2B_COUNT" == "1" ]] || fail "post-resubmission gi2 has $EV2B_COUNT ClaimEvents — accept-and-revert must not emit a second"
+    pass "post-race user resubmission ACCEPT-AND-REVERTED (status-0x0 $RESUB_TX, no ClaimEvent, metric $DEDUP_BEFORE_RESUB→$DEDUP_AFTER_RESUB)"
 
-    # ...then prove the SPONSOR is racing gi2, positively: after the user's
-    # LAST submission above, any further "claim already submitted" rejection
-    # for THIS gi can only come from the sponsor's ClaimTxManager (2s retry
-    # loop on its signed gi2 tx). Anchor strictly after the resubmission, then
-    # require fresh gi2 dedup rejections AND the sponsor signer's own
-    # eth_sendRawTransaction submissions in the proxy log. If the sponsor
-    # never raced, this FAILS — dedup evidence manufactured by the user's own
-    # resubmission cannot satisfy it (it is before the anchor).
+    # ...then prove the SPONSOR raced gi2, positively: after the user's LAST
+    # submission the sponsor's ClaimTxManager keeps re-broadcasting its own signed
+    # gi2 tx, which — the gi having landed — is ACCEPT-AND-REVERTED each time. So
+    # the sponsor's participation shows as its own eth_sendRawTransaction
+    # submissions in the proxy log AND further increments of the dedup-reverted
+    # metric, anchored strictly AFTER the user's resubmission (so the user's own
+    # accept-and-revert above cannot satisfy it).
     sleep 2
     SPONSOR_PROOF_TS=$(date -u +%Y-%m-%dT%H:%M:%S)
-    log "observing 15s for the sponsor's own gi=$GI2 submissions (anchor $SPONSOR_PROOF_TS)..."
-    sleep 15
+    DEDUP_AT_ANCHOR=$(metric_value "$DEDUP_METRIC")
+    log "observing 20s for the sponsor's own gi=$GI2 submissions (anchor $SPONSOR_PROOF_TS)..."
+    sleep 20
     PROOF_WINDOW=$(docker logs --tail 8000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
         | awk -v ts="$SPONSOR_PROOF_TS" '$1 >= ts')
-    GI2_DEDUP_HITS=$(printf '%s\n' "$PROOF_WINDOW" \
-        | grep -cE "already submitted for global_index ${GI2}([^0-9]|$)" || true)
     SPONSOR_SUBS=$(printf '%s\n' "$PROOF_WINDOW" \
         | grep -E "\"event\": ?\"eth_sendRawTransaction_received\"" \
         | grep -cE "\"signer\": ?\"$SPONSOR_ADDR_LC\"" || true)
-    # Race window submissions (from ready_for_claim onwards) for the log line.
-    RACE_WINDOW_SUBS=$(docker logs --tail 12000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
-        | awk -v ts="$RACE_START_TS" '$1 >= ts' \
-        | grep -E "\"event\": ?\"eth_sendRawTransaction_received\"" \
-        | grep -cE "\"signer\": ?\"$SPONSOR_ADDR_LC\"" || true)
-    log "post-anchor gi2 dedup rejections: ${GI2_DEDUP_HITS:-0}; sponsor submissions post-anchor: ${SPONSOR_SUBS:-0} (since race start: ${RACE_WINDOW_SUBS:-0})"
-    [[ "${GI2_DEDUP_HITS:-0}" -ge 1 ]] \
-        || fail "no NEW dedup rejection for gi=$GI2 after the user's last submission — the sponsor never raced this gi (leg 2 had no second racer)"
+    DEDUP_AFTER_WINDOW=$(metric_value "$DEDUP_METRIC")
+    log "post-anchor sponsor submissions: ${SPONSOR_SUBS:-0}; $DEDUP_METRIC $DEDUP_AT_ANCHOR→$DEDUP_AFTER_WINDOW (since race: ${DEDUP_BEFORE_RACE})"
     [[ "${SPONSOR_SUBS:-0}" -ge 1 ]] \
-        || fail "no eth_sendRawTransaction from the sponsor signer $SPONSOR_ADDR_LC in the proxy log after the user's last submission — cannot attribute the gi2 rejections to the sponsor"
-    pass "sponsor participation proven: sponsor kept submitting gi=$GI2 after the user stopped ($GI2_DEDUP_HITS dedup rejections, $SPONSOR_SUBS sponsor submissions in 15s)"
+        || fail "no eth_sendRawTransaction from the sponsor signer $SPONSOR_ADDR_LC after the user's last submission — the sponsor never raced gi=$GI2 (no second racer)"
+    [[ "$DEDUP_AFTER_WINDOW" -gt "$DEDUP_AT_ANCHOR" ]] \
+        || fail "$DEDUP_METRIC did not increment after the user stopped ($DEDUP_AT_ANCHOR → $DEDUP_AFTER_WINDOW) — the sponsor's own gi=$GI2 retries were not accept-and-reverted (cannot attribute continued claiming to the sponsor)"
+    pass "sponsor participation proven: sponsor kept submitting gi=$GI2 after the user stopped ($SPONSOR_SUBS submissions; dedup-reverted $DEDUP_AT_ANCHOR→$DEDUP_AFTER_WINDOW)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1028,11 +1092,12 @@ print('\n'.join(out))
     case "$SUBMIT_OUTCOME" in
         user_won)
             pass "allow-listed USER's manual claim accepted under allow-list mode (tx $USER_TX)" ;;
-        dedup_rejected)
-            # The sponsor (also allow-listed) beat the user; the user's own
-            # submission still traversed the allow-list gate (the dedup lock
-            # sits BEHIND it), so membership is proven either way.
-            pass "sponsor (also allow-listed) won the claim; user's submission passed the allow-list gate into the dedup path" ;;
+        dedup_rejected|accept_reverted)
+            # The sponsor (also allow-listed) beat the user — via in-flight dedup
+            # (dedup_rejected) or, if it already landed, #55 accept-and-revert. The
+            # user's submission still traversed the allow-list gate (the claim lock /
+            # landed classification sits BEHIND it), so membership is proven either way.
+            pass "sponsor (also allow-listed) won the claim ($SUBMIT_OUTCOME); user's submission passed the allow-list gate" ;;
         timeout)
             fail "no claim landed for gi=$gi_al under allow-list mode — allow-list config broke the claim path" ;;
     esac

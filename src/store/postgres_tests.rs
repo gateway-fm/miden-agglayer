@@ -1564,10 +1564,9 @@ async fn test_pgstore_crash_gap_nonce_repair() {
     assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
 
     // The repair (crash-gap signature: expected == tx.nonce == 0) advances once.
-    let repaired =
-        crate::service_send_raw_txn::repair_commit_gap_nonce(&service, signer, &signer_str, 0)
-            .await
-            .unwrap();
+    let repaired = crate::service_send_raw_txn::repair_commit_gap_nonce(&service, &signer_str, 0)
+        .await
+        .unwrap();
     assert!(repaired, "the crash-gap must be repaired");
     assert_eq!(
         store.nonce_get(&signer_str).await.unwrap(),
@@ -1577,7 +1576,7 @@ async fn test_pgstore_crash_gap_nonce_repair() {
 
     // Idempotent: a further repair for the same tx.nonce is a no-op (expected 1 != 0).
     let repaired_again =
-        crate::service_send_raw_txn::repair_commit_gap_nonce(&service, signer, &signer_str, 0)
+        crate::service_send_raw_txn::repair_commit_gap_nonce(&service, &signer_str, 0)
             .await
             .unwrap();
     assert!(!repaired_again, "repair must be idempotent");
@@ -1585,7 +1584,7 @@ async fn test_pgstore_crash_gap_nonce_repair() {
 
     // A normally-advanced tx (expected 1 > tx.nonce 0) is never repaired.
     assert!(
-        !crate::service_send_raw_txn::repair_commit_gap_nonce(&service, signer, &signer_str, 0)
+        !crate::service_send_raw_txn::repair_commit_gap_nonce(&service, &signer_str, 0)
             .await
             .unwrap()
     );
@@ -1605,4 +1604,89 @@ fn dummy_txn_entry_for(signer: Address) -> TxnEntry {
         expires_at: None,
         logs: vec![],
     }
+}
+
+/// BLOCKER D — `nonce_advance_cas` on PgStore: advances only WHERE the stored nonce
+/// equals `expected`, returning whether it won. Fresh address is nonce 0.
+#[tokio::test]
+async fn test_pgstore_nonce_advance_cas() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let addr = format!("0x{:040x}", rand_u64() as u128);
+
+    // Fresh (no row = 0): CAS(0) wins → 1; a second CAS(0) loses (now 1).
+    assert!(store.nonce_advance_cas(&addr, 0).await.unwrap());
+    assert_eq!(store.nonce_get(&addr).await.unwrap(), 1);
+    assert!(!store.nonce_advance_cas(&addr, 0).await.unwrap());
+    assert_eq!(store.nonce_get(&addr).await.unwrap(), 1);
+
+    // CAS at the wrong expected loses; at the right expected wins.
+    assert!(!store.nonce_advance_cas(&addr, 5).await.unwrap());
+    assert!(store.nonce_advance_cas(&addr, 1).await.unwrap());
+    assert_eq!(store.nonce_get(&addr).await.unwrap(), 2);
+}
+
+/// BLOCKER C — `commit_reverted_receipt_and_advance_nonce` on PgStore: one
+/// transaction writes a COMMITTED reverted receipt (never pending) AND CAS-advances
+/// the nonce; idempotent on tx_hash, and the CAS is a no-op once the nonce moved.
+#[tokio::test]
+async fn test_pgstore_commit_reverted_receipt_and_advance_nonce() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let base = rand_u64();
+    let signer = Address::from([(base % 251) as u8 + 1; 20]);
+    let signer_str = format!("{signer:#x}");
+    let tx_hash = TxHash::from([(base % 241) as u8 + 2; 32]);
+
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+
+    // First call: receipt committed-reverted + nonce CAS-advanced (expected 0 → 1).
+    let advanced = store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_hash,
+            dummy_txn_entry_for(signer),
+            "landed (AlreadyClaimed) #55".into(),
+            7,
+            [0u8; 32],
+            &signer_str,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        advanced,
+        "the nonce CAS wins on the sync accept path (expected == 0)"
+    );
+    // Receipt is COMMITTED (non-null) and reverted (status 0x0).
+    let (result, block) = store
+        .txn_receipt(tx_hash)
+        .await
+        .unwrap()
+        .expect("receipt is committed, never pending");
+    assert!(result.is_err(), "status 0x0 reverted");
+    assert_eq!(block, 7);
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+
+    // Idempotent re-entry (expected 0 again): receipt re-affirmed, nonce NOT
+    // double-advanced (the CAS no-ops because the nonce already moved to 1).
+    let advanced_again = store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_hash,
+            dummy_txn_entry_for(signer),
+            "landed (AlreadyClaimed) #55".into(),
+            7,
+            [0u8; 32],
+            &signer_str,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !advanced_again,
+        "re-entry must not double-advance the nonce"
+    );
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+    assert!(store.txn_receipt(tx_hash).await.unwrap().is_some());
 }
