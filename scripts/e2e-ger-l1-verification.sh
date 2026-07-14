@@ -13,12 +13,23 @@
 # side effect: no accepted hash, no nonce, no tx row/receipt, no UpdateGerNote.
 #
 # Phases:
-#   A. POSITIVE — read the CURRENT (mainnet, rollup) pair from the L1 GER
-#      contract, wait until the proxy's indexer has observed it
-#      (zkevm_getExitRootsByGER non-null), then submit updateExitRoot(R, M).
-#      Assert: accepted (tx hash), receipt lands, ger_entries.is_injected
-#      flips true (the projector sets it when the UpdateGerNote is CONSUMED),
-#      and the proxy logs show the UpdateGerNote for this GER.
+#   A. POSITIVE — prove a FRESH L1-observed GER is accepted and injected by
+#      THIS submission (not a pre-injected one that dedup would wave through):
+#        1. STOP the aggoracle (aggkit container) so it can't win the race and
+#           inject the GER before/instead of us.
+#        2. MINT a new L1 GER: one L1 bridgeAsset(forceUpdateGlobalExitRoot=true)
+#           advances lastMainnetExitRoot → a brand-new (mainnet, rollup) pair.
+#        3. Wait until the proxy's indexer has OBSERVED it on L1
+#           (zkevm_getExitRootsByGER non-null) — the exact H6 evidence predicate.
+#        4. ASSERT the precondition: this GER is NOT yet injected
+#           (ger_entries.is_injected = false / no row, and no prior UpdateGerNote
+#           log for it). This assert FAILS if the GER were already injected — so
+#           the test cannot silently pass on a pre-injected GER via dedup.
+#        5. Submit updateExitRoot(R, M); capture OUR tx hash.
+#        6. Tie every success signal to THAT hash: receipt lands with
+#           status == 0x1, ger_entries.is_injected flips true (the projector
+#           sets it when the UpdateGerNote is CONSUMED), and a proxy log shows
+#           the UpdateGerNote for THIS GER (which did not exist before step 5).
 #   B. NEGATIVE — submit insertGlobalExitRoot with a FORGED 32-byte root that
 #      never appeared in an L1 UpdateL1InfoTree event. Assert the H6 refusal
 #      AND that the rejection is side-effect-free: no result hash, nonce NOT
@@ -63,8 +74,32 @@ PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-
 # Signer of the test txs. The e2e proxy runs --insecure-allow-any-signer, so
 # any key works and per-signer nonces keep it isolated; on an allow-listed
 # deployment set SIGNER_KEY to a permitted key (e.g. the aggoracle key).
-# Default: anvil dev key #9 (unused by the stack's own submitters).
+# Default: anvil dev key #9 (unused by the stack's own submitters). The same key
+# funds the L1 bridgeAsset deposit Phase A uses to MINT a fresh L1 GER (all anvil
+# dev keys are pre-funded on the L1 chain).
 SIGNER_KEY="${SIGNER_KEY:-0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6}"
+
+# L1 bridge — Phase A does one bridgeAsset(forceUpdateGlobalExitRoot=true) here
+# to advance lastMainnetExitRoot and thereby MINT a brand-new L1 GER that the
+# aggoracle has NOT yet injected (see Phase A header).
+L1_BRIDGE_ADDRESS="${L1_BRIDGE_ADDRESS:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}"
+DEPOSIT_WEI="${DEPOSIT_WEI:-10000000000000}"
+
+# The aggoracle lives in the aggkit container. Phase A STOPS it for the duration
+# of the positive test so the proxy's OWN updateExitRoot submission is the tx
+# under test — otherwise the aggoracle races us, injects the fresh GER first,
+# and Phase A would false-pass through RD-940 tx-hash dedup on a GER that was
+# actually injected by someone else. Restarted unconditionally on exit (trap).
+AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
+AGGKIT_STOPPED=0
+cleanup() {
+    if [[ "$AGGKIT_STOPPED" == "1" ]]; then
+        step "cleanup — restarting aggoracle container $AGGKIT_CONTAINER"
+        docker start "$AGGKIT_CONTAINER" >/dev/null 2>&1 \
+            || warn "could not restart $AGGKIT_CONTAINER — restart it manually (docker start $AGGKIT_CONTAINER)"
+    fi
+}
+trap cleanup EXIT
 
 pgquery() {
     PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -A -c "$1" 2>/dev/null
@@ -124,31 +159,67 @@ json_field() { # $1 = field (result|error), stdin = JSON body
 # Phase A — POSITIVE: an L1-observed GER is accepted; UpdateGerNote submitted
 #           and consumed.
 # ══════════════════════════════════════════════════════════════════════════════
-step "Phase A — L1-observed GER must be accepted under strict H6"
+step "Phase A — a FRESH L1-observed GER must be accepted and injected by THIS tx"
+
+# ── A.1 Deconflict the aggoracle ───────────────────────────────────────────
+# Stop it BEFORE minting the GER so it can never observe+inject the new pair.
+step "A.1 stopping aggoracle container $AGGKIT_CONTAINER to deconflict the race"
+if docker inspect -f '{{.State.Running}}' "$AGGKIT_CONTAINER" 2>/dev/null | grep -q true; then
+    docker stop "$AGGKIT_CONTAINER" >/dev/null || fail "could not stop $AGGKIT_CONTAINER"
+    AGGKIT_STOPPED=1
+    pass "aggoracle stopped (will be restarted on exit)"
+else
+    warn "aggoracle container $AGGKIT_CONTAINER not running — proceeding (no race to deconflict)"
+fi
+
+# ── A.2 Mint a brand-new L1 GER ────────────────────────────────────────────
+# One L1 bridgeAsset with forceUpdateGlobalExitRoot=true advances
+# lastMainnetExitRoot, minting a (mainnet, rollup) pair no one has injected yet.
+MAIN_BEFORE=$(cast call "$L1_GER_ADDRESS" "lastMainnetExitRoot()(bytes32)" --rpc-url "$L1_RPC_URL")
+step "A.2 minting a fresh L1 GER via bridgeAsset (forceUpdateGlobalExitRoot=true)"
+cast send --rpc-url "$L1_RPC_URL" --private-key "$SIGNER_KEY" \
+    "$L1_BRIDGE_ADDRESS" \
+    'bridgeAsset(uint32,address,uint256,address,bool,bytes)' \
+    1 "0x000000000000000000000000000000000000dEaD" "$DEPOSIT_WEI" \
+    0x0000000000000000000000000000000000000000 true 0x \
+    --value "$DEPOSIT_WEI" >/dev/null \
+    || fail "L1 bridgeAsset failed — cannot mint a fresh GER (is $L1_BRIDGE_ADDRESS the L1 bridge?)"
 
 MAIN=$(cast call "$L1_GER_ADDRESS" "lastMainnetExitRoot()(bytes32)" --rpc-url "$L1_RPC_URL")
 ROLL=$(cast call "$L1_GER_ADDRESS" "lastRollupExitRoot()(bytes32)"  --rpc-url "$L1_RPC_URL")
+[[ "$MAIN" != "$MAIN_BEFORE" ]] \
+    || fail "lastMainnetExitRoot did not change after bridgeAsset ($MAIN) — no fresh GER was minted (L1 not auto-mining? wrong bridge addr?)"
 COMB=$(cast keccak "$(cast concat-hex "$MAIN" "$ROLL")")
 COMB_HEX="${COMB#0x}"
-log "L1 pair: mainnet=$MAIN rollup=$ROLL combined=$COMB"
+pass "fresh L1 GER minted: mainnet=$MAIN rollup=$ROLL combined=$COMB"
 
-# Wait until the proxy's own indexer has observed the pair on L1 — the exact
-# evidence predicate the H6 gate uses (both ger_entries roots resolved; the
-# same predicate zkevm_getExitRootsByGER answers with).
+# ── A.3 Wait for the proxy's indexer to OBSERVE it ─────────────────────────
+# Same evidence predicate the H6 gate uses (both ger_entries roots resolved).
 log "waiting for the L1 InfoTree indexer to corroborate $COMB..."
 ELAPSED=0; TIMEOUT=120
 while true; do
     OBSERVED=$(rpc_call zkevm_getExitRootsByGER "[\"$COMB\"]" | json_field result || true)
     [[ -n "$OBSERVED" ]] && break
     ELAPSED=$((ELAPSED + 3))
-    [[ $ELAPSED -ge $TIMEOUT ]] && fail "indexer did not corroborate the current L1 GER after ${TIMEOUT}s — is the L1InfoTreeIndexer running?"
+    [[ $ELAPSED -ge $TIMEOUT ]] && fail "indexer did not corroborate the fresh L1 GER after ${TIMEOUT}s — is the L1InfoTreeIndexer running?"
     sleep 3
 done
-pass "indexer corroborated the L1 GER (zkevm_getExitRootsByGER non-null)"
+pass "indexer corroborated the fresh L1 GER (zkevm_getExitRootsByGER non-null)"
 
-ALREADY_INJECTED=$(pgquery "SELECT COUNT(*) FROM ger_entries WHERE ger_hash = decode('${COMB_HEX}', 'hex') AND is_injected")
-[[ "$ALREADY_INJECTED" == "1" ]] && log "GER already injected by the aggoracle — our tx exercises the duplicate-accept path (still must NOT be H6-refused)"
+# ── A.4 ASSERT the not-yet-injected precondition ───────────────────────────
+# THE adversarial guard: if this GER were already injected, the whole positive
+# test would be meaningless (dedup would wave a foreign injection through). So
+# refuse to continue unless it is provably fresh. This assert MUST fail on a
+# pre-injected GER.
+INJECTED_BEFORE=$(pgquery "SELECT COUNT(*) FROM ger_entries WHERE ger_hash = decode('${COMB_HEX}', 'hex') AND is_injected")
+[[ "$INJECTED_BEFORE" == "0" ]] \
+    || fail "precondition violated: GER $COMB is ALREADY injected before our submission (is_injected rows=$INJECTED_BEFORE) — the aggoracle race was not deconflicted, so a pass here would be a dedup false-pass. Aborting."
+if grep "UpdateGerNote" <<<"$(proxy_logs)" | grep -qi "$COMB_HEX"; then
+    fail "precondition violated: an UpdateGerNote for $COMB already exists in the logs before our submission — cannot attribute the injection to THIS tx"
+fi
+pass "precondition holds: GER $COMB is L1-observed but NOT yet injected"
 
+# ── A.5 Submit — OUR updateExitRoot is the tx under test ───────────────────
 # updateExitRoot ships BOTH roots in calldata (rollup FIRST — see
 # one-shot-ger-inject.sh for why insertGlobalExitRoot would race L1 here).
 NONCE_A=$(signer_nonce)
@@ -158,42 +229,48 @@ RAW_A=$(cast mktx "$L2_GER_ADDRESS" "updateExitRoot(bytes32,bytes32)" "$ROLL" "$
 OUT_A=$(rpc_call eth_sendRawTransaction "[\"$RAW_A\"]")
 TX_A=$(echo "$OUT_A" | json_field result)
 ERR_A=$(echo "$OUT_A" | json_field error)
-[[ -n "$ERR_A" ]] && fail "L1-observed GER was refused under strict H6 (false positive!): $ERR_A"
-[[ -n "$TX_A" ]] || fail "no tx hash returned for the L1-observed GER: $OUT_A"
-pass "L1-observed GER accepted: $TX_A"
+[[ -n "$ERR_A" ]] && fail "fresh L1-observed GER was refused under strict H6 (false negative!): $ERR_A"
+[[ -n "$TX_A" ]] || fail "no tx hash returned for the fresh L1-observed GER: $OUT_A"
+pass "fresh L1-observed GER accepted: $TX_A"
 
-# Receipt must land: immediately for a duplicate, or when the projector sees
-# the UpdateGerNote consumed for a fresh injection.
+# ── A.6 Tie every success signal to THIS tx hash ───────────────────────────
+# Receipt must land AND carry status == 0x1 (a reverted/status-0 receipt is a
+# failure the old check would have accepted as "non-null").
 log "waiting for the receipt of $TX_A..."
 ELAPSED=0; TIMEOUT=120
 while true; do
     RCPT=$(rpc_call eth_getTransactionReceipt "[\"$TX_A\"]" | json_field result || true)
     [[ -n "$RCPT" ]] && break
     ELAPSED=$((ELAPSED + 3))
-    [[ $ELAPSED -ge $TIMEOUT ]] && fail "receipt for the accepted GER tx never landed after ${TIMEOUT}s"
+    [[ $ELAPSED -ge $TIMEOUT ]] && fail "receipt for the accepted GER tx $TX_A never landed after ${TIMEOUT}s"
     sleep 3
 done
-pass "receipt landed for the accepted GER tx"
+RCPT_STATUS=$(echo "$RCPT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+[[ "$RCPT_STATUS" == "0x1" ]] \
+    || fail "receipt for $TX_A has status=$RCPT_STATUS (expected 0x1) — the accepted GER tx did not succeed"
+pass "receipt landed for $TX_A with status 0x1"
 
 # The UpdateGerNote must have reached Miden and been CONSUMED — the projector
-# flips is_injected only when it observes the consumption.
+# flips is_injected only when it observes the consumption. Because we asserted
+# is_injected=false in A.4 and the aggoracle is stopped, this flip is
+# attributable to OUR tx.
 ELAPSED=0; TIMEOUT=120
 while true; do
     INJECTED=$(pgquery "SELECT COUNT(*) FROM ger_entries WHERE ger_hash = decode('${COMB_HEX}', 'hex') AND is_injected" || true)
     [[ "$INJECTED" == "1" ]] && break
     ELAPSED=$((ELAPSED + 3))
-    [[ $ELAPSED -ge $TIMEOUT ]] && fail "ger_entries.is_injected never flipped for the accepted GER — UpdateGerNote not consumed?"
+    [[ $ELAPSED -ge $TIMEOUT ]] && fail "ger_entries.is_injected never flipped for the accepted GER $COMB — UpdateGerNote not consumed?"
     sleep 3
 done
-pass "UpdateGerNote consumed (ger_entries.is_injected = true)"
+pass "UpdateGerNote consumed (ger_entries.is_injected = true) — attributable to $TX_A"
 
-# And the proxy must have logged the note for THIS ger (whether our tx or the
-# aggoracle's earlier duplicate original created it).
+# And the proxy must have logged the UpdateGerNote for THIS ger — which did not
+# exist in the logs before A.5 (asserted in A.4), so it is our submission's.
 LOGS=$(proxy_logs)
 grep -q "UpdateGerNote created" <<<"$LOGS" || fail "no 'UpdateGerNote created' log line at all"
 grep "UpdateGerNote" <<<"$LOGS" | grep -qi "$COMB_HEX" \
     || fail "no UpdateGerNote log line references the accepted GER $COMB"
-pass "Phase A complete — L1-observed GER accepted, UpdateGerNote submitted + consumed"
+pass "Phase A complete — FRESH L1-observed GER accepted and injected by $TX_A"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -270,6 +347,6 @@ pass "ger_injection_unverified_total >= 1"
 echo ""
 log "======================================================================"
 log "  H6 GER L1-VERIFICATION E2E COMPLETE"
-log "  Phase A: L1-observed GER accepted; UpdateGerNote submitted+consumed ✓"
+log "  Phase A: FRESH L1-observed GER accepted+injected by our tx (status 0x1) ✓"
 log "  Phase B: forged GER refused; no hash/nonce/row/note side effects    ✓"
 log "======================================================================"

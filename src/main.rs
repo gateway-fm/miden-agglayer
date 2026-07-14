@@ -169,8 +169,14 @@ struct Command {
     /// indexer lag on dev/e2e stacks — merging the H6 code without setting
     /// `REJECT_UNVERIFIED_GER_INJECTION=true` (or `REQUIRE_HARDENING=true`,
     /// which implies it) does NOT close audit finding H6. Strict mode
-    /// requires the L1 evidence source (`--l1-rpc-url` + `--ger-l1-address`)
-    /// at startup — see `check_h6_evidence_source`.
+    /// requires the L1 evidence source (`--l1-rpc-url` + `--ger-l1-address`,
+    /// both syntactically valid) at startup — a malformed L1 RPC URL or GER
+    /// address ABORTS the boot rather than serving with a dead evidence source
+    /// (see `check_h6_evidence_source`). On a FRESH database (no persisted
+    /// indexer cursor) strict mode also requires `--l1-indexer-from-block`
+    /// (`L1_INDEXER_FROM_BLOCK`) set to a block at or before the rollup
+    /// deployment, else the indexer would start at the current L1 head and
+    /// reject every pre-existing GER forever (see `check_h6_backfill_invariant`).
     ///
     /// The long flag is spelled `--reject-unverified-ger-injection` (matching
     /// the bail message in `ger.rs`, the e2e script, and the env var) rather
@@ -365,6 +371,77 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
              start (it only WARNS and continues), leaving strict mode with no evidence \
              source — every new GER injection would be rejected (fail-closed outage). \
              Fix the address before boot."
+        ));
+    }
+    // Blocker 1 — a MALFORMED L1 RPC URL is a config error, not a transient
+    // outage: `L1InfoTreeIndexer::spawn()` parses the URL synchronously and
+    // returns Err (which `main` previously only LOGGED before continuing to
+    // serve, leaving strict mode with a permanently-dead evidence source that
+    // rejects every fresh GER forever). Catch the unparsable URL here so strict
+    // startup ABORTS. This is the "config/spawn invalid → abort" half of the
+    // distinction; a syntactically-valid but currently-UNREACHABLE RPC parses
+    // fine here, `spawn()` builds its provider without connecting, and the
+    // indexer task retries the connection — the intended fail-closed-and-retry
+    // posture, NOT a startup abort. `url::Url` is exactly what alloy's
+    // `connect_http` parses the string into, so "parses here" ⟺ "spawn won't
+    // reject the URL".
+    if let Some(rpc) = command.l1_rpc_url.as_deref()
+        && rpc.parse::<Url>().is_err()
+    {
+        return Err(format!(
+            "strict H6 GER corroboration is enabled via {trigger}, but --l1-rpc-url \
+             `{rpc}` is not a valid URL. The L1 InfoTree indexer parses this string at \
+             spawn and would fail to start, leaving strict mode with no evidence source — \
+             every new GER injection would be rejected (fail-closed outage). This is a \
+             malformed-config error (distinct from a valid-but-currently-unreachable RPC, \
+             which stays fail-closed and retries): fix the URL before boot."
+        ));
+    }
+    Ok(())
+}
+
+/// Blocker 2 — fresh-database backfill invariant for strict H6. On a fresh
+/// database the persisted L1-indexer cursor is 0, and without an explicit
+/// `--l1-indexer-from-block` the indexer deliberately starts at the CURRENT L1
+/// head to avoid a multi-million-block backfill. That default is safe for a
+/// brand-new chain, but for a strict deployment brought up OVER an existing
+/// chain it means every pre-existing / currently-observed GER sits BELOW the
+/// indexer's first scanned block and can never be corroborated — so the first
+/// current or replayed GER is rejected forever. Make the operator choose:
+/// either a non-zero persisted cursor (an existing indexed database) OR an
+/// explicit safe from-block. Non-strict behavior is unchanged.
+///
+/// Takes the relevant Copy fields by value rather than `&Command` because it is
+/// evaluated only after the store exists (well past the point where non-Copy
+/// command fields such as `miden_store_dir` have already been moved out), so the
+/// whole struct can no longer be borrowed.
+fn check_h6_backfill_invariant(
+    reject_unverified_ger: bool,
+    require_hardening: bool,
+    l1_indexer_from_block: Option<u64>,
+    persisted_cursor: u64,
+) -> Result<(), String> {
+    let strict = reject_unverified_ger || require_hardening;
+    if !strict {
+        return Ok(());
+    }
+    if persisted_cursor == 0 && l1_indexer_from_block.is_none() {
+        let trigger = if reject_unverified_ger {
+            "--reject-unverified-ger-injection (REJECT_UNVERIFIED_GER_INJECTION)"
+        } else {
+            "--require-hardening (which implies strict H6 GER corroboration)"
+        };
+        return Err(format!(
+            "strict H6 GER corroboration is enabled via {trigger} on a FRESH database \
+             (persisted L1-indexer cursor = 0) with no --l1-indexer-from-block \
+             (L1_INDEXER_FROM_BLOCK) set. The indexer would start at the CURRENT L1 head, \
+             so every GER emitted at or before that head — i.e. every pre-existing or \
+             replayed GER when deploying over an existing chain — is permanently below \
+             the indexer's first scanned block and can never be corroborated: strict mode \
+             would reject the first current/replayed GER forever. Set \
+             --l1-indexer-from-block to a block at or before the rollup deployment so the \
+             historic UpdateL1InfoTree leaves are indexed, OR boot against a database that \
+             already carries a non-zero persisted cursor."
         ));
     }
     Ok(())
@@ -807,6 +884,25 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Blocker 2 — fresh-database backfill invariant. Runs only on the serving
+    // path (restore has already returned above), before `store` is moved into
+    // ServiceState. Under strict H6 a fresh DB (cursor 0) with no explicit
+    // from-block would silently start the indexer at the L1 head and reject
+    // every pre-existing GER forever; abort with an operator-actionable error
+    // instead. `get_l1_indexer_cursor` failing is treated as cursor 0 (the
+    // fail-closed reading) so a broken store can't mask the invariant.
+    {
+        let persisted_cursor = store.get_l1_indexer_cursor().await.unwrap_or(0);
+        if let Err(reason) = check_h6_backfill_invariant(
+            command.reject_unverified_ger,
+            command.require_hardening,
+            command.l1_indexer_from_block,
+            persisted_cursor,
+        ) {
+            anyhow::bail!("{reason}");
+        }
+    }
+
     let mut state = ServiceState::new(
         client,
         accounts,
@@ -875,6 +971,17 @@ async fn main() -> anyhow::Result<()> {
     // GER lands on L2. Idempotent UPSERT: no-op if both code paths populate
     // the same ger_entries row. See `l1_info_tree_indexer.rs` for the full
     // race analysis and store-ordering guarantees.
+    // Blocker 1 — under strict H6 the indexer IS the sole GER evidence source,
+    // so a config/spawn failure here (unparsable GER address, malformed L1 RPC
+    // URL) must ABORT startup rather than log-and-continue: continuing would
+    // leave the process serving with a permanently-dead evidence source that
+    // rejects every fresh GER forever. This is the "config/spawn invalid →
+    // abort" branch; a valid-but-unreachable RPC does NOT trip it — `spawn()`
+    // builds its provider without connecting and returns Ok, and the indexer
+    // task retries the connection (fail-closed-and-retry). `check_h6_evidence_source`
+    // already fails these cases at the earlier startup gate; this is the
+    // defense-in-depth backstop at the actual spawn site.
+    let strict_h6 = command.reject_unverified_ger || command.require_hardening;
     if let (Some(l1_rpc_url), Some(ger_addr_str)) =
         (state.l1_rpc_url.clone(), state.ger_l1_address.clone())
     {
@@ -902,11 +1009,29 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("L1InfoTreeIndexer spawned");
                     }
                     Err(e) => {
+                        if strict_h6 {
+                            anyhow::bail!(
+                                "strict H6 GER corroboration is enabled, but the L1 InfoTree \
+                                 indexer (its sole evidence source) failed to spawn: {e}. This is \
+                                 a config/spawn error (e.g. a malformed L1 RPC URL), not a \
+                                 transient outage — aborting rather than serving with a dead \
+                                 evidence source that would reject every fresh GER forever."
+                            );
+                        }
                         tracing::error!(error = %e, "failed to spawn L1InfoTreeIndexer");
                     }
                 }
             }
             Err(e) => {
+                if strict_h6 {
+                    anyhow::bail!(
+                        "strict H6 GER corroboration is enabled, but --ger-l1-address \
+                         `{ger_addr_str}` is not a valid EVM address ({e}); the L1 InfoTree \
+                         indexer (its sole evidence source) cannot start. Aborting rather than \
+                         serving with a dead evidence source that would reject every fresh GER \
+                         forever."
+                    );
+                }
                 tracing::error!(
                     address = %ger_addr_str,
                     error = %e,
@@ -1363,6 +1488,97 @@ mod hardening_tests {
         c.l1_rpc_url = Some("http://anvil:8545".into());
         c.ger_l1_address = Some("0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674".into());
         assert!(check_h6_evidence_source(&c).is_ok());
+    }
+
+    // ── Blocker 1: malformed L1 RPC URL → abort; unreachable → keep retrying ──
+
+    /// A base config with a valid GER address and a strict trigger, tunable
+    /// only in the L1 RPC URL — isolates the URL-syntax check.
+    fn strict_cmd_with_rpc(rpc: &str) -> Command {
+        let mut c = cmd(
+            true,
+            Some("strong-admin-key".into()),
+            Some(vec![alloy::primitives::Address::ZERO]),
+            Some(vec!["https://app.example.com".into()]),
+        );
+        c.reject_unverified_ger = true;
+        c.l1_rpc_url = Some(rpc.to_string());
+        c.ger_l1_address = Some("0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674".into());
+        c
+    }
+
+    /// A MALFORMED L1 RPC URL under strict mode aborts startup: the indexer
+    /// would fail to spawn, leaving strict mode with a permanently-dead
+    /// evidence source. This is a config error, not a transient outage.
+    #[test]
+    fn h6_strict_with_malformed_rpc_url_refused_at_startup() {
+        // A string with no scheme and a space is not a valid URL.
+        let c = strict_cmd_with_rpc("not a url");
+        let reason = check_h6_evidence_source(&c).unwrap_err();
+        assert!(
+            reason.contains("--l1-rpc-url"),
+            "must name the offending flag: {reason}"
+        );
+        assert!(
+            reason.contains("not a valid URL"),
+            "must cite the URL parse failure: {reason}"
+        );
+    }
+
+    /// A syntactically-VALID but (in this environment) UNREACHABLE L1 RPC does
+    /// NOT abort startup — it stays a retrying fail-closed condition. The
+    /// address is a non-routable RFC-5737 test host; the point is that URL
+    /// *syntax* is fine, so the config gate passes and the runtime indexer
+    /// retries the connection rather than the process refusing to boot.
+    #[test]
+    fn h6_strict_with_valid_but_unreachable_rpc_does_not_abort() {
+        let c = strict_cmd_with_rpc("http://203.0.113.1:8545");
+        assert!(
+            check_h6_evidence_source(&c).is_ok(),
+            "a valid-but-unreachable RPC must not abort startup — it stays fail-closed and retries"
+        );
+    }
+
+    // ── Blocker 2: fresh-DB backfill is an invariant, not advisory ───────────
+
+    /// Non-strict mode never enforces the backfill invariant, even on a fresh
+    /// DB with no from-block.
+    #[test]
+    fn h6_backfill_not_required_when_lenient() {
+        // reject_unverified_ger=false, require_hardening=false → lenient.
+        assert!(check_h6_backfill_invariant(false, false, None, 0).is_ok());
+    }
+
+    /// Strict + fresh DB (cursor 0) + no --l1-indexer-from-block must abort:
+    /// the indexer would start at the current L1 head and miss every
+    /// pre-existing GER forever.
+    #[test]
+    fn h6_backfill_strict_fresh_db_without_from_block_refused() {
+        let reason = check_h6_backfill_invariant(true, false, None, 0).unwrap_err();
+        assert!(
+            reason.contains("--l1-indexer-from-block"),
+            "must name the fix: {reason}"
+        );
+        assert!(
+            reason.contains("FRESH database"),
+            "must state the fresh-DB precondition: {reason}"
+        );
+        // `--require-hardening` is the other strict trigger and must also trip it.
+        assert!(check_h6_backfill_invariant(false, true, None, 0).is_err());
+    }
+
+    /// Strict + fresh DB (cursor 0) + explicit --l1-indexer-from-block passes:
+    /// the operator has chosen a safe start block.
+    #[test]
+    fn h6_backfill_strict_fresh_db_with_from_block_ok() {
+        assert!(check_h6_backfill_invariant(true, false, Some(0), 0).is_ok());
+    }
+
+    /// Strict + non-zero persisted cursor passes even without a from-block:
+    /// an existing indexed database already covers the historic leaves.
+    #[test]
+    fn h6_backfill_strict_nonzero_cursor_ok() {
+        assert!(check_h6_backfill_invariant(true, false, None, 42).is_ok());
     }
 }
 
