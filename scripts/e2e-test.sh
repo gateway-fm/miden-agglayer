@@ -89,6 +89,19 @@ case "$test_filter" in
         else
             echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
         fi
+        echo ""
+        # VERY LAST in the suite — defense in depth: the manual-user-claim
+        # script deliberately front-runs the sponsor's autoclaimer, which
+        # wedges the sponsor's ethtxmanager head nonce MID-RUN. The script
+        # heals the sponsor itself before exiting (consumes the wedged nonces
+        # with benign no-op txs and HARD-asserts that a fresh deposit
+        # autoclaims), but if it dies mid-leg the sponsor may stay wedged — so
+        # nothing that depends on sponsor autoclaim may run after it. Its legs
+        # are L1→L2-only (GER injection via aggoracle, no certificate
+        # settlement), so running after cantina13's poison leaf is safe. The
+        # optional ALLOWLIST_LEG=1 phase (restarts the proxy) is NOT enabled
+        # here — it is only for disposable stacks, run manually.
+        "$SCRIPT_DIR/e2e-manual-user-claim.sh"
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
@@ -134,6 +147,9 @@ case "$test_filter" in
         ;;
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
+        ;;
+    manual-user-claim)
+        "$SCRIPT_DIR/e2e-manual-user-claim.sh"
         ;;
     l2l2)
         # SIMPLE L2<->L2 pipeline group (NOT in `all` — needs the
