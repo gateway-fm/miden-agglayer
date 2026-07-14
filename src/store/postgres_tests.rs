@@ -1704,25 +1704,97 @@ async fn test_pgstore_reserve_nonce() {
     let addr = format!("0x{:040x}", base as u128);
     let h1 = TxHash::from([(base % 251) as u8 + 1; 32]);
     let h2 = TxHash::from([(base % 241) as u8 + 2; 32]);
+    let lease = std::time::Duration::from_secs(90);
 
+    // Fresh → Won(fence).
+    let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 5, h1, lease).await.unwrap()
+    else {
+        panic!("fresh slot must be Won");
+    };
+    // Same tx, valid lease → OwnedBySame.
     assert_eq!(
-        store.reserve_nonce(&addr, 5, h1).await.unwrap(),
-        NonceReservation::Won
+        store.reserve_nonce(&addr, 5, h1, lease).await.unwrap(),
+        NonceReservation::OwnedBySame
     );
-    // Same tx re-reserving → HeldBy(itself).
+    // Different tx, same slot → HeldByOther(winner h1).
     assert_eq!(
-        store.reserve_nonce(&addr, 5, h1).await.unwrap(),
-        NonceReservation::HeldBy(h1)
+        store.reserve_nonce(&addr, 5, h2, lease).await.unwrap(),
+        NonceReservation::HeldByOther(h1)
     );
-    // Different tx, same slot → HeldBy(winner h1).
+    // release-FAILURE → same tx takes over (fence bumps).
+    store
+        .release_reservation(&addr, 5, h1, fence, false)
+        .await
+        .unwrap();
+    let NonceReservation::Won { fence: fence2 } =
+        store.reserve_nonce(&addr, 5, h1, lease).await.unwrap()
+    else {
+        panic!("after release-failure the same tx must retake ownership");
+    };
+    assert!(fence2 > fence, "takeover bumps the fence");
+    // release-SUCCESS → same tx dedups.
+    store
+        .release_reservation(&addr, 5, h1, fence2, true)
+        .await
+        .unwrap();
     assert_eq!(
-        store.reserve_nonce(&addr, 5, h2).await.unwrap(),
-        NonceReservation::HeldBy(h1)
+        store.reserve_nonce(&addr, 5, h1, lease).await.unwrap(),
+        NonceReservation::OwnedBySame
     );
     // Different nonce → free.
+    assert!(matches!(
+        store.reserve_nonce(&addr, 6, h2, lease).await.unwrap(),
+        NonceReservation::Won { .. }
+    ));
+}
+
+/// BLOCKER 1 — FULL two-replica shared-PostgreSQL races. Two PgStore handles over
+/// the SAME database (two "replicas") reserve the SAME (signer, nonce) slot.
+#[tokio::test]
+async fn test_pgstore_two_replica_reservation_races() {
+    let Some(replica_a) = pg_store().await else {
+        return;
+    };
+    let Some(replica_b) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let lease = std::time::Duration::from_secs(90);
+    let base = rand_u64();
+
+    // (1) DIFFERENT-hash race at the same slot: exactly one wins, the other is
+    //     HeldByOther and must NOT execute.
+    let addr = format!("0x{:040x}", base as u128);
+    let ha = TxHash::from([(base % 251) as u8 + 7; 32]);
+    let hb = TxHash::from([(base % 241) as u8 + 8; 32]);
+    let ra = replica_a.reserve_nonce(&addr, 3, ha, lease).await.unwrap();
+    let rb = replica_b.reserve_nonce(&addr, 3, hb, lease).await.unwrap();
+    let a_won = matches!(ra, NonceReservation::Won { .. });
+    let b_won = matches!(rb, NonceReservation::Won { .. });
+    // Replica A reserved first (sequential here), so A wins and B is HeldByOther.
+    assert!(a_won, "the first replica to reserve wins: {ra:?}");
+    assert!(
+        !b_won,
+        "the second replica with a DIFFERENT hash must not win: {rb:?}"
+    );
+    assert_eq!(rb, NonceReservation::HeldByOther(ha));
+
+    // (2) SAME-hash race at another slot: replica A wins ownership; replica B
+    //     submitting the IDENTICAL tx while A's lease is valid gets OwnedBySame and
+    //     must DEDUP (not execute) — no double Miden work.
+    let addr2 = format!("0x{:040x}", base.wrapping_add(1) as u128);
+    let h = TxHash::from([(base % 233) as u8 + 9; 32]);
+    let ra2 = replica_a.reserve_nonce(&addr2, 4, h, lease).await.unwrap();
+    assert!(
+        matches!(ra2, NonceReservation::Won { .. }),
+        "A wins: {ra2:?}"
+    );
+    let rb2 = replica_b.reserve_nonce(&addr2, 4, h, lease).await.unwrap();
     assert_eq!(
-        store.reserve_nonce(&addr, 6, h2).await.unwrap(),
-        NonceReservation::Won
+        rb2,
+        NonceReservation::OwnedBySame,
+        "the same tx on another replica while the owner's lease is valid must dedup, \
+         not double-execute"
     );
 }
 

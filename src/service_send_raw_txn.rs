@@ -529,6 +529,122 @@ pub(crate) fn claim_resubmit_ttl() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// #55 BLOCKER 1 — how long a won `(signer, nonce)` admission lease is owned before
+/// another replica may take it over on expiry (crash recovery). Kept comfortably
+/// BELOW aggkit's re-broadcast envelope so a rebroadcast after an owner crash can
+/// take over promptly, yet above the slowest legitimate admission (a sync claim
+/// publish). Env-tunable via `NONCE_RESERVATION_LEASE_SECS`.
+pub(crate) fn reservation_lease() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 90;
+    let secs = std::env::var("NONCE_RESERVATION_LEASE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// #55 BLOCKER 1 — execute a WON admission (dispatch to the writer worker or the
+/// legacy sync path) and return the tx hash. Extracted so `service_send_raw_txn` can
+/// wrap it with the reservation-lease RELEASE (success → future same-hash dedups;
+/// failure → the same tx may retry via lease takeover). Only ever called after the
+/// caller won the `(signer, nonce)` reservation.
+async fn dispatch_after_reservation(
+    service: &ServiceState,
+    decoded: crate::writer_worker::DecodedWriteCall,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    txn_hash: TxHash,
+    signer_str: &str,
+    tx_nonce: u64,
+) -> anyhow::Result<TxHash> {
+    if service.enable_writer_worker {
+        let handle = service.writer_handle.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "enable_writer_worker=true but no writer_handle plumbed into ServiceState; \
+                 boot order bug — see main.rs writer spawn block"
+            )
+        })?;
+
+        // BLOCKER 3 — landed classification BEFORE C6 in WRITER mode too: an
+        // already-LANDED gi routes to accept-and-revert here (atomic reverted receipt
+        // + nonce, synchronous, no enqueue), regardless of GER state, so it never
+        // gets a C6 RPC error with no nonce consumption. The worker's
+        // `acquire_claim_lock` still catches a claim that LANDS after this check.
+        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+            && service
+                .store
+                .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
+                .await?
+        {
+            accept_and_revert_landed_claim(
+                service,
+                params,
+                txn_hash,
+                txn_envelope,
+                signer,
+                signer_str,
+                tx_nonce,
+            )
+            .await?;
+            return Ok(txn_hash);
+        }
+
+        // C6 on the REQUEST path (PR #127 review point 3) — gate before enqueue so a
+        // GER-not-yet-published claim leaves nothing behind. Only claims that would
+        // reach C6 in the worker are gated (zero-amount + unresolvable destinations
+        // are swallowed earlier).
+        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+            && params.destinationNetwork == service.network_id
+            && !params.amount.is_zero()
+            && crate::address_mapper::resolve_address(
+                &*service.store,
+                params.destinationAddress,
+                &service.accounts.0,
+            )
+            .await
+            .is_ok()
+        {
+            ensure_claim_ger_published(&service.store, params).await?;
+        }
+
+        let job = decoded.into_job(txn_envelope, signer, txn_hash);
+        match handle.try_enqueue(job) {
+            Ok(()) => {
+                let _ = service
+                    .store
+                    .nonce_advance_cas(signer_str, tx_nonce)
+                    .await?;
+                Ok(txn_hash)
+            }
+            Err(crate::writer_worker::TryEnqueueError::QueueFull) => {
+                Err(crate::writer_worker::WriterQueueSaturatedError.into())
+            }
+            Err(crate::writer_worker::TryEnqueueError::ShutDown) => {
+                anyhow::bail!(
+                    "writer worker has shut down — service is draining; retry against the next \
+                     replica"
+                );
+            }
+        }
+    } else {
+        // Legacy synchronous dispatch.
+        match decoded {
+            crate::writer_worker::DecodedWriteCall::Claim { params } => {
+                worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer).await?;
+            }
+            crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
+                worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer)
+                    .await?;
+            }
+        }
+        let _ = service
+            .store
+            .nonce_advance_cas(signer_str, tx_nonce)
+            .await?;
+        Ok(txn_hash)
+    }
+}
+
 /// Typed, AUTHORITATIVE outcome of [`acquire_claim_lock`]. Landed detection and the
 /// #55 accept-and-revert decision are ONE step here (no separate pre-check→lock
 /// window), so there is no interleaving in which a claim for an already-landed
@@ -1046,176 +1162,77 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // no enqueue, no dispatch, no receipt. (This runs AFTER the R4 per-signer lock,
     // which still serialises intra-process and provides the future-nonce wait; the
     // reservation is the cross-replica uniqueness guarantee the process lock can't.)
-    match service
+    // Reserve the (signer, nonce) admission LEASE atomically, BEFORE any
+    // queue/dispatch/receipt side effect. This is a FENCED-OWNERSHIP lifecycle,
+    // not a bare row: exactly one replica ever executes a given (signer, nonce),
+    // and a genuine retry after a failed/expired attempt is allowed via takeover.
+    let reservation_fence = match service
         .store
-        .reserve_nonce(&signer_str, tx_nonce, txn_hash)
+        .reserve_nonce(&signer_str, tx_nonce, txn_hash, reservation_lease())
         .await?
     {
-        crate::store::NonceReservation::Won => {}
-        crate::store::NonceReservation::HeldBy(h) if h == txn_hash => {
-            // This exact tx already reserved the slot (its own earlier attempt — e.g.
-            // a retry after a RETRYABLE C6/GER rejection that left the reservation but
-            // no receipt — or an idempotent rebroadcast). PROCEED so a retryable
-            // failure can re-run admission and eventually execute. The upstream
-            // tx-hash dedup already short-circuited a tx that truly completed
-            // (receipt written / in-flight), so reaching here means re-execution is
-            // safe (and idempotent: a landed gi accept-reverts, a GER re-inserts).
+        crate::store::NonceReservation::Won { fence } => fence,
+        crate::store::NonceReservation::OwnedBySame => {
+            // The slot is currently owned+executing by THIS SAME tx under a valid
+            // lease (another replica is admitting it), or it already released-
+            // success. Do NOT execute — dedup-return the hash; the owner produces
+            // the receipt. This is the authoritative single-executor guarantee that
+            // the process-local dedup reads (which can miss cross-replica) cannot give.
             tracing::debug!(
                 target: "rpc::reserve",
                 %txn_hash, nonce = tx_nonce,
-                "reservation held by this same tx — proceeding (retry/re-execute)"
+                "reservation owned by this same tx (valid lease / released-success) — \
+                 dedup-returning hash, NOT executing"
             );
-        }
-        crate::store::NonceReservation::HeldBy(other) => {
-            // A DIFFERENT tx already reserved this (signer, nonce) slot — this
-            // submission LOST and must NOT execute. Reject; the winner advances the
-            // nonce, so this loser's subsequent retries fail R4 as stale (nonce too
-            // low) and aggkit drops it — mirroring geth dropping the losing tx at an
-            // already-consumed nonce.
-            ::metrics::counter!("rpc_nonce_reservation_lost_total").increment(1);
-            anyhow::bail!(
-                "nonce {tx_nonce} for {signer_str} is already reserved by a different tx \
-                 {other:#x} (concurrent submission at the same nonce slot); this tx must not \
-                 execute"
-            );
-        }
-    }
-
-    // ── Dispatch fork (RD-940) ──────────────────────────────────────────
-    //
-    // `enable_writer_worker` defaults to false — the legacy synchronous
-    // branch below is byte-identical to pre-RD-940 behaviour for the
-    // claim and GER paths. When the flag is enabled and a writer handle
-    // is plumbed, requests are enqueued for asynchronous Miden submission
-    // and the HTTP future returns the tx-hash as soon as `try_enqueue`
-    // succeeds.
-    //
-    // Nonce-advance ordering matters under both branches:
-    //   - legacy: dispatch runs to completion → nonce_increment (current
-    //     behaviour preserved bit-for-bit)
-    //   - worker: try_enqueue → on Ok, nonce_increment; on QueueFull, the
-    //     nonce is intentionally **not** advanced so the caller retries
-    //     with the same nonce and -32005 doesn't burn a sequence slot
-    //
-    // Decision 3 (idempotent re-broadcast) and Decision 4
-    // (eth_getTransactionCount tag honouring) land in Phase 2.
-    if service.enable_writer_worker {
-        let handle = service.writer_handle.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "enable_writer_worker=true but no writer_handle plumbed into ServiceState; \
-                 boot order bug — see main.rs writer spawn block"
-            )
-        })?;
-
-        // BLOCKER 3 — landed classification BEFORE C6 in WRITER mode too. The sync
-        // worker already classifies landed before RD-860/C6, but the REQUEST path
-        // ran C6 (`ensure_claim_ger_published`) before enqueue: an already-LANDED gi
-        // with a resolvable destination and an altered/unobserved GER would get a C6
-        // RPC error with NO nonce consumption — the wedge. So route an already-landed
-        // claim to accept-and-revert HERE (atomic reverted receipt + nonce, synchronous,
-        // no enqueue), regardless of GER state. The worker's `acquire_claim_lock` still
-        // catches a claim that LANDS after this check (its `Landed` arm accept-reverts).
-        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-            && service
-                .store
-                .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
-                .await?
-        {
-            accept_and_revert_landed_claim(
-                &service,
-                params,
-                txn_hash,
-                txn_envelope,
-                signer,
-                &signer_str,
-                tx_nonce,
-            )
-            .await?;
             return Ok(txn_hash);
         }
+        crate::store::NonceReservation::HeldByOther(other) => {
+            // A DIFFERENT tx owns/owned this (signer, nonce) slot — this submission
+            // LOST and must NOT execute. Reject; the winner advances the nonce, so
+            // this loser's retries fail R4 as stale and aggkit drops it — mirroring
+            // geth dropping the losing tx at an already-consumed nonce.
+            ::metrics::counter!("rpc_nonce_reservation_lost_total").increment(1);
+            anyhow::bail!(
+                "nonce {tx_nonce} for {signer_str} is reserved by a different tx {other:#x} \
+                 (concurrent submission at the same nonce slot); this tx must not execute"
+            );
+        }
+    };
 
-        // C6 on the REQUEST path (PR #127 review point 3). Pre-fix, with the
-        // writer enabled the gate only ran inside the worker — AFTER
-        // `try_enqueue` had consumed the nonce and admitted the tx hash into
-        // the inflight dedup cache, so a GER-not-yet-published claim burned a
-        // sequence slot and its re-broadcast short-circuited as a "known"
-        // hash. Run the gate here, before any side-effect, so pre-admission
-        // failure leaves NOTHING behind: no tx hash/receipt, no nonce, no
-        // globalIndex lock, no queued job — the same signed transaction (same
-        // nonce) is accepted verbatim once the GER is published.
-        //
-        // Only claims that would actually reach C6 in the worker are gated,
-        // mirroring `worker_handle_claim_asset`'s short-circuit precedence:
-        // wrong-network claims hard-fail in the worker regardless of GER,
-        // zero-amount claims are swallowed as immediate successes, and
-        // unresolvable destinations are swallowed permanently (RD-860 runs
-        // BEFORE C6 because that state is permanent while a missing GER is
-        // transient).
-        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-            && params.destinationNetwork == service.network_id
-            && !params.amount.is_zero()
-            && crate::address_mapper::resolve_address(
-                &*service.store,
-                params.destinationAddress,
-                &service.accounts.0,
-            )
-            .await
-            .is_ok()
-        {
-            ensure_claim_ger_published(&service.store, params).await?;
-        }
-
-        let job = decoded.into_job(txn_envelope, signer, txn_hash);
-        match handle.try_enqueue(job) {
-            Ok(()) => {
-                // BLOCKER D — advance via store-level CAS (advance only WHERE nonce
-                // == tx_nonce), so two replicas on a shared PostgreSQL can't both
-                // advance from the same expected value (N→N+2). A `false` return
-                // means another replica (or the worker's own accept-and-revert)
-                // already advanced it — the nonce ends advanced either way.
-                let _ = service
-                    .store
-                    .nonce_advance_cas(&signer_str, tx_nonce)
-                    .await?;
-                Ok(txn_hash)
-            }
-            Err(crate::writer_worker::TryEnqueueError::QueueFull) => {
-                // The downcast on this typed error in `service.rs`
-                // promotes the JSON-RPC error code to -32005 (geth's
-                // LimitExceeded), letting aggkit's ethtxmanager retry
-                // transparently. The metric was already incremented in
-                // try_enqueue.
-                Err(crate::writer_worker::WriterQueueSaturatedError.into())
-            }
-            Err(crate::writer_worker::TryEnqueueError::ShutDown) => {
-                anyhow::bail!(
-                    "writer worker has shut down — service is draining; retry against the next \
-                     replica"
-                );
-            }
-        }
-    } else {
-        // Legacy synchronous dispatch — unchanged behaviour.
-        match decoded {
-            crate::writer_worker::DecodedWriteCall::Claim { params } => {
-                worker_handle_claim_asset(&service, *params, txn_hash, txn_envelope, signer)
-                    .await?;
-            }
-            crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
-                worker_handle_ger_insert(&service, ger_bytes, txn_hash, txn_envelope, signer)
-                    .await?;
-            }
-        }
-        // BLOCKER D — advance via store-level CAS (advance only WHERE nonce ==
-        // tx_nonce), cross-replica-safe. A `false` return means the advance already
-        // happened (the accept-and-revert path advances the nonce atomically with
-        // its receipt, or a concurrent replica won) — the nonce ends advanced.
-        let _ = service
-            .store
-            .nonce_advance_cas(&signer_str, tx_nonce)
-            .await?;
-        Ok(txn_hash)
+    // Execute the WON admission, then RELEASE the lease on the outcome: success →
+    // `released_success` (a future same-hash submission dedups via OwnedBySame);
+    // failure → `released_failure` (the SAME tx may retry via lease takeover). Only
+    // the current fence owner may release, so a delayed crashed owner whose lease was
+    // taken over cannot clobber the new owner's state. A crash before release leaves
+    // the lease to EXPIRE and be taken over. This is the durable admission lifecycle.
+    let admission = dispatch_after_reservation(
+        &service,
+        decoded,
+        txn_envelope,
+        signer,
+        txn_hash,
+        &signer_str,
+        tx_nonce,
+    )
+    .await;
+    if let Err(release_err) = service
+        .store
+        .release_reservation(
+            &signer_str,
+            tx_nonce,
+            txn_hash,
+            reservation_fence,
+            admission.is_ok(),
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "rpc::reserve",
+            %txn_hash, nonce = tx_nonce, err = %release_err,
+            "failed to release the nonce reservation lease; it will expire and be taken over"
+        );
     }
+    admission
 }
 
 #[cfg(test)]
@@ -3499,36 +3516,99 @@ mod tests {
         );
     }
 
-    /// BLOCKER 1 — atomic (signer, nonce) reservation: the FIRST tx to reserve a
-    /// slot wins; a DIFFERENT tx at the same slot loses (HeldBy the winner); the
-    /// SAME tx re-reserving is idempotent (HeldBy itself); a different nonce is free.
+    /// BLOCKER 1 — the fenced admission-lease LIFECYCLE: fresh → Won(fence); the
+    /// SAME tx under a valid lease → OwnedBySame (dedup, another replica must not
+    /// execute); a DIFFERENT tx → HeldByOther (hard reject); release-FAILURE lets the
+    /// SAME tx take over (fence bumps); a fenced-out stale release is ignored;
+    /// release-SUCCESS makes the SAME tx dedup; an EXPIRED lease is taken over.
     #[tokio::test]
-    async fn blocker_1_reserve_nonce_first_wins_different_tx_loses() {
+    async fn blocker_1_reserve_nonce_fenced_lifecycle() {
         use crate::store::NonceReservation;
-        let store: std::sync::Arc<dyn crate::store::Store> =
-            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
         let addr = "0x00000000000000000000000000000000000000dd";
         let h1 = TxHash::from([0x11u8; 32]);
         let h2 = TxHash::from([0x22u8; 32]);
+        let lease = std::time::Duration::from_secs(90);
 
+        // Fresh → Won(fence 1).
+        let NonceReservation::Won { fence } =
+            store.reserve_nonce(addr, 5, h1, lease).await.unwrap()
+        else {
+            panic!("fresh slot must be Won");
+        };
+        assert_eq!(fence, 1);
+        // Same tx, VALID lease → OwnedBySame (another replica must NOT execute).
         assert_eq!(
-            store.reserve_nonce(addr, 5, h1).await.unwrap(),
-            NonceReservation::Won
+            store.reserve_nonce(addr, 5, h1, lease).await.unwrap(),
+            NonceReservation::OwnedBySame
         );
-        // Same tx re-reserving → HeldBy(itself) (idempotent).
+        // A DIFFERENT tx at the same slot → HeldByOther(the winner) → hard reject.
         assert_eq!(
-            store.reserve_nonce(addr, 5, h1).await.unwrap(),
-            NonceReservation::HeldBy(h1)
+            store.reserve_nonce(addr, 5, h2, lease).await.unwrap(),
+            NonceReservation::HeldByOther(h1)
         );
-        // A DIFFERENT tx at the SAME slot → HeldBy(the winner h1) → it must not execute.
+
+        // release-FAILURE → the SAME tx may TAKE OVER (fence bumps).
+        store
+            .release_reservation(addr, 5, h1, fence, false)
+            .await
+            .unwrap();
+        let NonceReservation::Won { fence: fence2 } =
+            store.reserve_nonce(addr, 5, h1, lease).await.unwrap()
+        else {
+            panic!("after release-failure the same tx must retake ownership");
+        };
+        assert!(fence2 > fence, "takeover must bump the fence");
+        // A STALE prior owner (old fence) is fenced out — its release-FAILURE must be
+        // IGNORED. Without the fence guard it would flip the CURRENT owner's lease to
+        // released_failure and let a spurious takeover in; with it, the current owner
+        // (fence2) still holds the slot.
+        store
+            .release_reservation(addr, 5, h1, fence, false)
+            .await
+            .unwrap();
         assert_eq!(
-            store.reserve_nonce(addr, 5, h2).await.unwrap(),
-            NonceReservation::HeldBy(h1)
+            store.reserve_nonce(addr, 5, h1, lease).await.unwrap(),
+            NonceReservation::OwnedBySame,
+            "a fenced-out stale release must not flip the current owner's state"
         );
+
+        // release-SUCCESS (by the current owner) → the SAME tx now dedups.
+        store
+            .release_reservation(addr, 5, h1, fence2, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.reserve_nonce(addr, 5, h1, lease).await.unwrap(),
+            NonceReservation::OwnedBySame
+        );
+
         // A different nonce is a free slot.
+        assert!(matches!(
+            store.reserve_nonce(addr, 6, h2, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
+
+        // Lease-EXPIRY takeover (crash recovery): valid lease dedups; once expired
+        // the SAME tx takes over.
+        let addr2 = "0x00000000000000000000000000000000000000ee";
+        let h3 = TxHash::from([0x33u8; 32]);
+        assert!(matches!(
+            store.reserve_nonce(addr2, 0, h3, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
         assert_eq!(
-            store.reserve_nonce(addr, 6, h2).await.unwrap(),
-            NonceReservation::Won
+            store.reserve_nonce(addr2, 0, h3, lease).await.unwrap(),
+            NonceReservation::OwnedBySame
+        );
+        concrete.test_expire_reservation_lease(addr2, 0);
+        assert!(
+            matches!(
+                store.reserve_nonce(addr2, 0, h3, lease).await.unwrap(),
+                NonceReservation::Won { .. }
+            ),
+            "an EXPIRED lease must be taken over by the same tx (crash recovery)"
         );
     }
 
@@ -3547,17 +3627,19 @@ mod tests {
         let signer_str = format!("{signer:#x}");
         // Simulate another replica having won the (signer, 0) slot with a different tx.
         let other = TxHash::from([0xEEu8; 32]);
-        assert_eq!(
-            store.reserve_nonce(&signer_str, 0, other).await.unwrap(),
-            crate::store::NonceReservation::Won
-        );
+        assert!(matches!(
+            store
+                .reserve_nonce(&signer_str, 0, other, reservation_lease())
+                .await
+                .unwrap(),
+            crate::store::NonceReservation::Won { .. }
+        ));
 
         let err = service_send_raw_txn(service, input_hex)
             .await
             .expect_err("must be rejected — the (signer, nonce) slot is reserved by another tx");
         assert!(
-            err.to_string()
-                .contains("already reserved by a different tx"),
+            err.to_string().contains("reserved by a different tx"),
             "unexpected: {err:#}"
         );
         // Did NOT execute: nonce not advanced.

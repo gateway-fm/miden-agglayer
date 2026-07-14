@@ -118,16 +118,23 @@ pub struct TxnEntry {
     pub logs: Vec<LogData>,
 }
 
-/// Outcome of [`Store::reserve_nonce`] — the atomic `(signer, nonce)` slot claim
-/// (#55 BLOCKER 1).
+/// Outcome of [`Store::reserve_nonce`] — the atomic, FENCED `(signer, nonce)`
+/// admission-lease claim (#55 BLOCKER 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonceReservation {
-    /// THIS call inserted the reservation — this tx owns the slot and may execute.
-    Won,
-    /// The slot was already reserved; the winner's tx hash is carried. If it equals
-    /// this tx's own hash the reservation is idempotent (a rebroadcast / re-entry);
-    /// otherwise a DIFFERENT tx won the race and this submission must be rejected.
-    HeldBy(TxHash),
+    /// This call WON ownership of the admission lease — fresh, or a takeover of an
+    /// EXPIRED lease / a `released_failure` prior attempt by the same tx. This
+    /// replica (and ONLY this replica) may execute; the `fence` token must be
+    /// passed to [`Store::release_reservation`] so a delayed prior owner cannot
+    /// clobber this owner's release.
+    Won { fence: u64 },
+    /// The slot is currently owned+executing by the SAME tx under a VALID lease
+    /// (another replica is admitting it), or it already `released_success`. Do NOT
+    /// execute — dedup-return the hash; the owner produces the receipt.
+    OwnedBySame,
+    /// A DIFFERENT tx owns/owned this slot. Hard reject — this submission must not
+    /// execute.
+    HeldByOther(TxHash),
 }
 
 /// Record of a claim we dropped because the destination could not be resolved to a
@@ -480,17 +487,41 @@ pub trait Store: Send + Sync + 'static {
     /// (which may be this same tx — an idempotent re-reservation — or a DIFFERENT
     /// tx that raced and won).
     ///
-    /// MUST be atomic at the store level (single `INSERT … ON CONFLICT DO NOTHING`
-    /// + read of the winner / lock-guarded map insert), so that two replicas on a
-    /// shared PostgreSQL that each pass their process-local R4 for two DIFFERENT
-    /// txs at the same `(signer, nonce)` cannot BOTH be told they won — exactly one
-    /// wins and executes; the loser must be rejected without any side effect.
+    /// MUST be atomic at the store level (postgres: `SELECT … FOR UPDATE` +
+    /// conditional INSERT/UPDATE in ONE transaction; memory: one lock), so that two
+    /// replicas that each pass their process-local R4 for the same `(signer,
+    /// nonce)` are resolved deterministically:
+    ///   * a DIFFERENT tx → [`NonceReservation::HeldByOther`] (hard reject);
+    ///   * the SAME tx while the owner's lease is VALID (executing) or already
+    ///     `released_success` → [`NonceReservation::OwnedBySame`] (dedup, do NOT
+    ///     execute — the owner produces the receipt);
+    ///   * the SAME tx after the lease EXPIRED or a `released_failure` → takeover:
+    ///     [`NonceReservation::Won`] with a bumped fence (retry admission).
+    /// `lease` is how long the winner owns admission before another replica may
+    /// take over on expiry (crash recovery).
     async fn reserve_nonce(
         &self,
         addr: &str,
         nonce: u64,
         tx_hash: TxHash,
+        lease: std::time::Duration,
     ) -> anyhow::Result<NonceReservation>;
+
+    /// #55 BLOCKER 1 — release the admission lease won by [`Store::reserve_nonce`].
+    /// Transitions the reservation to `released_success` (admission completed — the
+    /// SAME tx henceforth dedups) or `released_failure` (admission failed — the SAME
+    /// tx may retry via takeover). FENCED: only applies while the row is still
+    /// `executing` under the given `fence` token, so a delayed prior owner whose
+    /// lease expired and was taken over (fence bumped) CANNOT clobber the new
+    /// owner's state. A no-op if already released or fenced out.
+    async fn release_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        fence: u64,
+        success: bool,
+    ) -> anyhow::Result<()>;
 
     /// #55 BLOCKER D — COMPARE-AND-SWAP nonce advance. Advance the stored nonce to
     /// `expected + 1` **iff** the current stored value equals `expected` (a fresh

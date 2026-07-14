@@ -23,6 +23,22 @@ struct TxnReceipt {
     logs: Vec<LogData>,
 }
 
+/// #55 BLOCKER 1 — in-memory fenced admission-lease reservation row.
+#[derive(Clone)]
+struct Reservation {
+    tx_hash: TxHash,
+    state: ReservationState,
+    lease_expires_at: std::time::Instant,
+    fence: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReservationState {
+    Executing,
+    ReleasedSuccess,
+    ReleasedFailure,
+}
+
 pub struct InMemoryStore {
     // Block number
     latest_block_number: RwLock<u64>,
@@ -45,9 +61,8 @@ pub struct InMemoryStore {
     // Nonces
     nonces: RwLock<HashMap<String, u64>>,
 
-    // #55 BLOCKER 1 — (signer, nonce) → tx_hash reservations. Insert-if-absent;
-    // the first tx to reserve a (signer, nonce) slot wins and executes.
-    nonce_reservations: RwLock<HashMap<(String, u64), TxHash>>,
+    // #55 BLOCKER 1 — (signer, nonce) → fenced admission-lease reservations.
+    nonce_reservations: RwLock<HashMap<(String, u64), Reservation>>,
 
     // Claims — value = when `try_claim` acquired the lock (as read from
     // `claim_clock_now`), so orphaned records (crash between the lock write and
@@ -206,6 +221,19 @@ impl InMemoryStore {
     #[cfg(test)]
     pub fn test_land_gi_after_next_has_claim_miss(&self, global_index: [u8; 32]) {
         *self.test_land_after_next_has_claim_miss.write() = Some(global_index);
+    }
+
+    /// Test hook (#55 BLOCKER 1): force the admission lease for `(addr, nonce)` to
+    /// have already EXPIRED, so the next `reserve_nonce` by the SAME tx takes over
+    /// (crash-recovery path). Panics if there is no reservation (test-authoring bug).
+    #[cfg(test)]
+    pub fn test_expire_reservation_lease(&self, addr: &str, nonce: u64) {
+        let key = (addr.to_lowercase(), nonce);
+        let mut reservations = self.nonce_reservations.write();
+        let r = reservations
+            .get_mut(&key)
+            .expect("test_expire_reservation_lease: no reservation for (addr, nonce)");
+        r.lease_expires_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     }
 
     /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
@@ -744,16 +772,72 @@ impl Store for InMemoryStore {
         addr: &str,
         nonce: u64,
         tx_hash: TxHash,
+        lease: std::time::Duration,
     ) -> anyhow::Result<crate::store::NonceReservation> {
+        use crate::store::NonceReservation;
         let key = (addr.to_lowercase(), nonce);
+        let now = std::time::Instant::now();
         let mut reservations = self.nonce_reservations.write();
         match reservations.get(&key) {
-            Some(existing) => Ok(crate::store::NonceReservation::HeldBy(*existing)),
             None => {
-                reservations.insert(key, tx_hash);
-                Ok(crate::store::NonceReservation::Won)
+                reservations.insert(
+                    key,
+                    Reservation {
+                        tx_hash,
+                        state: ReservationState::Executing,
+                        lease_expires_at: now + lease,
+                        fence: 1,
+                    },
+                );
+                Ok(NonceReservation::Won { fence: 1 })
+            }
+            Some(r) if r.tx_hash != tx_hash => Ok(NonceReservation::HeldByOther(r.tx_hash)),
+            Some(r) => {
+                // Same tx. Owned+executing under a valid lease, or released_success →
+                // dedup. Expired lease or released_failure → takeover (fence++).
+                let takeover = matches!(r.state, ReservationState::ReleasedFailure)
+                    || (r.state == ReservationState::Executing && r.lease_expires_at <= now);
+                if takeover {
+                    let fence = r.fence + 1;
+                    reservations.insert(
+                        key,
+                        Reservation {
+                            tx_hash,
+                            state: ReservationState::Executing,
+                            lease_expires_at: now + lease,
+                            fence,
+                        },
+                    );
+                    Ok(NonceReservation::Won { fence })
+                } else {
+                    Ok(NonceReservation::OwnedBySame)
+                }
             }
         }
+    }
+
+    async fn release_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        fence: u64,
+        success: bool,
+    ) -> anyhow::Result<()> {
+        let key = (addr.to_lowercase(), nonce);
+        let mut reservations = self.nonce_reservations.write();
+        if let Some(r) = reservations.get_mut(&key)
+            && r.tx_hash == tx_hash
+            && r.fence == fence
+            && r.state == ReservationState::Executing
+        {
+            r.state = if success {
+                ReservationState::ReleasedSuccess
+            } else {
+                ReservationState::ReleasedFailure
+            };
+        }
+        Ok(())
     }
 
     async fn commit_reverted_receipt_and_advance_nonce(

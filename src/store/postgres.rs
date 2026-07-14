@@ -1130,35 +1130,101 @@ impl Store for PgStore {
         addr: &str,
         nonce: u64,
         tx_hash: TxHash,
+        lease: std::time::Duration,
     ) -> anyhow::Result<crate::store::NonceReservation> {
-        let client = self.pool.get().await?;
+        use crate::store::NonceReservation;
+        let mut client = self.pool.get().await?;
         let key = addr.to_lowercase();
         let hash_str = format!("{tx_hash:#x}");
-        // Insert-if-absent; RETURNING yields a row IFF THIS statement inserted (won
-        // the atomic race — postgres serialises concurrent inserts on the PK). A
-        // conflict (no returned row) means the slot is already held; read the
-        // durable winner (the row never changes once inserted). So exactly one
-        // replica is ever told `Won`, even for two replicas submitting the same hash.
-        let inserted = client
+        let lease_secs = lease.as_secs().max(1) as f64;
+
+        // ONE transaction: lock the slot row (FOR UPDATE), then decide + write.
+        // Serialises concurrent replicas on the (signer, nonce) row so exactly one
+        // is ever told `Won`.
+        let tx = client.transaction().await?;
+        let existing = tx
             .query_opt(
-                "INSERT INTO nonce_reservations (signer, nonce, tx_hash) VALUES ($1, $2, $3)
-                 ON CONFLICT (signer, nonce) DO NOTHING
-                 RETURNING tx_hash",
-                &[&key, &(nonce as i64), &hash_str],
-            )
-            .await?;
-        if inserted.is_some() {
-            return Ok(crate::store::NonceReservation::Won);
-        }
-        let row = client
-            .query_one(
-                "SELECT tx_hash FROM nonce_reservations WHERE signer = $1 AND nonce = $2",
+                "SELECT tx_hash, state, (lease_expires_at <= now()) AS expired, fence_token
+                 FROM nonce_reservations WHERE signer = $1 AND nonce = $2 FOR UPDATE",
                 &[&key, &(nonce as i64)],
             )
             .await?;
-        let winner: String = row.get(0);
-        let other = <TxHash as std::str::FromStr>::from_str(&winner).unwrap_or_default();
-        Ok(crate::store::NonceReservation::HeldBy(other))
+        let outcome = match existing {
+            None => {
+                tx.execute(
+                    "INSERT INTO nonce_reservations (signer, nonce, tx_hash, state, lease_expires_at, fence_token)
+                     VALUES ($1, $2, $3, 'executing', now() + ($4 || ' seconds')::interval, 1)",
+                    &[&key, &(nonce as i64), &hash_str, &lease_secs.to_string()],
+                )
+                .await?;
+                NonceReservation::Won { fence: 1 }
+            }
+            Some(row) => {
+                let row_hash: String = row.get(0);
+                if !row_hash.eq_ignore_ascii_case(&hash_str) {
+                    let other =
+                        <TxHash as std::str::FromStr>::from_str(&row_hash).unwrap_or_default();
+                    NonceReservation::HeldByOther(other)
+                } else {
+                    let state: String = row.get(1);
+                    let expired: bool = row.get(2);
+                    let fence: i64 = row.get(3);
+                    let takeover = state == "released_failure" || (state == "executing" && expired);
+                    if takeover {
+                        let new_fence = fence + 1;
+                        tx.execute(
+                            "UPDATE nonce_reservations SET state = 'executing',
+                             lease_expires_at = now() + ($3 || ' seconds')::interval,
+                             fence_token = $4
+                             WHERE signer = $1 AND nonce = $2",
+                            &[&key, &(nonce as i64), &lease_secs.to_string(), &new_fence],
+                        )
+                        .await?;
+                        NonceReservation::Won {
+                            fence: new_fence as u64,
+                        }
+                    } else {
+                        NonceReservation::OwnedBySame
+                    }
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    async fn release_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        fence: u64,
+        success: bool,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        let hash_str = format!("{tx_hash:#x}");
+        let new_state = if success {
+            "released_success"
+        } else {
+            "released_failure"
+        };
+        // FENCED: only the current fence owner still in `executing` may release.
+        client
+            .execute(
+                "UPDATE nonce_reservations SET state = $5, lease_expires_at = now()
+                 WHERE signer = $1 AND nonce = $2 AND tx_hash = $3 AND fence_token = $4
+                   AND state = 'executing'",
+                &[
+                    &key,
+                    &(nonce as i64),
+                    &hash_str,
+                    &(fence as i64),
+                    &new_state,
+                ],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn commit_reverted_receipt_and_advance_nonce(
