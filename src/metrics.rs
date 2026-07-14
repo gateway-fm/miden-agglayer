@@ -88,6 +88,14 @@ pub fn init_metrics() {
          crash in the receipt→nonce window is the recovery WORKING (the signer is NOT wedged); a \
          steady climb without restarts would signal a store that is losing nonce writes."
     );
+    describe_counter!(
+        "rpc_nonce_reservation_lost_total",
+        "#55 BLOCKER 1 cross-replica guard: a submission LOST the atomic (signer, nonce) \
+         reservation to a DIFFERENT tx that already owned the slot, so it was rejected without \
+         executing (no enqueue/dispatch/receipt). Nonzero means two txs raced the same nonce \
+         slot (across replicas or a stale replacement) and the reservation kept exactly one; the \
+         winner advances the nonce and the loser is dropped, mirroring geth."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",

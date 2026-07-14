@@ -419,14 +419,23 @@ submit_user_claim() {
         if [[ -n "$result" ]]; then
             USER_TX="$result"
             # #55 — a returned hash is NOT automatically a user win. If the sponsor
-            # already LANDED this gi, the proxy ACCEPTS the user's tx and writes an
-            # IMMEDIATE status-0x0 (reverted) receipt with EMPTY logs / NO ClaimEvent
+            # already LANDED this gi, the proxy ACCEPTS the user's tx and writes a
+            # status-0x0 (reverted) receipt with EMPTY logs / NO ClaimEvent
             # (geth-faithful AlreadyClaimed) — the user did NOT win. A genuine win's
-            # receipt is null (pending) here and finalises to status 0x1 later.
-            # accept-and-revert's receipt is written synchronously; one re-check
-            # covers RPC propagation.
-            local st; st=$(receipt_status "$result")
-            [[ -z "$st" ]] && { sleep 1; st=$(receipt_status "$result"); }
+            # receipt finalises to status 0x1.
+            #
+            # BLOCKER 5 — in WRITER (async) mode the accept-and-revert receipt is
+            # written by the worker AFTER the queue, so a single 1s re-check is not
+            # enough. POLL until the receipt reaches a TERMINAL status: 0x1 → genuine
+            # user win (exit immediately); 0x0 → accept-and-reverted. If it never
+            # terminalises within the bound it is a slow projector on a genuine win,
+            # so default to user_won and let the downstream status-1 wait confirm it.
+            local st="" polled=0
+            while (( polled < 180 )); do
+                st=$(receipt_status "$result")
+                [[ "$st" == "0x0" || "$st" == "0x1" ]] && break
+                sleep 2; polled=$((polled+2))
+            done
             if [[ "$st" == "0x0" ]]; then
                 SUBMIT_OUTCOME="accept_reverted"; return 0
             fi

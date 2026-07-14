@@ -1125,6 +1125,42 @@ impl Store for PgStore {
         Ok(n == 1)
     }
 
+    async fn reserve_nonce(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<crate::store::NonceReservation> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        let hash_str = format!("{tx_hash:#x}");
+        // Insert-if-absent; RETURNING yields a row IFF THIS statement inserted (won
+        // the atomic race — postgres serialises concurrent inserts on the PK). A
+        // conflict (no returned row) means the slot is already held; read the
+        // durable winner (the row never changes once inserted). So exactly one
+        // replica is ever told `Won`, even for two replicas submitting the same hash.
+        let inserted = client
+            .query_opt(
+                "INSERT INTO nonce_reservations (signer, nonce, tx_hash) VALUES ($1, $2, $3)
+                 ON CONFLICT (signer, nonce) DO NOTHING
+                 RETURNING tx_hash",
+                &[&key, &(nonce as i64), &hash_str],
+            )
+            .await?;
+        if inserted.is_some() {
+            return Ok(crate::store::NonceReservation::Won);
+        }
+        let row = client
+            .query_one(
+                "SELECT tx_hash FROM nonce_reservations WHERE signer = $1 AND nonce = $2",
+                &[&key, &(nonce as i64)],
+            )
+            .await?;
+        let winner: String = row.get(0);
+        let other = <TxHash as std::str::FromStr>::from_str(&winner).unwrap_or_default();
+        Ok(crate::store::NonceReservation::HeldBy(other))
+    }
+
     async fn commit_reverted_receipt_and_advance_nonce(
         &self,
         tx_hash: TxHash,
@@ -1146,12 +1182,21 @@ impl Store for PgStore {
         // BLOCKER C — receipt + nonce in ONE transaction. The tx row is inserted
         // already committed-`failed` (status 0x0, no attached logs → no ClaimEvent),
         // so there is no `txn_begin`→`txn_commit` pending window a crash could freeze
-        // forever. Idempotent on tx_hash (a re-entry re-affirms the reverted row).
+        // forever.
+        //
+        // BLOCKER 4 — CONDITIONAL upsert: `ON CONFLICT ... WHERE transactions.status
+        // = 'failed'` so a REAL receipt is NEVER overwritten to status 0. If a
+        // cross-replica path already materialised the real claim under this hash
+        // (status 'pending' → awaiting the projector, or 'success' → landed), the
+        // conflicting UPDATE's WHERE fails → the real receipt survives and both
+        // replicas converge to the real outcome. Absent → insert; already 'failed' →
+        // idempotently re-affirm.
         let tx = client.transaction().await?;
         tx.execute(
             "INSERT INTO transactions (tx_hash, miden_tx_id, envelope_bytes, signer, expires_at, status, error_message, block_number)
              VALUES ($1, $2, $3, $4, $5, 'failed', $6, $7)
-             ON CONFLICT (tx_hash) DO UPDATE SET status = 'failed', error_message = $6, block_number = $7, updated_at = now()",
+             ON CONFLICT (tx_hash) DO UPDATE SET status = 'failed', error_message = $6, block_number = $7, updated_at = now()
+             WHERE transactions.status = 'failed'",
             &[
                 &hash_str,
                 &miden_id as &(dyn ToSql + Sync),

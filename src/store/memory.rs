@@ -45,6 +45,10 @@ pub struct InMemoryStore {
     // Nonces
     nonces: RwLock<HashMap<String, u64>>,
 
+    // #55 BLOCKER 1 — (signer, nonce) → tx_hash reservations. Insert-if-absent;
+    // the first tx to reserve a (signer, nonce) slot wins and executes.
+    nonce_reservations: RwLock<HashMap<(String, u64), TxHash>>,
+
     // Claims — value = when `try_claim` acquired the lock (as read from
     // `claim_clock_now`), so orphaned records (crash between the lock write and
     // the CLAIM landing) can be superseded after a TTL (`try_reclaim_expired`,
@@ -138,6 +142,7 @@ impl InMemoryStore {
             injected_gers: RwLock::new(HashSet::new()),
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
+            nonce_reservations: RwLock::new(HashMap::new()),
             claimed: RwLock::new(HashMap::new()),
             #[cfg(test)]
             claim_clock_skew: RwLock::new(std::time::Duration::ZERO),
@@ -734,6 +739,23 @@ impl Store for InMemoryStore {
         }
     }
 
+    async fn reserve_nonce(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<crate::store::NonceReservation> {
+        let key = (addr.to_lowercase(), nonce);
+        let mut reservations = self.nonce_reservations.write();
+        match reservations.get(&key) {
+            Some(existing) => Ok(crate::store::NonceReservation::HeldBy(*existing)),
+            None => {
+                reservations.insert(key, tx_hash);
+                Ok(crate::store::NonceReservation::Won)
+            }
+        }
+    }
+
     async fn commit_reverted_receipt_and_advance_nonce(
         &self,
         tx_hash: TxHash,
@@ -751,18 +773,31 @@ impl Store for InMemoryStore {
         // synthetic ClaimEvent), so there is no pending window.
         let mut txns = self.transactions.lock();
         let mut nonces = self.nonces.write();
-        let receipt = TxnReceipt {
-            id: entry.id,
-            envelope: entry.envelope,
-            signer: entry.signer,
-            expires_at: entry.expires_at,
-            result: Some(Err(reason)),
-            block_num,
-            logs: vec![],
+        // BLOCKER 4 — CONDITIONAL: never overwrite a REAL receipt. If this hash
+        // already has a pending (result None → a real claim awaiting the projector)
+        // or successful (Some(Ok) → a landed real claim) receipt, DO NOT rewrite it
+        // to status 0. A cross-replica accept-and-revert on the same hash must
+        // converge to the real outcome, not suppress a real success/pending. Only
+        // write the reverted receipt when the hash is absent or already `failed`
+        // (idempotent re-affirm).
+        let may_write = match txns.peek(&tx_hash).map(|r| &r.result) {
+            None => true,                // absent
+            Some(None) => false,         // pending real receipt — keep it
+            Some(Some(Ok(()))) => false, // successful real receipt — keep it
+            Some(Some(Err(_))) => true,  // already failed — re-affirm
         };
-        // Idempotent on tx_hash: a rebroadcast/re-entry re-affirms the same
-        // committed-reverted row rather than erroring.
-        let _ = txns.put(tx_hash, receipt);
+        if may_write {
+            let receipt = TxnReceipt {
+                id: entry.id,
+                envelope: entry.envelope,
+                signer: entry.signer,
+                expires_at: entry.expires_at,
+                result: Some(Err(reason)),
+                block_num,
+                logs: vec![],
+            };
+            let _ = txns.put(tx_hash, receipt);
+        }
         let cur = nonces.entry(addr.to_lowercase()).or_insert(0);
         let advanced = if *cur == expected_nonce {
             *cur = expected_nonce + 1;

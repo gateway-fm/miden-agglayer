@@ -118,6 +118,18 @@ pub struct TxnEntry {
     pub logs: Vec<LogData>,
 }
 
+/// Outcome of [`Store::reserve_nonce`] — the atomic `(signer, nonce)` slot claim
+/// (#55 BLOCKER 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceReservation {
+    /// THIS call inserted the reservation — this tx owns the slot and may execute.
+    Won,
+    /// The slot was already reserved; the winner's tx hash is carried. If it equals
+    /// this tx's own hash the reservation is idempotent (a rebroadcast / re-entry);
+    /// otherwise a DIFFERENT tx won the race and this submission must be rejected.
+    HeldBy(TxHash),
+}
+
 /// Record of a claim we dropped because the destination could not be resolved to a
 /// Miden AccountId. See RD-860: storing these lets operators inspect the backlog and
 /// audit what happened to a user's funds when support asks about a specific deposit.
@@ -460,6 +472,25 @@ pub trait Store: Send + Sync + 'static {
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;
+
+    /// #55 BLOCKER 1 — atomic `(signer, nonce)` reservation. Insert-if-absent keyed
+    /// on `(addr, nonce)`; the winner's `tx_hash` is durable. Returns
+    /// [`NonceReservation::Won`] iff THIS call inserted the row (this tx owns the
+    /// slot), or [`NonceReservation::HeldBy`] with the winner's hash otherwise
+    /// (which may be this same tx — an idempotent re-reservation — or a DIFFERENT
+    /// tx that raced and won).
+    ///
+    /// MUST be atomic at the store level (single `INSERT … ON CONFLICT DO NOTHING`
+    /// + read of the winner / lock-guarded map insert), so that two replicas on a
+    /// shared PostgreSQL that each pass their process-local R4 for two DIFFERENT
+    /// txs at the same `(signer, nonce)` cannot BOTH be told they won — exactly one
+    /// wins and executes; the loser must be rejected without any side effect.
+    async fn reserve_nonce(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<NonceReservation>;
 
     /// #55 BLOCKER D — COMPARE-AND-SWAP nonce advance. Advance the stored nonce to
     /// `expected + 1` **iff** the current stored value equals `expected` (a fresh

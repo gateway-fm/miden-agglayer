@@ -1690,3 +1690,118 @@ async fn test_pgstore_commit_reverted_receipt_and_advance_nonce() {
     assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
     assert!(store.txn_receipt(tx_hash).await.unwrap().is_some());
 }
+
+/// BLOCKER 1 — `reserve_nonce` on PgStore: the first tx to reserve a (signer, nonce)
+/// wins; a different tx at the same slot loses (HeldBy the winner); the same tx is
+/// idempotent (HeldBy itself); a different nonce is free.
+#[tokio::test]
+async fn test_pgstore_reserve_nonce() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let base = rand_u64();
+    let addr = format!("0x{:040x}", base as u128);
+    let h1 = TxHash::from([(base % 251) as u8 + 1; 32]);
+    let h2 = TxHash::from([(base % 241) as u8 + 2; 32]);
+
+    assert_eq!(
+        store.reserve_nonce(&addr, 5, h1).await.unwrap(),
+        NonceReservation::Won
+    );
+    // Same tx re-reserving → HeldBy(itself).
+    assert_eq!(
+        store.reserve_nonce(&addr, 5, h1).await.unwrap(),
+        NonceReservation::HeldBy(h1)
+    );
+    // Different tx, same slot → HeldBy(winner h1).
+    assert_eq!(
+        store.reserve_nonce(&addr, 5, h2).await.unwrap(),
+        NonceReservation::HeldBy(h1)
+    );
+    // Different nonce → free.
+    assert_eq!(
+        store.reserve_nonce(&addr, 6, h2).await.unwrap(),
+        NonceReservation::Won
+    );
+}
+
+/// BLOCKER 4 — `commit_reverted_receipt_and_advance_nonce` on PgStore is CONDITIONAL:
+/// it never overwrites a REAL receipt (pending or successful) with status 0.
+#[tokio::test]
+async fn test_pgstore_reverted_receipt_conditional() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let base = rand_u64();
+    let signer = Address::from([(base % 251) as u8 + 3; 20]);
+    let signer_str = format!("{signer:#x}");
+
+    // (a) SUCCESS receipt must survive.
+    let tx_ok = TxHash::from([(base % 239) as u8 + 4; 32]);
+    store
+        .txn_begin(tx_ok, dummy_txn_entry_for(signer))
+        .await
+        .unwrap();
+    store.txn_commit(tx_ok, Ok(()), 5, [0u8; 32]).await.unwrap();
+    store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_ok,
+            dummy_txn_entry_for(signer),
+            "revert".into(),
+            9,
+            [0u8; 32],
+            &signer_str,
+            0,
+        )
+        .await
+        .unwrap();
+    let (r_ok, _) = store.txn_receipt(tx_ok).await.unwrap().expect("receipt");
+    assert!(
+        r_ok.is_ok(),
+        "a REAL success receipt must NOT be overwritten to failed"
+    );
+
+    // (b) PENDING receipt must stay pending.
+    let tx_pending = TxHash::from([(base % 233) as u8 + 5; 32]);
+    store
+        .txn_begin(tx_pending, dummy_txn_entry_for(signer))
+        .await
+        .unwrap();
+    store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_pending,
+            dummy_txn_entry_for(signer),
+            "revert".into(),
+            9,
+            [0u8; 32],
+            &signer_str,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.txn_receipt(tx_pending).await.unwrap().is_none(),
+        "a REAL pending receipt must stay pending, not be finalised to failed"
+    );
+
+    // (c) ABSENT hash → reverted receipt IS written.
+    let tx_new = TxHash::from([(base % 229) as u8 + 6; 32]);
+    store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_new,
+            dummy_txn_entry_for(signer),
+            "revert".into(),
+            9,
+            [0u8; 32],
+            &signer_str,
+            2,
+        )
+        .await
+        .unwrap();
+    let (r_new, _) = store.txn_receipt(tx_new).await.unwrap().expect("receipt");
+    assert!(
+        r_new.is_err(),
+        "an absent hash gets the reverted (status 0x0) receipt"
+    );
+}

@@ -610,6 +610,20 @@ pub(crate) async fn acquire_claim_lock(
                 }
                 return Ok(ClaimLockOutcome::InFlight);
             }
+            // BLOCKER 2 — the reclaim SUCCEEDED (an expired lock was superseded to
+            // us). But a claim that landed AFTER the first read yet still holds an
+            // expired-looking lock (a slow real claim: publish took > TTL, then its
+            // ClaimEvent committed) would be reclaimed here and misclassified
+            // `Acquired` → DUPLICATE PUBLISH. So RE-READ landed after the successful
+            // reclaim: if it landed, RELEASE the lock we just superseded and return
+            // `Landed` (→ accept-and-revert), never Acquired. A gi that landed at any
+            // point up to here is Landed. (Residual: an event landing strictly after
+            // this final read is caught only by the worker's own re-classification —
+            // see the report's single-store-transaction residual.)
+            if store.has_claim_event_for_global_index(&gi_bytes).await? {
+                store.unclaim(&global_index).await?;
+                return Ok(ClaimLockOutcome::Landed);
+            }
             ::metrics::counter!("claim_resubmission_recovered_total").increment(1);
             tracing::warn!(
                 global_index = %global_index,
@@ -1023,6 +1037,50 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         anyhow::bail!("unhandled txn method {params_encoded:?}");
     };
 
+    // ── #55 BLOCKER 1 — atomic (signer, nonce) reservation ──────────────
+    //
+    // Reserve the (signer, nonce) slot ATOMICALLY, BEFORE any queue/dispatch/receipt
+    // side effect. Two replicas on a shared PostgreSQL that each passed their
+    // process-local R4 for two DIFFERENT txs at the same (signer, nonce) both reach
+    // here; the store reservation lets exactly ONE win. The loser NEVER executes —
+    // no enqueue, no dispatch, no receipt. (This runs AFTER the R4 per-signer lock,
+    // which still serialises intra-process and provides the future-nonce wait; the
+    // reservation is the cross-replica uniqueness guarantee the process lock can't.)
+    match service
+        .store
+        .reserve_nonce(&signer_str, tx_nonce, txn_hash)
+        .await?
+    {
+        crate::store::NonceReservation::Won => {}
+        crate::store::NonceReservation::HeldBy(h) if h == txn_hash => {
+            // This exact tx already reserved the slot (its own earlier attempt — e.g.
+            // a retry after a RETRYABLE C6/GER rejection that left the reservation but
+            // no receipt — or an idempotent rebroadcast). PROCEED so a retryable
+            // failure can re-run admission and eventually execute. The upstream
+            // tx-hash dedup already short-circuited a tx that truly completed
+            // (receipt written / in-flight), so reaching here means re-execution is
+            // safe (and idempotent: a landed gi accept-reverts, a GER re-inserts).
+            tracing::debug!(
+                target: "rpc::reserve",
+                %txn_hash, nonce = tx_nonce,
+                "reservation held by this same tx — proceeding (retry/re-execute)"
+            );
+        }
+        crate::store::NonceReservation::HeldBy(other) => {
+            // A DIFFERENT tx already reserved this (signer, nonce) slot — this
+            // submission LOST and must NOT execute. Reject; the winner advances the
+            // nonce, so this loser's subsequent retries fail R4 as stale (nonce too
+            // low) and aggkit drops it — mirroring geth dropping the losing tx at an
+            // already-consumed nonce.
+            ::metrics::counter!("rpc_nonce_reservation_lost_total").increment(1);
+            anyhow::bail!(
+                "nonce {tx_nonce} for {signer_str} is already reserved by a different tx \
+                 {other:#x} (concurrent submission at the same nonce slot); this tx must not \
+                 execute"
+            );
+        }
+    }
+
     // ── Dispatch fork (RD-940) ──────────────────────────────────────────
     //
     // `enable_writer_worker` defaults to false — the legacy synchronous
@@ -1048,6 +1106,33 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                  boot order bug — see main.rs writer spawn block"
             )
         })?;
+
+        // BLOCKER 3 — landed classification BEFORE C6 in WRITER mode too. The sync
+        // worker already classifies landed before RD-860/C6, but the REQUEST path
+        // ran C6 (`ensure_claim_ger_published`) before enqueue: an already-LANDED gi
+        // with a resolvable destination and an altered/unobserved GER would get a C6
+        // RPC error with NO nonce consumption — the wedge. So route an already-landed
+        // claim to accept-and-revert HERE (atomic reverted receipt + nonce, synchronous,
+        // no enqueue), regardless of GER state. The worker's `acquire_claim_lock` still
+        // catches a claim that LANDS after this check (its `Landed` arm accept-reverts).
+        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+            && service
+                .store
+                .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
+                .await?
+        {
+            accept_and_revert_landed_claim(
+                &service,
+                params,
+                txn_hash,
+                txn_envelope,
+                signer,
+                &signer_str,
+                tx_nonce,
+            )
+            .await?;
+            return Ok(txn_hash);
+        }
 
         // C6 on the REQUEST path (PR #127 review point 3). Pre-fix, with the
         // writer enabled the gate only ran inside the worker — AFTER
@@ -2615,13 +2700,23 @@ mod tests {
         // completes under the stub): destination is a third party's EVM
         // address ≠ C. Accepted, ClaimEvent emitted, and the recorded signer
         // is C — the destination in the calldata is untouched by who signed.
+        //
+        // Fresh service so C's nonce-0 slot is a clean reservation: leg 1 already
+        // reserved (addr_c, 0) for its (different-calldata) tx — #55 BLOCKER 1
+        // correctly refuses a DIFFERENT tx at that same slot, so a genuinely new
+        // leg-2 scenario needs its own reservation namespace (a real sponsor would
+        // retry leg 1's SAME tx, not submit a different claim at the same nonce).
+        let mut service2 = create_test_service();
+        service2.allow_any_signer = false;
+        service2.allowed_signers = Some(vec![addr_c]);
+        let store = service2.store.clone();
+        seed_zero_ger(&store).await;
         let gi_swallow = U256::from(0x5006u64);
         let someone_else = Address::from([0x77u8; 20]);
         assert_ne!(someone_else, addr_c);
-        // Leg 1's publish failed, so C's nonce is still 0.
         let calldata = claim_calldata(gi_swallow, someone_else, U256::from(1_000_000u64));
         let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&key_c, calldata, 0);
-        let accepted = service_send_raw_txn(service, input_hex)
+        let accepted = service_send_raw_txn(service2, input_hex)
             .await
             .expect("permissionless claim for someone else's deposit must be accepted");
         assert_eq!(accepted, tx_hash);
@@ -3401,6 +3496,224 @@ mod tests {
             store.nonce_get(addr).await.unwrap(),
             6,
             "nonce advances to exactly N+1 (never N+2 — the cross-replica skip)"
+        );
+    }
+
+    /// BLOCKER 1 — atomic (signer, nonce) reservation: the FIRST tx to reserve a
+    /// slot wins; a DIFFERENT tx at the same slot loses (HeldBy the winner); the
+    /// SAME tx re-reserving is idempotent (HeldBy itself); a different nonce is free.
+    #[tokio::test]
+    async fn blocker_1_reserve_nonce_first_wins_different_tx_loses() {
+        use crate::store::NonceReservation;
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let addr = "0x00000000000000000000000000000000000000dd";
+        let h1 = TxHash::from([0x11u8; 32]);
+        let h2 = TxHash::from([0x22u8; 32]);
+
+        assert_eq!(
+            store.reserve_nonce(addr, 5, h1).await.unwrap(),
+            NonceReservation::Won
+        );
+        // Same tx re-reserving → HeldBy(itself) (idempotent).
+        assert_eq!(
+            store.reserve_nonce(addr, 5, h1).await.unwrap(),
+            NonceReservation::HeldBy(h1)
+        );
+        // A DIFFERENT tx at the SAME slot → HeldBy(the winner h1) → it must not execute.
+        assert_eq!(
+            store.reserve_nonce(addr, 5, h2).await.unwrap(),
+            NonceReservation::HeldBy(h1)
+        );
+        // A different nonce is a free slot.
+        assert_eq!(
+            store.reserve_nonce(addr, 6, h2).await.unwrap(),
+            NonceReservation::Won
+        );
+    }
+
+    /// BLOCKER 1 — end-to-end: a submission whose (signer, nonce) slot was already
+    /// reserved by a DIFFERENT tx (another replica won) is REJECTED and does NOT
+    /// execute — no nonce advance, no receipt.
+    #[tokio::test]
+    async fn blocker_1_service_rejects_when_slot_reserved_by_another() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xE1u8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata); // nonce 0
+        let signer_str = format!("{signer:#x}");
+        // Simulate another replica having won the (signer, 0) slot with a different tx.
+        let other = TxHash::from([0xEEu8; 32]);
+        assert_eq!(
+            store.reserve_nonce(&signer_str, 0, other).await.unwrap(),
+            crate::store::NonceReservation::Won
+        );
+
+        let err = service_send_raw_txn(service, input_hex)
+            .await
+            .expect_err("must be rejected — the (signer, nonce) slot is reserved by another tx");
+        assert!(
+            err.to_string()
+                .contains("already reserved by a different tx"),
+            "unexpected: {err:#}"
+        );
+        // Did NOT execute: nonce not advanced.
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+    }
+
+    /// BLOCKER 2 — the reclaim-SUCCESS window. A gi whose lock is EXPIRED but which
+    /// LANDED (its ClaimEvent committed after the first read) must classify `Landed`,
+    /// NOT `Acquired` (which would duplicate-publish). Driven deterministically: the
+    /// first `has_claim_event` read misses (arming the landing), the expired lock is
+    /// reclaimed, and the re-read AFTER the successful reclaim observes the landing.
+    #[tokio::test]
+    async fn blocker_2_landed_in_reclaim_success_window_classifies_landed() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let gi = U256::from(0x55b2u64);
+        store.try_claim(gi).await.unwrap();
+        // Lock is EXPIRED (backdated past the TTL) so try_reclaim_expired SUCCEEDS.
+        concrete.test_backdate_claim(
+            gi,
+            claim_resubmit_ttl() + std::time::Duration::from_secs(10),
+        );
+        // The claim LANDS on the first has_claim_event miss (so the re-read sees it).
+        concrete.test_land_gi_after_next_has_claim_miss(gi.to_be_bytes::<32>());
+
+        let outcome = acquire_claim_lock(&store, gi, claim_resubmit_ttl())
+            .await
+            .expect("classification must not error");
+        assert_eq!(
+            outcome,
+            ClaimLockOutcome::Landed,
+            "a gi that landed but has an expired lock must classify Landed via the \
+             reclaim-success re-read, never Acquired (no duplicate publish)"
+        );
+    }
+
+    /// BLOCKER 3 — writer mode: an already-LANDED gi with an UNOBSERVED GER must
+    /// accept-and-revert on the REQUEST path (before C6/enqueue), not get a C6 GER
+    /// rejection with no nonce consumption.
+    #[tokio::test]
+    async fn blocker_3_writer_mode_landed_before_c6() {
+        let mut service = create_test_service();
+        let store = service.store.clone();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service.enable_writer_worker = true;
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+        // gi LANDED; GER deliberately NOT seeded → C6 would reject "not observed yet".
+        let gi = U256::from(0x55c3u64);
+        land_claim_for(&store, gi).await;
+
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        let accepted = service_send_raw_txn(service.clone(), input_b)
+            .await
+            .expect("writer-mode landed gi must accept-and-revert before C6, not reject on GER");
+        assert_eq!(accepted, tx_b);
+        assert_eq!(
+            store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(),
+            1,
+            "nonce consumed via accept-and-revert (not a C6 hard-reject)"
+        );
+        let (result, _blk) = store.txn_receipt(tx_b).await.unwrap().expect("receipt");
+        assert!(result.is_err(), "reverted (status 0x0)");
+        let _ = shutdown.send(());
+    }
+
+    /// BLOCKER 4 — the conditional reverted-receipt write must NEVER overwrite a REAL
+    /// receipt (pending or successful) with status 0. Cross-replica: one path lands
+    /// the real claim; another later classifies Landed and calls accept-and-revert on
+    /// the same hash — the real outcome must survive.
+    #[tokio::test]
+    async fn blocker_4_reverted_receipt_does_not_overwrite_real_receipt() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let signer = Address::from([0x44u8; 20]);
+        let signer_str = format!("{signer:#x}");
+        let envelope = TxEnvelope::Legacy(alloy::consensus::Signed::new_unchecked(
+            alloy::consensus::TxLegacy::default(),
+            alloy::primitives::Signature::test_signature(),
+            TxHash::default(),
+        ));
+        let entry = || crate::store::TxnEntry {
+            id: None,
+            envelope: envelope.clone(),
+            signer,
+            expires_at: None,
+            logs: vec![],
+        };
+
+        // (a) SUCCESS receipt must not be overwritten to failed.
+        let tx_ok = TxHash::from([0x41u8; 32]);
+        store.txn_begin(tx_ok, entry()).await.unwrap();
+        store.txn_commit(tx_ok, Ok(()), 5, [0u8; 32]).await.unwrap();
+        store
+            .commit_reverted_receipt_and_advance_nonce(
+                tx_ok,
+                entry(),
+                "revert".into(),
+                9,
+                [0u8; 32],
+                &signer_str,
+                0,
+            )
+            .await
+            .unwrap();
+        let (r_ok, _) = store.txn_receipt(tx_ok).await.unwrap().expect("receipt");
+        assert!(
+            r_ok.is_ok(),
+            "a REAL success receipt must NOT be overwritten to failed"
+        );
+
+        // (b) PENDING receipt (begun, awaiting the projector) must not be finalised to failed.
+        let tx_pending = TxHash::from([0x42u8; 32]);
+        store.txn_begin(tx_pending, entry()).await.unwrap();
+        store
+            .commit_reverted_receipt_and_advance_nonce(
+                tx_pending,
+                entry(),
+                "revert".into(),
+                9,
+                [0u8; 32],
+                &signer_str,
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.txn_receipt(tx_pending).await.unwrap().is_none(),
+            "a REAL pending receipt must stay pending (null), not be finalised to failed"
+        );
+
+        // (c) ABSENT hash → the reverted receipt IS written (status 0x0).
+        let tx_new = TxHash::from([0x43u8; 32]);
+        store
+            .commit_reverted_receipt_and_advance_nonce(
+                tx_new,
+                entry(),
+                "revert".into(),
+                9,
+                [0u8; 32],
+                &signer_str,
+                2,
+            )
+            .await
+            .unwrap();
+        let (r_new, _) = store.txn_receipt(tx_new).await.unwrap().expect("receipt");
+        assert!(
+            r_new.is_err(),
+            "an absent hash gets the reverted (status 0x0) receipt"
         );
     }
 
