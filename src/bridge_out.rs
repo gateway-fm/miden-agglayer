@@ -717,16 +717,14 @@ impl BridgeOutScanner {
             return Ok(());
         };
         let on_chain = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
-        // Quarantine-aware accounting (Cantina #7 alignment): a quarantined/unbridgeable
-        // exit occupies an on-chain LET leaf but deliberately has NO emitted BridgeEvent,
-        // so the honest local view is emitted + quarantined — counting deposit_count alone
-        // false-alarms on every by-design quarantine. (Metadata-deferred and self-targeted
-        // skips leave no durable row, so a standing on_chain_ahead alarm can still be one
-        // of those — see docs/operations/let-cardinality-gate.md for triage.) This monitor
-        // stays alarm-only, post-emit — the pre-seal LET cardinality gate in the projector
-        // is the enforcing view (two independent views, outside-checker doctrine).
-        let aggkit = self.store.get_deposit_count().await?
-            + self.store.count_unbridgeable_bridge_outs().await?;
+        // Cantina #7: `deposit_counter` now RESERVES an index for EVERY Emit-class
+        // bridge-consumed B2AGG leaf — including quarantined / metadata-deferred /
+        // self-targeted classes that emit no event — so the counter is directly comparable
+        // to the on-chain leaf count with no quarantine-row arithmetic (which double-counted
+        // recovered exits and mixed in rows from other bridges). Pre-#7 history may hold
+        // unreserved skipped leaves; the gate's persisted baseline absorbs those, and this
+        // monitor stays alarm-only, post-emit (two independent views).
+        let aggkit = self.store.get_deposit_count().await?;
         match crate::let_divergence::compare_let_state(on_chain, aggkit) {
             crate::let_divergence::LetDivergence::InSync => {}
             crate::let_divergence::LetDivergence::OnChainAhead { gap } => {
@@ -1427,6 +1425,7 @@ mod tests {
         crate::restore::project_b2agg_note(
             store,
             note,
+            note.id(),
             bridge_id,
             7,
             block,
