@@ -45,10 +45,19 @@ pub struct InMemoryStore {
     // Nonces
     nonces: RwLock<HashMap<String, u64>>,
 
-    // Claims — value = when `try_claim` acquired the lock, so orphaned records
-    // (crash between the lock write and the CLAIM landing) can be superseded
-    // after a TTL (`try_reclaim_expired`, SOAK FINDING #1).
+    // Claims — value = when `try_claim` acquired the lock (as read from
+    // `claim_clock_now`), so orphaned records (crash between the lock write and
+    // the CLAIM landing) can be superseded after a TTL (`try_reclaim_expired`,
+    // SOAK FINDING #1).
     claimed: RwLock<HashMap<U256, std::time::Instant>>,
+
+    // Test-only skew for the claim-lock clock. `test_backdate_claim` ages
+    // records by moving this clock FORWARD instead of subtracting from the
+    // stored `Instant`s — `Instant::now() - age` underflows (panics) whenever
+    // the process has been alive for less than `age` (short test binaries, or
+    // a raised CLAIM_RESUBMIT_TTL_SECS). See `claim_clock_now`.
+    #[cfg(test)]
+    claim_clock_skew: RwLock<std::time::Duration>,
 
     // Unclaimable claims — first-write wins per global_index (RD-860).
     unclaimable: RwLock<HashMap<U256, UnclaimableClaim>>,
@@ -122,6 +131,8 @@ impl InMemoryStore {
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
             claimed: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            claim_clock_skew: RwLock::new(std::time::Duration::ZERO),
             unclaimable: RwLock::new(HashMap::new()),
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
@@ -139,24 +150,39 @@ impl InMemoryStore {
         }
     }
 
-    /// Test-only: age an existing claim-lock record by `age`, so TTL-expiry
-    /// paths (`try_reclaim_expired` via `acquire_claim_lock`) can be exercised
-    /// through the full RPC pipeline without sleeping for the real
-    /// `CLAIM_RESUBMIT_TTL_SECS` or mutating process-global env (unsafe under
-    /// parallel tests on edition 2024).
+    /// The claim-lock clock: `Instant::now()`, plus the test-only forward skew.
+    /// Every claim-lock timestamp read/write (`try_claim`, `try_reclaim_expired`)
+    /// goes through this, so tests can age records by advancing the clock —
+    /// which is always representable — instead of `Instant` subtraction, which
+    /// underflows (panics) when the process uptime is shorter than the age.
+    fn claim_clock_now(&self) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        #[cfg(test)]
+        let now = now + *self.claim_clock_skew.read();
+        now
+    }
+
+    /// Test-only: age the existing claim-lock record for `global_index` by
+    /// `age`, so TTL-expiry paths (`try_reclaim_expired` via
+    /// `acquire_claim_lock`) can be exercised through the full RPC pipeline
+    /// without sleeping for the real `CLAIM_RESUBMIT_TTL_SECS` or mutating
+    /// process-global env (unsafe under parallel tests on edition 2024).
     ///
-    /// Panics if `global_index` has no record, or if the process has not been
-    /// alive long enough for `Instant::now() - age` to be representable (never
-    /// the case for the ~2 min TTLs the tests use on any real machine).
+    /// Implemented as a forward skew of the store's claim clock (all records
+    /// age together — each test constructs its own store, so that is exactly
+    /// the record under test), never as `Instant::now() - age` arithmetic:
+    /// that subtraction underflows (panics) whenever the process has been
+    /// alive for less than `age` — e.g. a short test binary with a raised
+    /// `CLAIM_RESUBMIT_TTL_SECS`.
+    ///
+    /// Panics only if `global_index` has no record (a test-authoring error).
     #[cfg(test)]
     pub fn test_backdate_claim(&self, global_index: U256, age: std::time::Duration) {
-        let mut claimed = self.claimed.write();
-        let acquired_at = claimed
-            .get_mut(&global_index)
-            .expect("test_backdate_claim: no claim record for global_index");
-        *acquired_at = acquired_at
-            .checked_sub(age)
-            .expect("test_backdate_claim: process uptime shorter than backdate age");
+        assert!(
+            self.claimed.read().contains_key(&global_index),
+            "test_backdate_claim: no claim record for global_index {global_index}"
+        );
+        *self.claim_clock_skew.write() += age;
     }
 
     /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
@@ -685,7 +711,7 @@ impl Store for InMemoryStore {
         if claimed.contains_key(&global_index) {
             anyhow::bail!("claim already submitted for global_index {global_index}");
         }
-        claimed.insert(global_index, std::time::Instant::now());
+        claimed.insert(global_index, self.claim_clock_now());
         Ok(())
     }
 
@@ -696,10 +722,11 @@ impl Store for InMemoryStore {
     ) -> anyhow::Result<bool> {
         // One write lock end-to-end = atomic check-and-refresh: exactly one of any
         // concurrent recoveries wins; the losers observe the refreshed timestamp.
+        let now = self.claim_clock_now();
         let mut claimed = self.claimed.write();
         match claimed.get_mut(&global_index) {
-            Some(acquired_at) if acquired_at.elapsed() >= ttl => {
-                *acquired_at = std::time::Instant::now();
+            Some(acquired_at) if now.saturating_duration_since(*acquired_at) >= ttl => {
+                *acquired_at = now;
                 Ok(true)
             }
             _ => Ok(false),
