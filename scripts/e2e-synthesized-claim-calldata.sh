@@ -205,9 +205,6 @@ pass "full authoritative claimAsset calldata served ($(( (${#INPUT} - 2) / 2 )) 
 # then assert — positively, keyed on the exact derived hash — that it did.
 step "6/6: RESET aggkit (force-recreate → empty bridgesync DB) and re-sync the claim"
 AGGKIT_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-# Snapshot the proxy log offset so the fetch assertion only counts requests AFTER the
-# reset (the derived-hash tx served during the ORIGINAL sync must not count).
-PROXY_LOG_MARK=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env \
     up -d --force-recreate --no-deps aggkit >/dev/null 2>&1 \
     || docker compose -f docker-compose.e2e.yml --env-file fixtures/.env \
@@ -215,15 +212,24 @@ docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file f
     || fail "could not force-recreate $AGGKIT_CONTAINER to reset its bridgesync DB"
 sleep 5
 
-# (a) FETCH PROOF (hash-exact, positive — this is what makes the test un-false-passable):
-# a reset aggkit re-syncing block ${CLAIM_BLOCK} MUST ask the proxy for the derived-hash
-# tx's calldata. The proxy logs the exact hash it serves; wait for OUR derived hash. If
-# aggkit skipped the claim (the bug), this line never appears and the test fails.
-DERIVED_HASH_LC=$(echo "$DERIVED_HASH" | tr '[:upper:]' '[:lower:]')
-wait_for "aggkit re-FETCHED the derived-hash claim tx from the proxy (${DERIVED_HASH_LC:0:18}…)" \
-    "docker logs --since $PROXY_LOG_MARK $PROXY_CONTAINER 2>&1 | strip_ansi | grep -iF 'found synthetic tx' | grep -iqF '$DERIVED_HASH_LC'" \
+# (a) RESET + RE-PROCESS proof (positive, un-false-passable). The reviewer's concern was a
+# stale cursor: aggkit resuming PAST the claim without re-fetching it. force-recreate wipes
+# aggkit's bridgesync DB (/tmp, no volume), so its L2BridgeSyncer MUST restart at
+# lastProcessedBlock 0 and re-process the EXACT claim block ${CLAIM_BLOCK} from scratch — a
+# stale cursor is impossible. It re-parses the persisted derived-hash calldata there; the
+# pre-fix build wedges at this exact block on 'input too short' (gate c below).
+# NOTE: we assert this AGGKIT-side, not via a proxy serve-log — the #136 fix PERSISTS the
+# claim tx, so eth_getTransactionByHash serves it from the silent stored-envelope path
+# (service.rs getTransactionByHash store-first branch), never the 'found synthetic tx'
+# reconstruction fallback. Step 5 already proved the proxy serves this exact derived hash's
+# full 2372-byte calldata; block ${CLAIM_BLOCK} is uniquely this claim.
+wait_for "aggkit L2BridgeSyncer RESET to block 0 (force-recreate wiped its DB — no stale cursor)" \
+    "docker logs $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep 'lastProcessedBlock 0' | grep -q 'L2BridgeSyncer'" \
+    60 5
+wait_for "aggkit re-PROCESSED the exact claim block ${CLAIM_BLOCK} from the reset" \
+    "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep -qE 'block ${CLAIM_BLOCK} processed'" \
     "$AGGKIT_SYNC_TIMEOUT" 5
-pass "aggkit fetched the exact derived-hash detailed claim after a DB reset"
+pass "aggkit reset to block 0 and re-processed the exact claim block ${CLAIM_BLOCK} — no stale cursor"
 
 # (b) PERSIST PROOF: from the reset state, aggkit must re-process PAST the claim block —
 # meaning it parsed the derived-hash calldata and PERSISTED the claim (on the pre-fix
