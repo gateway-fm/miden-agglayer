@@ -95,6 +95,19 @@ case "$test_filter" in
         else
             echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
         fi
+        echo ""
+        # VERY LAST in the suite — defense in depth: the manual-user-claim
+        # script deliberately front-runs the sponsor's autoclaimer, which
+        # wedges the sponsor's ethtxmanager head nonce MID-RUN. The script
+        # heals the sponsor itself before exiting (consumes the wedged nonces
+        # with benign no-op txs and HARD-asserts that a fresh deposit
+        # autoclaims), but if it dies mid-leg the sponsor may stay wedged — so
+        # nothing that depends on sponsor autoclaim may run after it. Its legs
+        # are L1→L2-only (GER injection via aggoracle, no certificate
+        # settlement), so running after cantina13's poison leaf is safe. The
+        # optional ALLOWLIST_LEG=1 phase (restarts the proxy) is NOT enabled
+        # here — it is only for disposable stacks, run manually.
+        "$SCRIPT_DIR/e2e-manual-user-claim.sh"
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
@@ -144,6 +157,9 @@ case "$test_filter" in
     mint-monitor-provenance)
         "$SCRIPT_DIR/e2e-mint-monitor-provenance.sh"
         ;;
+    manual-user-claim)
+        "$SCRIPT_DIR/e2e-manual-user-claim.sh"
+        ;;
     l2l2)
         # SIMPLE L2<->L2 pipeline group (NOT in `all` — needs the
         # docker-compose.l2l2.yml overlay: second rollup + aggkit-l2b on top of
@@ -180,7 +196,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|mint-monitor-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|mint-monitor-provenance|manual-user-claim|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
         echo "       (l2l2 is optional and not part of 'all' — it needs the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;
