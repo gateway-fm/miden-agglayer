@@ -450,6 +450,73 @@ async fn test_pgstore_txn_commit_missing_row_errors() {
     assert!(err.to_string().contains("not found"));
 }
 
+/// BLOCKER 2 (first-terminal-wins CAS) — PG twin of
+/// `memory::tests::test_txn_commit_terminal_success_not_clobbered_by_failure`.
+/// Once a receipt is terminal (success), the `AND status = 'pending'` predicate
+/// makes a later failure commit a zero-row no-op that returns Ok, preserving
+/// status 0x1. Models the TTL sweeper racing a worker that already landed the
+/// Miden op — the pre-fix overwrite made aggkit resubmit a landed op.
+/// PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_terminal_success_not_clobbered_by_failure() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let tx_hash = TxHash::from([0x5Au8; 32]);
+    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    store
+        .txn_commit(tx_hash, Ok(()), 12, [0u8; 32])
+        .await
+        .unwrap();
+
+    // Late failure commit for the already-terminal (success) row: accepted,
+    // but a NO-OP — the success must survive.
+    store
+        .txn_commit(
+            tx_hash,
+            Err("TTL expired (>300s in non-terminal state)".to_string()),
+            15,
+            [0u8; 32],
+        )
+        .await
+        .expect("late failure commit must be an accepted no-op, not an error");
+
+    let (res, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+    assert!(res.is_ok(), "success must win; got failure: {res:?}");
+    assert_eq!(block, 12, "success block preserved");
+}
+
+/// BLOCKER 2 (first-terminal-wins CAS) — PG twin of
+/// `memory::tests::test_txn_commit_terminal_failure_not_clobbered_by_success`.
+/// First terminal wins regardless of ordering: a failure that lands first is
+/// not overwritten by a later success commit.
+/// PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_terminal_failure_not_clobbered_by_success() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let tx_hash = TxHash::from([0x5Bu8; 32]);
+    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    store
+        .txn_commit(tx_hash, Err("first terminal".to_string()), 3, [0u8; 32])
+        .await
+        .unwrap();
+    store
+        .txn_commit(tx_hash, Ok(()), 5, [0u8; 32])
+        .await
+        .expect("late success commit must be an accepted no-op, not an error");
+
+    let (res, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+    let err = res.expect_err("first terminal (failure) must win");
+    assert!(err.contains("first terminal"), "reason preserved: {err}");
+    assert_eq!(block, 3, "failure block preserved");
+}
+
 // ── Nonces ───────────────────────────────────────────────────
 
 #[tokio::test]

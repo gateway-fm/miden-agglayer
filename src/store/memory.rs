@@ -566,25 +566,43 @@ impl Store for InMemoryStore {
             let Some(receipt) = txns.get_mut(&tx_hash) else {
                 anyhow::bail!("Store: transaction {tx_hash} not found");
             };
-            receipt.result = Some(result);
-            receipt.block_num = block_num;
+            // BLOCKER 2 — first-terminal-wins CAS. A receipt whose `result` is
+            // already `Some(_)` is terminal; a later commit MUST NOT overwrite
+            // it. This closes the race where the TTL sweeper's
+            // `write_failure_receipt` runs against a job whose worker already
+            // committed SUCCESS: without this guard the Err would clobber the
+            // landed success (status 0x1 → 0x0) and aggkit would resubmit a
+            // Miden op that already landed. Ignored idempotently for ANY
+            // terminal→terminal transition (success- or failure-first), and it
+            // also stops the pre-existing double-log-emission on a repeated
+            // success commit.
+            if receipt.result.is_some() {
+                tracing::debug!(
+                    "Store: txn {tx_hash} already terminal; ignoring subsequent commit \
+                     (first-terminal-wins CAS)"
+                );
+                None
+            } else {
+                receipt.result = Some(result);
+                receipt.block_num = block_num;
 
-            match &receipt.result {
-                Some(Ok(_)) => {
-                    tracing::info!(
-                        "Store: committed txn {tx_hash}; miden txn: {:?}",
-                        receipt.id
-                    );
-                    Some(receipt.logs.clone())
+                match &receipt.result {
+                    Some(Ok(_)) => {
+                        tracing::info!(
+                            "Store: committed txn {tx_hash}; miden txn: {:?}",
+                            receipt.id
+                        );
+                        Some(receipt.logs.clone())
+                    }
+                    Some(Err(err)) => {
+                        tracing::error!(
+                            "Store: failed txn {tx_hash}; miden txn: {:?}; reason: {err}",
+                            receipt.id
+                        );
+                        None
+                    }
+                    None => None,
                 }
-                Some(Err(err)) => {
-                    tracing::error!(
-                        "Store: failed txn {tx_hash}; miden txn: {:?}; reason: {err}",
-                        receipt.id
-                    );
-                    None
-                }
-                None => None,
             }
         }; // Mutex dropped before any .await
 
@@ -1728,6 +1746,97 @@ mod tests {
         );
         // And it must not have invented a receipt.
         assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+    }
+
+    /// Build a minimal pending `txn_begin` entry for the CAS tests below.
+    async fn seed_pending_txn(store: &InMemoryStore, tx_hash: TxHash) {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let envelope = alloy::consensus::TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy::default(),
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::ZERO,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// BLOCKER 2 (first-terminal-wins CAS) — a SUCCESS receipt must survive a
+    /// later failure commit. Models the TTL-sweeper race: the worker commits
+    /// SUCCESS (status 0x1) first, then the sweeper's `write_failure_receipt`
+    /// fires `txn_commit(Err)` for the same hash. Pre-fix the Err overwrote the
+    /// success (status 0x1 → 0x0) and aggkit resubmitted a Miden op that had
+    /// already landed. The success must be preserved verbatim.
+    ///
+    /// Mutation check: deleting the `receipt.result.is_some()` guard in
+    /// `txn_commit` makes this assertion fail (the failure clobbers success).
+    #[tokio::test]
+    async fn test_txn_commit_terminal_success_not_clobbered_by_failure() {
+        let store = InMemoryStore::new();
+        let tx_hash = TxHash::from([0x51u8; 32]);
+        seed_pending_txn(&store, tx_hash).await;
+
+        // Worker commits SUCCESS at block 7.
+        store
+            .txn_commit(tx_hash, Ok(()), 7, [0xAAu8; 32])
+            .await
+            .unwrap();
+
+        // TTL sweeper races in with a failure commit for the same hash.
+        store
+            .txn_commit(
+                tx_hash,
+                Err("TTL expired (>300s in non-terminal state)".to_string()),
+                9,
+                [0xBBu8; 32],
+            )
+            .await
+            .expect("late failure commit must be an accepted no-op, not an error");
+
+        // The landed success is preserved: status stays 0x1, block unchanged.
+        let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+        assert!(
+            res.is_ok(),
+            "first terminal (success) must win; got failure: {res:?}"
+        );
+        assert_eq!(block_num, 7, "success block must be preserved");
+    }
+
+    /// BLOCKER 2 (first-terminal-wins CAS) — the reverse ordering. If a failure
+    /// lands first (e.g. TTL sweeper marks a stuck job failed) a later success
+    /// commit for the same hash is a no-op: the FIRST terminal wins, so the
+    /// receipt stays failed. This keeps terminal transitions monotonic and
+    /// deterministic across both stores.
+    #[tokio::test]
+    async fn test_txn_commit_terminal_failure_not_clobbered_by_success() {
+        let store = InMemoryStore::new();
+        let tx_hash = TxHash::from([0x52u8; 32]);
+        seed_pending_txn(&store, tx_hash).await;
+
+        store
+            .txn_commit(tx_hash, Err("first terminal".to_string()), 3, [0u8; 32])
+            .await
+            .unwrap();
+        store
+            .txn_commit(tx_hash, Ok(()), 5, [0u8; 32])
+            .await
+            .expect("late success commit must be an accepted no-op, not an error");
+
+        let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+        let err = res.expect_err("first terminal (failure) must win");
+        assert!(err.contains("first terminal"), "reason preserved: {err}");
+        assert_eq!(block_num, 3, "failure block must be preserved");
     }
 
     #[tokio::test]

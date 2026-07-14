@@ -773,9 +773,17 @@ impl Store for PgStore {
         // any partial log inserts.
         let tx = client.transaction().await?;
 
+        // BLOCKER 2 — first-terminal-wins CAS. The `AND status = 'pending'`
+        // predicate makes the terminal transition a compare-and-set: only a
+        // still-pending row is updated. This closes the race where the TTL
+        // sweeper's `write_failure_receipt` runs against a job whose worker
+        // already committed SUCCESS — the Err UPDATE now matches zero rows and
+        // the landed success (status 0x1) is preserved instead of being
+        // clobbered to 0x0 (which would make aggkit resubmit an op that already
+        // landed). Identical semantics to `InMemoryStore::txn_commit`.
         let updated = tx
             .execute(
-                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
+                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4 AND status = 'pending'",
                 &[
                     &status,
                     &error_msg as &(dyn ToSql + Sync),
@@ -785,20 +793,36 @@ impl Store for PgStore {
             )
             .await?;
 
-        // PR #127 review — finalising a transaction that has no `txn_begin`
-        // row must be an ERROR, matching `InMemoryStore::txn_commit`
-        // ("transaction {tx_hash} not found"). Pre-fix this UPDATE silently
-        // affected zero rows and the method still committed the synthetic
-        // logs below and returned Ok — so a projector racing a submitter
-        // could "finalise" a receipt that was never durably begun, and the
-        // late `txn_begin` would then park the real receipt as pending
-        // forever. Every caller either creates the row first or explicitly
-        // tolerates this error (`project_ger_note` / `project_claim_note`
-        // use `let _ = ... inspect_err`, the pending/expiry sweeps log and
-        // continue), so erroring here is safe and makes the two stores
-        // behave identically. Bailing before `tx.commit()` rolls the whole
-        // transaction back — no partial log/counter writes escape.
+        // A zero-row UPDATE now means one of two things, which must be told
+        // apart:
+        //   - the row is ALREADY TERMINAL (success/failed) → first-terminal-wins
+        //     no-op: leave it untouched and return Ok (do NOT re-materialise
+        //     logs / re-bump counters).
+        //   - the row DOES NOT EXIST → contract error, matching
+        //     `InMemoryStore::txn_commit` ("transaction not found"). PR #127:
+        //     finalising a receipt that was never durably begun must fail so a
+        //     projector racing a submitter cannot silently "finalise" a phantom.
+        // Every caller either creates the row first or explicitly tolerates the
+        // not-found error (`project_ger_note` / `project_claim_note` use
+        // `let _ = ... inspect_err`; the pending/expiry sweeps log and continue).
+        // Rolling back (drop/rollback of `tx`) guarantees no partial writes
+        // escape in either branch.
         if updated == 0 {
+            let already_terminal = tx
+                .query_opt(
+                    "SELECT 1 FROM transactions WHERE tx_hash = $1 AND status <> 'pending'",
+                    &[&hash_str],
+                )
+                .await?
+                .is_some();
+            tx.rollback().await?;
+            if already_terminal {
+                tracing::debug!(
+                    "PgStore: txn {tx_hash} already terminal; ignoring subsequent commit \
+                     (first-terminal-wins CAS)"
+                );
+                return Ok(());
+            }
             anyhow::bail!("PgStore: transaction {tx_hash} not found");
         }
 

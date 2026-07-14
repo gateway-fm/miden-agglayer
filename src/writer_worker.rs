@@ -999,6 +999,64 @@ mod tests {
         );
     }
 
+    /// BLOCKER 2 (first-terminal-wins CAS), worker path — the TTL sweeper's
+    /// `write_failure_receipt` must NOT clobber a receipt the worker already
+    /// committed SUCCESS. The sweeper snapshots a job it believes is stuck and
+    /// does not cancel the worker, so a worker success can land first; the
+    /// subsequent failure commit must be a no-op and leave
+    /// `eth_getTransactionReceipt` at status 0x1.
+    ///
+    /// Mutation check: reverting the store CAS (memory `is_some()` guard or the
+    /// pg `AND status = 'pending'` predicate) makes this fail — the failure
+    /// overwrites success.
+    #[tokio::test]
+    async fn write_failure_receipt_does_not_clobber_committed_success() {
+        let service = crate::test_helpers::create_test_service();
+        let store = service.store.clone();
+        let (envelope, signer) = fake_envelope(0);
+        let hash = *envelope.tx_hash();
+
+        // Worker path: begin + commit SUCCESS at block 12 (status 0x1).
+        store
+            .txn_begin(
+                hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope: envelope.clone(),
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .txn_commit(hash, Ok(()), 12, [0xCDu8; 32])
+            .await
+            .unwrap();
+
+        // TTL sweeper fires against the same hash (worker already succeeded).
+        write_failure_receipt(
+            &service,
+            hash,
+            &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
+            Some((envelope, signer)),
+        )
+        .await
+        .expect("failure-receipt write must succeed as a no-op, not error");
+
+        let (result, block) = store
+            .txn_receipt(hash)
+            .await
+            .unwrap()
+            .expect("the committed success receipt must still exist");
+        assert!(
+            result.is_ok(),
+            "success (status 0x1) must be preserved; failure must not clobber it: {result:?}"
+        );
+        assert_eq!(block, 12, "the success block must be unchanged");
+    }
+
     fn fake_ger_job(nonce: u64) -> WriteJob {
         let (env, signer) = fake_envelope(nonce);
         // Hash derived from envelope; recompute via the same path as

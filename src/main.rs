@@ -111,6 +111,18 @@ struct Command {
     #[arg(long, env = "L1_INDEXER_FROM_BLOCK")]
     l1_indexer_from_block: Option<u64>,
 
+    /// Audit H6 — confirmation depth below L1 `latest` at which an observed
+    /// `(mainnet, rollup)` exit-root pair is trusted as GER evidence. Because a
+    /// Miden GER injection is IRREVERSIBLE and the evidence store has no
+    /// revoke/rollback, the indexer only records evidence this many blocks deep
+    /// so a short-lived reorg can never leave a stale row that permanently
+    /// authorizes a strict-mode injection. A not-yet-final GER stays unverified
+    /// (fail-closed, retryable) until it finalizes. Default 64 (≈ Sepolia
+    /// finality). Raise for extra safety; 0 disables the guard (unsafe with
+    /// `--reject-unverified-ger-injection`).
+    #[arg(long, env = "L1_INDEXER_CONFIRMATIONS", default_value_t = miden_agglayer_service::l1_info_tree_indexer::DEFAULT_CONFIRMATIONS)]
+    l1_indexer_confirmations: u64,
+
     /// Faucet-registry security reconciler poll interval, in seconds. The reconciler is
     /// a TRIPWIRE: it scans the bridge's on-chain faucet registrations and halts the
     /// proxy (fail-closed) if it finds one with no local `faucet_registry` row — the
@@ -1008,6 +1020,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(from_block) = command.l1_indexer_from_block {
                     indexer = indexer.with_from_block_override(from_block);
                 }
+                indexer = indexer.with_confirmations(command.l1_indexer_confirmations);
                 match indexer.spawn() {
                     Ok(shutdown_tx) => {
                         // The indexer runs for the lifetime of the tokio
@@ -1291,6 +1304,8 @@ mod hardening_tests {
             l1_rpc_url: None,
             ger_l1_address: None,
             l1_indexer_from_block: None,
+            l1_indexer_confirmations:
+                miden_agglayer_service::l1_info_tree_indexer::DEFAULT_CONFIRMATIONS,
             faucet_reconciler_poll_secs: 30,
             faucet_reconciler_grace_ticks: 3,
             miden_debug: false,
