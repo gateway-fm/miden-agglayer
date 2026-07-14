@@ -109,6 +109,27 @@ pub struct FaucetEntry {
     pub metadata: Vec<u8>,
 }
 
+/// The full derivable identity of the ONE legitimate MINT a consumed CLAIM
+/// note produces (Cantina #4, blocker #1). Decoded from the CLAIM's on-chain
+/// `ClaimNoteStorage`. Persisted keyed by the expected MINT serial
+/// (PROOF_DATA_KEY) and compared field-by-field against every observed MINT so
+/// a forger reusing a stored serial with a different MINT still alerts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedMint {
+    /// Exact Miden-scaled amount the MINT carries (CLAIM `miden_claim_amount`,
+    /// storage felt 568). Binds the observed MINT's fungible-asset amount.
+    pub minted_amount: u64,
+    /// EVM claimant the MINT pays (LeafData.destination_address). Binds the
+    /// MINT recipient; recorded for forensic attribution.
+    pub destination_address: [u8; 20],
+    /// Origin chain network id of the claimed token (LeafData.origin_network).
+    /// With `origin_address`, resolves via the faucet registry to the wrapped
+    /// faucet the MINT must mint — binding the observed MINT's asset faucet.
+    pub origin_network: u32,
+    /// Origin token contract address (LeafData.origin_token_address).
+    pub origin_address: [u8; 20],
+}
+
 /// Data for registering a new transaction.
 pub struct TxnEntry {
     pub id: Option<TransactionId>,
@@ -569,23 +590,39 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Record a legitimate expected-MINT serial derived from a consumed CLAIM
-    /// note's storage (Cantina #4 reconciliation history — see
+    /// Record the FULL expected-MINT identity derived from a consumed CLAIM
+    /// note's storage, keyed by the expected MINT serial (PROOF_DATA_KEY)
+    /// (Cantina #4 reconciliation history — see
     /// `migrations/011_claim_mint_serials.sql`). PERMANENT, unlike the
     /// Cantina #7 `expected_mint_*` staleness rows: the forged-MINT monitor
-    /// reconciles every observed MINT against this set forever. Idempotent
-    /// (re-recording the same serial is a no-op).
-    async fn claim_mint_serial_record(&self, _serial: &[u8; 32]) -> anyhow::Result<()> {
+    /// reconciles every observed MINT against this set forever. First-write
+    /// wins / idempotent (re-recording the same serial is a no-op — the
+    /// serial is unique per deposit).
+    ///
+    /// SECURITY (blocker #1): the monitor no longer accepts a MINT on serial
+    /// membership alone — it compares the observed MINT's amount/asset against
+    /// this stored identity, so a MINT reusing a stored serial with different
+    /// details still alerts. Only NON-NATIVE claims (which actually produce a
+    /// MINT) are recorded; the scanner filters native claims out before
+    /// calling this.
+    async fn claim_mint_expected_record(
+        &self,
+        _serial: &[u8; 32],
+        _identity: &ExpectedMint,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Does a recorded claim's expected-MINT serial match this serial?
-    /// `false` means NO recorded claim produced a MINT with this serial —
+    /// Fetch the recorded expected-MINT identity for this serial, if any.
+    /// `None` means NO recorded claim produced a MINT with this serial —
     /// the Cantina #4 forged signature (after the scanner's cross-tick
-    /// import-ordering grace). Default `false` is the fail-CLOSED direction
+    /// import-ordering grace). Default `None` is the fail-CLOSED direction
     /// for a security monitor: a store that doesn't persist the history
     /// alerts rather than suppresses.
-    async fn claim_mint_serial_seen(&self, _serial: &[u8; 32]) -> anyhow::Result<bool> {
-        Ok(false)
+    async fn claim_mint_expected_get(
+        &self,
+        _serial: &[u8; 32],
+    ) -> anyhow::Result<Option<ExpectedMint>> {
+        Ok(None)
     }
 
     // === Bridge-out ===

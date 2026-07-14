@@ -86,9 +86,9 @@ pub struct InMemoryStore {
     monitor_burn_serials: RwLock<HashSet<[u8; 32]>>,
     monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
     monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
-    // Cantina #4 — permanent claim→expected-MINT-serial reconciliation history
-    // (mirror of monitor_claim_mint_serials).
-    monitor_claim_mint_serials: RwLock<HashSet<[u8; 32]>>,
+    // Cantina #4 — permanent claim→expected-MINT-IDENTITY reconciliation
+    // history (mirror of monitor_claim_mint_serials): serial → full identity.
+    monitor_claim_mint_serials: RwLock<HashMap<[u8; 32], crate::store::ExpectedMint>>,
     // Test hook: force `list_faucets` to fail so scanner tests can drive the
     // registry-degraded fail-closed path (`bridge_out::note_positively_foreign`
     // with `registered_faucets == None`). Never set outside tests.
@@ -158,7 +158,7 @@ impl InMemoryStore {
             monitor_burn_serials: RwLock::new(HashSet::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
-            monitor_claim_mint_serials: RwLock::new(HashSet::new()),
+            monitor_claim_mint_serials: RwLock::new(HashMap::new()),
             fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
@@ -1085,13 +1085,24 @@ impl Store for InMemoryStore {
         }
     }
 
-    async fn claim_mint_serial_record(&self, serial: &[u8; 32]) -> anyhow::Result<()> {
-        self.monitor_claim_mint_serials.write().insert(*serial);
+    async fn claim_mint_expected_record(
+        &self,
+        serial: &[u8; 32],
+        identity: &crate::store::ExpectedMint,
+    ) -> anyhow::Result<()> {
+        // First-write-wins to mirror Postgres `ON CONFLICT DO NOTHING`.
+        self.monitor_claim_mint_serials
+            .write()
+            .entry(*serial)
+            .or_insert_with(|| identity.clone());
         Ok(())
     }
 
-    async fn claim_mint_serial_seen(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
-        Ok(self.monitor_claim_mint_serials.read().contains(serial))
+    async fn claim_mint_expected_get(
+        &self,
+        serial: &[u8; 32],
+    ) -> anyhow::Result<Option<crate::store::ExpectedMint>> {
+        Ok(self.monitor_claim_mint_serials.read().get(serial).cloned())
     }
 
     async fn expected_mint_record(

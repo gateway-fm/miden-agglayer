@@ -1,53 +1,48 @@
 #!/usr/bin/env bash
 # E2E: mint-monitor provenance — a FOREIGN miden-agglayer deployment minting on
 # the SAME Miden chain must not raise a false Cantina #2 (mint-target) / #4
-# (forged-mint) critical alert on OUR BridgeOutScanner monitors.
+# (forged-mint) critical alert on OUR BridgeOutScanner monitors, AND our
+# provenance GATE must be exercised end-to-end (positive skip evidence), AND the
+# monitor must still ALERT on a genuinely-ours forged MINT (positive control).
 #
-# Companion to e2e-claim-provenance.sh. That test covers the CLAIM path (foreign
-# CLAIMs are tag-0, so our reconciler DOES import them and the projector gate
-# must skip them). THIS test covers the MINT path, and asserts the OTHER half of
-# the provenance story established in the investigation:
+# Companion to e2e-claim-provenance.sh (CLAIM path). THIS test covers the MINT
+# path. CORRECTED PREMISE (second security re-review, blocker #3): the bridge
+# MASM emits its MINT/BURN output notes with the DEFAULT (0) tag
+# (`bridge_in_output.masm` / `bridge_out.masm` both `push.DEFAULT_TAG`) — the
+# SAME tag-0 family our note-visibility reconciler sweeps. So a FOREIGN
+# deployment's MINT, once its (network-account) faucet CONSUMES it, IS swept
+# into our store and DOES reach `BridgeOutScanner::scan_consumed_notes_monitors`.
+# The earlier claim that MINTs carry a non-zero tag (and therefore never reach
+# us) was WRONG — which is exactly why the provenance gate is load-bearing and
+# must be exercised, not assumed inert.
 #
-#   MINT and BURN notes are minted with tag = NoteTag::with_account_target(faucet)
-#   (miden-standards mint.rs:124 / burn.rs:99), which is NON-ZERO (high 14 bits of
-#   the faucet account prefix). Our note-visibility reconciler sweeps ONLY tag 0
-#   (synthetic_projector.rs:130). So a FOREIGN deployment's MINT — targeting and
-#   consumed by ITS OWN faucet — is NEVER imported into our store, never reaches
-#   BridgeOutScanner::on_post_sync, and therefore can NEVER trip:
-#       - bridge_mint_target_mismatch_total  (Cantina #2)
-#       - bridge_forged_mint_total           (Cantina #4)
+# The gate (src/bridge_out.rs::note_provenance → FOREIGN) classifies that
+# consumed foreign MINT as another deployment's note and SKIPS it in the value
+# monitors (bridge_mint_foreign_skipped_total++), instead of raising a false
+# #2/#4 page.
 #
-# The fix (src/bridge_out.rs::mint_note_belongs_to_deployment + mint_*_alert)
-# makes that guarantee EXPLICIT rather than incidental: even if such a MINT DID
-# reach us, it is provably not attributable to our deployment and is skipped
-# (bridge_mint_foreign_skipped_total) instead of alerting. The pure-predicate
-# defence-in-depth is proven RED->GREEN by the bridge_out.rs unit tests
-# (foreign_mint_does_not_raise_cross_faucet_alert et al.). This e2e proves the
-# END-TO-END invariant on a live shared chain.
-#
-# Topology: reuses e2e-claim-provenance.sh's foreign-deployment machinery
-# (bridge-out-tool --create-foreign-bridge + --submit-foreign-claim, isolated
-# store — the proxy's store is never touched). Driving a claim through the
-# FOREIGN bridge makes that bridge EMIT a foreign MINT (targeting the foreign
-# faucet) — exactly the note that, pre-provenance-fix, would have tripped #2 had
-# the tag machinery ever delivered it to us.
+# Topology: reuses the foreign-deployment machinery (bridge-out-tool
+# --create-foreign-bridge + --submit-foreign-claim, isolated store — the proxy's
+# store is never touched). Driving a claim through the FOREIGN bridge makes that
+# bridge EMIT a foreign MINT (target = foreign faucet); the foreign faucet is a
+# NETWORK account, so the stack's network-tx executor CONSUMES that MINT, and our
+# reconciler then imports the consumed tag-0 note.
 #
 # Assertions:
-#   (a) bridge_mint_target_mismatch_total UNCHANGED across a foreign-deployment
-#       mint (Cantina #2 stays quiet — no false cross-faucet alert).
-#   (b) bridge_forged_mint_total UNCHANGED (Cantina #4 stays quiet).
-#   (c) Positive control: our OWN legit MINT flow (L1->L2) runs and likewise does
-#       NOT inflate the mismatch counter (our MINT targets our registered faucet
-#       -> belongs -> no alert), while our synthetic ClaimEvent still lands.
-#   (d) Proxy healthy: synthetic tip advancing, /metrics serving.
-#
-# HONEST COVERAGE NOTE: because the foreign MINT's non-zero tag keeps it out of
-# our tag-0 sweep, bridge_mint_foreign_skipped_total is EXPECTED to stay 0 here
-# too (the note never reaches on_post_sync to be skipped). Exercising the skip
-# COUNTER end-to-end would require injecting a tag-0 MINT, which the standard
-# note constructors never produce; that path is covered by the unit tests. This
-# script therefore asserts the invariant that matters operationally: a foreign
-# deployment minting raises NO false #2/#4 alert on our monitors.
+#   (a) POSITIVE SKIP EVIDENCE — bridge_mint_foreign_skipped_total MUST INCREMENT
+#       (the consumed foreign MINT reached our scanner and the gate skipped it).
+#       Deleting the gate makes this assertion FAIL: the foreign MINT would
+#       instead be treated as ours and trip #4.
+#   (b) bridge_mint_target_mismatch_total UNCHANGED (Cantina #2 — no false page).
+#   (c) bridge_forged_mint_total UNCHANGED across the FOREIGN mint (Cantina #4 —
+#       no false page while the faucet is unregistered / foreign).
+#   (d) POSITIVE ALERT CONTROL — allowlist the foreign faucet into OUR registry
+#       (admin_registerNativeFaucet). The SAME imported MINT is now classified
+#       OURS, its serial matches NO aggkit-recorded claim, so #4 MUST FIRE
+#       (bridge_forged_mint_total INCREMENTS). Proves the monitor is not merely
+#       always-quiet — a real forged case that SHOULD alert does. Deleting the
+#       #4 reconcile makes this assertion FAIL.
+#   (e) Proxy healthy: synthetic tip advancing, /metrics serving.
 #
 # Usage:  ./scripts/e2e-mint-monitor-provenance.sh   (stack must be up: make e2e-up)
 set -euo pipefail
@@ -70,10 +65,15 @@ CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396
 # 1) so our aggkit never auto-claims the fabricated deposit.
 FOREIGN_NETWORK_ID="${FOREIGN_NETWORK_ID:-2}"
 DEPOSIT_AMOUNT="10000000000000" # 10^13 wei -> 1000 Miden units at scale 10^10
-# Window we give the reconciler/projector a chance to (fail to) import + surface
-# the foreign MINT before we assert the counters stayed flat. Several sweep ticks
-# (5s each) so a would-be false alert has ample time to fire if the fix regressed.
-OBSERVE_SECS="${OBSERVE_SECS:-90}"
+# Admin bearer for admin_registerNativeFaucet (positive alert control, step 7).
+: "${ADMIN_API_KEY:?fixtures/.env must define ADMIN_API_KEY (needed for the positive alert control)}"
+ADMIN_BEARER="Authorization: Bearer ${ADMIN_API_KEY}"
+# Max time to wait for (a) the consumed foreign MINT to be imported+skipped and
+# (d) the reclassified MINT's forged alert to fire (grace window ~10 sync ticks).
+SKIP_WAIT_SECS="${SKIP_WAIT_SECS:-180}"
+FORGED_WAIT_SECS="${FORGED_WAIT_SECS:-180}"
+# Window over which #2/#4 must stay FLAT while the faucet is still foreign.
+OBSERVE_SECS="${OBSERVE_SECS:-60}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $*"; }
@@ -150,7 +150,7 @@ BASE_MINT_SKIPPED=$(counter bridge_mint_foreign_skipped_total)
 BASE_TIP=$(l2_tip) || fail "proxy eth_blockNumber unreachable"
 log "  bridge_mint_target_mismatch_total = $BASE_MISMATCH  (Cantina #2 — MUST NOT move)"
 log "  bridge_forged_mint_total          = $BASE_FORGED     (Cantina #4 — MUST NOT move)"
-log "  bridge_mint_foreign_skipped_total = $BASE_MINT_SKIPPED  (expected flat: foreign MINT not tag-0)"
+log "  bridge_mint_foreign_skipped_total = $BASE_MINT_SKIPPED  (MUST INCREMENT: gate skip evidence)"
 log "  synthetic tip                     = $BASE_TIP"
 # Positive control (c): our own MINT above did NOT trip the mismatch counter
 # (our MINT targets our registered faucet -> belongs -> no alert).
@@ -223,54 +223,99 @@ FC_OUT=$(iso_tool --submit-foreign-claim \
 echo "$FC_OUT" | tail -6
 pass "foreign bridge consumed the CLAIM — a foreign MINT (target=foreign faucet) is now on-chain"
 
-# ── Step 6: observe — the foreign MINT must NOT trip our #2/#4 monitors ──────
-step "Observing our mint monitors for ${OBSERVE_SECS}s (must stay flat)"
+# ── Step 6: the foreign faucet consumes the MINT → our scanner MUST skip it ──
+# The foreign faucet is a network account; the stack's network-tx executor
+# consumes the tag-0 MINT it targets. Our reconciler then imports that consumed
+# note and the provenance gate skips it. Assertion (a): the skip counter MUST
+# INCREMENT (exact skip evidence) — AND, while the faucet is still foreign, #2/#4
+# MUST stay flat (assertions b/c). This is the deletion-detecting core: with the
+# gate removed, the imported foreign MINT is treated as ours and trips #4 (so the
+# forged counter moves — failing (c) — and the skip counter never moves —
+# failing (a)).
+step "Waiting ≤${SKIP_WAIT_SECS}s for the consumed foreign MINT to be imported + SKIPPED"
+NEW_MINT_SKIPPED="$BASE_MINT_SKIPPED"
+ELAPSED=0
+while [[ "$ELAPSED" -lt "$SKIP_WAIT_SECS" ]]; do
+    NOW_MISMATCH=$(counter bridge_mint_target_mismatch_total)
+    NOW_FORGED=$(counter bridge_forged_mint_total)
+    # Fail FAST if a false alert fires while the faucet is still FOREIGN.
+    [[ "$NOW_MISMATCH" -le "$BASE_MISMATCH" ]] \
+        || fail "FALSE CANTINA #2 ALERT: bridge_mint_target_mismatch_total $BASE_MISMATCH -> $NOW_MISMATCH on a FOREIGN mint"
+    [[ "$NOW_FORGED" -le "$BASE_FORGED" ]] \
+        || fail "FALSE CANTINA #4 ALERT: bridge_forged_mint_total $BASE_FORGED -> $NOW_FORGED on a FOREIGN mint (gate deleted?)"
+    NEW_MINT_SKIPPED=$(counter bridge_mint_foreign_skipped_total)
+    [[ "$NEW_MINT_SKIPPED" -gt "$BASE_MINT_SKIPPED" ]] && break
+    sleep 5; ELAPSED=$((ELAPSED + 5)); echo -n "."
+done
+echo ""
+[[ "$NEW_MINT_SKIPPED" -gt "$BASE_MINT_SKIPPED" ]] \
+    || fail "NO SKIP EVIDENCE: bridge_mint_foreign_skipped_total stayed $BASE_MINT_SKIPPED after ${SKIP_WAIT_SECS}s — the consumed foreign MINT never reached the gate (or the gate was deleted)"
+pass "gate exercised: bridge_mint_foreign_skipped_total $BASE_MINT_SKIPPED -> $NEW_MINT_SKIPPED (foreign MINT skipped)"
+
+# ── Step 6b: hold — #2/#4 stay flat for OBSERVE_SECS while still foreign ──────
+step "Confirming #2/#4 stay flat for ${OBSERVE_SECS}s (no false page on the foreign mint)"
 ELAPSED=0
 while [[ "$ELAPSED" -lt "$OBSERVE_SECS" ]]; do
     NOW_MISMATCH=$(counter bridge_mint_target_mismatch_total)
     NOW_FORGED=$(counter bridge_forged_mint_total)
-    # Fail FAST if a false alert fires at any point in the window.
-    [[ "$NOW_MISMATCH" -le "$BASE_MISMATCH" ]] \
-        || fail "FALSE CANTINA #2 ALERT: bridge_mint_target_mismatch_total $BASE_MISMATCH -> $NOW_MISMATCH while a foreign deployment minted"
-    [[ "$NOW_FORGED" -le "$BASE_FORGED" ]] \
-        || fail "FALSE CANTINA #4 ALERT: bridge_forged_mint_total $BASE_FORGED -> $NOW_FORGED while a foreign deployment minted"
+    [[ "$NOW_MISMATCH" == "$BASE_MISMATCH" ]] \
+        || fail "bridge_mint_target_mismatch_total moved: $BASE_MISMATCH -> $NOW_MISMATCH"
+    [[ "$NOW_FORGED" == "$BASE_FORGED" ]] \
+        || fail "bridge_forged_mint_total moved on a FOREIGN mint: $BASE_FORGED -> $NOW_FORGED"
     sleep 5; ELAPSED=$((ELAPSED + 5)); echo -n "."
 done
 echo ""
 NEW_MISMATCH=$(counter bridge_mint_target_mismatch_total)
-NEW_FORGED=$(counter bridge_forged_mint_total)
-NEW_MINT_SKIPPED=$(counter bridge_mint_foreign_skipped_total)
-[[ "$NEW_MISMATCH" == "$BASE_MISMATCH" ]] \
-    || fail "bridge_mint_target_mismatch_total moved: $BASE_MISMATCH -> $NEW_MISMATCH"
-[[ "$NEW_FORGED" == "$BASE_FORGED" ]] \
-    || fail "bridge_forged_mint_total moved: $BASE_FORGED -> $NEW_FORGED"
 pass "Cantina #2 quiet: bridge_mint_target_mismatch_total stayed $NEW_MISMATCH"
-pass "Cantina #4 quiet: bridge_forged_mint_total stayed $NEW_FORGED"
-# Honest note: the foreign MINT's non-zero account-target tag keeps it out of our
-# tag-0 reconciler sweep, so it never reaches on_post_sync — the skip counter is
-# EXPECTED to stay flat too. Report it for observability; do not fail on it.
-log "  bridge_mint_foreign_skipped_total: $BASE_MINT_SKIPPED -> $NEW_MINT_SKIPPED (expected flat — see header)"
+pass "Cantina #4 quiet on the FOREIGN mint: bridge_forged_mint_total stayed $BASE_FORGED"
 
-# ── Step 7: positive control — our own ClaimEvent/mint flow intact ──────────
-step "Positive control: our own ClaimEvent rows intact (our mint flow unaffected)"
+# ── Step 7: POSITIVE ALERT CONTROL — allowlist the foreign faucet → #4 MUST FIRE
+# Register the foreign faucet id into OUR registry. The SAME imported MINT is now
+# classified OURS (target ∈ our registered set); its serial matches NO
+# aggkit-recorded claim, so the forged-MINT reconciler MUST fire after its grace
+# window. This proves the monitor is not merely always-quiet — a real forged case
+# that SHOULD alert does. Deleting the #4 reconcile makes this assertion FAIL.
+step "Positive control: allowlisting the foreign faucet, then requiring #4 to FIRE"
+NATIVE_ORIGIN_ADDR="0x0f0f0f$(python3 -c 'import secrets;print(secrets.token_hex(17))')"
+REG=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+  \"params\":[{\"faucet_id\":\"$FOREIGN_FAUCET_ID\",\"origin_token_address\":\"$NATIVE_ORIGIN_ADDR\",
+    \"symbol\":\"FGN\",\"decimals\":8}]}" 2>/dev/null) \
+    || fail "admin_registerNativeFaucet unreachable (positive control needs it)"
+echo "$REG" | python3 -c "import json,sys;sys.exit(0 if 'result' in json.load(sys.stdin) else 1)" \
+    || fail "admin_registerNativeFaucet failed: $REG"
+log "  foreign faucet $FOREIGN_FAUCET_ID allowlisted — it now reads as OURS"
+
+step "Waiting ≤${FORGED_WAIT_SECS}s for the reclassified MINT to trip Cantina #4"
+NEW_FORGED="$BASE_FORGED"
+ELAPSED=0
+while [[ "$ELAPSED" -lt "$FORGED_WAIT_SECS" ]]; do
+    NEW_FORGED=$(counter bridge_forged_mint_total)
+    [[ "$NEW_FORGED" -gt "$BASE_FORGED" ]] && break
+    sleep 5; ELAPSED=$((ELAPSED + 5)); echo -n "."
+done
+echo ""
+[[ "$NEW_FORGED" -gt "$BASE_FORGED" ]] \
+    || fail "POSITIVE CONTROL FAILED: bridge_forged_mint_total stayed $BASE_FORGED — an ours-classified MINT with NO matching claim did NOT trip #4 (the forged reconcile is broken/deleted)"
+pass "Cantina #4 FIRES on a genuinely-forged (ours, no-claim) MINT: $BASE_FORGED -> $NEW_FORGED"
+
+# ── Step 8: positive control (own flow intact) + proxy health ────────────────
+step "Own ClaimEvent rows intact + proxy health (tip advancing, /metrics serving)"
 OWN_ROWS_AFTER=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}';")
 [[ "${OWN_ROWS_AFTER:-0}" -ge 1 ]] \
     || fail "positive control broken: no OWN ClaimEvent rows remain"
-pass "own ClaimEvent rows intact: $OWN_ROWS_AFTER"
-
-# ── Step 8: proxy health ────────────────────────────────────────────────────
-step "Proxy health: tip advancing + /metrics serving"
 TIP_A=$(l2_tip) || fail "eth_blockNumber unreachable after test"
 sleep 12
 TIP_B=$(l2_tip) || fail "eth_blockNumber unreachable after test"
 [[ "$TIP_B" -gt "$TIP_A" ]] || fail "synthetic tip frozen at $TIP_A — proxy unhealthy"
-pass "tip advancing: $TIP_A -> $TIP_B"
+pass "own ClaimEvent rows intact: $OWN_ROWS_AFTER; tip advancing: $TIP_A -> $TIP_B"
 
 log "======================================================================"
 log "  MINT-MONITOR PROVENANCE PASS"
 log "    foreign bridge:                    $FOREIGN_BRIDGE_ID (network $FOREIGN_NETWORK_ID)"
 log "    foreign faucet (mint target):      $FOREIGN_FAUCET_ID"
-log "    bridge_mint_target_mismatch_total: $BASE_MISMATCH -> $NEW_MISMATCH (must be equal)"
-log "    bridge_forged_mint_total:          $BASE_FORGED -> $NEW_FORGED (must be equal)"
+log "    bridge_mint_foreign_skipped_total: $BASE_MINT_SKIPPED -> $NEW_MINT_SKIPPED (gate skip evidence — MUST increase)"
+log "    bridge_mint_target_mismatch_total: $BASE_MISMATCH -> $NEW_MISMATCH (foreign mint: must be equal)"
+log "    bridge_forged_mint_total:          $BASE_FORGED -> $NEW_FORGED (positive control: MUST increase after allowlist)"
 log "    own ClaimEvent rows:               $OWN_ROWS_AFTER"
 log "======================================================================"

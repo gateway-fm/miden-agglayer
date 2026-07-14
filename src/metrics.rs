@@ -180,13 +180,15 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "bridge_forged_mint_total",
-        "MINT note observed consumed that corresponds to NO aggkit-recorded \
-         claim (Cantina #4): its serial number matches no recorded claim's \
-         PROOF_DATA_KEY (the bridge MASM derives every legitimate MINT's \
-         serial from its producing claim's proof data). Forged via NoAuth \
-         bridge note authorship. One-shot per MINT note id, after a short \
-         grace window that absorbs cross-tick note-import ordering. Page \
-         critical, freeze claim processing."
+        "MINT note observed consumed that does NOT reconcile to an \
+         aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge note \
+         authorship. One-shot per MINT note id. Label reason=no_claim: the \
+         serial matches no recorded claim's PROOF_DATA_KEY (fires after a \
+         short grace window that absorbs cross-tick note-import ordering). \
+         Label reason=detail_mismatch (blocker #1): the serial IS recorded \
+         but the observed MINT's identity (amount / asset) differs from the \
+         claim's derived expected MINT — a copied-serial forgery — fires \
+         immediately, no grace. Page critical, freeze claim processing."
     );
     describe_counter!(
         "bridge_mint_foreign_skipped_total",

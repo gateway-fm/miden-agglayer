@@ -121,7 +121,7 @@ Treat each one as a hard-page criterion at any non-zero rate.
 | `bridge_twin_note_detected_total` | Second on-chain note with a previously-observed NoteId but different metadata — B2AGG reclaim attack signature. | #6 |
 | `bridge_mint_target_mismatch_total` | MINT note **in our deployment's flow** (consumed by our bridge/registered faucet) whose `NetworkAccountTarget` names an unregistered faucet — cross-faucet exploit / misregistration. Claimant about to receive the wrong wrapped asset. Provenance-scoped: a foreign deployment's MINT does not trip this (see `bridge_mint_foreign_skipped_total`). | #2 |
 | `bridge_faucet_ownership_drift_total{kind=drift\|renounced}` | Faucet owner storage slot moved away from the configured bridge AccountId. `renounced` wedges the faucet permanently. | #4 |
-| `bridge_forged_mint_total` | MINT note **in our deployment's flow** with no decodable `NetworkAccountTarget` — forged via NoAuth. Provenance-scoped (foreign MINTs skipped). | #4 |
+| `bridge_forged_mint_total{reason}` | MINT note **in our deployment's flow** that does not reconcile to an aggkit-recorded claim — forged via NoAuth. `reason=no_claim`: its serial matches no recorded claim's PROOF_DATA_KEY (after a short grace window). `reason=detail_mismatch`: its serial IS recorded but the observed amount/asset differs from the claim's derived expected MINT (a copied-serial forgery) — fires immediately. Provenance-scoped (foreign MINTs skipped; native claims are never whitelisted). | #4 |
 | `bridge_out_self_targeted_total` | B2AGG whose `destination_network` equals our `network_id`. Each one is a poison leaf. | #13 |
 
 ### Quarantine / unbridgeable — funds parked, operator handle exists
