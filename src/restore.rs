@@ -304,8 +304,7 @@ pub async fn restore(
     // sync_transactions feed (+ the Phase 1.5 nullifier index for authenticated inputs).
     // Best-effort like Phase 1.5: on failure restore proceeds with local-only attribution
     // (pre-existing behavior), which fail-closed skips consumer-unknown notes.
-    let mut bridge_attribution: std::collections::HashMap<[u8; 32], (u64, u32)> =
-        std::collections::HashMap::new();
+    let mut bridge_attribution: BridgePositionMap = std::collections::HashMap::new();
     if let Some(url) = node_url {
         let from_block: u32 = std::env::var("RECOVER_FROM_BLOCK")
             .ok()
@@ -502,7 +501,10 @@ async fn recover_missed_bridge_outs(
     from_block: u32,
 ) -> anyhow::Result<(
     usize,
-    std::collections::HashMap<miden_protocol::note::Nullifier, [u8; 32]>,
+    std::collections::HashMap<
+        miden_protocol::note::Nullifier,
+        (miden_protocol::note::NoteId, [u8; 32]),
+    >,
 )> {
     use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
@@ -540,8 +542,14 @@ async fn recover_missed_bridge_outs(
     // the local store does not, so its nullifier is unrecoverable there). This is the
     // join `authoritative_bridge_attribution` needs to attribute AUTHENTICATED
     // (nullifier-only) bridge-tx inputs back to their notes.
-    let mut nullifier_index: std::collections::HashMap<miden_protocol::note::Nullifier, [u8; 32]> =
-        std::collections::HashMap::new();
+    // nullifier -> (unique NoteId, details commitment): the identity index the attribution
+    // join keys AUTHENTICATED bridge-tx inputs by (they carry only the nullifier). Computed
+    // HERE because a fetched PUBLIC note carries the metadata to derive both — a consumed
+    // local-store record has neither.
+    let mut nullifier_index: std::collections::HashMap<
+        miden_protocol::note::Nullifier,
+        (NoteId, [u8; 32]),
+    > = std::collections::HashMap::new();
     let mut scanned = 0usize;
     for b in from_block..=to_block {
         let block = match rpc.get_block_by_number(BlockNumber::from(b), false).await {
@@ -562,8 +570,10 @@ async fn recover_missed_bridge_outs(
                             let details: NoteDetails = note.clone().into();
                             if is_b2agg_note(&details) {
                                 b2agg_ids.push(note.id());
-                                nullifier_index
-                                    .insert(note.nullifier(), details.commitment().as_bytes());
+                                nullifier_index.insert(
+                                    note.nullifier(),
+                                    (note.id(), details.commitment().as_bytes()),
+                                );
                             }
                         }
                     }
@@ -623,6 +633,15 @@ async fn recover_missed_bridge_outs(
     Ok((imported, nullifier_index))
 }
 
+/// Shared key shape with the live projector's ordering feed (#137
+/// `restore_bridge_positions`): unique NoteId -> (details commitment, consumption block,
+/// per-block bridge-tx order, within-tx input position). Keying by the UNIQUE NoteId — not
+/// the shareable details commitment — is the identity fix (two distinct notes can share a
+/// commitment; a commitment key cross-attributes or overwrites one). The within-tx position
+/// is carried so #137's restore ordering consumes it at merge.
+type BridgePositionMap =
+    std::collections::HashMap<miden_protocol::note::NoteId, ([u8; 32], u64, u32, u32)>;
+
 /// Build the AUTHORITATIVE bridge-consumption attribution map for restore Phase 2:
 /// details-commitment → `(consumption block, per-block bridge-tx order)` for every note a
 /// BRIDGE-executed transaction consumed, sourced from the node's `sync_transactions` feed —
@@ -654,8 +673,11 @@ async fn authoritative_bridge_attribution(
     node_url: &str,
     api_key: Option<&str>,
     bridge_id: AccountId,
-    nullifier_index: &std::collections::HashMap<miden_protocol::note::Nullifier, [u8; 32]>,
-) -> anyhow::Result<std::collections::HashMap<[u8; 32], (u64, u32)>> {
+    nullifier_index: &std::collections::HashMap<
+        miden_protocol::note::Nullifier,
+        (miden_protocol::note::NoteId, [u8; 32]),
+    >,
+) -> anyhow::Result<BridgePositionMap> {
     use miden_protocol::block::BlockNumber;
 
     let endpoint = crate::miden_client::parse_node_url(node_url)?;
@@ -670,54 +692,36 @@ async fn authoritative_bridge_attribution(
         .await
         .map_err(|e| anyhow::anyhow!("attribution: sync_transactions(0..{tip}): {e}"))?;
 
-    let refs = crate::synthetic_projector::bridge_consumed_nullifiers(&txs, bridge_id);
-    let mut out: std::collections::HashMap<[u8; 32], (u64, u32)> = std::collections::HashMap::new();
-    let mut unauth_ids: Vec<(miden_protocol::note::NoteId, (u64, u32))> = Vec::new();
+    // Key by the UNIQUE NoteId (not the shareable commitment) with the within-tx input
+    // position — the position is the input's index in the tx header's ordered
+    // `input_notes()`, the on-chain LET append order (same shape as #137's ordering feed).
+    let mut out: BridgePositionMap = std::collections::HashMap::new();
+    let mut per_block_order: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     for tx in &txs {
         if tx.transaction_header.account_id() != bridge_id {
             continue;
         }
-        for input in tx.transaction_header.input_notes().iter() {
-            let Some(cref) = refs.get(&input.nullifier()) else {
-                continue;
-            };
+        let block = tx.block_num.as_u64();
+        let order = *per_block_order
+            .entry(block)
+            .and_modify(|i| *i += 1)
+            .or_insert(0u32);
+        for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
+            let pos = pos as u32;
             if let Some(header) = input.header() {
-                // Unauthenticated input: the header carries the commitment directly.
+                // Unauthenticated input: the header carries BOTH the id and the commitment.
                 out.insert(
-                    header.details_commitment().as_bytes(),
-                    (cref.block, cref.order),
+                    header.id(),
+                    (header.details_commitment().as_bytes(), block, order, pos),
                 );
-            } else if let Some(commitment) = nullifier_index.get(&input.nullifier()) {
-                // Authenticated input: resolve via the Phase 1.5 nullifier index.
-                out.insert(*commitment, (cref.block, cref.order));
-            } else if let Some(id) = cref.note_id {
-                unauth_ids.push((id, (cref.block, cref.order)));
+            } else if let Some((id, commitment)) = nullifier_index.get(&input.nullifier()) {
+                // Authenticated input: resolve id + commitment via the Phase 1.5 index.
+                out.insert(*id, (*commitment, block, order, pos));
             }
         }
     }
-    // Residual ids (unauthenticated refs observed without a usable header/index entry):
-    // resolve their commitments from the node. Usually empty.
-    if !unauth_ids.is_empty() {
-        let ids: Vec<miden_protocol::note::NoteId> = unauth_ids.iter().map(|(i, _)| *i).collect();
-        if let Ok(fetched) = rpc.get_notes_by_id(&ids).await {
-            let by_id: std::collections::HashMap<miden_protocol::note::NoteId, [u8; 32]> = fetched
-                .into_iter()
-                .filter_map(|f| match f {
-                    miden_client::rpc::domain::note::FetchedNote::Public(note, _) => {
-                        let id = note.id();
-                        let details: miden_protocol::note::NoteDetails = note.into();
-                        Some((id, details.commitment().as_bytes()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            for (id, at) in unauth_ids {
-                if let Some(c) = by_id.get(&id) {
-                    out.insert(*c, at);
-                }
-            }
-        }
-    }
+    // Every attributable input resolved above (unauthenticated via its header, authenticated
+    // via the id-carrying Phase 1.5 index) — no node round-trip needed to recover ids.
     tracing::info!(
         bridge = %bridge_id,
         attributed = out.len(),
@@ -735,8 +739,9 @@ async fn authoritative_bridge_attribution(
 /// when the consumer is already known, or the note is not bridge-attributed.
 pub(crate) fn attribute_bridge_consumption(
     note: &InputNoteRecord,
+    unique_id: Option<miden_protocol::note::NoteId>,
     bridge_id: AccountId,
-    attribution: &std::collections::HashMap<[u8; 32], (u64, u32)>,
+    attribution: &BridgePositionMap,
 ) -> Option<InputNoteRecord> {
     use miden_client::store::InputNoteState;
     use miden_client::store::input_note_states::ConsumedExternalNoteState;
@@ -745,8 +750,9 @@ pub(crate) fn attribute_bridge_consumption(
     if note.consumer_account().is_some() {
         return None; // consumer known (locally executed / reclaim) — nothing to attribute
     }
-    let key: [u8; 32] = note.details_commitment().as_bytes();
-    let (block, order) = attribution.get(&key)?;
+    // Look up by the note's UNIQUE NoteId, not its (shareable) details commitment — two
+    // distinct notes sharing a commitment must not cross-attribute.
+    let (_commitment, block, order, _pos) = attribution.get(&unique_id?)?;
     let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
         nullifier_block_height: BlockNumber::from(*block as u32),
         consumer_account: Some(bridge_id),
@@ -906,7 +912,7 @@ async fn restore_bridge_outs(
     block_state: &Arc<BlockState>,
     restore_block: u64,
     l1_rpc_url: Option<String>,
-    bridge_attribution: std::collections::HashMap<[u8; 32], (u64, u32)>,
+    bridge_attribution: BridgePositionMap,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -939,15 +945,40 @@ async fn restore_bridge_outs(
                 // the bridge's on-chain transaction feed proves the bridge consumed it.
                 // Notes with a known consumer, and notes NOT in the bridge feed, pass
                 // through unchanged — the MA#3 gate below is untouched.
+                // Resolve each consumed record's UNIQUE NoteId from the attribution map.
+                // A consumed local-store record has lost its id (metadata gone), so the join
+                // is by details commitment — and because distinct notes CAN share one, each
+                // commitment keeps a QUEUE of candidate ids (sorted for determinism) that
+                // every matching record pops from: same-commitment siblings resolve to
+                // DISTINCT ids, so no note is cross-attributed or collapsed.
+                let mut ids_by_commitment: std::collections::HashMap<
+                    [u8; 32],
+                    Vec<miden_protocol::note::NoteId>,
+                > = std::collections::HashMap::new();
+                for (id, (commitment, _, _, _)) in &bridge_attribution {
+                    ids_by_commitment.entry(*commitment).or_default().push(*id);
+                }
+                for ids in ids_by_commitment.values_mut() {
+                    ids.sort_by_key(|i| i.as_bytes());
+                    ids.reverse(); // pop() takes the smallest first
+                }
                 let consumed_notes: Vec<InputNoteRecord> = consumed_notes
                     .iter()
                     .map(|n| {
-                        match attribute_bridge_consumption(n, bridge_id, &bridge_attribution) {
+                        let unique_id = ids_by_commitment
+                            .get_mut(&n.details_commitment().as_bytes())
+                            .and_then(|q| q.pop());
+                        match attribute_bridge_consumption(
+                            n,
+                            unique_id,
+                            bridge_id,
+                            &bridge_attribution,
+                        ) {
                             Some(rebuilt) => {
                                 ::metrics::counter!("restore_b2agg_authoritative_attributed_total")
                                     .increment(1);
                                 tracing::info!(
-                                    note_id = %hex::encode(n.details_commitment().as_bytes()),
+                                    note_id = ?unique_id,
                                     block = rebuilt
                                         .state()
                                         .consumed_block_height()
@@ -2116,9 +2147,15 @@ mod tests {
     use crate::store::Store;
     use crate::store::memory::InMemoryStore;
     use miden_protocol::note::{
-        NoteAttachment, NoteAttachments, NoteMetadata, NoteType, PartialNoteMetadata,
+        NoteAttachment, NoteAttachments, NoteId, NoteMetadata, NoteType, PartialNoteMetadata,
     };
+    use miden_protocol::{Felt, Word};
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
+
+    /// Distinct synthetic NoteIds for the identity-keyed attribution tests.
+    fn test_note_id(byte: u64) -> NoteId {
+        NoteId::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
+    }
     use std::sync::Arc as StdArc;
 
     // Test AccountIds — four distinct, valid protocol-0.15 (version-1) ids.
@@ -3753,7 +3790,8 @@ mod tests {
 
         // NTX-consumed: the store does NOT know the consumer.
         let note = ma3_b2agg_input_note(faucet_id, None);
-        let key: [u8; 32] = note.details_commitment().as_bytes();
+        let commitment: [u8; 32] = note.details_commitment().as_bytes();
+        let note_uid = test_note_id(0x544);
 
         // Pre-fix behavior still holds WITHOUT attribution: fail-closed skip.
         let skipped = project_b2agg_note(
@@ -3775,9 +3813,11 @@ mod tests {
             "without attribution the untracked consumer stays fail-closed (MA#3)"
         );
 
-        // The bridge's on-chain tx feed attributes it: consumed at block 544, order 3.
-        let attribution = std::collections::HashMap::from([(key, (544u64, 3u32))]);
-        let rebuilt = attribute_bridge_consumption(&note, bridge_id, &attribution)
+        // The bridge's on-chain tx feed attributes it BY UNIQUE NoteId: consumed at block
+        // 544, order 3, within-tx position 2 (id -> (commitment, block, order, pos)).
+        let attribution: BridgePositionMap =
+            std::collections::HashMap::from([(note_uid, (commitment, 544u64, 3u32, 2u32))]);
+        let rebuilt = attribute_bridge_consumption(&note, Some(note_uid), bridge_id, &attribution)
             .expect("bridge-attributed consumer-unknown note must be rebuilt");
         assert_eq!(rebuilt.consumer_account(), Some(bridge_id));
         assert_eq!(
@@ -3825,8 +3865,13 @@ mod tests {
         // (a) consumer unknown + NOT bridge-attributed → no rebuild, fail-closed skip.
         let unknown = ma3_b2agg_input_note(faucet_id, None);
         assert!(
-            attribute_bridge_consumption(&unknown, bridge_id, &std::collections::HashMap::new())
-                .is_none(),
+            attribute_bridge_consumption(
+                &unknown,
+                Some(test_note_id(0x999)),
+                bridge_id,
+                &std::collections::HashMap::new()
+            )
+            .is_none(),
             "no attribution entry → record unchanged"
         );
         let outcome = project_b2agg_note(
@@ -3847,10 +3892,12 @@ mod tests {
         // (b) KNOWN non-bridge consumer (user reclaim): attribution must never rewrite it,
         // and the MA#3 reclaim gate still skips.
         let reclaimed = ma3_b2agg_input_note(faucet_id, Some(sender_id));
-        let key: [u8; 32] = reclaimed.details_commitment().as_bytes();
-        let adversarial = std::collections::HashMap::from([(key, (5u64, 0u32))]);
+        let commitment: [u8; 32] = reclaimed.details_commitment().as_bytes();
+        let rid = test_note_id(0x5);
+        let adversarial: BridgePositionMap =
+            std::collections::HashMap::from([(rid, (commitment, 5u64, 0u32, 0u32))]);
         assert!(
-            attribute_bridge_consumption(&reclaimed, bridge_id, &adversarial).is_none(),
+            attribute_bridge_consumption(&reclaimed, Some(rid), bridge_id, &adversarial).is_none(),
             "a known consumer is never overwritten by the map"
         );
         let outcome = project_b2agg_note(
@@ -3870,6 +3917,63 @@ mod tests {
             outcome,
             B2AggRestoreOutcome::Skipped,
             "reclaimed note stays gated (MA#3) regardless of attribution"
+        );
+    }
+
+    /// Blocker 1 (identity) — two DISTINCT consumer-unknown notes that SHARE a details
+    /// commitment must be attributed by their UNIQUE NoteIds, never cross-attributed. A
+    /// commitment-keyed map (the pre-fix bug) would give both the SAME (block, order); the
+    /// id-keyed map gives each its own, and an id absent from the map yields no rebuild.
+    #[tokio::test]
+    async fn shared_commitment_notes_attributed_by_unique_id() {
+        let (faucet_id, bridge_id, _sender) = ma3_accounts();
+
+        // Same faucet + storage → IDENTICAL details commitment; two on-chain notes.
+        let note_a = ma3_b2agg_input_note(faucet_id, None);
+        let note_b = ma3_b2agg_input_note(faucet_id, None);
+        let commitment: [u8; 32] = note_a.details_commitment().as_bytes();
+        assert_eq!(
+            commitment,
+            note_b.details_commitment().as_bytes(),
+            "fixture: the two notes share a details commitment"
+        );
+
+        let id_a = test_note_id(0xA1);
+        let id_b = test_note_id(0xB2);
+        // Distinct authoritative positions for the two siblings under one commitment.
+        let attribution: BridgePositionMap = std::collections::HashMap::from([
+            (id_a, (commitment, 100u64, 0u32, 0u32)),
+            (id_b, (commitment, 100u64, 0u32, 1u32)),
+        ]);
+
+        let ra = attribute_bridge_consumption(&note_a, Some(id_a), bridge_id, &attribution)
+            .expect("note_a resolves via id_a");
+        let rb = attribute_bridge_consumption(&note_b, Some(id_b), bridge_id, &attribution)
+            .expect("note_b resolves via id_b");
+        // Both attributed to the bridge (block 100), each with its OWN tx_order slot from
+        // its own id — not collapsed to a single (block, order) by the shared commitment.
+        assert_eq!(ra.consumer_account(), Some(bridge_id));
+        assert_eq!(rb.consumer_account(), Some(bridge_id));
+        assert_eq!(
+            ra.state().consumed_block_height().map(|h| h.as_u64()),
+            Some(100)
+        );
+        assert_eq!(
+            rb.state().consumed_block_height().map(|h| h.as_u64()),
+            Some(100)
+        );
+
+        // An id NOT in the map (a third sibling the feed did not attribute) → no rebuild,
+        // even though its commitment IS present.
+        assert!(
+            attribute_bridge_consumption(
+                &note_a,
+                Some(test_note_id(0xC3)),
+                bridge_id,
+                &attribution
+            )
+            .is_none(),
+            "attribution is keyed by unique id, not the shared commitment"
         );
     }
 }

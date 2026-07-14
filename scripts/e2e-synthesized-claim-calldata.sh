@@ -194,23 +194,68 @@ LOCAL_PROOF_HEX="${INPUT:10:2048}"
     || fail "local SMT proof in calldata is all-zero — fabrication, not the authoritative proof"
 pass "full authoritative claimAsset calldata served ($(( (${#INPUT} - 2) / 2 )) bytes, truthful gi, non-zero proofs)"
 
-# ── Step 6: aggkit parses it, syncs past the block, cert settles ─────────────
-step "6/6: aggkit full-claim parser + certificate pipeline"
+# ── Step 6: aggkit RE-SYNCS the claim from a reset DB, parses it, cert settles ─
+#
+# CRITICAL (review blocker 2): a `docker restart` PRESERVES the container filesystem, and
+# aggkit stores its bridgesync DB under PathRWData=/tmp (no named volume) — so a restarted
+# aggkit RESUMES past the already-processed claim block and NEVER re-fetches the
+# derived-hash tx. That made the old assertions vacuous (it was "already past", never
+# re-parsed). We instead RESET aggkit's sync state by RECREATING the container (fresh
+# /tmp), forcing a full re-sync that MUST re-fetch and re-parse the derived-hash claim,
+# then assert — positively, keyed on the exact derived hash — that it did.
+step "6/6: RESET aggkit (force-recreate → empty bridgesync DB) and re-sync the claim"
 AGGKIT_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-docker restart "$AGGKIT_CONTAINER" >/dev/null
+# Snapshot the proxy log offset so the fetch assertion only counts requests AFTER the
+# reset (the derived-hash tx served during the ORIGINAL sync must not count).
+PROXY_LOG_MARK=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env \
+    up -d --force-recreate --no-deps aggkit >/dev/null 2>&1 \
+    || docker compose -f docker-compose.e2e.yml --env-file fixtures/.env \
+        up -d --force-recreate --no-deps aggkit >/dev/null 2>&1 \
+    || fail "could not force-recreate $AGGKIT_CONTAINER to reset its bridgesync DB"
 sleep 5
 
-# (a) L2BridgeSyncer must get PAST the claim block: its processed block exceeds it.
-wait_for "aggkit L2BridgeSyncer past claim block ${CLAIM_BLOCK}" \
+# (a) FETCH PROOF (hash-exact, positive — this is what makes the test un-false-passable):
+# a reset aggkit re-syncing block ${CLAIM_BLOCK} MUST ask the proxy for the derived-hash
+# tx's calldata. The proxy logs the exact hash it serves; wait for OUR derived hash. If
+# aggkit skipped the claim (the bug), this line never appears and the test fails.
+DERIVED_HASH_LC=$(echo "$DERIVED_HASH" | tr '[:upper:]' '[:lower:]')
+wait_for "aggkit re-FETCHED the derived-hash claim tx from the proxy (${DERIVED_HASH_LC:0:18}…)" \
+    "docker logs --since $PROXY_LOG_MARK $PROXY_CONTAINER 2>&1 | strip_ansi | grep -iF 'found synthetic tx' | grep -iqF '$DERIVED_HASH_LC'" \
+    "$AGGKIT_SYNC_TIMEOUT" 5
+pass "aggkit fetched the exact derived-hash detailed claim after a DB reset"
+
+# (b) PERSIST PROOF: from the reset state, aggkit must re-process PAST the claim block —
+# meaning it parsed the derived-hash calldata and PERSISTED the claim (on the pre-fix
+# build it wedges at ${CLAIM_BLOCK} on 'input too short' and never advances).
+wait_for "aggkit L2BridgeSyncer re-processed PAST claim block ${CLAIM_BLOCK}" \
     "docker logs --since $AGGKIT_START $AGGKIT_CONTAINER 2>&1 | strip_ansi | grep -oE 'L2BridgeSyncer.*block[ =:]+[0-9]+' | grep -oE '[0-9]+$' | sort -n | tail -1 | awk '{exit !(\$1 > ${CLAIM_BLOCK})}'" \
     "$AGGKIT_SYNC_TIMEOUT" 10
 
-# (b) ZERO calldata-parse failures — the exact soak wedge signature.
+# (b2) Best-effort bridgesync DB probe (extra positive persist evidence when the aggkit
+# image ships sqlite3): the claim's global_index must appear in a bridgesync table. Skips
+# with a note if the DB/tooling layout differs — the fetch + re-sync gates above are the
+# hard proof.
+GI_DEC=$(cast to-dec "0x${GI_HEX}" 2>/dev/null || echo "")
+DBF=$(docker exec "$AGGKIT_CONTAINER" sh -c 'ls /tmp/*.sqlite* /tmp/*bridge*l2* 2>/dev/null | head -1' 2>/dev/null || true)
+if [[ -n "$DBF" ]] && docker exec "$AGGKIT_CONTAINER" sh -c 'command -v sqlite3' >/dev/null 2>&1 && [[ -n "$GI_DEC" ]]; then
+    HITS=$(docker exec "$AGGKIT_CONTAINER" sh -c \
+        "sqlite3 '$DBF' \"SELECT count(*) FROM claim WHERE global_index='$GI_DEC';\"" 2>/dev/null || echo "0")
+    if [[ "${HITS:-0}" -ge 1 ]]; then
+        pass "bridgesync DB persisted the claim (global_index=$GI_DEC present in $DBF)"
+    else
+        warn "bridgesync DB probe found no claim row for global_index=$GI_DEC in $DBF (schema may differ); relying on the fetch + re-sync gates"
+    fi
+else
+    warn "bridgesync DB probe skipped (no sqlite3/db in aggkit image); fetch + re-sync gates are the hard proof"
+fi
+
+# (c) ZERO calldata-parse failures — now MEANINGFUL because aggkit genuinely re-parsed.
 if docker logs --since "$AGGKIT_START" "$AGGKIT_CONTAINER" 2>&1 | strip_ansi \
     | grep -q "input too short"; then
     fail "aggkit logged 'input too short' — a claim tx still serves unparsable calldata"
 fi
-pass "aggkit synced past block ${CLAIM_BLOCK} with zero claim-calldata parse errors"
+pass "aggkit re-synced past block ${CLAIM_BLOCK} (claim persisted) with zero parse errors"
 
 # (c) certificate pipeline alive THROUGH the recovered claim's window. A settled cert
 # needs something to certify: with no new bridge activity aggsender (correctly) builds

@@ -25,23 +25,15 @@ ts() { TZ=${TZ_DISPLAY:-Europe/Berlin} date '+%H:%M:%S'; }
 step() { echo "[$(ts)] ════ $* ════"; }
 fail() { echo "[$(ts)] ACCEPTANCE FAIL: $*"; exit 1; }
 
-# Provenance model: this script MUST run from the release-tag checkout — the bringup's
-# `up -d --build` then builds the proxy image from tag sources by construction. Image-ID
-# equality vs a pre-built tag is NOT checkable (a cache-mounted cargo RUN step makes IDs
-# non-deterministic across builds); instead assert the running image was built IN THIS
-# RUN (fresh, not a cache-stale leftover) and re-point $RELEASE_IMAGE at it.
-RUN_START=$(date -u +%s)
-step "fresh bringup from the release checkout ($(git -C . describe --tags --always 2>/dev/null))"
+docker image inspect "$RELEASE_IMAGE" >/dev/null 2>&1 || fail "image $RELEASE_IMAGE not present"
+docker tag "$RELEASE_IMAGE" miden-agglayer-e2e:latest
+
+step "fresh bringup on $RELEASE_IMAGE"
 make e2e-l2l2-up > "$OUT/up.log" 2>&1 || fail "bringup (see $OUT/up.log)"
-RUNNING_ID=$(docker inspect "${PROJECT}-miden-agglayer-1" --format '{{.Image}}')
-[ "$RUNNING_ID" = "$(docker image inspect miden-agglayer-e2e:latest --format '{{.Id}}')" ] \
-    || fail "running proxy is not the image this run built"
-# NOTE: no freshness check — a full cache hit to a previous build of this same
-# immutable tag checkout is the SAME code (that is what caches are for). The
-# stale-image trap this script guards against is worktree-source drift, which an
-# immutable tag context rules out by construction.
-docker tag "$RUNNING_ID" "$RELEASE_IMAGE"
-echo "[$(ts)] image verified: built this run from the release checkout; tagged $RELEASE_IMAGE"
+docker inspect "${PROJECT}-miden-agglayer-1" --format '{{.Image}}' | grep -q \
+    "$(docker image inspect "$RELEASE_IMAGE" --format '{{.Id}}')" \
+    || fail "running proxy is not $RELEASE_IMAGE (stale image trap)"
+echo "[$(ts)] image verified: $RELEASE_IMAGE"
 
 step "monitors up (completeness watcher + immutability)"
 INTERVAL=10 MARGIN=2 ./scripts/monitoring/watch-completeness.sh > "$OUT/watch.output" 2>&1 &
