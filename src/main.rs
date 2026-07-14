@@ -385,17 +385,30 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
     // posture, NOT a startup abort. `url::Url` is exactly what alloy's
     // `connect_http` parses the string into, so "parses here" ⟺ "spawn won't
     // reject the URL".
-    if let Some(rpc) = command.l1_rpc_url.as_deref()
-        && rpc.parse::<Url>().is_err()
-    {
-        return Err(format!(
-            "strict H6 GER corroboration is enabled via {trigger}, but --l1-rpc-url \
-             `{rpc}` is not a valid URL. The L1 InfoTree indexer parses this string at \
-             spawn and would fail to start, leaving strict mode with no evidence source — \
-             every new GER injection would be rejected (fail-closed outage). This is a \
-             malformed-config error (distinct from a valid-but-currently-unreachable RPC, \
-             which stays fail-closed and retries): fix the URL before boot."
-        ));
+    if let Some(rpc) = command.l1_rpc_url.as_deref() {
+        // `Url::parse` alone is too weak: it accepts `file:///…`, `ws://…`,
+        // hostless URLs, and custom schemes (the common `anvil:8545` typo parses
+        // as scheme=`anvil`). `connect_http` does NOT reject those synchronously
+        // at spawn — the indexer starts and then retries failed HTTP posts
+        // forever while strict mode refuses every fresh GER. So require an
+        // http(s) scheme AND a host. A syntactically valid but currently
+        // UNREACHABLE http(s) endpoint still passes (it spawns and retries — the
+        // intended fail-closed posture).
+        let usable_http = rpc.parse::<Url>().ok().is_some_and(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str().is_some_and(|h| !h.is_empty())
+        });
+        if !usable_http {
+            return Err(format!(
+                "strict H6 GER corroboration is enabled via {trigger}, but --l1-rpc-url \
+                 `{rpc}` is not a usable HTTP(S) RPC endpoint: it must have an `http` or \
+                 `https` scheme AND a host (rejected examples: `file:///…`, `ws://…`, a \
+                 hostless URL, or the `anvil:8545` custom-scheme typo). The L1 InfoTree \
+                 indexer would start against it and retry failed HTTP posts forever while \
+                 strict mode refuses every fresh GER — a fail-closed outage. A valid but \
+                 temporarily-unreachable http(s) endpoint is fine; fix the URL before boot."
+            ));
+        }
     }
     Ok(())
 }
@@ -1520,9 +1533,38 @@ mod hardening_tests {
             "must name the offending flag: {reason}"
         );
         assert!(
-            reason.contains("not a valid URL"),
-            "must cite the URL parse failure: {reason}"
+            reason.contains("HTTP(S)"),
+            "must cite the HTTP(S) requirement: {reason}"
         );
+    }
+
+    /// Non-HTTP schemes that `Url::parse` accepts but `connect_http` can never
+    /// use must abort strict startup (else the indexer retries forever while
+    /// every fresh GER is refused).
+    #[test]
+    fn h6_strict_with_non_http_scheme_refused_at_startup() {
+        for bad in ["file:///tmp/rpc", "ws://anvil:8545", "wss://l1:8546"] {
+            let c = strict_cmd_with_rpc(bad);
+            let reason = check_h6_evidence_source(&c).expect_err(bad);
+            assert!(
+                reason.contains("--l1-rpc-url") && reason.contains("HTTP(S)"),
+                "`{bad}` must be refused as non-HTTP(S): {reason}"
+            );
+        }
+    }
+
+    /// Hostless / custom-scheme values (notably the common `anvil:8545` typo,
+    /// which parses as scheme=`anvil` with no host) must abort strict startup.
+    #[test]
+    fn h6_strict_with_hostless_or_custom_scheme_refused_at_startup() {
+        for bad in ["anvil:8545", "http:///onlypath", "https://"] {
+            let c = strict_cmd_with_rpc(bad);
+            let reason = check_h6_evidence_source(&c).expect_err(bad);
+            assert!(
+                reason.contains("--l1-rpc-url") && reason.contains("HTTP(S)"),
+                "`{bad}` must be refused (no usable host/scheme): {reason}"
+            );
+        }
     }
 
     /// A syntactically-VALID but (in this environment) UNREACHABLE L1 RPC does
