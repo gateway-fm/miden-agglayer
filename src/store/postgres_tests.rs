@@ -152,6 +152,7 @@ async fn test_pgstore_ger_lifecycle() {
         rollup_exit_root: Some([0x02; 32]),
         block_number: 100,
         timestamp: 1234567890,
+        finalized_verified: false,
     };
 
     // Initially not seen
@@ -624,6 +625,105 @@ async fn test_pgstore_l1_finalized_block_roundtrip() {
     store.set_l1_indexer_cursor(99).await.unwrap();
     assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
     assert_eq!(store.get_l1_indexer_cursor().await.unwrap(), 99);
+    // And of the finalized-scan cursor (migration 012).
+    store.set_l1_finalized_scan_cursor(50).await.unwrap();
+    assert_eq!(store.get_l1_finalized_scan_cursor().await.unwrap(), 50);
+    assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
+}
+
+/// BLOCKER 1 (re-review) — `mark_ger_finalized` sets the finalized-chain tie
+/// flag (migration 012), and `set_ger_exit_roots` (the latest scan) never resets
+/// it (monotone). PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_mark_ger_finalized_monotone() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let ger = [0x3Au8; 32];
+    store
+        .set_ger_exit_roots(&ger, [0x01u8; 32], [0x02u8; 32], 100, 1_700_000_000)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .get_ger_entry(&ger)
+            .await
+            .unwrap()
+            .unwrap()
+            .finalized_verified,
+        "latest scan leaves finalized_verified false"
+    );
+
+    store.mark_ger_finalized(&ger).await.unwrap();
+    assert!(
+        store
+            .get_ger_entry(&ger)
+            .await
+            .unwrap()
+            .unwrap()
+            .finalized_verified,
+        "mark_ger_finalized sets the flag"
+    );
+
+    // A later latest-scan re-observation must NOT reset the flag (monotone).
+    store
+        .set_ger_exit_roots(&ger, [0x01u8; 32], [0x02u8; 32], 100, 1_700_000_050)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_ger_entry(&ger)
+            .await
+            .unwrap()
+            .unwrap()
+            .finalized_verified,
+        "set_ger_exit_roots must preserve finalized_verified"
+    );
+}
+
+/// BLOCKER 2 (re-review) — a PROVISIONAL TTL-expiry is served as null (NOT
+/// terminal 0x0), and a real later landing supersedes it to success — so no
+/// observable `0x0 → 0x1` flip. A genuine `txn_commit(Err)` remains observable
+/// 0x0. PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_ttl_expiry_is_provisional_then_superseded() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    // Provisional path.
+    let a = TxHash::from([0x6Au8; 32]);
+    store.txn_begin(a, dummy_txn_entry()).await.unwrap();
+    store
+        .txn_commit_ttl_expired(a, "TTL expired".into(), 3, [0u8; 32])
+        .await
+        .unwrap();
+    assert!(
+        store.txn_receipt(a).await.unwrap().is_none(),
+        "a provisional TTL-expiry must read as null, not terminal 0x0"
+    );
+    store.txn_commit(a, Ok(()), 5, [0u8; 32]).await.unwrap();
+    let (res, _) = store.txn_receipt(a).await.unwrap().unwrap();
+    assert!(
+        res.is_ok(),
+        "a real landing must supersede the provisional expiry"
+    );
+
+    // Genuine worker failure remains observable 0x0.
+    let b = TxHash::from([0x6Bu8; 32]);
+    store.txn_begin(b, dummy_txn_entry()).await.unwrap();
+    store
+        .txn_commit(b, Err("boom".into()), 3, [0u8; 32])
+        .await
+        .unwrap();
+    let (res, _) = store.txn_receipt(b).await.unwrap().unwrap();
+    assert!(
+        res.is_err(),
+        "a genuine worker failure must be observable status 0x0"
+    );
 }
 
 // ── Nonces ───────────────────────────────────────────────────

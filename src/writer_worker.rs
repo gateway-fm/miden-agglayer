@@ -619,9 +619,11 @@ impl WriterWorker {
                         *hash,
                         &reason,
                         inflight_envelope,
-                        // BLOCKER 1 — the sweeper runs CONCURRENTLY with a live
-                        // submit/handoff; it must NOT seed a competing row.
-                        false,
+                        // BLOCKER 1 — must NOT seed a competing row (runs
+                        // concurrently with a live submit/handoff). BLOCKER 2 —
+                        // writes a PROVISIONAL expiry (served as null), never an
+                        // observable terminal 0x0 that a later landing would flip.
+                        FailureMode::SweeperProvisional,
                     )
                     .await
                     {
@@ -629,16 +631,16 @@ impl WriterWorker {
                             target: "writer_worker::ttl",
                             %hash,
                             err = format!("{e:#}"),
-                            "TTL expiry: store.txn_commit(Err) failed; \
-                             eth_getTransactionReceipt may still return null. \
-                             Next sweeper tick will retry."
+                            "TTL expiry: provisional-expiry write failed; \
+                             next sweeper tick will retry."
                         );
                     } else {
                         tracing::warn!(
                             target: "writer_worker::ttl",
                             %hash,
-                            "TTL expiry: wrote failure receipt (status:0x0). \
-                             Caller must re-submit with a fresh nonce."
+                            "TTL expiry: wrote PROVISIONAL expiry (served as null, NOT terminal \
+                             0x0). A real later landing still supersedes it to success — no \
+                             observable 0x0→0x1 flip."
                         );
                         ::metrics::counter!(
                             "agglayer_writer_job_failures_total",
@@ -803,8 +805,14 @@ impl WriterWorker {
                     // The worker owns this job here (dispatch_job has returned,
                     // so no live handoff is concurrent) — seeding a missing row
                     // is race-free, so allow it.
-                    write_failure_receipt(&self.service, hash, &err, inflight_envelope, true)
-                            .await
+                    write_failure_receipt(
+                        &self.service,
+                        hash,
+                        &err,
+                        inflight_envelope,
+                        FailureMode::WorkerTerminal,
+                    )
+                    .await
                 {
                     tracing::error!(
                         target: "writer_worker",
@@ -881,31 +889,40 @@ async fn dispatch_job(service: &ServiceState, job: WriteJob) -> anyhow::Result<(
     }
 }
 
-/// Best-effort failure receipt writer. Records a pending tx row (if one
-/// doesn't already exist, e.g. because the failure happened before
-/// `record_local_pending_tx` ran), then `txn_commit` with `Err`. The
-/// downstream effect is that `eth_getTransactionReceipt(hash)` transitions
-/// from JSON `null` (not-yet-mined) to `status:0x0` (failed) — the contract
-/// aggkit's ethtxmanager needs to move the tx out of its retry loop.
+/// Who is writing the failure receipt — determines both seed ownership
+/// (BLOCKER 1) and observability (BLOCKER 2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureMode {
+    /// The worker's own terminal-failure path (`dispatch_job` returned Err).
+    /// Runs AFTER dispatch returned, so no live handoff is concurrent → may seed
+    /// a missing row, and writes a TERMINAL failure (observable status 0x0).
+    WorkerTerminal,
+    /// The TTL sweeper, running CONCURRENTLY with a possibly-in-flight submit.
+    /// Must NOT seed a competing row (BLOCKER 1), and writes only a PROVISIONAL,
+    /// non-observable-terminal expiry (BLOCKER 2) that a real landing supersedes.
+    SweeperProvisional,
+}
+
+/// Best-effort failure-receipt writer.
 ///
-/// `allow_seed` gates whether a MISSING receipt row may be seeded here
-/// (BLOCKER 1, re-review). Only the OWNER of a job may seed — the worker's own
-/// terminal-failure path (`allow_seed = true`), which runs AFTER `dispatch_job`
-/// has returned, so no live submit/handoff is concurrent. The TTL sweeper runs
-/// CONCURRENTLY with an in-flight submit and passes `allow_seed = false`: it
-/// must NOT seed a competing row, because the live claim/GER handoff creates the
-/// receipt row and the tx↔note link together, and a sweeper seed interleaving
-/// there would steal the row (making the live `txn_begin` fail and the
-/// `record_tx_note_link` never run — the projector could then never finalise the
-/// receipt under the real tx hash). With no row and `allow_seed = false` the
-/// sweeper defers: the live handoff (or the worker's own failure path) creates
-/// the row, and a real Miden landing then wins via success-always-wins.
+/// BLOCKER 1 (seed ownership): only `WorkerTerminal` may seed a MISSING receipt
+/// row — it runs after `dispatch_job` returned, so no live claim/GER handoff
+/// (which creates the row + the tx↔note link together) is concurrent.
+/// `SweeperProvisional` runs concurrently with an in-flight submit and must NOT
+/// seed: a seed would steal the row, making the live `txn_begin` fail and the
+/// link never record. With no row it defers.
+///
+/// BLOCKER 2 (observability): `WorkerTerminal` writes a TERMINAL failure
+/// (`txn_commit(Err)` → observable 0x0). `SweeperProvisional` writes a
+/// PROVISIONAL expiry (`txn_commit_ttl_expired` → served as null), so a client
+/// never observes a terminal `0x0 → 0x1` flip: a real later landing supersedes
+/// the provisional expiry to success before it was ever observable-terminal.
 async fn write_failure_receipt(
     service: &ServiceState,
     hash: TxHash,
     err: &anyhow::Error,
     inflight_envelope: Option<(TxEnvelope, Address)>,
-    allow_seed: bool,
+    mode: FailureMode,
 ) -> anyhow::Result<()> {
     let reason = format!("writer_worker: {err:#}");
 
@@ -916,13 +933,12 @@ async fn write_failure_receipt(
     let block_hash = service.block_state.get_block_hash(block_num);
 
     if service.store.txn_get(hash).await?.is_none() {
-        // No receipt row yet. Seed one ONLY if this path owns the job (see the
-        // `allow_seed` contract above); otherwise defer so the live handoff's
-        // txn_begin + note↔tx link are not raced/stolen.
+        // No receipt row yet. Seed one ONLY if this path owns the job; otherwise
+        // defer so the live handoff's txn_begin + note↔tx link are not raced.
+        let allow_seed = mode == FailureMode::WorkerTerminal;
         let Some((envelope, signer)) = inflight_envelope.filter(|_| allow_seed) else {
             tracing::debug!(
                 %hash,
-                allow_seed,
                 "failure receipt deferred: no row yet and seeding is not owned by this path \
                  (the live handoff owns row creation)"
             );
@@ -930,9 +946,7 @@ async fn write_failure_receipt(
         };
         // Best-effort seed: txn_begin is an INSERT and errors on an existing row.
         // If a concurrent task won the race and already seeded the row, ignore
-        // the duplicate — the row now exists, so the txn_commit below finalises
-        // it. Propagating the error here would return early WITHOUT writing the
-        // receipt even though the row is present.
+        // the duplicate — the row now exists, so the commit below finalises it.
         if let Err(e) = service
             .store
             .txn_begin(
@@ -950,10 +964,20 @@ async fn write_failure_receipt(
             tracing::debug!(%hash, error = %e, "failure-receipt seed lost the txn_begin race (row already exists); finalising the existing row");
         }
     }
-    service
-        .store
-        .txn_commit(hash, Err(reason), block_num, block_hash)
-        .await
+    match mode {
+        FailureMode::WorkerTerminal => {
+            service
+                .store
+                .txn_commit(hash, Err(reason), block_num, block_hash)
+                .await
+        }
+        FailureMode::SweeperProvisional => {
+            service
+                .store
+                .txn_commit_ttl_expired(hash, reason, block_num, block_hash)
+                .await
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1010,7 +1034,7 @@ mod tests {
             hash,
             &anyhow::anyhow!("indexer-lag rejection"),
             Some((envelope, signer)),
-            true, // worker-owned failure path may seed a missing row
+            FailureMode::WorkerTerminal,
         )
         .await
         .expect("failure receipt must be writable without a prior txn_begin");
@@ -1067,7 +1091,7 @@ mod tests {
             hash,
             &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
             Some((envelope, signer)),
-            false, // sweeper path
+            FailureMode::SweeperProvisional,
         )
         .await
         .expect("failure-receipt write must succeed as a no-op, not error");
@@ -1121,17 +1145,24 @@ mod tests {
             .await
             .unwrap();
 
-        // TTL sweeper fails the still-running job (the real sweeper call path,
-        // allow_seed = false — the row already exists here).
+        // TTL sweeper fails the still-running job (the real sweeper call path).
         write_failure_receipt(
             &service,
             hash,
             &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
             Some((envelope, signer)),
-            false,
+            FailureMode::SweeperProvisional,
         )
         .await
         .unwrap();
+
+        // BLOCKER 2 — the provisional expiry must NOT be observable as terminal:
+        // a receipt poll here returns null (None), NOT status 0x0. So a client
+        // can never see a terminal 0x0 that the landing below then flips to 0x1.
+        assert!(
+            store.txn_receipt(hash).await.unwrap().is_none(),
+            "a TTL-expired-but-still-live receipt must read as null, NOT terminal 0x0"
+        );
 
         // Miden lands → the projector finalises the SAME pending row as success.
         store
@@ -1176,7 +1207,7 @@ mod tests {
             hash,
             &anyhow::anyhow!("TTL expired (>300s in non-terminal state)"),
             Some((envelope.clone(), signer)),
-            false,
+            FailureMode::SweeperProvisional,
         )
         .await
         .expect("sweeper deferral must be Ok");
@@ -1233,7 +1264,7 @@ mod tests {
             hash,
             &anyhow::anyhow!("miden submission failed pre-handoff"),
             Some((envelope, signer)),
-            true,
+            FailureMode::WorkerTerminal,
         )
         .await
         .expect("worker-owned seed must write a real failure receipt");

@@ -34,60 +34,88 @@ alloy_core::sol! {
 /// epochs / 64 slots).
 pub const DEFAULT_CONFIRMATIONS: u64 = 64;
 
-/// How the strict-H6 gate qualifies an L1 observation as final enough to
-/// authorize an irreversible GER injection (audit H6, re-review BLOCKER 3).
-/// Normal decomposition (`zkevm_getExitRootsByGER`) never consults this — it
-/// reads the evidence row directly, so ordinary bridge readiness is unaffected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// The SINGLE strict-H6 evidence-finality setting (audit H6). One value fully
+/// specifies how the gate qualifies an L1 observation as final enough to
+/// authorize an irreversible GER injection — there is no second finality knob.
+/// Parsed from `--l1-evidence-tag` / `L1_EVIDENCE_TAG`:
+///   - `confirmations:<N>` — depth-below-head: the observation must be `N` blocks
+///     below the indexer's head cursor (strict-non-hardened only).
+///   - `finalized`         — the observation's `(mainnet, rollup)` must be on the
+///     L1 FINALIZED canonical chain (BLOCKER 1 finalized-chain tie). MANDATORY
+///     under `--require-hardening`.
+///   - `safe`              — same, against the L1 `safe` block (weaker; not
+///     sufficient for hardened).
+///
+/// Normal (lenient) decomposition (`zkevm_getExitRootsByGER`) never consults
+/// this — it reads the evidence row directly, so bridge readiness is unaffected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvidenceTag {
-    /// Depth-based: the observation must be `l1_confirmations` blocks below the
-    /// indexer's head cursor. The configurable option for strict-but-NOT-hardened
-    /// deployments; NOT permitted under `--require-hardening`.
-    #[default]
-    Confirmations,
-    /// The observation's L1 block must be at or below the L1 `finalized` block.
-    /// MANDATORY under `--require-hardening` — a finalized block cannot be
-    /// reorged, so this is the strongest evidence qualification.
+    /// Depth `N` below the indexer head cursor.
+    Confirmations(u64),
+    /// On the L1 finalized canonical chain.
     Finalized,
-    /// The observation's L1 block must be at or below the L1 `safe` block
-    /// (justified but not yet finalized — weaker than `finalized`). Allowed for
-    /// strict-non-hardened; NOT sufficient for hardened.
+    /// On the L1 safe canonical chain.
     Safe,
+}
+
+impl Default for EvidenceTag {
+    fn default() -> Self {
+        Self::Confirmations(DEFAULT_CONFIRMATIONS)
+    }
 }
 
 impl EvidenceTag {
     /// True for the L1 finality-tag modes (`finalized` / `safe`), which qualify
-    /// evidence against a separately-tracked finality block rather than a
+    /// evidence against the finalized/safe canonical chain rather than a
     /// confirmation depth below head.
     pub fn is_finality_tag(self) -> bool {
         matches!(self, Self::Finalized | Self::Safe)
     }
 
-    pub fn as_str(self) -> &'static str {
+    /// The confirmation depth in `confirmations:<N>` mode, else `None`.
+    pub fn confirmations(self) -> Option<u64> {
         match self {
-            Self::Confirmations => "confirmations",
-            Self::Finalized => "finalized",
-            Self::Safe => "safe",
+            Self::Confirmations(n) => Some(n),
+            _ => None,
         }
     }
 
-    /// Parse a CLI/env value; `None` on an unrecognised token.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "confirmations" | "depth" | "confirmation" => Some(Self::Confirmations),
-            "finalized" | "finalised" => Some(Self::Finalized),
-            "safe" => Some(Self::Safe),
-            _ => None,
+    /// Human/log form, round-trippable through `parse`.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Confirmations(n) => format!("confirmations:{n}"),
+            Self::Finalized => "finalized".to_string(),
+            Self::Safe => "safe".to_string(),
         }
+    }
+
+    /// Parse the single CLI/env value. Accepts `finalized`, `safe`,
+    /// `confirmations:<N>`, and bare `confirmations` (→ `DEFAULT_CONFIRMATIONS`).
+    /// `None` on an unrecognised token or a malformed depth.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "finalized" | "finalised" => return Some(Self::Finalized),
+            "safe" => return Some(Self::Safe),
+            "confirmations" | "confirmation" | "depth" => {
+                return Some(Self::Confirmations(DEFAULT_CONFIRMATIONS));
+            }
+            _ => {}
+        }
+        // `confirmations:<N>` (also accept `depth:<N>`).
+        let rest = s
+            .strip_prefix("confirmations:")
+            .or_else(|| s.strip_prefix("depth:"))?;
+        rest.trim().parse::<u64>().ok().map(Self::Confirmations)
     }
 }
 
 /// Minimum confirmation depth strict H6 will boot with. Zero would authorize an
 /// irreversible injection from a 0-confirmation (freely reorg-able) observation,
 /// defeating the finality guarantee — so strict mode refuses to start with
-/// `L1_INDEXER_CONFIRMATIONS < MIN_STRICT_CONFIRMATIONS` (see
+/// `confirmations:<N>` where `N < MIN_STRICT_CONFIRMATIONS` (see
 /// `check_h6_evidence_source`). Production should use `DEFAULT_CONFIRMATIONS` or
-/// higher; the floor merely forbids the outright-unsafe zero.
+/// higher, or `finalized`; the floor merely forbids the outright-unsafe zero.
 pub const MIN_STRICT_CONFIRMATIONS: u64 = 1;
 
 /// Compute the combined GER from mainnet and rollup exit roots.
@@ -311,7 +339,6 @@ pub async fn insert_ger(
     txn_hash: TxHash,
     require_l1_observed: bool,
     evidence_tag: EvidenceTag,
-    confirmations: u64,
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<bool> {
@@ -325,7 +352,6 @@ pub async fn insert_ger(
         &ger_bytes,
         require_l1_observed,
         evidence_tag,
-        confirmations,
         txn_hash,
     )
     .await?;
@@ -464,7 +490,6 @@ pub async fn ensure_ger_l1_observed(
     ger_bytes: &[u8; 32],
     require_l1_observed: bool,
     evidence_tag: EvidenceTag,
-    confirmations: u64,
     txn_hash: TxHash,
 ) -> anyhow::Result<()> {
     // Dedup precedence — duplicates never reach Miden; see doc above.
@@ -481,31 +506,30 @@ pub async fn ensure_ger_l1_observed(
     // ordinary decomposition / bridge readiness (`zkevm_getExitRootsByGER`, which
     // reads `get_ger_entry` directly and does NOT call this gate) is never
     // delayed. Only strict authorization of an IRREVERSIBLE injection
-    // additionally requires the observation to be final by the configured
-    // `evidence_tag` (BLOCKER 3):
-    //   - Confirmations: `l1_head - evidence_block >= confirmations`, using the
-    //     indexer's persisted head cursor (strict-non-hardened only).
-    //   - Finalized / Safe: `evidence_block <= l1_finalized_block`, where the
-    //     indexer separately tracks the L1 `finalized`/`safe` block (MANDATORY
-    //     under --require-hardening: a finalized block cannot be reorged).
-    // An evidence row with NO recorded L1 block (`block_number == 0`: a
-    // legacy/pre-guard row, or one seeded by a non-indexer write path) is treated
-    // as NOT final — fail-closed — closing the upgrade-state gap. Likewise a
-    // finality-tag mode with no finality block recorded yet fails closed. Lenient
-    // mode never gates on finality.
+    // additionally requires the observation to be final per the SINGLE
+    // `evidence_tag` setting:
+    //   - Confirmations(N): `l1_head - evidence_block >= N`, using the indexer's
+    //     persisted head cursor (strict-non-hardened only). An evidence row with
+    //     NO recorded L1 block (`block_number == 0`: a legacy/pre-guard row, or
+    //     one seeded by a non-indexer write path) is NOT final — fail-closed —
+    //     which closes the upgrade-state gap.
+    //   - Finalized / Safe (BLOCKER 1 finalized-chain tie): the row must be
+    //     `finalized_verified` — a flag the indexer sets ONLY from a scan pinned
+    //     to the L1 finalized/safe canonical chain. A `latest`-observed row from
+    //     a fork that was later reorged away is never `finalized_verified`, so a
+    //     block-height coincidence (`block <= finalized`) can no longer
+    //     authorize it. MANDATORY under `--require-hardening`.
+    // Lenient mode never gates on finality.
     let final_enough = if require_l1_observed {
         match entry.as_ref() {
-            Some(e) if e.block_number > 0 => match evidence_tag {
-                EvidenceTag::Confirmations => {
+            Some(e) => match evidence_tag {
+                EvidenceTag::Confirmations(depth) => {
                     let l1_head = store.get_l1_indexer_cursor().await.unwrap_or(0);
-                    l1_head.saturating_sub(e.block_number) >= confirmations
+                    e.block_number > 0 && l1_head.saturating_sub(e.block_number) >= depth
                 }
-                EvidenceTag::Finalized | EvidenceTag::Safe => {
-                    let finality_block = store.get_l1_finalized_block().await.unwrap_or(0);
-                    finality_block > 0 && e.block_number <= finality_block
-                }
+                EvidenceTag::Finalized | EvidenceTag::Safe => e.finalized_verified,
             },
-            _ => false,
+            None => false,
         }
     } else {
         true
@@ -521,12 +545,12 @@ pub async fn ensure_ger_l1_observed(
             // e2e / callers match; "not yet" for the not-final case.)
             if roots_observed {
                 anyhow::bail!(
-                    "GER {} was observed on L1 but is not yet final by the `{}` evidence tag \
-                     (finality guard, audit H6); refusing injection under \
+                    "GER {} was observed on L1 but is not yet final per the `{}` evidence \
+                     setting (finality guard, audit H6); refusing injection under \
                      --reject-unverified-ger-injection. Transient — retry once the L1 \
                      observation finalizes.",
                     hex::encode(ger_bytes),
-                    evidence_tag.as_str(),
+                    evidence_tag.describe(),
                 );
             }
             anyhow::bail!(
@@ -540,7 +564,7 @@ pub async fn ensure_ger_l1_observed(
             ger = %hex::encode(ger_bytes),
             tx = %txn_hash,
             roots_observed,
-            evidence_tag = evidence_tag.as_str(),
+            evidence_tag = %evidence_tag.describe(),
             "GER injection not yet corroborated/finalized by the L1 InfoTree indexer; \
              allowing through but unverified (lenient mode)"
         );
@@ -634,8 +658,7 @@ mod tests {
             &store,
             tx_hash,
             true, // require_l1_observed
-            EvidenceTag::Confirmations,
-            0, // confirmations (irrelevant: no roots observed)
+            EvidenceTag::Confirmations(0),
             env.clone(),
             signer,
         )
@@ -659,8 +682,7 @@ mod tests {
             &store,
             tx_hash,
             false, // lenient
-            EvidenceTag::Confirmations,
-            0, // confirmations (lenient never gates on finality)
+            EvidenceTag::Confirmations(0),
             env,
             signer,
         )
@@ -706,8 +728,7 @@ mod tests {
             &store,
             tx_hash,
             true,
-            EvidenceTag::Confirmations,
-            0, // confirmations (dedup precedence returns before the finality check)
+            EvidenceTag::Confirmations(0),
             env,
             signer,
         )
@@ -750,8 +771,7 @@ mod tests {
             &store,
             tx_hash,
             true,
-            EvidenceTag::Confirmations,
-            0, // confirmations (finality asserted separately below)
+            EvidenceTag::Confirmations(0),
             env,
             signer,
         )
@@ -791,8 +811,7 @@ mod tests {
             &store,
             &ger,
             true,
-            EvidenceTag::Confirmations,
-            DEFAULT_CONFIRMATIONS,
+            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
             tx_hash,
         )
         .await
@@ -810,8 +829,7 @@ mod tests {
             &store,
             &ger,
             true,
-            EvidenceTag::Confirmations,
-            DEFAULT_CONFIRMATIONS,
+            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
             tx_hash,
         )
         .await
@@ -840,6 +858,7 @@ mod tests {
                     rollup_exit_root: Some([0x02u8; 32]),
                     block_number: 0,
                     timestamp: 0,
+                    finalized_verified: false,
                 },
             )
             .await
@@ -851,8 +870,7 @@ mod tests {
             &store,
             &ger,
             true,
-            EvidenceTag::Confirmations,
-            DEFAULT_CONFIRMATIONS,
+            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
             tx_hash,
         )
         .await
@@ -866,55 +884,77 @@ mod tests {
             &store,
             &ger,
             false,
-            EvidenceTag::Confirmations,
-            DEFAULT_CONFIRMATIONS,
+            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
             tx_hash,
         )
         .await
         .expect("lenient mode must not refuse a block-less row");
     }
 
-    /// Audit H6 (BLOCKER 3) — the `finalized` evidence tag qualifies an
-    /// observation by the separately-tracked L1 finalized block, NOT by
-    /// confirmation depth: a resolved row authorizes iff `evidence_block <=
-    /// finalized_block`. With no finalized block yet (0), or one below the
-    /// evidence block, it fail-closes; once the finalized block reaches the
-    /// evidence block it authorizes. The head cursor is irrelevant in this mode.
+    /// Audit H6 BLOCKER 1 (re-review) — the `finalized` evidence tag qualifies an
+    /// observation by the FINALIZED-CHAIN TIE (`finalized_verified`), NOT by a
+    /// block-height coincidence. A `latest`-observed row (roots present, block
+    /// recorded) that the finalized-pinned scan never confirmed — e.g. a row from
+    /// a fork later reorged away — must NOT authorize even with a huge head
+    /// cursor / finalized block. Only after `mark_ger_finalized` (which the
+    /// indexer runs solely from the finalized canonical chain) does it authorize.
     ///
-    /// Mutation check: dropping the `evidence_block <= finality_block` clause
-    /// (always final) makes the not-yet-finalized case wrongly authorize.
+    /// Mutation check: making the gate authorize on block-height instead of
+    /// `finalized_verified` (drop the flag requirement) makes the reorged-fork
+    /// row wrongly authorize.
     #[tokio::test]
-    async fn h6_finalized_tag_gate_requires_finalized_block() {
+    async fn h6_finalized_tag_gate_requires_finalized_chain_tie() {
         let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
         let ger = combined_ger(&[0x1Au8; 32], &[0x1Bu8; 32]);
         let tx_hash = TxHash::from([0x46u8; 32]);
-        // Observed at L1 block 100. Head cursor set high to prove it's ignored
-        // in finalized mode (a depth check would wrongly pass).
+        // A `latest`-observed row: roots present, block 100. Set the head cursor
+        // AND finalized block far above it, so a height-only check would pass.
         store
             .set_ger_exit_roots(&ger, [0x1Au8; 32], [0x1Bu8; 32], 100, 1_700_000_000)
             .await
             .unwrap();
         store.set_l1_indexer_cursor(10_000).await.unwrap();
+        store.set_l1_finalized_block(10_000).await.unwrap();
 
-        // No finalized block yet → fail-closed.
-        let err = ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, 0, tx_hash)
+        // NOT finalized-verified (the finalized scan never covered it, e.g. a
+        // reorged fork) → refused despite the height coincidence.
+        let err = ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, tx_hash)
             .await
-            .expect_err("finalized mode with no finalized block must refuse");
+            .expect_err("a non-finalized-verified row must be refused in finalized mode");
         assert!(
             err.to_string().contains("not yet"),
             "finality-guard refusal: {err}"
         );
 
-        // Finalized block below the evidence block → still not final.
-        store.set_l1_finalized_block(90).await.unwrap();
-        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, 0, tx_hash)
+        // The finalized-pinned scan confirms it on the canonical chain.
+        store.mark_ger_finalized(&ger).await.unwrap();
+        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, tx_hash)
             .await
-            .expect_err("evidence above the finalized block must refuse");
+            .expect("a finalized-chain-verified observation must pass the strict gate");
+    }
 
-        // Finalized block reaches/passes the evidence block → authorized.
-        store.set_l1_finalized_block(120).await.unwrap();
-        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, 0, tx_hash)
+    /// Audit H6 — confirmation-depth mode still works under the SINGLE setting:
+    /// `Confirmations(N)` authorizes iff `head_cursor - block >= N`, and the
+    /// `finalized_verified` flag is irrelevant in this mode.
+    #[tokio::test]
+    async fn h6_confirmations_mode_under_single_setting() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let ger = combined_ger(&[0x2Au8; 32], &[0x2Bu8; 32]);
+        let tx_hash = TxHash::from([0x47u8; 32]);
+        store
+            .set_ger_exit_roots(&ger, [0x2Au8; 32], [0x2Bu8; 32], 100, 1_700_000_000)
             .await
-            .expect("a finalized observation must pass the strict gate");
+            .unwrap();
+
+        // 40 deep < 64 → refused.
+        store.set_l1_indexer_cursor(140).await.unwrap();
+        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Confirmations(64), tx_hash)
+            .await
+            .expect_err("shallow observation must be refused in confirmations mode");
+        // 70 deep >= 64 → authorized (no finalized_verified needed).
+        store.set_l1_indexer_cursor(170).await.unwrap();
+        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Confirmations(64), tx_hash)
+            .await
+            .expect("confirmation-deep observation must pass");
     }
 }

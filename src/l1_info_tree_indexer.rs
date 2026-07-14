@@ -124,7 +124,7 @@ impl L1InfoTreeIndexer {
     /// confirmation-depth mode (no finality block needed).
     fn finality_block_tag(&self) -> Option<BlockNumberOrTag> {
         match self.evidence_tag {
-            crate::ger::EvidenceTag::Confirmations => None,
+            crate::ger::EvidenceTag::Confirmations(_) => None,
             crate::ger::EvidenceTag::Finalized => Some(BlockNumberOrTag::Finalized),
             crate::ger::EvidenceTag::Safe => Some(BlockNumberOrTag::Safe),
         }
@@ -275,10 +275,13 @@ impl L1InfoTreeIndexer {
         provider: &P,
         last_processed: &mut u64,
     ) -> anyhow::Result<()> {
-        // BLOCKER 3 — keep the L1 finality-tag block fresh for the strict gate
-        // (no-op in confirmation-depth mode). Done before the head check so it
-        // still advances while the head is idle.
+        // Keep the L1 finality-tag block fresh for the strict gate (no-op in
+        // confirmation-depth mode). Done before the head check so it still
+        // advances while the head is idle.
         self.refresh_finality_block(provider).await;
+        // BLOCKER 1 — mark finalized-chain evidence (no-op in confirmation-depth
+        // mode). Runs regardless of head progress so finality marking keeps up.
+        self.poll_finalized_scan(provider).await?;
 
         let head = provider.get_block_number().await?;
         if head <= *last_processed {
@@ -390,6 +393,78 @@ impl L1InfoTreeIndexer {
             metrics::counter!("l1_info_tree_indexer_cursor_persist_errors_total").increment(1);
         }
 
+        Ok(())
+    }
+
+    /// Audit H6 BLOCKER 1 — the FINALIZED-pinned scan. In a finality-tag mode,
+    /// scan `(mainnet, rollup)` events over `[finalized_scan_cursor+1,
+    /// finalized_block]` and `mark_ger_finalized` each pair. Because the window
+    /// ends at the L1 finalized/safe block, every log it returns is on the
+    /// canonical finalized chain — a fork's event at a height <= finalized is NOT
+    /// returned, so it is never marked and can never authorize. A no-op in
+    /// confirmation-depth mode. A mark-write failure keeps the batch retryable
+    /// (cursor not advanced), exactly like the latest scan.
+    async fn poll_finalized_scan<P: Provider>(&self, provider: &P) -> anyhow::Result<()> {
+        if !self.evidence_tag.is_finality_tag() {
+            return Ok(());
+        }
+        let finalized = self.store.get_l1_finalized_block().await?;
+        if finalized == 0 {
+            return Ok(());
+        }
+        let cursor = self.store.get_l1_finalized_scan_cursor().await?;
+        if finalized <= cursor {
+            return Ok(());
+        }
+        let from = cursor + 1;
+        let to = finalized.min(from + self.max_range - 1);
+
+        let filter = Filter::new()
+            .address(self.contract_address)
+            .from_block(from)
+            .to_block(to)
+            .event_signature(vec![
+                UpdateL1InfoTree::SIGNATURE_HASH,
+                UpdateGlobalExitRoot::SIGNATURE_HASH,
+            ]);
+        let logs: Vec<Log> = provider.get_logs(&filter).await?;
+
+        let mut marked = 0usize;
+        for log in &logs {
+            let topics = log.topics();
+            if topics.len() < 3 {
+                continue;
+            }
+            let mainnet: [u8; 32] = topics[1].0;
+            let rollup: [u8; 32] = topics[2].0;
+            let combined = combined_ger(&mainnet, &rollup);
+            if let Err(e) = self.store.mark_ger_finalized(&combined).await {
+                metrics::counter!("l1_info_tree_indexer_log_errors_total").increment(1);
+                return Err(e.context(format!(
+                    "L1InfoTreeIndexer: finalized mark failed at block {}; finalized batch \
+                     [{from}, {to}] left unadvanced (retryable)",
+                    log.block_number.unwrap_or(0)
+                )));
+            }
+            marked += 1;
+        }
+
+        if marked > 0 {
+            tracing::info!(
+                from,
+                to,
+                finalized,
+                marked,
+                "L1InfoTreeIndexer: marked finalized-chain evidence"
+            );
+        }
+        if let Err(e) = self.store.set_l1_finalized_scan_cursor(to).await {
+            tracing::warn!(
+                error = %e,
+                cursor = to,
+                "L1InfoTreeIndexer: failed to persist finalized-scan cursor; continuing in-memory"
+            );
+        }
         Ok(())
     }
 
@@ -616,8 +691,7 @@ mod tests {
             &store,
             &ger,
             true,
-            crate::ger::EvidenceTag::Confirmations,
-            CONF,
+            crate::ger::EvidenceTag::Confirmations(CONF),
             tx,
         )
         .await
@@ -640,8 +714,7 @@ mod tests {
             &store,
             &ger,
             true,
-            crate::ger::EvidenceTag::Confirmations,
-            CONF,
+            crate::ger::EvidenceTag::Confirmations(CONF),
             tx,
         )
         .await
@@ -686,6 +759,70 @@ mod tests {
             last_processed, 0,
             "cursor MUST NOT advance past a batch whose evidence write failed"
         );
+    }
+
+    /// BLOCKER 1 (re-review) — the FINALIZED-pinned scan is the finalized-chain
+    /// tie. In `finalized` mode it scans `[cursor+1, finalized_block]` (whose logs
+    /// ARE the canonical finalized chain) and marks each pair `finalized_verified`
+    /// — which is exactly what the strict `finalized` gate then requires. A
+    /// `latest`-observed pair NOT covered by this scan is never marked and cannot
+    /// authorize (proved in `ger::tests::h6_finalized_tag_gate_requires_finalized_chain_tie`).
+    ///
+    /// Mutation check: making `poll_finalized_scan` a no-op leaves the row
+    /// unverified → the authorize step below fails.
+    #[tokio::test]
+    async fn poll_finalized_scan_marks_finalized_chain_evidence() {
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let indexer =
+            test_indexer(store.clone()).with_evidence_tag(crate::ger::EvidenceTag::Finalized);
+
+        let mainnet = B256::from([0x0Au8; 32]);
+        let rollup = B256::from([0x0Bu8; 32]);
+        let ger = combined_ger(&mainnet.0, &rollup.0);
+        // The latest scan already recorded roots (block 8); NOT finalized yet.
+        store
+            .set_ger_exit_roots(&ger, mainnet.0, rollup.0, 8, 0)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get_ger_entry(&ger)
+                .await
+                .unwrap()
+                .unwrap()
+                .finalized_verified,
+            "must start un-finalized"
+        );
+
+        // The L1 finalized block (100) is well above block 8; the finalized scan
+        // covers [1, 100] and reads the canonical pair.
+        store.set_l1_finalized_block(100).await.unwrap();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
+        indexer.poll_finalized_scan(&provider).await.unwrap();
+
+        assert!(
+            store
+                .get_ger_entry(&ger)
+                .await
+                .unwrap()
+                .unwrap()
+                .finalized_verified,
+            "the finalized-pinned scan must mark the canonical pair finalized_verified"
+        );
+        assert_eq!(store.get_l1_finalized_scan_cursor().await.unwrap(), 100);
+
+        // The strict `finalized` gate now authorizes it (roots + finalized_verified).
+        crate::ger::ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            crate::ger::EvidenceTag::Finalized,
+            TxHash::from([0x01u8; 32]),
+        )
+        .await
+        .expect("a finalized-chain-verified observation must authorize");
     }
 
     /// A Store that fails only `set_ger_exit_roots` (the indexer's durable

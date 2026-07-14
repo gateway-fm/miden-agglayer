@@ -111,28 +111,23 @@ struct Command {
     #[arg(long, env = "L1_INDEXER_FROM_BLOCK")]
     l1_indexer_from_block: Option<u64>,
 
-    /// Audit H6 — L1 confirmation depth the STRICT gate requires before
-    /// authorizing an irreversible GER injection: an observation must be this
-    /// many blocks deep (`l1_head - evidence_block >= depth`, indexer cursor as
-    /// head) to be trusted, so a short-lived reorg cannot authorize a GER that
-    /// never truly landed. Enforced AT THE GATE, not the indexer cursor — the
-    /// indexer still records the decomposition up to `latest`, so ordinary
-    /// decomposition / bridge readiness (`zkevm_getExitRootsByGER`) is NOT
-    /// delayed. A not-yet-deep observation stays unverified (fail-closed,
-    /// retryable) for strict authorization only. Default 64 (≈ Sepolia finality).
-    /// Under `--reject-unverified-ger-injection` / `--require-hardening` the
-    /// value must be ≥ the safe minimum (nonzero) or the service refuses to boot.
-    #[arg(long, env = "L1_INDEXER_CONFIRMATIONS", default_value_t = miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS)]
-    l1_indexer_confirmations: u64,
-
-    /// Audit H6 (BLOCKER 3) — how the STRICT gate qualifies an L1 observation as
-    /// final: `confirmations` (depth below head, uses --l1-indexer-confirmations),
-    /// `finalized` (L1 finalized block — cannot be reorged), or `safe` (L1 safe
-    /// block — justified, weaker than finalized). Normal decomposition always
-    /// uses `latest` and is unaffected. Under `--require-hardening` the tag MUST
-    /// be `finalized` (the service refuses to boot otherwise); strict-non-hardened
-    /// may use any. Default `confirmations`.
-    #[arg(long, env = "L1_EVIDENCE_TAG", default_value = "confirmations")]
+    /// Audit H6 — the SINGLE strict-H6 evidence-finality setting. One value
+    /// fully specifies how the strict gate qualifies an L1 observation as final
+    /// enough to authorize an IRREVERSIBLE GER injection (there is no separate
+    /// confirmation-depth flag). Values: `confirmations:<N>` = depth below the
+    /// indexer head cursor (`l1_head - evidence_block >= N`), strict-non-hardened
+    /// only; `finalized` = the `(mainnet, rollup)` must be on the L1 FINALIZED
+    /// canonical chain (verified by a finalized-pinned scan; a reorged fork
+    /// cannot authorize), MANDATORY under `--require-hardening`; `safe` = same,
+    /// against the L1 `safe` block (weaker than `finalized`).
+    ///
+    /// Normal (lenient) decomposition always uses `latest` and is unaffected;
+    /// this gates strict authorization only. Under
+    /// `--reject-unverified-ger-injection` a `confirmations:<N>` value must have
+    /// `N >= 1`; under `--require-hardening` the value must be `finalized`, else
+    /// the service refuses to boot. Default `confirmations:64` (≈ Sepolia
+    /// finality).
+    #[arg(long, env = "L1_EVIDENCE_TAG", default_value = "confirmations:64")]
     l1_evidence_tag: String,
 
     /// Faucet-registry security reconciler poll interval, in seconds. The reconciler is
@@ -433,44 +428,42 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
             ));
         }
     }
-    // BLOCKER 3 — the evidence tag must parse, and hardened mode MANDATES the
-    // `finalized` tag (a finalized L1 block cannot be reorged). A non-finalized
-    // tag under --require-hardening is refused at startup.
+    // Audit H6 — the SINGLE evidence-finality setting must parse and satisfy the
+    // strict/hardened invariants. There is exactly one knob (`--l1-evidence-tag`).
     use miden_agglayer_service::ger::EvidenceTag;
     let Some(tag) = EvidenceTag::parse(&command.l1_evidence_tag) else {
         return Err(format!(
             "strict H6 GER corroboration is enabled via {trigger}, but --l1-evidence-tag \
-             (L1_EVIDENCE_TAG) `{}` is not a recognised tag (expected: confirmations | \
-             finalized | safe).",
+             (L1_EVIDENCE_TAG) `{}` is not a recognised value (expected: \
+             `confirmations:<N>`, `finalized`, or `safe`).",
             command.l1_evidence_tag
         ));
     };
+    // Hardened MANDATES `finalized` (a finalized L1 block cannot be reorged): a
+    // finalized-chain-verified decomposition is the only evidence strong enough
+    // for hardened authorization. `confirmations:<N>` and `safe` are refused.
     if command.require_hardening && tag != EvidenceTag::Finalized {
         return Err(format!(
-            "--require-hardening MANDATES the `finalized` L1 evidence tag, but \
-             --l1-evidence-tag (L1_EVIDENCE_TAG) is `{}`. A finalized L1 block cannot be \
-             reorged; confirmation-depth and `safe` are NOT sufficient for hardened GER \
-             authorization. Set --l1-evidence-tag=finalized.",
-            tag.as_str()
+            "--require-hardening MANDATES `--l1-evidence-tag=finalized`, but it is `{}`. \
+             A finalized L1 block cannot be reorged; confirmation-depth and `safe` are NOT \
+             sufficient for hardened GER authorization. Set --l1-evidence-tag=finalized.",
+            tag.describe()
         ));
     }
-
-    // BLOCKER 1 — in confirmation-depth mode, strict must NOT authorize an
-    // irreversible injection from a zero-confirmation (freely reorg-able)
-    // observation. Refuse to boot with a sub-minimum depth so an operator can't
-    // disable the finality guard while leaving strict on (a silent reorg
-    // exposure). Finality-tag modes qualify by block, so the depth is moot there.
-    if tag == EvidenceTag::Confirmations
-        && command.l1_indexer_confirmations < miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS
+    // In `confirmations:<N>` mode, strict must NOT authorize an irreversible
+    // injection from a zero-confirmation (freely reorg-able) observation. Refuse
+    // a sub-minimum depth so an operator can't disable the finality guard while
+    // leaving strict on. Finality-tag modes qualify by canonical chain, so no
+    // depth applies there.
+    if let EvidenceTag::Confirmations(n) = tag
+        && n < miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS
     {
         return Err(format!(
-            "strict H6 GER corroboration is enabled via {trigger}, but \
-             --l1-indexer-confirmations (L1_INDEXER_CONFIRMATIONS) is {} — below the safe \
-             minimum of {}. A zero/sub-minimum depth would authorize an IRREVERSIBLE GER \
-             injection from a 0-confirmation, freely reorg-able L1 observation, defeating \
-             the finality guard. Set it to {} (≈ Sepolia finality) or higher, or use \
-             --l1-evidence-tag=finalized.",
-            command.l1_indexer_confirmations,
+            "strict H6 GER corroboration is enabled via {trigger}, but --l1-evidence-tag \
+             (L1_EVIDENCE_TAG) `confirmations:{n}` has a depth below the safe minimum of \
+             {}. A zero/sub-minimum depth would authorize an IRREVERSIBLE GER injection \
+             from a 0-confirmation, freely reorg-able L1 observation. Use \
+             `confirmations:{}` (≈ Sepolia finality) or higher, or `finalized`.",
             miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS,
             miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS,
         ));
@@ -997,23 +990,21 @@ async fn main() -> anyhow::Result<()> {
     state.allow_any_signer = command.insecure_allow_any_signer;
     // H6 — strict L1 GER corroboration is implied by --require-hardening.
     state.reject_unverified_ger = command.reject_unverified_ger || command.require_hardening;
-    // H6 (BLOCKER 1) — confirmation depth the strict gate enforces (at the gate,
-    // not the indexer cursor). `check_h6_evidence_source` already refused a
-    // sub-minimum depth under strict, so this value is safe by the time we boot.
-    state.l1_confirmations = command.l1_indexer_confirmations;
-    // H6 (BLOCKER 3) — evidence finality tag. `check_h6_evidence_source` already
-    // rejected an unparsable tag (and a non-`finalized` tag under hardening)
-    // under strict; in lenient mode an unparsable value defaults to
-    // `Confirmations` (the gate never gates in lenient mode anyway).
+    // H6 — the SINGLE evidence-finality setting. `check_h6_evidence_source`
+    // already rejected an unparsable value (and a non-`finalized` value under
+    // hardening, and a sub-minimum `confirmations:<N>`) under strict; in lenient
+    // mode an unparsable value defaults to `confirmations:DEFAULT` (the gate
+    // never gates in lenient mode anyway).
     state.l1_evidence_tag = miden_agglayer_service::ger::EvidenceTag::parse(
         &command.l1_evidence_tag,
     )
     .unwrap_or_else(|| {
         tracing::warn!(
             value = %command.l1_evidence_tag,
-            "unrecognised --l1-evidence-tag; defaulting to `confirmations`"
+            "unrecognised --l1-evidence-tag; defaulting to `confirmations:{}`",
+            miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS
         );
-        miden_agglayer_service::ger::EvidenceTag::Confirmations
+        miden_agglayer_service::ger::EvidenceTag::default()
     });
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
@@ -1378,8 +1369,7 @@ mod hardening_tests {
             l1_rpc_url: None,
             ger_l1_address: None,
             l1_indexer_from_block: None,
-            l1_indexer_confirmations: miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS,
-            l1_evidence_tag: "confirmations".to_string(),
+            l1_evidence_tag: "confirmations:64".to_string(),
             faucet_reconciler_poll_secs: 30,
             faucet_reconciler_grace_ticks: 3,
             miden_debug: false,
@@ -1611,16 +1601,20 @@ mod hardening_tests {
         c.ger_l1_address = Some("0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674".into());
         // Exercise the confirmation-depth zero refusal specifically → non-hardened
         // strict (reject_unverified only), so the finalized-tag mandate (which
-        // hardened would trip first) doesn't preempt the depth check.
+        // hardened would trip first) doesn't preempt the depth check. The depth is
+        // folded into the SINGLE `--l1-evidence-tag` value.
         c.require_hardening = false;
-        c.l1_indexer_confirmations = 0;
+        c.l1_evidence_tag = "confirmations:0".into();
         let reason = check_h6_evidence_source(&c).unwrap_err();
         assert!(
-            reason.contains("--l1-indexer-confirmations"),
-            "must name the depth flag: {reason}"
+            reason.contains("confirmations:0") || reason.contains("safe minimum"),
+            "must name the sub-minimum depth: {reason}"
         );
-        // A nonzero depth (the safe minimum) with the same evidence source boots.
-        c.l1_indexer_confirmations = miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS;
+        // A nonzero depth with the same evidence source boots.
+        c.l1_evidence_tag = format!(
+            "confirmations:{}",
+            miden_agglayer_service::ger::MIN_STRICT_CONFIRMATIONS
+        );
         assert!(check_h6_evidence_source(&c).is_ok());
     }
 

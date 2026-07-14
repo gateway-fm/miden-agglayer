@@ -558,7 +558,6 @@ pub(crate) async fn worker_handle_ger_insert(
             txn_hash,
             service.reject_unverified_ger,
             service.l1_evidence_tag,
-            service.l1_confirmations,
             // The envelope + signer ride into `insert_ger` so the pending
             // receipt row is created INSIDE the serialized Miden-client
             // closure, together with the tx↔note link (handoff-before-
@@ -875,7 +874,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 ger_bytes,
                 true,
                 service.l1_evidence_tag,
-                service.l1_confirmations,
                 txn_hash,
             )
             .await?;

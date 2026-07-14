@@ -145,6 +145,28 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT finalized_scan_cursor FROM l1_indexer_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
+    }
+
+    async fn set_l1_finalized_scan_cursor(&self, block: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE l1_indexer_state SET finalized_scan_cursor = $1, updated_at = now() WHERE id = 1",
+                &[&(block as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── Synthetic projector cursor (Phase 2a) ────────────────────
     //
     // Persisted as a column on the single-row service_state table, mirroring
@@ -540,7 +562,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT mainnet_exit_root, rollup_exit_root, block_number, timestamp FROM ger_entries WHERE ger_hash = $1",
+                "SELECT mainnet_exit_root, rollup_exit_root, block_number, timestamp, finalized_verified FROM ger_entries WHERE ger_hash = $1",
                 &[&ger.as_slice()],
             )
             .await
@@ -554,6 +576,7 @@ impl Store for PgStore {
                 rollup_exit_root: rollup.filter(|v| v.len() == 32).map(bytes_to_array_32),
                 block_number: r.get::<_, i64>(2) as u64,
                 timestamp: r.get::<_, i64>(3) as u64,
+                finalized_verified: r.get::<_, bool>(4),
             }
         }))
     }
@@ -585,6 +608,24 @@ impl Store for PgStore {
                     &(l1_block_number as i64),
                     &(l1_timestamp as i64),
                 ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_ger_finalized(&self, ger: &[u8; 32]) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        // Row should already exist (roots from the latest scan). The explicit
+        // block_number/timestamp 0 satisfy the NOT NULL columns for the safety-net
+        // insert path; DO UPDATE only flips the flag (monotone), never resets
+        // roots. The `finalized`/`safe` gate also requires roots present, so a
+        // flag-only row cannot authorize until the latest scan fills the roots.
+        client
+            .execute(
+                "INSERT INTO ger_entries (ger_hash, block_number, timestamp, finalized_verified)
+                 VALUES ($1, 0, 0, TRUE)
+                 ON CONFLICT (ger_hash) DO UPDATE SET finalized_verified = TRUE",
+                &[&ger.as_slice()],
             )
             .await?;
         Ok(())
@@ -829,15 +870,18 @@ impl Store for PgStore {
         };
 
         // success-always-wins terminal CAS, identical to `InMemoryStore`:
-        //   success           + any → protected no-op (never clobber a landing)
-        //   {pending,failed}   + Ok → apply (a real landing supersedes a prior
-        //                              failure and re-materialises its ClaimEvent)
-        //   pending            + Err → apply (pending → failed)
-        //   failed             + Err → keep the first failure (no-op)
+        //   success                  + any → protected no-op
+        //   {pending,failed,expired} + Ok  → apply (a real landing supersedes a
+        //                                    prior failure/expiry, re-materialises
+        //                                    its ClaimEvent)
+        //   {pending,expired}        + Err → apply → 'failed' (a genuine worker
+        //                                    failure supersedes a provisional
+        //                                    expiry; observable 0x0)
+        //   failed                   + Err → keep the first failure (no-op)
         let apply = match (current_status.as_str(), result.is_ok()) {
             ("success", _) => false,
             (_, true) => true,
-            ("pending", false) => true,
+            ("pending", false) | ("expired", false) => true,
             (_, false) => false,
         };
         if !apply {
@@ -935,6 +979,42 @@ impl Store for PgStore {
             tracing::error!("PgStore: failed txn {tx_hash}: {err}");
         }
 
+        Ok(())
+    }
+
+    async fn txn_commit_ttl_expired(
+        &self,
+        tx_hash: TxHash,
+        reason: String,
+        block_num: u64,
+        _block_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        // BLOCKER 2 — PROVISIONAL, non-terminal TTL-expiry. Single-snapshot
+        // `FOR UPDATE` CAS: only a still-'pending' row becomes 'expired'; a
+        // terminal (success/failed) or already-'expired' row is left untouched
+        // (a TTL guess must never downgrade a real outcome). `txn_receipt` serves
+        // 'expired' as null, so this is never observable-terminal — a real
+        // landing supersedes it to 'success' before it could flip.
+        let mut client = self.pool.get().await?;
+        let hash_str = format!("{tx_hash:#x}");
+        let tx = client.transaction().await?;
+        let current: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM transactions WHERE tx_hash = $1 FOR UPDATE",
+                &[&hash_str],
+            )
+            .await?
+            .map(|r| r.get::<_, String>(0));
+        // Missing row → best-effort no-op (the sweeper only calls this when it
+        // observed a row; it never seeds — BLOCKER 1).
+        if current.as_deref() == Some("pending") {
+            tx.execute(
+                "UPDATE transactions SET status = 'expired', error_message = $1, block_number = $2, updated_at = now() WHERE tx_hash = $3",
+                &[&reason.as_str(), &(block_num as i64), &hash_str],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

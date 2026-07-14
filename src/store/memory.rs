@@ -19,6 +19,14 @@ struct TxnReceipt {
     signer: Address,
     expires_at: Option<u64>,
     result: Option<Result<(), String>>,
+    /// BLOCKER 2 (re-review) — receipt-status monotonicity. When the TTL sweeper
+    /// expires a still-live job it writes a PROVISIONAL failure (`result =
+    /// Some(Err), expired = true`) that `txn_receipt` serves as `None` (null,
+    /// non-terminal), NOT as terminal 0x0. A real later landing supersedes it
+    /// (→ success, `expired = false`) BEFORE it was ever observable-terminal, so
+    /// no client can ever see a terminal `0x0 → 0x1` flip for one tx. A genuine
+    /// worker failure writes `Some(Err), expired = false` (observable 0x0).
+    expired: bool,
     block_num: u64,
     logs: Vec<LogData>,
 }
@@ -112,6 +120,9 @@ pub struct InMemoryStore {
     // .finalized_block` column (migration 011).
     l1_finalized_block: RwLock<u64>,
 
+    // Progress cursor of the indexer's finalized-pinned scan (audit H6 BLOCKER 1).
+    l1_finalized_scan_cursor: RwLock<u64>,
+
     // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
     // first-write-wins evm_tx_hash -> note_commitment, with the reverse index
     // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
@@ -160,6 +171,7 @@ impl InMemoryStore {
             reconcile_cursor: RwLock::new(0),
             l1_indexer_cursor: RwLock::new(0),
             l1_finalized_block: RwLock::new(0),
+            l1_finalized_scan_cursor: RwLock::new(0),
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
         }
@@ -309,6 +321,15 @@ impl Store for InMemoryStore {
 
     async fn set_l1_finalized_block(&self, block: u64) -> anyhow::Result<()> {
         *self.l1_finalized_block.write() = block;
+        Ok(())
+    }
+
+    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
+        Ok(*self.l1_finalized_scan_cursor.read())
+    }
+
+    async fn set_l1_finalized_scan_cursor(&self, block: u64) -> anyhow::Result<()> {
+        *self.l1_finalized_scan_cursor.write() = block;
         Ok(())
     }
 
@@ -487,13 +508,30 @@ impl Store for InMemoryStore {
             rollup_exit_root: None,
             block_number: 0,
             timestamp: 0,
+            finalized_verified: false,
         });
+        // NOTE: `finalized_verified` is deliberately NOT touched here — the
+        // latest scan (this method) must never reset a flag the finalized scan
+        // set (monotone). New rows default to `false` via `or_insert` above.
         entry.mainnet_exit_root = Some(mainnet_exit_root);
         entry.rollup_exit_root = Some(rollup_exit_root);
         // Mirror the PgStore semantics: indexer is authoritative for L1
         // origin metadata, so overwrite unconditionally on every call.
         entry.block_number = l1_block_number;
         entry.timestamp = l1_timestamp;
+        Ok(())
+    }
+
+    async fn mark_ger_finalized(&self, ger: &[u8; 32]) -> anyhow::Result<()> {
+        let mut seen = self.seen_gers.write();
+        let entry = seen.entry(*ger).or_insert(GerEntry {
+            mainnet_exit_root: None,
+            rollup_exit_root: None,
+            block_number: 0,
+            timestamp: 0,
+            finalized_verified: false,
+        });
+        entry.finalized_verified = true;
         Ok(())
     }
 
@@ -523,6 +561,7 @@ impl Store for InMemoryStore {
                 rollup_exit_root,
                 block_number,
                 timestamp,
+                finalized_verified: false,
             },
         )
         .await?;
@@ -582,6 +621,7 @@ impl Store for InMemoryStore {
             signer: entry.signer,
             expires_at: entry.expires_at,
             result: None,
+            expired: false,
             block_num: 0,
             logs: entry.logs,
         };
@@ -601,58 +641,57 @@ impl Store for InMemoryStore {
             let Some(receipt) = txns.get_mut(&tx_hash) else {
                 anyhow::bail!("Store: transaction {tx_hash} not found");
             };
-            // BLOCKER 2 — success-always-wins terminal CAS. A REAL Miden landing
-            // must always beat a failure/timeout guess, and a landed success
-            // must never be clobbered into failure. So:
-            //   pending      + Ok  → success (materialise logs incl. ClaimEvent)
-            //   pending      + Err → failure
-            //   failure      + Ok  → OVERRIDE to success (the op actually landed;
-            //                        e.g. the TTL sweeper failed a still-running
-            //                        job that then committed on Miden — the
-            //                        projector's later success supersedes the
-            //                        provisional failure and re-materialises the
-            //                        ClaimEvent that the failure had suppressed)
-            //   failure      + Err → keep first failure (idempotent no-op)
-            //   success      + any → protected no-op (never clobber a landing;
-            //                        also stops the old double-log-emission on a
-            //                        repeated success commit)
-            enum Cas {
-                NoOp,
-                Commit,
+            // BLOCKER 2 — success-always-wins + monotonic-observability CAS. A
+            // REAL Miden landing (Ok) must always beat a failure/timeout guess,
+            // and a landed success must never be clobbered. The four receipt
+            // states are (result, expired): Pending(None), Expired(Err,true),
+            // Failed(Err,false), Success(Ok,_). This method handles Ok/Err
+            // commits (the TTL sweeper's PROVISIONAL expiry goes through
+            // `txn_commit_ttl_expired`):
+            //   Success       + any → protected no-op
+            //   Pending/Expired/Failed + Ok  → apply success (re-materialise the
+            //                                   ClaimEvent the failure suppressed)
+            //   Pending       + Err → apply failed (observable 0x0)
+            //   Expired       + Err → apply failed (a genuine worker failure
+            //                         supersedes the provisional expiry)
+            //   Failed        + Err → keep first failure (no-op)
+            enum St {
+                Pending,
+                Expired,
+                Failed,
+                Success,
             }
-            let decision = match (&receipt.result, result.is_ok()) {
-                (Some(Ok(_)), _) => Cas::NoOp,
-                (Some(Err(_)), true) => Cas::Commit, // real landing supersedes failure
-                (Some(Err(_)), false) => Cas::NoOp,  // first failure wins
-                (None, _) => Cas::Commit,
+            let st = match (&receipt.result, receipt.expired) {
+                (None, _) => St::Pending,
+                (Some(Ok(_)), _) => St::Success,
+                (Some(Err(_)), true) => St::Expired,
+                (Some(Err(_)), false) => St::Failed,
             };
-            match decision {
-                Cas::NoOp => {
-                    tracing::debug!(
-                        "Store: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
+            let apply = match (&st, result.is_ok()) {
+                (St::Success, _) => false,
+                (_, true) => true,
+                (St::Pending, false) | (St::Expired, false) => true,
+                (St::Failed, false) => false,
+            };
+            if !apply {
+                tracing::debug!(
+                    "Store: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
+                );
+                None
+            } else {
+                let is_ok = result.is_ok();
+                receipt.result = Some(result);
+                receipt.expired = false; // a real terminal commit clears provisional
+                receipt.block_num = block_num;
+                if is_ok {
+                    tracing::info!(
+                        "Store: committed txn {tx_hash}; miden txn: {:?}",
+                        receipt.id
                     );
+                    Some(receipt.logs.clone())
+                } else {
+                    tracing::error!("Store: failed txn {tx_hash}; miden txn: {:?}", receipt.id);
                     None
-                }
-                Cas::Commit => {
-                    receipt.result = Some(result);
-                    receipt.block_num = block_num;
-                    match &receipt.result {
-                        Some(Ok(_)) => {
-                            tracing::info!(
-                                "Store: committed txn {tx_hash}; miden txn: {:?}",
-                                receipt.id
-                            );
-                            Some(receipt.logs.clone())
-                        }
-                        Some(Err(err)) => {
-                            tracing::error!(
-                                "Store: failed txn {tx_hash}; miden txn: {:?}; reason: {err}",
-                                receipt.id
-                            );
-                            None
-                        }
-                        None => None,
-                    }
                 }
             }
         }; // Mutex dropped before any .await
@@ -685,6 +724,14 @@ impl Store for InMemoryStore {
         let Some(receipt) = txns.peek(&tx_hash) else {
             return Ok(None);
         };
+        // BLOCKER 2 — a PROVISIONAL TTL-expiry is NOT observable as terminal:
+        // serve it as `None` (null, "keep polling"), NOT status 0x0. A real
+        // landing supersedes it to success before it ever becomes terminal, so
+        // no observer sees a 0x0 → 0x1 flip.
+        if receipt.expired {
+            tracing::debug!("Store::txn_receipt: {tx_hash} provisionally expired (served as null)");
+            return Ok(None);
+        }
         if receipt.result.is_none() {
             tracing::debug!("Store::txn_receipt: {tx_hash} exists but result=None (uncommitted)");
             return Ok(None);
@@ -693,6 +740,34 @@ impl Store for InMemoryStore {
             return Ok(None);
         };
         Ok(Some((result, receipt.block_num)))
+    }
+
+    async fn txn_commit_ttl_expired(
+        &self,
+        tx_hash: TxHash,
+        reason: String,
+        block_num: u64,
+        _block_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let mut txns = self.transactions.lock();
+        let Some(receipt) = txns.get_mut(&tx_hash) else {
+            // No row → nothing to expire. The sweeper only calls this when it
+            // observed a row (BLOCKER 1 seed-defer), so a missing row is a
+            // best-effort no-op, not the txn_commit "not found" contract.
+            return Ok(());
+        };
+        // Only a still-PENDING row becomes provisionally expired. A terminal
+        // (success/failed) or already-expired row is left untouched — the TTL
+        // expiry is a provisional guess that must never downgrade a real outcome.
+        if receipt.result.is_none() && !receipt.expired {
+            receipt.result = Some(Err(reason));
+            receipt.expired = true;
+            receipt.block_num = block_num;
+            tracing::debug!(
+                "Store: txn {tx_hash} marked provisionally TTL-expired (served as null)"
+            );
+        }
+        Ok(())
     }
 
     async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>> {

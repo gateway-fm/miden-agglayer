@@ -106,16 +106,14 @@ pub struct ServiceState {
     /// `ger_injection_unverified_total` metric) to tolerate indexer lag;
     /// `--require-hardening` implies true.
     pub reject_unverified_ger: bool,
-    /// Audit H6 (BLOCKER 1) — L1 confirmation depth the STRICT gate requires
-    /// before authorizing an irreversible GER injection: an observation must be
-    /// `l1_confirmations` blocks deep (indexer cursor as head) to be trusted.
-    /// Checked at the gate (`ger::ensure_ger_l1_observed`), NOT at the indexer
-    /// cursor, so ordinary decomposition is never delayed. Defaults to
-    /// `ger::DEFAULT_CONFIRMATIONS`.
-    pub l1_confirmations: u64,
-    /// Audit H6 (BLOCKER 3) — how the strict gate qualifies an L1 observation as
-    /// final: confirmation depth, or an L1 `finalized`/`safe` tag (mandatory
-    /// `finalized` under `--require-hardening`). Defaults to `Confirmations`.
+    /// Audit H6 — the SINGLE strict-H6 evidence-finality setting (parsed from
+    /// `--l1-evidence-tag` / `L1_EVIDENCE_TAG`): `confirmations:<N>` (depth below
+    /// the indexer head cursor), `finalized`, or `safe`. This one value fully
+    /// specifies how the gate qualifies an L1 observation as final — there is no
+    /// second confirmation-depth knob. Enforced at the gate
+    /// (`ger::ensure_ger_l1_observed`); normal decomposition is unaffected.
+    /// Mandatory `finalized` under `--require-hardening`. Defaults to
+    /// `confirmations:DEFAULT_CONFIRMATIONS`.
     pub l1_evidence_tag: crate::ger::EvidenceTag,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one
@@ -196,7 +194,6 @@ impl ServiceState {
             allowed_signers: None,
             allow_any_signer: false,
             reject_unverified_ger: false,
-            l1_confirmations: crate::ger::DEFAULT_CONFIRMATIONS,
             l1_evidence_tag: crate::ger::EvidenceTag::default(),
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
