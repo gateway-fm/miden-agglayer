@@ -1,6 +1,7 @@
 use crate::COMPONENT;
 use crate::hex::hex_decode_u64;
 use crate::service_debug::service_debug_trace_transaction;
+use crate::service_estimate_gas::service_estimate_gas;
 use crate::service_eth_call::service_eth_call;
 use crate::service_get_logs::service_get_logs;
 use crate::service_get_txn_receipt::service_get_txn_receipt;
@@ -460,7 +461,11 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
         "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
-        "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+        // Claim-aware (Cantina #21 / PR #127 review): mirrors the EVM
+        // bridge's fail-fast `GlobalExitRootInvalid()` revert while the
+        // claim's GER is unpublished, so the official ClaimTxManager never
+        // allocates a nonce for a claim the proxy would have to park.
+        "eth_estimateGas" => service_estimate_gas(service, request).await,
 
         "eth_chainId" => Ok(JsonRpcResponse::success(
             answer_id,

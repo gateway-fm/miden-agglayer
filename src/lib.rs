@@ -31,6 +31,7 @@ pub mod restore;
 pub mod service;
 pub(crate) mod service_admin;
 pub(crate) mod service_debug;
+pub(crate) mod service_estimate_gas;
 pub(crate) mod service_eth_call;
 pub(crate) mod service_get_logs;
 pub mod service_get_txn_receipt;

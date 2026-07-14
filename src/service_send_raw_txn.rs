@@ -75,13 +75,45 @@ async fn handle_ger_result(
             let _ = ger_bytes; // kept for backward-compat; unused here.
             tracing::info!("inserted GER with eth txn: {txn_hash}");
             if is_new {
-                // New GER: insert_ger recorded the eth-tx ↔ UpdateGerNote link. Record
-                // ONLY a pending receipt; the SyntheticProjector finalises it (txn_commit)
-                // at the Miden block where it consumes the note — receipt block == GER-log
-                // block. eth_getTransactionReceipt returns null until then (mined-when-
-                // consumed), which aggkit tolerates.
-                record_local_pending_tx(service, txn_hash, txn_envelope, signer, None, vec![])
-                    .await?;
+                // New GER: insert_ger's serialized-client closure
+                // (`ger::record_ger_submission_handoff`) records BOTH the
+                // eth-tx ↔ UpdateGerNote link AND the pending receipt
+                // (txn_begin) behind the projection-exclusion boundary — so
+                // the SyntheticProjector can never resolve a consumed note's
+                // real linked hash to a receipt that was never durably begun
+                // (the review guarantee; pre-fix the pending row was created
+                // out here, AFTER the client was released, and the projector
+                // could tick in that gap, silently finalise zero rows on
+                // PostgreSQL, and the late row then stayed pending forever).
+                // The projector finalises the receipt (txn_commit) at the
+                // Miden block where it consumes the note — receipt block ==
+                // GER-log block; eth_getTransactionReceipt returns null until
+                // then (mined-when-consumed), which aggkit tolerates.
+                //
+                // RD-940 Decision 3 dedup independence: that handoff runs
+                // INSIDE the serialized Miden client, so its row is not
+                // guaranteed to be `txn_get`-findable on the accept path by
+                // the time we return the hash (the writer worker runs the
+                // closure asynchronously; the client stub in tests skips the
+                // closure body entirely). The tx-hash dedup early-return reads
+                // `txn_get` on the accept path, so we GUARANTEE a dedup-serving
+                // pending row exists synchronously here, before
+                // service_send_raw_txn returns — otherwise an aggkit
+                // re-broadcast racing the closure would miss dedup, hit the R4
+                // nonce check against the already-advanced nonce, and wedge
+                // ethtxmanager. Idempotent: a no-op when the closure already
+                // produced the row (production sync mode, and the writer path
+                // once the worker has run it — where the inflight cache covers
+                // the accept-path gap regardless); it materialises the row
+                // only when the boundary handoff hasn't. Production therefore
+                // always writes link+receipt behind the boundary; this is a
+                // synchronous dedup safety net, never a second write.
+                if service.store.txn_get(txn_hash).await?.is_none() {
+                    record_local_pending_tx(service, txn_hash, txn_envelope, signer, None, vec![])
+                        .await?;
+                } else {
+                    drop(txn_envelope);
+                }
             } else {
                 // Duplicate GER (already injected): no new UpdateGerNote will be consumed,
                 // so the projector has nothing to finalise — complete the receipt now at
@@ -252,37 +284,13 @@ pub(crate) async fn worker_handle_claim_asset(
         return Ok(());
     }
 
-    // C6 — gate on `has_seen_ger` BEFORE acquiring the claim lock.
-    //
-    // The CLAIM note's leaf proof is internally consistent (built from L1
-    // calldata), but on-chain the bridge MASM verifies it against the GER
-    // currently stored in the bridge account. If aggkit hasn't yet observed
-    // (and propagated) the relevant GER, the on-chain `assert_valid_ger`
-    // rejects the claim — but only AFTER:
-    //   1. try_claim locks the globalIndex
-    //   2. publish_claim sleeps 15s waiting for GER propagation
-    //   3. Miden tx is submitted
-    //   4. on-chain MASM panics with ERR_GER_NOT_FOUND
-    //   5. unclaim runs
-    //
-    // That entire round-trip is wasted work (and burns a Miden gas budget).
-    // Pre-check `has_seen_ger(combined_ger(mainnet_exit_root, rollup_exit_root))`
-    // — if false, return a retryable error immediately so aggkit-driven
-    // clients re-submit cleanly without burning the lock or the 15s wait.
-    let combined = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
-    // `is_ger_injected` rather than `has_seen_ger`: the L1InfoTreeIndexer
-    // pre-populates ger_entries rows for L1 pairs it has indexed but that
-    // haven't yet been injected to L2. C6 requires the GER to be on L2, not
-    // merely indexed; checking the `is_injected` flag captures that intent.
-    if !service.store.is_ger_injected(&combined).await? {
-        ::metrics::counter!("rpc_claim_ger_not_seen_total").increment(1);
-        anyhow::bail!(
-            "claim references a GER that aggkit has not observed yet \
-             (mainnet={}, rollup={}); retry after the GER is injected. C6.",
-            ::hex::encode(params.mainnetExitRoot.0),
-            ::hex::encode(params.rollupExitRoot.0)
-        );
-    }
+    // C6 — pre-admission GER publication gate, BEFORE acquiring the claim
+    // lock (and before any nonce/receipt side-effect on this path). In
+    // writer mode the SAME gate already ran on the request path before
+    // `try_enqueue`/`nonce_increment` (PR #127 review point 3); this second
+    // run is cheap defense-in-depth, not the primary admission decision.
+    // See `ensure_claim_ger_published` for the full rationale.
+    ensure_claim_ger_published(&service.store, &params).await?;
 
     // Lock the claim index. All error paths after this MUST unclaim.
     //
@@ -300,7 +308,7 @@ pub(crate) async fn worker_handle_claim_asset(
     // dropped (client disconnect mid-publish, panic, task cancellation), the
     // claim lock is released. Without the guard, a malicious caller can
     // permanently lock arbitrary globalIndex values by repeatedly disconnecting
-    // mid-flight during the 15s GER-propagation wait inside `publish_claim`.
+    // mid-flight during the multi-second proof/submit work inside `publish_claim`.
     let guard = ClaimGuard::new(service.store.clone(), params.globalIndex);
 
     let result =
@@ -320,11 +328,59 @@ pub(crate) async fn worker_handle_claim_asset(
     Ok(())
 }
 
+/// C6 — the pre-admission GER publication gate (Cantina #21 / PR #127 review).
+///
+/// The CLAIM note's leaf proof is internally consistent (built from L1
+/// calldata), but on-chain the bridge MASM verifies it against the GER
+/// currently stored in the bridge account. Mirroring the real EVM bridge
+/// (`AgglayerBridge._verifyLeaf` reads `globalExitRootMap[combinedGER]` once
+/// and reverts `GlobalExitRootInvalid()` when zero — it never waits), a claim
+/// whose GER the proxy has not yet PUBLISHED is rejected fail-fast with a
+/// retryable error: no nonce is consumed, no globalIndex lock is taken, no
+/// receipt or queued job is created, and the SAME signed transaction can be
+/// re-submitted after GER publication.
+///
+/// This gate MUST run before every enqueue path, nonce increment, try_claim,
+/// txn_begin, or receipt creation:
+///   - sync path: `worker_handle_claim_asset` calls it before
+///     `acquire_claim_lock` (nonce advances only after the dispatch returns
+///     Ok);
+///   - writer path: `service_send_raw_txn` calls it on the REQUEST thread
+///     before `try_enqueue` (which would otherwise consume the nonce and
+///     admit the hash into the inflight dedup cache).
+///
+/// `is_ger_injected` rather than `has_seen_ger`: the L1InfoTreeIndexer
+/// pre-populates ger_entries rows for L1 pairs it has indexed but that
+/// haven't yet been injected/published on L2. C6 requires the GER event to be
+/// published on L2, not merely indexed; the `is_injected` flag captures that
+/// intent (it also holds while the #30 visibility barrier keeps the projector
+/// from publishing the consumption event). The final race/security gate stays
+/// on-chain: the CLAIM's FPI runs the MASM `assert_valid_ger` against the
+/// authoritative bridge-account storage and fails closed with
+/// `ERR_GER_NOT_FOUND` — C6 is scheduling/visibility policy, MASM is the hard
+/// safety boundary.
+pub(crate) async fn ensure_claim_ger_published(
+    store: &std::sync::Arc<dyn crate::store::Store>,
+    params: &claimAssetCall,
+) -> anyhow::Result<()> {
+    let combined = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
+    if !store.is_ger_injected(&combined).await? {
+        ::metrics::counter!("rpc_claim_ger_not_seen_total").increment(1);
+        anyhow::bail!(
+            "claim references a GER that aggkit has not observed yet \
+             (mainnet={}, rollup={}); retry after the GER is injected. C6.",
+            ::hex::encode(params.mainnetExitRoot.0),
+            ::hex::encode(params.rollupExitRoot.0)
+        );
+    }
+    Ok(())
+}
+
 /// How long a `try_claim` record may sit WITHOUT its ClaimEvent landing before it is
 /// treated as an orphaned (crashed-mid-flight) submission and superseded on the next
 /// retry. Env-tunable via `CLAIM_RESUBMIT_TTL_SECS`; the default comfortably covers the
-/// slowest legitimate in-flight path (GER-propagation waits + Miden commit, tens of
-/// seconds) while unwedging a crash-orphaned deposit within ~2 sponsor retries.
+/// slowest legitimate in-flight path (Miden proof + commit, tens of seconds)
+/// while unwedging a crash-orphaned deposit within ~2 sponsor retries.
 pub(crate) fn claim_resubmit_ttl() -> std::time::Duration {
     const DEFAULT_SECS: u64 = 120;
     let secs = std::env::var("CLAIM_RESUBMIT_TTL_SECS")
@@ -500,6 +556,12 @@ pub(crate) async fn worker_handle_ger_insert(
             service.accounts.clone(),
             &service.store,
             txn_hash,
+            // The envelope + signer ride into `insert_ger` so the pending
+            // receipt row is created INSIDE the serialized Miden-client
+            // closure, together with the tx↔note link (handoff-before-
+            // projection — see `ger::record_ger_submission_handoff`).
+            txn_envelope.clone(),
+            signer,
         )
         .await,
         txn_hash,
@@ -784,6 +846,38 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                  boot order bug — see main.rs writer spawn block"
             )
         })?;
+
+        // C6 on the REQUEST path (PR #127 review point 3). Pre-fix, with the
+        // writer enabled the gate only ran inside the worker — AFTER
+        // `try_enqueue` had consumed the nonce and admitted the tx hash into
+        // the inflight dedup cache, so a GER-not-yet-published claim burned a
+        // sequence slot and its re-broadcast short-circuited as a "known"
+        // hash. Run the gate here, before any side-effect, so pre-admission
+        // failure leaves NOTHING behind: no tx hash/receipt, no nonce, no
+        // globalIndex lock, no queued job — the same signed transaction (same
+        // nonce) is accepted verbatim once the GER is published.
+        //
+        // Only claims that would actually reach C6 in the worker are gated,
+        // mirroring `worker_handle_claim_asset`'s short-circuit precedence:
+        // wrong-network claims hard-fail in the worker regardless of GER,
+        // zero-amount claims are swallowed as immediate successes, and
+        // unresolvable destinations are swallowed permanently (RD-860 runs
+        // BEFORE C6 because that state is permanent while a missing GER is
+        // transient).
+        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+            && params.destinationNetwork == service.network_id
+            && !params.amount.is_zero()
+            && crate::address_mapper::resolve_address(
+                &*service.store,
+                params.destinationAddress,
+                &service.accounts.0,
+            )
+            .await
+            .is_ok()
+        {
+            ensure_claim_ger_published(&service.store, params).await?;
+        }
+
         let job = decoded.into_job(txn_envelope, signer, txn_hash);
         match handle.try_enqueue(job) {
             Ok(()) => {
@@ -1050,7 +1144,7 @@ mod tests {
         let (input_hex, _) = encode_legacy_tx(calldata);
 
         // GER is NOT pre-seeded — this is the test's whole point.
-        let result = service_send_raw_txn(service, input_hex).await;
+        let result = service_send_raw_txn(service, input_hex.clone()).await;
         let err = result.expect_err("claim with unseen GER must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("not observed yet"), "unexpected: {msg}");
@@ -1060,6 +1154,171 @@ mod tests {
             !store.is_claimed(&global_index).await.unwrap(),
             "C6 must reject before acquiring the claim lock"
         );
+
+        // PR #127 review point 5 — pre-admission failure must leave NOTHING
+        // behind: no nonce consumed (the same signed tx/nonce is retryable
+        // after GER publication), no receipt, no stored tx row (which would
+        // make the retry short-circuit through the RD-940 dedup as "known").
+        let payload = crate::hex::hex_decode_prefixed(&input_hex).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut payload.as_slice()).unwrap();
+        let tx_hash = *envelope.tx_hash();
+        let signer = envelope.recover_signer().unwrap();
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            0,
+            "C6 rejection must not consume the nonce"
+        );
+        assert!(
+            store.txn_get(tx_hash).await.unwrap().is_none(),
+            "C6 rejection must not create a tx row / receipt"
+        );
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_none(),
+            "C6 rejection must not create a receipt"
+        );
+    }
+
+    /// PR #127 review point 3 — writer mode. Pre-fix, with
+    /// `enable_writer_worker = true` the C6 gate only ran inside the worker,
+    /// AFTER `try_enqueue` had consumed the nonce and admitted the tx hash
+    /// into the inflight dedup cache. The gate must run on the REQUEST path:
+    /// a claim whose GER is unpublished is rejected with no nonce consumed,
+    /// no globalIndex lock, no receipt, and no queued job — and the SAME
+    /// signed transaction (same nonce) is accepted once the GER is published.
+    #[tokio::test]
+    async fn c6_writer_mode_missing_ger_rejected_before_enqueue_then_retryable() {
+        let mut service = create_test_service();
+        service.enable_writer_worker = true;
+        let (handle, _shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        let handle = std::sync::Arc::new(handle);
+        service.writer_handle = Some(handle.clone());
+        let store = service.store.clone();
+
+        let global_index = U256::from(77u64);
+        let mainnet = [0xA7u8; 32];
+        let rollup = [0xB7u8; 32];
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: global_index,
+            mainnetExitRoot: FixedBytes::from(mainnet),
+            rollupExitRoot: FixedBytes::from(rollup),
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 1,
+            // Zero-padded resolvable destination so the RD-860 short-circuit
+            // doesn't pre-empt the C6 gate under test.
+            destinationAddress: alloy::primitives::address!(
+                "0x00000000ac0000000000dd110000ee000000fc00"
+            ),
+            amount: U256::from(1_000u64),
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+        let payload = crate::hex::hex_decode_prefixed(&input_hex).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut payload.as_slice()).unwrap();
+        let tx_hash = *envelope.tx_hash();
+
+        // GER unpublished → rejected on the request path.
+        let err = service_send_raw_txn(service.clone(), input_hex.clone())
+            .await
+            .expect_err("writer mode must reject an unpublished-GER claim at admission");
+        assert!(
+            format!("{err}").contains("not observed yet"),
+            "unexpected: {err}"
+        );
+
+        // Nothing left behind: no nonce, no lock, no receipt, no queued job.
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            0,
+            "pre-admission failure must not consume the nonce"
+        );
+        assert!(
+            !store.is_claimed(&global_index).await.unwrap(),
+            "pre-admission failure must not lock the globalIndex"
+        );
+        assert!(
+            store.txn_get(tx_hash).await.unwrap().is_none(),
+            "pre-admission failure must not create a tx row"
+        );
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_none(),
+            "pre-admission failure must not create a receipt"
+        );
+        assert!(
+            !handle.is_inflight(&tx_hash),
+            "pre-admission failure must not admit the hash into the inflight cache"
+        );
+        assert_eq!(
+            handle.available_capacity(),
+            handle.queue_depth(),
+            "no job may be queued (channel must remain at full capacity)"
+        );
+
+        // Publish the GER (what the SyntheticProjector does on consumption) —
+        // the SAME signed transaction, same nonce, must now be accepted.
+        let ger = crate::ger::combined_ger(&mainnet, &rollup);
+        store
+            .commit_ger_event_atomic(1, [0u8; 32], "0xger-pub", &ger, None, None, 0)
+            .await
+            .unwrap();
+        let accepted_hash = service_send_raw_txn(service.clone(), input_hex)
+            .await
+            .expect("the identical signed tx must be accepted after GER publication");
+        assert_eq!(accepted_hash, tx_hash);
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            1,
+            "acceptance advances the nonce exactly once"
+        );
+        assert!(
+            handle.is_inflight(&tx_hash),
+            "accepted claim must be admitted to the writer queue"
+        );
+    }
+
+    /// Writer-mode C6 precedence mirror: claims the worker would swallow
+    /// WITHOUT reaching C6 (zero-amount genesis claims) must NOT be gated on
+    /// GER publication at admission — the gate only covers claims that would
+    /// actually reach `ensure_claim_ger_published` in the worker.
+    #[tokio::test]
+    async fn c6_writer_mode_zero_amount_claim_not_ger_gated() {
+        let mut service = create_test_service();
+        service.enable_writer_worker = true;
+        let (handle, _shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: U256::from(1u64),
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 1,
+            destinationAddress: Address::ZERO,
+            amount: U256::ZERO,
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let (input_hex, _) = encode_legacy_tx(calldata);
+
+        // No GER seeded — the zero-amount claim must still be accepted
+        // (the worker swallows it as an immediate success, never touching C6).
+        service_send_raw_txn(service, input_hex)
+            .await
+            .expect("zero-amount claim must not be GER-gated at admission");
     }
 
     #[tokio::test]
@@ -1669,6 +1928,452 @@ mod tests {
         assert!(
             err.to_string().contains("already submitted"),
             "landed dedup keeps the original rejection: {err:#}"
+        );
+    }
+
+    // ── MANUAL USER CLAIM tests ─────────────────────────────────────────
+    //
+    // There is NO sponsor concept in this proxy: the bridge-service sponsor's
+    // claims and an ordinary user's manual claims take the IDENTICAL path
+    // through `service_send_raw_txn` (signer recovery → nonce → allow-list →
+    // claim dispatch), and the claim dedup lock is keyed by globalIndex only.
+    // These tests pin that behavior from both sides: a user CAN manually claim
+    // (their own or anyone's deposit) if allow-listed, and the dedup / TTL
+    // takeover semantics are signer-agnostic.
+
+    /// Shared helpers for the manual-user-claim tests.
+    ///
+    /// Build + encode a legacy tx REALLY signed by `key` at an explicit
+    /// `nonce`. Unlike `encode_legacy_tx_signed` (same-nonce concurrency
+    /// helper, nonce pinned to 0), this one is general-purpose. Returns the
+    /// hex payload and the tx hash (for receipt / store assertions).
+    fn encode_tx_signed_with_nonce(
+        key: &alloy::signers::local::PrivateKeySigner,
+        input: Vec<u8>,
+        nonce: u64,
+    ) -> (String, TxHash) {
+        use alloy::consensus::SignableTransaction;
+        use alloy::signers::SignerSync;
+        let txn = TxLegacy {
+            nonce,
+            input: input.into(),
+            chain_id: Some(1),
+            ..Default::default()
+        };
+        let signature = key
+            .sign_hash_sync(&txn.signature_hash())
+            .expect("signing the legacy test tx must succeed");
+        let envelope: TxEnvelope = txn.into_signed(signature).into();
+        let hash = match &envelope {
+            TxEnvelope::Legacy(s) => *s.hash(),
+            _ => unreachable!("constructed as legacy"),
+        };
+        let mut encoded = Vec::new();
+        envelope.encode_2718(&mut encoded);
+        (format!("0x{}", ::hex::encode(encoded)), hash)
+    }
+
+    /// A valid `claimAsset` calldata for `create_test_service`'s network (1).
+    /// Zero exit roots pair with `seed_zero_ger` for the C6 gate.
+    fn claim_calldata(global_index: U256, destination: Address, amount: U256) -> Vec<u8> {
+        claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: global_index,
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 1,
+            destinationAddress: destination,
+            amount,
+            metadata: Default::default(),
+        }
+        .abi_encode()
+    }
+
+    /// Zero-padded MidenAccountId — resolvable by `address_mapper` without a
+    /// store mapping, so a claim to it gets PAST the RD-860 swallow and onto
+    /// the real lock + publish path.
+    fn resolvable_dest() -> Address {
+        alloy::primitives::address!("0x00000000ac0000000000dd110000ee000000fc00")
+    }
+
+    /// Mark the all-zero mainnet/rollup GER pair injected so the C6 pre-check
+    /// passes (mirrors `test_claim_asset_no_event_on_failure`'s seeding).
+    async fn seed_zero_ger(store: &std::sync::Arc<dyn crate::store::Store>) {
+        let ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
+        store
+            .commit_ger_event_atomic(
+                1,
+                [0u8; 32],
+                "0xger-seed",
+                &ger,
+                Some([0u8; 32]),
+                Some([0u8; 32]),
+                0,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn count_claim_events(store: &std::sync::Arc<dyn crate::store::Store>) -> usize {
+        let filter = crate::log_synthesis::LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xFFFF".to_string()),
+            ..Default::default()
+        };
+        store
+            .get_logs(&filter, 0xFFFF)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|l| {
+                l.topics.first().map(|t| t.as_str())
+                    == Some(crate::log_synthesis::CLAIM_EVENT_TOPIC)
+            })
+            .count()
+    }
+
+    /// MANUAL USER CLAIM happy path — an ordinary, explicitly allow-listed
+    /// USER key (NOT open mode, NOT any sponsor identity) submits a valid
+    /// `claimAsset` and is accepted end-to-end: ClaimEvent emitted, receipt
+    /// recorded, and the recorded signer is the USER's address. Pins that a
+    /// user needs nothing beyond allow-list membership to claim manually —
+    /// there is no sponsor-only gate anywhere on the path.
+    ///
+    /// Unit-harness note: the stub `MidenClient` never runs the publish
+    /// closure, so the only claim route that completes SYNCHRONOUSLY is the
+    /// RD-860 unresolvable-destination swallow — which still exercises the
+    /// full RPC pipeline (chain-id, nonce, allow-list, dispatch) and emits the
+    /// synthetic ClaimEvent + receipt. The user here claims a deposit destined
+    /// to their own EVM address (no Miden mapping registered → swallow). The
+    /// real-Miden happy path is covered by scripts/e2e-manual-user-claim.sh.
+    #[tokio::test]
+    async fn manual_user_claim_succeeds() {
+        let user_key = alloy::signers::local::PrivateKeySigner::random();
+        let user_addr = user_key.address();
+
+        let mut service = create_test_service();
+        // A real allow-list containing ONLY the user — the manual claim must
+        // pass on allow-list membership alone.
+        service.allow_any_signer = false;
+        service.allowed_signers = Some(vec![user_addr]);
+        let store = service.store.clone();
+
+        let gi = U256::from(0x1001u64);
+        let calldata = claim_calldata(gi, user_addr, U256::from(1_000_000u64));
+        let (input_hex, expected_hash) = encode_tx_signed_with_nonce(&user_key, calldata, 0);
+
+        let tx_hash = service_send_raw_txn(service, input_hex)
+            .await
+            .expect("allow-listed user's manual claim must be accepted");
+        assert_eq!(
+            tx_hash, expected_hash,
+            "returned hash must be the user's tx hash"
+        );
+
+        assert_eq!(
+            count_claim_events(&store).await,
+            1,
+            "exactly one ClaimEvent must be emitted for the user's claim"
+        );
+        let txn = store
+            .txn_get(tx_hash)
+            .await
+            .unwrap()
+            .expect("the user's claim tx must be recorded");
+        assert_eq!(
+            txn.signer, user_addr,
+            "the recorded signer must be the USER (no sponsor substitution anywhere)"
+        );
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_some(),
+            "a receipt must exist for the user's claim tx"
+        );
+        assert_eq!(
+            store.nonce_get(&format!("{user_addr:#x}")).await.unwrap(),
+            1,
+            "the user's tracked nonce must advance on acceptance"
+        );
+    }
+
+    /// Signer-agnostic dedup, in-flight then landed. Signer A ("the sponsor")
+    /// has a submission genuinely in flight for gi=X (lock record present,
+    /// younger than the TTL, no ClaimEvent yet — created directly on the
+    /// store, exactly the state `service_send_raw_txn` holds between
+    /// `acquire_claim_lock` and publish completion). Signer B — a DIFFERENT
+    /// key — submits a full valid claimAsset for the SAME gi:
+    ///   1. within the TTL → rejected on the "already submitted" path, with
+    ///      ZERO side effects for B (no publish, no nonce advance, no tx);
+    ///   2. after A's claim LANDS (ClaimEvent recorded) → B stays HARD
+    ///      rejected, even with the TTL treated as expired — landed dedup
+    ///      holds forever, for any signer.
+    #[tokio::test]
+    async fn user_sponsor_double_submit_same_global_index() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let miden = service.miden_client.clone();
+        seed_zero_ger(&store).await;
+
+        let gi = U256::from(0x2002u64);
+        store.try_claim(gi).await.expect("A's submission locks gi");
+
+        // B: different key, same globalIndex, within the (default 120s) TTL.
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let addr_b = key_b.address();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        let err = service_send_raw_txn(service.clone(), input_b.clone())
+            .await
+            .expect_err("a different signer's claim for an in-flight gi must be rejected");
+        assert!(
+            err.to_string().contains("already submitted"),
+            "must be the dedup rejection: {err:#}"
+        );
+        // The rejection must leave NO trace of B's attempt.
+        assert!(
+            !miden.test_was_called(),
+            "B must never reach the Miden publish while A is in flight"
+        );
+        assert_eq!(
+            store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(),
+            0,
+            "a rejected claim must not advance B's nonce"
+        );
+        assert!(
+            store.txn_get(tx_b).await.unwrap().is_none(),
+            "no tx entry may be recorded for B's rejected claim"
+        );
+
+        // A's claim LANDS: a ClaimEvent now exists for gi.
+        store
+            .commit_manual_claim_event_atomic(
+                "manual-user-claim-test-note".into(),
+                "0x00000000000000000000000000000000000000aa",
+                5,
+                [0u8; 32],
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+                gi.to_be_bytes::<32>(),
+                0,
+                &[0u8; 20],
+                &[0u8; 20],
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        // B retries the same tx — still hard-rejected (LANDED beats everything).
+        let err = service_send_raw_txn(service, input_b)
+            .await
+            .expect_err("a landed gi must stay rejected for any signer");
+        assert!(
+            err.to_string().contains("already submitted"),
+            "landed dedup keeps the original rejection: {err:#}"
+        );
+        // ...and even with the TTL forced to zero (i.e. long expired), the
+        // LANDED check wins over orphan recovery, regardless of submitter.
+        let err = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+            .await
+            .expect_err("LANDED must beat TTL-expiry recovery");
+        assert!(err.to_string().contains("already submitted"));
+    }
+
+    /// TTL takeover by a DIFFERENT signer — PINS CURRENT (deliberate) BEHAVIOR:
+    /// the claim submission lock is SIGNER-AGNOSTIC. The lock record stores no
+    /// signer at all (`InMemoryStore::claimed` maps globalIndex → Instant;
+    /// `acquire_claim_lock` takes no signer), so once a record is orphaned
+    /// (no ClaimEvent + TTL expired), ANY allow-listed party may supersede it
+    /// and finish the stranded claim. This is intentional: the claim's effect
+    /// is identical regardless of submitter — destination, amount, and token
+    /// are bound by the claimAsset calldata (whose proof commits to the L1
+    /// leaf), so a takeover changes only who paid to submit, never where the
+    /// funds go. The same property holds on the L1 PolygonZkEVMBridge, where
+    /// claimAsset is fully permissionless.
+    #[tokio::test]
+    async fn ttl_expired_lock_superseded_by_different_signer() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let service = crate::test_helpers::create_test_service_with_store(store.clone());
+        let miden = service.miden_client.clone();
+        seed_zero_ger(&store).await;
+
+        let gi = U256::from(0x3003u64);
+        // Signer A's submission crashed mid-flight: lock record present, no
+        // ClaimEvent ever landed...
+        store.try_claim(gi).await.expect("A's submission locks gi");
+        // ...and the record has out-lived CLAIM_RESUBMIT_TTL_SECS (backdated —
+        // no sleeping, no process-global env mutation).
+        concrete.test_backdate_claim(
+            gi,
+            claim_resubmit_ttl() + std::time::Duration::from_secs(10),
+        );
+
+        // Signer B (a different key — the record wouldn't know: it carries no
+        // signer) submits the same gi through the FULL RPC path.
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_b, _) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+
+        let err = service_send_raw_txn(service, input_b)
+            .await
+            .expect_err("the stub MidenClient cannot complete the publish");
+        // The orphaned record was superseded and B's claim PROCEEDED: the
+        // failure is the unit stub's publish failure, NOT the dedup rejection.
+        assert!(
+            !err.to_string().contains("already submitted"),
+            "an orphaned (TTL-expired) record must not keep rejecting: {err:#}"
+        );
+        assert!(
+            miden.test_was_called(),
+            "B's claim must reach the Miden publish — the orphaned lock was superseded"
+        );
+    }
+
+    /// Allow-list × claimAsset — the existing R2/C2 tests exercise the gate
+    /// with insertGlobalExitRoot calldata only; this pins it on the CLAIM path
+    /// specifically, including the fail-closed default, and that the rejection
+    /// happens BEFORE any claim side effect. The claim is fully valid (GER
+    /// seeded, resolvable destination), so if the gate failed to fire it WOULD
+    /// proceed to the lock — making the no-side-effect assertions meaningful.
+    #[tokio::test]
+    async fn unauthorized_signer_claim_rejected() {
+        let user_key = alloy::signers::local::PrivateKeySigner::random();
+        let user_addr = user_key.address();
+        let gi = U256::from(0x4004u64);
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&user_key, calldata, 0);
+
+        // (a) allow-list configured, signer NOT on it.
+        let mut service = create_test_service();
+        service.allow_any_signer = false;
+        let foreign: Address = "0xdeAddeaDdEadDeaDDEaDDeadDEADDeaDDEAdDEaD"
+            .parse()
+            .unwrap();
+        service.allowed_signers = Some(vec![foreign]);
+        let store = service.store.clone();
+        let miden = service.miden_client.clone();
+        seed_zero_ger(&store).await;
+
+        let err = service_send_raw_txn(service, input_hex.clone())
+            .await
+            .expect_err("non-allow-listed signer's claimAsset must be rejected");
+        assert!(
+            err.to_string().contains("not on the allow-list"),
+            "unexpected: {err:#}"
+        );
+        // Rejected BEFORE any lock / receipt / nonce / Miden side effect.
+        assert!(
+            !store.is_claimed(&gi).await.unwrap(),
+            "no claimed_indices entry may exist for a rejected signer's gi"
+        );
+        assert!(
+            store.txn_get(tx_hash).await.unwrap().is_none(),
+            "no tx entry may be recorded"
+        );
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_none(),
+            "no receipt may be recorded"
+        );
+        assert_eq!(
+            store.nonce_get(&format!("{user_addr:#x}")).await.unwrap(),
+            0,
+            "the nonce must not advance for a rejected signer"
+        );
+        assert!(!miden.test_was_called(), "Miden must never be touched");
+        assert_eq!(count_claim_events(&store).await, 0);
+
+        // (b) fail-closed default (audit C2): NO allow-list configured at all →
+        // the same valid claimAsset is rejected identically.
+        let mut service = create_test_service();
+        service.allow_any_signer = false;
+        service.allowed_signers = None;
+        let store = service.store.clone();
+        seed_zero_ger(&store).await;
+
+        let err = service_send_raw_txn(service, input_hex)
+            .await
+            .expect_err("claimAsset must be rejected under the fail-closed default");
+        assert!(
+            err.to_string().contains("not on the allow-list"),
+            "unexpected: {err:#}"
+        );
+        assert!(!store.is_claimed(&gi).await.unwrap());
+    }
+
+    /// Claims are PERMISSIONLESS — pins the EVM-bridge-equivalent design: on
+    /// the L1 PolygonZkEVMBridge anyone may call claimAsset for any leaf, and
+    /// the funds go to the destinationAddress bound in the (merkle-proven)
+    /// calldata, never to the caller. The proxy mirrors that: the submitter
+    /// only needs to pass the allow-list; NOTHING compares the recovered
+    /// signer to destinationAddress. Signer C claims a deposit whose
+    /// destination is someone else entirely, on both claim routes.
+    #[tokio::test]
+    async fn claim_for_someone_elses_deposit_permissionless() {
+        let key_c = alloy::signers::local::PrivateKeySigner::random();
+        let addr_c = key_c.address();
+
+        let mut service = create_test_service();
+        service.allow_any_signer = false;
+        service.allowed_signers = Some(vec![addr_c]);
+        let store = service.store.clone();
+        let miden = service.miden_client.clone();
+        seed_zero_ger(&store).await;
+
+        // Leg 1 — REAL claim route: destination is a resolvable Miden-mapped
+        // address that is NOT C. The claim passes every signer gate, acquires
+        // the lock, and reaches the Miden publish (the unit stub cannot
+        // complete it — but the failure is the stub's, not any
+        // signer≠destination authorization error, because no such check
+        // exists).
+        let gi_real = U256::from(0x5005u64);
+        assert_ne!(resolvable_dest(), addr_c);
+        let calldata = claim_calldata(gi_real, resolvable_dest(), U256::from(1_000_000u64));
+        let (input_hex, _) = encode_tx_signed_with_nonce(&key_c, calldata, 0);
+        let err = service_send_raw_txn(service.clone(), input_hex)
+            .await
+            .expect_err("the stub MidenClient cannot complete the publish");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("allow-list") && !msg.contains("already submitted"),
+            "someone-else's-deposit claim must not be rejected on any authorization \
+             or dedup path: {msg}"
+        );
+        assert!(
+            miden.test_was_called(),
+            "C's claim for someone else's deposit must reach the Miden publish"
+        );
+
+        // Leg 2 — synchronous accept (RD-860 swallow route, the only one that
+        // completes under the stub): destination is a third party's EVM
+        // address ≠ C. Accepted, ClaimEvent emitted, and the recorded signer
+        // is C — the destination in the calldata is untouched by who signed.
+        let gi_swallow = U256::from(0x5006u64);
+        let someone_else = Address::from([0x77u8; 20]);
+        assert_ne!(someone_else, addr_c);
+        // Leg 1's publish failed, so C's nonce is still 0.
+        let calldata = claim_calldata(gi_swallow, someone_else, U256::from(1_000_000u64));
+        let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&key_c, calldata, 0);
+        let accepted = service_send_raw_txn(service, input_hex)
+            .await
+            .expect("permissionless claim for someone else's deposit must be accepted");
+        assert_eq!(accepted, tx_hash);
+        assert_eq!(count_claim_events(&store).await, 1);
+        let txn = store.txn_get(tx_hash).await.unwrap().expect("tx recorded");
+        assert_eq!(
+            txn.signer, addr_c,
+            "the recorded signer is the submitter; the destination stays the \
+             calldata's, not the signer's"
+        );
+        let rec = store
+            .get_unclaimable_claim(&gi_swallow)
+            .await
+            .unwrap()
+            .expect("swallow route records the unclaimable entry");
+        assert_eq!(
+            rec.destination_address, someone_else,
+            "funds are bound to the calldata's destination regardless of submitter"
         );
     }
 

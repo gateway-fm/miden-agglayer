@@ -1,5 +1,6 @@
 use crate::miden_client::MidenClient;
-use alloy::primitives::TxHash;
+use alloy::consensus::TxEnvelope;
+use alloy::primitives::{Address, TxHash};
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
 use miden_client::transaction::TransactionRequestBuilder;
 use sha3::{Digest, Keccak256};
@@ -40,22 +41,45 @@ pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
 /// the UpdateGerNote. The main client's subsequent sync_nullifiers only
 /// queries [current_cursor, tip], so those consumption events were never
 /// discovered and `NoteFilter::Consumed` returned nothing in restore.
-/// Submit the `UpdateGerNote` to Miden and return the on-chain note's
-/// `details_commitment` (hex), encoded identically to how the projector keys
-/// consumed notes (`InputNoteRecord::details_commitment()`) — so `insert_ger`
-/// can tie the real `insertGlobalExitRoot` eth-tx to this note via
-/// `record_tx_note_link`. Returns `None` only when the submit closure did not
-/// execute (a stubbed MidenClient in unit tests).
+///
+/// Also records the durable eth-tx handoff via
+/// [`record_ger_submission_handoff`]: the eth-tx ↔ note link
+/// (`record_tx_note_link`, keyed by the note's `details_commitment` — hex,
+/// encoded identically to how the projector keys consumed notes,
+/// `InputNoteRecord::details_commitment()`) AND the pending receipt row
+/// (`txn_begin`).
+///
+/// Handoff-before-projection (PR #127 review, point 6 + follow-up): BOTH the
+/// link and the pending receipt are written INSIDE this closure, immediately
+/// after the Miden tx commits and strictly BEFORE the serialized
+/// `MidenClient::with` slot is released. The SyntheticProjector observes note
+/// consumption through the same serialized client, so it cannot tick between
+/// the note landing and the handoff existing — the GER event always rides the
+/// REAL eth-tx hash (never the derived fallback) and `txn_commit` always
+/// finds the pending row to finalise. (Pre-fix, the link was recorded here
+/// but the pending row was only created by `handle_ger_result` AFTER
+/// `insert_ger` returned and released the client; the projector could acquire
+/// the client in that gap, resolve the real linked hash, and try to finalise
+/// a receipt whose `txn_begin` didn't exist yet — on PostgreSQL that
+/// silently finalised zero rows and the late `txn_begin` then left the real
+/// receipt pending forever.) Mirrors the identical pattern in
+/// `claim::attempt_publish_claim`.
+///
+/// Cantina #21 (PR #127 review, points 1/4): this function deliberately does
+/// NOT wait for the NTX builder to consume the note into the bridge account.
+/// GER propagation is fail-fast/retry-later: `eth_estimateGas` and the C6
+/// pre-admission gate reject claims until the projector publishes the GER,
+/// and the on-chain MASM `assert_valid_ger` remains the final safety gate.
 async fn submit_update_ger_note(
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
+    store: Arc<dyn crate::store::Store>,
     ger_bytes: [u8; 32],
-) -> anyhow::Result<Option<String>> {
+    txn_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+) -> anyhow::Result<()> {
     let inner_accounts = accounts.0.clone();
-    // `MidenClient::with` closures resolve to `Result<()>`; surface the note
-    // commitment through a captured slot (same pattern as `publish_claim`).
-    let commitment_slot = Arc::new(std::sync::OnceLock::<String>::new());
-    let commitment_inner = commitment_slot.clone();
     miden_client
         .with(move |client| {
             Box::new(async move {
@@ -75,7 +99,6 @@ async fn submit_update_ger_note(
                         .commitment()
                         .as_bytes(),
                 );
-                let _ = commitment_inner.set(note_commitment);
                 tracing::info!(
                     note_id = %note.id(),
                     ger = %hex::encode(ger_bytes),
@@ -106,23 +129,94 @@ async fn submit_update_ger_note(
                     anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
                 }
                 tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
+
+                // Record the durable handoff (link + pending receipt) WHILE
+                // STILL HOLDING the serialized client — see the function
+                // docstring (handoff-before-projection). Recording after the
+                // commit (not before the submit) keeps the recoverable-retry
+                // path in `insert_ger` correct: a failed attempt records
+                // nothing, so the retry's fresh note gets the first (and
+                // only) link for this eth-tx and a single pending row.
+                record_ger_submission_handoff(
+                    &*store,
+                    txn_hash,
+                    &note_commitment,
+                    txn_envelope,
+                    signer,
+                )
+                .await?;
                 Ok(())
             })
         })
+        .await
+}
+
+/// The durable eth-tx handoff for a committed `UpdateGerNote` submission:
+/// record the eth-tx ↔ note link AND create the pending receipt row that the
+/// SyntheticProjector finalises (`txn_commit`) when it observes the note
+/// consumed. This is the EXACT code `submit_update_ger_note` runs inside the
+/// serialized `MidenClient::with` closure, factored out so tests can drive
+/// the real submission ordering (handoff → client released → projection)
+/// without a live Miden node.
+///
+/// Ordering within the handoff — link FIRST, pending row SECOND — is what
+/// makes a partial failure retry-safe (no stray pending row):
+///
+///   - Link write fails → nothing durable exists; a resubmission of the same
+///     eth-tx re-runs the whole path cleanly.
+///   - Link lands but `txn_begin` fails → there is a link but NO pending row.
+///     The projector tolerates the missing row (`let _ = txn_commit` in
+///     `project_ger_note`; both stores now error identically on the missing
+///     row) and still emits the GER event under the real linked hash, from
+///     which `service_get_txn_receipt` can synthesise the receipt. A
+///     resubmission re-runs the path: `record_tx_note_link` is first-write-
+///     wins (no-op) and `txn_begin` creates the one pending row.
+///   - The reverse order would allow the original bug shape: a pending row
+///     with no link, which the projector can never finalise (derived-hash
+///     fallback) — pending forever.
+pub(crate) async fn record_ger_submission_handoff(
+    store: &dyn crate::store::Store,
+    txn_hash: TxHash,
+    note_commitment: &str,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+) -> anyhow::Result<()> {
+    store
+        .record_tx_note_link(&format!("{txn_hash:#x}"), note_commitment)
         .await?;
-    Ok(commitment_slot.get().cloned())
+    // `id: None` hides this row from the StoreSyncListener's commit-pending
+    // sweep (which finalises by Miden tx id at the note's CREATION block);
+    // the projector finalises it at the CONSUMPTION block instead — receipt
+    // block == GER-log block. No `expires_at`: GER receipts are finalised by
+    // consumption, not TTL (matches the pre-existing pending-row semantics).
+    store
+        .txn_begin(
+            txn_hash,
+            crate::store::TxnEntry {
+                id: None,
+                envelope: txn_envelope,
+                signer,
+                expires_at: None,
+                logs: vec![],
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 /// Submit a GER injection to Miden. Returns `true` if a new `UpdateGerNote` was
-/// submitted (and the real eth-tx ↔ note link recorded so the projector finalises
-/// the receipt + emits the GER log on consumption), `false` if the GER was already
-/// injected (a duplicate — the caller completes its receipt immediately).
+/// submitted (and the real eth-tx ↔ note link + pending receipt recorded so the
+/// projector finalises the receipt + emits the GER log on consumption), `false`
+/// if the GER was already injected (a duplicate — the caller completes its
+/// receipt immediately).
 pub async fn insert_ger(
     ger_bytes: [u8; 32],
     miden_client: &MidenClient,
     accounts: crate::AccountsConfig,
     store: &Arc<dyn crate::store::Store>,
     txn_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
 ) -> anyhow::Result<bool> {
     // Check dedup before doing any work.
     //
@@ -148,14 +242,25 @@ pub async fn insert_ger(
         // the node's view), reimport the ger_manager account from the
         // live Miden node and retry once. See `src/account_recovery.rs`
         // for the analysis — this is the actual bali production cure.
-        let note_commitment = match submit_update_ger_note(
+        //
+        // The eth-tx ↔ UpdateGerNote link AND the pending receipt row (which
+        // let the SyntheticProjector finalise THIS receipt and emit the GER
+        // log under the real tx hash on consumption, making receipt block ==
+        // GER-log block) are recorded by `submit_update_ger_note` itself,
+        // while it still holds the serialized Miden client — see its
+        // docstring (handoff-before-projection).
+        match submit_update_ger_note(
             miden_client,
             accounts.clone(),
+            store.clone(),
             ger_bytes,
+            txn_hash,
+            txn_envelope.clone(),
+            signer,
         )
         .await
         {
-            Ok(commitment) => commitment,
+            Ok(()) => {}
             Err(err) if crate::account_recovery::is_recoverable_account_error(&err) => {
                 tracing::warn!(
                     err = %err,
@@ -174,22 +279,24 @@ pub async fn insert_ger(
                     "ger_manager",
                 )
                 .await?;
-                submit_update_ger_note(miden_client, accounts.clone(), ger_bytes).await?
+                // Retry-safety: the first attempt failed BEFORE its handoff
+                // (account errors surface at submit/commit time, and the
+                // handoff only runs after commit confirmation), so no link or
+                // pending row exists yet — the retry's fresh note records
+                // both exactly once.
+                submit_update_ger_note(
+                    miden_client,
+                    accounts.clone(),
+                    store.clone(),
+                    ger_bytes,
+                    txn_hash,
+                    txn_envelope,
+                    signer,
+                )
+                .await?
             }
             Err(err) => return Err(err),
         };
-
-        // Tie the real `insertGlobalExitRoot` eth-tx to the on-chain UpdateGerNote so
-        // the SyntheticProjector finalises THIS receipt (and emits the GER log) under
-        // the real tx hash when it observes the note consumed — making the receipt
-        // block == the GER-log block. No synthetic log / tip advance / receipt
-        // completion happens in this path. (`note_commitment` is `None` only under a
-        // stubbed test client; the projector then falls back to the derived hash.)
-        if let Some(note_commitment) = note_commitment {
-            store
-                .record_tx_note_link(&format!("{txn_hash:#x}"), &note_commitment)
-                .await?;
-        }
     } else {
         tracing::debug!(
             ger = %hex::encode(ger_bytes),
