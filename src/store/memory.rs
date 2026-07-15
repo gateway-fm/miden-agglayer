@@ -23,6 +23,22 @@ struct TxnReceipt {
     logs: Vec<LogData>,
 }
 
+/// #55 BLOCKER 1 — in-memory fenced admission-lease reservation row.
+#[derive(Clone)]
+struct Reservation {
+    tx_hash: TxHash,
+    state: ReservationState,
+    lease_expires_at: std::time::Instant,
+    fence: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReservationState {
+    Executing,
+    ReleasedSuccess,
+    ReleasedFailure,
+}
+
 pub struct InMemoryStore {
     // Block number
     latest_block_number: RwLock<u64>,
@@ -44,6 +60,13 @@ pub struct InMemoryStore {
 
     // Nonces
     nonces: RwLock<HashMap<String, u64>>,
+
+    // #55 BLOCKER 1 — (signer, nonce) → fenced admission-lease reservations.
+    nonce_reservations: RwLock<HashMap<(String, u64), Reservation>>,
+
+    // #55 BLOCKER B test hook: when true, the NEXT `nonce_advance_cas` returns a
+    // store error (simulating a DB failure on the CAS). Always false in production.
+    test_fail_next_nonce_cas: std::sync::atomic::AtomicBool,
 
     // Claims — value = when `try_claim` acquired the lock (as read from
     // `claim_clock_now`), so orphaned records (crash between the lock write and
@@ -75,6 +98,14 @@ pub struct InMemoryStore {
     // Claim watcher (independent from bridge-out so CLAIM observations do not
     // consume B2AGG `deposit_counter` slots — see commit_manual_claim_event_atomic).
     claim_watcher_processed: RwLock<HashMap<String, [u8; 32]>>,
+
+    /// Test hook (#55 BLOCKER B): when set to `Some(gi)`, the next
+    /// `has_claim_event_for_global_index(gi)` call that would report NO event
+    /// instead LANDS the claim (records a watcher ClaimEvent) as a side effect and
+    /// still reports the miss — so the FOLLOWING call observes it. Deterministically
+    /// models "the racing claim commits its ClaimEvent between `acquire_claim_lock`'s
+    /// two landed reads." Always `None` in production (zero behavioural impact).
+    test_land_after_next_has_claim_miss: RwLock<Option<[u8; 32]>>,
 
     // Faucet registry
     faucets: RwLock<Vec<FaucetEntry>>,
@@ -130,6 +161,8 @@ impl InMemoryStore {
             injected_gers: RwLock::new(HashSet::new()),
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
+            nonce_reservations: RwLock::new(HashMap::new()),
+            test_fail_next_nonce_cas: std::sync::atomic::AtomicBool::new(false),
             claimed: RwLock::new(HashMap::new()),
             #[cfg(test)]
             claim_clock_skew: RwLock::new(std::time::Duration::ZERO),
@@ -139,6 +172,7 @@ impl InMemoryStore {
             processed_notes: RwLock::new(HashMap::new()),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
+            test_land_after_next_has_claim_miss: RwLock::new(None),
             faucets: RwLock::new(Vec::new()),
             monitor_burn_serials: RwLock::new(HashSet::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
@@ -183,6 +217,36 @@ impl InMemoryStore {
             "test_backdate_claim: no claim record for global_index {global_index}"
         );
         *self.claim_clock_skew.write() += age;
+    }
+
+    /// Test hook (#55 BLOCKER B): arm the store so the NEXT
+    /// `has_claim_event_for_global_index(gi)` that finds no event lands the claim as
+    /// a side effect (see the field doc). Used to deterministically drive the
+    /// try_claim-Err → reclaim-fail → re-read-landed interleaving.
+    #[cfg(test)]
+    pub fn test_land_gi_after_next_has_claim_miss(&self, global_index: [u8; 32]) {
+        *self.test_land_after_next_has_claim_miss.write() = Some(global_index);
+    }
+
+    /// Test hook (#55 BLOCKER B): arm the store so the NEXT `nonce_advance_cas`
+    /// returns a store error, simulating a DB failure on the nonce CAS.
+    #[cfg(test)]
+    pub fn test_fail_next_nonce_cas(&self) {
+        self.test_fail_next_nonce_cas
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test hook (#55 BLOCKER 1): force the admission lease for `(addr, nonce)` to
+    /// have already EXPIRED, so the next `reserve_nonce` by the SAME tx takes over
+    /// (crash-recovery path). Panics if there is no reservation (test-authoring bug).
+    #[cfg(test)]
+    pub fn test_expire_reservation_lease(&self, addr: &str, nonce: u64) {
+        let key = (addr.to_lowercase(), nonce);
+        let mut reservations = self.nonce_reservations.write();
+        let r = reservations
+            .get_mut(&key)
+            .expect("test_expire_reservation_lease: no reservation for (addr, nonce)");
+        r.lease_expires_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     }
 
     /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
@@ -704,6 +768,155 @@ impl Store for InMemoryStore {
         Ok(prev)
     }
 
+    async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool> {
+        // BLOCKER B test hook — one-shot simulated CAS store failure.
+        if self
+            .test_fail_next_nonce_cas
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated nonce_advance_cas store failure (test hook)");
+        }
+        let key = addr.to_lowercase();
+        let mut nonces = self.nonces.write();
+        let cur = nonces.entry(key).or_insert(0);
+        if *cur == expected {
+            *cur = expected + 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn reserve_nonce(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<crate::store::NonceReservation> {
+        use crate::store::NonceReservation;
+        let key = (addr.to_lowercase(), nonce);
+        let now = std::time::Instant::now();
+        let mut reservations = self.nonce_reservations.write();
+        let existing = reservations.get(&key).cloned();
+        match existing {
+            None => {
+                reservations.insert(
+                    key,
+                    Reservation {
+                        tx_hash,
+                        state: ReservationState::Executing,
+                        lease_expires_at: now + lease,
+                        fence: 1,
+                    },
+                );
+                Ok(NonceReservation::Won { fence: 1 })
+            }
+            Some(r) => {
+                // STATE-FIRST (BLOCKER A): a holder that FAILED or whose lease EXPIRED
+                // consumed NO nonce, so the slot is free for takeover by ANY tx — the
+                // SAME tx (retry) OR a DIFFERENT tx. A holder that is executing under a
+                // valid lease, or already released_success, has consumed the nonce / is
+                // in flight, so a DIFFERENT tx hard-rejects and the SAME tx dedups.
+                let takeover = matches!(r.state, ReservationState::ReleasedFailure)
+                    || (r.state == ReservationState::Executing && r.lease_expires_at <= now);
+                if takeover {
+                    let fence = r.fence + 1;
+                    reservations.insert(
+                        key,
+                        Reservation {
+                            tx_hash,
+                            state: ReservationState::Executing,
+                            lease_expires_at: now + lease,
+                            fence,
+                        },
+                    );
+                    Ok(NonceReservation::Won { fence })
+                } else if r.tx_hash == tx_hash {
+                    Ok(NonceReservation::OwnedBySame)
+                } else {
+                    Ok(NonceReservation::HeldByOther(r.tx_hash))
+                }
+            }
+        }
+    }
+
+    async fn release_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        fence: u64,
+        success: bool,
+    ) -> anyhow::Result<()> {
+        let key = (addr.to_lowercase(), nonce);
+        let mut reservations = self.nonce_reservations.write();
+        if let Some(r) = reservations.get_mut(&key)
+            && r.tx_hash == tx_hash
+            && r.fence == fence
+            && r.state == ReservationState::Executing
+        {
+            r.state = if success {
+                ReservationState::ReleasedSuccess
+            } else {
+                ReservationState::ReleasedFailure
+            };
+        }
+        Ok(())
+    }
+
+    async fn commit_reverted_receipt_and_advance_nonce(
+        &self,
+        tx_hash: TxHash,
+        entry: TxnEntry,
+        reason: String,
+        block_num: u64,
+        _block_hash: [u8; 32],
+        addr: &str,
+        expected_nonce: u64,
+    ) -> anyhow::Result<bool> {
+        // BLOCKER C — receipt + nonce in one atomic step: hold BOTH the
+        // transactions and nonces locks so a reader can never observe the
+        // receipt committed with the nonce not yet advanced (or vice versa).
+        // The row is inserted already committed-`failed` (empty logs, no
+        // synthetic ClaimEvent), so there is no pending window.
+        let mut txns = self.transactions.lock();
+        let mut nonces = self.nonces.write();
+        // BLOCKER 4 — CONDITIONAL: never overwrite a REAL receipt. If this hash
+        // already has a pending (result None → a real claim awaiting the projector)
+        // or successful (Some(Ok) → a landed real claim) receipt, DO NOT rewrite it
+        // to status 0. A cross-replica accept-and-revert on the same hash must
+        // converge to the real outcome, not suppress a real success/pending. Only
+        // write the reverted receipt when the hash is absent or already `failed`
+        // (idempotent re-affirm).
+        let may_write = match txns.peek(&tx_hash).map(|r| &r.result) {
+            None => true,                // absent
+            Some(None) => false,         // pending real receipt — keep it
+            Some(Some(Ok(()))) => false, // successful real receipt — keep it
+            Some(Some(Err(_))) => true,  // already failed — re-affirm
+        };
+        if may_write {
+            let receipt = TxnReceipt {
+                id: entry.id,
+                envelope: entry.envelope,
+                signer: entry.signer,
+                expires_at: entry.expires_at,
+                result: Some(Err(reason)),
+                block_num,
+                logs: vec![],
+            };
+            let _ = txns.put(tx_hash, receipt);
+        }
+        let cur = nonces.entry(addr.to_lowercase()).or_insert(0);
+        let advanced = if *cur == expected_nonce {
+            *cur = expected_nonce + 1;
+            true
+        } else {
+            false
+        };
+        Ok(advanced)
+    }
+
     // ── Claims ───────────────────────────────────────────────────
 
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
@@ -943,6 +1156,19 @@ impl Store for InMemoryStore {
                 {
                     return Ok(true);
                 }
+            }
+        }
+        drop(logs);
+        // Test hook (BLOCKER B): this call found NO event. If armed for this gi, LAND
+        // it now so the NEXT call observes it, and still report this miss.
+        {
+            let mut armed = self.test_land_after_next_has_claim_miss.write();
+            if armed.as_ref() == Some(global_index) {
+                *armed = None;
+                drop(armed);
+                self.claim_watcher_processed
+                    .write()
+                    .insert("blockerB-race-land".to_string(), *global_index);
             }
         }
         Ok(false)

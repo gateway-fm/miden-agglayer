@@ -1098,6 +1098,216 @@ impl Store for PgStore {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
+    async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        // BLOCKER D — atomic conditional advance. A fresh address (no row) is
+        // nonce 0: for `expected == 0` create/advance to 1 only while the current
+        // value is still 0; otherwise advance only WHERE the stored nonce equals
+        // `expected`. Postgres row-locking on the conflict/UPDATE serialises
+        // concurrent replicas, so exactly one wins the CAS.
+        let n = if expected == 0 {
+            client
+                .execute(
+                    "INSERT INTO nonces (address, nonce) VALUES ($1, 1)
+                     ON CONFLICT (address) DO UPDATE SET nonce = 1 WHERE nonces.nonce = 0",
+                    &[&key],
+                )
+                .await?
+        } else {
+            client
+                .execute(
+                    "UPDATE nonces SET nonce = nonce + 1 WHERE address = $1 AND nonce = $2",
+                    &[&key, &(expected as i64)],
+                )
+                .await?
+        };
+        Ok(n == 1)
+    }
+
+    async fn reserve_nonce(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<crate::store::NonceReservation> {
+        use crate::store::NonceReservation;
+        let mut client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        let hash_str = format!("{tx_hash:#x}");
+        let lease_secs = lease.as_secs().max(1) as f64;
+
+        // ONE transaction: lock the slot row (FOR UPDATE), then decide + write.
+        // Serialises concurrent replicas on the (signer, nonce) row so exactly one
+        // is ever told `Won`.
+        let tx = client.transaction().await?;
+        let existing = tx
+            .query_opt(
+                "SELECT tx_hash, state, (lease_expires_at <= now()) AS expired, fence_token
+                 FROM nonce_reservations WHERE signer = $1 AND nonce = $2 FOR UPDATE",
+                &[&key, &(nonce as i64)],
+            )
+            .await?;
+        let outcome = match existing {
+            None => {
+                tx.execute(
+                    "INSERT INTO nonce_reservations (signer, nonce, tx_hash, state, lease_expires_at, fence_token)
+                     VALUES ($1, $2, $3, 'executing', now() + ($4 || ' seconds')::interval, 1)",
+                    &[&key, &(nonce as i64), &hash_str, &lease_secs.to_string()],
+                )
+                .await?;
+                NonceReservation::Won { fence: 1 }
+            }
+            Some(row) => {
+                let row_hash: String = row.get(0);
+                let state: String = row.get(1);
+                let expired: bool = row.get(2);
+                let fence: i64 = row.get(3);
+                // STATE-FIRST (BLOCKER A): a holder that FAILED or whose lease EXPIRED
+                // consumed NO nonce, so the slot is free for takeover by ANY tx (the
+                // SAME tx retrying OR a DIFFERENT tx). Executing-under-valid-lease or
+                // released_success means the nonce is consumed / in flight → a
+                // DIFFERENT tx hard-rejects, the SAME tx dedups.
+                let takeover = state == "released_failure" || (state == "executing" && expired);
+                if takeover {
+                    let new_fence = fence + 1;
+                    tx.execute(
+                        "UPDATE nonce_reservations SET tx_hash = $5, state = 'executing',
+                         lease_expires_at = now() + ($3 || ' seconds')::interval,
+                         fence_token = $4
+                         WHERE signer = $1 AND nonce = $2",
+                        &[
+                            &key,
+                            &(nonce as i64),
+                            &lease_secs.to_string(),
+                            &new_fence,
+                            &hash_str,
+                        ],
+                    )
+                    .await?;
+                    NonceReservation::Won {
+                        fence: new_fence as u64,
+                    }
+                } else if row_hash.eq_ignore_ascii_case(&hash_str) {
+                    NonceReservation::OwnedBySame
+                } else {
+                    // NIT — propagate a parse error WITH context instead of
+                    // substituting the zero hash.
+                    let other =
+                        <TxHash as std::str::FromStr>::from_str(&row_hash).map_err(|e| {
+                            anyhow::anyhow!(
+                                "nonce_reservations row for signer {key} nonce {nonce} has an \
+                             unparsable tx_hash {row_hash:?}: {e}"
+                            )
+                        })?;
+                    NonceReservation::HeldByOther(other)
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    async fn release_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        fence: u64,
+        success: bool,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        let hash_str = format!("{tx_hash:#x}");
+        let new_state = if success {
+            "released_success"
+        } else {
+            "released_failure"
+        };
+        // FENCED: only the current fence owner still in `executing` may release.
+        client
+            .execute(
+                "UPDATE nonce_reservations SET state = $5, lease_expires_at = now()
+                 WHERE signer = $1 AND nonce = $2 AND tx_hash = $3 AND fence_token = $4
+                   AND state = 'executing'",
+                &[
+                    &key,
+                    &(nonce as i64),
+                    &hash_str,
+                    &(fence as i64),
+                    &new_state,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn commit_reverted_receipt_and_advance_nonce(
+        &self,
+        tx_hash: TxHash,
+        entry: TxnEntry,
+        reason: String,
+        block_num: u64,
+        _block_hash: [u8; 32],
+        addr: &str,
+        expected_nonce: u64,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let hash_str = format!("{tx_hash:#x}");
+        let miden_id = entry.id.map(|id| id.to_hex());
+        let signer_str = format!("{:#x}", entry.signer);
+        let mut envelope_bytes = Vec::new();
+        entry.envelope.encode_2718(&mut envelope_bytes);
+        let key = addr.to_lowercase();
+
+        // BLOCKER C — receipt + nonce in ONE transaction. The tx row is inserted
+        // already committed-`failed` (status 0x0, no attached logs → no ClaimEvent),
+        // so there is no `txn_begin`→`txn_commit` pending window a crash could freeze
+        // forever.
+        //
+        // BLOCKER 4 — CONDITIONAL upsert: `ON CONFLICT ... WHERE transactions.status
+        // = 'failed'` so a REAL receipt is NEVER overwritten to status 0. If a
+        // cross-replica path already materialised the real claim under this hash
+        // (status 'pending' → awaiting the projector, or 'success' → landed), the
+        // conflicting UPDATE's WHERE fails → the real receipt survives and both
+        // replicas converge to the real outcome. Absent → insert; already 'failed' →
+        // idempotently re-affirm.
+        let tx = client.transaction().await?;
+        tx.execute(
+            "INSERT INTO transactions (tx_hash, miden_tx_id, envelope_bytes, signer, expires_at, status, error_message, block_number)
+             VALUES ($1, $2, $3, $4, $5, 'failed', $6, $7)
+             ON CONFLICT (tx_hash) DO UPDATE SET status = 'failed', error_message = $6, block_number = $7, updated_at = now()
+             WHERE transactions.status = 'failed'",
+            &[
+                &hash_str,
+                &miden_id as &(dyn ToSql + Sync),
+                &envelope_bytes,
+                &signer_str,
+                &entry.expires_at.map(|v| v as i64) as &(dyn ToSql + Sync),
+                &reason,
+                &(block_num as i64),
+            ],
+        )
+        .await?;
+        let n = if expected_nonce == 0 {
+            tx.execute(
+                "INSERT INTO nonces (address, nonce) VALUES ($1, 1)
+                 ON CONFLICT (address) DO UPDATE SET nonce = 1 WHERE nonces.nonce = 0",
+                &[&key],
+            )
+            .await?
+        } else {
+            tx.execute(
+                "UPDATE nonces SET nonce = nonce + 1 WHERE address = $1 AND nonce = $2",
+                &[&key, &(expected_nonce as i64)],
+            )
+            .await?
+        };
+        tx.commit().await?;
+        Ok(n == 1)
+    }
+
     // ── Claims ───────────────────────────────────────────────────
 
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {

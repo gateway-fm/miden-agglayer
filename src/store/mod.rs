@@ -118,6 +118,25 @@ pub struct TxnEntry {
     pub logs: Vec<LogData>,
 }
 
+/// Outcome of [`Store::reserve_nonce`] — the atomic, FENCED `(signer, nonce)`
+/// admission-lease claim (#55 BLOCKER 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceReservation {
+    /// This call WON ownership of the admission lease — fresh, or a takeover of an
+    /// EXPIRED lease / a `released_failure` prior attempt by the same tx. This
+    /// replica (and ONLY this replica) may execute; the `fence` token must be
+    /// passed to [`Store::release_reservation`] so a delayed prior owner cannot
+    /// clobber this owner's release.
+    Won { fence: u64 },
+    /// The slot is currently owned+executing by the SAME tx under a VALID lease
+    /// (another replica is admitting it), or it already `released_success`. Do NOT
+    /// execute — dedup-return the hash; the owner produces the receipt.
+    OwnedBySame,
+    /// A DIFFERENT tx owns/owned this slot. Hard reject — this submission must not
+    /// execute.
+    HeldByOther(TxHash),
+}
+
 /// Record of a claim we dropped because the destination could not be resolved to a
 /// Miden AccountId. See RD-860: storing these lets operators inspect the backlog and
 /// audit what happened to a user's funds when support asks about a specific deposit.
@@ -460,6 +479,85 @@ pub trait Store: Send + Sync + 'static {
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;
+
+    /// #55 BLOCKER 1 — atomic `(signer, nonce)` reservation. Insert-if-absent keyed
+    /// on `(addr, nonce)`; the winner's `tx_hash` is durable. Returns
+    /// [`NonceReservation::Won`] iff THIS call inserted the row (this tx owns the
+    /// slot), or [`NonceReservation::HeldBy`] with the winner's hash otherwise
+    /// (which may be this same tx — an idempotent re-reservation — or a DIFFERENT
+    /// tx that raced and won).
+    ///
+    /// MUST be atomic at the store level (postgres: `SELECT … FOR UPDATE` +
+    /// conditional INSERT/UPDATE in ONE transaction; memory: one lock), so that two
+    /// replicas that each pass their process-local R4 for the same `(signer,
+    /// nonce)` are resolved deterministically:
+    ///   * a DIFFERENT tx → [`NonceReservation::HeldByOther`] (hard reject);
+    ///   * the SAME tx while the owner's lease is VALID (executing) or already
+    ///     `released_success` → [`NonceReservation::OwnedBySame`] (dedup, do NOT
+    ///     execute — the owner produces the receipt);
+    ///   * the SAME tx after the lease EXPIRED or a `released_failure` → takeover:
+    ///     [`NonceReservation::Won`] with a bumped fence (retry admission).
+    /// `lease` is how long the winner owns admission before another replica may
+    /// take over on expiry (crash recovery).
+    async fn reserve_nonce(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<NonceReservation>;
+
+    /// #55 BLOCKER 1 — release the admission lease won by [`Store::reserve_nonce`].
+    /// Transitions the reservation to `released_success` (admission completed — the
+    /// SAME tx henceforth dedups) or `released_failure` (admission failed — the SAME
+    /// tx may retry via takeover). FENCED: only applies while the row is still
+    /// `executing` under the given `fence` token, so a delayed prior owner whose
+    /// lease expired and was taken over (fence bumped) CANNOT clobber the new
+    /// owner's state. A no-op if already released or fenced out.
+    async fn release_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        fence: u64,
+        success: bool,
+    ) -> anyhow::Result<()>;
+
+    /// #55 BLOCKER D — COMPARE-AND-SWAP nonce advance. Advance the stored nonce to
+    /// `expected + 1` **iff** the current stored value equals `expected` (a fresh
+    /// address is treated as nonce 0). Returns `true` iff it won the CAS (advanced).
+    ///
+    /// MUST be atomic at the store level (single conditional UPDATE / lock-guarded
+    /// CAS), so that under a shared PostgreSQL with rolling replicas two replicas
+    /// that both read expected nonce `N` cannot BOTH advance (`N → N+2`, skipping a
+    /// nonce → wedge). The process-local `per_signer_lock` only serialises within
+    /// one replica; this CAS is the cross-replica guarantee. Used on the accept
+    /// path (in place of the unconditional `nonce_increment`) and by the crash-gap
+    /// repair.
+    async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool>;
+
+    /// #55 BLOCKER C — atomically persist a REVERTED receipt (status 0x0, EMPTY
+    /// logs, no ClaimEvent) for `tx_hash` **and** CAS-advance the signer's nonce, in
+    /// ONE store transaction, so a crash can never leave a half state — no
+    /// pending-forever receipt (the row is written already committed-`failed`, never
+    /// a separate `txn_begin`→`txn_commit`) and no stale nonce.
+    ///
+    /// The nonce CAS advances iff the current nonce == `expected_nonce` (the sync
+    /// accept path, where the nonce has not yet advanced). In async-writer mode the
+    /// enqueue already CAS-advanced it, so this CAS is a no-op and only the receipt
+    /// is written. Idempotent on `tx_hash` (a rebroadcast/re-entry re-affirms the
+    /// same committed-reverted row). Returns whether the nonce advanced here.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_reverted_receipt_and_advance_nonce(
+        &self,
+        tx_hash: TxHash,
+        entry: TxnEntry,
+        reason: String,
+        block_num: u64,
+        block_hash: [u8; 32],
+        addr: &str,
+        expected_nonce: u64,
+    ) -> anyhow::Result<bool>;
 
     // === Claims ===
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()>;

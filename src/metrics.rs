@@ -70,6 +70,32 @@ pub fn init_metrics() {
          and the sponsor's resubmission accepted. Nonzero after a crash in the submit window is \
          the recovery WORKING; a steady climb without restarts means claims are failing to land."
     );
+    describe_counter!(
+        "claim_landed_dedup_reverted_total",
+        "#55 accept-and-revert: a claimAsset targeting an ALREADY-LANDED globalIndex (a real \
+         ClaimEvent already exists) was ACCEPTED with a reverted (status 0x0) receipt instead of \
+         hard-rejected at the JSON-RPC layer — so the submitter's nonce is consumed, geth-faithful \
+         AlreadyClaimed. Nonzero means a sponsor/user cross-claimed the same gi and the sponsor's \
+         nonce sequence was kept in lockstep (autoclaim NOT wedged). A steady climb means heavy \
+         claim front-running, not a bug."
+    );
+    describe_counter!(
+        "rpc_nonce_repaired_after_commit_gap_total",
+        "#55 BLOCKER-2 crash-gap repair: on a same-hash rebroadcast, the signer's expected \
+         nonce was still equal to the known tx's nonce — meaning the tx's durable receipt was \
+         persisted but its nonce advance was lost to a crash BETWEEN the two on the sync accept \
+         path — so the nonce was advanced to complete the interrupted accept. Nonzero after a \
+         crash in the receipt→nonce window is the recovery WORKING (the signer is NOT wedged); a \
+         steady climb without restarts would signal a store that is losing nonce writes."
+    );
+    describe_counter!(
+        "rpc_nonce_reservation_lost_total",
+        "#55 BLOCKER 1 cross-replica guard: a submission LOST the atomic (signer, nonce) \
+         reservation to a DIFFERENT tx that already owned the slot, so it was rejected without \
+         executing (no enqueue/dispatch/receipt). Nonzero means two txs raced the same nonce \
+         slot (across replicas or a stale replacement) and the reservation kept exactly one; the \
+         winner advances the nonce and the loser is dropped, mirroring geth."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",
