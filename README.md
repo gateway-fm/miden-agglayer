@@ -414,3 +414,18 @@ Public accounts re-attach automatically via sync. Private accounts (if any)
 cannot be re-imported from the node alone — they would need a fresh `--init`
 (which mints new on-chain accounts and invalidates existing balances), so
 prefer `--unlock-miden-accounts` first when the divergence is recoverable.
+
+## License
+
+This project is dual-licensed under either of
+
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE)), or
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Contributions intentionally submitted for inclusion in this
+project shall be dual-licensed as above, without any additional terms or
+conditions.
+
+The vendored `axum-jrpc` crate (under `axum-jrpc/`) is a third-party
+dependency and remains licensed under the MIT License as noted in its own
+[`LICENSE`](axum-jrpc/LICENSE) file.

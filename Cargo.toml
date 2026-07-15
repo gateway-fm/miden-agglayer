@@ -2,7 +2,7 @@
 description = "Miden AggLayer integration service"
 edition = "2024"
 exclude = [".github/"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 name = "miden-agglayer-service"
 readme = "README.md"
 rust-version = "1.93"
