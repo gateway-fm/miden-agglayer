@@ -218,8 +218,8 @@ pub(crate) async fn claim_and_ger_applied(
         .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())
         .await?;
     let projected_ger = service.store.is_ger_injected(ger).await?;
-    if projected_claim && projected_ger {
-        return Ok((true, true));
+    if projected_claim {
+        return Ok((true, projected_ger));
     }
     let snapshot = bridge_snapshot(
         service,

@@ -15,6 +15,11 @@ pub async fn service_get_txn_receipt(
     let (status, block_num) = match service.store.txn_receipt(txn_hash).await? {
         Some((result, block_num)) => (result.is_ok(), block_num),
         None => {
+            // A known transaction without a terminal result is still pending.
+            // Synthetic-log fallback is only for hashes with no transaction row.
+            if service.store.txn_get(txn_hash).await?.is_some() {
+                return Ok(None);
+            }
             // Synthetic-log receipt fallback (receipts contract). A bridge-out
             // `BridgeEvent` (and a projected GER `UpdateHashChain`) has NO real txn
             // record: it was never an `eth_sendRawTransaction` — the
@@ -195,6 +200,21 @@ mod tests {
             .await
             .unwrap();
         // Deliberately NOT committing.
+        service
+            .store
+            .add_log(crate::log_synthesis::SyntheticLog {
+                address: Address::ZERO.to_string(),
+                topics: vec![],
+                data: "0x".to_string(),
+                block_number: 1,
+                block_hash: [0u8; 32],
+                transaction_hash: format!("{txn_hash:#x}"),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            })
+            .await
+            .unwrap();
 
         let result = service_get_txn_receipt(service, txn_hash.to_string())
             .await

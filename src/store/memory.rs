@@ -435,8 +435,8 @@ impl Store for InMemoryStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let txns = self.transactions.lock();
         let links = self.tx_note_links.read();
+        let txns = self.transactions.lock();
         let mut pending: Vec<TxHash> = txns
             .iter()
             .filter(|(tx_hash, txn)| {
@@ -1040,8 +1040,8 @@ impl Store for InMemoryStore {
 
     async fn pending_nonce_frontier(&self, addr: &str) -> anyhow::Result<PendingNonceFrontier> {
         let addr = addr.to_lowercase();
-        let txns = self.transactions.lock();
         let links = self.tx_note_links.read();
+        let txns = self.transactions.lock();
         let mut frontier = PendingNonceFrontier::default();
         for (tx_hash, receipt) in txns.iter() {
             if receipt.result.is_some() || format!("{:#x}", receipt.signer).to_lowercase() != addr {
