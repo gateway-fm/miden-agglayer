@@ -4,7 +4,30 @@ use alloy::primitives::{Address, TxHash};
 use miden_base_agglayer::{ExitRoot, UpdateGerNote};
 use miden_client::transaction::TransactionRequestBuilder;
 use sha3::{Digest, Keccak256};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// Polling policy for the narrow strict-H6 state where a GER is already
+/// corroborated by the L1 indexer but has not reached the configured finality
+/// yet. Keeping the request pending is side-effect-free (no nonce, tx row, or
+/// Miden submission exists yet) and prevents a one-shot aggoracle broadcast
+/// from being lost in the observation-to-finality race.
+const GER_FINALITY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const GER_FINALITY_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug, thiserror::Error)]
+enum GerL1GateError {
+    #[error(
+        "GER {ger} was observed on L1 but is not yet final per the `{evidence_tag}` evidence setting (finality guard, audit H6); refusing injection under --reject-unverified-ger-injection. Transient — retry once the L1 observation finalizes."
+    )]
+    NotFinal { ger: String, evidence_tag: String },
+    #[error(
+        "GER {ger} was not observed on L1 by the indexer (exit-root decomposition unresolved); refusing injection under --reject-unverified-ger-injection (audit H6). Retry after the L1 InfoTree indexer catches up."
+    )]
+    NotObserved { ger: String },
+}
 
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/sovereignChains/GlobalExitRootManagerL2SovereignChain.sol#L166
@@ -26,7 +49,7 @@ alloy_core::sol! {
 /// injection — a short-lived reorg then cannot leave a stale "observed" row that
 /// permanently authorizes a GER that never truly landed on canonical L1.
 ///
-/// This depth is enforced AT THE GATE (`ensure_ger_l1_observed`), NOT at the
+/// This depth is enforced at admission (`wait_for_ger_l1_observed`), NOT at the
 /// indexer cursor: the indexer records the `(mainnet, rollup)` decomposition up
 /// to LATEST so ordinary decomposition / bridge readiness
 /// (`zkevm_getExitRootsByGER`) is never delayed. Only strict authorization waits
@@ -342,12 +365,12 @@ pub async fn insert_ger(
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<bool> {
-    // Audit H6 gate (dedup-first — see `ensure_ger_l1_observed`). In writer
+    // Audit H6 gate (dedup-first — see `wait_for_ger_l1_observed`). In writer
     // mode the SAME gate already ran on the request path before
     // `try_enqueue`/`nonce_increment` (PR #121 review); this run is the sync
     // path's primary admission decision and the writer path's
     // defense-in-depth.
-    ensure_ger_l1_observed(
+    wait_for_ger_l1_observed(
         store,
         &ger_bytes,
         require_l1_observed,
@@ -365,7 +388,7 @@ pub async fn insert_ger(
     // and the synthetic L2 event would never be emitted, leaving deposits
     // stuck `ready_for_claim=false`. Gating on `is_injected = TRUE` correctly
     // reflects "have we already submitted the Miden tx and committed the
-    // synthetic event for this GER?". (`ensure_ger_l1_observed` above already
+    // synthetic event for this GER?". (`wait_for_ger_l1_observed` above already
     // short-circuits on the same `is_ger_injected` check, so an already-injected
     // GER never reaches the gate's finality logic — this read then just decides
     // the duplicate no-op return value.)
@@ -477,9 +500,10 @@ pub async fn insert_ger(
 ///     receipt could never be written — the aggoracle/ethtxmanager wedge).
 ///     The `insert_ger` call inside the worker remains as defense-in-depth.
 ///
-/// A strict-mode refusal must stay TRANSIENT: no nonce is consumed, no tx
-/// row/receipt is created, no job is queued — the identical signed
-/// transaction (same nonce) is accepted verbatim once the indexer catches up.
+/// An unobserved strict-mode refusal stays transient and side-effect-free: no nonce
+/// is consumed, no tx row/receipt is created, and no job is queued. An already
+/// observed but shallow GER instead waits here, also before any side effect,
+/// until the configured evidence finality is reached.
 ///
 /// Metric discipline: `ger_injection_unverified_total` increments on every
 /// unverified sighting this function makes. The writer-mode request path only
@@ -544,21 +568,16 @@ pub async fn ensure_ger_l1_observed(
             // on L1" stays the stable substring for the unresolved case that the
             // e2e / callers match; "not yet" for the not-final case.)
             if roots_observed {
-                anyhow::bail!(
-                    "GER {} was observed on L1 but is not yet final per the `{}` evidence \
-                     setting (finality guard, audit H6); refusing injection under \
-                     --reject-unverified-ger-injection. Transient — retry once the L1 \
-                     observation finalizes.",
-                    hex::encode(ger_bytes),
-                    evidence_tag.describe(),
-                );
+                return Err(GerL1GateError::NotFinal {
+                    ger: hex::encode(ger_bytes),
+                    evidence_tag: evidence_tag.describe(),
+                }
+                .into());
             }
-            anyhow::bail!(
-                "GER {} was not observed on L1 by the indexer (exit-root decomposition \
-                 unresolved); refusing injection under --reject-unverified-ger-injection \
-                 (audit H6). Retry after the L1 InfoTree indexer catches up.",
-                hex::encode(ger_bytes)
-            );
+            return Err(GerL1GateError::NotObserved {
+                ger: hex::encode(ger_bytes),
+            }
+            .into());
         }
         tracing::warn!(
             ger = %hex::encode(ger_bytes),
@@ -570,6 +589,117 @@ pub async fn ensure_ger_l1_observed(
         );
     }
     Ok(())
+}
+
+/// Wait for an already-observed GER to reach the configured strict-H6 finality.
+///
+/// An unobserved GER is still refused immediately: it may be forged, and the
+/// indexer has supplied no evidence that waiting is justified. Once both roots
+/// are observed, however, finality is only a time-dependent gate. Keeping this
+/// request pending is side-effect-free and closes the race where aggoracle sent
+/// once between observation and the next indexer cursor advance, received a
+/// transient refusal, and never produced another usable submission.
+pub async fn wait_for_ger_l1_observed(
+    store: &Arc<dyn crate::store::Store>,
+    ger_bytes: &[u8; 32],
+    require_l1_observed: bool,
+    evidence_tag: EvidenceTag,
+    txn_hash: TxHash,
+) -> anyhow::Result<()> {
+    wait_for_ger_l1_observed_with_timing(
+        store,
+        ger_bytes,
+        require_l1_observed,
+        evidence_tag,
+        txn_hash,
+        GER_FINALITY_WAIT_TIMEOUT,
+        GER_FINALITY_POLL_INTERVAL,
+    )
+    .await
+}
+
+async fn wait_for_ger_l1_observed_with_timing(
+    store: &Arc<dyn crate::store::Store>,
+    ger_bytes: &[u8; 32],
+    require_l1_observed: bool,
+    evidence_tag: EvidenceTag,
+    txn_hash: TxHash,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let pending_error = match ensure_ger_l1_observed(
+        store,
+        ger_bytes,
+        require_l1_observed,
+        evidence_tag,
+        txn_hash,
+    )
+    .await
+    {
+        Ok(()) => return Ok(()),
+        Err(err)
+            if require_l1_observed
+                && matches!(
+                    err.downcast_ref::<GerL1GateError>(),
+                    Some(GerL1GateError::NotFinal { .. })
+                ) =>
+        {
+            err
+        }
+        Err(err) => return Err(err),
+    };
+
+    tracing::info!(
+        ger = %hex::encode(ger_bytes),
+        tx = %txn_hash,
+        evidence_tag = %evidence_tag.describe(),
+        timeout_secs = timeout.as_secs(),
+        "GER is L1-observed but not final yet; waiting side-effect-free before admission"
+    );
+
+    let started = Instant::now();
+    loop {
+        if ger_l1_finality_reached(store, ger_bytes, evidence_tag).await? {
+            tracing::info!(
+                ger = %hex::encode(ger_bytes),
+                waited_ms = started.elapsed().as_millis() as u64,
+                "GER L1 evidence reached finality; continuing admission"
+            );
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            tracing::warn!(
+                ger = %hex::encode(ger_bytes),
+                waited_secs = started.elapsed().as_secs(),
+                "timed out waiting for GER L1 evidence finality"
+            );
+            return Err(pending_error);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn ger_l1_finality_reached(
+    store: &Arc<dyn crate::store::Store>,
+    ger_bytes: &[u8; 32],
+    evidence_tag: EvidenceTag,
+) -> anyhow::Result<bool> {
+    if store.is_ger_injected(ger_bytes).await? {
+        return Ok(true);
+    }
+    let Some(entry) = store.get_ger_entry(ger_bytes).await? else {
+        return Ok(false);
+    };
+    if entry.mainnet_exit_root.is_none() || entry.rollup_exit_root.is_none() {
+        return Ok(false);
+    }
+    match evidence_tag {
+        EvidenceTag::Confirmations(depth) => {
+            let l1_head = store.get_l1_indexer_cursor().await?;
+            Ok(entry.block_number > 0 && l1_head.saturating_sub(entry.block_number) >= depth)
+        }
+        EvidenceTag::Finalized | EvidenceTag::Safe => Ok(entry.finalized_verified),
+    }
 }
 
 #[cfg(test)]
@@ -956,5 +1086,67 @@ mod tests {
         ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Confirmations(64), tx_hash)
             .await
             .expect("confirmation-deep observation must pass");
+    }
+
+    /// Regression for task #59: once the indexer has resolved both roots, a
+    /// one-block finality race is held side-effect-free until the cursor advances.
+    /// Before this wait, a one-shot aggoracle submission could be refused in this
+    /// window and the deposit would remain stalled indefinitely.
+    #[tokio::test]
+    async fn h6_observed_ger_waits_for_confirmation_cursor() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let ger = combined_ger(&[0x3Au8; 32], &[0x3Bu8; 32]);
+        let tx_hash = TxHash::from([0x48u8; 32]);
+        store
+            .set_ger_exit_roots(&ger, [0x3Au8; 32], [0x3Bu8; 32], 100, 1_700_000_000)
+            .await
+            .unwrap();
+        store.set_l1_indexer_cursor(100).await.unwrap();
+
+        let advancing_store = store.clone();
+        let advance = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            advancing_store.set_l1_indexer_cursor(101).await.unwrap();
+        });
+
+        wait_for_ger_l1_observed_with_timing(
+            &store,
+            &ger,
+            true,
+            EvidenceTag::Confirmations(1),
+            tx_hash,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("an observed GER must be admitted once its confirmation becomes final");
+        advance.await.unwrap();
+        assert_eq!(store.get_l1_indexer_cursor().await.unwrap(), 101);
+    }
+
+    /// Unknown roots are not eligible for the wait: they may be forged and must
+    /// retain the strict H6 immediate-refusal behavior.
+    #[tokio::test]
+    async fn h6_unobserved_ger_does_not_enter_finality_wait() {
+        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
+        let ger = [0x49u8; 32];
+        let tx_hash = TxHash::from([0x49u8; 32]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_ger_l1_observed_with_timing(
+                &store,
+                &ger,
+                true,
+                EvidenceTag::Confirmations(1),
+                tx_hash,
+                Duration::from_secs(60),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("an unobserved GER must be rejected without waiting");
+        let err = result.expect_err("an unobserved GER must remain rejected");
+        assert!(err.to_string().contains("not observed on L1"));
     }
 }

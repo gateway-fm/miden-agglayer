@@ -858,8 +858,9 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // forever — an aggoracle/ethtxmanager wedge. Run the gate here, before
         // any side-effect, so a strict-mode rejection leaves NOTHING behind
         // (no accepted hash, no nonce, no tx row/receipt, no queued job) and
-        // the SAME signed transaction (same nonce) is accepted once the
-        // indexer catches up. The worker's own `insert_ger` gate remains as
+        // the request waits here before admission when the GER is already observed
+        // but not final. Unknown roots are rejected immediately, leaving the same
+        // signed transaction retryable once the indexer observes them. The worker's own `insert_ger` gate remains as
         // defense-in-depth.
         //
         // Only run under strict mode: in lenient mode the gate never rejects,
@@ -869,7 +870,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         if service.reject_unverified_ger
             && let crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } = &decoded
         {
-            crate::ger::ensure_ger_l1_observed(
+            crate::ger::wait_for_ger_l1_observed(
                 &service.store,
                 ger_bytes,
                 true,
