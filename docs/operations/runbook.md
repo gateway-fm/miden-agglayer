@@ -67,15 +67,22 @@ its shape for new environments.
 | `--reject-zero-padding-addresses` | `REJECT_ZERO_PADDING_ADDRESSES` | `false` | Refuse the address-mapper zero-padding fallback (production posture). |
 | `--disable-hardhat-alias` | `DISABLE_HARDHAT_ALIAS` | `false` | Refuse the well-known Hardhat address remap (Cantina MA#8). **MUST be set in production.** |
 | `--reject-unverified-ger-injection` | `REJECT_UNVERIFIED_GER_INJECTION` | `false` | Audit H6: refuse GER injection unless the independent L1 indexer observed its decomposition under the configured evidence policy. Production must enable this (or `REQUIRE_HARDENING`). Strict startup requires valid `L1_RPC_URL` and `GER_L1_ADDRESS`; a fresh database also requires `L1_INDEXER_FROM_BLOCK` at or before rollup deployment. Rejections are side-effect-free and retryable. |
-| `--l1-evidence-tag` | `L1_EVIDENCE_TAG` | `confirmations:64` | Canonical evidence policy: `confirmations:<N>`, `safe`, or `finalized`. The database is bound to this exact value; hardened mode requires `finalized`. |
+| `--l1-evidence-tag` | `L1_EVIDENCE_TAG` | `latest` | The one frontier used by the entire L1 evidence scan: `latest`, `safe`, or `finalized`. The database is bound to this exact value; hardened mode requires `safe` or `finalized`. |
 | `--require-hardening` | `REQUIRE_HARDENING` | `false` | Startup invariant: refuse to boot unless `ADMIN_API_KEY`, `ALLOWED_SIGNERS`, `MIDEN_PROVER_URL`, `DISABLE_HARDHAT_ALIAS` are set and CORS is not `*`. Also enables strict H6 and requires its L1 evidence source. Set it on any internet-adjacent deployment. |
 | `--miden-debug` | `MIDEN_DEBUG` | `false` | Verbose Miden VM traces. Disable in production. |
 
 Evidence policy is immutable for a running database. To change it, stop the
 service and clear policy-derived state in one PostgreSQL transaction:
 `BEGIN; UPDATE ger_entries SET finalized_verified = FALSE; UPDATE l1_indexer_state SET finalized_block = 0, finalized_scan_cursor = 0, evidence_tag = NULL; COMMIT;`.
-Restart with the new `L1_EVIDENCE_TAG`; the finality scan rebuilds from block
-0. Never edit only `evidence_tag`, because that would relabel old evidence.
+The `finalized_*` names are retained for migration compatibility; they hold the
+selected policy's marker and cursor, not a second scan. Restart with the new
+`L1_EVIDENCE_TAG` and an appropriate `L1_INDEXER_FROM_BLOCK` so the selected
+scan rebuilds its evidence. Never edit only `evidence_tag`, because that would
+relabel old evidence.
+
+On the first upgrade, `latest` alone resumes the legacy `last_processed`
+cursor. `safe` and `finalized` never inherit latest-scan progress; configure
+`L1_INDEXER_FROM_BLOCK` for their first backfill.
 
 ### Writer worker (RD-940)
 

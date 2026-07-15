@@ -92,11 +92,8 @@ pub struct L1InfoTreeIndexer {
     /// cursor advances forward normally; remove the flag for subsequent
     /// boots.
     from_block_override: Option<u64>,
-    /// Strict-H6 evidence qualification tag (audit H6 BLOCKER 3). When a
-    /// finality tag (`finalized`/`safe`) is configured, each poll also fetches
-    /// that L1 block and persists its number via `set_l1_finalized_block`, which
-    /// the strict gate uses to qualify evidence. In `Confirmations` mode the
-    /// indexer does no extra work (the gate uses the head cursor + depth).
+    /// The one L1 frontier this indexer scans. Roots are learned exclusively
+    /// from `latest`, `safe`, or `finalized` according to this setting.
     evidence_tag: crate::ger::EvidenceTag,
 }
 
@@ -113,45 +110,26 @@ impl L1InfoTreeIndexer {
         }
     }
 
-    /// Configure the strict-H6 evidence tag. In `Finalized`/`Safe` mode the
-    /// indexer tracks the corresponding L1 finality block (BLOCKER 3).
+    /// Configure the single L1 scan frontier.
     pub fn with_evidence_tag(mut self, tag: crate::ger::EvidenceTag) -> Self {
         self.evidence_tag = tag;
         self
     }
 
-    /// The L1 block tag to poll for finality tracking, or `None` in
-    /// confirmation-depth mode (no finality block needed).
-    fn finality_block_tag(&self) -> Option<BlockNumberOrTag> {
+    fn scan_block_tag(&self) -> BlockNumberOrTag {
         match self.evidence_tag {
-            crate::ger::EvidenceTag::Confirmations(_) => None,
-            crate::ger::EvidenceTag::Finalized => Some(BlockNumberOrTag::Finalized),
-            crate::ger::EvidenceTag::Safe => Some(BlockNumberOrTag::Safe),
+            crate::ger::EvidenceTag::Latest => BlockNumberOrTag::Latest,
+            crate::ger::EvidenceTag::Safe => BlockNumberOrTag::Safe,
+            crate::ger::EvidenceTag::Finalized => BlockNumberOrTag::Finalized,
         }
     }
 
-    /// Best-effort refresh of the persisted L1 finality-tag block (BLOCKER 3).
-    /// A no-op in confirmation-depth mode. A fetch/persist failure just leaves
-    /// the previous value — the strict gate stays fail-closed (never
-    /// over-authorizes on a stale finality block).
-    async fn refresh_finality_block<P: Provider>(&self, provider: &P) {
-        let Some(tag) = self.finality_block_tag() else {
-            return;
-        };
-        match provider.get_block_by_number(tag).await {
-            Ok(Some(block)) => {
-                let n = block.header.number;
-                if let Err(e) = self.store.set_l1_finalized_block(n).await {
-                    tracing::warn!(error = %e, tag = ?tag, "L1InfoTreeIndexer: failed to persist L1 finality block");
-                }
-            }
-            Ok(None) => {
-                tracing::debug!(tag = ?tag, "L1InfoTreeIndexer: L1 finality block not available yet");
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, tag = ?tag, "L1InfoTreeIndexer: failed to fetch L1 finality block");
-            }
-        }
+    async fn scan_head<P: Provider>(&self, provider: &P) -> anyhow::Result<u64> {
+        let tag = self.scan_block_tag();
+        let block = provider.get_block_by_number(tag).await?.ok_or_else(|| {
+            anyhow::anyhow!("L1 `{}` block is unavailable", self.evidence_tag.describe())
+        })?;
+        Ok(block.header.number)
     }
 
     /// Operator override for the indexer start block. Overrides both the
@@ -161,6 +139,12 @@ impl L1InfoTreeIndexer {
     pub fn with_from_block_override(mut self, from_block: u64) -> Self {
         self.from_block_override = Some(from_block);
         self
+    }
+
+    fn initial_cursor(&self, stored: u64, selected_head: u64) -> u64 {
+        self.from_block_override
+            .map(|from| from.saturating_sub(1))
+            .unwrap_or_else(|| if stored == 0 { selected_head } else { stored })
     }
 
     /// Spawn the indexer as a tokio task. Returns a oneshot sender for graceful
@@ -186,29 +170,29 @@ impl L1InfoTreeIndexer {
                 "L1InfoTreeIndexer starting"
             );
 
-            // Resume from the persisted cursor if we have one, else start at
-            // current L1 head. The persisted cursor closes the gap that
+            // Resume from the selected-policy cursor if we have one, else start
+            // at the configured L1 frontier. The persisted cursor closes the gap that
             // stranded GERs every time the proxy restarted (OOMKills,
             // planned deploys): historic `UpdateL1InfoTree` events emitted
             // during downtime are now indexed on the next boot and the
             // orphan ger_entries rows from that window get their (M, R)
             // filled in by the indexer's `set_ger_exit_roots` UPSERT.
             //
-            // Fresh deployments (cursor = 0) start at head — same behaviour
+            // Fresh lenient deployments (cursor = 0) start at the selected head — same behaviour
             // as before persistence. Pre-existing deployments inherit a 0
             // cursor on first boot after the migration; treat 0 as "no
             // cursor recorded yet" and fall back to head to avoid a
             // multi-million-block backfill on the first boot.
-            let head = provider.get_block_number().await.unwrap_or_else(|e| {
-                tracing::error!(error = %e, "L1InfoTreeIndexer: failed to fetch initial L1 block; starting at 0");
+            let head = self.scan_head(&provider).await.unwrap_or_else(|e| {
+                tracing::error!(error = %e, tag = %self.evidence_tag.describe(), "L1InfoTreeIndexer: failed to fetch initial selected L1 block; starting at 0");
                 0
             });
-            let stored = match self.store.get_l1_indexer_cursor().await {
+            let stored = match self.store.get_l1_evidence_cursor().await {
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(
                         error = %e,
-                        "L1InfoTreeIndexer: failed to load persisted cursor; falling back to L1 head"
+                        "L1InfoTreeIndexer: failed to load selected-policy cursor; falling back to selected L1 head"
                     );
                     0
                 }
@@ -217,9 +201,9 @@ impl L1InfoTreeIndexer {
             //   1. Operator override (`--l1-indexer-from-block <N>`) wins
             //      unconditionally — used to backfill historic orphan GERs
             //      whose events predate the persisted cursor.
-            //   2. Else persisted cursor minus reorg margin, if non-zero.
-            //   3. Else current L1 head (fresh deployment).
-            let mut last_processed: u64 = if let Some(forced) = self.from_block_override {
+            //   2. Else the persisted selected-policy cursor, if non-zero.
+            //   3. Else the selected L1 head (fresh lenient deployment).
+            if let Some(forced) = self.from_block_override {
                 tracing::warn!(
                     from_block = forced,
                     stored_cursor = stored,
@@ -227,20 +211,13 @@ impl L1InfoTreeIndexer {
                     "L1InfoTreeIndexer: operator override active — starting from forced block. \
                      Remove --l1-indexer-from-block after this boot's backfill completes."
                 );
-                forced.saturating_sub(1)
-            } else if stored == 0 {
-                head
-            } else {
-                // Re-process a small reorg window so we don't miss reorg'd
-                // events. Sepolia 64 blocks ≈ 12 minutes, well inside what
-                // `get_logs` can chunk through quickly via max_range.
-                const REORG_MARGIN: u64 = 64;
-                stored.saturating_sub(REORG_MARGIN)
-            };
+            }
+            let mut last_processed = self.initial_cursor(stored, head);
             tracing::info!(
                 start_block = last_processed,
                 stored_cursor = stored,
-                l1_head = head,
+                selected_head = head,
+                evidence_tag = %self.evidence_tag.describe(),
                 from_block_override = ?self.from_block_override,
                 "L1InfoTreeIndexer cursor initialized"
             );
@@ -275,26 +252,23 @@ impl L1InfoTreeIndexer {
         provider: &P,
         last_processed: &mut u64,
     ) -> anyhow::Result<()> {
-        // Keep the L1 finality-tag block fresh for the strict gate (no-op in
-        // confirmation-depth mode). Done before the head check so it still
-        // advances while the head is idle.
-        self.refresh_finality_block(provider).await;
-        // BLOCKER 1 — mark finalized-chain evidence (no-op in confirmation-depth
-        // mode). Runs regardless of head progress so finality marking keeps up.
-        self.poll_finalized_scan(provider).await?;
+        let head = self.scan_head(provider).await?;
+        self.poll_to_head(provider, last_processed, head).await
+    }
 
-        let head = provider.get_block_number().await?;
+    async fn poll_to_head<P: Provider>(
+        &self,
+        provider: &P,
+        last_processed: &mut u64,
+        head: u64,
+    ) -> anyhow::Result<()> {
         if head <= *last_processed {
             return Ok(());
         }
 
-        // Index the `(mainnet, rollup)` decomposition up to LATEST — ordinary
-        // decomposition / bridge readiness (`zkevm_getExitRootsByGER`) must not
-        // be delayed. H6 reorg-safety for the IRREVERSIBLE strict injection is
-        // enforced at the gate instead (`ger::ensure_ger_l1_observed` requires
-        // the observation to be `confirmations`-deep on L1, using this indexer's
-        // persisted cursor as the head), so a not-yet-final observation is
-        // recorded for normal use but not trusted for strict authorization.
+        // One configured scan is the sole source of L1 root evidence. In
+        // `safe`/`finalized` mode, decomposition intentionally becomes visible
+        // only when that frontier reaches the event.
         let from = *last_processed + 1;
         let to = head.min(from + self.max_range - 1);
 
@@ -380,91 +354,19 @@ impl L1InfoTreeIndexer {
 
         *last_processed = to;
 
-        // Persist the cursor so a restart resumes from here instead of
-        // jumping back to L1 head. Failure to persist is logged but does
+        // Persist the selected-policy cursor so a restart resumes from here.
+        // Failure to persist is logged but does
         // not abort the loop — we'd rather keep indexing on a transient
         // DB blip than wedge the service.
-        if let Err(e) = self.store.set_l1_indexer_cursor(to).await {
+        if let Err(e) = self.store.set_l1_evidence_cursor(to).await {
             tracing::warn!(
                 error = %e,
                 cursor = to,
-                "L1InfoTreeIndexer: failed to persist cursor; continuing in-memory"
+                "L1InfoTreeIndexer: failed to persist selected-policy cursor; continuing in-memory"
             );
             metrics::counter!("l1_info_tree_indexer_cursor_persist_errors_total").increment(1);
         }
 
-        Ok(())
-    }
-
-    /// Audit H6 BLOCKER 1 — the FINALIZED-pinned scan. In a finality-tag mode,
-    /// scan `(mainnet, rollup)` events over `[finalized_scan_cursor+1,
-    /// finalized_block]` and `mark_ger_finalized` each pair. Because the window
-    /// ends at the L1 finalized/safe block, every log it returns is on the
-    /// canonical finalized chain — a fork's event at a height <= finalized is NOT
-    /// returned, so it is never marked and can never authorize. A no-op in
-    /// confirmation-depth mode. A mark-write failure keeps the batch retryable
-    /// (cursor not advanced), exactly like the latest scan.
-    async fn poll_finalized_scan<P: Provider>(&self, provider: &P) -> anyhow::Result<()> {
-        if !self.evidence_tag.is_finality_tag() {
-            return Ok(());
-        }
-        let finalized = self.store.get_l1_finalized_block().await?;
-        if finalized == 0 {
-            return Ok(());
-        }
-        let cursor = self.store.get_l1_finalized_scan_cursor().await?;
-        if finalized <= cursor {
-            return Ok(());
-        }
-        let from = cursor + 1;
-        let to = finalized.min(from + self.max_range - 1);
-
-        let filter = Filter::new()
-            .address(self.contract_address)
-            .from_block(from)
-            .to_block(to)
-            .event_signature(vec![
-                UpdateL1InfoTree::SIGNATURE_HASH,
-                UpdateGlobalExitRoot::SIGNATURE_HASH,
-            ]);
-        let logs: Vec<Log> = provider.get_logs(&filter).await?;
-
-        let mut marked = 0usize;
-        for log in &logs {
-            let topics = log.topics();
-            if topics.len() < 3 {
-                continue;
-            }
-            let mainnet: [u8; 32] = topics[1].0;
-            let rollup: [u8; 32] = topics[2].0;
-            let combined = combined_ger(&mainnet, &rollup);
-            if let Err(e) = self.store.mark_ger_finalized(&combined).await {
-                metrics::counter!("l1_info_tree_indexer_log_errors_total").increment(1);
-                return Err(e.context(format!(
-                    "L1InfoTreeIndexer: finalized mark failed at block {}; finalized batch \
-                     [{from}, {to}] left unadvanced (retryable)",
-                    log.block_number.unwrap_or(0)
-                )));
-            }
-            marked += 1;
-        }
-
-        if marked > 0 {
-            tracing::info!(
-                from,
-                to,
-                finalized,
-                marked,
-                "L1InfoTreeIndexer: marked finalized-chain evidence"
-            );
-        }
-        if let Err(e) = self.store.set_l1_finalized_scan_cursor(to).await {
-            tracing::warn!(
-                error = %e,
-                cursor = to,
-                "L1InfoTreeIndexer: failed to persist finalized-scan cursor; continuing in-memory"
-            );
-        }
         Ok(())
     }
 
@@ -574,7 +476,7 @@ fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::store::memory::InMemoryStore;
-    use alloy::primitives::{B256, Bytes, LogData, TxHash, U64};
+    use alloy::primitives::{B256, Bytes, LogData, TxHash};
     use alloy::providers::ProviderBuilder;
     use alloy_transport::mock::Asserter;
 
@@ -636,85 +538,46 @@ mod tests {
         }
     }
 
-    /// BLOCKER 1 — the indexer records the decomposition up to LATEST (NO
-    /// confirmation delay for ordinary decomposition), while the STRICT gate
-    /// enforces finality using the indexer cursor as the L1 head. Drives the
-    /// REAL `poll_once` with a mock L1: a pair only 2 blocks deep is recorded
-    /// immediately (so `get_ger_entry` / `zkevm_getExitRootsByGER` see it with no
-    /// delay), yet the strict gate REFUSES it until the cursor advances past the
-    /// confirmation depth — which is exactly what keeps a short-lived reorg from
-    /// authorizing an irreversible injection while never delaying normal ops.
-    ///
-    /// Mutation check: dropping the gate's `l1_head - block >= confirmations`
-    /// clause makes the shallow observation wrongly authorize (phase-1 pass).
+    /// The one selected scan writes roots and provenance together, then advances
+    /// its one cursor. The strict gate can therefore trust exactly those rows.
     #[tokio::test]
-    async fn h6_indexes_to_latest_but_strict_gate_waits_for_finality() {
+    async fn selected_scan_persists_roots_provenance_and_cursor() {
         let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-        let indexer = test_indexer(store.clone());
+        let indexer = test_indexer(store.clone()).with_evidence_tag(crate::ger::EvidenceTag::Safe);
 
         let mainnet = B256::from([0x0Au8; 32]);
         let rollup = B256::from([0x0Bu8; 32]);
         let ger = combined_ger(&mainnet.0, &rollup.0);
-        let tx = TxHash::from([0x01u8; 32]);
-        const CONF: u64 = 64;
 
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let mut last_processed = 0u64;
 
-        // Phase 1 — L1 head 10: poll_once indexes the pair at block 8 IMMEDIATELY
-        // (only 2 deep) and advances the cursor to head. Ordinary decomposition
-        // sees it at once; the strict gate refuses it (2 < 64) — transiently.
-        asserter.push_success(&U64::from(10u64));
         asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
         asserter.push_success(&Option::<serde_json::Value>::None); // block ts → 0
         indexer
-            .poll_once(&provider, &mut last_processed)
+            .poll_to_head(&provider, &mut last_processed, 10)
             .await
             .unwrap();
-        assert_eq!(
-            last_processed, 10,
-            "cursor tracks latest (no confirmation delay)"
-        );
+        assert_eq!(last_processed, 10);
+        assert_eq!(store.get_l1_evidence_cursor().await.unwrap(), 10);
         let entry = store
             .get_ger_entry(&ger)
             .await
             .unwrap()
-            .expect("decomposition must be recorded immediately (no delay for normal ops)");
+            .expect("selected scan must persist the decomposition");
         assert!(entry.mainnet_exit_root.is_some() && entry.rollup_exit_root.is_some());
+        assert!(entry.evidence_verified);
 
-        let err = crate::ger::ensure_ger_l1_observed(
-            &store,
-            &ger,
-            true,
-            crate::ger::EvidenceTag::Confirmations(CONF),
-            tx,
-        )
-        .await
-        .expect_err("strict gate must refuse a not-yet-confirmation-deep observation");
-        assert!(
-            err.to_string().contains("not yet"),
-            "must cite the finality guard: {err:#}"
-        );
-
-        // Phase 2 — L1 advances to 80: poll_once moves the cursor to 80, so the
-        // block-8 observation is now 72 deep (>= 64) and the strict gate passes.
-        asserter.push_success(&U64::from(80u64));
-        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new()); // no new events
-        indexer
-            .poll_once(&provider, &mut last_processed)
-            .await
-            .unwrap();
-        assert_eq!(last_processed, 80, "cursor advanced to the new head");
         crate::ger::ensure_ger_l1_observed(
             &store,
             &ger,
             true,
-            crate::ger::EvidenceTag::Confirmations(CONF),
-            tx,
+            crate::ger::EvidenceTag::Safe,
+            TxHash::from([0x01u8; 32]),
         )
         .await
-        .expect("strict gate must authorize once the observation is confirmation-deep");
+        .expect("selected-scan evidence must authorize strict admission");
     }
 
     /// BLOCKER 3 (retryable batch) — a durable evidence-write failure must keep
@@ -739,13 +602,12 @@ mod tests {
 
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        asserter.push_success(&U64::from(100u64));
         asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
         asserter.push_success(&Option::<serde_json::Value>::None);
 
         let mut last_processed = 0u64;
         let err = indexer
-            .poll_once(&provider, &mut last_processed)
+            .poll_to_head(&provider, &mut last_processed, 100)
             .await
             .expect_err("a durable evidence-write failure must fail the batch");
         assert!(
@@ -758,67 +620,20 @@ mod tests {
         );
     }
 
-    /// BLOCKER 1 (re-review) — the FINALIZED-pinned scan is the finalized-chain
-    /// tie. In `finalized` mode it scans `[cursor+1, finalized_block]` (whose logs
-    /// ARE the canonical finalized chain) and marks each pair `finalized_verified`
-    /// — which is exactly what the strict `finalized` gate then requires. A
-    /// `latest`-observed pair NOT covered by this scan is never marked and cannot
-    /// authorize (proved in `ger::tests::h6_finalized_tag_gate_requires_finalized_chain_tie`).
-    ///
-    /// Mutation check: making `poll_finalized_scan` a no-op leaves the row
-    /// unverified → the authorize step below fails.
-    #[tokio::test]
-    async fn poll_finalized_scan_marks_finalized_chain_evidence() {
+    #[test]
+    fn one_tag_and_from_block_drive_the_single_cursor() {
         let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-        let indexer =
-            test_indexer(store.clone()).with_evidence_tag(crate::ger::EvidenceTag::Finalized);
+        let latest = test_indexer(store.clone());
+        let safe = test_indexer(store.clone()).with_evidence_tag(crate::ger::EvidenceTag::Safe);
+        let finalized = test_indexer(store)
+            .with_evidence_tag(crate::ger::EvidenceTag::Finalized)
+            .with_from_block_override(12_345);
 
-        let mainnet = B256::from([0x0Au8; 32]);
-        let rollup = B256::from([0x0Bu8; 32]);
-        let ger = combined_ger(&mainnet.0, &rollup.0);
-        // The latest scan already recorded roots (block 8); NOT finalized yet.
-        store
-            .set_ger_exit_roots(&ger, mainnet.0, rollup.0, 8, 0)
-            .await
-            .unwrap();
-        assert!(
-            !store
-                .get_ger_entry(&ger)
-                .await
-                .unwrap()
-                .unwrap()
-                .finalized_verified,
-            "must start un-finalized"
-        );
-
-        // The L1 finalized block (100) is well above block 8; the finalized scan
-        // covers [1, 100] and reads the canonical pair.
-        store.set_l1_finalized_block(100).await.unwrap();
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
-        indexer.poll_finalized_scan(&provider).await.unwrap();
-
-        assert!(
-            store
-                .get_ger_entry(&ger)
-                .await
-                .unwrap()
-                .unwrap()
-                .finalized_verified,
-            "the finalized-pinned scan must mark the canonical pair finalized_verified"
-        );
-        assert_eq!(store.get_l1_finalized_scan_cursor().await.unwrap(), 100);
-
-        // The strict `finalized` gate now authorizes it (roots + finalized_verified).
-        crate::ger::ensure_ger_l1_observed(
-            &store,
-            &ger,
-            true,
-            crate::ger::EvidenceTag::Finalized,
-            TxHash::from([0x01u8; 32]),
-        )
-        .await
-        .expect("a finalized-chain-verified observation must authorize");
+        assert_eq!(latest.scan_block_tag(), BlockNumberOrTag::Latest);
+        assert_eq!(safe.scan_block_tag(), BlockNumberOrTag::Safe);
+        assert_eq!(finalized.scan_block_tag(), BlockNumberOrTag::Finalized);
+        assert_eq!(finalized.initial_cursor(0, 20_000_000), 12_344);
+        assert_eq!(safe.initial_cursor(77, 100), 77);
+        assert_eq!(latest.initial_cursor(0, 100), 100);
     }
 }

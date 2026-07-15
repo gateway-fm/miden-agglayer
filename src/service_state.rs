@@ -106,14 +106,10 @@ pub struct ServiceState {
     /// `ger_injection_unverified_total` metric) to tolerate indexer lag;
     /// `--require-hardening` implies true.
     pub reject_unverified_ger: bool,
-    /// Audit H6 — the SINGLE strict-H6 evidence-finality setting (parsed from
-    /// `--l1-evidence-tag` / `L1_EVIDENCE_TAG`): `confirmations:<N>` (depth below
-    /// the indexer head cursor), `finalized`, or `safe`. This one value fully
-    /// specifies how the gate qualifies an L1 observation as final — there is no
-    /// second confirmation-depth knob. Enforced at the gate
-    /// (`ger::ensure_ger_l1_observed`); normal decomposition is unaffected.
-    /// Mandatory `finalized` under `--require-hardening`. Defaults to
-    /// `confirmations:DEFAULT_CONFIRMATIONS`.
+    /// Audit H6 — the single L1 frontier scanned for evidence: `latest`,
+    /// `safe`, or `finalized`. Roots are persisted only from this scan, so row
+    /// provenance and the scan cursor always share one setting. Hardened mode
+    /// accepts `safe` or `finalized`; the default is `latest`.
     pub l1_evidence_tag: crate::ger::EvidenceTag,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one

@@ -9,24 +9,26 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Polling policy for the narrow strict-H6 state where a GER is already
-/// corroborated by the L1 indexer but has not reached the configured finality
-/// yet. Keeping the request pending is side-effect-free (no nonce, tx row, or
-/// Miden submission exists yet) and prevents a one-shot aggoracle broadcast
-/// from being lost in the observation-to-finality race.
-const GER_FINALITY_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const GER_FINALITY_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Polling policy while the single configured L1 scan catches up to a GER.
+/// Waiting is side-effect-free: no nonce, transaction row, writer job, or Miden
+/// submission exists until the selected `latest` / `safe` / `finalized` scan
+/// has persisted both roots.
+#[cfg(not(test))]
+const GER_EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const GER_EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const GER_EVIDENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// Request-path tests exercise timeout behavior without waiting 15 minutes.
+#[cfg(test)]
+const GER_EVIDENCE_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 enum GerL1GateError {
     #[error(
-        "GER {ger} was observed on L1 but is not yet final per the `{evidence_tag}` evidence setting (finality guard, audit H6); refusing injection under --reject-unverified-ger-injection. Transient — retry once the L1 observation finalizes."
+        "GER {ger} was not observed by the configured L1 `{evidence_tag}` scan (exit-root decomposition unresolved); refusing injection under --reject-unverified-ger-injection (audit H6). Retry after that scan catches up."
     )]
-    NotFinal { ger: String, evidence_tag: String },
-    #[error(
-        "GER {ger} was not observed on L1 by the indexer (exit-root decomposition unresolved); refusing injection under --reject-unverified-ger-injection (audit H6). Retry after the L1 InfoTree indexer catches up."
-    )]
-    NotObserved { ger: String },
+    NotObserved { ger: String, evidence_tag: String },
 }
 
 alloy_core::sol! {
@@ -41,94 +43,43 @@ alloy_core::sol! {
     function updateExitRoot(bytes32 newRollupExitRoot, bytes32 newMainnetExitRoot);
 }
 
-/// Default L1 confirmation depth for STRICT H6 GER authorization (audit H6).
-///
-/// A Miden GER injection is IRREVERSIBLE and the evidence store has no
-/// revoke/rollback, so under strict `--reject-unverified-ger-injection` an
-/// observation must be at least this many L1 blocks deep before it authorizes an
-/// injection — a short-lived reorg then cannot leave a stale "observed" row that
-/// permanently authorizes a GER that never truly landed on canonical L1.
-///
-/// This depth is enforced at admission (`wait_for_ger_l1_observed`), NOT at the
-/// indexer cursor: the indexer records the `(mainnet, rollup)` decomposition up
-/// to LATEST so ordinary decomposition / bridge readiness
-/// (`zkevm_getExitRootsByGER`) is never delayed. Only strict authorization waits
-/// for finality. 64 ≈ Sepolia finality (justification ~1 epoch, finality ~2
-/// epochs / 64 slots).
-pub const DEFAULT_CONFIRMATIONS: u64 = 64;
-
-/// The SINGLE strict-H6 evidence-finality setting (audit H6). One value fully
-/// specifies how the gate qualifies an L1 observation as final enough to
-/// authorize an irreversible GER injection — there is no second finality knob.
+/// The single L1 evidence scan setting (audit H6). The indexer scans exactly one
+/// canonical frontier and stores roots only from that frontier:
 /// Parsed from `--l1-evidence-tag` / `L1_EVIDENCE_TAG`:
-///   - `confirmations:<N>` — depth-below-head: the observation must be `N` blocks
-///     below the indexer's head cursor (strict-non-hardened only).
-///   - `finalized`         — the observation's `(mainnet, rollup)` must be on the
-///     L1 FINALIZED canonical chain (BLOCKER 1 finalized-chain tie). MANDATORY
-///     under `--require-hardening`.
-///   - `safe`              — same, against the L1 `safe` block (weaker; not
-///     sufficient for hardened).
+///   - `latest` — lowest latency; may include reorgable L1 blocks.
+///   - `safe` — scan only through the L1 safe head.
+///   - `finalized` — scan only through the L1 finalized head.
 ///
-/// Normal (lenient) decomposition (`zkevm_getExitRootsByGER`) never consults
-/// this — it reads the evidence row directly, so bridge readiness is unaffected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `safe` and `finalized` satisfy `--require-hardening`; `latest` does not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EvidenceTag {
-    /// Depth `N` below the indexer head cursor.
-    Confirmations(u64),
+    #[default]
+    Latest,
+    Safe,
     /// On the L1 finalized canonical chain.
     Finalized,
-    /// On the L1 safe canonical chain.
-    Safe,
-}
-
-impl Default for EvidenceTag {
-    fn default() -> Self {
-        Self::Confirmations(DEFAULT_CONFIRMATIONS)
-    }
 }
 
 impl EvidenceTag {
-    /// True for the L1 finality-tag modes (`finalized` / `safe`), which qualify
-    /// evidence against the finalized/safe canonical chain rather than a
-    /// confirmation depth below head.
-    pub fn is_finality_tag(self) -> bool {
-        matches!(self, Self::Finalized | Self::Safe)
-    }
-
     /// Human/log form, round-trippable through `parse`.
-    pub fn describe(self) -> String {
+    pub fn describe(self) -> &'static str {
         match self {
-            Self::Confirmations(n) => format!("confirmations:{n}"),
-            Self::Finalized => "finalized".to_string(),
-            Self::Safe => "safe".to_string(),
+            Self::Latest => "latest",
+            Self::Safe => "safe",
+            Self::Finalized => "finalized",
         }
     }
 
-    /// Parse the single CLI/env value. Accepts `finalized`, `safe`,
-    /// `confirmations:<N>`, and bare `confirmations` (→ `DEFAULT_CONFIRMATIONS`).
-    /// `None` on an unrecognised token or a malformed depth.
+    /// Parse the single CLI/env value.
     pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim().to_ascii_lowercase();
-        match s.as_str() {
-            "finalized" => return Some(Self::Finalized),
-            "safe" => return Some(Self::Safe),
-            "confirmations" => {
-                return Some(Self::Confirmations(DEFAULT_CONFIRMATIONS));
-            }
-            _ => {}
+        match s.trim().to_ascii_lowercase().as_str() {
+            "latest" => Some(Self::Latest),
+            "safe" => Some(Self::Safe),
+            "finalized" => Some(Self::Finalized),
+            _ => None,
         }
-        let rest = s.strip_prefix("confirmations:")?;
-        rest.trim().parse::<u64>().ok().map(Self::Confirmations)
     }
 }
-
-/// Minimum confirmation depth strict H6 will boot with. Zero would authorize an
-/// irreversible injection from a 0-confirmation (freely reorg-able) observation,
-/// defeating the finality guarantee — so strict mode refuses to start with
-/// `confirmations:<N>` where `N < MIN_STRICT_CONFIRMATIONS` (see
-/// `check_h6_evidence_source`). Production should use `DEFAULT_CONFIRMATIONS` or
-/// higher, or `finalized`; the floor merely forbids the outright-unsafe zero.
-pub const MIN_STRICT_CONFIRMATIONS: u64 = 1;
 
 /// Compute the combined GER from mainnet and rollup exit roots.
 pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
@@ -327,11 +278,10 @@ pub(crate) async fn record_ger_submission_handoff(
 /// bytes are otherwise trusted verbatim: a compromised signer could inject a
 /// FORGED GER (one whose `(mainnet, rollup)` decomposition the indexer never saw
 /// on L1) onto Miden. The indexer writes the authoritative decomposition via
-/// `set_ger_exit_roots`; a GER is "resolved" only when BOTH roots are recorded —
-/// the same predicate `zkevm_getExitRootsByGER` answers with (anything less
-/// returns null there so bridge-service retries). When `require_l1_observed` is
-/// set, an unresolved GER is refused before it reaches Miden; otherwise it is
-/// allowed through (to tolerate indexer lag) but flagged via the
+/// `set_ger_exit_roots`; strict admission requires BOTH roots plus the
+/// database-bound selected-scan provenance marker. When `require_l1_observed`
+/// is set, a GER without that evidence is refused before it reaches Miden;
+/// otherwise it is allowed through (to tolerate indexer lag) but flagged via the
 /// `ger_injection_unverified_total` metric + warn.
 ///
 /// The duplicate check runs BEFORE the H6 gate: an already-injected GER is a
@@ -379,7 +329,7 @@ pub async fn insert_ger(
     // reflects "have we already submitted the Miden tx and committed the
     // synthetic event for this GER?". (`wait_for_ger_l1_observed` above already
     // short-circuits on the same `is_ger_injected` check, so an already-injected
-    // GER never reaches the gate's finality logic — this read then just decides
+    // GER never reaches the gate's evidence check — this read then just decides
     // the duplicate no-op return value.)
     let is_new = !store.is_ger_injected(&ger_bytes).await?;
 
@@ -473,12 +423,10 @@ pub async fn insert_ger(
 /// increment, txn_begin, or receipt creation).
 ///
 /// Verifies the GER was observed on L1 by the independent L1InfoTreeIndexer
-/// (it writes the `(mainnet, rollup)` decomposition via `set_ger_exit_roots`).
-/// "Observed" means BOTH roots resolved — the same predicate
-/// `zkevm_getExitRootsByGER` uses (ger_entries rows exist in partial states:
-/// the indexer pre-creates them with roots to be filled in later). A GER with
-/// no resolved decomposition was supplied only by the aggoracle and never
-/// corroborated by an L1 observation — a forged-GER injection signal.
+/// (it atomically writes the `(mainnet, rollup)` decomposition and selected-scan
+/// provenance via `set_ger_exit_roots`). A row populated by another path, or by
+/// a pre-upgrade `latest` scan, is not sufficient until the configured scan
+/// rewrites it. Missing selected-scan evidence is a forged-GER injection signal.
 ///
 /// The duplicate check runs FIRST: an already-injected GER never reaches
 /// Miden, so the gate has nothing to stop — and refusing it would break
@@ -494,10 +442,10 @@ pub async fn insert_ger(
 ///   - `insert_ger` repeats it inside the worker immediately before Miden
 ///     submission as a defense-in-depth state check.
 ///
-/// An unobserved strict-mode refusal stays transient and side-effect-free: no nonce
-/// is consumed, no tx row/receipt is created, and no job is queued. An already
-/// observed but shallow GER instead waits here, also before any side effect,
-/// until the configured evidence finality is reached.
+/// A strict-mode wait/refusal stays side-effect-free: no nonce is consumed, no
+/// tx row/receipt is created, and no job is queued. This matters for `safe` and
+/// `finalized`, where a legitimate event is intentionally absent until the
+/// selected L1 frontier reaches it.
 ///
 /// Metric discipline: `ger_injection_unverified_total` increments on every
 /// unverified sighting this function makes. The request path invokes it under
@@ -519,57 +467,19 @@ pub async fn ensure_ger_l1_observed(
         .as_ref()
         .is_some_and(|e| e.mainnet_exit_root.is_some() && e.rollup_exit_root.is_some());
 
-    // Finality is checked HERE (at the strict gate), NOT at the indexer cursor.
-    // The indexer records the `(mainnet, rollup)` decomposition up to LATEST, so
-    // ordinary decomposition / bridge readiness (`zkevm_getExitRootsByGER`, which
-    // reads `get_ger_entry` directly and does NOT call this gate) is never
-    // delayed. Only strict authorization of an IRREVERSIBLE injection
-    // additionally requires the observation to be final per the SINGLE
-    // `evidence_tag` setting:
-    //   - Confirmations(N): `l1_head - evidence_block >= N`, using the indexer's
-    //     persisted head cursor (strict-non-hardened only). An evidence row with
-    //     NO recorded L1 block (`block_number == 0`: a legacy/pre-guard row, or
-    //     one seeded by a non-indexer write path) is NOT final — fail-closed —
-    //     which closes the upgrade-state gap.
-    //   - Finalized / Safe (BLOCKER 1 finalized-chain tie): the row must be
-    //     `finalized_verified` — a flag the indexer sets ONLY from a scan pinned
-    //     to the L1 finalized/safe canonical chain. A `latest`-observed row from
-    //     a fork that was later reorged away is never `finalized_verified`, so a
-    //     block-height coincidence (`block <= finalized`) can no longer
-    //     authorize it. MANDATORY under `--require-hardening`.
-    // Lenient mode never gates on finality.
-    let final_enough = if require_l1_observed {
-        match entry.as_ref() {
-            Some(e) => match evidence_tag {
-                EvidenceTag::Confirmations(depth) => {
-                    let l1_head = store.get_l1_indexer_cursor().await?;
-                    e.block_number > 0 && l1_head.saturating_sub(e.block_number) >= depth
-                }
-                EvidenceTag::Finalized | EvidenceTag::Safe => e.finalized_verified,
-            },
-            None => false,
-        }
-    } else {
-        true
-    };
-
-    let l1_verified = roots_observed && final_enough;
+    // One scan, one policy, one provenance marker. The selected scan writes
+    // roots and the provenance marker together, so old `latest` roots from an
+    // upgraded database cannot be silently reinterpreted as `safe`/`finalized`
+    // evidence. The physical column retains its migration-era name, but now
+    // means "observed by the configured scan" for all three tags.
+    let policy_observed = entry.as_ref().is_some_and(|e| e.evidence_verified);
+    let l1_verified = roots_observed && policy_observed;
     if !l1_verified {
         ::metrics::counter!("ger_injection_unverified_total").increment(1);
         if require_l1_observed {
-            // A resolved-but-not-yet-final observation is a DISTINCT transient
-            // state from an unresolved one; surface it plainly. ("not observed
-            // on L1" stays the stable substring for the unresolved case that the
-            // e2e / callers match; "not yet" for the not-final case.)
-            if roots_observed {
-                return Err(GerL1GateError::NotFinal {
-                    ger: hex::encode(ger_bytes),
-                    evidence_tag: evidence_tag.describe(),
-                }
-                .into());
-            }
             return Err(GerL1GateError::NotObserved {
                 ger: hex::encode(ger_bytes),
+                evidence_tag: evidence_tag.describe().to_string(),
             }
             .into());
         }
@@ -578,21 +488,18 @@ pub async fn ensure_ger_l1_observed(
             tx = %txn_hash,
             roots_observed,
             evidence_tag = %evidence_tag.describe(),
-            "GER injection not yet corroborated/finalized by the L1 InfoTree indexer; \
+            policy_observed,
+            "GER injection not yet corroborated by the configured L1 InfoTree scan; \
              allowing through but unverified (lenient mode)"
         );
     }
     Ok(())
 }
 
-/// Wait for an already-observed GER to reach the configured strict-H6 finality.
-///
-/// An unobserved GER is still refused immediately: it may be forged, and the
-/// indexer has supplied no evidence that waiting is justified. Once both roots
-/// are observed, however, finality is only a time-dependent gate. Keeping this
-/// request pending is side-effect-free and closes the race where aggoracle sent
-/// once between observation and the next indexer cursor advance, received a
-/// transient refusal, and never produced another usable submission.
+/// Wait for the configured single L1 scan to persist a GER. Before the selected
+/// `safe`/`finalized` frontier reaches a legitimate event it is indistinguishable
+/// from an unknown GER, so the bounded wait covers both missing roots and a
+/// missing provenance marker. The signer allow-list and timeout bound exposure.
 pub async fn wait_for_ger_l1_observed(
     store: &Arc<dyn crate::store::Store>,
     ger_bytes: &[u8; 32],
@@ -606,8 +513,8 @@ pub async fn wait_for_ger_l1_observed(
         require_l1_observed,
         evidence_tag,
         txn_hash,
-        GER_FINALITY_WAIT_TIMEOUT,
-        GER_FINALITY_POLL_INTERVAL,
+        GER_EVIDENCE_WAIT_TIMEOUT,
+        GER_EVIDENCE_POLL_INTERVAL,
     )
     .await
 }
@@ -631,15 +538,7 @@ async fn wait_for_ger_l1_observed_with_timing(
     .await
     {
         Ok(()) => return Ok(()),
-        Err(err)
-            if require_l1_observed
-                && matches!(
-                    err.downcast_ref::<GerL1GateError>(),
-                    Some(GerL1GateError::NotFinal { .. })
-                ) =>
-        {
-            err
-        }
+        Err(err) if require_l1_observed && err.downcast_ref::<GerL1GateError>().is_some() => err,
         Err(err) => return Err(err),
     };
 
@@ -648,16 +547,16 @@ async fn wait_for_ger_l1_observed_with_timing(
         tx = %txn_hash,
         evidence_tag = %evidence_tag.describe(),
         timeout_secs = timeout.as_secs(),
-        "GER is L1-observed but not final yet; waiting side-effect-free before admission"
+        "waiting side-effect-free for the configured L1 scan to observe GER"
     );
 
     let started = Instant::now();
     loop {
-        if ger_l1_finality_reached(store, ger_bytes, evidence_tag).await? {
+        if ger_l1_evidence_reached(store, ger_bytes).await? {
             tracing::info!(
                 ger = %hex::encode(ger_bytes),
                 waited_ms = started.elapsed().as_millis() as u64,
-                "GER L1 evidence reached finality; continuing admission"
+                "configured L1 scan observed GER; continuing admission"
             );
             return Ok(());
         }
@@ -665,7 +564,7 @@ async fn wait_for_ger_l1_observed_with_timing(
             tracing::warn!(
                 ger = %hex::encode(ger_bytes),
                 waited_secs = started.elapsed().as_secs(),
-                "timed out waiting for GER L1 evidence finality"
+                "timed out waiting for configured L1 scan evidence"
             );
             return Err(pending_error);
         }
@@ -673,10 +572,9 @@ async fn wait_for_ger_l1_observed_with_timing(
     }
 }
 
-async fn ger_l1_finality_reached(
+async fn ger_l1_evidence_reached(
     store: &Arc<dyn crate::store::Store>,
     ger_bytes: &[u8; 32],
-    evidence_tag: EvidenceTag,
 ) -> anyhow::Result<bool> {
     if store.is_ger_injected(ger_bytes).await? {
         return Ok(true);
@@ -684,16 +582,9 @@ async fn ger_l1_finality_reached(
     let Some(entry) = store.get_ger_entry(ger_bytes).await? else {
         return Ok(false);
     };
-    if entry.mainnet_exit_root.is_none() || entry.rollup_exit_root.is_none() {
-        return Ok(false);
-    }
-    match evidence_tag {
-        EvidenceTag::Confirmations(depth) => {
-            let l1_head = store.get_l1_indexer_cursor().await?;
-            Ok(entry.block_number > 0 && l1_head.saturating_sub(entry.block_number) >= depth)
-        }
-        EvidenceTag::Finalized | EvidenceTag::Safe => Ok(entry.finalized_verified),
-    }
+    Ok(entry.mainnet_exit_root.is_some()
+        && entry.rollup_exit_root.is_some()
+        && entry.evidence_verified)
 }
 
 #[cfg(test)]
@@ -752,6 +643,18 @@ mod tests {
         assert_ne!(combined_ger(&a, &b), combined_ger(&b, &a));
     }
 
+    #[test]
+    fn evidence_tag_accepts_only_scan_frontiers() {
+        assert_eq!(EvidenceTag::parse("latest"), Some(EvidenceTag::Latest));
+        assert_eq!(EvidenceTag::parse(" SAFE "), Some(EvidenceTag::Safe));
+        assert_eq!(
+            EvidenceTag::parse("FINALIZED"),
+            Some(EvidenceTag::Finalized)
+        );
+        assert_eq!(EvidenceTag::parse("confirmations:64"), None);
+        assert_eq!(EvidenceTag::parse("confirmations"), None);
+    }
+
     /// Audit H6 — a GER whose `(mainnet, rollup)` decomposition was NOT
     /// corroborated by the L1 InfoTree indexer MUST be refused when
     /// `require_l1_observed` is set, BEFORE any Miden submission is attempted.
@@ -760,63 +663,27 @@ mod tests {
     /// gas burn, and — with a colluding claim — a mint against an L1 deposit
     /// that never happened).
     ///
-    /// The check fires at the top of `insert_ger`, so the MidenClient is never
-    /// reached; a stub client is sufficient.
     #[tokio::test]
     async fn h6_unverified_ger_refused_when_strict() {
         let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
-        let miden_client = crate::test_helpers::create_test_service().miden_client;
-        let accounts = crate::test_helpers::test_accounts_config();
         let tx_hash = alloy::primitives::TxHash::from_str(
             "0x1111111111111111111111111111111111111111111111111111111111111111",
         )
         .unwrap();
         let forged_ger = [0xCDu8; 32]; // no ger_entries row → mainnet_exit_root unset
 
-        // Strict mode: the unverified GER must be refused before Miden submission.
-        let (env, signer) = h6_test_envelope(tx_hash);
-        let err = insert_ger(
-            forged_ger,
-            &miden_client,
-            accounts.clone(),
-            &store,
-            tx_hash,
-            true, // require_l1_observed
-            EvidenceTag::Confirmations(0),
-            env.clone(),
-            signer,
-        )
-        .await
-        .expect_err("unverified GER must be refused under require_l1_observed");
+        let err = ensure_ger_l1_observed(&store, &forged_ger, true, EvidenceTag::Latest, tx_hash)
+            .await
+            .expect_err("unverified GER must be refused under require_l1_observed");
         let msg = err.to_string();
         assert!(
-            msg.contains("not observed on L1"),
+            msg.contains("not observed by the configured L1 `latest` scan"),
             "must cite L1 non-observation: {msg}"
         );
 
-        // Lenient mode (default): the same GER is allowed through (it may still
-        // Err downstream because the MidenClient stub can't really submit, but
-        // it must NOT bail at the H6 gate). Assert the result is NOT the H6
-        // "not observed on L1" refusal — a bare `let _ =` would pass even if
-        // lenient mode wrongly refused, defeating the point of this test.
-        let lenient = insert_ger(
-            forged_ger,
-            &miden_client,
-            accounts,
-            &store,
-            tx_hash,
-            false, // lenient
-            EvidenceTag::Confirmations(0),
-            env,
-            signer,
-        )
-        .await;
-        if let Err(err) = lenient {
-            assert!(
-                !err.to_string().contains("not observed on L1"),
-                "lenient mode must NOT refuse an unverified GER at the H6 gate: {err}"
-            );
-        }
+        ensure_ger_l1_observed(&store, &forged_ger, false, EvidenceTag::Latest, tx_hash)
+            .await
+            .expect("lenient mode must allow unverified GER evidence");
     }
 
     /// Audit H6 (review follow-up) — the duplicate check runs BEFORE the strict
@@ -852,7 +719,7 @@ mod tests {
             &store,
             tx_hash,
             true,
-            EvidenceTag::Confirmations(0),
+            EvidenceTag::Latest,
             env,
             signer,
         )
@@ -864,10 +731,9 @@ mod tests {
         );
     }
 
-    /// Audit H6 (review follow-up) — the gate uses the SAME resolved predicate
-    /// as `zkevm_getExitRootsByGER`: BOTH roots recorded. An entry the indexer
-    /// fully resolved must pass the strict gate (any downstream error from the
-    /// stub MidenClient must not be the H6 refusal).
+    /// Audit H6 (review follow-up) — an entry fully written by the selected scan
+    /// (both roots plus provenance) must pass the strict gate. Any downstream
+    /// error from the stub MidenClient must not be the H6 refusal.
     #[tokio::test]
     async fn h6_resolved_ger_passes_strict_gate() {
         let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
@@ -895,173 +761,66 @@ mod tests {
             &store,
             tx_hash,
             true,
-            EvidenceTag::Confirmations(0),
+            EvidenceTag::Latest,
             env,
             signer,
         )
         .await;
         if let Err(err) = result {
             assert!(
-                !err.to_string().contains("not observed on L1"),
+                !err.to_string()
+                    .contains("not observed by the configured L1"),
                 "a fully-resolved GER must pass the strict H6 gate: {err}"
             );
         }
     }
 
-    /// Audit H6 (BLOCKER 1) — finality is enforced AT THE GATE. A resolved
-    /// observation must be at least `confirmations` L1 blocks deep (indexer
-    /// cursor as head) before strict mode authorizes the irreversible injection.
-    /// A not-yet-deep observation is refused (transient), and once the cursor
-    /// advances past the confirmation depth it passes. Ordinary decomposition
-    /// (`get_ger_entry`, unchanged) sees the row regardless — this delay applies
-    /// ONLY to strict authorization.
-    ///
-    /// Mutation check: dropping the `l1_head - block >= confirmations` clause
-    /// (always `final_enough = true`) makes the not-yet-deep case wrongly pass.
+    /// Pre-upgrade roots have no selected-scan provenance and must remain
+    /// untrusted until the configured scan rewrites them. This is what prevents
+    /// old `latest` observations being silently relabelled `safe`/`finalized`.
     #[tokio::test]
-    async fn h6_strict_gate_requires_confirmation_depth() {
-        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
-        let ger = combined_ger(&[0x0Au8; 32], &[0x0Bu8; 32]);
-        let tx_hash = TxHash::from([0x44u8; 32]);
-        // Indexer recorded the pair at L1 block 100 (roots resolved immediately).
-        store
-            .set_ger_exit_roots(&ger, [0x0Au8; 32], [0x0Bu8; 32], 100, 1_700_000_000)
-            .await
-            .unwrap();
-
-        // Cursor at 140 → only 40 deep, < 64 confirmations → refused (transient).
-        store.set_l1_indexer_cursor(140).await.unwrap();
-        let err = ensure_ger_l1_observed(
-            &store,
-            &ger,
-            true,
-            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
-            tx_hash,
-        )
-        .await
-        .expect_err("a not-yet-confirmation-deep observation must be refused under strict");
-        assert!(
-            err.to_string().contains("not yet"),
-            "must cite the finality guard, not unresolved roots: {err}"
-        );
-        // Normal decomposition is unaffected: the row is present immediately.
-        assert!(store.get_ger_entry(&ger).await.unwrap().is_some());
-
-        // Cursor advances to 170 → 70 deep, >= 64 → authorized.
-        store.set_l1_indexer_cursor(170).await.unwrap();
-        ensure_ger_l1_observed(
-            &store,
-            &ger,
-            true,
-            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
-            tx_hash,
-        )
-        .await
-        .expect("a confirmation-deep observation must pass the strict gate");
-    }
-
-    /// Audit H6 (BLOCKER 1) — a legacy / pre-guard evidence row that carries NO
-    /// recorded L1 block (`block_number == 0`) but somehow has both roots must be
-    /// treated as unverified under strict (fail-closed), closing the
-    /// upgrade-state gap. Lenient mode still lets it through.
-    ///
-    /// Mutation check: treating a block-less row as final (removing the
-    /// `block_number > 0` guard) makes the strict case wrongly pass.
-    #[tokio::test]
-    async fn h6_strict_gate_refuses_blockless_legacy_row() {
+    async fn h6_strict_gate_requires_selected_scan_provenance() {
         let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
         let ger = [0x77u8; 32];
-        // A row with both roots but block_number 0 (e.g. seeded by a non-indexer
-        // path before this guard existed). commit_ger_event_atomic sets roots +
-        // block 0 here and does NOT set is_injected... so use mark_ger_seen shape.
+        let mainnet = [0x01u8; 32];
+        let rollup = [0x02u8; 32];
         store
             .mark_ger_seen(
                 &ger,
                 crate::log_synthesis::GerEntry {
-                    mainnet_exit_root: Some([0x01u8; 32]),
-                    rollup_exit_root: Some([0x02u8; 32]),
-                    block_number: 0,
-                    timestamp: 0,
-                    finalized_verified: false,
+                    mainnet_exit_root: Some(mainnet),
+                    rollup_exit_root: Some(rollup),
+                    block_number: 100,
+                    timestamp: 1_700_000_000,
+                    evidence_verified: false,
                 },
             )
             .await
             .unwrap();
-        // Even with a huge cursor, block 0 means "no recorded L1 block" → refused.
-        store.set_l1_indexer_cursor(10_000_000).await.unwrap();
         let tx_hash = TxHash::from([0x45u8; 32]);
-        let err = ensure_ger_l1_observed(
-            &store,
-            &ger,
-            true,
-            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
-            tx_hash,
-        )
-        .await
-        .expect_err("a block-less legacy row must be refused under strict");
+        let err = ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Safe, tx_hash)
+            .await
+            .expect_err("roots without selected-scan provenance must be refused");
         assert!(
-            err.to_string().contains("not yet"),
-            "finality-guard refusal: {err}"
+            err.to_string()
+                .contains("not observed by the configured L1 `safe` scan"),
+            "selected-scan refusal: {err}"
         );
-        // Lenient mode lets it through (no bail).
-        ensure_ger_l1_observed(
-            &store,
-            &ger,
-            false,
-            EvidenceTag::Confirmations(DEFAULT_CONFIRMATIONS),
-            tx_hash,
-        )
-        .await
-        .expect("lenient mode must not refuse a block-less row");
-    }
 
-    /// Audit H6 BLOCKER 1 (re-review) — the `finalized` evidence tag qualifies an
-    /// observation by the FINALIZED-CHAIN TIE (`finalized_verified`), NOT by a
-    /// block-height coincidence. A `latest`-observed row (roots present, block
-    /// recorded) that the finalized-pinned scan never confirmed — e.g. a row from
-    /// a fork later reorged away — must NOT authorize even with a huge head
-    /// cursor / finalized block. Only after `mark_ger_finalized` (which the
-    /// indexer runs solely from the finalized canonical chain) does it authorize.
-    ///
-    /// Mutation check: making the gate authorize on block-height instead of
-    /// `finalized_verified` (drop the flag requirement) makes the reorged-fork
-    /// row wrongly authorize.
-    #[tokio::test]
-    async fn h6_finalized_tag_gate_requires_finalized_chain_tie() {
-        let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
-        let ger = combined_ger(&[0x1Au8; 32], &[0x1Bu8; 32]);
-        let tx_hash = TxHash::from([0x46u8; 32]);
-        // A `latest`-observed row: roots present, block 100. Set the head cursor
-        // AND finalized block far above it, so a height-only check would pass.
+        // The selected scan atomically rewrites roots plus its provenance marker.
         store
-            .set_ger_exit_roots(&ger, [0x1Au8; 32], [0x1Bu8; 32], 100, 1_700_000_000)
+            .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
             .await
             .unwrap();
-        store.set_l1_indexer_cursor(10_000).await.unwrap();
-        store.set_l1_finalized_block(10_000).await.unwrap();
-
-        // NOT finalized-verified (the finalized scan never covered it, e.g. a
-        // reorged fork) → refused despite the height coincidence.
-        let err = ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, tx_hash)
+        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Safe, tx_hash)
             .await
-            .expect_err("a non-finalized-verified row must be refused in finalized mode");
-        assert!(
-            err.to_string().contains("not yet"),
-            "finality-guard refusal: {err}"
-        );
-
-        // The finalized-pinned scan confirms it on the canonical chain.
-        store.mark_ger_finalized(&ger).await.unwrap();
-        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Finalized, tx_hash)
-            .await
-            .expect("a finalized-chain-verified observation must pass the strict gate");
+            .expect("the selected scan's atomic evidence write must authorize the GER");
     }
 
-    /// Audit H6 — confirmation-depth mode still works under the SINGLE setting:
-    /// `Confirmations(N)` authorizes iff `head_cursor - block >= N`, and the
-    /// `finalized_verified` flag is irrelevant in this mode.
+    /// All three settings share the same admission predicate because the
+    /// configured tag controls what the sole indexer scans, not a second gate.
     #[tokio::test]
-    async fn h6_confirmations_mode_under_single_setting() {
+    async fn h6_selected_scan_evidence_authorizes_every_tag() {
         let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
         let ger = combined_ger(&[0x2Au8; 32], &[0x2Bu8; 32]);
         let tx_hash = TxHash::from([0x47u8; 32]);
@@ -1070,77 +829,73 @@ mod tests {
             .await
             .unwrap();
 
-        // 40 deep < 64 → refused.
-        store.set_l1_indexer_cursor(140).await.unwrap();
-        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Confirmations(64), tx_hash)
-            .await
-            .expect_err("shallow observation must be refused in confirmations mode");
-        // 70 deep >= 64 → authorized (no finalized_verified needed).
-        store.set_l1_indexer_cursor(170).await.unwrap();
-        ensure_ger_l1_observed(&store, &ger, true, EvidenceTag::Confirmations(64), tx_hash)
-            .await
-            .expect("confirmation-deep observation must pass");
+        for tag in [
+            EvidenceTag::Latest,
+            EvidenceTag::Safe,
+            EvidenceTag::Finalized,
+        ] {
+            ensure_ger_l1_observed(&store, &ger, true, tag, tx_hash)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("selected-scan evidence must pass for {tag:?}: {err}")
+                });
+        }
     }
 
-    /// Regression for task #59: once the indexer has resolved both roots, a
-    /// one-block finality race is held side-effect-free until the cursor advances.
-    /// Before this wait, a one-shot aggoracle submission could be refused in this
-    /// window and the deposit would remain stalled indefinitely.
+    /// A legitimate GER is absent until the selected scan reaches it. Admission
+    /// waits side-effect-free and succeeds as soon as that atomic evidence write
+    /// lands; there is only the selected scan's cursor.
     #[tokio::test]
-    async fn h6_observed_ger_waits_for_confirmation_cursor() {
+    async fn h6_waits_for_selected_scan_evidence() {
         let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
         let ger = combined_ger(&[0x3Au8; 32], &[0x3Bu8; 32]);
         let tx_hash = TxHash::from([0x48u8; 32]);
-        store
-            .set_ger_exit_roots(&ger, [0x3Au8; 32], [0x3Bu8; 32], 100, 1_700_000_000)
-            .await
-            .unwrap();
-        store.set_l1_indexer_cursor(100).await.unwrap();
 
-        let advancing_store = store.clone();
-        let advance = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            advancing_store.set_l1_indexer_cursor(101).await.unwrap();
+        let indexing_store = store.clone();
+        let index = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            indexing_store
+                .set_ger_exit_roots(&ger, [0x3Au8; 32], [0x3Bu8; 32], 100, 1_700_000_000)
+                .await
+                .unwrap();
         });
 
         wait_for_ger_l1_observed_with_timing(
             &store,
             &ger,
             true,
-            EvidenceTag::Confirmations(1),
+            EvidenceTag::Finalized,
             tx_hash,
             Duration::from_secs(1),
-            Duration::from_millis(5),
+            Duration::from_millis(1),
         )
         .await
-        .expect("an observed GER must be admitted once its confirmation becomes final");
-        advance.await.unwrap();
-        assert_eq!(store.get_l1_indexer_cursor().await.unwrap(), 101);
+        .expect("a GER must be admitted once the configured scan persists it");
+        index.await.unwrap();
     }
 
-    /// Unknown roots are not eligible for the wait: they may be forged and must
-    /// retain the strict H6 immediate-refusal behavior.
+    /// A forged/unknown GER remains rejected when the bounded wait expires.
     #[tokio::test]
-    async fn h6_unobserved_ger_does_not_enter_finality_wait() {
+    async fn h6_unknown_ger_is_rejected_after_bounded_wait() {
         let store: Arc<dyn crate::store::Store> = Arc::new(InMemoryStore::new());
         let ger = [0x49u8; 32];
         let tx_hash = TxHash::from([0x49u8; 32]);
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_ger_l1_observed_with_timing(
-                &store,
-                &ger,
-                true,
-                EvidenceTag::Confirmations(1),
-                tx_hash,
-                Duration::from_secs(60),
-                Duration::from_millis(5),
-            ),
+        let err = wait_for_ger_l1_observed_with_timing(
+            &store,
+            &ger,
+            true,
+            EvidenceTag::Safe,
+            tx_hash,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
         )
         .await
-        .expect("an unobserved GER must be rejected without waiting");
-        let err = result.expect_err("an unobserved GER must remain rejected");
-        assert!(err.to_string().contains("not observed on L1"));
+        .expect_err("an unknown GER must remain rejected after the bounded wait");
+        assert!(
+            err.to_string()
+                .contains("not observed by the configured L1 `safe` scan"),
+            "selected-scan refusal: {err}"
+        );
     }
 }

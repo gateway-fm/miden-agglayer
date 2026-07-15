@@ -193,9 +193,11 @@ COMB=$(cast keccak "$(cast concat-hex "$MAIN" "$ROLL")")
 COMB_HEX="${COMB#0x}"
 pass "fresh L1 GER minted: mainnet=$MAIN rollup=$ROLL combined=$COMB"
 
-# ── A.3 Wait for the proxy's indexer to OBSERVE it ─────────────────────────
-# Same evidence predicate the H6 gate uses (both ger_entries roots resolved).
-log "waiting for the L1 InfoTree indexer to corroborate $COMB..."
+# ── A.3 Wait for the selected evidence scan to OBSERVE it ──────────────────
+# The indexer scans exactly one configured frontier, so a resolved row already
+# satisfies the same evidence predicate used by the strict H6 gate.
+EVIDENCE_TAG="${L1_EVIDENCE_TAG:-latest}"
+log "waiting for the L1 InfoTree indexer's '$EVIDENCE_TAG' scan to corroborate $COMB..."
 ELAPSED=0; TIMEOUT=120
 while true; do
     OBSERVED=$(rpc_call zkevm_getExitRootsByGER "[\"$COMB\"]" | json_field result || true)
@@ -204,43 +206,7 @@ while true; do
     [[ $ELAPSED -ge $TIMEOUT ]] && fail "indexer did not corroborate the fresh L1 GER after ${TIMEOUT}s — is the L1InfoTreeIndexer running?"
     sleep 3
 done
-pass "indexer corroborated the fresh L1 GER (zkevm_getExitRootsByGER non-null)"
-
-# ── A.3b Wait for the fresh GER to satisfy the strict finality setting ──────
-# The SINGLE evidence-finality setting (`--l1-evidence-tag` / L1_EVIDENCE_TAG)
-# is enforced AT THE GATE; ordinary decomposition (asserted above) is NOT
-# delayed. `confirmations:<N>` authorizes once the indexer cursor is N blocks
-# past the evidence block; `finalized`/`safe` authorize once the finalized-pinned
-# scan has set `ger_entries.finalized_verified` (the finalized-chain tie). Nudge
-# anvil forward so the indexer advances (single-node anvil has instant finality;
-# empty blocks are harmless).
-EVIDENCE_TAG="${L1_EVIDENCE_TAG:-confirmations:1}"
-GER_BLOCK=$(pgquery "SELECT block_number FROM ger_entries WHERE ger_hash = decode('${COMB_HEX}', 'hex')")
-step "A.3b waiting for GER $COMB to satisfy the strict finality setting '$EVIDENCE_TAG' (evidence block ${GER_BLOCK:-?})"
-ELAPSED=0; TIMEOUT=120
-while true; do
-    case "$EVIDENCE_TAG" in
-        finalized|safe)
-            FV=$(pgquery "SELECT finalized_verified FROM ger_entries WHERE ger_hash = decode('${COMB_HEX}', 'hex')" || echo "")
-            [[ "$FV" == "t" ]] && break
-            ;;
-        *)
-            # confirmations:<N> (or bare 'confirmations' → depth 1)
-            DEPTH="${EVIDENCE_TAG#confirmations:}"
-            [[ "$DEPTH" == "$EVIDENCE_TAG" || -z "$DEPTH" ]] && DEPTH=1
-            CURSOR=$(pgquery "SELECT last_processed FROM l1_indexer_state WHERE id = 1" || echo "")
-            [[ -n "$GER_BLOCK" && -n "$CURSOR" && $((CURSOR - GER_BLOCK)) -ge $DEPTH ]] && break
-            ;;
-    esac
-    # Advance L1 so the indexer's next poll moves its cursor / finalized scan.
-    cast rpc anvil_mine 1 --rpc-url "$L1_RPC_URL" >/dev/null 2>&1 \
-        || cast rpc evm_mine --rpc-url "$L1_RPC_URL" >/dev/null 2>&1 || true
-    ELAPSED=$((ELAPSED + 2))
-    [[ $ELAPSED -ge $TIMEOUT ]] \
-        && fail "GER $COMB did not satisfy '$EVIDENCE_TAG' after ${TIMEOUT}s (evidence block '${GER_BLOCK}')"
-    sleep 2
-done
-pass "GER satisfies the strict finality setting ($EVIDENCE_TAG)"
+pass "the '$EVIDENCE_TAG' scan corroborated the fresh L1 GER (zkevm_getExitRootsByGER non-null)"
 
 # ── A.4 ASSERT the not-yet-injected precondition ───────────────────────────
 # THE adversarial guard: if this GER were already injected, the whole positive

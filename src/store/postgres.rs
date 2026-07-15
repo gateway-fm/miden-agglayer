@@ -96,57 +96,7 @@ impl Store for PgStore {
         Ok(val as u64)
     }
 
-    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT last_processed FROM l1_indexer_state WHERE id = 1",
-                &[],
-            )
-            .await?;
-        match row {
-            Some(r) => {
-                let val: i64 = r.get(0);
-                Ok(val as u64)
-            }
-            None => Ok(0),
-        }
-    }
-
-    async fn set_l1_indexer_cursor(&self, block: u64) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "UPDATE l1_indexer_state SET last_processed = $1, updated_at = now() WHERE id = 1",
-                &[&(block as i64)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT finalized_block FROM l1_indexer_state WHERE id = 1",
-                &[],
-            )
-            .await?;
-        Ok(row.map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
-    }
-
-    async fn set_l1_finalized_block(&self, block: u64) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "UPDATE l1_indexer_state SET finalized_block = $1, updated_at = now() WHERE id = 1",
-                &[&(block as i64)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
+    async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
@@ -157,7 +107,7 @@ impl Store for PgStore {
         Ok(row.map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
     }
 
-    async fn set_l1_finalized_scan_cursor(&self, block: u64) -> anyhow::Result<()> {
+    async fn set_l1_evidence_cursor(&self, block: u64) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
@@ -173,7 +123,8 @@ impl Store for PgStore {
         let tx = client.transaction().await?;
         let row = tx
             .query_one(
-                "SELECT evidence_tag, finalized_block, finalized_scan_cursor FROM l1_indexer_state WHERE id = 1 FOR UPDATE",
+                "SELECT evidence_tag, finalized_block, finalized_scan_cursor, last_processed \
+                 FROM l1_indexer_state WHERE id = 1 FOR UPDATE",
                 &[],
             )
             .await?;
@@ -185,12 +136,13 @@ impl Store for PgStore {
             }
             tx.rollback().await?;
             anyhow::bail!(
-                "L1 evidence policy mismatch: database is bound to `{existing}`, configured `{policy}`; stop the service and reset/rebuild finality markers before changing policy"
+                "L1 evidence policy mismatch: database is bound to `{existing}`, configured `{policy}`; stop the service and reset/rebuild L1 evidence before changing policy"
             );
         }
 
         let finalized_block: i64 = row.get(1);
         let finalized_scan_cursor: i64 = row.get(2);
+        let legacy_latest_cursor: i64 = row.get(3);
         let has_verified: bool = tx
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM ger_entries WHERE finalized_verified = TRUE)",
@@ -201,14 +153,28 @@ impl Store for PgStore {
         if finalized_block != 0 || finalized_scan_cursor != 0 || has_verified {
             tx.rollback().await?;
             anyhow::bail!(
-                "L1 finality state exists without an evidence policy; reset/rebuild finality markers before serving"
+                "L1 evidence state exists without an evidence policy; reset/rebuild L1 evidence before serving"
             );
         }
-        tx.execute(
-            "UPDATE l1_indexer_state SET evidence_tag = $1, updated_at = now() WHERE id = 1",
-            &[&policy],
-        )
-        .await?;
+        if policy == "latest" {
+            // Migration 005 already persisted the old sole latest-scan cursor
+            // in `last_processed`. Preserve that progress on upgrade so events
+            // emitted during the restart are not skipped. Safe/finalized must
+            // never inherit a latest frontier.
+            tx.execute(
+                "UPDATE l1_indexer_state \
+                 SET evidence_tag = $1, finalized_scan_cursor = $2, updated_at = now() \
+                 WHERE id = 1",
+                &[&policy, &legacy_latest_cursor],
+            )
+            .await?;
+        } else {
+            tx.execute(
+                "UPDATE l1_indexer_state SET evidence_tag = $1, updated_at = now() WHERE id = 1",
+                &[&policy],
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -877,7 +843,7 @@ impl Store for PgStore {
                 rollup_exit_root: rollup.filter(|v| v.len() == 32).map(bytes_to_array_32),
                 block_number: r.get::<_, i64>(2) as u64,
                 timestamp: r.get::<_, i64>(3) as u64,
-                finalized_verified: r.get::<_, bool>(4),
+                evidence_verified: r.get::<_, bool>(4),
             }
         }))
     }
@@ -895,13 +861,14 @@ impl Store for PgStore {
         let rollup = rollup_exit_root.to_vec();
         client
             .execute(
-                "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
-                 VALUES ($1, $2, $3, $4, $5)
+                "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp, finalized_verified)
+                 VALUES ($1, $2, $3, $4, $5, TRUE)
                  ON CONFLICT (ger_hash) DO UPDATE
                  SET mainnet_exit_root = EXCLUDED.mainnet_exit_root,
                      rollup_exit_root  = EXCLUDED.rollup_exit_root,
                      block_number      = EXCLUDED.block_number,
-                     timestamp         = EXCLUDED.timestamp",
+                     timestamp         = EXCLUDED.timestamp,
+                     finalized_verified = TRUE",
                 &[
                     &ger.as_slice(),
                     &mainnet,
@@ -909,24 +876,6 @@ impl Store for PgStore {
                     &(l1_block_number as i64),
                     &(l1_timestamp as i64),
                 ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn mark_ger_finalized(&self, ger: &[u8; 32]) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        // Row should already exist (roots from the latest scan). The explicit
-        // block_number/timestamp 0 satisfy the NOT NULL columns for the safety-net
-        // insert path; DO UPDATE only flips the flag (monotone), never resets
-        // roots. The `finalized`/`safe` gate also requires roots present, so a
-        // flag-only row cannot authorize until the latest scan fills the roots.
-        client
-            .execute(
-                "INSERT INTO ger_entries (ger_hash, block_number, timestamp, finalized_verified)
-                 VALUES ($1, 0, 0, TRUE)
-                 ON CONFLICT (ger_hash) DO UPDATE SET finalized_verified = TRUE",
-                &[&ger.as_slice()],
             )
             .await?;
         Ok(())

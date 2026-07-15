@@ -152,7 +152,7 @@ async fn test_pgstore_ger_lifecycle() {
         rollup_exit_root: Some([0x02; 32]),
         block_number: 100,
         timestamp: 1234567890,
-        finalized_verified: false,
+        evidence_verified: false,
     };
 
     // Initially not seen
@@ -644,31 +644,20 @@ async fn test_pgstore_txn_commit_concurrent_begin_single_snapshot() {
     }
 }
 
-/// BLOCKER 3 — the L1 finalized/safe block round-trips through the new
-/// `l1_indexer_state.finalized_block` column (migration 013), separate from the
-/// head cursor. PG-gated: skips when `DATABASE_URL` is unset.
+/// The one selected evidence-scan cursor round-trips through the legacy
+/// `l1_indexer_state.finalized_scan_cursor` column. PG-gated: skips when
+/// `DATABASE_URL` is unset.
 #[tokio::test]
-async fn test_pgstore_l1_finalized_block_roundtrip() {
+async fn test_pgstore_l1_evidence_cursor_roundtrip() {
     let Some(store) = pg_store().await else {
         return;
     };
     reset_state(&store).await;
 
-    assert_eq!(
-        store.get_l1_finalized_block().await.unwrap(),
-        0,
-        "default 0"
-    );
-    store.set_l1_finalized_block(12_345).await.unwrap();
-    assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
-    // Independent of the head cursor.
-    store.set_l1_indexer_cursor(99).await.unwrap();
-    assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
-    assert_eq!(store.get_l1_indexer_cursor().await.unwrap(), 99);
-    // And of the finalized-scan cursor (migration 014).
-    store.set_l1_finalized_scan_cursor(50).await.unwrap();
-    assert_eq!(store.get_l1_finalized_scan_cursor().await.unwrap(), 50);
-    assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
+    store.set_l1_evidence_cursor(0).await.unwrap();
+    assert_eq!(store.get_l1_evidence_cursor().await.unwrap(), 0);
+    store.set_l1_evidence_cursor(12_345).await.unwrap();
+    assert_eq!(store.get_l1_evidence_cursor().await.unwrap(), 12_345);
 }
 
 /// Evidence provenance binding requires a dedicated freshly-migrated database
@@ -690,7 +679,7 @@ async fn test_pgstore_l1_evidence_policy_binding_is_immutable() {
 /// ambiguous and must not be silently labelled with the current setting.
 #[tokio::test]
 #[ignore = "requires a dedicated fresh PostgreSQL database"]
-async fn test_pgstore_untagged_finality_state_is_rejected() {
+async fn test_pgstore_untagged_evidence_state_is_rejected() {
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
         .await
@@ -701,7 +690,7 @@ async fn test_pgstore_untagged_finality_state_is_rejected() {
     client
         .batch_execute(
             "UPDATE l1_indexer_state
-             SET evidence_tag = NULL, finalized_block = 1, finalized_scan_cursor = 0;
+             SET evidence_tag = NULL, finalized_block = 0, finalized_scan_cursor = 1;
              UPDATE ger_entries SET finalized_verified = FALSE;",
         )
         .await
@@ -711,7 +700,7 @@ async fn test_pgstore_untagged_finality_state_is_rejected() {
     let err = store
         .bind_l1_evidence_policy("finalized")
         .await
-        .expect_err("untagged finality progress must fail closed");
+        .expect_err("untagged evidence progress must fail closed");
     assert!(format!("{err:#}").contains("without an evidence policy"));
 
     client
@@ -724,11 +713,11 @@ async fn test_pgstore_untagged_finality_state_is_rejected() {
         .expect("restore clean singleton state");
 }
 
-/// BLOCKER 1 (re-review) — `mark_ger_finalized` sets the finalized-chain tie
-/// flag (migration 014), and `set_ger_exit_roots` (the latest scan) never resets
-/// it (monotone). PG-gated: skips when `DATABASE_URL` is unset.
+/// The configured scan writes roots, L1 metadata, and its provenance marker in
+/// one UPSERT. The PostgreSQL marker retains its legacy physical column name.
+/// PG-gated: skips when `DATABASE_URL` is unset.
 #[tokio::test]
-async fn test_pgstore_mark_ger_finalized_monotone() {
+async fn test_pgstore_set_ger_exit_roots_verifies_evidence() {
     let Some(store) = pg_store().await else {
         return;
     };
@@ -739,41 +728,15 @@ async fn test_pgstore_mark_ger_finalized_monotone() {
         .set_ger_exit_roots(&ger, [0x01u8; 32], [0x02u8; 32], 100, 1_700_000_000)
         .await
         .unwrap();
+    let entry = store.get_ger_entry(&ger).await.unwrap().unwrap();
     assert!(
-        !store
-            .get_ger_entry(&ger)
-            .await
-            .unwrap()
-            .unwrap()
-            .finalized_verified,
-        "latest scan leaves finalized_verified false"
+        entry.evidence_verified,
+        "the selected scan must set its provenance marker with the roots"
     );
-
-    store.mark_ger_finalized(&ger).await.unwrap();
-    assert!(
-        store
-            .get_ger_entry(&ger)
-            .await
-            .unwrap()
-            .unwrap()
-            .finalized_verified,
-        "mark_ger_finalized sets the flag"
-    );
-
-    // A later latest-scan re-observation must NOT reset the flag (monotone).
-    store
-        .set_ger_exit_roots(&ger, [0x01u8; 32], [0x02u8; 32], 100, 1_700_000_050)
-        .await
-        .unwrap();
-    assert!(
-        store
-            .get_ger_entry(&ger)
-            .await
-            .unwrap()
-            .unwrap()
-            .finalized_verified,
-        "set_ger_exit_roots must preserve finalized_verified"
-    );
+    assert_eq!(entry.mainnet_exit_root, Some([0x01u8; 32]));
+    assert_eq!(entry.rollup_exit_root, Some([0x02u8; 32]));
+    assert_eq!(entry.block_number, 100);
+    assert_eq!(entry.timestamp, 1_700_000_000);
 }
 
 // ── Nonces ───────────────────────────────────────────────────
