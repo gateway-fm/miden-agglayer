@@ -1,5 +1,9 @@
 # Postmortem: eth_blockNumber frozen at a stale tip (2026-07-04)
 
+> **Historical incident record.** Measurements and version references below
+> describe the affected release. The resolution section states the behaviour on
+> current `main`; use the operations and upgrade docs for current procedures.
+
 ## Impact
 During the N=250 strict loadtest, `eth_blockNumber` returned **659** while the
 synthetic tip was **2702**. Delivery was unaffected (250/250 claimed — aggkit
@@ -33,7 +37,7 @@ delivery — impossible if events were absent). Cross-check showed the projector
 log at `miden_tip == projector_cursor == synthetic_tip == 2702` while
 `eth_blockNumber` returned 659; grep proved `record_tip` had no live caller.
 
-## Fixes (this commit)
+## Resolution on current `main`
 - `eth_blockNumber` reads the store (single source of truth) and refreshes the
   mirror for any writer-mode consumers. The Phase-3 micro-optimization is
   forfeited until a caller that actually maintains the mirror exists.
@@ -49,21 +53,18 @@ log at `miden_tip == projector_cursor == synthetic_tip == 2702` while
 - "Impossible" verifier results (missing events + 100% delivery) mean the
   instrument, not just the system, must be suspected.
 
-## Follow-ups
-- [ ] RD-940 owners: either have the projector call `record_tip()` or retire
-      the mirror fast-path entirely.
-- [ ] ntx-builder crash-loop during the run (h2 `error reading a body from
-      connection`, RestartCount=4) — node-side, tolerated by design (retries),
-      upstream issue worth filing.
+## Current disposition
 
-## Addendum (same day): reproduced on v0.15.2 — production impact
+- `eth_blockNumber` is store-backed and refreshes the in-process tip mirror;
+  the mirror is not the endpoint's source of truth.
+- The completeness verifier independently takes the maximum of the RPC tip and
+  the node snapshot, so a stale proxy response cannot truncate its scan.
+- The incident's ntx-builder restart was external to this repository. It is
+  retained as evidence, not as an open code action here.
+
+## Addendum (same day): reproduced on v0.15.2
 During the upgrade-path test's seed phase, the **unmodified v0.15.2 proxy**
-showed the same signature (`eth_blockNumber=25` vs `latest.number=446`). The
-redesign is NOT a necessary ingredient: any deployment running RD-940 Phase 3
-with the writer worker disabled (the default) has a frozen `eth_blockNumber`
-today, including production v0.15.2. Downstream impact is limited because
-aggkit and the bridge-service derive ranges from store-backed paths — but any
-client trusting `eth_blockNumber` (health checks, explorers, tooling) sees a
-frozen tip. The fix in this branch (store-backed read) plus the
-`e2e-rpc-tip-consistency.sh` liveness gate cover both eras; backporting the
-one-line fix to a 0.15.2 point release is recommended.
+showed the same signature (`eth_blockNumber=25` vs `latest.number=446`). This
+proved the redesign was not a necessary ingredient: the mirror could freeze
+whenever its writer was disabled. The store-backed endpoint and
+`e2e-rpc-tip-consistency.sh` liveness gate now cover this regression class.

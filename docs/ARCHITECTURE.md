@@ -1,331 +1,248 @@
-# miden-agglayer proxy — architecture & main flows
+# Architecture
 
-Current as of the `reopen-92-synthetic-indexer-redesign` line (SyntheticProjector
-as the sole synthetic-event producer + note-visibility reconciler + direct
-recovery). Supersedes `docs/architecture.png` (pre-redesign, outdated).
+This document describes the implementation on `main`. The Rust source is the
+authority when this overview and the code disagree.
 
-## Component architecture
+`miden-agglayer` presents an EVM-compatible JSON-RPC surface for an AggLayer
+rollup whose execution layer is Miden. It does not execute EVM blocks. Instead,
+it submits bridge operations to Miden and projects finalized Miden activity into
+an EVM-shaped block and log stream consumed by AggKit and bridge-service.
+
+## Runtime components
 
 ```mermaid
-flowchart TD
+flowchart LR
     subgraph L1["Ethereum L1"]
-        BRIDGE_L1["zkEVM Bridge contract"]
-        GERM_L1["GER manager (L1InfoTree)"]
+        L1GER["Global exit root manager"]
+        L1BRIDGE["AggLayer bridge"]
     end
 
-    subgraph AGG["AggLayer stack"]
-        AGGORACLE["aggkit / aggoracle"]
-        AGGSENDER["aggkit / aggsender"]
-        AGL["agglayer (settlement)"]
-        BSVC["bridge-service (deposit index API)"]
-        AUTOCLAIM["bridge-autoclaim (L1 claimer)"]
+    subgraph STACK["AggLayer services"]
+        AGGORACLE["aggoracle"]
+        AGGSENDER["aggsender"]
+        AGGLAYER["agglayer"]
+        BRIDGESVC["bridge-service"]
+        AUTOCLAIM["bridge-autoclaim"]
     end
 
-    subgraph PROXY["miden-agglayer proxy (single process)"]
-        RPC["JSON-RPC service<br/>eth_* / zkevm_* / admin_*"]
-        CLAIM["claim path<br/>handle_claim_asset → publish_claim<br/>(per-origin faucet lock #10,<br/>miden decimals=min(origin,8), reject &gt;26 #17)"]
-        GER["GER path<br/>insert_ger (ger_manager)"]
-        WW["writer worker (RD-940, optional)<br/>future-nonce queue"]
-        MC["MidenClient ACTOR<br/>single thread, one select! loop:<br/>sync_state every ~5s + request queue<br/>process-wide singleton"]
-        subgraph LISTENERS["on_post_sync listeners"]
-            SP["SyntheticProjector — SOLE producer<br/>cursor: Miden block N → synthetic block N<br/>+ note reconciler (sync_notes → import)<br/>+ late-consumption sweep<br/>+ direct recovery (get_notes_by_id +<br/>sync_transactions consumer attribution)"]
-            BOS["BridgeOutScanner — monitors only<br/>LET divergence #9, twin notes #6,<br/>faucet ownership #4, expected MINT #7"]
-        end
-        STORE[("Store (Postgres / in-memory)<br/>synthetic blocks+logs, receipts,<br/>faucet registry, deposit_count,<br/>projector cursor")]
-        SQLITE[("miden-client store.sqlite3<br/>+ keystore (proxy-private)")]
+    subgraph PROXY["miden-agglayer process"]
+        RPC["JSON-RPC and metrics"]
+        WRITER["Mandatory bounded writer"]
+        MIDENCLIENT["Process-wide MidenClient actor"]
+        PROJECTOR["SyntheticProjector"]
+        MONITORS["BridgeOutScanner monitors"]
+        L1INDEXER["L1InfoTreeIndexer"]
+        REGISTRY["Faucet registry reconciler"]
+        STORE[("PostgreSQL or in-memory store")]
+        CLIENTDB[("miden-client SQLite and keystore")]
     end
 
     subgraph MIDEN["Miden network"]
-        NODE["miden-node (sequencer RPC :57291)"]
-        NTX["ntx-builder (consumes network notes)"]
-        PROVER["tx-prover (remote proving)"]
-        BACC["bridge account (LET, GER chain)"]
+        NODE["miden-node"]
+        NTX["network transaction builder"]
+        PROVER["transaction prover"]
+        BRIDGE["bridge account"]
     end
 
-    EXTW["external wallet client<br/>(independent store — e.g. bridge-out-tool)"]
-
-    AGGORACLE -- "GER tx via eth_sendRawTransaction" --> RPC
-    AUTOCLAIM -- "claimAsset via eth_sendRawTransaction" --> RPC
-    AGGSENDER -- "eth_getLogs (BridgeEvent/ClaimEvent/GER)" --> RPC
-    BSVC -- "indexes L1 + synthetic L2 logs" --> RPC
-    RPC --> CLAIM & GER
-    CLAIM & GER --> WW --> MC
-    MC <--> SQLITE
-    MC -- "gRPC (sync, submit, sync_notes,<br/>get_notes_by_id, sync_transactions)" --> NODE
-    MC -- "prove tx" --> PROVER
-    MC -- "on_post_sync" --> LISTENERS
-    SP --> STORE
-    NTX --> BACC
-    EXTW -- "B2AGG note (own store, own keys)" --> NODE
-    AGGSENDER --> AGL --> BRIDGE_L1
-    AUTOCLAIM --> BRIDGE_L1
-    GERM_L1 --> AGGORACLE
-
-    classDef proxyBox fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px
-    classDef proxyNode fill:#eff6ff,stroke:#1d4ed8
-    classDef aggBox fill:#e9d5ff,stroke:#7e22ce
-    classDef aggNode fill:#f3e8ff,stroke:#7e22ce
-    classDef midenBox fill:#ffedd5,stroke:#ea580c
-    classDef midenNode fill:#fff7ed,stroke:#ea580c
-    class PROXY,LISTENERS proxyBox
-    class RPC,CLAIM,GER,WW,MC,SP,BOS,STORE,SQLITE proxyNode
-    class L1,AGG aggBox
-    class BRIDGE_L1,GERM_L1,AGGORACLE,AGGSENDER,AGL,BSVC,AUTOCLAIM aggNode
-    class MIDEN midenBox
-    class NODE,NTX,PROVER,BACC,EXTW midenNode
+    AGGORACLE -->|"signed GER transaction"| RPC
+    BRIDGESVC -->|"signed claim transaction"| RPC
+    RPC --> WRITER
+    WRITER --> MIDENCLIENT
+    MIDENCLIENT --> PROVER
+    MIDENCLIENT <--> NODE
+    MIDENCLIENT <--> CLIENTDB
+    NODE --> NTX
+    NTX --> BRIDGE
+    MIDENCLIENT -->|"post-sync callbacks"| PROJECTOR
+    MIDENCLIENT -->|"post-sync callbacks"| MONITORS
+    PROJECTOR --> STORE
+    MONITORS --> STORE
+    L1GER --> L1INDEXER
+    L1INDEXER --> STORE
+    REGISTRY --> STORE
+    AGGSENDER -->|"reads synthetic logs"| RPC
+    AGGSENDER --> AGGLAYER
+    AGGLAYER --> L1BRIDGE
+    AUTOCLAIM -->|"reads synthetic BridgeEvent logs"| RPC
+    AUTOCLAIM -->|"submits L1 claimAsset"| L1BRIDGE
 ```
 
-Key invariants:
-- **One `MidenClient`** per process (guarded); all Miden work — sync, claims,
-  GER, proving — serializes through its single loop. This is the throughput
-  ceiling (~1 proven tx/min) and why the projector needs recovery paths for
-  notes whose whole lifecycle fits between two sync points.
-- **The projector is the only writer** of synthetic blocks/logs and the tip
-  (`Miden block N ⇒ synthetic block N`, write-before-advance — a block is never
-  exposed before its events are written, so `eth_getLogs` consumers cannot skip
-  events; recovered events land in the first not-yet-exposed block).
-- The external wallet **never shares the proxy's sqlite** (prod topology; also
-  the DB-lock isolation result).
+The process has four important ownership rules:
 
-## The synthetic block engine (projector tick)
+1. `MidenClient` is a process-wide singleton. Its channel has capacity one and
+   all mutable miden-client work, including synchronization and transaction
+   submission, runs on its dedicated thread and runtime.
+2. The writer worker is the only production path from
+   `eth_sendRawTransaction` to Miden. It accepts only `claimAsset`,
+   `insertGlobalExitRoot`, and `updateExitRoot` calls.
+3. `SyntheticProjector` is the only live synthetic-event producer and the only
+   live writer of the exposed synthetic tip. Offline `--restore` replays the
+   same event derivations before the normal service starts.
+4. The projector is single-process. Running multiple proxy replicas against one
+   store is unsupported even though nonce admission itself is fenced in the
+   database.
 
-How synthetic blocks come to exist at all: the proxy has no EVM execution — the
-projector *derives* an EVM-shaped chain from Miden, one synthetic block per
-Miden block (Miden-1:1), inside every sync tick:
+## Signed transaction admission
+
+The HTTP request does not wait for proving and Miden submission. It validates
+and durably admits the signed envelope, then hands it to the bounded writer.
 
 ```mermaid
 sequenceDiagram
-    box rgb(255,237,213) Miden
-        participant N as miden-node
-    end
-    box rgb(219,234,254) proxy
-        participant MC as MidenClient actor
-        participant SP as SyntheticProjector
-        participant BS as BlockState
-        participant ST as Store (synthetic chain)
-    end
+    participant C as RPC client
+    participant R as JSON-RPC handler
+    participant S as Store
+    participant W as Writer worker
+    participant M as MidenClient
+    participant N as Miden node
 
-    MC->>N: sync_state (~5s cadence)
-    N-->>MC: block headers, account deltas,<br/>tag-matched notes, spent nullifiers
-    MC->>SP: on_post_sync (exclusive client access)
-    SP->>N: reconciler: sync_notes + import missing<br/>+ direct recovery (R1 ladder)
-    SP->>MC: get_input_notes(Consumed) — ONCE per tick
-    SP->>SP: group consumed notes by consumption block<br/>merge late-swept + recovered notes into<br/>first unprojected block
-    loop for each Miden block B = cursor+1 … tip
-        SP->>BS: block hash + timestamp for B<br/>(derived from the Miden block)
-        SP->>SP: order block notes by<br/>(consumed_tx_order, note_id) — deterministic
-        SP->>ST: derive + write logs at synthetic block B:<br/>B2AGG→BridgeEvent, CLAIM→ClaimEvent,<br/>GER→UpdateHashChainValue<br/>(each gated + deduped — idempotent)
-        SP->>ST: persist projector cursor = B
-        SP->>ST: advance tip: latest_block_number = B<br/>(WRITE-BEFORE-ADVANCE — even for empty blocks)
-    end
-    Note over SP,ST: tip is the sole gate for eth_blockNumber /<br/>eth_getLogs readers: a block is never visible<br/>before all its events are written, so consumers<br/>cannot skip events — and re-running the projector<br/>over the same chain is byte-identical (deterministic)
+    C->>R: eth_sendRawTransaction
+    R->>R: decode, chain-id and signer checks
+    R->>S: known-hash and state checks
+    R->>S: fenced signer/nonce reservation
+    R->>S: persist signed envelope
+    R->>S: compare-and-set next accepted nonce
+    R->>W: non-blocking enqueue
+    R-->>C: transaction hash
+    W->>M: serialized claim or GER dispatch
+    M->>S: persist exact note handoff
+    M->>N: submit proven Miden transaction
+    N-->>M: accepted or rejected
 ```
 
-Properties: **deterministic** (same Miden chain ⇒ byte-identical synthetic
-chain), **idempotent** (crash mid-block re-projects through dedup keys),
-**gap-free** (empty Miden blocks produce empty synthetic blocks, so the chain
-mirrors Miden block-for-block and `eth_blockNumber` tracks the Miden tip).
+Important behavior:
 
-## Flow 1 — GER injection (L1 → L2 info propagation)
+- The default queue capacity is 64 and is configurable through
+  `AGGLAYER_WRITER_QUEUE_DEPTH`.
+- Queue saturation is returned as JSON-RPC error `-32005`.
+- A repeated signed transaction is deduplicated by transaction hash before the
+  nonce check. A durable unlinked intent can be resumed after restart by
+  submitting the same signed transaction again.
+- `eth_getTransactionReceipt` returns `null` while work is admitted or handed
+  off but not finalized. A definite failure before an ambiguous Miden handoff
+  produces a status-0 receipt. An ambiguous result after the exact note handoff
+  remains pending for projector reconciliation.
+- `latest` transaction count is the committed frontier; `pending` is the
+  accepted frontier.
+
+The complete writer contract is documented in
+[`design/RD-940-async-writer.md`](design/RD-940-async-writer.md).
+
+## Synthetic chain projection
+
+Synthetic block number `N` corresponds to Miden block `N`. Empty Miden blocks
+still advance the synthetic chain. The store's `latest_block_number` is the
+visibility boundary used by `eth_blockNumber` and `eth_getLogs`.
 
 ```mermaid
 sequenceDiagram
-    box rgb(233,213,255) AggLayer / L1
-        participant L1 as L1 (GER manager)
-        participant AO as aggoracle
-    end
-    box rgb(219,234,254) proxy
-        participant RPC as proxy RPC
-        participant MC as MidenClient actor
-        participant SP as SyntheticProjector
-        participant ST as Store
-    end
-    box rgb(255,237,213) Miden
-        participant N as miden-node / ntx-builder
-    end
+    participant M as MidenClient sync loop
+    participant P as SyntheticProjector
+    participant N as Miden node RPC
+    participant S as Store
 
-    L1->>AO: UpdateL1InfoTree (new GER)
-    AO->>RPC: eth_sendRawTransaction (GER update tx)
-    RPC->>MC: insert_ger via actor request queue
-    MC->>MC: ger_manager signs UpdateGerNote (targets bridge)
-    MC->>N: submit proven tx (tx-prover)
-    N->>N: ntx-builder consumes UpdateGerNote<br/>bridge account: GER hash-chain += GER (block B)
-    MC->>MC: sync_state sees consumption
-    MC->>SP: on_post_sync
-    SP->>ST: project_ger_note → UpdateHashChainValue log<br/>at synthetic block B (GER contract address)
-    Note over SP,ST: dedup: is_ger_injected — idempotent
-    ST-->>RPC: eth_getLogs / eth_getBlockByNumber
+    M->>N: sync_state
+    M->>P: on_post_sync with exclusive client access
+    P->>N: sync_notes for tag-0 note bodies
+    P->>S: persist completed body-sweep frontier
+    P->>P: projection ceiling = min(Miden tip, body-sweep frontier)
+    P->>N: sync_transactions for bridge account and block window
+    N-->>P: finalized bridge transactions and consumed nullifiers
+    P->>M: read locally consumed CLAIM and GER notes
+    loop Each block from cursor plus one to ceiling
+        P->>P: order notes by block, transaction order, commitment
+        P->>S: atomically commit derived events and receipt updates
+        P->>S: advance exposed tip after every event is stored
+        P->>S: persist projector cursor
+    end
 ```
 
-## Flow 2 — Claim (L1 → L2 deposit delivery)
+The note sources are deliberately different:
 
-```mermaid
-sequenceDiagram
-    box rgb(233,213,255) AggLayer / L1
-        participant U as user / autoclaim
-        participant BS as bridge-service
-    end
-    box rgb(219,234,254) proxy
-        participant RPC as proxy RPC
-        participant MC as MidenClient actor
-        participant SP as SyntheticProjector
-    end
-    box rgb(255,237,213) Miden
-        participant P as tx-prover
-        participant N as miden-node / ntx-builder
-        participant W as recipient wallet
-    end
+- B2AGG bridge-outs are externally created. Their finalized consumption comes
+  from `sync_transactions` filtered to the bridge account. The tag-0
+  `sync_notes` sweep supplies their bodies and gates projection until those
+  bodies are available.
+- CLAIM and `UpdateGerNote` notes are created by this proxy. Their consumption
+  is read from the local miden-client consumed-note view.
 
-    U->>BS: (after L1 bridgeAsset) poll ready_for_claim
-    Note over BS: deposit ready once its GER<br/>reached L2 via Flow 1
-    U->>RPC: claimAsset via eth_sendRawTransaction
-    RPC->>RPC: verify SMT proof vs injected GER<br/>find_or_create_faucet (per-origin lock #10,<br/>miden decimals=min(origin,8), reject &gt;26 #17)
-    RPC->>MC: publish_claim via actor request queue<br/>(nonce guard R4 — writer worker queues future nonces)
-    MC->>P: prove CLAIM note tx (~30–60 s)
-    MC->>N: submit CLAIM (targets bridge)
-    N->>N: ntx-builder consumes CLAIM (block B)<br/>bridge mints → MINT note to wallet
-    MC->>SP: on_post_sync (consumption seen)
-    SP->>SP: project_claim_note → ClaimEvent at block B<br/>claim receipt finalised by projector
-    W->>N: consume MINT (P2ID tag) — funds on Miden
-```
+Each event path validates provenance and fails closed:
 
-## Flow 3 — B2AGG (L2 → L1 bridge-out)
+- B2AGG notes must have the canonical script and a bridge-account consumer.
+- CLAIM notes must be attributable to this bridge or this service account.
+- GER notes must be attributable to the configured GER manager and bridge.
 
-```mermaid
-sequenceDiagram
-    box rgb(255,237,213) Miden side
-        participant EW as external wallet client
-        participant N as miden-node / ntx-builder
-    end
-    box rgb(219,234,254) proxy
-        participant MC as MidenClient actor
-        participant SP as SyntheticProjector
-    end
-    box rgb(233,213,255) AggLayer / L1
-        participant AS as aggsender / agglayer
-        participant AC as bridge-autoclaim
-        participant L1 as L1 bridge
-    end
+Per-event store operations are idempotent and transactional. B2AGG commits bind
+the note, deposit counter, and `BridgeEvent`; CLAIM commits bind the note,
+`ClaimEvent`, and linked receipt; GER commits bind injection state, hash-chain
+roll, log, and linked receipt. A crash before the tip advance leaves the partial
+block unexposed, and the persisted projector cursor makes replay idempotent.
 
-    EW->>N: submit B2AGG note (own store/keys,<br/>targets bridge, tag 0 network note)
-    N->>N: ntx-builder consumes B2AGG (block B)<br/>bridge: burn asset, append LET leaf
-    alt sync-visible (note seen before consumption)
-        MC->>SP: consumed note in local store
-        SP->>SP: project_b2agg_note → BridgeEvent at block B (exact)
-    else missed by sync (fast lifecycle / sync starved)
-        SP->>N: reconciler: sync_notes(range, tag 0)
-        SP->>MC: import_notes(unknown ids)
-        alt import lands (not yet consumed)
-            MC->>SP: consumption discovered next sync → exact block B
-        else spent-before-import (miden-client drops it)
-            SP->>N: get_notes_by_id (full body)<br/>+ nullifier spend height<br/>+ sync_transactions(bridge) — consumer proof
-            Note over SP: MA#3 gate: only bridge-executed<br/>consumptions emit (reclaims fail closed)
-            SP->>SP: direct-project into first unexposed block
-        end
-    end
-    SP->>SP: BridgeEvent(deposit_count++) — dedup by note id
-    AS->>SP: eth_getLogs → build certificate → settle
-    AC->>L1: claimAsset(exit) once settled
-    L1-->>EW: funds to L1 recipient
-```
+Synthetic block headers form a deterministic RLP-hashed parent chain derived
+from block number and fixed header fields. They do not contain a log root; log
+immutability comes from reconcile-before-project and write-before-advance.
 
-## Verification harness
+See [`SYNTHETIC-INDEXER-REDESIGN.md`](SYNTHETIC-INDEXER-REDESIGN.md) for the
+projection contract and
+[`design/UNIFIED-PROJECTOR.md`](design/UNIFIED-PROJECTOR.md) for the consumption
+source split.
 
-`scripts/e2e-bridge-loadtest-isolated.sh` (prod-faithful independent wallet)
-ends with a 0-`database is locked` gate and
-`scripts/verify-event-completeness.sh`: an independent cross-check of the
-miden-node DB (consumed B2AGG/CLAIM/GER notes by canonical script root) against
-`eth_getLogs` — **every consumed correct note must have exactly one event at
-exactly its consumption block** (`late`/`missing`/`extra` reported per type).
+## Bridge flows
 
-## Recovery flows
+### L1 to Miden
 
-Three distinct recovery mechanisms exist at different layers.
+1. `L1InfoTreeIndexer` records `(mainnetExitRoot, rollupExitRoot)` from L1 GER
+   events and keys the pair by its combined hash.
+2. Aggoracle submits a signed `insertGlobalExitRoot` or `updateExitRoot`
+   transaction to the proxy.
+3. The writer creates and submits an `UpdateGerNote` to Miden. The bridge's
+   network transaction consumes it.
+4. The projector emits `UpdateHashChainValue` and marks the GER injected at the
+   consumption block.
+5. A claim client submits `claimAsset`. The claim path checks the applied GER,
+   validates the proof and destination, resolves or creates the origin-keyed
+   faucet, and submits a CLAIM note.
+6. When the bridge consumes the CLAIM note, the projector emits `ClaimEvent`
+   and finalizes the real EVM transaction receipt at that block. The bridge
+   emits the MINT note used to credit the Miden recipient.
 
-### R1 — Live note recovery ladder (event completeness, in-process)
+Faucets are keyed by both origin address and origin network. ERC-20 origins are
+scaled to Miden's supported decimal precision; the registry stores the origin
+and Miden decimal metadata used for the reverse bridge.
 
-Why: notes created by external wallets that are committed **and** consumed
-between two proxy sync points are never delivered by interest-based
-`sync_state`; under load (claims starving the actor loop) this window grows to
-minutes. Three escalating catchers:
+### Miden to L1 or another L2
 
-```mermaid
-sequenceDiagram
-    box rgb(255,237,213) Miden
-        participant N as miden-node
-    end
-    box rgb(219,234,254) proxy
-        participant MC as MidenClient store
-        participant SP as SyntheticProjector (per tick)
-    end
+1. A wallet with its own miden-client store creates a public B2AGG note that
+   targets the bridge account. It does not share the proxy's SQLite database or
+   keys.
+2. The Miden network transaction builder consumes the note, burns the asset,
+   and appends to the bridge's local exit tree.
+3. The projector attributes the bridge consumption, resolves the note body,
+   and commits one `BridgeEvent` with the matching deposit count.
+4. Aggsender reads the event, builds a certificate, and sends it to AggLayer.
+5. For L2-to-L1 exits, the separate `bridge-autoclaim` binary discovers this
+   rollup's events from the proxy, checks L1 `isClaimed`, obtains a proof from
+   bridge-service, simulates the claim, and submits `claimAsset` on L1. It does
+   not use bridge-service's `/pending-bridges` endpoint.
 
-    Note over SP: Catcher 1 — late-consumption sweep
-    SP->>MC: get_input_notes(Consumed)
-    SP->>SP: note consumed at block ≤ cursor,<br/>not yet processed → project into<br/>FIRST unexposed block (tip never<br/>advances past unwritten events)
+## Synchronization, monitoring, and recovery
 
-    Note over SP: Catcher 2 — note reconciler
-    SP->>N: sync_notes(cursor+1 … tip, tag 0) — ≤200 blocks/tick
-    SP->>MC: which ids unknown? (NoteFilter::List)
-    SP->>MC: import_notes(NoteFile::NoteId …)
-    MC->>N: fetch bodies + inclusion proofs
-    Note over MC: next sync discovers the nullifier →<br/>consumed state → Catcher 1 projects it
+The Miden client synchronizes on startup and every five seconds. Listener order
+is store receipt maintenance, block-header cache, security monitors, then the
+projector. The `BridgeOutScanner` is monitor-only: it checks LET divergence,
+faucet ownership, twin notes, burn serials, MINT targets, and expected MINTs; it
+does not write synthetic events or advance the tip.
 
-    Note over SP: Catcher 3 — direct recovery (spent-before-import)
-    SP->>MC: re-query: which imports did NOT land?<br/>(miden-client 0.15 silently drops<br/>already-spent imports)
-    SP->>N: get_notes_by_id (full public body)
-    SP->>N: nullifier spend height
-    SP->>N: sync_transactions(bridge account, spend range)
-    Note over SP: MA#3 reclaim gate: emit ONLY if a<br/>bridge-executed tx consumed this nullifier<br/>(reclaim by sender ⇒ fail-closed skip + metric)
-    SP->>SP: fabricate ConsumedExternal record →<br/>same project_b2agg_note derivation,<br/>dedup by note id, retry-safe queue
-```
+`--restore` is an offline reconstruction mode. It pauses post-sync listener
+side effects, reimports configured accounts, syncs to the Miden tip, recovers
+missed public B2AGG notes, rebuilds faucet identities, replays B2AGG, CLAIM, and
+GER events through the shared derivations, finalizes the synthetic tip and
+projector cursor, resets the note-sweep cursor for a full healing pass, and
+exits. `--reset-miden-store --restore` is the full local-state recovery path;
+the PostgreSQL volume still contains EVM envelopes and calldata that do not
+exist on Miden and therefore cannot be reconstructed from chain data alone.
 
-### R2 — Startup restore (disaster recovery, `--restore`)
-
-Rebuilds the synthetic event store from Miden after data loss
-(`--reset-miden-store --restore` wipes the sqlite first; Postgres dedup keys
-make the replay idempotent):
-
-```mermaid
-sequenceDiagram
-    box rgb(229,231,235) operator
-        participant OP as operator
-    end
-    box rgb(219,234,254) proxy
-        participant PX as proxy (startup)
-        participant MC as MidenClient
-        participant ST as Store
-    end
-    box rgb(255,237,213) Miden
-        participant N as miden-node
-    end
-
-    OP->>PX: start with --restore [--reset-miden-store]
-    PX->>PX: pause sync listeners (no live projection<br/>during replay)
-    PX->>MC: Phase 1: sync_state to Miden tip
-    MC->>N: full sync (accounts, tag-matched notes)
-    PX->>ST: Phase 2: replay consumed B2AGGs →<br/>project_b2agg_note (BridgeEvents, deposit_count)
-    PX->>ST: Phase 3: replay consumed UpdateGerNotes →<br/>GER set + hash chain
-    PX->>ST: Phase 4: replay consumed CLAIMs →<br/>ClaimEvents (MA#27 synthesis)
-    PX->>PX: unpause listeners — projector cursor<br/>resumes catch-up as the normal loop
-    Note over PX,ST: limitation: replay reads the LOCAL consumed-note<br/>view — notes invisible to sync are healed by the<br/>R1 reconciler's genesis re-sweep after startup
-```
-
-### R3 — Account self-heal (runtime, per-submission)
-
-```mermaid
-sequenceDiagram
-    box rgb(219,234,254) proxy
-        participant CP as claim / GER path
-        participant MC as MidenClient
-    end
-    box rgb(255,237,213) Miden
-        participant N as miden-node
-    end
-
-    CP->>MC: submit tx (insert_ger / publish_claim)
-    MC-->>CP: AccountDataNotFound /<br/>IncorrectAccountInitialCommitment
-    CP->>MC: import_account_by_id(affected account)
-    MC->>N: fetch live PUBLIC account state
-    CP->>MC: retry submission once
-    Note over CP: infra accounts are deployed PUBLIC precisely<br/>so a lost sqlite row is recoverable from chain
-```
+The independent completeness check is
+`scripts/verify-event-completeness.sh`. The production-faithful load test is
+`scripts/e2e-bridge-loadtest-isolated.sh`, which uses a wallet store separate
+from the proxy.

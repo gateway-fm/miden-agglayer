@@ -1,13 +1,18 @@
 # Postmortem — bali IAIC → AccountDataNotFound (2026-05-11 → 2026-05-18)
 
+> **Historical incident record.** Commit IDs, line numbers, deployment names,
+> version references and code excerpts below describe the incident-era system.
+> They are retained as evidence, not as current operating instructions. Use
+> `docs/operations/runbook.md` and `docs/UPGRADE.md` for current procedures.
+
 | Field | Value |
 |---|---|
-| Status | RESOLVED in v0.3.0 (PR #44); cure for bali's existing deployment is the REDEPLOY procedure (see `docs/REDEPLOY_RUNBOOK_BALI.md`). |
+| Status | Resolved. The recovery and regression paths described in the disposition table are present on current `main`. |
 | Severity | High — L1→L2 bridge stuck for ~20 wall-days; ~1.1M deposits unresolvable; marti's deposit cnt=1130654 the user-visible canary. |
 | Detection | Manual — Igor / operator triage. No alert fired on the IAIC rate. |
 | Author | claude-code + miden-l1-l2-debug agents on `feat/v0.3.0-self-heal`. |
 | Cluster | `dev-gateway-eks`, ns `outpost-testnet-miden-testnet`, pod `miden-agglayer-0`. |
-| Pre-incident image | `gatewayfm/miden-agglayer:0.2.1` = commit `388775e` = current `main`. |
+| Pre-incident image | `gatewayfm/miden-agglayer:0.2.1` = commit `388775e` (the incident-era `main`). |
 
 ## TL;DR
 
@@ -128,7 +133,7 @@ The operator escalated correctly by the existing runbook. The runbook was the tr
 
 If a pending tx exists in mempool whose `init_commitment` matches what we just sent, the node rejects the second tx as a conflict (only one of them can commit; whichever lands wins, the other is invalid by construction).
 
-On `main`, `publish_claim` (`src/claim.rs:611-704`) built a FRESH `Client` per call:
+In the affected incident-era code, `publish_claim` built a fresh `Client` per call:
 
 ```rust
 let rt = tokio::runtime::Runtime::new()?;
@@ -244,12 +249,15 @@ async fn sync_miden_block(miden_client: &MidenClient, store: &Arc<dyn Store>)
 
 On the next aggoracle push:
 
-```
-insert_ger → MidenClient::with → client.submit_new_transaction(ger_manager_id, ...)
-                                  → miden-client looks up ger_manager_id in
-                                    latest_account_headers
-                                  → not present
-                                  → returns ClientError::AccountDataNotFound
+```mermaid
+sequenceDiagram
+    participant O as Aggoracle
+    participant P as Proxy MidenClient
+    participant C as Local miden-client store
+    O->>P: insert GER
+    P->>C: load ger_manager account header
+    C-->>P: account is not tracked
+    P-->>O: AccountDataNotFound
 ```
 
 Surfaced to the JSON-RPC caller as `eth_sendRawTransaction: ERR account data wasn't found for account id 0x...`.
@@ -279,10 +287,11 @@ The next submission lookups succeed; AccountDataNotFound cannot fire from this r
 
 ## Why this took 73+ hours of chronic firing without escalation
 
-1. **No alert on IAIC rate.** Metrics for `miden_agglayer_service::service::eth_sendRawTransaction_errors_total` exist but no Prometheus rule fires on a sustained non-zero rate. Should add.
+1. **No alert on IAIC rate at incident time.** Metrics existed, but no deployed Prometheus rule fired on a sustained non-zero rate.
 2. **Symptom looked transient at low rates.** ~2/hour reads as "intermittent flakiness" on a testnet — not a P2 page.
 3. **Existing runbook framed IAIC as a sqlite-staleness problem.** That framing pointed at `--reset-miden-store --restore`, which inadvertently locked the system harder.
-4. **No before/after test of the documented recovery flow.** `scripts/e2e-restore.sh` exists but doesn't cover the `--reset-miden-store --restore` chain or AccountDataNotFound assertion. Now added: `scripts/e2e-reset-restore-recovery.sh`.
+4. **No before/after test of the documented recovery flow at incident time.**
+   That gap is now covered by `scripts/e2e-reset-restore-recovery.sh`.
 
 ## Fix mapping (commit → bug)
 
@@ -309,13 +318,16 @@ The next submission lookups succeed; AccountDataNotFound cannot fire from this r
 
 5. **Two related bugs in sequence look like one bug from the outside.** The IAIC → AccountDataNotFound transition could have been one root cause with two manifestations, or two distinct bugs in series. The Loki density chart distinguished them: chronic-flat-then-spike for bug 1, single-event-with-3-reset-spam for bug 2 are signatures that don't share a parent.
 
-## Action items
+## Current disposition
 
-| # | Item | Owner | Status |
-|---|---|---|---|
-| 1 | Ship v0.3.0 (this PR). | release | PR #44 open, security PASS, evidence captured. |
-| 2 | REDEPLOY bali per `docs/REDEPLOY_RUNBOOK_BALI.md` — existing Private accounts cannot be self-healed in place. | SRE | runbook ready. |
-| 3 | Add Prometheus alert on `account data wasn't found` and `incorrect account initial commitment` log occurrences (non-zero rate over 5min). | observability | TODO. |
-| 4 | Add a `miden-agglayer-service get-account <id>` subcommand for operator inspection of network-side account status without needing miden-cli. | platform | TODO. |
-| 5 | CLAIM_REPLAY_FILE generator (`scripts/e2e-claim-watcher.sh --dump-raw-tx <path>`) so `scripts/e2e-iaic-mempool-conflict.sh` is runnable on every PR. | platform | TODO. |
-| 6 | Audit other `recovery::*` flags for the same "documented-cure-locks-harder" pattern. | platform | TODO. |
+| Incident concern | State on current `main` |
+|---|---|
+| Concurrent claim submission | Claim publication uses the managed Miden client path; the regression is covered by `scripts/e2e-iaic-mempool-conflict.sh`. |
+| Empty local Miden store after reset | Restore re-imports configured accounts before syncing; `scripts/e2e-reset-restore-recovery.sh` and `scripts/e2e-account-reimport.sh` cover the recovery path. |
+| Recoverable account errors | Account recovery handles `AccountDataNotFound` and `IncorrectAccountInitialCommitment`; `scripts/e2e-account-self-heal.sh` exercises the self-heal path. |
+| Operator procedure | The current source of truth is `docs/operations/runbook.md`; the Bali redeploy document is incident-specific. |
+| Alerting | The service exports recovery and error metrics. Alert-rule ownership and deployment are outside this repository. |
+
+The incident-era wishlist has been removed from this record: unfinished product
+ideas are not current operating requirements and should be tracked as issues,
+not as permanently stale postmortem checkboxes.
