@@ -1030,7 +1030,8 @@ mod tests {
     async fn over_age_queued_job_expires_before_miden_dispatch() {
         let service = crate::test_helpers::create_test_service();
         let miden_client = service.miden_client.clone();
-        let mut job = fake_ger_job(29);
+        let nonce = service.store.nonce_get("queue-expiry-test").await.unwrap();
+        let mut job = fake_ger_job(nonce);
         if let WriteJob::Ger { ger_bytes, .. } = &mut job {
             *ger_bytes = [0x42; 32];
         }
