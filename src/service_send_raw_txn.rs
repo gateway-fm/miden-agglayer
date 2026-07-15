@@ -16,13 +16,7 @@ struct TransactionData {
 }
 
 pub(crate) fn envelope_nonce(txn_envelope: &TxEnvelope) -> u64 {
-    match txn_envelope {
-        TxEnvelope::Eip1559(s) => s.tx().nonce,
-        TxEnvelope::Eip2930(s) => s.tx().nonce,
-        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
-        TxEnvelope::Eip7702(s) => s.tx().nonce,
-        TxEnvelope::Legacy(s) => s.tx().nonce,
-    }
+    crate::store::envelope_nonce(txn_envelope)
 }
 
 fn calldata_selector(input: &alloy::primitives::Bytes) -> String {
@@ -124,6 +118,20 @@ async fn handle_ger_result(
             Ok(())
         }
         Err(err) => {
+            let tx_key = format!("{txn_hash:#x}");
+            if service
+                .store
+                .get_note_handoff_for_tx(&tx_key)
+                .await?
+                .is_some()
+            {
+                tracing::warn!(
+                    %txn_hash,
+                    error = %err,
+                    "GER outcome is ambiguous after durable note handoff; leaving receipt pending"
+                );
+                return Ok(());
+            }
             tracing::error!("insert_ger failed: {err:#?}");
             Err(err)
         }
@@ -553,6 +561,29 @@ pub(crate) fn reservation_lease() -> std::time::Duration {
     std::time::Duration::from_secs(secs.max(3))
 }
 
+/// A spawned lease-renewal task must never outlive the request that owns it.
+/// Tokio detaches a `JoinHandle` on drop, so an unguarded handle would keep an
+/// abandoned reservation alive forever after request cancellation.
+struct AbortTaskOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortTaskOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 /// #55 BLOCKER 1 — execute a WON admission (dispatch to the writer worker or the
 /// legacy sync path) and return the tx hash. Extracted so `service_send_raw_txn` can
 /// wrap it with the reservation-lease RELEASE (success → future same-hash dedups;
@@ -597,6 +628,47 @@ async fn durably_admit_and_advance_nonce(
     Ok(())
 }
 
+/// Run every deterministic / side-effect-free rejection before binding the
+/// `(signer, nonce)` reservation to a hash. A malformed claim can therefore be
+/// corrected and re-signed at the same nonce. Stateful checks are repeated by
+/// the dispatcher after reservation only to close a landed-claim race.
+async fn validate_before_nonce_reservation(
+    service: &ServiceState,
+    decoded: &crate::writer_worker::DecodedWriteCall,
+) -> anyhow::Result<()> {
+    let crate::writer_worker::DecodedWriteCall::Claim { params } = decoded else {
+        return Ok(());
+    };
+    if params.destinationNetwork != service.network_id {
+        anyhow::bail!(
+            "claim targets destinationNetwork {} but this proxy only handles network {}",
+            params.destinationNetwork,
+            service.network_id
+        );
+    }
+
+    // A landed claim must bypass C6 and be accepted-and-reverted.
+    if service
+        .store
+        .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
+        .await?
+    {
+        return Ok(());
+    }
+    if !params.amount.is_zero()
+        && crate::address_mapper::resolve_address(
+            &*service.store,
+            params.destinationAddress,
+            &service.accounts.0,
+        )
+        .await
+        .is_ok()
+    {
+        ensure_claim_ger_published(&service.store, params).await?;
+    }
+    Ok(())
+}
+
 async fn dispatch_after_reservation(
     service: &ServiceState,
     decoded: crate::writer_worker::DecodedWriteCall,
@@ -606,17 +678,8 @@ async fn dispatch_after_reservation(
     signer_str: &str,
     tx_nonce: u64,
 ) -> anyhow::Result<TxHash> {
-    // Cheap deterministic validation, landed classification, and retryable GER
-    // checks happen before durable acceptance in both sync and writer modes.
-    if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-        && params.destinationNetwork != service.network_id
-    {
-        anyhow::bail!(
-            "claim targets destinationNetwork {} but this proxy only handles network {}",
-            params.destinationNetwork,
-            service.network_id
-        );
-    }
+    // Landed classification is repeated after reservation to close the race
+    // with a claim that lands immediately after pre-validation.
     if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
         && service
             .store
@@ -817,20 +880,42 @@ pub(crate) struct ClaimSubmissionFence {
 }
 
 impl ClaimSubmissionFence {
-    pub(crate) async fn mark_submitted(&self, note_commitment: &str) -> anyhow::Result<()> {
+    pub(crate) async fn prepare(
+        &self,
+        note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
+    ) -> anyhow::Result<()> {
         if !self
             .store
-            .mark_claim_submitted_fenced(
+            .prepare_claim_submission_fenced(
                 self.global_index,
                 self.owner_tx_hash,
                 self.fence,
                 self.owner_tx_hash,
                 note_commitment,
+                note_id,
+                expiration_block,
             )
             .await?
         {
             anyhow::bail!(
                 "claim ownership fence lost before submission for global_index {}",
+                self.global_index
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn confirm(&self, note_commitment: &str) -> anyhow::Result<()> {
+        let tx_key = format!("{:#x}", self.owner_tx_hash);
+        if !self
+            .store
+            .confirm_note_handoff(&tx_key, note_commitment)
+            .await?
+        {
+            anyhow::bail!(
+                "claim note handoff changed before commit confirmation for global_index {}",
                 self.global_index
             );
         }
@@ -943,13 +1028,35 @@ async fn publish_and_record_claim(
         Some(service.expected_mints.clone()),
         guard.submission_fence(),
     )
-    .await?;
-    tracing::info!(
-        eth_tx = %txn_hash,
-        miden_tx = %claim_result.txn_id,
-        "claim published; receipt pending until the projector finalises it on consumption"
-    );
-    Ok(())
+    .await;
+    match claim_result {
+        Ok(claim_result) => {
+            tracing::info!(
+                eth_tx = %txn_hash,
+                miden_tx = %claim_result.txn_id,
+                "claim published; receipt pending until the projector finalises it on consumption"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            let tx_key = format!("{txn_hash:#x}");
+            if service
+                .store
+                .get_note_handoff_for_tx(&tx_key)
+                .await?
+                .is_some()
+            {
+                tracing::warn!(
+                    %txn_hash,
+                    error = %err,
+                    "claim outcome is ambiguous after durable note handoff; leaving receipt pending"
+                );
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 /// Unified GER-insert / updateExitRoot dispatcher used by both the legacy sync
@@ -1077,17 +1184,38 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         .writer_handle
         .as_ref()
         .is_some_and(|handle| handle.is_inflight(&txn_hash));
-    let known_store_entry = service.store.txn_get(txn_hash).await?;
-    let known_store_tx = known_store_entry.is_some();
-    let known_store_linked = if known_store_tx {
-        service
+    let tx_key = format!("{txn_hash:#x}");
+    let mut known_store_entry = service.store.txn_get(txn_hash).await?;
+    let mut handoff = service.store.get_note_handoff_for_tx(&tx_key).await?;
+    if let Some(prepared) = handoff
+        .as_ref()
+        .filter(|handoff| handoff.state == crate::store::NoteHandoffState::Prepared)
+    {
+        if service
             .store
-            .get_note_link_for_tx(&format!("{txn_hash:#x}"))
+            .clear_expired_prepared_note_handoff(&tx_key, &prepared.note_commitment)
             .await?
-            .is_some()
-    } else {
-        false
-    };
+        {
+            tracing::warn!(
+                %txn_hash,
+                "authoritative reconcile cursor passed prepared transaction expiration; retrying exact transaction"
+            );
+            handoff = None;
+            known_store_entry = service.store.txn_get(txn_hash).await?;
+        } else {
+            repair_commit_gap_nonce(&service, &signer_str, tx_nonce).await?;
+            tracing::debug!(
+                target: "rpc::dedup",
+                %txn_hash,
+                "prepared note handoff is still ambiguous; leaving receipt pending"
+            );
+            return Ok(txn_hash);
+        }
+    }
+    let known_store_tx = known_store_entry.is_some();
+    let known_store_linked = handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.state == crate::store::NoteHandoffState::Submitted);
     // A pending row without a note handoff is the durable queue intent. It must
     // be resumed after a crashed process loses its in-memory mpsc contents.
     let known_durable_intent = known_store_entry
@@ -1106,6 +1234,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             "known_inflight": known_inflight,
             "known_store_tx": known_store_tx,
             "known_store_linked": known_store_linked,
+            "known_store_prepared": handoff.as_ref().is_some_and(|handoff| handoff.state == crate::store::NoteHandoffState::Prepared),
             "known_durable_intent": known_durable_intent,
             "writer_enabled": service.enable_writer_worker,
             "writer_handle_present": service.writer_handle.is_some(),
@@ -1152,6 +1281,20 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // only on success and never compared the incoming `tx.nonce` against
         // the expected next value. That allowed replay and skipped sequencing.
         let expected_nonce = service.store.nonce_get(&signer_str).await?;
+        let durable_frontier = service.store.pending_nonce_frontier(&signer_str).await?;
+        if let Some(lower_nonce) = durable_frontier.lowest_unlinked
+            && lower_nonce < tx_nonce
+        {
+            let lower_is_live = service
+                .writer_handle
+                .as_ref()
+                .is_some_and(|handle| handle.has_non_terminal_nonce(&signer, lower_nonce));
+            if !lower_is_live {
+                anyhow::bail!(
+                    "cannot admit nonce {tx_nonce} for {signer_str}: durable transaction at lower nonce {lower_nonce} has not reached the Miden handoff; re-submit that exact signed transaction first"
+                );
+            }
+        }
         let durable_resume_nonce =
             known_durable_intent && expected_nonce == tx_nonce.saturating_add(1);
         let can_wait_for_future_nonce = service.enable_writer_worker
@@ -1173,6 +1316,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 "tx_hash": format!("{txn_hash:#x}"),
                 "tx_nonce": tx_nonce,
                 "expected_nonce": expected_nonce,
+                "durable_lowest_unlinked": durable_frontier.lowest_unlinked,
                 "nonce_matches": tx_nonce == expected_nonce,
                 "durable_resume": durable_resume_nonce,
                 "action": nonce_action,
@@ -1255,6 +1399,20 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         anyhow::bail!("unhandled txn method {params_encoded:?}");
     };
 
+    // All deterministic claim rejection happens before the permanent
+    // reservation row is created, so a corrected transaction may reuse nonce N.
+    validate_before_nonce_reservation(&service, &decoded).await?;
+    if service.enable_writer_worker {
+        let handle = service.writer_handle.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "enable_writer_worker=true but no writer_handle plumbed into ServiceState"
+            )
+        })?;
+        if handle.available_capacity() == 0 {
+            return Err(crate::writer_worker::WriterQueueSaturatedError.into());
+        }
+    }
+
     // ── #55 BLOCKER 1 — atomic (signer, nonce) reservation ──────────────
     //
     // Reserve the (signer, nonce) slot ATOMICALLY, BEFORE any queue/dispatch/receipt
@@ -1276,14 +1434,14 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         crate::store::NonceReservation::Won { fence } => fence,
         crate::store::NonceReservation::OwnedBySame => {
             // The slot is currently owned+executing by THIS SAME tx under a valid
-            // lease (another replica is admitting it), or it already released-
-            // success. Do NOT execute — dedup-return the hash; the owner produces
-            // the receipt. This is the authoritative single-executor guarantee that
+            // lease (another replica is admitting it). Do NOT execute — dedup-return
+            // the hash; the owner produces the receipt. This is the authoritative
+            // single-executor guarantee that
             // the process-local dedup reads (which can miss cross-replica) cannot give.
             tracing::debug!(
                 target: "rpc::reserve",
                 %txn_hash, nonce = tx_nonce,
-                "reservation owned by this same tx (valid lease / released-success) — \
+                "reservation owned by this same tx under a valid executing lease — \
                  dedup-returning hash, NOT executing"
             );
             return Ok(txn_hash);
@@ -1308,7 +1466,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let heartbeat_signer = signer_str.clone();
     let heartbeat_lease = reservation_lease();
     let heartbeat_period = std::cmp::max(std::time::Duration::from_secs(1), heartbeat_lease / 3);
-    let reservation_heartbeat = tokio::spawn(async move {
+    let mut reservation_heartbeat = AbortTaskOnDrop::new(tokio::spawn(async move {
         loop {
             tokio::time::sleep(heartbeat_period).await;
             match heartbeat_store
@@ -1323,10 +1481,10 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 ),
             }
         }
-    });
+    }));
 
     // Execute the WON admission, then RELEASE the lease on the outcome: success →
-    // `released_success` (a future same-hash submission dedups via OwnedBySame);
+    // `released_success` (a future same-hash durable recovery may reacquire);
     // failure → `released_failure` (the SAME tx may retry via lease takeover). Only
     // the current fence owner may release, so a delayed crashed owner whose lease was
     // taken over cannot clobber the new owner's state. A crash before release leaves
@@ -2585,7 +2743,8 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
-        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+        let nonce_b = store.nonce_get(&format!("{addr_b:#x}")).await.unwrap();
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, nonce_b);
 
         let accepted_inflight = service_send_raw_txn(service.clone(), input_b.clone())
             .await
@@ -2706,7 +2865,11 @@ mod tests {
         // signer) submits the same gi through the FULL RPC path.
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
-        let (input_b, _) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
+        let nonce_b = store
+            .nonce_get(&format!("{:#x}", key_b.address()))
+            .await
+            .unwrap();
+        let (input_b, _) = encode_tx_signed_with_nonce(&key_b, calldata, nonce_b);
 
         let accepted = service_send_raw_txn(service, input_b)
             .await
@@ -2733,8 +2896,6 @@ mod tests {
         let user_key = alloy::signers::local::PrivateKeySigner::random();
         let user_addr = user_key.address();
         let gi = U256::from(0x4004u64);
-        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
-        let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&user_key, calldata, 0);
 
         // (a) allow-list configured, signer NOT on it.
         let mut service = create_test_service();
@@ -2746,6 +2907,9 @@ mod tests {
         let store = service.store.clone();
         let miden = service.miden_client.clone();
         seed_zero_ger(&store).await;
+        let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        let nonce = store.nonce_get(&format!("{user_addr:#x}")).await.unwrap();
+        let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&user_key, calldata, nonce);
 
         let err = service_send_raw_txn(service, input_hex.clone())
             .await
@@ -3648,8 +3812,8 @@ mod tests {
     /// SAME tx under a valid lease → OwnedBySame (dedup, another replica must not
     /// execute); a DIFFERENT tx → HeldByOther (hard reject); release-FAILURE lets the
     /// SAME tx take over (fence bumps); a fenced-out stale release is ignored;
-    /// release-SUCCESS makes the SAME tx dedup; only the SAME tx can take over an
-    /// EXPIRED lease.
+    /// release-SUCCESS remains recoverable by the SAME durable tx; only that hash
+    /// can ever take over the slot.
     #[tokio::test]
     async fn blocker_1_reserve_nonce_fenced_lifecycle() {
         use crate::store::NonceReservation;
@@ -3703,15 +3867,16 @@ mod tests {
             "a fenced-out stale release must not flip the current owner's state"
         );
 
-        // release-SUCCESS (by the current owner) → the SAME tx now dedups.
+        // release-SUCCESS (by the current owner) → the SAME durable tx can
+        // resume after a restart loses the in-memory queue.
         store
             .release_reservation(addr, 5, h1, fence2, true)
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             store.reserve_nonce(addr, 5, h1, lease).await.unwrap(),
-            NonceReservation::OwnedBySame
-        );
+            NonceReservation::Won { fence } if fence > fence2
+        ));
 
         // A different nonce is a free slot.
         assert!(matches!(
@@ -3990,14 +4155,30 @@ mod tests {
         assert!(b.fence > a.fence);
         assert!(
             !store
-                .mark_claim_submitted_fenced(gi, tx_a, a.fence, tx_a, "stale-note")
+                .prepare_claim_submission_fenced(
+                    gi,
+                    tx_a,
+                    a.fence,
+                    tx_a,
+                    "stale-note",
+                    "stale-id",
+                    100,
+                )
                 .await
                 .unwrap()
         );
         assert!(!store.unclaim_fenced(&gi, tx_a, a.fence).await.unwrap());
         assert!(
             store
-                .mark_claim_submitted_fenced(gi, tx_b, b.fence, tx_b, "winner-note")
+                .prepare_claim_submission_fenced(
+                    gi,
+                    tx_b,
+                    b.fence,
+                    tx_b,
+                    "winner-note",
+                    "winner-id",
+                    100,
+                )
                 .await
                 .unwrap()
         );
@@ -4225,5 +4406,139 @@ mod tests {
             "an in-flight record (younger than the TTL, no ClaimEvent) must classify InFlight"
         );
         assert!(store.is_claimed(&gi).await.unwrap(), "lock stays held");
+    }
+
+    #[tokio::test]
+    async fn invalid_claim_does_not_bind_nonce_reservation() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let gi = U256::from(0xd001u64);
+
+        let mut bad =
+            claimAssetCall::abi_decode(&claim_calldata(gi, resolvable_dest(), U256::ZERO)).unwrap();
+        bad.destinationNetwork = service.network_id + 1;
+        let signer_key = format!("{:#x}", key.address());
+        let nonce = store.nonce_get(&signer_key).await.unwrap();
+        let (bad_raw, bad_hash) = encode_tx_signed_with_nonce(&key, bad.abi_encode(), nonce);
+        let err = service_send_raw_txn(service.clone(), bad_raw)
+            .await
+            .expect_err("wrong destination network must be rejected");
+        assert!(err.to_string().contains("destinationNetwork"));
+        assert!(store.txn_get(bad_hash).await.unwrap().is_none());
+
+        // A corrected, newly-signed hash at the same nonce is still admissible.
+        let (good_raw, good_hash) = encode_tx_signed_with_nonce(
+            &key,
+            claim_calldata(gi, resolvable_dest(), U256::ZERO),
+            store.nonce_get(&signer_key).await.unwrap(),
+        );
+        assert_eq!(
+            service_send_raw_txn(service, good_raw).await.unwrap(),
+            good_hash
+        );
+        assert_eq!(
+            store
+                .nonce_get(&format!("{:#x}", key.address()))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_pending_floor_survives_restart_and_blocks_nonce_skip() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer = key.address();
+        let signer_str = format!("{signer:#x}");
+        let call0 = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xd0; 32]),
+        }
+        .abi_encode();
+        let nonce0 = store.nonce_get(&signer_str).await.unwrap();
+        let (raw0, hash0) = encode_tx_signed_with_nonce(&key, call0, nonce0);
+        let payload0 = hex_decode_prefixed(&raw0).unwrap();
+        let envelope0 = TxEnvelope::decode_2718(&mut payload0.as_slice()).unwrap();
+
+        // Model a process kill after durable intent + nonce CAS, with no DashMap.
+        store
+            .txn_begin_if_absent(
+                hash0,
+                TxnEntry {
+                    id: None,
+                    envelope: envelope0,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.nonce_advance_cas(&signer_str, nonce0).await.unwrap());
+
+        let frontier = store.pending_nonce_frontier(&signer_str).await.unwrap();
+        assert_eq!(frontier.lowest_pending, Some(0));
+        assert_eq!(frontier.lowest_unlinked, Some(0));
+        assert_eq!(
+            crate::service::select_transaction_count(1, "latest", frontier),
+            0
+        );
+        assert_eq!(
+            crate::service::select_transaction_count(1, "pending", frontier),
+            1
+        );
+
+        let call1 = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xd1; 32]),
+        }
+        .abi_encode();
+        let nonce1 = store.nonce_get(&signer_str).await.unwrap();
+        let (raw1, _) = encode_tx_signed_with_nonce(&key, call1, nonce1);
+        let err = service_send_raw_txn(service, raw1)
+            .await
+            .expect_err("nonce 1 must not skip recoverable durable nonce 0");
+        assert!(err.to_string().contains("lower nonce 0"));
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn reservation_heartbeat_is_aborted_on_owner_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let task_ticks = ticks.clone();
+        let guard = AbortTaskOnDrop::new(tokio::spawn(async move {
+            loop {
+                task_ticks.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let after_abort = ticks.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(ticks.load(Ordering::SeqCst), after_abort);
+    }
+
+    #[tokio::test]
+    async fn same_hash_claim_lease_is_immediately_reclaimable() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let gi = U256::from(0xd004u64);
+        let owner = TxHash::from([0xd4; 32]);
+        let ttl = std::time::Duration::from_secs(120);
+        store
+            .try_claim_fenced(gi, owner, ttl)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            acquire_claim_lock(&store, gi, owner, ttl).await.unwrap(),
+            ClaimLockOutcome::Acquired { .. }
+        ));
     }
 }

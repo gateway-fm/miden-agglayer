@@ -635,9 +635,9 @@ async fn test_pgstore_has_claim_event_for_global_index_finds_both_sources() {
     assert!(store.has_claim_event_for_global_index(&gi_b).await.unwrap());
 }
 
-/// `commit_manual_claim_event_atomic`: a single PG txn folds mark +
-/// log insert + cursor advance. Verify cursor lands at the expected
-/// block and a fresh ClaimEvent log appears.
+/// `commit_manual_claim_event_atomic`: a single PG txn folds the processed
+/// marker, log insert, and linked receipt completion. Block-tip advancement is
+/// intentionally left to the projector after the full block.
 #[tokio::test]
 async fn test_pgstore_commit_manual_claim_event_atomic() {
     let Some(store) = pg_store().await else {
@@ -674,8 +674,6 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
         .await
         .unwrap();
 
-    // Cursor advanced.
-    assert!(store.get_latest_block_number().await.unwrap() >= block);
     // Note processed.
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());
     // ClaimEvent dedup query finds the row.
@@ -1738,15 +1736,15 @@ async fn test_pgstore_reserve_nonce() {
         panic!("after release-failure the same tx must retake ownership");
     };
     assert!(fence2 > fence, "takeover bumps the fence");
-    // release-SUCCESS → same tx dedups.
+    // release-SUCCESS → the exact durable tx can resume after restart.
     store
         .release_reservation(&addr, 5, h1, fence2, true)
         .await
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         store.reserve_nonce(&addr, 5, h1, lease).await.unwrap(),
-        NonceReservation::OwnedBySame
-    );
+        NonceReservation::Won { fence } if fence > fence2
+    ));
     // Different nonce → free.
     assert!(matches!(
         store.reserve_nonce(&addr, 6, h2, lease).await.unwrap(),
@@ -1911,14 +1909,14 @@ async fn test_pgstore_claim_reclaim_fences_stale_owner() {
     assert!(b.fence > a.fence);
     assert!(
         !store
-            .mark_claim_submitted_fenced(gi, tx_a, a.fence, tx_a, "stale")
+            .prepare_claim_submission_fenced(gi, tx_a, a.fence, tx_a, "stale", "stale-id", 100,)
             .await
             .unwrap()
     );
     assert!(!store.unclaim_fenced(&gi, tx_a, a.fence).await.unwrap());
     assert!(
         store
-            .mark_claim_submitted_fenced(gi, tx_b, b.fence, tx_b, "winner")
+            .prepare_claim_submission_fenced(gi, tx_b, b.fence, tx_b, "winner", "winner-id", 100,)
             .await
             .unwrap()
     );

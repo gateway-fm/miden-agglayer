@@ -364,7 +364,7 @@ silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
 | `agglayer_writer_inflight_jobs` | gauge | `try_enqueue`, worker, TTL sweeper | Size of the inflight DashMap — Queued + Submitting + pre-eviction terminal. |
 | `agglayer_writer_job_duration_seconds{kind,outcome}` | histogram | worker `process` | Time from dequeue to terminal. `kind=claim\|ger_insert`, `outcome=committed\|failed`. |
 | `agglayer_writer_queue_full_rejections_total{kind}` | counter | `try_enqueue` | Backpressure events (returns JSON-RPC `-32005`). |
-| `agglayer_writer_job_failures_total{kind,reason}` | counter | worker fail path + TTL sweeper | Terminal Failed transitions. `reason=miden\|ttl\|panic\|store`. |
+| `agglayer_writer_job_failures_total{kind,reason}` | counter | worker fail path | Terminal Failed transitions. `reason=ttl` means queue age expired before dispatch; Submitting work is never failed by the maintenance sweeper. |
 | `agglayer_writer_dropped_on_restart_total` | counter | main.rs at boot | Residual jobs read from `/tmp/agglayer-writer-queue-snapshot`. |
 | `agglayer_writer_drain_outcome_total{outcome}` | counter | main.rs after `service::serve` | `outcome=clean\|partial`. |
 | `rpc_future_nonce_wait_total` | counter | `service_send_raw_txn` | Out-of-order submissions that entered the bounded future-nonce wait instead of erroring (writer mode only). Dashboard-level: measures how much reordering the worker absorbs. |
@@ -376,7 +376,7 @@ silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
 | **WriterQueueWarn** | `agglayer_writer_queue_depth > 0.8 * AGGLAYER_WRITER_QUEUE_DEPTH` for 10 m | warn | Sustained backpressure; queue is filling faster than the single worker can drain. Capacity-plan or bump `AGGLAYER_WRITER_QUEUE_DEPTH`. |
 | **WriterQueueCritical** | `agglayer_writer_queue_depth > 0.95 * AGGLAYER_WRITER_QUEUE_DEPTH` for 2 m | page | One step from `-32005` rejections; aggkit ethtxmanager retry budgets will start tripping. |
 | **WriterJobDurationP99** | `histogram_quantile(0.99, rate(agglayer_writer_job_duration_seconds_bucket[10m])) > 60` | page | p99 > 60 s breaks aggkit's `WaitTxToBeMined = 2 m` envelope (Spec E). Miden submission is degraded. |
-| **WriterJobFailures** | `rate(agglayer_writer_job_failures_total[5m]) > 0.5` for 5 m | page | Burst of dispatch failures. Drill down by `kind` + `reason` to distinguish Miden errors from TTL expiries. |
+| **WriterJobFailures** | `rate(agglayer_writer_job_failures_total[5m]) > 0.5` for 5 m | page | Burst of worker failures. Drill down by `kind` + `reason`; `ttl` identifies queue saturation/age before dispatch, while `miden` identifies a completed dispatch error. |
 | **WriterDroppedOnRestart** | `increase(agglayer_writer_dropped_on_restart_total[1h]) > 0` | **hard page** | Restart-pressure tripwire: dispatch was lost but the signed envelope remains durable for same-hash recovery. See `docs/operations/runbook.md` Failure mode I. |
 | **WriterQueueFullRejections** | `rate(agglayer_writer_queue_full_rejections_total[5m]) > 0.1` for 5 m | page | aggkit retries `-32005` transparently up to its budget; sustained backpressure exhausts the budget and surfaces as a stuck tx. |
 | **WriterDrainOutcomePartial** | none — dashboard only | n/a | Counts non-clean shutdowns over time; correlate with restart events when investigating `dropped_on_restart` increments. |

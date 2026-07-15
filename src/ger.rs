@@ -84,6 +84,7 @@ async fn submit_update_ger_note(
                 let bridge_id = inner_accounts.bridge.0;
                 let ger = ExitRoot::new(ger_bytes);
                 let note = UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
+                let note_id = note.id().to_string();
                 // Commitment of the on-chain note, matching the projector's
                 // consumed-note key (`InputNoteRecord::details_commitment()`).
                 let note_commitment = hex::encode(
@@ -104,6 +105,10 @@ async fn submit_update_ger_note(
                     .execute_transaction(ger_manager_id, tx_request)
                     .await?;
                 let tx_id = tx_result.executed_transaction().id();
+                let expiration_block = tx_result
+                    .executed_transaction()
+                    .expiration_block_num()
+                    .as_u64();
                 let proven_tx = crate::metrics::meter_proof(
                     crate::metrics::ProofKind::Ger,
                     client.prove_transaction(&tx_result),
@@ -118,6 +123,8 @@ async fn submit_update_ger_note(
                     &*store,
                     txn_hash,
                     &note_commitment,
+                    &note_id,
+                    expiration_block,
                     txn_envelope,
                     signer,
                 )
@@ -144,6 +151,13 @@ async fn submit_update_ger_note(
                 if !committed {
                     anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
                 }
+                let tx_key = format!("{txn_hash:#x}");
+                if !store
+                    .confirm_note_handoff(&tx_key, &note_commitment)
+                    .await?
+                {
+                    anyhow::bail!("GER note handoff changed before commit confirmation");
+                }
                 tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
                 Ok(())
             })
@@ -161,15 +175,15 @@ pub(crate) async fn record_ger_submission_handoff(
     store: &dyn crate::store::Store,
     txn_hash: TxHash,
     note_commitment: &str,
+    note_id: &str,
+    expiration_block: u64,
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<()> {
     let tx_key = format!("{txn_hash:#x}");
-    store.record_tx_note_link(&tx_key, note_commitment).await?;
-    let linked = store.get_note_link_for_tx(&tx_key).await?;
-    if linked.as_deref() != Some(note_commitment) {
-        anyhow::bail!("transaction {tx_key} is already linked to a different GER note");
-    }
+    store
+        .prepare_note_handoff(&tx_key, note_commitment, note_id, expiration_block)
+        .await?;
     // `id: None` hides this row from the StoreSyncListener's commit-pending
     // sweep (which finalises by Miden tx id at the note's CREATION block);
     // the projector finalises it at the CONSUMPTION block instead — receipt

@@ -4,9 +4,9 @@
 >
 > This is the design-of-record for the implementation that ships under [`feat/rd-940-async-writer`](https://github.com/gateway-fm/miden-agglayer/tree/feat/rd-940-async-writer). Linear ticket: [RD-940](https://linear.app/gateway-fm/issue/RD-940).
 
-## Ship status (2026-05-27)
+## Ship status (updated 2026-07-15)
 
-The feat branch lands the writer worker + RPC wire contract + observability surface as a **flag-gated default-off** rollout. Every section below that is marked ✅ ships in this PR; the BlockMonitor unification (§2.3) is the one explicit deferral, captured under "Phase 3 deferred" below.
+The implementation lands the writer worker + RPC wire contract + observability surface as a **flag-gated default-off** rollout. The full BlockMonitor unification (§2.3) remains explicitly deferred.
 
 | Section | Status | Commit |
 |---|---|---|
@@ -17,10 +17,10 @@ The feat branch lands the writer worker + RPC wire contract + observability surf
 | §2.4 RPC wire contract | ✅ shipped — geth pending shape, top-level null pre-commit, `eth_getBlockByNumber("pending")` aliased | Phase 4 (`ae35fe9`) |
 | §3 consumer interop | ✅ shipped — `-32005` mapping, idempotent re-broadcast, `eth_getTransactionCount` tag honour | Phase 1+2 (`95d6e4f`, `e1dfe0c`) |
 | §4 metrics + observability | ✅ shipped — 8 metrics, tracing spans per job, graceful drain, `dropped_on_restart` tmpfile | Phase 5 (`9da5aa2`) |
-| §5 unit tests | ✅ shipped — 12 new tests on top of 167 pre-existing; 179 lib + 4 bin pass | Phases 1–4 |
+| §5 unit tests | ✅ shipped — admission, receipt, nonce, lease, and claim-fence regressions | Phases 1–4 + #55 hardening |
 | §5 e2e scripts | **⏸️ deferred** — require live fixture environment; will land in follow-up | follow-up PR |
 | `service_get_txn_receipt.rs:40` `from` co-fix | ✅ shipped | Phase 4 (`ae35fe9`) |
-| 5-minute TTL → status:0x0 (Decision 5) | ✅ shipped — TTL sweeper writes failure receipt | Phase 4 (`ae35fe9`) |
+| 5-minute writer TTL (Decision 5) | ✅ shipped — consumer expires queue-aged work before dispatch; sweeper only renews leases and evicts terminal cache entries | Phase 4 (`ae35fe9`) + crash-safety hardening |
 | `docs/operations/runbook.md` + `monitoring.md` | ✅ shipped — Failure Mode I + 8-metric alert table | Phase 7 |
 | Default flag flip false→true | **⏸️ deferred** — operational rollout in a follow-up after canary validation | follow-up PR |
 
@@ -38,22 +38,22 @@ The follow-up PR will own §2.3 in its entirety + the cross-emitter race elimina
 
 The six new `scripts/e2e-rd940-*.sh` scripts described in §5 (async-submit golden path, pending-receipt wire shape, queue-backpressure 600 req/s, restart-inflight, worker-panic, claim-guard-cancellation) require a running fixture environment (miden-node + bridge contracts + aggkit) that can't be stood up from a code review. They will land in a follow-up PR alongside `scripts/setup-iaic-fixture.sh` that lets the IAIC regression sentinel run strict in CI.
 
-The unit-test coverage (179 lib + 4 bin tests) covers the load-bearing per-component invariants. Two failure modes are explicitly only catchable in e2e and are flagged as accepted Phase-1 risk:
+Unit tests cover the load-bearing per-component invariants. Two failure modes still require a live-stack test:
 
 - aggkit ethtxmanager-loop interaction under real wire JSON (the `insta` snapshot test in `build_inflight_pending_tx_json_emits_geth_wire_shape` pins the Rust-side shape; an aggkit-side parse smoke is the follow-up).
 - 50 req/s × 10 min v1 acceptance gate (drop-rate <1%, p99 < 60 s) needs a real Miden node — runs on bali staging once the flag is enabled.
 
 ## TL;DR
 
-The async write path replaces today's sync-on-Miden-commit `eth_sendRawTransaction` (`src/service_send_raw_txn.rs:407-595`) with: cheap synchronous validation on the request thread → bounded `tokio::sync::mpsc(64)` enqueue → single writer-worker task → `MidenClient::with(...)` (preserved channel-of-1 invariant from `src/miden_client.rs:126`) → `BlockMonitor::record(...)` (new sole writer of `latest_block_number` and synthetic logs) → durable receipt via `store.txn_commit`. The HTTP handler returns the tx hash as soon as the job is on the queue.
+The async write path performs cheap request validation, reserves `(signer, nonce)`, persists the full signed envelope as an unlinked pending intent, CAS-advances the nonce, and then enqueues into a bounded `tokio::sync::mpsc(64)`. A single worker dispatches through `MidenClient::with(...)`; the SyntheticProjector finalises the receipt and event after note consumption. The mpsc is a dispatch buffer, not the durability boundary.
 
 **Five load-bearing decisions** (resolved cross-spec conflicts, see §6):
 
-1. **`ClaimGuard` is acquired _inside_ the worker, not at enqueue.** First step of the worker job, immediately before `publish_claim`. Eliminates the only real defect class (`Queued × restart`, `Submitting × restart`) — without it a crash before dequeue leaves a wedged row in `claimed_indices` and aggkit retries are blocked.
+1. **The fenced `ClaimGuard` is acquired inside the worker, not at enqueue.** Before external submission, its owner/fence and exact note handoff are sealed durably; stale owners cannot release or overwrite a successor.
 2. **Durable intent precedes nonce acceptance.** The handler idempotently persists the full signed envelope before the nonce CAS. The mpsc is only a dispatch buffer: after restart, a same-hash rebroadcast reconstructs and re-enqueues an unlinked pending intent without advancing the nonce twice.
-3. **`eth_sendRawTransaction` is idempotent on tx-hash _before_ R4 nonce check.** If the hash already exists in the in-flight `DashMap` or `txn_data`, short-circuit to `Ok(hash)` without re-enqueueing or bumping nonce. Required to survive aggkit's ethtxmanager re-broadcast within its 2-min `WaitTxToBeMined` (`fixtures/aggkit-config.toml:43`). Today's code has no such early-return; this is a forced addition.
+3. **`eth_sendRawTransaction` classifies known hashes _before_ R4 nonce rejection.** In-flight, handed-off, and terminal hashes deduplicate to `Ok(hash)`; an unlinked pending intent is the one exception and resumes dispatch without advancing its nonce twice.
 4. **`eth_getTransactionCount` finally honours its block tag.** `latest` = next-committed; `pending` = next-accepted. Current code ignores the tag (`src/service.rs:370-377`) — claim-sponsor's `nonce_cache.go:35` reads `latest` and will race itself if pool-queued txs leak into `latest`.
-5. **5-minute hard TTL on every accepted hash.** On expiry, worker writes `txn_commit(hash, Err("ttl"), block_num, block_hash)` so the receipt transitions `null → status:0x0`. Bounds the contract: every hash reaches a terminal state. No more IAIC-shaped forever-pending traps (`docs/POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md`).
+5. **5-minute owner-local queue TTL and terminal-cache TTL.** After dequeue, the consuming worker fails an over-age queued item _before_ constructing its dispatch future. Once dispatch starts, no independent sweeper may publish `status:0x0`: `MidenClient::with(...)` hands the closure to another task, so dropping the outer waiter does not cancel the Miden operation. A completed dispatch error may fail only when no durable exact-note handoff exists; ambiguous handed-off work remains pending for projector/reconciler recovery. Terminal cache entries are evicted after the same TTL.
 
 **v1 acceptance gate:** 50 req/s × 10 min, drop-rate < 1%, p99 worker-job-duration < 60 s (inside aggkit's 2 m `WaitTxToBeMined`), zero `agglayer_writer_dropped_on_restart_total`, zero per-signer nonce gaps. 500 req/s stays as a nightly stress benchmark — at queue cap 64 and p50 commit ≈ 10 s, sustainable throughput tops out near 6 jobs/s by design.
 
@@ -65,21 +65,21 @@ The async write path replaces today's sync-on-Miden-commit `eth_sendRawTransacti
                        HTTP request thread                             writer worker (single)                Miden node
                      ─────────────────────────                       ─────────────────────────              ─────────────
 service_send_raw_txn                                   mpsc(64)
-  │ decode envelope (`:408`)                            ──▶  recv  ──▶  ClaimGuard::new (R9 lock)
+  │ decode + deterministic validation                   ──▶  recv  ──▶  fenced ClaimGuard
   │ R4 chain_id                                                          │ MidenClient::with(...)
-  │ R2 signer allow-list                                                 │   submit_proven_transaction ──▶  apply
-  │ per-signer-lock acquire (`:447`)                                     │   wait_for_transaction_commit◀──  commit
-  │ ★ tx-hash dedup early-return   ◀── NEW                               │ txn_begin / txn_commit
-  │ R4 nonce equality                                                    │ BlockMonitor::record(event)
-  │ R9 try_claim + ClaimGuard ─── REMOVED (moved to worker)              │   = sole writer of latest_block
-  │ store.nonce_increment                                                │   = sole emitter of synth log row
+  │ R2 signer allow-list                                                 │   seal claim fence + note link
+  │ per-signer lock + nonce equality                                     │   submit_proven_transaction ──▶ apply
+  │ tx-hash/durable-intent classification                                │ SyntheticProjector
+  │ reserve (signer, nonce) lease                                        │   = receipt/event finalisation
+  │ txn_begin_if_absent(full envelope)
+  │ nonce_advance_cas
   │ try_send(WriteJob)        ───────────────────────────────────────────┘
   │ release per-signer lock
   ▼
 return tx_hash
 ```
 
-`BlockMonitor` absorbs `BlockState`, `StoreSyncListener`, and the inline emitters in `claim.rs`, `ger.rs`, `bridge_out.rs`, `claim_watcher.rs`. It implements `SyncListener`; `StoreSyncListener` and `BlockState::on_sync` both delete. Public surface: `record(BlockEvent) -> Result<u64>` for writers, `current_tip() / get_block_by_*` for read RPCs.
+The shipped `BlockMonitor` is currently a monotonic tip mirror over `BlockState`. Full ownership of block headers, listeners, and event writers remains the explicit Phase-3 follow-up below.
 
 In-flight map (`DashMap<TxHash, JobState>`) is a hot read cache backing `eth_getTransactionByHash` for not-yet-committed envelopes; it is **not** a durability boundary. Entries linger 5 min past terminal then a sweeper evicts (mirrors `L1InfoTreeIndexer::spawn`, `src/l1_info_tree_indexer.rs:124-223`).
 
@@ -91,19 +91,19 @@ In-flight map (`DashMap<TxHash, JobState>`) is a hot read cache backing `eth_get
 - On `TrySendError::Full`: JSON-RPC error `-32005 "writer queue saturated; retry"`. HTTP 200 JSON-body (axum-jrpc convention). Spec E confirms aggkit's ethtxmanager retries on `-32005`.
 - Single worker task mirroring `L1InfoTreeIndexer::spawn`, with a `oneshot` shutdown signal. Worker is a **translator only** — no retry logic of its own; existing self-heal at `src/claim.rs:591-628` and `src/ger.rs:201-224` already handles recoverable errors. A pool adds nothing because `MidenClient::with(...)` is a channel-of-1 (`src/miden_client.rs:126`).
 - `WriteJob` carries decoded params + `eth_tx_hash` (idempotency key). Decode on the request thread so malformed payloads cannot poison the queue.
-- Per-signer lock (`src/service_state.rs:21-44`): held across **enqueue only** — its job is nonce-counter atomicity, not submission ordering. Holding across submit re-serialises pipelined signers and defeats async.
+- Per-signer lock (`src/service_state.rs:21-44`): serialises nonce classification and admission. Writer mode releases it after durable admission/enqueue; the legacy synchronous mode remains serial for the full dispatch.
 
 ### 2.2 ClaimGuard placement — Spec B, recommendation (b) with amendments
 
-- **Where the lock is taken:** worker dequeues → `store.try_claim(global_index)` → `ClaimGuard::new` → `publish_claim`. The HTTP request future never holds the lock. This is the resolution of the A↔B conflict (§6).
-- **Drop semantics:** `Handle::try_current().spawn(unclaim)` runs on the worker tokio runtime. Worker-panic supervision (pattern: `src/miden_client.rs:150-162`) catches and respawns; per-job `AssertUnwindSafe` wrapper catches the panic and writes `Failed { err: "panic..." }` so the receipt transitions deterministically.
-- **Retry across self-heal:** guard held across both attempts of `IncorrectAccountInitialCommitment` recovery (`src/claim.rs:607-628`). Only released on terminal outcome.
+- **Where the lock is taken:** worker dequeues → `try_claim_fenced(global_index, tx_hash, lease)` → `ClaimGuard` → `publish_claim`. The request thread owns only the nonce reservation.
+- **Drop semantics:** before submission, cancellation conditionally releases only the caller's current fence. After the exact note handoff is sealed as `submitted`, stale release and lease reclaim are fail-closed.
+- **Retry across self-heal:** retry is allowed only before the durable note handoff. Once that boundary exists, an ambiguous result does not build a second random note.
 - **Recovery from `Queued × restart`:** the pending transaction row is the durable intent. A same-hash rebroadcast after the reservation lease expires re-decodes the stored signed envelope, resumes the job, and accepts either the pre-CAS nonce or its already-advanced value. A different hash can never take over the nonce slot.
-- **`MidenSubmitted × worker-panic`** residual-risk cell: the proven tx may sit in Miden mempool while ClaimGuard releases. Resolved by existing self-heal + `claim_watcher` (`src/claim_watcher.rs:1-27`) which decodes consumed CLAIMs from Miden sync and back-fills the ClaimEvent. Loud and ugly under load but recoverable.
+- **`MidenSubmitted × worker-panic`** is fail-closed: the submitted fence and tx↔note link remain durable, and the projector/watcher can attribute later note consumption to the original hash.
 
-### 2.3 BlockMonitor unification — Spec C
+### 2.3 BlockMonitor unification — Spec C (target design; deferred)
 
-`BlockMonitor` is the **sole** caller of `store.set_latest_block_number` (and the sole allocator via `store.advance_block_number`). It owns:
+The current implementation ships only `current_tip()` / `record_tip()`. The deferred structural target makes `BlockMonitor` the sole caller of `store.set_latest_block_number` and has it own:
 - the synthetic-block header cache (absorbs `BlockState::blocks` / `BlockState::hash_to_number`, `src/block_state.rs:137-148`);
 - an `AtomicU64` tip mirror for `eth_blockNumber` (hot-read, no async hop);
 - the single write entrypoint `async fn record(&self, BlockEvent) -> Result<u64>` wrapping the existing `store.commit_*_atomic` helpers (`src/store/mod.rs:208-231, 339-368, 438-471`) so the "log first / cursor second" ordering is a property of `record()` rather than a tribal-knowledge comment at four call sites (`src/bridge_out.rs:555-561`, `src/ger.rs:226-231`, `src/claim.rs:557-561`).
@@ -136,7 +136,7 @@ aggkit's **only** on-proxy signer is `aggoracle`. `aggsender` uses gRPC `SendCer
 - aggoracle uses `github.com/0xPolygon/zkevm-ethtx-manager v0.2.18` with `WaitPeriodMonitorTx=5s`, `FrequencyToMonitorTxs=1s`, `WaitTxToBeMined=2m`, `EstimateGasMaxRetries=0` (unbounded). Re-broadcasts stuck txs by bumping gas + re-signing. Proxy MUST accept duplicate `eth_sendRawTransaction` calls with the same tx-hash idempotently (Decision 3).
 - claim-sponsor's `RetryNumber=10` (`bridge-config.toml:66`) — finite retry budget. Calls `NonceAt(ctx, from, nil)` = `latest`; `nonce_cache.go:35` LRU breaks if `latest` leaks pool-queued txs. Decision 4 fixes this.
 - **Stay strictly geth-compatible.** Do NOT add `gateway_getTxStatus` or any non-`eth_` namespace. aggkit's state machine maps cleanly to geth semantics; a new RPC would require forking aggkit or a translation shim.
-- **Receipt with `status:0x0` on Miden rejection** non-negotiable. On terminal failure (incl. TTL expiry) worker writes `txn_commit(hash, Err(...))` so aggoracle transitions to `Failed` instead of retrying forever (IAIC re-incarnation surface from postmortem line 117).
+- **Receipt with `status:0x0` on definite pre-handoff failure** is non-negotiable. This includes queue-age expiry before dispatch and completed Miden rejections for which the store disproves an exact-note handoff. Submitting or handed-off work is never terminalised concurrently; an ambiguous outcome remains pending so a still-running Miden closure cannot later contradict a failure receipt.
 - **IAIC-class regression guard:** every async dispatch funnels through `MidenClient::with(...)` (`src/miden_client.rs:126`). The worker may dequeue concurrently in a future version, but Miden submission is always serial.
 
 ## 4. Failure modes + observability — Spec F
@@ -165,13 +165,7 @@ aggkit's **only** on-proxy signer is `aggoracle`. `aggsender` uses gRPC `SendCer
 
 ## 5. Test plan + acceptance gate — Spec G
 
-**Unit tests** (`cargo test --lib`, ~3 min CI):
-- `writer_worker`: enqueue/submit/commit/fail, panic catch + `Failed` write, per-signer arrival-order, idempotent resubmit-same-hash, backpressure 32 producers × 1000 enqueues, shutdown drain ≤20 s.
-- In-flight map: TTL expiry → synthetic-failure receipt, 150 k-entry memory bound, concurrent read-during-write.
-- ClaimGuard: one test per F-matrix cell (Queued/Submitting/MidenSubmitted × disconnect/panic/shutdown/sigkill), guard-held-across-self-heal, drop-outside-runtime logs error.
-- BlockMonitor: `record` is sole writer (grep assertion), log-first/cursor-second order, 8-task concurrent record distinct block numbers, `tick` does not overrun `record`, stale-low atomic safe / stale-high impossible, RD-862 fixture replay 0 orphans, `from` populated in receipt.
-- RPC wire: `getTxByHash` pending JSON shape, `getReceipt` top-level null, `getReceipt` status:0x0 after TTL, JSON snapshot pin, `eth_getTransactionCount` pending vs latest diverge.
-- `WriteJob` bincode round-trip (lands v1.5 wire shape early).
+**Unit tests** (`cargo test --lib`): writer enqueue/failure/TTL behavior; pending RPC wire shape; nonce CAS and reservation lifecycle; durable-intent recovery after a lost enqueue; landed/in-flight claim classification; fenced stale-owner release; and accept-and-revert receipt/nonce invariants.
 
 **Existing e2e** (`make test-e2e-coverage`, ~12 min):
 
@@ -192,8 +186,8 @@ aggkit's **only** on-proxy signer is `aggoracle`. `aggsender` uses gRPC `SendCer
 | # | Conflict | Resolution | Rationale |
 |---|---|---|---|
 | 1 | ClaimGuard placement (A: enqueue / B: worker) | Worker | Eliminates `Queued/Submitting × restart` wedge defects. v1 in-memory queue means a crash before dequeue must leave _no_ on-disk lock. |
-| 2 | Durable intent placement | Handler before nonce CAS | Prevents nonce advancement without recoverable work; downstream handoffs use idempotent begin/update. | Worker | Consistent with #1 and v1 no-persistence contract. Receipt-null-after-restart is documented behaviour. |
-| 3 | R4 nonce equality (A) vs idempotent re-broadcast (D/E) | Hash-dedup _before_ R4 nonce | aggkit's ethtxmanager re-broadcasts within `WaitTxToBeMined=2m`. R4 against bumped nonce returns "nonce mismatch" and wedges aggkit; early-return on known hash preserves R4's replay defence on novel hashes. |
+| 2 | Durable intent placement | Handler before nonce CAS | Prevents nonce advancement without recoverable work; downstream handoffs use idempotent begin/update. |
+| 3 | R4 nonce equality (A) vs idempotent re-broadcast (D/E) | Classify known hash before R4 rejection | In-flight/handed-off/terminal hashes deduplicate; an unlinked durable intent resumes with its already-advanced nonce. Novel stale hashes still fail R4. |
 | 4 | `eth_getTransactionCount` semantics (D punted / E forced) | `latest` = next-committed, `pending` = next-accepted; honour tag (today ignored at `src/service.rs:370-377`) | claim-sponsor's `nonce_cache.go:35` reads `latest` and breaks if pool-queued txs leak in. |
 | 5 | Queue cap 64 vs 500 req/s gate | v1 gate at 50 req/s; 500 → nightly stress | At cap 64 and p50 ≈ 10 s, sustainable throughput ~6 jobs/s. 500 req/s is 100× current bali load. |
 
@@ -201,7 +195,7 @@ aggkit's **only** on-proxy signer is `aggoracle`. `aggsender` uses gRPC `SendCer
 
 1. **Queue depth 64** — agreeable, or size against an observed aggsender burst (~100+ changes drain math)? — **Answered (build): 64, env-overridable.**
 2. **Nonce-burn on failure** — stay advanced (recommended) vs rewind? — **Default: stay advanced.**
-3. **TTL default 5 min** — env-configurable? — **Default: yes, env-overridable.**
+3. **TTL default 5 min** — env-configurable? — **Default: yes, env-overridable; applies to queue-age admission and terminal-cache eviction, never concurrent submitting-work failure.**
 4. **`expected_mint_record` store API** for RD-913 coordination — extend `commit_manual_claim_event_atomic` or new variant? (RD-913 owner's call.) — **Deferred; hook point only.**
 5. **`dropped_on_restart` persistence** — tmpfile in `/tmp`, k8s `emptyDir`, or SIGKILL → 0 + queue-depth-history-before-kill as the signal? — **Default: tmpfile in `/tmp/agglayer-writer-queue-snapshot`.**
 6. **`-32005` vs `-32603`** on backpressure? — **Answered (build): -32005.**
@@ -213,8 +207,8 @@ aggkit's **only** on-proxy signer is `aggoracle`. `aggsender` uses gRPC `SendCer
 ## 8. Risks + scope notes
 
 - **+50% spike risk (RPC contract / receipt-availability race)** fully covered by Decisions 3, 4, 5 + Spec D's wire-shape audit. Residual: alloy upgrade regression — mitigated by JSON snapshot test.
-- **No persistence in v1** deliberate. v1.5 lands a `worker_jobs` table or WAL-style journal — Spec B amendment 2 sketches the shape; `WriteJob` is already serializable so migration is additive.
-- **`MidenSubmitted × worker-panic`** retains a self-heal-via-claim_watcher floor; loud and ugly under load but recoverable. Acceptable for v1.
+- **No standalone durable queue table in v1.** The signed transaction row is the durable admission intent; same-hash rebroadcast reconstructs dispatch after a restart. A future queue/outbox table would add autonomous recovery without requiring that rebroadcast.
+- **`MidenSubmitted × worker-panic`** retains the submitted claim fence and exact note link; the projector/watcher remains the recovery floor.
 - **Adjacent tickets:** RD-913 (persisted trackers) needs explicit coordination (§2.3). RD-891 (gas budget) orthogonal — merges independently. RD-862 (GER decomposition race) structurally already cured; BlockMonitor preserves the cure.
 - **Not in scope for RD-940:** worker pool, a standalone queue table, `gateway_getTxStatus` RPC, `pending` block enumeration, real wallclock block timestamps. Explicitly deferred.
 

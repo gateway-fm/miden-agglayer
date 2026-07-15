@@ -1,7 +1,8 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
 use super::{
-    ClaimFence, FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
+    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, Store, TxnData,
+    TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
 };
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
@@ -44,7 +45,9 @@ enum ReservationState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClaimState {
     Executing,
+    Prepared,
     Submitted,
+    Landed,
 }
 
 #[derive(Clone)]
@@ -54,6 +57,14 @@ struct ClaimRecord {
     acquired_at: std::time::Instant,
     lease_expires_at: Option<std::time::Instant>,
     fence: u64,
+}
+
+#[derive(Clone)]
+struct NoteHandoffRecord {
+    note_commitment: String,
+    note_id: Option<String>,
+    state: NoteHandoffState,
+    expiration_block: Option<u64>,
 }
 
 pub struct InMemoryStore {
@@ -121,7 +132,8 @@ pub struct InMemoryStore {
     /// instead LANDS the claim (records a watcher ClaimEvent) as a side effect and
     /// still reports the miss — so the FOLLOWING call observes it. Deterministically
     /// models "the racing claim commits its ClaimEvent between `acquire_claim_lock`'s
-    /// two landed reads." Always `None` in production (zero behavioural impact).
+    /// two landed reads."
+    #[cfg(test)]
     test_land_after_next_has_claim_miss: RwLock<Option<[u8; 32]>>,
 
     // Faucet registry
@@ -150,7 +162,7 @@ pub struct InMemoryStore {
     // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
     // first-write-wins evm_tx_hash -> note_commitment, with the reverse index
     // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
-    tx_note_links: RwLock<HashMap<String, String>>,
+    tx_note_links: RwLock<HashMap<String, NoteHandoffRecord>>,
     note_tx_links: RwLock<HashMap<String, String>>,
 }
 
@@ -189,6 +201,7 @@ impl InMemoryStore {
             processed_notes: RwLock::new(HashMap::new()),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
+            #[cfg(test)]
             test_land_after_next_has_claim_miss: RwLock::new(None),
             faucets: RwLock::new(Vec::new()),
             monitor_burn_serials: RwLock::new(HashSet::new()),
@@ -372,7 +385,15 @@ impl Store for InMemoryStore {
         if fwd.contains_key(tx_hash) {
             return Ok(());
         }
-        fwd.insert(tx_hash.to_string(), note_commitment.to_string());
+        fwd.insert(
+            tx_hash.to_string(),
+            NoteHandoffRecord {
+                note_commitment: note_commitment.to_string(),
+                note_id: None,
+                state: NoteHandoffState::Submitted,
+                expiration_block: None,
+            },
+        );
         drop(fwd);
         self.note_tx_links
             .write()
@@ -382,11 +403,188 @@ impl Store for InMemoryStore {
     }
 
     async fn get_note_link_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.tx_note_links.read().get(tx_hash).cloned())
+        Ok(self
+            .tx_note_links
+            .read()
+            .get(tx_hash)
+            .map(|record| record.note_commitment.clone()))
     }
 
     async fn get_tx_for_note(&self, note_commitment: &str) -> anyhow::Result<Option<String>> {
         Ok(self.note_tx_links.read().get(note_commitment).cloned())
+    }
+
+    async fn get_note_handoff_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<NoteHandoff>> {
+        Ok(self
+            .tx_note_links
+            .read()
+            .get(tx_hash)
+            .map(|record| NoteHandoff {
+                note_commitment: record.note_commitment.clone(),
+                note_id: record.note_id.clone(),
+                state: record.state,
+                expiration_block: record.expiration_block,
+            }))
+    }
+
+    async fn prepare_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
+    ) -> anyhow::Result<()> {
+        let mut links = self.tx_note_links.write();
+        if let Some(existing) = links.get(tx_hash) {
+            if existing.note_commitment != note_commitment
+                || existing.note_id.as_deref() != Some(note_id)
+            {
+                anyhow::bail!("transaction {tx_hash} is already linked to a different note");
+            }
+            return Ok(());
+        }
+        links.insert(
+            tx_hash.to_string(),
+            NoteHandoffRecord {
+                note_commitment: note_commitment.to_string(),
+                note_id: Some(note_id.to_string()),
+                state: NoteHandoffState::Prepared,
+                expiration_block: Some(expiration_block),
+            },
+        );
+        self.note_tx_links
+            .write()
+            .entry(note_commitment.to_string())
+            .or_insert_with(|| tx_hash.to_string());
+        Ok(())
+    }
+
+    async fn confirm_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool> {
+        let mut links = self.tx_note_links.write();
+        let mut claimed = self.claimed.write();
+        let Some(record) = links.get_mut(tx_hash) else {
+            return Ok(false);
+        };
+        if record.note_commitment != note_commitment {
+            return Ok(false);
+        }
+        record.state = NoteHandoffState::Submitted;
+        record.expiration_block = None;
+        if let Ok(owner) = tx_hash.parse::<TxHash>() {
+            for claim in claimed.values_mut() {
+                if claim.owner_tx_hash == Some(owner) && claim.state == ClaimState::Prepared {
+                    claim.state = ClaimState::Submitted;
+                    claim.lease_expires_at = None;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn confirm_note_handoff_by_commitment(
+        &self,
+        note_commitment: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let preferred = self.note_tx_links.read().get(note_commitment).cloned();
+        let mut links = self.tx_note_links.write();
+        let mut matching: Vec<String> = links
+            .iter()
+            .filter(|(_, link)| link.note_commitment == note_commitment)
+            .map(|(tx_hash, _)| tx_hash.clone())
+            .collect();
+        if matching.is_empty() {
+            return Ok(None);
+        }
+        matching.sort();
+        let mut claimed = self.claimed.write();
+        for tx_hash in &matching {
+            let link = links.get_mut(tx_hash).expect("matching link exists");
+            link.state = NoteHandoffState::Submitted;
+            link.expiration_block = None;
+            if let Ok(owner) = tx_hash.parse::<TxHash>() {
+                for claim in claimed.values_mut() {
+                    if claim.owner_tx_hash == Some(owner) && claim.state == ClaimState::Prepared {
+                        claim.state = ClaimState::Submitted;
+                        claim.lease_expires_at = None;
+                    }
+                }
+            }
+        }
+        Ok(Some(preferred.unwrap_or_else(|| matching[0].clone())))
+    }
+
+    async fn confirm_prepared_note_handoffs(&self, note_ids: &[String]) -> anyhow::Result<u64> {
+        let ids: HashSet<&str> = note_ids.iter().map(String::as_str).collect();
+        let matches: Vec<(String, String)> = self
+            .tx_note_links
+            .read()
+            .iter()
+            .filter(|(_, link)| {
+                link.state == NoteHandoffState::Prepared
+                    && link.note_id.as_deref().is_some_and(|id| ids.contains(id))
+            })
+            .map(|(tx_hash, link)| (tx_hash.clone(), link.note_commitment.clone()))
+            .collect();
+        let mut confirmed = 0;
+        for (tx_hash, commitment) in matches {
+            confirmed += u64::from(self.confirm_note_handoff(&tx_hash, &commitment).await?);
+        }
+        Ok(confirmed)
+    }
+
+    async fn clear_expired_prepared_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool> {
+        let cursor = *self.reconcile_cursor.read();
+        let mut links = self.tx_note_links.write();
+        let mut claimed = self.claimed.write();
+        let Some(record) = links.get(tx_hash) else {
+            return Ok(false);
+        };
+        if record.state != NoteHandoffState::Prepared
+            || record.note_commitment != note_commitment
+            || record
+                .expiration_block
+                .is_none_or(|expiration| cursor <= expiration)
+        {
+            return Ok(false);
+        }
+        if let Ok(owner) = tx_hash.parse::<TxHash>() {
+            let matching_claim = claimed.iter().find_map(|(gi, claim)| {
+                (claim.owner_tx_hash == Some(owner)).then_some((*gi, claim.state))
+            });
+            match matching_claim {
+                Some((gi, ClaimState::Prepared)) => {
+                    claimed.remove(&gi);
+                }
+                Some((_gi, ClaimState::Landed)) => return Ok(false),
+                None => {}
+                Some(_) => return Ok(false),
+            }
+        }
+        links.remove(tx_hash);
+        if self
+            .note_tx_links
+            .read()
+            .get(note_commitment)
+            .is_some_and(|v| v == tx_hash)
+        {
+            self.note_tx_links.write().remove(note_commitment);
+        }
+        if let Ok(hash) = tx_hash.parse::<TxHash>()
+            && let Some(receipt) = self.transactions.lock().get_mut(&hash)
+            && receipt.result.as_ref().is_some_and(Result::is_err)
+        {
+            receipt.result = None;
+            receipt.block_num = 0;
+        }
+        Ok(true)
     }
 
     // ── Logs ─────────────────────────────────────────────────────
@@ -562,16 +760,30 @@ impl Store for InMemoryStore {
         rollup_exit_root: Option<[u8; 32]>,
         timestamp: u64,
     ) -> anyhow::Result<()> {
-        self.mark_ger_seen(
-            global_exit_root,
-            GerEntry {
-                mainnet_exit_root,
-                rollup_exit_root,
-                block_number,
-                timestamp,
-            },
-        )
-        .await?;
+        // Observing the exact note is authoritative confirmation of the
+        // pre-submit handoff. Hold this guard through the in-memory commit so a
+        // recovery clear cannot interleave with event publication.
+        let mut links = self.tx_note_links.write();
+        if let Some(link) = links.get_mut(&tx_hash.to_lowercase()) {
+            link.state = NoteHandoffState::Submitted;
+            link.expiration_block = None;
+        }
+
+        {
+            let mut seen = self.seen_gers.write();
+            if !seen.contains_key(global_exit_root) {
+                seen.insert(
+                    *global_exit_root,
+                    GerEntry {
+                        mainnet_exit_root,
+                        rollup_exit_root,
+                        block_number,
+                        timestamp,
+                    },
+                );
+                *self.latest_ger.write() = Some(*global_exit_root);
+            }
+        }
 
         // Audit H2 — idempotent chain roll + log emission. A retry (e.g. after a
         // crash) used to roll the hash chain and emit a duplicate synthetic log
@@ -607,11 +819,33 @@ impl Store for InMemoryStore {
                 log_index: 0,
                 removed: false,
             };
-            self.add_log(log).await?;
+            let mut log = log;
+            let mut counter = self.log_counter.write();
+            log.log_index = *counter;
+            *counter += 1;
+            drop(counter);
+            self.logs_by_block
+                .write()
+                .entry(block_number)
+                .or_default()
+                .push(log.clone());
+            self.logs_by_tx
+                .write()
+                .entry(tx_hash.to_lowercase())
+                .or_default()
+                .push(log.clone());
+            self.pending_events.write().push(log);
         }
 
         // Always set is_injected = TRUE (idempotent).
         self.injected_gers.write().insert(*global_exit_root);
+        if let Ok(hash) = tx_hash.parse::<TxHash>()
+            && let Some(receipt) = self.transactions.lock().get_mut(&hash)
+        {
+            receipt.result = Some(Ok(()));
+            receipt.block_num = block_number;
+        }
+        drop(links);
         Ok(())
     }
 
@@ -671,7 +905,13 @@ impl Store for InMemoryStore {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()> {
+        // Once an exact handoff exists, an error is ambiguous until commit,
+        // observation, or expiration reconciliation. Never expose status 0.
         let logs_to_add = {
+            let links = self.tx_note_links.read();
+            if result.is_err() && links.contains_key(&format!("{tx_hash:#x}")) {
+                return Ok(());
+            }
             let mut txns = self.transactions.lock();
             let Some(receipt) = txns.get_mut(&tx_hash) else {
                 anyhow::bail!("Store: transaction {tx_hash} not found");
@@ -750,6 +990,35 @@ impl Store for InMemoryStore {
             block_num: receipt.block_num,
             logs: receipt.logs.clone(),
         }))
+    }
+
+    async fn pending_nonce_frontier(&self, addr: &str) -> anyhow::Result<PendingNonceFrontier> {
+        let addr = addr.to_lowercase();
+        let txns = self.transactions.lock();
+        let links = self.tx_note_links.read();
+        let mut frontier = PendingNonceFrontier::default();
+        for (tx_hash, receipt) in txns.iter() {
+            if receipt.result.is_some() || format!("{:#x}", receipt.signer).to_lowercase() != addr {
+                continue;
+            }
+            let nonce = super::envelope_nonce(&receipt.envelope);
+            frontier.lowest_pending = Some(
+                frontier
+                    .lowest_pending
+                    .map_or(nonce, |current| current.min(nonce)),
+            );
+            if !links
+                .get(&format!("{tx_hash:#x}"))
+                .is_some_and(|link| link.state == NoteHandoffState::Submitted)
+            {
+                frontier.lowest_unlinked = Some(
+                    frontier
+                        .lowest_unlinked
+                        .map_or(nonce, |current| current.min(nonce)),
+                );
+            }
+        }
+        Ok(frontier)
     }
 
     async fn txn_pending_by_miden_id(&self, id: TransactionId) -> anyhow::Result<Option<TxHash>> {
@@ -863,8 +1132,10 @@ impl Store for InMemoryStore {
                 // failed or expired attempt may have crossed an external side-effect
                 // boundary, so a different replacement can never take it over.
                 let takeover = r.tx_hash == tx_hash
-                    && (matches!(r.state, ReservationState::ReleasedFailure)
-                        || r.lease_expires_at <= now);
+                    && (matches!(
+                        r.state,
+                        ReservationState::ReleasedFailure | ReservationState::ReleasedSuccess
+                    ) || r.lease_expires_at <= now);
                 if takeover {
                     let fence = r.fence + 1;
                     reservations.insert(
@@ -945,6 +1216,7 @@ impl Store for InMemoryStore {
         // receipt committed with the nonce not yet advanced (or vice versa).
         // The row is inserted already committed-`failed` (empty logs, no
         // synthetic ClaimEvent), so there is no pending window.
+        let links = self.tx_note_links.read();
         let mut txns = self.transactions.lock();
         let mut nonces = self.nonces.write();
         // BLOCKER 4 — CONDITIONAL: never overwrite a REAL receipt. If this hash
@@ -956,10 +1228,7 @@ impl Store for InMemoryStore {
         // (idempotent re-affirm).
         let may_write = match txns.peek(&tx_hash).map(|r| &r.result) {
             None => true, // absent
-            Some(None) => !self
-                .tx_note_links
-                .read()
-                .contains_key(&format!("{tx_hash:#x}")),
+            Some(None) => !links.contains_key(&format!("{tx_hash:#x}")),
             // linked pending receipt is a real external handoff; an unlinked pending
             // row is only the durable pre-admission intent and may be reverted
             Some(Some(Ok(()))) => false, // successful real receipt — keep it
@@ -1029,7 +1298,9 @@ impl Store for InMemoryStore {
             .is_some_and(|deadline| deadline <= now)
             || (record.lease_expires_at.is_none()
                 && now.saturating_duration_since(record.acquired_at) >= lease);
-        if record.state != ClaimState::Executing || !expired {
+        if record.state != ClaimState::Executing
+            || (record.owner_tx_hash != Some(owner_tx_hash) && !expired)
+        {
             return Ok(None);
         }
         record.owner_tx_hash = Some(owner_tx_hash);
@@ -1041,16 +1312,27 @@ impl Store for InMemoryStore {
         }))
     }
 
-    async fn mark_claim_submitted_fenced(
+    async fn prepare_claim_submission_fenced(
         &self,
         global_index: U256,
         owner_tx_hash: TxHash,
         fence: u64,
         tx_hash: TxHash,
         note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
     ) -> anyhow::Result<bool> {
         let now = self.claim_clock_now();
         let tx_key = format!("{tx_hash:#x}");
+        let mut links = self.tx_note_links.write();
+        if let Some(existing) = links.get(&tx_key) {
+            if existing.note_commitment != note_commitment
+                || existing.note_id.as_deref() != Some(note_id)
+            {
+                anyhow::bail!("transaction {tx_key} is already linked to a different claim note");
+            }
+            return Ok(false);
+        }
         let mut claimed = self.claimed.write();
         let Some(record) = claimed.get_mut(&global_index) else {
             return Ok(false);
@@ -1064,17 +1346,17 @@ impl Store for InMemoryStore {
         {
             return Ok(false);
         }
-        if let Some(existing) = self.tx_note_links.read().get(&tx_key)
-            && existing != note_commitment
-        {
-            anyhow::bail!("transaction {tx_key} is already linked to a different claim note");
-        }
-        record.state = ClaimState::Submitted;
+        links.insert(
+            tx_key.clone(),
+            NoteHandoffRecord {
+                note_commitment: note_commitment.to_string(),
+                note_id: Some(note_id.to_string()),
+                state: NoteHandoffState::Prepared,
+                expiration_block: Some(expiration_block),
+            },
+        );
+        record.state = ClaimState::Prepared;
         record.lease_expires_at = None;
-        self.tx_note_links
-            .write()
-            .entry(tx_key.clone())
-            .or_insert_with(|| note_commitment.to_string());
         self.note_tx_links
             .write()
             .entry(note_commitment.to_string())
@@ -1356,6 +1638,7 @@ impl Store for InMemoryStore {
         drop(logs);
         // Test hook (BLOCKER B): this call found NO event. If armed for this gi, LAND
         // it now so the NEXT call observes it, and still report this miss.
+        #[cfg(test)]
         {
             let mut armed = self.test_land_after_next_has_claim_miss.write();
             if armed.as_ref() == Some(global_index) {
@@ -1367,6 +1650,104 @@ impl Store for InMemoryStore {
             }
         }
         Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_manual_claim_event_atomic(
+        &self,
+        note_id: String,
+        bridge_address: &str,
+        block_number: u64,
+        block_hash: [u8; 32],
+        tx_hash: &str,
+        global_index: [u8; 32],
+        origin_network: u32,
+        origin_address: &[u8; 20],
+        destination_address: &[u8; 20],
+        amount: u64,
+    ) -> anyhow::Result<()> {
+        // Link -> claim is the global handoff lock order. A ClaimEvent is the
+        // terminal claim fence even on replay, so a publisher whose final read
+        // raced this commit cannot subsequently prepare under an executing row.
+        let mut links = self.tx_note_links.write();
+        if let Some(link) = links.get_mut(&tx_hash.to_lowercase()) {
+            link.state = NoteHandoffState::Submitted;
+            link.expiration_block = None;
+        }
+        let gi = U256::from_be_bytes(global_index);
+        let mut claimed = self.claimed.write();
+        match claimed.entry(gi) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let claim = entry.get_mut();
+                claim.state = ClaimState::Landed;
+                claim.lease_expires_at = None;
+                claim.fence += 1;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(ClaimRecord {
+                    owner_tx_hash: None,
+                    state: ClaimState::Landed,
+                    acquired_at: self.claim_clock_now(),
+                    lease_expires_at: None,
+                    fence: 1,
+                });
+            }
+        }
+
+        let mut processed = self.claim_watcher_processed.write();
+        let inserted = match processed.entry(note_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(global_index);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        };
+
+        // Finalise a real linked receipt under the same in-process critical
+        // section. Derived hashes simply have no transaction row.
+        if let Ok(hash) = tx_hash.parse::<TxHash>()
+            && let Some(receipt) = self.transactions.lock().get_mut(&hash)
+        {
+            receipt.result = Some(Ok(()));
+            receipt.block_num = block_number;
+        }
+
+        if !inserted {
+            return Ok(());
+        }
+
+        let mut log = SyntheticLog {
+            address: bridge_address.to_string(),
+            topics: vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
+            data: crate::log_synthesis::encode_claim_event_data_u64(
+                &global_index,
+                origin_network,
+                origin_address,
+                destination_address,
+                amount,
+            ),
+            block_number,
+            block_hash,
+            transaction_hash: tx_hash.to_lowercase(),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+        let mut counter = self.log_counter.write();
+        log.log_index = *counter;
+        *counter += 1;
+        self.logs_by_block
+            .write()
+            .entry(block_number)
+            .or_default()
+            .push(log.clone());
+        self.logs_by_tx
+            .write()
+            .entry(tx_hash.to_lowercase())
+            .or_default()
+            .push(log.clone());
+        self.pending_events.write().push(log);
+        Ok(())
     }
 
     // ── Faucet registry ──────────────────────────────────────────
@@ -1655,6 +2036,88 @@ mod tests {
         assert_eq!(
             store.get_tx_for_note("note_c").await.unwrap(),
             Some("0xtx2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_handoff_clears_only_after_authoritative_expiration() {
+        let store = InMemoryStore::new();
+        let tx = "0xprepared";
+        store
+            .prepare_note_handoff(tx, "commitment", "note-id", 10)
+            .await
+            .unwrap();
+
+        store.set_reconcile_cursor(10).await.unwrap();
+        assert!(
+            !store
+                .clear_expired_prepared_note_handoff(tx, "commitment")
+                .await
+                .unwrap()
+        );
+        store.set_reconcile_cursor(11).await.unwrap();
+        assert!(
+            store
+                .clear_expired_prepared_note_handoff(tx, "commitment")
+                .await
+                .unwrap()
+        );
+        assert!(store.get_note_handoff_for_tx(tx).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_observation_confirms_all_matching_handoffs_with_stable_attribution() {
+        let store = InMemoryStore::new();
+        store
+            .prepare_note_handoff("0xtx2", "same-note", "note-id-2", 10)
+            .await
+            .unwrap();
+        store
+            .prepare_note_handoff("0xtx1", "same-note", "note-id-1", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .confirm_note_handoff_by_commitment("same-note")
+                .await
+                .unwrap(),
+            Some("0xtx2".to_string()),
+            "the first-associated tx remains the projector attribution"
+        );
+        for tx in ["0xtx1", "0xtx2"] {
+            assert_eq!(
+                store
+                    .get_note_handoff_for_tx(tx)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                NoteHandoffState::Submitted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_note_id_confirmation_prevents_expiration_clear() {
+        let store = InMemoryStore::new();
+        store
+            .prepare_note_handoff("0xtx", "commitment", "exact-note-id", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .confirm_prepared_note_handoffs(&["exact-note-id".to_string()])
+                .await
+                .unwrap(),
+            1
+        );
+        store.set_reconcile_cursor(11).await.unwrap();
+        assert!(
+            !store
+                .clear_expired_prepared_note_handoff("0xtx", "commitment")
+                .await
+                .unwrap()
         );
     }
 
@@ -2149,6 +2612,65 @@ mod tests {
         );
         // And it must not have invented a receipt.
         assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn handoff_blocks_failure_receipt_until_authoritative_clear() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+
+        let store = InMemoryStore::new();
+        let tx_hash = TxHash::from([0x78u8; 32]);
+        let tx_key = format!("{tx_hash:#x}");
+        let envelope = alloy::consensus::TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy::default(),
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::ZERO,
+                    expires_at: Some(10),
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .prepare_note_handoff(&tx_key, "commitment", "note-id", 10)
+            .await
+            .unwrap();
+
+        store
+            .txn_commit(tx_hash, Err("ambiguous".into()), 10, [0; 32])
+            .await
+            .unwrap();
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+
+        store.set_reconcile_cursor(11).await.unwrap();
+        assert!(
+            store
+                .clear_expired_prepared_note_handoff(&tx_key, "commitment")
+                .await
+                .unwrap()
+        );
+        store
+            .txn_commit(tx_hash, Err("definitive".into()), 11, [0; 32])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .txn_receipt(tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .is_err()
+        );
     }
 
     #[tokio::test]

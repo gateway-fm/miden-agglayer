@@ -129,8 +129,8 @@ pub enum NonceReservation {
     /// clobber this owner's release.
     Won { fence: u64 },
     /// The slot is currently owned+executing by the SAME tx under a VALID lease
-    /// (another replica is admitting it), or it already `released_success`. Do NOT
-    /// execute — dedup-return the hash; the owner produces the receipt.
+    /// (another replica is admitting it). Do NOT execute — dedup-return the hash;
+    /// the owner produces the receipt.
     OwnedBySame,
     /// A DIFFERENT tx owns/owned this slot. Hard reject — this submission must not
     /// execute.
@@ -141,6 +141,25 @@ pub enum NonceReservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimFence {
     pub fence: u64,
+}
+
+/// Durable state of the exact Miden note associated with an Ethereum write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteHandoffState {
+    /// The exact note identity is durable, but inclusion has not been observed.
+    Prepared,
+    /// The transaction committed or the exact note was later observed.
+    Submitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteHandoff {
+    pub note_commitment: String,
+    pub note_id: Option<String>,
+    pub state: NoteHandoffState,
+    /// The executed Miden transaction's expiration block. Present for prepared
+    /// rows; a missing value is treated fail-closed and is never cleared.
+    pub expiration_block: Option<u64>,
 }
 
 /// Record of a claim we dropped because the destination could not be resolved to a
@@ -274,6 +293,28 @@ pub struct TxnData {
     pub logs: Vec<LogData>,
 }
 
+/// Durable pending-nonce frontier for one recovered signer.
+///
+/// `lowest_pending` is the committed-nonce boundary used by
+/// `eth_getTransactionCount(..., "latest")`. `lowest_unlinked` is the oldest
+/// accepted transaction that has not crossed the Miden note-handoff boundary;
+/// later nonces must not be admitted ahead of it after a process restart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingNonceFrontier {
+    pub lowest_pending: Option<u64>,
+    pub lowest_unlinked: Option<u64>,
+}
+
+pub(crate) fn envelope_nonce(envelope: &TxEnvelope) -> u64 {
+    match envelope {
+        TxEnvelope::Eip1559(s) => s.tx().nonce,
+        TxEnvelope::Eip2930(s) => s.tx().nonce,
+        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
+        TxEnvelope::Eip7702(s) => s.tx().nonce,
+        TxEnvelope::Legacy(s) => s.tx().nonce,
+    }
+}
+
 impl TxnData {
     /// Build an `alloy::rpc::types::Transaction` for JSON-RPC responses.
     pub fn to_rpc_transaction(
@@ -394,6 +435,38 @@ pub trait Store: Send + Sync + 'static {
     async fn get_tx_for_note(&self, _note_commitment: &str) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
+    /// Return the durable prepared/submitted state for an exact note handoff.
+    async fn get_note_handoff_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<NoteHandoff>>;
+    /// Persist an exact note identity immediately before the external submit.
+    async fn prepare_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
+    ) -> anyhow::Result<()>;
+    /// Confirm Miden acceptance (or later exact-note observation).
+    async fn confirm_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool>;
+    /// Confirm a prepared handoff from an observed note details commitment and
+    /// return its real Ethereum transaction hash.
+    async fn confirm_note_handoff_by_commitment(
+        &self,
+        note_commitment: &str,
+    ) -> anyhow::Result<Option<String>>;
+    /// Confirm prepared handoffs directly from a reconciler window's raw note
+    /// IDs, before body import/fetch and cursor advancement.
+    async fn confirm_prepared_note_handoffs(&self, note_ids: &[String]) -> anyhow::Result<u64>;
+    /// Clear only the same exact prepared handoff after an authoritative sync is
+    /// strictly past its Miden expiration block. Returns true when retry may proceed.
+    async fn clear_expired_prepared_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool>;
 
     // === Synthetic logs ===
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;
@@ -475,6 +548,9 @@ pub trait Store: Send + Sync + 'static {
         tx_hash: TxHash,
     ) -> anyhow::Result<Option<(Result<(), String>, u64)>>;
     async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>>;
+    /// Return the durable pending-nonce boundary for `addr`. Unlike the writer
+    /// DashMap, this survives restart and covers both sync and async admission.
+    async fn pending_nonce_frontier(&self, addr: &str) -> anyhow::Result<PendingNonceFrontier>;
     async fn txn_pending_by_miden_id(&self, id: TransactionId) -> anyhow::Result<Option<TxHash>>;
     async fn txn_commit_pending(
         &self,
@@ -491,20 +567,19 @@ pub trait Store: Send + Sync + 'static {
 
     /// #55 BLOCKER 1 — atomic `(signer, nonce)` reservation. Insert-if-absent keyed
     /// on `(addr, nonce)`; the winner's `tx_hash` is durable. Returns
-    /// [`NonceReservation::Won`] iff THIS call inserted the row (this tx owns the
-    /// slot), or [`NonceReservation::HeldBy`] with the winner's hash otherwise
-    /// (which may be this same tx — an idempotent re-reservation — or a DIFFERENT
-    /// tx that raced and won).
+    /// [`NonceReservation::Won`] iff this call owns the lease, otherwise
+    /// [`NonceReservation::OwnedBySame`] for the same hash or
+    /// [`NonceReservation::HeldByOther`] for a different winner.
     ///
     /// MUST be atomic at the store level (postgres: `SELECT … FOR UPDATE` +
     /// conditional INSERT/UPDATE in ONE transaction; memory: one lock), so that two
     /// replicas that each pass their process-local R4 for the same `(signer,
     /// nonce)` are resolved deterministically:
     ///   * a DIFFERENT tx → [`NonceReservation::HeldByOther`] (hard reject);
-    ///   * the SAME tx while the owner's lease is VALID (executing) or already
-    ///     `released_success` → [`NonceReservation::OwnedBySame`] (dedup, do NOT
-    ///     execute — the owner produces the receipt);
-    ///   * the SAME tx after the lease EXPIRED or a `released_failure` → takeover:
+    ///   * the SAME tx while the owner's lease is VALID and `executing` →
+    ///     [`NonceReservation::OwnedBySame`] (dedup, do NOT execute);
+    ///   * the SAME tx after lease expiry, `released_failure`, or
+    ///     `released_success` → takeover:
     ///     [`NonceReservation::Won`] with a bumped fence (retry admission).
     /// `lease` is how long the winner owns admission before another replica
     /// presenting the SAME hash may take over on expiry (crash recovery). The
@@ -526,8 +601,8 @@ pub trait Store: Send + Sync + 'static {
         lease: std::time::Duration,
     ) -> anyhow::Result<bool>;
 
-    /// Fenced completion of a won admission. Success retains its recovery lease;
-    /// failure becomes immediately retryable by the same hash only.
+    /// Fenced completion of a won admission. Either terminal state remains bound
+    /// to this hash and is immediately reclaimable by that exact durable retry.
     async fn release_reservation(
         &self,
         addr: &str,
@@ -588,14 +663,18 @@ pub trait Store: Send + Sync + 'static {
         owner_tx_hash: TxHash,
         lease: std::time::Duration,
     ) -> anyhow::Result<Option<ClaimFence>>;
-    /// Seal the current fence before the first external submission side effect.
-    async fn mark_claim_submitted_fenced(
+    /// Atomically seal the current fence and persist an exact prepared note
+    /// identity before the first external submission side effect.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_claim_submission_fenced(
         &self,
         global_index: U256,
         owner_tx_hash: TxHash,
         fence: u64,
         tx_hash: TxHash,
         note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
     ) -> anyhow::Result<bool>;
     /// Release only the current executing owner; stale owners cannot delete successors.
     async fn unclaim_fenced(
@@ -826,17 +905,14 @@ pub trait Store: Send + Sync + 'static {
         global_index: &[u8; 32],
     ) -> anyhow::Result<bool>;
 
-    /// Atomic commit for a watcher-synthesised ClaimEvent. Combines:
-    ///   1. `mark_claim_note_processed`
-    ///   2. `add_claim_event` (synthetic log emission)
-    ///   3. `set_latest_block_number` (cursor advance)
+    /// Atomic commit for a watcher-synthesised ClaimEvent. In one all-or-nothing
+    /// operation this marks the note processed, emits the synthetic log, and
+    /// finalises a linked pending transaction (when `tx_hash` names one).
     ///
-    /// PgStore overrides with a single SERIALIZABLE postgres txn; the default
-    /// impl below chains the three primitives sequentially, which is fine for
-    /// `InMemoryStore` where every primitive is an in-process lock. The
-    /// race-safe ordering (log THEN cursor) is the same invariant
-    /// `the projector B2AGG commit` and `the projector GER commit` enforce — see
-    /// the canonical comment at `src/bridge_out.rs::on_post_sync`.
+    /// The synthetic block tip is deliberately *not* advanced here. A block may
+    /// contain more notes; `SyntheticProjector` seals the block only after every
+    /// note has been projected. There is no default implementation so each store
+    /// must preserve the event/receipt atomicity contract.
     #[allow(clippy::too_many_arguments)]
     async fn commit_manual_claim_event_atomic(
         &self,
@@ -850,24 +926,7 @@ pub trait Store: Send + Sync + 'static {
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
         amount: u64,
-    ) -> anyhow::Result<()> {
-        self.mark_claim_note_processed(note_id, global_index, block_number)
-            .await?;
-        self.add_claim_event(
-            bridge_address,
-            block_number,
-            block_hash,
-            tx_hash,
-            &global_index,
-            origin_network,
-            origin_address,
-            destination_address,
-            amount,
-        )
-        .await?;
-        self.set_latest_block_number(block_number).await?;
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).

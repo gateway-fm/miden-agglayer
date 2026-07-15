@@ -863,6 +863,7 @@ async fn publish_claim_internal(
         .execute_transaction(accounts.service.0, txn_request)
         .await?;
     let exec_tx = tx_result.executed_transaction();
+    let expiration_block = exec_tx.expiration_block_num().as_u64();
     for (i, note) in exec_tx.output_notes().iter().enumerate() {
         let variant = match note {
             miden_protocol::transaction::RawOutputNote::Full(_) => "Full",
@@ -940,10 +941,12 @@ async fn publish_claim_internal(
     // prove step for the remote→local prover fallback above), so it must
     // call the chokepoint check itself before touching the node.
     crate::miden_client::ensure_writable(accounts.service.0)?;
-    // Atomically seal the current claim fence and persist the note handoff
-    // before the first external side effect. A stale reclaimed owner cannot
-    // submit or overwrite the successor note link.
-    submission_fence.mark_submitted(&note_commitment).await?;
+    // Atomically seal the current claim fence and persist the exact note
+    // identity before the first external side effect. It remains PREPARED
+    // until commit or exact-note observation proves inclusion.
+    submission_fence
+        .prepare(&note_commitment, &claim_note_id, expiration_block)
+        .await?;
     let _submission_height = client
         .submit_proven_transaction(proven_tx, &tx_result)
         .await?;
@@ -1000,6 +1003,7 @@ async fn publish_claim_internal(
     )
     .await?;
     if committed {
+        submission_fence.confirm(&note_commitment).await?;
         tracing::info!("claim tx {txn_id} committed to block");
         // Cantina #7: mark Landed once `wait_for_transaction_commit`
         // confirms the CLAIM tx was committed. Aggkit's miden-client
@@ -1222,18 +1226,9 @@ async fn attempt_publish_claim(
                         },
                     )
                     .await?;
-                // Tie the real claim eth-tx to the on-chain CLAIM note so the
-                // SyntheticProjector emits the ClaimEvent under THIS tx hash —
-                // whose tx carries the `claimAsset` calldata aggkit decodes for the
-                // claim's GER boundary — instead of a derived hash with empty
-                // calldata (which made aggkit's L2BridgeSyncer fail
-                // "input too short: 0 bytes" and stall certificate settlement).
-                store
-                    .record_tx_note_link(&format!("{txn_hash:#x}"), &value.note_commitment)
-                    .await?;
                 tracing::info!(
                     eth_tx = %txn_hash,
-                    "claim tx recorded pending + note↔tx link; projector finalises \
+                    "claim tx recorded pending; durable note handoff lets projector finalise \
                      receipt + ClaimEvent on consumption (cancellation-safe)"
                 );
                 let _ = result_inner.set(value);

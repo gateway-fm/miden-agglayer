@@ -247,6 +247,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+pub(crate) fn select_transaction_count(
+    accepted_nonce: u64,
+    tag: &str,
+    frontier: crate::store::PendingNonceFrontier,
+) -> u64 {
+    if matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest") {
+        frontier
+            .lowest_pending
+            .map_or(accepted_nonce, |nonce| accepted_nonce.min(nonce))
+    } else {
+        accepted_nonce
+    }
+}
+
 async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let method_name = request.method.clone();
@@ -391,35 +405,30 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .nonce_get(addr)
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?;
-            let mut returned_nonce = accepted_nonce;
 
             // RD-940 Decision 4 — honour the block tag.
             //
-            // `store.nonce_get` returns the **next-accepted** nonce because
-            // `eth_sendRawTransaction` advances it on accept (both legacy and
-            // worker paths). That value matches geth's `pending` semantics
-            // directly. For `latest` / `safe` / `finalized` / `earliest` the
-            // RPC must instead return the **next-committed** nonce, computed
-            // as `next-accepted - count(inflight non-terminal jobs from this
-            // signer)`.
+            // `store.nonce_get` is the next-accepted nonce (`pending`). For
+            // committed tags, use the oldest durable pending row as the
+            // boundary. This works in sync mode and survives a writer restart;
+            // the old DashMap subtraction lost both properties.
             //
             // claim-sponsor's `nonce_cache.go:35` LRU reads `latest`; without
             // this branch it sees queued/submitting txs leak into `latest`
-            // and races itself (Spec E). When the writer worker is disabled
-            // there are no inflight jobs so the two tags agree by
-            // construction.
+            // and races itself (Spec E).
             //
             // Empty / missing tag defaults to `latest` per the geth contract
             // (`eth_getTransactionCount` second-param convention).
             let treat_as_latest = matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest");
-            let mut inflight_non_terminal = 0usize;
-            if treat_as_latest
-                && let Some(handle) = service.writer_handle.as_ref()
-                && let Ok(signer_addr) = addr.parse::<alloy::primitives::Address>()
-            {
-                inflight_non_terminal = handle.count_non_terminal_for_signer(&signer_addr);
-                returned_nonce = returned_nonce.saturating_sub(inflight_non_terminal as u64);
+            let mut pending_frontier = crate::store::PendingNonceFrontier::default();
+            if treat_as_latest {
+                pending_frontier = service
+                    .store
+                    .pending_nonce_frontier(addr)
+                    .await
+                    .map_err(|e| store_error(answer_id.clone(), e))?;
             }
+            let returned_nonce = select_transaction_count(accepted_nonce, tag, pending_frontier);
 
             tracing::info!(
                 target: "rpc::nonce_snoop",
@@ -430,7 +439,8 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                     "tag": tag,
                     "treat_as_latest": treat_as_latest,
                     "accepted_nonce": accepted_nonce,
-                    "inflight_non_terminal": inflight_non_terminal,
+                    "durable_lowest_pending": pending_frontier.lowest_pending,
+                    "durable_lowest_unlinked": pending_frontier.lowest_unlinked,
                     "returned_nonce": returned_nonce,
                     "writer_enabled": service.enable_writer_worker,
                     "writer_handle_present": service.writer_handle.is_some(),

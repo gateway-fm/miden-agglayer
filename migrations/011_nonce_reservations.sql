@@ -26,11 +26,3 @@ CREATE TABLE IF NOT EXISTS nonce_reservations (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (signer, nonce)
 );
-
--- Fenced claim leases. Existing rows are migrated fail-closed as submitted: they
--- may represent work that reached Miden before this ownership protocol existed.
-ALTER TABLE claimed_indices
-    ADD COLUMN IF NOT EXISTS owner_tx_hash TEXT,
-    ADD COLUMN IF NOT EXISTS fence_token BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS claim_state TEXT NOT NULL DEFAULT 'submitted',
-    ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;

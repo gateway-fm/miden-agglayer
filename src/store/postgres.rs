@@ -4,8 +4,9 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    ClaimFence, FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
-    UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
+    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, Store, TxnData,
+    TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim,
+    UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
@@ -230,6 +231,228 @@ impl Store for PgStore {
             )
             .await?;
         Ok(row.map(|r| r.get::<_, String>(0)))
+    }
+
+    async fn get_note_handoff_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<NoteHandoff>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT note_commitment, note_id, handoff_state, prepared_expiration_block
+                 FROM tx_note_links WHERE tx_hash = $1",
+                &[&tx_hash],
+            )
+            .await?;
+        row.map(|row| {
+            let state: String = row.get(2);
+            let state = match state.as_str() {
+                "prepared" => NoteHandoffState::Prepared,
+                "submitted" => NoteHandoffState::Submitted,
+                other => anyhow::bail!("unknown note handoff state {other:?} for {tx_hash}"),
+            };
+            Ok(NoteHandoff {
+                note_commitment: row.get(0),
+                note_id: row.get(1),
+                state,
+                expiration_block: row.get::<_, Option<i64>>(3).map(|v| v as u64),
+            })
+        })
+        .transpose()
+    }
+
+    async fn prepare_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO tx_note_links
+                    (tx_hash, note_commitment, note_id, handoff_state, prepared_expiration_block)
+                 VALUES ($1, $2, $3, 'prepared', $4)
+                 ON CONFLICT (tx_hash) DO NOTHING",
+                &[
+                    &tx_hash,
+                    &note_commitment,
+                    &note_id,
+                    &(expiration_block as i64),
+                ],
+            )
+            .await?;
+        let row = client
+            .query_one(
+                "SELECT note_commitment, note_id FROM tx_note_links WHERE tx_hash = $1",
+                &[&tx_hash],
+            )
+            .await?;
+        let existing_commitment: String = row.get(0);
+        let existing_note_id: Option<String> = row.get(1);
+        if existing_commitment != note_commitment || existing_note_id.as_deref() != Some(note_id) {
+            anyhow::bail!("transaction {tx_hash} is already linked to a different note");
+        }
+        Ok(())
+    }
+
+    async fn confirm_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let updated = txn
+            .execute(
+                "UPDATE tx_note_links
+                 SET handoff_state = 'submitted', prepared_expiration_block = NULL
+                 WHERE tx_hash = $1 AND note_commitment = $2",
+                &[&tx_hash, &note_commitment],
+            )
+            .await?;
+        if updated == 1 {
+            txn.execute(
+                "UPDATE claimed_indices
+                 SET claim_state = 'submitted', lease_expires_at = NULL
+                 WHERE owner_tx_hash = $1 AND claim_state = 'prepared'",
+                &[&tx_hash],
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(updated == 1)
+    }
+
+    async fn confirm_note_handoff_by_commitment(
+        &self,
+        note_commitment: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let rows = txn
+            .query(
+                "SELECT tx_hash FROM tx_note_links
+                 WHERE note_commitment = $1
+                 ORDER BY created_at ASC, tx_hash ASC
+                 FOR UPDATE",
+                &[&note_commitment],
+            )
+            .await?;
+        if rows.is_empty() {
+            txn.commit().await?;
+            return Ok(None);
+        }
+        txn.execute(
+            "UPDATE tx_note_links
+             SET handoff_state = 'submitted', prepared_expiration_block = NULL
+             WHERE note_commitment = $1",
+            &[&note_commitment],
+        )
+        .await?;
+        for row in &rows {
+            let tx_hash: String = row.get(0);
+            txn.execute(
+                "UPDATE claimed_indices
+                 SET claim_state = 'submitted', lease_expires_at = NULL
+                 WHERE owner_tx_hash = $1 AND claim_state = 'prepared'",
+                &[&tx_hash],
+            )
+            .await?;
+        }
+        let first_tx_hash: String = rows[0].get(0);
+        txn.commit().await?;
+        Ok(Some(first_tx_hash))
+    }
+
+    async fn confirm_prepared_note_handoffs(&self, note_ids: &[String]) -> anyhow::Result<u64> {
+        if note_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let rows = txn
+            .query(
+                "UPDATE tx_note_links
+                 SET handoff_state = 'submitted', prepared_expiration_block = NULL
+                 WHERE handoff_state = 'prepared' AND note_id = ANY($1)
+                 RETURNING tx_hash",
+                &[&note_ids],
+            )
+            .await?;
+        for row in &rows {
+            let tx_hash: String = row.get(0);
+            txn.execute(
+                "UPDATE claimed_indices
+                 SET claim_state = 'submitted', lease_expires_at = NULL
+                 WHERE owner_tx_hash = $1 AND claim_state = 'prepared'",
+                &[&tx_hash],
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(rows.len() as u64)
+    }
+
+    async fn clear_expired_prepared_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let deleted = txn
+            .execute(
+                "DELETE FROM tx_note_links l
+                 USING service_state s
+                 WHERE l.tx_hash = $1 AND l.note_commitment = $2
+                   AND l.handoff_state = 'prepared'
+                   AND l.prepared_expiration_block IS NOT NULL
+                   AND s.id = 1 AND s.reconcile_cursor > l.prepared_expiration_block",
+                &[&tx_hash, &note_commitment],
+            )
+            .await?;
+        if deleted != 1 {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        let row = txn
+            .query_opt(
+                "SELECT claim_state FROM claimed_indices WHERE owner_tx_hash = $1 FOR UPDATE",
+                &[&tx_hash],
+            )
+            .await?;
+        if let Some(row) = row {
+            let state: String = row.get(0);
+            match state.as_str() {
+                "prepared" => {
+                    txn.execute(
+                        "DELETE FROM claimed_indices
+                         WHERE owner_tx_hash = $1 AND claim_state = 'prepared'",
+                        &[&tx_hash],
+                    )
+                    .await?;
+                }
+                // A landed claim is an authoritative fence. Rolling the link
+                // back would reopen attribution and permit a duplicate claim.
+                "landed" => {
+                    txn.rollback().await?;
+                    return Ok(false);
+                }
+                _ => {
+                    txn.rollback().await?;
+                    return Ok(false);
+                }
+            }
+        }
+        txn.execute(
+            "UPDATE transactions
+             SET status = 'pending', error_message = NULL, block_number = 0, updated_at = now()
+             WHERE tx_hash = $1 AND status = 'failed'",
+            &[&tx_hash],
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(true)
     }
 
     // ── Logs ─────────────────────────────────────────────────────
@@ -596,6 +819,17 @@ impl Store for PgStore {
     ) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
+        let tx_hash_key = tx_hash.to_lowercase();
+
+        // Exact note observation confirms the handoff in the same transaction
+        // as the event and receipt. This runs even on an idempotent replay.
+        txn.execute(
+            "UPDATE tx_note_links
+             SET handoff_state = 'submitted', prepared_expiration_block = NULL
+             WHERE lower(tx_hash) = $1",
+            &[&tx_hash_key],
+        )
+        .await?;
 
         let mainnet: Option<Vec<u8>> = mainnet_exit_root.map(|root| root.to_vec());
         let rollup: Option<Vec<u8>> = rollup_exit_root.map(|root| root.to_vec());
@@ -617,7 +851,6 @@ impl Store for PgStore {
         // Canonicalize tx_hash to lowercase to match the store's convention
         // (get_logs_for_tx / memory.rs) so a mixed-case retry still matches the
         // stored lowercase row instead of double-emitting.
-        let tx_hash_key = tx_hash.to_lowercase();
         let already_emitted = txn
             .query_opt(
                 "SELECT 1 FROM synthetic_logs WHERE lower(transaction_hash) = $1 LIMIT 1",
@@ -689,6 +922,17 @@ impl Store for PgStore {
                 &(block_number as i64),
                 &(timestamp as i64),
             ],
+        )
+        .await?;
+
+        // A real linked GER hash has a pending transaction row. Finalise it in
+        // the same commit as the injected flag/log so a crash cannot expose the
+        // GER event while its receipt remains null. Derived hashes have no row.
+        txn.execute(
+            "UPDATE transactions SET status = 'success', error_message = NULL,
+                    block_number = $1, updated_at = now()
+             WHERE lower(tx_hash) = $2",
+            &[&(block_number as i64), &tx_hash_key],
         )
         .await?;
 
@@ -834,7 +1078,12 @@ impl Store for PgStore {
 
         let updated = tx
             .execute(
-                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
+                "UPDATE transactions
+                 SET status = $1, error_message = $2, block_number = $3, updated_at = now()
+                 WHERE tx_hash = $4
+                   AND ($1 <> 'failed' OR NOT EXISTS (
+                       SELECT 1 FROM tx_note_links WHERE tx_note_links.tx_hash = $4
+                   ))",
                 &[
                     &status,
                     &error_msg as &(dyn ToSql + Sync),
@@ -857,6 +1106,21 @@ impl Store for PgStore {
         // continue), so erroring here is safe and makes the two stores
         // behave identically. Bailing before `tx.commit()` rolls the whole
         // transaction back — no partial log/counter writes escape.
+        if updated == 0 && result.is_err() {
+            let protected = tx
+                .query_opt(
+                    "SELECT 1 FROM transactions t
+                     JOIN tx_note_links l ON l.tx_hash = t.tx_hash
+                     WHERE t.tx_hash = $1",
+                    &[&hash_str],
+                )
+                .await?
+                .is_some();
+            if protected {
+                tx.commit().await?;
+                return Ok(());
+            }
+        }
         if updated == 0 {
             anyhow::bail!("PgStore: transaction {tx_hash} not found");
         }
@@ -1075,6 +1339,45 @@ impl Store for PgStore {
         }))
     }
 
+    async fn pending_nonce_frontier(&self, addr: &str) -> anyhow::Result<PendingNonceFrontier> {
+        use alloy::eips::Decodable2718;
+
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT t.envelope_bytes,
+                        (l.tx_hash IS NULL OR l.handoff_state <> 'submitted') AS unlinked
+                 FROM transactions t
+                 LEFT JOIN tx_note_links l ON l.tx_hash = t.tx_hash
+                 WHERE lower(t.signer) = lower($1) AND t.status = 'pending'",
+                &[&addr],
+            )
+            .await?;
+        let mut frontier = PendingNonceFrontier::default();
+        for row in rows {
+            let bytes: &[u8] = row.get(0);
+            let envelope = TxEnvelope::decode_2718(&mut &bytes[..]).map_err(|err| {
+                anyhow::anyhow!(
+                    "pending transaction for signer {addr} has an undecodable envelope: {err}"
+                )
+            })?;
+            let nonce = super::envelope_nonce(&envelope);
+            frontier.lowest_pending = Some(
+                frontier
+                    .lowest_pending
+                    .map_or(nonce, |current| current.min(nonce)),
+            );
+            if row.get::<_, bool>(1) {
+                frontier.lowest_unlinked = Some(
+                    frontier
+                        .lowest_unlinked
+                        .map_or(nonce, |current| current.min(nonce)),
+                );
+            }
+        }
+        Ok(frontier)
+    }
+
     async fn txn_pending_by_miden_id(&self, id: TransactionId) -> anyhow::Result<Option<TxHash>> {
         let client = self.pool.get().await?;
         let id_str = id.to_hex();
@@ -1227,7 +1530,8 @@ impl Store for PgStore {
                 // Expiry only permits recovery by that exact signed transaction; a
                 // replacement is unsafe because the prior external outcome may be ambiguous.
                 let same_tx = row_hash.eq_ignore_ascii_case(&hash_str);
-                let takeover = same_tx && (state == "released_failure" || expired);
+                let takeover = same_tx
+                    && (state == "released_failure" || state == "released_success" || expired);
                 if takeover {
                     let new_fence = fence + 1;
                     tx.execute(
@@ -1362,7 +1666,8 @@ impl Store for PgStore {
              ON CONFLICT (tx_hash) DO UPDATE SET status = 'failed', error_message = $6, block_number = $7, updated_at = now()
              WHERE transactions.status = 'failed' OR
                (transactions.status = 'pending' AND NOT EXISTS (
-                   SELECT 1 FROM tx_note_links WHERE tx_note_links.tx_hash = transactions.tx_hash
+                   SELECT 1 FROM tx_note_links
+                   WHERE tx_note_links.tx_hash = transactions.tx_hash
                ))",
             &[
                 &hash_str,
@@ -1431,7 +1736,7 @@ impl Store for PgStore {
             "UPDATE claimed_indices SET owner_tx_hash = $2, fence_token = fence_token + 1,
                 created_at = now(), lease_expires_at = now() + ($3 || ' seconds')::interval
              WHERE global_index = $1 AND claim_state = 'executing'
-               AND (lease_expires_at <= now() OR
+               AND (owner_tx_hash = $2 OR lease_expires_at <= now() OR
                     (lease_expires_at IS NULL AND created_at <= now() - ($3 || ' seconds')::interval))
              RETURNING fence_token",
             &[&key, &owner, &lease_secs.to_string()],
@@ -1441,45 +1746,55 @@ impl Store for PgStore {
         }))
     }
 
-    async fn mark_claim_submitted_fenced(
+    async fn prepare_claim_submission_fenced(
         &self,
         global_index: U256,
         owner_tx_hash: TxHash,
         fence: u64,
         tx_hash: TxHash,
         note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
     ) -> anyhow::Result<bool> {
         let mut client = self.pool.get().await?;
         let key = format!("{global_index:#x}");
         let owner = format!("{owner_tx_hash:#x}");
         let tx_hash = format!("{tx_hash:#x}");
         let tx = client.transaction().await?;
+        tx.execute(
+            "INSERT INTO tx_note_links
+                (tx_hash, note_commitment, note_id, handoff_state, prepared_expiration_block)
+             VALUES ($1, $2, $3, 'prepared', $4)
+             ON CONFLICT (tx_hash) DO NOTHING",
+            &[
+                &tx_hash,
+                &note_commitment,
+                &note_id,
+                &(expiration_block as i64),
+            ],
+        )
+        .await?;
+        let row = tx
+            .query_one(
+                "SELECT note_commitment, note_id FROM tx_note_links WHERE tx_hash = $1",
+                &[&tx_hash],
+            )
+            .await?;
+        let existing: String = row.get(0);
+        let existing_note_id: Option<String> = row.get(1);
+        if existing != note_commitment || existing_note_id.as_deref() != Some(note_id) {
+            anyhow::bail!("transaction {tx_hash} is already linked to a different claim note");
+        }
         let updated = tx
             .execute(
-                "UPDATE claimed_indices SET claim_state = 'submitted', lease_expires_at = NULL
-             WHERE global_index = $1 AND owner_tx_hash = $2 AND fence_token = $3
-               AND claim_state = 'executing' AND lease_expires_at > now()",
+                "UPDATE claimed_indices SET claim_state = 'prepared', lease_expires_at = NULL
+                 WHERE global_index = $1 AND owner_tx_hash = $2 AND fence_token = $3
+                   AND claim_state = 'executing' AND lease_expires_at > now()",
                 &[&key, &owner, &(fence as i64)],
             )
             .await?;
         if updated != 1 {
             return Ok(false);
-        }
-        tx.execute(
-            "INSERT INTO tx_note_links (tx_hash, note_commitment) VALUES ($1, $2)
-             ON CONFLICT (tx_hash) DO NOTHING",
-            &[&tx_hash, &note_commitment],
-        )
-        .await?;
-        let row = tx
-            .query_one(
-                "SELECT note_commitment FROM tx_note_links WHERE tx_hash = $1",
-                &[&tx_hash],
-            )
-            .await?;
-        let existing: String = row.get(0);
-        if existing != note_commitment {
-            anyhow::bail!("transaction {tx_hash} is already linked to a different claim note");
         }
         tx.commit().await?;
         Ok(true)
@@ -1970,9 +2285,9 @@ impl Store for PgStore {
         Ok(!rpc_rows.is_empty())
     }
 
-    /// Atomic commit for a watcher-synthesised ClaimEvent. Single PG txn folding
-    /// the three writes the default impl chains separately. Mirrors the design
-    /// of `the projector B2AGG commit` and `the projector GER commit`.
+    /// Atomic commit for a watcher-synthesised ClaimEvent and its linked receipt.
+    /// The block tip is sealed by `SyntheticProjector` after the whole block, not
+    /// by an individual note projection.
     #[allow(clippy::too_many_arguments)]
     async fn commit_manual_claim_event_atomic(
         &self,
@@ -1989,60 +2304,85 @@ impl Store for PgStore {
     ) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
+        let tx_hash_key = tx_hash.to_lowercase();
 
-        // 1. Mark the CLAIM note processed (idempotent — second observation no-ops).
+        // Link -> claim is the global handoff lock order. Observation is
+        // terminal even on replay, and fences out a publisher that raced the
+        // projector after its final landed-state read.
         txn.execute(
-            "INSERT INTO claim_watcher_processed (note_id, global_index, block_number)
+            "UPDATE tx_note_links
+             SET handoff_state = 'submitted', prepared_expiration_block = NULL
+             WHERE lower(tx_hash) = $1",
+            &[&tx_hash_key],
+        )
+        .await?;
+        let global_index_key = format!("{:#x}", U256::from_be_bytes(global_index));
+        txn.execute(
+            "INSERT INTO claimed_indices
+                 (global_index, owner_tx_hash, fence_token, claim_state, lease_expires_at)
+             VALUES ($1, NULL, 1, 'landed', NULL)
+             ON CONFLICT (global_index) DO UPDATE
+             SET claim_state = 'landed', lease_expires_at = NULL,
+                 fence_token = claimed_indices.fence_token + 1",
+            &[&global_index_key],
+        )
+        .await?;
+
+        // 1. Mark the note processed. Exactly one concurrent projector emits the
+        // log; a retry still repairs the linked receipt below.
+        let inserted = txn
+            .execute(
+                "INSERT INTO claim_watcher_processed (note_id, global_index, block_number)
              VALUES ($1, $2, $3)
              ON CONFLICT (note_id) DO NOTHING",
-            &[&note_id, &global_index.as_slice(), &(block_number as i64)],
-        )
-        .await?;
+                &[&note_id, &global_index.as_slice(), &(block_number as i64)],
+            )
+            .await?
+            == 1;
 
-        // 2. Allocate a log_index.
-        let row = txn
-            .query_one(
-                "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
-                &[],
+        if inserted {
+            let row = txn
+                .query_one(
+                    "UPDATE service_state SET log_counter = log_counter + 1, updated_at = now() WHERE id = 1 RETURNING log_counter - 1",
+                    &[],
+                )
+                .await?;
+            let log_index: i64 = row.get(0);
+            let data = crate::log_synthesis::encode_claim_event_data_u64(
+                &global_index,
+                origin_network,
+                origin_address,
+                destination_address,
+                amount,
+            );
+            let topics_owned: [String; 1] = [crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()];
+            let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
+            txn.execute(
+                "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &log_index,
+                    &bridge_address,
+                    &topics,
+                    &data,
+                    &(block_number as i64),
+                    &block_hash.as_slice(),
+                    &tx_hash_key,
+                    &0_i64,
+                    &false,
+                ],
             )
             .await?;
-        let log_index: i64 = row.get(0);
+        }
 
-        // 3. Encode + insert the synthetic ClaimEvent log. Encoding is the
-        //    same path `add_claim_event` would take — keep it inline to keep
-        //    the bundle in one connection / one transaction.
-        let data = crate::log_synthesis::encode_claim_event_data_u64(
-            &global_index,
-            origin_network,
-            origin_address,
-            destination_address,
-            amount,
-        );
-        let topics_owned: [String; 1] = [crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()];
-        let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
+        // A real linked hash has a pending `transactions` row; a derived hash
+        // does not, so this idempotent update naturally becomes a no-op. Keeping
+        // it in this transaction prevents a visible ClaimEvent/null-receipt gap.
         txn.execute(
-            "INSERT INTO synthetic_logs (log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            &[
-                &log_index,
-                &bridge_address,
-                &topics,
-                &data,
-                &(block_number as i64),
-                &block_hash.as_slice(),
-                &tx_hash,
-                &0_i64,
-                &false,
-            ],
-        )
-        .await?;
-
-        // 4. Advance the cursor — write log THEN advance, so any reader who
-        //    sees latest >= N also sees the log at N. The same invariant
-        //    `bridge_out.rs::on_post_sync` documents at line 555.
-        txn.execute(
-            "UPDATE service_state SET latest_block_number = $1, updated_at = now() WHERE id = 1",
-            &[&(block_number as i64)],
+            "UPDATE transactions SET status = 'success', error_message = NULL,
+                    block_number = $1, updated_at = now()
+             WHERE lower(tx_hash) = lower($2)",
+            &[&(block_number as i64), &tx_hash_key],
         )
         .await?;
 

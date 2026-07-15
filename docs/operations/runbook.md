@@ -75,7 +75,7 @@ its shape for new environments.
 |---|---|---|
 | `--enable-writer-worker` / `AGGLAYER_ENABLE_WRITER_WORKER` | `false` | Async `eth_sendRawTransaction` dispatch. Runtime toggle; see the RD-940 section at the end of this doc for the flag-flip procedure and restart-loss contract. Also enables the bounded future-nonce wait (out-of-order submissions wait up to 30 s for the missing nonce instead of erroring). |
 | `AGGLAYER_WRITER_QUEUE_DEPTH` (env only) | `64` | mpsc capacity. |
-| `AGGLAYER_WRITER_TX_TTL` (env only) | `300` | Seconds before a stuck job is forced to Failed. |
+| `AGGLAYER_WRITER_TX_TTL` (env only) | `300` | Maximum queue age before the consuming worker fails a job prior to dispatch; also terminal-cache retention. Submitting work is never failed by the sweeper. |
 | `AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS` (env only) | `120` | Miden-block lifetime of pending claim receipts waiting for the projector to observe claim-note consumption. |
 
 ### One-shot / recovery flags
@@ -831,8 +831,8 @@ no cascading effect.
    - `agglayer_writer_queue_depth` should stay well under 0.5 × cap
      (32 with the default cap of 64).
    - `agglayer_writer_job_failures_total{reason="ttl"}` should stay 0.
-     Any non-zero rate means a Miden submission is stuck longer than
-     `AGGLAYER_WRITER_TX_TTL` (default 300 s).
+     Any non-zero rate means a job waited in the local queue longer than
+     `AGGLAYER_WRITER_TX_TTL` (default 300 s) before dispatch began.
    - `agglayer_writer_dropped_on_restart_total` must be 0 (this is the
      first boot under the flag; non-zero here means the previous boot
      was already running the worker and left residue).
@@ -849,5 +849,5 @@ no cascading effect.
 |---|---|---|
 | `AGGLAYER_ENABLE_WRITER_WORKER` | `false` | Master toggle for the RD-940 async path. Also enables the bounded future-nonce wait (30 s) that absorbs out-of-order autoclaim submissions. |
 | `AGGLAYER_WRITER_QUEUE_DEPTH` | `64` | mpsc capacity. At 64 + p50 commit ≈ 10 s, sustainable throughput tops near 6 jobs/s. Bump if `queue_full_rejections` rate climbs. |
-| `AGGLAYER_WRITER_TX_TTL` | `300` (5 min) | Seconds before the TTL sweeper forcibly transitions a stuck non-terminal hash to Failed + writes a `status:0x0` receipt. Sits inside aggkit's `WaitTxToBeMined = 2 m` with margin. |
+| `AGGLAYER_WRITER_TX_TTL` | `300` (5 min) | Maximum queue age before the consuming worker writes `status:0x0` without starting dispatch; also retention time for terminal in-memory entries. The sweeper renews live reservations and evicts terminal entries, but never fails Submitting work concurrently. |
 | `AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS` | `120` | Miden-block lifetime for pending claim receipts that wait for the projector to observe claim-note consumption. Increase if valid claims expire before projection under load. |

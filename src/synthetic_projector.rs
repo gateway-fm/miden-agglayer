@@ -491,6 +491,17 @@ impl SyntheticProjector {
                         self.reconcile_cursor.load(Ordering::Acquire)
                     )
                 })?;
+                // PREPARED handoffs persist the exact Miden NoteId before the
+                // external submit. `sync_notes` is the authoritative,
+                // inclusive creation feed, so seeing that id confirms the
+                // handoff even when a crash happened before the local client
+                // applied the accepted transaction. Do this on the raw ids,
+                // before body import/fetch (which may lag) and before the
+                // durable cursor advances past the transaction's expiry.
+                if !candidates.is_empty() {
+                    let note_ids: Vec<String> = candidates.iter().map(NoteId::to_hex).collect();
+                    self.store.confirm_prepared_note_handoffs(&note_ids).await?;
+                }
                 if !candidates.is_empty() {
                     let client = client.as_deref_mut().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -2112,13 +2123,19 @@ mod tests {
     struct FakeFetcher {
         calls: std::sync::Mutex<Vec<(u64, u64)>>,
         fail_from: Option<u64>,
+        note_ids: Vec<NoteId>,
     }
 
     impl FakeFetcher {
         fn new(fail_from: Option<u64>) -> StdArc<Self> {
+            Self::with_note_ids(fail_from, Vec::new())
+        }
+
+        fn with_note_ids(fail_from: Option<u64>, note_ids: Vec<NoteId>) -> StdArc<Self> {
             StdArc::new(Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 fail_from,
+                note_ids,
             })
         }
 
@@ -2134,8 +2151,80 @@ mod tests {
             if self.fail_from == Some(from) {
                 anyhow::bail!("injected window-fetch failure ({from}..{to})");
             }
-            Ok(Vec::new())
+            Ok(self.note_ids.clone())
         }
+    }
+
+    /// A raw `sync_notes` NoteId is enough to close a PREPARED handoff even
+    /// when the subsequent body import cannot run. Conversely, a failed fetch
+    /// must neither confirm the handoff nor move the durable low-water mark.
+    #[tokio::test]
+    async fn reconcile_raw_note_id_confirmation_is_ordered_before_cursor_advance() {
+        let note_id = NoteId::from_raw(Word::new([Felt::new(0x42).unwrap(); 4]));
+        let tx_hash = "0xprepared-note";
+
+        // Successful raw-id observation: confirmation happens first. Supplying
+        // no client deliberately fails the later body-import step, proving the
+        // cursor is still held while the exact handoff is already confirmed.
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        store
+            .prepare_note_handoff(tx_hash, "details-commitment", &note_id.to_hex(), 100)
+            .await
+            .unwrap();
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 1, Duration::ZERO);
+        let fetcher = FakeFetcher::with_note_ids(None, vec![note_id]);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher;
+        let err = projector
+            .reconcile_notes_with(None, None, &f, 200)
+            .await
+            .expect_err("candidate import without a client must fail");
+        assert!(format!("{err:#}").contains("no client handle"));
+        assert_eq!(
+            store
+                .get_note_handoff_for_tx(tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::store::NoteHandoffState::Submitted,
+            "raw NoteId observation must confirm before body import"
+        );
+        assert_eq!(
+            store.get_reconcile_cursor().await.unwrap(),
+            0,
+            "cursor must not advance when later window work fails"
+        );
+
+        // Failed window fetch: no raw ids were authoritatively observed, so
+        // neither confirmation nor cursor advancement is allowed.
+        let failed_store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        failed_store
+            .prepare_note_handoff(tx_hash, "details-commitment", &note_id.to_hex(), 100)
+            .await
+            .unwrap();
+        let failed_projector = test_projector(&failed_store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 1, Duration::ZERO);
+        let failed_fetcher = FakeFetcher::with_note_ids(Some(1), vec![note_id]);
+        let failed: StdArc<dyn ReconcileFetcher> = failed_fetcher;
+        failed_projector
+            .reconcile_notes_with(None, None, &failed, 200)
+            .await
+            .expect_err("injected fetch failure must fail the window");
+        assert_eq!(
+            failed_store
+                .get_note_handoff_for_tx(tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::store::NoteHandoffState::Prepared,
+            "a failed fetch must not confirm an unobserved NoteId"
+        );
+        assert_eq!(failed_store.get_reconcile_cursor().await.unwrap(), 0);
     }
 
     /// Catch-up throughput contract: when the sweep is behind the tip, ONE
