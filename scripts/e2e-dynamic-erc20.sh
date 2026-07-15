@@ -190,17 +190,20 @@ if [[ "$FAUCET_COUNT" -le "$FAUCETS_BEFORE" ]]; then
     fail "No new faucet was created! Expected faucet count > $FAUCETS_BEFORE"
 fi
 
-# Get the new faucet's ID (look for our token symbol "TT")
+# Symbols are not unique across deployments or cumulative E2E runs. Resolve the
+# faucet by the bridge route identity: (origin_network, origin_address).
 NEW_FAUCET_ID=$(echo "$FAUCETS_AFTER" | python3 -c "
 import json, sys
 r = json.load(sys.stdin)
-for f in r.get('result', []):
-    if f.get('symbol') == 'TT':
-        print(f['faucet_id'])
-        break
+token = \"$TOKEN_ADDR\".lower()
+matches = [f for f in r.get(\"result\", [])
+           if f.get(\"origin_network\") == 0
+           and f.get(\"origin_address\", \"\").lower() == token]
+if len(matches) == 1:
+    print(matches[0][\"faucet_id\"])
 ")
-[[ -z "$NEW_FAUCET_ID" ]] && fail "Could not find TT faucet in admin_listFaucets"
-pass "Faucet auto-created: $NEW_FAUCET_ID (symbol=TT)"
+[[ -z "$NEW_FAUCET_ID" ]] && fail "Could not resolve exactly one faucet for origin (network=0, address=$TOKEN_ADDR)"
+pass "Faucet auto-created: $NEW_FAUCET_ID (origin network=0 address=$TOKEN_ADDR)"
 
 # ── Step 5: Verify L2 wallet balance ──────────────────────────────────────────
 # Convert faucet_id hex to bech32 for bridge-out-tool (it expects bech32)
