@@ -360,9 +360,9 @@ pub fn init_metrics() {
         "agglayer_writer_dropped_on_restart_total",
         "RD-940: queue-depth snapshot read on boot from the previous \
          process's graceful shutdown. A non-zero value means the previous \
-         restart dropped that many in-flight jobs whose hashes had already \
-         been returned to callers — those callers MUST re-submit. \
-         **Hard page on increase[1h]>0** — v1 tripwire (no on-disk queue). \
+         restart lost that many in-memory dispatches whose signed envelopes \
+         remain durable — those callers MUST re-submit the SAME hash. \
+         **Hard page on increase[1h]>0** — restart-pressure tripwire. \
          The metric is silent under SIGKILL because the tmpfile is only \
          written on graceful drain; combined with pre-kill queue-depth \
          history this still pinpoints the loss window."

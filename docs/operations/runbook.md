@@ -775,66 +775,27 @@ For incident scenarios touching the bridge as a whole, also consult
 `docs/POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md` and the linked Cantina
 audit notes.
 
-## Failure mode I — forever-pending tx after restart (RD-940)
+## Failure mode I — durable writer recovery after restart (RD-940)
 
-**Symptom:** `eth_getTransactionReceipt(hash)` returns JSON `null`
-indefinitely for a hash that `eth_sendRawTransaction` previously
-returned. aggkit's ethtxmanager polls the receipt forever and the tx
-never transitions to Committed or Failed.
+**Symptom:** a previously accepted hash remains pending after a worker restart.
 
-**Cause:** The writer worker (`AGGLAYER_ENABLE_WRITER_WORKER=true`) keeps
-in-flight WriteJobs in a bounded `tokio::sync::mpsc(64)` channel + a
-DashMap inflight cache. **There is no on-disk durable queue in v1.**
-When the proxy restarts via SIGKILL, k8s OOM-kill, or host eviction,
-every job that hadn't yet been `txn_commit`-ed to the store is lost. The
-tx-hashes we returned to callers are not recoverable; the work must be
-re-submitted by the caller.
-
-A graceful SIGTERM shutdown will:
-1. signal the worker to stop accepting new dispatches,
-2. wait up to 20 s for in-flight Miden round-trips to complete,
-3. snapshot the count of still-non-terminal jobs to
-   `/tmp/agglayer-writer-queue-snapshot`, and
-4. emit `agglayer_writer_drain_outcome_total{outcome=partial}`.
-
-On the next boot we read that snapshot and increment
-`agglayer_writer_dropped_on_restart_total` by the count. **This counter
-is the v1 tripwire — every increment is real, unrecovered work.** Hard
-page on `increase(agglayer_writer_dropped_on_restart_total[1h]) > 0`.
-
-A SIGKILL leaves the tmpfile absent — the counter stays at 0. Combined
-with the `agglayer_writer_queue_depth` history just before the kill,
-that's still enough to size the loss window.
+**Cause:** the mpsc dispatch buffer is process-local, but the full signed envelope
+is persisted as an unlinked pending transaction before the nonce CAS. The nonce
+reservation is permanently bound to that hash and its live lease stops renewing
+when the process dies.
 
 ### Response
 
-1. **Identify the lost cohort.** Cross-reference
-   `agglayer_writer_queue_depth` for the 30 s window before the
-   restart against the proxy's structured logs
-   (`target=writer_worker::job` events with `kind` and `signer` fields).
-   Any hash that appears in a `writer_worker: job committed` or
-   `writer_worker: job failed` log line before the restart was already
-   terminal in the store; those are not lost.
-2. **Notify the affected callers.** Today this is aggoracle (the only
-   on-proxy signer in aggkit's stack — see
-   `docs/design/RD-940-async-writer.md` Spec E). aggoracle's
-   ethtxmanager will eventually time out at its `WaitTxToBeMined = 2 m`
-   threshold and re-broadcast; the tx-hash dedup early-return
-   (`service_send_raw_txn.rs`) ensures the re-broadcast is idempotent
-   if it lands within the receipt's lifetime, otherwise it gets a
-   fresh nonce and proceeds normally.
-3. **Document each incident.** Increments of
-   `agglayer_writer_dropped_on_restart_total` must be triaged into
-   Linear under RD-940 follow-up so the v1.5 durable-queue prioritisation
-   stays honest.
-
-### Resolution roadmap
-
-v1.5 (RD-940 follow-up) lands a `worker_jobs` table or WAL-style journal.
-`WriteJob` already implements `Clone` + carries an ULID `job_id` so the
-on-disk shape is additive. Until then, **every accepted tx hash is at
-risk of being lost on restart** — operators must treat this as the
-explicit contract.
+1. Re-broadcast the **same signed transaction** after the reservation lease
+   (`NONCE_RESERVATION_LEASE_SECS`, default 90 s) expires. The service re-decodes
+   the durable envelope, accepts the already-advanced nonce, and enqueues once.
+2. Never replace it with a different hash at the same nonce; replacement is
+   fail-closed because the prior external outcome may be ambiguous.
+3. If the transaction already has a note link, do not force recovery: the
+   external submission boundary was crossed and the projector owns finalisation.
+4. `agglayer_writer_dropped_on_restart_total` remains a restart-pressure signal,
+   not a count of unrecoverable work. Alert and investigate repeated restarts or
+   queue saturation, then verify same-hash recovery and nonce continuity.
 
 ## Coordinated downstream change — k8s `terminationGracePeriodSeconds`
 

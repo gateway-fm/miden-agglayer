@@ -1481,14 +1481,18 @@ async fn test_pgstore_acquire_claim_lock_outcomes() {
 
     // 1. Fresh index → Acquired.
     assert_eq!(
-        acquire_claim_lock(&store, gi_fresh, ttl).await.unwrap(),
-        ClaimLockOutcome::Acquired
+        acquire_claim_lock(&store, gi_fresh, TxHash::ZERO, ttl)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::Acquired { fence: 1 }
     );
 
     // 2. Locked, no ClaimEvent, within TTL → InFlight.
     store.try_claim(gi_inflight).await.unwrap();
     assert_eq!(
-        acquire_claim_lock(&store, gi_inflight, ttl).await.unwrap(),
+        acquire_claim_lock(&store, gi_inflight, TxHash::ZERO, ttl)
+            .await
+            .unwrap(),
         ClaimLockOutcome::InFlight
     );
 
@@ -1510,12 +1514,14 @@ async fn test_pgstore_acquire_claim_lock_outcomes() {
         .await
         .unwrap();
     assert_eq!(
-        acquire_claim_lock(&store, gi_landed, ttl).await.unwrap(),
+        acquire_claim_lock(&store, gi_landed, TxHash::ZERO, ttl)
+            .await
+            .unwrap(),
         ClaimLockOutcome::Landed
     );
     // LANDED beats TTL-expiry recovery.
     assert_eq!(
-        acquire_claim_lock(&store, gi_landed, std::time::Duration::ZERO)
+        acquire_claim_lock(&store, gi_landed, TxHash::ZERO, std::time::Duration::ZERO)
             .await
             .unwrap(),
         ClaimLockOutcome::Landed
@@ -1524,10 +1530,10 @@ async fn test_pgstore_acquire_claim_lock_outcomes() {
     // 4. Orphaned (locked, no ClaimEvent, TTL expired) → Acquired (superseded).
     store.try_claim(gi_orphan).await.unwrap();
     assert_eq!(
-        acquire_claim_lock(&store, gi_orphan, std::time::Duration::ZERO)
+        acquire_claim_lock(&store, gi_orphan, TxHash::ZERO, std::time::Duration::ZERO)
             .await
             .unwrap(),
-        ClaimLockOutcome::Acquired
+        ClaimLockOutcome::Acquired { fence: 1 }
     );
 }
 
@@ -1841,6 +1847,10 @@ async fn test_pgstore_reverted_receipt_conditional() {
         .await
         .unwrap();
     store
+        .record_tx_note_link(&format!("{tx_pending:#x}"), "real-note")
+        .await
+        .unwrap();
+    store
         .commit_reverted_receipt_and_advance_nonce(
             tx_pending,
             dummy_txn_entry_for(signer),
@@ -1878,11 +1888,53 @@ async fn test_pgstore_reverted_receipt_conditional() {
     );
 }
 
-/// BLOCKER A — state-FIRST takeover on PgStore: a DIFFERENT tx takes over a
-/// released_failure or EXPIRED slot (nonce not consumed), but is hard-rejected while
-/// the holder is executing under a valid lease or released_success.
+/// PostgreSQL claim reclaim is fenced through the atomic submitted-state + note-link seal.
 #[tokio::test]
-async fn test_pgstore_different_tx_takeover() {
+async fn test_pgstore_claim_reclaim_fences_stale_owner() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let base = rand_u64();
+    let gi = U256::from(base);
+    let tx_a = TxHash::from([(base % 211) as u8 + 12; 32]);
+    let tx_b = TxHash::from([(base % 199) as u8 + 13; 32]);
+    let a = store
+        .try_claim_fenced(gi, tx_a, std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    let b = store
+        .try_reclaim_claim_fenced(gi, tx_b, std::time::Duration::from_secs(90))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(b.fence > a.fence);
+    assert!(
+        !store
+            .mark_claim_submitted_fenced(gi, tx_a, a.fence, tx_a, "stale")
+            .await
+            .unwrap()
+    );
+    assert!(!store.unclaim_fenced(&gi, tx_a, a.fence).await.unwrap());
+    assert!(
+        store
+            .mark_claim_submitted_fenced(gi, tx_b, b.fence, tx_b, "winner")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_note_link_for_tx(&format!("{tx_b:#x}"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("winner")
+    );
+}
+
+/// PostgreSQL must permanently bind an ambiguous nonce slot to the first hash.
+#[tokio::test]
+async fn test_pgstore_different_tx_cannot_take_over() {
     let Some(store) = pg_store().await else {
         return;
     };
@@ -1893,45 +1945,20 @@ async fn test_pgstore_different_tx_takeover() {
     let ha = TxHash::from([(base % 251) as u8 + 10; 32]);
     let hb = TxHash::from([(base % 241) as u8 + 11; 32]);
 
-    // released_FAILURE → a DIFFERENT tx takes over.
     let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 1, ha, lease).await.unwrap()
     else {
-        panic!("fresh must Win");
+        panic!("fresh must win");
     };
     store
         .release_reservation(&addr, 1, ha, fence, false)
         .await
         .unwrap();
-    assert!(
-        matches!(
-            store.reserve_nonce(&addr, 1, hb, lease).await.unwrap(),
-            NonceReservation::Won { .. }
-        ),
-        "a DIFFERENT tx must take over a released_failure slot"
+    assert_eq!(
+        store.reserve_nonce(&addr, 1, hb, lease).await.unwrap(),
+        NonceReservation::HeldByOther(ha)
     );
-
-    // executing + VALID lease → a DIFFERENT tx is HARD-REJECTED.
     assert!(matches!(
-        store.reserve_nonce(&addr, 2, ha, lease).await.unwrap(),
+        store.reserve_nonce(&addr, 1, ha, lease).await.unwrap(),
         NonceReservation::Won { .. }
     ));
-    assert_eq!(
-        store.reserve_nonce(&addr, 2, hb, lease).await.unwrap(),
-        NonceReservation::HeldByOther(ha)
-    );
-
-    // released_SUCCESS → a DIFFERENT tx is HARD-REJECTED (nonce consumed).
-    let NonceReservation::Won { fence: f3 } =
-        store.reserve_nonce(&addr, 3, ha, lease).await.unwrap()
-    else {
-        panic!("fresh must Win");
-    };
-    store
-        .release_reservation(&addr, 3, ha, f3, true)
-        .await
-        .unwrap();
-    assert_eq!(
-        store.reserve_nonce(&addr, 3, hb, lease).await.unwrap(),
-        NonceReservation::HeldByOther(ha)
-    );
 }

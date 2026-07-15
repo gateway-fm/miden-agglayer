@@ -82,8 +82,8 @@ const SWEEPER_INTERVAL: Duration = Duration::from_secs(30);
 /// next process boot to feed the `agglayer_writer_dropped_on_restart_total`
 /// counter. `/tmp` is appropriate for a k8s `emptyDir` (default behaviour on
 /// bali) — survives across container restarts within the same Pod, lost
-/// across Pod evictions, which matches the lossy semantics of the v1
-/// in-memory queue. SIGKILL leaves the tmpfile absent; combined with
+/// across Pod evictions, which remains useful as an observability signal even though the signed
+/// envelope is durably recoverable from the transaction store. SIGKILL leaves the tmpfile absent; combined with
 /// pre-kill `agglayer_writer_queue_depth` history this still pinpoints the
 /// loss window.
 pub const DROP_SNAPSHOT_PATH: &str = "/tmp/agglayer-writer-queue-snapshot";
@@ -568,7 +568,9 @@ impl WriterWorker {
         let sweeper_ttl = tx_ttl;
         let sweeper_service = service.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(SWEEPER_INTERVAL);
+            let reservation_lease = crate::service_send_raw_txn::reservation_lease();
+            let renewal_period = std::cmp::max(Duration::from_secs(1), reservation_lease / 3);
+            let mut ticker = tokio::time::interval(std::cmp::min(SWEEPER_INTERVAL, renewal_period));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate first tick.
             ticker.tick().await;
@@ -578,10 +580,16 @@ impl WriterWorker {
 
                 // Snapshot two cohorts in a single pass.
                 let mut to_expire: Vec<(TxHash, Address)> = Vec::new();
+                let mut to_renew: Vec<(TxHash, Address, u64)> = Vec::new();
                 let mut to_evict: Vec<TxHash> = Vec::new();
                 for entry in sweeper_inflight.iter() {
                     match entry.state {
                         JobState::Queued | JobState::Submitting => {
+                            to_renew.push((
+                                *entry.key(),
+                                entry.signer,
+                                crate::service_send_raw_txn::envelope_nonce(&entry.envelope),
+                            ));
                             if now.duration_since(entry.created_at) > sweeper_ttl {
                                 to_expire.push((*entry.key(), entry.signer));
                             }
@@ -593,6 +601,20 @@ impl WriterWorker {
                                 to_evict.push(*entry.key());
                             }
                         }
+                    }
+                }
+
+                for (hash, signer, nonce) in &to_renew {
+                    let signer = format!("{signer:#x}");
+                    if let Err(err) = sweeper_service
+                        .store
+                        .renew_reservation(&signer, *nonce, *hash, reservation_lease)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "writer_worker::lease", %hash, error = %err,
+                            "failed to renew durable writer reservation"
+                        );
                     }
                 }
 
@@ -826,7 +848,7 @@ impl WriterWorker {
 /// Dispatch a `WriteJob` to the matching Phase-1 translator in
 /// `service_send_raw_txn`. Each variant calls the same publish/insert path the
 /// legacy sync handler does, minus the per-signer `nonce_increment` (the
-/// request thread already advanced the nonce at enqueue time — Spec §1 flow).
+/// request thread durably admitted the envelope and advanced the nonce before enqueue.
 async fn dispatch_job(service: &ServiceState, job: WriteJob) -> anyhow::Result<()> {
     match job {
         WriteJob::Claim {

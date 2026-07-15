@@ -15,7 +15,7 @@ struct TransactionData {
     pub input: alloy::primitives::Bytes,
 }
 
-fn envelope_nonce(txn_envelope: &TxEnvelope) -> u64 {
+pub(crate) fn envelope_nonce(txn_envelope: &TxEnvelope) -> u64 {
     match txn_envelope {
         TxEnvelope::Eip1559(s) => s.tx().nonce,
         TxEnvelope::Eip2930(s) => s.tx().nonce,
@@ -140,7 +140,7 @@ async fn record_local_pending_tx(
 ) -> anyhow::Result<()> {
     service
         .store
-        .txn_begin(
+        .txn_begin_if_absent(
             tx_hash,
             TxnEntry {
                 id: None,
@@ -151,6 +151,7 @@ async fn record_local_pending_tx(
             },
         )
         .await
+        .map(|_| ())
 }
 
 async fn record_local_immediate_success(
@@ -286,15 +287,10 @@ pub(crate) async fn repair_commit_gap_nonce(
 
 /// Handle a `claimAsset` transaction: skip zero-amount or publish the claim.
 ///
-/// RD-940 Phase 1: this is the unified dispatcher for both the legacy sync
-/// path and the new writer-worker path. **It does NOT advance the per-signer
-/// nonce** — the caller in `service_send_raw_txn` does that once, after the
-/// dispatch (sync) or after a successful `try_enqueue` (worker), so the two
-/// paths agree on when nonce advances.
-///
-/// `_` suffix in `_signer_str_unused` calls below is a deliberate marker that
-/// this function used to own three `nonce_increment` calls — see git blame on
-/// the previous revision.
+/// This is the unified dispatcher for both the sync path and writer worker. It
+/// runs only after the signed envelope is durable and the nonce CAS has accepted
+/// the transaction. It never advances or reopens the nonce itself; any later
+/// failure becomes a status-0 receipt for the already-accepted hash.
 pub(crate) async fn worker_handle_claim_asset(
     service: &ServiceState,
     params: claimAssetCall,
@@ -338,7 +334,14 @@ pub(crate) async fn worker_handle_claim_asset(
     // `InFlight`, so no interleaving hard-rejects a landed gi.
     let tx_nonce = envelope_nonce(&txn_envelope);
     let signer_str = format!("{signer:#x}");
-    match acquire_claim_lock(&service.store, params.globalIndex, claim_resubmit_ttl()).await? {
+    let claim_fence = match acquire_claim_lock(
+        &service.store,
+        params.globalIndex,
+        txn_hash,
+        claim_resubmit_ttl(),
+    )
+    .await?
+    {
         // Geth-faithful accept-and-revert: ACCEPT, write a REVERTED receipt (status
         // 0x0, empty logs, NO new ClaimEvent) AND advance the nonce ATOMICALLY (one
         // store transaction — BLOCKER C), so the submitter's nonce is consumed like
@@ -358,10 +361,9 @@ pub(crate) async fn worker_handle_claim_asset(
             return Ok(());
         }
         // A genuine concurrent submission for this gi is in flight (locked, no
-        // ClaimEvent yet, within TTL). Hard-reject — must not double-publish. In
-        // sync mode this returns Err WITHOUT the caller advancing the nonce (a
-        // genuine retry, nonce not consumed); once the in-flight claim LANDS, the
-        // retry re-enters and takes the `Landed` accept-and-revert arm above.
+        // ClaimEvent yet, within TTL). Do not double-publish. Because this dispatcher
+        // runs after durable admission, the outer sync/worker path records status 0;
+        // a same-hash rebroadcast then deduplicates to that terminal receipt.
         ClaimLockOutcome::InFlight => {
             anyhow::bail!(
                 "claim already submitted for global_index {}",
@@ -369,13 +371,18 @@ pub(crate) async fn worker_handle_claim_asset(
             );
         }
         // Fresh lock (or an orphaned record superseded) — proceed to publish.
-        ClaimLockOutcome::Acquired => {}
-    }
+        ClaimLockOutcome::Acquired { fence } => fence,
+    };
 
-    // R9 — we now HOLD the per-globalIndex lock. Install a RAII drop guard so a
-    // cancelled / panicked / disconnected future releases it; every early return
-    // below (RD-860 swallow, C6 reject, publish failure) releases it explicitly.
-    let guard = ClaimGuard::new(service.store.clone(), params.globalIndex);
+    // R9 — install a fenced RAII guard. Cancellation or a pre-submit failure can
+    // release only this executing fence; after `mark_submitted_fenced`, release is
+    // fail-closed and neither this guard nor a stale owner can reopen the claim.
+    let guard = ClaimGuard::new(
+        service.store.clone(),
+        params.globalIndex,
+        txn_hash,
+        claim_fence,
+    );
 
     // RD-860 — swallow unresolvable-destination claims permanently. If the
     // destination address can't be resolved to a Miden AccountId, record the
@@ -450,8 +457,15 @@ pub(crate) async fn worker_handle_claim_asset(
         return Err(err);
     }
 
-    let result =
-        publish_and_record_claim(service, params.clone(), txn_hash, txn_envelope, signer).await;
+    let result = publish_and_record_claim(
+        service,
+        params.clone(),
+        txn_hash,
+        txn_envelope,
+        signer,
+        &guard,
+    )
+    .await;
     if let Err(err) = result {
         // Explicit release: the guard would also fire on drop, but doing it
         // here avoids the tokio::spawn round-trip on the error path.
@@ -479,14 +493,10 @@ pub(crate) async fn worker_handle_claim_asset(
 /// receipt or queued job is created, and the SAME signed transaction can be
 /// re-submitted after GER publication.
 ///
-/// This gate MUST run before every enqueue path, nonce increment, try_claim,
-/// txn_begin, or receipt creation:
-///   - sync path: `worker_handle_claim_asset` calls it before
-///     `acquire_claim_lock` (nonce advances only after the dispatch returns
-///     Ok);
-///   - writer path: `service_send_raw_txn` calls it on the REQUEST thread
-///     before `try_enqueue` (which would otherwise consume the nonce and
-///     admit the hash into the inflight dedup cache).
+/// This gate MUST run before durable admission, nonce CAS, or enqueue.
+/// `dispatch_after_reservation` does so on the request thread for both sync and
+/// writer modes. `worker_handle_claim_asset` repeats it after fenced acquisition
+/// as defense in depth against GER state changing while a queued job waits.
 ///
 /// `is_ger_injected` rather than `has_seen_ger`: the L1InfoTreeIndexer
 /// pre-populates ger_entries rows for L1 pairs it has indexed but that
@@ -530,7 +540,7 @@ pub(crate) fn claim_resubmit_ttl() -> std::time::Duration {
 }
 
 /// #55 BLOCKER 1 — how long a won `(signer, nonce)` admission lease is owned before
-/// another replica may take it over on expiry (crash recovery). Kept comfortably
+/// another replica presenting the SAME hash may take it over on expiry. Kept comfortably
 /// BELOW aggkit's re-broadcast envelope so a rebroadcast after an owner crash can
 /// take over promptly, yet above the slowest legitimate admission (a sync claim
 /// publish). Env-tunable via `NONCE_RESERVATION_LEASE_SECS`.
@@ -540,7 +550,7 @@ pub(crate) fn reservation_lease() -> std::time::Duration {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SECS);
-    std::time::Duration::from_secs(secs)
+    std::time::Duration::from_secs(secs.max(3))
 }
 
 /// #55 BLOCKER 1 — execute a WON admission (dispatch to the writer worker or the
@@ -548,6 +558,45 @@ pub(crate) fn reservation_lease() -> std::time::Duration {
 /// wrap it with the reservation-lease RELEASE (success → future same-hash dedups;
 /// failure → the same tx may retry via lease takeover). Only ever called after the
 /// caller won the `(signer, nonce)` reservation.
+async fn durably_admit_and_advance_nonce(
+    service: &ServiceState,
+    txn_hash: TxHash,
+    txn_envelope: &TxEnvelope,
+    signer: Address,
+    signer_str: &str,
+    tx_nonce: u64,
+) -> anyhow::Result<()> {
+    // The pending row is the durable queue intent. It is committed before the
+    // nonce CAS, so a crash can never consume a nonce while leaving no work to
+    // recover from the signed envelope.
+    service
+        .store
+        .txn_begin_if_absent(
+            txn_hash,
+            TxnEntry {
+                id: None,
+                envelope: txn_envelope.clone(),
+                signer,
+                expires_at: None,
+                logs: vec![],
+            },
+        )
+        .await?;
+    let advanced = service
+        .store
+        .nonce_advance_cas(signer_str, tx_nonce)
+        .await?;
+    if !advanced {
+        let current = service.store.nonce_get(signer_str).await?;
+        if current != tx_nonce.saturating_add(1) {
+            anyhow::bail!(
+                "lost nonce CAS for durable transaction {txn_hash:#x}: expected {tx_nonce}, current {current}"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn dispatch_after_reservation(
     service: &ServiceState,
     decoded: crate::writer_worker::DecodedWriteCall,
@@ -557,76 +606,67 @@ async fn dispatch_after_reservation(
     signer_str: &str,
     tx_nonce: u64,
 ) -> anyhow::Result<TxHash> {
+    // Cheap deterministic validation, landed classification, and retryable GER
+    // checks happen before durable acceptance in both sync and writer modes.
+    if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+        && params.destinationNetwork != service.network_id
+    {
+        anyhow::bail!(
+            "claim targets destinationNetwork {} but this proxy only handles network {}",
+            params.destinationNetwork,
+            service.network_id
+        );
+    }
+    if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+        && service
+            .store
+            .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
+            .await?
+    {
+        accept_and_revert_landed_claim(
+            service,
+            params,
+            txn_hash,
+            txn_envelope,
+            signer,
+            signer_str,
+            tx_nonce,
+        )
+        .await?;
+        return Ok(txn_hash);
+    }
+    if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+        && params.destinationNetwork == service.network_id
+        && !params.amount.is_zero()
+        && crate::address_mapper::resolve_address(
+            &*service.store,
+            params.destinationAddress,
+            &service.accounts.0,
+        )
+        .await
+        .is_ok()
+    {
+        ensure_claim_ger_published(&service.store, params).await?;
+    }
+
     if service.enable_writer_worker {
         let handle = service.writer_handle.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "enable_writer_worker=true but no writer_handle plumbed into ServiceState; \
-                 boot order bug — see main.rs writer spawn block"
+                "enable_writer_worker=true but no writer_handle plumbed into ServiceState"
             )
         })?;
-
-        // BLOCKER 3 — landed classification BEFORE C6 in WRITER mode too: an
-        // already-LANDED gi routes to accept-and-revert here (atomic reverted receipt
-        // + nonce, synchronous, no enqueue), regardless of GER state, so it never
-        // gets a C6 RPC error with no nonce consumption. The worker's
-        // `acquire_claim_lock` still catches a claim that LANDS after this check.
-        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-            && service
-                .store
-                .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
-                .await?
-        {
-            accept_and_revert_landed_claim(
-                service,
-                params,
-                txn_hash,
-                txn_envelope,
-                signer,
-                signer_str,
-                tx_nonce,
-            )
-            .await?;
-            return Ok(txn_hash);
-        }
-
-        // C6 on the REQUEST path (PR #127 review point 3) — gate before enqueue so a
-        // GER-not-yet-published claim leaves nothing behind. Only claims that would
-        // reach C6 in the worker are gated (zero-amount + unresolvable destinations
-        // are swallowed earlier).
-        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-            && params.destinationNetwork == service.network_id
-            && !params.amount.is_zero()
-            && crate::address_mapper::resolve_address(
-                &*service.store,
-                params.destinationAddress,
-                &service.accounts.0,
-            )
-            .await
-            .is_ok()
-        {
-            ensure_claim_ger_published(&service.store, params).await?;
-        }
-
-        // BLOCKER B — order MUST be reserve → nonce_advance_cas → enqueue. If the
-        // CAS ran AFTER a successful `try_enqueue`, a CAS store error would leave the
-        // job LIVE (enqueued, will execute) with a STALE nonce, and the outer
-        // reservation would be marked `released_failure` — so an immediate same-hash
-        // retry could retake the lease and enqueue DUPLICATE work. Advancing the
-        // nonce FIRST means a CAS failure aborts admission with NO enqueued job and
-        // NO nonce change.
-        //
-        // To keep genuine backpressure retryable with the SAME nonce, fast-fail
-        // QueueFull BEFORE the CAS when the queue is already full (the common case);
-        // only a rare fill-in-the-gap TOCTOU (queue fills between this check and
-        // try_enqueue) consumes the nonce — the geth-like consumed-nonce semantics,
-        // never an enqueue-then-fail-the-nonce.
         if handle.available_capacity() == 0 {
             return Err(crate::writer_worker::WriterQueueSaturatedError.into());
         }
-        let _ = service
-            .store
-            .nonce_advance_cas(signer_str, tx_nonce)
-            .await?;
+        durably_admit_and_advance_nonce(
+            service,
+            txn_hash,
+            &txn_envelope,
+            signer,
+            signer_str,
+            tx_nonce,
+        )
+        .await?;
         let job = decoded.into_job(txn_envelope, signer, txn_hash);
         match handle.try_enqueue(job) {
             Ok(()) => Ok(txn_hash),
@@ -634,27 +674,44 @@ async fn dispatch_after_reservation(
                 Err(crate::writer_worker::WriterQueueSaturatedError.into())
             }
             Err(crate::writer_worker::TryEnqueueError::ShutDown) => {
-                anyhow::bail!(
-                    "writer worker has shut down — service is draining; retry against the next \
-                     replica"
-                );
+                anyhow::bail!("writer worker has shut down; retry the same signed transaction")
             }
         }
     } else {
-        // Legacy synchronous dispatch.
-        match decoded {
+        durably_admit_and_advance_nonce(
+            service,
+            txn_hash,
+            &txn_envelope,
+            signer,
+            signer_str,
+            tx_nonce,
+        )
+        .await?;
+        let dispatch: anyhow::Result<()> = match decoded {
             crate::writer_worker::DecodedWriteCall::Claim { params } => {
-                worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer).await?;
+                worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer).await
             }
             crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
-                worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer)
-                    .await?;
+                worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer).await
             }
+        };
+        if let Err(err) = dispatch {
+            // Once the durable row and nonce CAS commit, the transaction is accepted.
+            // Any later sync failure is represented as a status-0 receipt instead of
+            // reopening the nonce slot after an outcome-ambiguous external call.
+            let block_num = service.store.get_latest_block_number().await?;
+            let block_hash = service.block_state.get_block_hash(block_num);
+            service
+                .store
+                .txn_commit(
+                    txn_hash,
+                    Err(format!("sync dispatch failed: {err:#}")),
+                    block_num,
+                    block_hash,
+                )
+                .await?;
+            tracing::error!(%txn_hash, error = %err, "accepted sync transaction reverted");
         }
-        let _ = service
-            .store
-            .nonce_advance_cas(signer_str, tx_nonce)
-            .await?;
         Ok(txn_hash)
     }
 }
@@ -667,11 +724,11 @@ async fn dispatch_after_reservation(
 pub(crate) enum ClaimLockOutcome {
     /// The submission lock is now held by THIS caller (fresh index, or an orphaned
     /// record superseded — SOAK FINDING #1). Proceed to publish; the caller MUST
-    /// arrange `unclaim` on any later failure (via `ClaimGuard`).
-    Acquired,
+    /// arrange a fenced conditional release on any pre-submit failure (via `ClaimGuard`).
+    Acquired { fence: u64 },
     /// A genuine concurrent submission for the same gi is in flight (locked, no
-    /// ClaimEvent yet, record younger than `ttl`). The caller hard-rejects
-    /// ("already submitted") — no double publish, and no nonce is consumed.
+    /// ClaimEvent yet, record younger than `ttl`). Publication is denied so there
+    /// is no double submit; an already-accepted RPC hash is finalised status 0.
     InFlight,
     /// A real `ClaimEvent` already exists for this globalIndex — the claim LANDED.
     /// The caller routes this to #55 accept-and-revert (consume the nonce + write a
@@ -687,117 +744,140 @@ pub(crate) enum ClaimLockOutcome {
 /// interleaving, an index whose `ClaimEvent` already exists is classified `Landed`
 /// (→ #55 accept-and-revert), never hard-rejected. Cases:
 ///
-///   1. `try_claim` succeeds (fresh) + no ClaimEvent → `Acquired` (normal path).
-///   2. `try_claim` succeeds (fresh) + a ClaimEvent already exists (e.g. a restore
+///   1. `try_claim_fenced` succeeds (fresh) + no ClaimEvent → `Acquired` (normal path).
+///   2. `try_claim_fenced` succeeds (fresh) + a ClaimEvent already exists (e.g. a restore
 ///      wrote the event without a submission lock) → release the spurious lock and
 ///      return `Landed` — never double-publish onto a landed gi.
-///   3. `try_claim` fails + a ClaimEvent exists → `Landed`. This is the closed
+///   3. fenced acquisition conflicts + a ClaimEvent exists → `Landed`. This is the closed
 ///      TOCTOU: even if the claim LANDED after some earlier read, the landed
 ///      classification is made here, at the lock decision, and routes to
 ///      accept-and-revert rather than a hard reject.
-///   4. `try_claim` fails + no ClaimEvent + record younger than `ttl` → `InFlight`.
-///   5. `try_claim` fails + no ClaimEvent + `ttl` expired → ORPHANED: atomically
-///      supersede (`Store::try_reclaim_expired` — single UPDATE, one winner under
+///   4. fenced acquisition conflicts + no ClaimEvent + record younger than `ttl` → `InFlight`.
+///   5. fenced acquisition conflicts + no ClaimEvent + `ttl` expired → ORPHANED: atomically
+///      supersede (`Store::try_reclaim_claim_fenced` — single UPDATE, one winner under
 ///      concurrency), warn + `claim_resubmission_recovered_total`, return `Acquired`.
 pub(crate) async fn acquire_claim_lock(
     store: &std::sync::Arc<dyn crate::store::Store>,
     global_index: alloy::primitives::U256,
+    owner_tx_hash: TxHash,
     ttl: std::time::Duration,
 ) -> anyhow::Result<ClaimLockOutcome> {
     let gi_bytes: [u8; 32] = global_index.to_be_bytes::<32>();
-    match store.try_claim(global_index).await {
-        Ok(()) => {
-            // Fresh lock acquired. Guard the rare "ClaimEvent exists but no lock"
-            // (e.g. a restore populated the event without a submission lock): if a
-            // ClaimEvent already exists, this is LANDED — release the lock we just
-            // took and route to accept-and-revert rather than double-publishing.
-            if store.has_claim_event_for_global_index(&gi_bytes).await? {
-                store.unclaim(&global_index).await?;
-                return Ok(ClaimLockOutcome::Landed);
-            }
-            Ok(ClaimLockOutcome::Acquired)
+    if let Some(claim) = store
+        .try_claim_fenced(global_index, owner_tx_hash, ttl)
+        .await?
+    {
+        if store.has_claim_event_for_global_index(&gi_bytes).await? {
+            store
+                .unclaim_fenced(&global_index, owner_tx_hash, claim.fence)
+                .await?;
+            return Ok(ClaimLockOutcome::Landed);
         }
-        Err(_rejected) => {
-            // LANDED is authoritative and checked AT the lock decision — there is
-            // no separate pre-check window in which a landed gi could be routed to
-            // a hard reject.
-            if store.has_claim_event_for_global_index(&gi_bytes).await? {
-                return Ok(ClaimLockOutcome::Landed);
-            }
-            // Not landed at the first read. Atomically supersede IFF the record has
-            // out-lived the in-flight TTL; a fresher record means a submission is
-            // genuinely in flight.
-            if !store.try_reclaim_expired(global_index, ttl).await? {
-                // BLOCKER B — RE-READ the authoritative landed state AFTER failing
-                // to reclaim. The original claim may have committed its ClaimEvent
-                // in the window between the first `has_claim_event` read and the
-                // reclaim attempt; without this re-read that just-landed gi would
-                // classify `InFlight` and be hard-rejected WITHOUT consuming the
-                // nonce — the exact wedge. A gi that landed at ANY point up to here
-                // classifies `Landed` (→ accept-and-revert), never `InFlight`.
-                if store.has_claim_event_for_global_index(&gi_bytes).await? {
-                    return Ok(ClaimLockOutcome::Landed);
-                }
-                return Ok(ClaimLockOutcome::InFlight);
-            }
-            // BLOCKER 2 — the reclaim SUCCEEDED (an expired lock was superseded to
-            // us). But a claim that landed AFTER the first read yet still holds an
-            // expired-looking lock (a slow real claim: publish took > TTL, then its
-            // ClaimEvent committed) would be reclaimed here and misclassified
-            // `Acquired` → DUPLICATE PUBLISH. So RE-READ landed after the successful
-            // reclaim: if it landed, RELEASE the lock we just superseded and return
-            // `Landed` (→ accept-and-revert), never Acquired. A gi that landed at any
-            // point up to here is Landed. (Residual: an event landing strictly after
-            // this final read is caught only by the worker's own re-classification —
-            // see the report's single-store-transaction residual.)
-            if store.has_claim_event_for_global_index(&gi_bytes).await? {
-                store.unclaim(&global_index).await?;
-                return Ok(ClaimLockOutcome::Landed);
-            }
-            ::metrics::counter!("claim_resubmission_recovered_total").increment(1);
-            tracing::warn!(
-                global_index = %global_index,
-                ttl_secs = ttl.as_secs(),
-                "orphaned claim submission record for global_index {global_index} (submitted but \
-                 never landed — likely a crash mid-flight); accepting resubmission"
+        return Ok(ClaimLockOutcome::Acquired { fence: claim.fence });
+    }
+
+    if store.has_claim_event_for_global_index(&gi_bytes).await? {
+        return Ok(ClaimLockOutcome::Landed);
+    }
+    let Some(claim) = store
+        .try_reclaim_claim_fenced(global_index, owner_tx_hash, ttl)
+        .await?
+    else {
+        if store.has_claim_event_for_global_index(&gi_bytes).await? {
+            return Ok(ClaimLockOutcome::Landed);
+        }
+        return Ok(ClaimLockOutcome::InFlight);
+    };
+    if store.has_claim_event_for_global_index(&gi_bytes).await? {
+        store
+            .unclaim_fenced(&global_index, owner_tx_hash, claim.fence)
+            .await?;
+        return Ok(ClaimLockOutcome::Landed);
+    }
+    ::metrics::counter!("claim_resubmission_recovered_total").increment(1);
+    tracing::warn!(
+        global_index = %global_index,
+        ttl_secs = ttl.as_secs(),
+        fence = claim.fence,
+        "reclaimed an expired claim submission with a new ownership fence"
+    );
+    Ok(ClaimLockOutcome::Acquired { fence: claim.fence })
+}
+
+/// RAII guard that conditionally releases only its own executing claim fence if
+/// the holding future is dropped before `commit()` or `release_explicitly()`. On
+/// drop it schedules `unclaim_fenced` on the runtime; a stale owner cannot delete a
+/// successor fence, and a submitted claim remains fail-closed. Self-review R9.
+#[derive(Clone)]
+pub(crate) struct ClaimSubmissionFence {
+    store: std::sync::Arc<dyn crate::store::Store>,
+    global_index: alloy::primitives::U256,
+    owner_tx_hash: TxHash,
+    fence: u64,
+}
+
+impl ClaimSubmissionFence {
+    pub(crate) async fn mark_submitted(&self, note_commitment: &str) -> anyhow::Result<()> {
+        if !self
+            .store
+            .mark_claim_submitted_fenced(
+                self.global_index,
+                self.owner_tx_hash,
+                self.fence,
+                self.owner_tx_hash,
+                note_commitment,
+            )
+            .await?
+        {
+            anyhow::bail!(
+                "claim ownership fence lost before submission for global_index {}",
+                self.global_index
             );
-            Ok(ClaimLockOutcome::Acquired)
         }
+        Ok(())
     }
 }
 
-/// RAII guard that releases a `try_claim` lock if the holding future is dropped
-/// before either `commit()` (claim succeeded — keep the lock) or
-/// `release_explicitly()` (claim failed — release synchronously) is called.
-///
-/// On drop with neither call made, schedules a background `unclaim` via
-/// `tokio::spawn`. Guarantees that a cancelled / panicked / disconnected request
-/// future cannot leave a globalIndex permanently locked. Self-review R9.
 pub(crate) struct ClaimGuard {
     store: Option<std::sync::Arc<dyn crate::store::Store>>,
     global_index: alloy::primitives::U256,
+    owner_tx_hash: TxHash,
+    fence: u64,
 }
 
 impl ClaimGuard {
     fn new(
         store: std::sync::Arc<dyn crate::store::Store>,
         global_index: alloy::primitives::U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
     ) -> Self {
         Self {
             store: Some(store),
             global_index,
+            owner_tx_hash,
+            fence,
         }
     }
 
-    /// Mark the lock as committed — the claim succeeded. Drop becomes a no-op.
+    fn submission_fence(&self) -> ClaimSubmissionFence {
+        ClaimSubmissionFence {
+            store: self.store.as_ref().expect("active claim guard").clone(),
+            global_index: self.global_index,
+            owner_tx_hash: self.owner_tx_hash,
+            fence: self.fence,
+        }
+    }
+
     fn commit(mut self) {
         self.store = None;
     }
 
-    /// Synchronously release the lock (caller awaits the unclaim).
     async fn release_explicitly(mut self) {
         if let Some(store) = self.store.take() {
-            let _ = store.unclaim(&self.global_index).await;
+            let _ = store
+                .unclaim_fenced(&self.global_index, self.owner_tx_hash, self.fence)
+                .await;
         }
     }
 }
@@ -806,30 +886,31 @@ impl Drop for ClaimGuard {
     fn drop(&mut self) {
         if let Some(store) = self.store.take() {
             let global_index = self.global_index;
-            // tokio::spawn requires a current runtime; in normal handler contexts
-            // it always exists. If we're somehow being dropped outside any
-            // runtime (e.g. a unit test that constructed the guard but never
-            // entered tokio), the spawn will panic — guard against that with
-            // try_handle.
+            let owner_tx_hash = self.owner_tx_hash;
+            let fence = self.fence;
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    if let Err(e) = store.unclaim(&global_index).await {
-                        tracing::error!(
+                    match store
+                        .unclaim_fenced(&global_index, owner_tx_hash, fence)
+                        .await
+                    {
+                        Ok(true) => tracing::warn!(
                             target: "claim::guard",
-                            "R9 drop-guard failed to unclaim {global_index}: {e:#}"
-                        );
-                    } else {
-                        tracing::warn!(
+                            %global_index, fence,
+                            "released current fenced claim after cancellation"
+                        ),
+                        Ok(false) => tracing::debug!(
                             target: "claim::guard",
-                            "R9 drop-guard released claim {global_index} after future was cancelled"
-                        );
+                            %global_index, fence,
+                            "stale or submitted claim guard release was fenced out"
+                        ),
+                        Err(e) => tracing::error!(
+                            target: "claim::guard",
+                            %global_index, fence, error = %e,
+                            "failed to release fenced claim guard"
+                        ),
                     }
                 });
-            } else {
-                tracing::error!(
-                    target: "claim::guard",
-                    "R9 drop-guard ran outside tokio runtime; claim {global_index} may be leaked"
-                );
             }
         }
     }
@@ -837,14 +918,15 @@ impl Drop for ClaimGuard {
 
 /// Publish a CLAIM note and record the transaction in the store.
 ///
-/// Called after `try_claim` succeeds. The caller is responsible for calling
-/// `unclaim()` if this function returns an error.
+/// Called after fenced claim acquisition. The caller owns `ClaimGuard`, whose
+/// conditional release cannot delete a successor or a submitted claim.
 async fn publish_and_record_claim(
     service: &ServiceState,
     params: claimAssetCall,
     txn_hash: TxHash,
     txn_envelope: TxEnvelope,
     signer: Address,
+    guard: &ClaimGuard,
 ) -> anyhow::Result<()> {
     // ClaimEvent recording happens inside the MidenClient closure (cancellation-safe).
     let latest_block = service.store.get_latest_block_number().await?;
@@ -859,6 +941,7 @@ async fn publish_and_record_claim(
         signer,
         service.reject_zero_padding_addresses,
         Some(service.expected_mints.clone()),
+        guard.submission_fence(),
     )
     .await?;
     tracing::info!(
@@ -994,12 +1077,22 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         .writer_handle
         .as_ref()
         .is_some_and(|handle| handle.is_inflight(&txn_hash));
-    let known_store_tx = service
-        .store
-        .txn_get(txn_hash)
-        .await
-        .map(|entry| entry.is_some())
-        .unwrap_or(false);
+    let known_store_entry = service.store.txn_get(txn_hash).await?;
+    let known_store_tx = known_store_entry.is_some();
+    let known_store_linked = if known_store_tx {
+        service
+            .store
+            .get_note_link_for_tx(&format!("{txn_hash:#x}"))
+            .await?
+            .is_some()
+    } else {
+        false
+    };
+    // A pending row without a note handoff is the durable queue intent. It must
+    // be resumed after a crashed process loses its in-memory mpsc contents.
+    let known_durable_intent = known_store_entry
+        .as_ref()
+        .is_some_and(|entry| entry.result.is_none() && !known_store_linked);
     tracing::info!(
         target: "rpc::nonce_snoop",
         "{}",
@@ -1012,6 +1105,8 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             "calldata_len": txn.input.len(),
             "known_inflight": known_inflight,
             "known_store_tx": known_store_tx,
+            "known_store_linked": known_store_linked,
+            "known_durable_intent": known_durable_intent,
             "writer_enabled": service.enable_writer_worker,
             "writer_handle_present": service.writer_handle.is_some(),
         })
@@ -1025,22 +1120,12 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         );
         return Ok(txn_hash);
     }
-    if known_store_tx {
+    if known_store_tx && !known_durable_intent {
         tracing::debug!(
             target: "rpc::dedup",
             %txn_hash,
-            "tx-hash dedup (committed): returning OK without re-running R4"
+            "tx-hash dedup (handed off or terminal): returning OK"
         );
-        // BLOCKER C/D (#55 review) — crash-gap nonce REPAIR via store-level CAS.
-        // On the sync accept path the durable receipt write and the nonce advance
-        // are SEPARATE steps; a crash / store error BETWEEN them leaves this tx
-        // KNOWN (receipt persisted) while the signer's expected nonce stays STALE
-        // at this tx's nonce. Without repair this rebroadcast is served as success
-        // forever while the nonce never advances, and the signer's NEXT tx
-        // (nonce+1) fails the R4 gate — the exact wedge #55 fixes, reintroduced by
-        // a crash in the commit gap. `repair_commit_gap_nonce` CAS-advances the
-        // nonce iff it is still stuck at tx_nonce (idempotent; cross-replica-safe;
-        // extracted so both stores regression-test it directly).
         repair_commit_gap_nonce(&service, &signer_str, tx_nonce).await?;
         return Ok(txn_hash);
     }
@@ -1067,10 +1152,12 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // only on success and never compared the incoming `tx.nonce` against
         // the expected next value. That allowed replay and skipped sequencing.
         let expected_nonce = service.store.nonce_get(&signer_str).await?;
+        let durable_resume_nonce =
+            known_durable_intent && expected_nonce == tx_nonce.saturating_add(1);
         let can_wait_for_future_nonce = service.enable_writer_worker
             && tx_nonce > expected_nonce
             && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
-        let nonce_action = if tx_nonce == expected_nonce {
+        let nonce_action = if tx_nonce == expected_nonce || durable_resume_nonce {
             "accept"
         } else if can_wait_for_future_nonce {
             "wait_future"
@@ -1087,6 +1174,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 "tx_nonce": tx_nonce,
                 "expected_nonce": expected_nonce,
                 "nonce_matches": tx_nonce == expected_nonce,
+                "durable_resume": durable_resume_nonce,
                 "action": nonce_action,
                 "future_nonce_wait_ms": future_nonce_wait_started.elapsed().as_millis(),
                 "writer_enabled": service.enable_writer_worker,
@@ -1094,7 +1182,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             })
         );
 
-        if tx_nonce == expected_nonce {
+        if tx_nonce == expected_nonce || durable_resume_nonce {
             break lock;
         }
 
@@ -1213,6 +1301,30 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         }
     };
 
+    // Keep ownership live while sync publication or request-thread admission is
+    // running. Without renewal, a slow proof can outlive the lease and let a
+    // second replica execute the same hash concurrently.
+    let heartbeat_store = service.store.clone();
+    let heartbeat_signer = signer_str.clone();
+    let heartbeat_lease = reservation_lease();
+    let heartbeat_period = std::cmp::max(std::time::Duration::from_secs(1), heartbeat_lease / 3);
+    let reservation_heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(heartbeat_period).await;
+            match heartbeat_store
+                .renew_reservation(&heartbeat_signer, tx_nonce, txn_hash, heartbeat_lease)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(err) => tracing::warn!(
+                    target: "rpc::reserve", %txn_hash, error = %err,
+                    "failed to renew nonce reservation; retrying until the lease expires"
+                ),
+            }
+        }
+    });
+
     // Execute the WON admission, then RELEASE the lease on the outcome: success →
     // `released_success` (a future same-hash submission dedups via OwnedBySame);
     // failure → `released_failure` (the SAME tx may retry via lease takeover). Only
@@ -1229,6 +1341,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         tx_nonce,
     )
     .await;
+    reservation_heartbeat.abort();
     if let Err(release_err) = service
         .store
         .release_reservation(
@@ -1705,8 +1818,14 @@ mod tests {
             .await
             .unwrap();
 
-        let result = service_send_raw_txn(service, input_hex).await;
-        assert!(result.is_err(), "publish_claim should fail with test stub");
+        let tx_hash = service_send_raw_txn(service, input_hex)
+            .await
+            .expect("post-accept publish failure returns the accepted hash");
+        let (receipt, _) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+        assert!(
+            receipt.is_err(),
+            "publish failure is represented as status 0x0"
+        );
 
         assert!(
             miden_client.test_was_called(),
@@ -2223,12 +2342,12 @@ mod tests {
 
         // "Crash": no ClaimEvent ever lands, and the record out-lives the TTL
         // (Duration::ZERO = instantly expired, keeps the test clock-free).
-        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+        let outcome = acquire_claim_lock(&store, gi, TxHash::ZERO, std::time::Duration::ZERO)
             .await
             .expect("orphaned record classification must not error");
         assert_eq!(
             outcome,
-            ClaimLockOutcome::Acquired,
+            ClaimLockOutcome::Acquired { fence: 1 },
             "orphaned record (no ClaimEvent, TTL expired) must be superseded → Acquired"
         );
         assert!(
@@ -2264,7 +2383,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+        let outcome = acquire_claim_lock(&store, gi, TxHash::ZERO, std::time::Duration::ZERO)
             .await
             .expect("landed classification must not error");
         assert_eq!(
@@ -2443,22 +2562,15 @@ mod tests {
     }
 
     /// Signer-agnostic dedup, in-flight then landed. Signer A ("the sponsor")
-    /// has a submission genuinely in flight for gi=X (lock record present,
-    /// younger than the TTL, no ClaimEvent yet — created directly on the
-    /// store, exactly the state `service_send_raw_txn` holds between
-    /// `acquire_claim_lock` and publish completion). Signer B — a DIFFERENT
-    /// key — submits a full valid claimAsset for the SAME gi:
-    ///   1. IN FLIGHT (no ClaimEvent yet), within the TTL → rejected on the
-    ///      "already submitted" path, with ZERO side effects for B (no publish,
-    ///      no nonce advance, no tx). accept-and-revert does NOT fire here
-    ///      because the gi has not LANDED (no ClaimEvent).
-    ///   2. after A's claim LANDS (ClaimEvent recorded) → #55 accept-and-revert:
-    ///      B's full-RPC resubmission is ACCEPTED with a reverted (status 0x0)
-    ///      receipt (nonce consumed, NO new ClaimEvent, no Miden publish) — the
-    ///      geth-faithful AlreadyClaimed, so a cross-signer's nonce never
-    ///      desyncs. The claim-lock PRIMITIVE (`acquire_claim_lock`) is
-    ///      unchanged and still hard-rejects a LANDED gi — accept-and-revert
-    ///      lives in the RPC handler ABOVE the lock, not in the lock itself.
+    /// has a submission genuinely in flight for gi=X (a fresh fenced lock,
+    /// no ClaimEvent yet). Signer B — a DIFFERENT key — submits a full valid
+    /// claimAsset for the SAME gi:
+    ///   1. while A is IN FLIGHT, B crosses the durable acceptance boundary but
+    ///      cannot acquire the claim fence, so it receives a status-0 receipt;
+    ///      its nonce is consumed, with no Miden publish and no ClaimEvent.
+    ///   2. after A lands, B same-hash rebroadcast deduplicates to the existing
+    ///      status-0 receipt. A landed claim submitted under a fresh B nonce
+    ///      follows the same geth-faithful accept-and-revert path.
     #[tokio::test]
     async fn user_sponsor_double_submit_same_global_index() {
         let service = create_test_service();
@@ -2475,26 +2587,24 @@ mod tests {
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
-        let err = service_send_raw_txn(service.clone(), input_b.clone())
+        let accepted_inflight = service_send_raw_txn(service.clone(), input_b.clone())
             .await
-            .expect_err("a different signer's claim for an in-flight gi must be rejected");
-        assert!(
-            err.to_string().contains("already submitted"),
-            "must be the dedup rejection: {err:#}"
-        );
-        // The rejection must leave NO trace of B's attempt.
+            .expect("the structurally valid transaction is accepted then reverted");
+        assert_eq!(accepted_inflight, tx_b);
+        // The claim must not reach Miden while A is in flight.
         assert!(
             !miden.test_was_called(),
             "B must never reach the Miden publish while A is in flight"
         );
         assert_eq!(
             store.nonce_get(&format!("{addr_b:#x}")).await.unwrap(),
-            0,
-            "a rejected claim must not advance B's nonce"
+            1,
+            "accepted status-0 transaction consumes B nonce"
         );
+        let (failed, _) = store.txn_receipt(tx_b).await.unwrap().unwrap();
         assert!(
-            store.txn_get(tx_b).await.unwrap().is_none(),
-            "no tx entry may be recorded for B's rejected claim"
+            failed.is_err(),
+            "in-flight claim becomes a status-0 receipt"
         );
 
         // A's claim LANDS: a ClaimEvent now exists for gi.
@@ -2552,7 +2662,7 @@ mod tests {
         // gi returns `Landed` even with the TTL forced to zero — the LANDED check
         // wins over orphan recovery, regardless of submitter (routes to
         // accept-and-revert, never a hard reject).
-        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::ZERO)
+        let outcome = acquire_claim_lock(&store, gi, TxHash::ZERO, std::time::Duration::ZERO)
             .await
             .expect("landed classification must not error");
         assert_eq!(
@@ -2598,14 +2708,13 @@ mod tests {
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
         let (input_b, _) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
-        let err = service_send_raw_txn(service, input_b)
+        let accepted = service_send_raw_txn(service, input_b)
             .await
-            .expect_err("the stub MidenClient cannot complete the publish");
-        // The orphaned record was superseded and B's claim PROCEEDED: the
-        // failure is the unit stub's publish failure, NOT the dedup rejection.
+            .expect("the orphaned record is reclaimed and the tx is accepted");
+        let (failed, _) = store.txn_receipt(accepted).await.unwrap().unwrap();
         assert!(
-            !err.to_string().contains("already submitted"),
-            "an orphaned (TTL-expired) record must not keep rejecting: {err:#}"
+            failed.is_err(),
+            "the stub publish failure becomes status 0x0"
         );
         assert!(
             miden.test_was_called(),
@@ -2712,15 +2821,15 @@ mod tests {
         let gi_real = U256::from(0x5005u64);
         assert_ne!(resolvable_dest(), addr_c);
         let calldata = claim_calldata(gi_real, resolvable_dest(), U256::from(1_000_000u64));
-        let (input_hex, _) = encode_tx_signed_with_nonce(&key_c, calldata, 0);
-        let err = service_send_raw_txn(service.clone(), input_hex)
+        let (input_hex, tx_real) = encode_tx_signed_with_nonce(&key_c, calldata, 0);
+        let accepted = service_send_raw_txn(service.clone(), input_hex)
             .await
-            .expect_err("the stub MidenClient cannot complete the publish");
-        let msg = err.to_string();
+            .expect("permissionless structurally valid claim is accepted");
+        assert_eq!(accepted, tx_real);
+        let (failed, _) = store.txn_receipt(tx_real).await.unwrap().unwrap();
         assert!(
-            !msg.contains("allow-list") && !msg.contains("already submitted"),
-            "someone-else's-deposit claim must not be rejected on any authorization \
-             or dedup path: {msg}"
+            failed.is_err(),
+            "the unit-stub publish failure becomes status 0x0"
         );
         assert!(
             miden.test_was_called(),
@@ -3147,7 +3256,7 @@ mod tests {
         // a pre-check would read as "not landed".
         store.try_claim(gi).await.expect("A locks gi");
         assert_eq!(
-            acquire_claim_lock(&store, gi, claim_resubmit_ttl())
+            acquire_claim_lock(&store, gi, TxHash::ZERO, claim_resubmit_ttl())
                 .await
                 .expect("classify must not error"),
             ClaimLockOutcome::InFlight,
@@ -3175,7 +3284,7 @@ mod tests {
         // The SAME lock call now classifies `Landed` — routed to accept-and-revert,
         // NEVER a hard reject. The TOCTOU window is closed.
         assert_eq!(
-            acquire_claim_lock(&store, gi, claim_resubmit_ttl())
+            acquire_claim_lock(&store, gi, TxHash::ZERO, claim_resubmit_ttl())
                 .await
                 .expect("classify must not error"),
             ClaimLockOutcome::Landed,
@@ -3402,9 +3511,14 @@ mod tests {
         // BLOCKER-B re-read (after the failed reclaim) observes it.
         concrete.test_land_gi_after_next_has_claim_miss(gi.to_be_bytes::<32>());
 
-        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::from_secs(3600))
-            .await
-            .expect("classification must not error");
+        let outcome = acquire_claim_lock(
+            &store,
+            gi,
+            TxHash::ZERO,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .expect("classification must not error");
         assert_eq!(
             outcome,
             ClaimLockOutcome::Landed,
@@ -3534,7 +3648,8 @@ mod tests {
     /// SAME tx under a valid lease → OwnedBySame (dedup, another replica must not
     /// execute); a DIFFERENT tx → HeldByOther (hard reject); release-FAILURE lets the
     /// SAME tx take over (fence bumps); a fenced-out stale release is ignored;
-    /// release-SUCCESS makes the SAME tx dedup; an EXPIRED lease is taken over.
+    /// release-SUCCESS makes the SAME tx dedup; only the SAME tx can take over an
+    /// EXPIRED lease.
     #[tokio::test]
     async fn blocker_1_reserve_nonce_fenced_lifecycle() {
         use crate::store::NonceReservation;
@@ -3660,12 +3775,11 @@ mod tests {
         assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
     }
 
-    /// BLOCKER A — state-FIRST takeover: a DIFFERENT tx may take over a slot whose
-    /// holder FAILED or whose lease EXPIRED (nonce NOT consumed), but is HARD-rejected
-    /// while the holder is executing under a valid lease or already released_success
-    /// (nonce consumed / in flight).
+    /// Crash outcomes are ambiguous: a nonce slot is permanently bound to the
+    /// first signed transaction, even after failure or lease expiry. Only that
+    /// exact hash may recover the durable intent.
     #[tokio::test]
-    async fn blocker_a_different_tx_takes_over_failed_or_expired_slot() {
+    async fn blocker_a_different_tx_never_takes_over_ambiguous_slot() {
         use crate::store::NonceReservation;
         let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
         let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
@@ -3674,71 +3788,45 @@ mod tests {
         let hb = TxHash::from([0xb2u8; 32]);
         let lease = std::time::Duration::from_secs(90);
 
-        // (1) released_FAILURE slot → a DIFFERENT tx takes over (fence bumps).
         let NonceReservation::Won { fence } =
             store.reserve_nonce(addr, 1, ha, lease).await.unwrap()
         else {
-            panic!("fresh must Win");
+            panic!("fresh must win");
         };
         store
             .release_reservation(addr, 1, ha, fence, false)
             .await
             .unwrap();
-        assert!(
-            matches!(
-                store.reserve_nonce(addr, 1, hb, lease).await.unwrap(),
-                NonceReservation::Won { .. }
-            ),
-            "a DIFFERENT tx must take over a released_failure slot (nonce not consumed)"
+        assert_eq!(
+            store.reserve_nonce(addr, 1, hb, lease).await.unwrap(),
+            NonceReservation::HeldByOther(ha),
+            "failure cannot authorize a replacement after an ambiguous external outcome"
         );
+        assert!(matches!(
+            store.reserve_nonce(addr, 1, ha, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
 
-        // (2) EXPIRED lease → a DIFFERENT tx takes over.
         assert!(matches!(
             store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),
             NonceReservation::Won { .. }
         ));
         concrete.test_expire_reservation_lease(addr, 2);
-        assert!(
-            matches!(
-                store.reserve_nonce(addr, 2, hb, lease).await.unwrap(),
-                NonceReservation::Won { .. }
-            ),
-            "a DIFFERENT tx must take over an EXPIRED slot (owner crashed, nonce not consumed)"
+        assert_eq!(
+            store.reserve_nonce(addr, 2, hb, lease).await.unwrap(),
+            NonceReservation::HeldByOther(ha),
+            "expiry is crash recovery for the same hash, never replacement permission"
         );
-
-        // (3) executing + VALID lease → a DIFFERENT tx is HARD-REJECTED (in flight).
         assert!(matches!(
-            store.reserve_nonce(addr, 3, ha, lease).await.unwrap(),
+            store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),
             NonceReservation::Won { .. }
         ));
-        assert_eq!(
-            store.reserve_nonce(addr, 3, hb, lease).await.unwrap(),
-            NonceReservation::HeldByOther(ha),
-            "a valid/executing holder must still reject a different tx"
-        );
-
-        // (4) released_SUCCESS → a DIFFERENT tx is HARD-REJECTED (nonce consumed).
-        let NonceReservation::Won { fence: f4 } =
-            store.reserve_nonce(addr, 4, ha, lease).await.unwrap()
-        else {
-            panic!("fresh must Win");
-        };
-        store
-            .release_reservation(addr, 4, ha, f4, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.reserve_nonce(addr, 4, hb, lease).await.unwrap(),
-            NonceReservation::HeldByOther(ha),
-            "a released_success holder (nonce consumed) must reject a different tx"
-        );
     }
 
-    /// BLOCKER B — writer mode advances the nonce (CAS) BEFORE enqueue. A nonce-CAS
-    /// store FAILURE must leave NO enqueued job and the nonce UNCHANGED; a successful
-    /// admission advances the nonce exactly once AND enqueues the job.
+    /// Writer admission persists the recoverable envelope before nonce CAS and enqueue.
+    /// A CAS error leaves a durable, unlinked intent and no live in-memory job.
     #[tokio::test]
-    async fn blocker_b_writer_cas_before_enqueue() {
+    async fn blocker_b_writer_durable_intent_precedes_nonce_cas() {
         // Happy path: exactly-once advance + job enqueued.
         let mut service = create_test_service();
         let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
@@ -3787,6 +3875,9 @@ mod tests {
         }
         .abi_encode();
         let (input_hex2, signer2) = encode_legacy_tx(calldata2);
+        let raw = hex_decode_prefixed(&input_hex2).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+        let durable_hash = unwrap_txn_envelope(envelope).unwrap().hash;
         let err = service_send_raw_txn(service2, input_hex2)
             .await
             .expect_err("a nonce-CAS store failure must abort admission");
@@ -3804,7 +3895,128 @@ mod tests {
             0,
             "NO job may be enqueued when the CAS failed before enqueue"
         );
+        let intent = concrete.txn_get(durable_hash).await.unwrap().unwrap();
+        assert!(
+            intent.result.is_none(),
+            "durable admission remains retryable"
+        );
+        assert!(
+            concrete
+                .get_note_link_for_tx(&format!("{durable_hash:#x}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "pre-dispatch durable intent is deliberately unlinked"
+        );
         let _ = shutdown2.send(());
+    }
+
+    /// A crash after nonce CAS but before mpsc enqueue is recovered from the
+    /// durable unlinked envelope without advancing twice.
+    #[tokio::test]
+    async fn writer_crash_after_nonce_cas_resumes_same_durable_hash() {
+        use crate::store::NonceReservation;
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let mut service = crate::test_helpers::create_test_service_with_store(concrete.clone());
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xc7u8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+        let raw = hex_decode_prefixed(&input_hex).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+        let tx_hash = unwrap_txn_envelope(envelope.clone()).unwrap().hash;
+        let signer_str = format!("{signer:#x}");
+        let NonceReservation::Won { .. } = concrete
+            .reserve_nonce(&signer_str, 0, tx_hash, reservation_lease())
+            .await
+            .unwrap()
+        else {
+            panic!("fresh reservation must win");
+        };
+        durably_admit_and_advance_nonce(&service, tx_hash, &envelope, signer, &signer_str, 0)
+            .await
+            .unwrap();
+        assert_eq!(concrete.nonce_get(&signer_str).await.unwrap(), 1);
+        assert!(
+            concrete
+                .txn_get(tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .is_none()
+        );
+
+        // Simulate process death: the durable row and nonce survived, the mpsc did
+        // not, and the reservation heartbeat stopped until its lease expired.
+        concrete.test_expire_reservation_lease(&signer_str, 0);
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        let handle = std::sync::Arc::new(handle);
+        service.enable_writer_worker = true;
+        service.writer_handle = Some(handle.clone());
+        let retried = service_send_raw_txn(service, input_hex).await.unwrap();
+        assert_eq!(retried, tx_hash);
+        assert_eq!(concrete.nonce_get(&signer_str).await.unwrap(), 1);
+        assert!(handle.is_inflight(&tx_hash));
+        let _ = shutdown.send(());
+    }
+
+    /// A stale claim owner cannot seal or release a successor after lease reclaim.
+    #[tokio::test]
+    async fn claim_reclaim_is_fenced_through_external_submission_boundary() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let gi = U256::from(0xf3ceu64);
+        let tx_a = TxHash::from([0xaau8; 32]);
+        let tx_b = TxHash::from([0xbbu8; 32]);
+        let ttl = std::time::Duration::from_secs(90);
+
+        let a = store
+            .try_claim_fenced(gi, tx_a, ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        concrete.test_backdate_claim(gi, ttl + std::time::Duration::from_secs(1));
+        let b = store
+            .try_reclaim_claim_fenced(gi, tx_b, ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(b.fence > a.fence);
+        assert!(
+            !store
+                .mark_claim_submitted_fenced(gi, tx_a, a.fence, tx_a, "stale-note")
+                .await
+                .unwrap()
+        );
+        assert!(!store.unclaim_fenced(&gi, tx_a, a.fence).await.unwrap());
+        assert!(
+            store
+                .mark_claim_submitted_fenced(gi, tx_b, b.fence, tx_b, "winner-note")
+                .await
+                .unwrap()
+        );
+        assert!(!store.unclaim_fenced(&gi, tx_b, b.fence).await.unwrap());
+        assert_eq!(
+            store
+                .get_note_link_for_tx(&format!("{tx_b:#x}"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("winner-note")
+        );
+        assert!(
+            store
+                .try_reclaim_claim_fenced(gi, tx_a, ttl)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// BLOCKER 2 — the reclaim-SUCCESS window. A gi whose lock is EXPIRED but which
@@ -3826,7 +4038,7 @@ mod tests {
         // The claim LANDS on the first has_claim_event miss (so the re-read sees it).
         concrete.test_land_gi_after_next_has_claim_miss(gi.to_be_bytes::<32>());
 
-        let outcome = acquire_claim_lock(&store, gi, claim_resubmit_ttl())
+        let outcome = acquire_claim_lock(&store, gi, TxHash::ZERO, claim_resubmit_ttl())
             .await
             .expect("classification must not error");
         assert_eq!(
@@ -3923,6 +4135,10 @@ mod tests {
         let tx_pending = TxHash::from([0x42u8; 32]);
         store.txn_begin(tx_pending, entry()).await.unwrap();
         store
+            .record_tx_note_link(&format!("{tx_pending:#x}"), "real-note")
+            .await
+            .unwrap();
+        store
             .commit_reverted_receipt_and_advance_nonce(
                 tx_pending,
                 entry(),
@@ -3939,8 +4155,34 @@ mod tests {
             "a REAL pending receipt must stay pending (null), not be finalised to failed"
         );
 
-        // (c) ABSENT hash → the reverted receipt IS written (status 0x0).
-        let tx_new = TxHash::from([0x43u8; 32]);
+        // (c) An unlinked pending row is only a durable pre-admission intent and
+        // must be finalised to failed when the landed-claim race is detected.
+        let tx_intent = TxHash::from([0x43u8; 32]);
+        store.txn_begin_if_absent(tx_intent, entry()).await.unwrap();
+        store
+            .commit_reverted_receipt_and_advance_nonce(
+                tx_intent,
+                entry(),
+                "revert".into(),
+                9,
+                [0u8; 32],
+                &signer_str,
+                2,
+            )
+            .await
+            .unwrap();
+        let (r_intent, _) = store
+            .txn_receipt(tx_intent)
+            .await
+            .unwrap()
+            .expect("receipt");
+        assert!(
+            r_intent.is_err(),
+            "unlinked durable intent must become status 0x0"
+        );
+
+        // (d) ABSENT hash → the reverted receipt IS written (status 0x0).
+        let tx_new = TxHash::from([0x44u8; 32]);
         store
             .commit_reverted_receipt_and_advance_nonce(
                 tx_new,
@@ -3949,7 +4191,7 @@ mod tests {
                 9,
                 [0u8; 32],
                 &signer_str,
-                2,
+                3,
             )
             .await
             .unwrap();
@@ -3969,9 +4211,14 @@ mod tests {
         let gi = U256::from(88u64);
         store.try_claim(gi).await.unwrap();
 
-        let outcome = acquire_claim_lock(&store, gi, std::time::Duration::from_secs(3600))
-            .await
-            .expect("in-flight classification must not error");
+        let outcome = acquire_claim_lock(
+            &store,
+            gi,
+            TxHash::ZERO,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .expect("in-flight classification must not error");
         assert_eq!(
             outcome,
             ClaimLockOutcome::InFlight,

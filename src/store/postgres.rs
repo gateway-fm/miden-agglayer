@@ -4,8 +4,8 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason,
-    UnclaimableClaim, UnclaimableReason,
+    ClaimFence, FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
+    UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
@@ -740,6 +740,65 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn txn_begin_if_absent(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let hash_str = format!("{tx_hash:#x}");
+        let miden_id = entry.id.map(|id| id.to_hex());
+        let signer_str = format!("{:#x}", entry.signer);
+        let mut envelope_bytes = Vec::new();
+        entry.envelope.encode_2718(&mut envelope_bytes);
+        let tx = client.transaction().await?;
+        let inserted = tx.execute(
+            "INSERT INTO transactions (tx_hash, miden_tx_id, envelope_bytes, signer, expires_at, status, block_number)
+             VALUES ($1, $2, $3, $4, $5, 'pending', 0) ON CONFLICT (tx_hash) DO NOTHING",
+            &[
+                &hash_str,
+                &miden_id as &(dyn ToSql + Sync),
+                &envelope_bytes,
+                &signer_str,
+                &entry.expires_at.map(|v| v as i64) as &(dyn ToSql + Sync),
+            ],
+        ).await? == 1;
+        let pending = if !inserted {
+            tx.execute(
+                "UPDATE transactions SET
+                    miden_tx_id = COALESCE($2, miden_tx_id),
+                    expires_at = COALESCE($3, expires_at), updated_at = now()
+                 WHERE tx_hash = $1 AND status = 'pending'",
+                &[
+                    &hash_str,
+                    &miden_id as &(dyn ToSql + Sync),
+                    &entry.expires_at.map(|v| v as i64) as &(dyn ToSql + Sync),
+                ],
+            )
+            .await?
+                == 1
+        } else {
+            true
+        };
+        if pending && !entry.logs.is_empty() {
+            tx.execute(
+                "DELETE FROM transaction_logs WHERE tx_hash = $1",
+                &[&hash_str],
+            )
+            .await?;
+            for log_data in &entry.logs {
+                let topics_bytes: Vec<Vec<u8>> = log_data
+                    .topics()
+                    .iter()
+                    .map(|t| t.as_slice().to_vec())
+                    .collect();
+                tx.execute(
+                    "INSERT INTO transaction_logs (tx_hash, topics, data) VALUES ($1, $2, $3)",
+                    &[&hash_str, &topics_bytes, &log_data.data.as_ref()],
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
     async fn txn_commit(
         &self,
         tx_hash: TxHash,
@@ -1164,12 +1223,11 @@ impl Store for PgStore {
                 let state: String = row.get(1);
                 let expired: bool = row.get(2);
                 let fence: i64 = row.get(3);
-                // STATE-FIRST (BLOCKER A): a holder that FAILED or whose lease EXPIRED
-                // consumed NO nonce, so the slot is free for takeover by ANY tx (the
-                // SAME tx retrying OR a DIFFERENT tx). Executing-under-valid-lease or
-                // released_success means the nonce is consumed / in flight → a
-                // DIFFERENT tx hard-rejects, the SAME tx dedups.
-                let takeover = state == "released_failure" || (state == "executing" && expired);
+                // A nonce slot is permanently bound to its first transaction hash.
+                // Expiry only permits recovery by that exact signed transaction; a
+                // replacement is unsafe because the prior external outcome may be ambiguous.
+                let same_tx = row_hash.eq_ignore_ascii_case(&hash_str);
+                let takeover = same_tx && (state == "released_failure" || expired);
                 if takeover {
                     let new_fence = fence + 1;
                     tx.execute(
@@ -1209,6 +1267,29 @@ impl Store for PgStore {
         Ok(outcome)
     }
 
+    async fn renew_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        let hash_str = format!("{tx_hash:#x}");
+        let lease_secs = lease.as_secs().max(1) as f64;
+        let updated = client
+            .execute(
+                "UPDATE nonce_reservations
+             SET lease_expires_at = now() + ($4 || ' seconds')::interval
+             WHERE signer = $1 AND nonce = $2 AND tx_hash = $3
+               AND state <> 'released_failure'",
+                &[&key, &(nonce as i64), &hash_str, &lease_secs.to_string()],
+            )
+            .await?;
+        Ok(updated == 1)
+    }
+
     async fn release_reservation(
         &self,
         addr: &str,
@@ -1228,7 +1309,8 @@ impl Store for PgStore {
         // FENCED: only the current fence owner still in `executing` may release.
         client
             .execute(
-                "UPDATE nonce_reservations SET state = $5, lease_expires_at = now()
+                "UPDATE nonce_reservations SET state = $5,
+                    lease_expires_at = CASE WHEN $5 = 'released_failure' THEN now() ELSE lease_expires_at END
                  WHERE signer = $1 AND nonce = $2 AND tx_hash = $3 AND fence_token = $4
                    AND state = 'executing'",
                 &[
@@ -1278,7 +1360,10 @@ impl Store for PgStore {
             "INSERT INTO transactions (tx_hash, miden_tx_id, envelope_bytes, signer, expires_at, status, error_message, block_number)
              VALUES ($1, $2, $3, $4, $5, 'failed', $6, $7)
              ON CONFLICT (tx_hash) DO UPDATE SET status = 'failed', error_message = $6, block_number = $7, updated_at = now()
-             WHERE transactions.status = 'failed'",
+             WHERE transactions.status = 'failed' OR
+               (transactions.status = 'pending' AND NOT EXISTS (
+                   SELECT 1 FROM tx_note_links WHERE tx_note_links.tx_hash = transactions.tx_hash
+               ))",
             &[
                 &hash_str,
                 &miden_id as &(dyn ToSql + Sync),
@@ -1310,12 +1395,121 @@ impl Store for PgStore {
 
     // ── Claims ───────────────────────────────────────────────────
 
+    async fn try_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>> {
+        let client = self.pool.get().await?;
+        let key = format!("{global_index:#x}");
+        let owner = format!("{owner_tx_hash:#x}");
+        let lease_secs = lease.as_secs_f64();
+        let inserted = client
+            .execute(
+                "INSERT INTO claimed_indices
+                (global_index, owner_tx_hash, fence_token, claim_state, lease_expires_at)
+             VALUES ($1, $2, 1, 'executing', now() + ($3 || ' seconds')::interval)
+             ON CONFLICT (global_index) DO NOTHING",
+                &[&key, &owner, &lease_secs.to_string()],
+            )
+            .await?;
+        Ok((inserted == 1).then_some(ClaimFence { fence: 1 }))
+    }
+
+    async fn try_reclaim_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>> {
+        let client = self.pool.get().await?;
+        let key = format!("{global_index:#x}");
+        let owner = format!("{owner_tx_hash:#x}");
+        let lease_secs = lease.as_secs_f64();
+        let row = client.query_opt(
+            "UPDATE claimed_indices SET owner_tx_hash = $2, fence_token = fence_token + 1,
+                created_at = now(), lease_expires_at = now() + ($3 || ' seconds')::interval
+             WHERE global_index = $1 AND claim_state = 'executing'
+               AND (lease_expires_at <= now() OR
+                    (lease_expires_at IS NULL AND created_at <= now() - ($3 || ' seconds')::interval))
+             RETURNING fence_token",
+            &[&key, &owner, &lease_secs.to_string()],
+        ).await?;
+        Ok(row.map(|row| ClaimFence {
+            fence: row.get::<_, i64>(0) as u64,
+        }))
+    }
+
+    async fn mark_claim_submitted_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+        tx_hash: TxHash,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let key = format!("{global_index:#x}");
+        let owner = format!("{owner_tx_hash:#x}");
+        let tx_hash = format!("{tx_hash:#x}");
+        let tx = client.transaction().await?;
+        let updated = tx
+            .execute(
+                "UPDATE claimed_indices SET claim_state = 'submitted', lease_expires_at = NULL
+             WHERE global_index = $1 AND owner_tx_hash = $2 AND fence_token = $3
+               AND claim_state = 'executing' AND lease_expires_at > now()",
+                &[&key, &owner, &(fence as i64)],
+            )
+            .await?;
+        if updated != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO tx_note_links (tx_hash, note_commitment) VALUES ($1, $2)
+             ON CONFLICT (tx_hash) DO NOTHING",
+            &[&tx_hash, &note_commitment],
+        )
+        .await?;
+        let row = tx
+            .query_one(
+                "SELECT note_commitment FROM tx_note_links WHERE tx_hash = $1",
+                &[&tx_hash],
+            )
+            .await?;
+        let existing: String = row.get(0);
+        if existing != note_commitment {
+            anyhow::bail!("transaction {tx_hash} is already linked to a different claim note");
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn unclaim_fenced(
+        &self,
+        global_index: &U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let key = format!("{global_index:#x}");
+        let owner = format!("{owner_tx_hash:#x}");
+        let deleted = client
+            .execute(
+                "DELETE FROM claimed_indices WHERE global_index = $1
+             AND owner_tx_hash = $2 AND fence_token = $3 AND claim_state = 'executing'",
+                &[&key, &owner, &(fence as i64)],
+            )
+            .await?;
+        Ok(deleted == 1)
+    }
+
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         let key = format!("{global_index:#x}");
         let result = client
             .execute(
-                "INSERT INTO claimed_indices (global_index) VALUES ($1)",
+                "INSERT INTO claimed_indices (global_index, claim_state) VALUES ($1, 'executing')",
                 &[&key],
             )
             .await;
@@ -1340,6 +1534,7 @@ impl Store for PgStore {
             .execute(
                 "UPDATE claimed_indices SET created_at = now()
                  WHERE global_index = $1
+                   AND owner_tx_hash IS NULL AND claim_state = 'executing'
                    AND created_at <= now() - make_interval(secs => $2)",
                 &[&key, &ttl.as_secs_f64()],
             )
@@ -1352,7 +1547,7 @@ impl Store for PgStore {
         let key = format!("{global_index:#x}");
         client
             .execute(
-                "DELETE FROM claimed_indices WHERE global_index = $1",
+                "DELETE FROM claimed_indices WHERE global_index = $1 AND owner_tx_hash IS NULL",
                 &[&key],
             )
             .await?;

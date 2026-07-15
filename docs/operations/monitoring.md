@@ -377,7 +377,7 @@ silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
 | **WriterQueueCritical** | `agglayer_writer_queue_depth > 0.95 * AGGLAYER_WRITER_QUEUE_DEPTH` for 2 m | page | One step from `-32005` rejections; aggkit ethtxmanager retry budgets will start tripping. |
 | **WriterJobDurationP99** | `histogram_quantile(0.99, rate(agglayer_writer_job_duration_seconds_bucket[10m])) > 60` | page | p99 > 60 s breaks aggkit's `WaitTxToBeMined = 2 m` envelope (Spec E). Miden submission is degraded. |
 | **WriterJobFailures** | `rate(agglayer_writer_job_failures_total[5m]) > 0.5` for 5 m | page | Burst of dispatch failures. Drill down by `kind` + `reason` to distinguish Miden errors from TTL expiries. |
-| **WriterDroppedOnRestart** | `increase(agglayer_writer_dropped_on_restart_total[1h]) > 0` | **hard page** | v1 tripwire: real unrecovered work. See `docs/operations/runbook.md` Failure mode I. |
+| **WriterDroppedOnRestart** | `increase(agglayer_writer_dropped_on_restart_total[1h]) > 0` | **hard page** | Restart-pressure tripwire: dispatch was lost but the signed envelope remains durable for same-hash recovery. See `docs/operations/runbook.md` Failure mode I. |
 | **WriterQueueFullRejections** | `rate(agglayer_writer_queue_full_rejections_total[5m]) > 0.1` for 5 m | page | aggkit retries `-32005` transparently up to its budget; sustained backpressure exhausts the budget and surfaces as a stuck tx. |
 | **WriterDrainOutcomePartial** | none — dashboard only | n/a | Counts non-clean shutdowns over time; correlate with restart events when investigating `dropped_on_restart` increments. |
 | **WriterInflightSize** | none — dashboard only | n/a | Informational; size of the DashMap. Should track `queue_depth + jobs in flight at Miden`. |

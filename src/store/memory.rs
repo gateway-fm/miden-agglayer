@@ -1,6 +1,8 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
-use super::{FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim};
+use super::{
+    ClaimFence, FaucetEntry, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
+};
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
@@ -39,6 +41,21 @@ enum ReservationState {
     ReleasedFailure,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimState {
+    Executing,
+    Submitted,
+}
+
+#[derive(Clone)]
+struct ClaimRecord {
+    owner_tx_hash: Option<TxHash>,
+    state: ClaimState,
+    acquired_at: std::time::Instant,
+    lease_expires_at: Option<std::time::Instant>,
+    fence: u64,
+}
+
 pub struct InMemoryStore {
     // Block number
     latest_block_number: RwLock<u64>,
@@ -72,7 +89,7 @@ pub struct InMemoryStore {
     // `claim_clock_now`), so orphaned records (crash between the lock write and
     // the CLAIM landing) can be superseded after a TTL (`try_reclaim_expired`,
     // SOAK FINDING #1).
-    claimed: RwLock<HashMap<U256, std::time::Instant>>,
+    claimed: RwLock<HashMap<U256, ClaimRecord>>,
 
     // Test-only skew for the claim-lock clock. `test_backdate_claim` ages
     // records by moving this clock FORWARD instead of subtracting from the
@@ -618,6 +635,35 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn txn_begin_if_absent(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<bool> {
+        let mut txns = self.transactions.lock();
+        if let Some(receipt) = txns.get_mut(&tx_hash) {
+            if receipt.result.is_none() {
+                if entry.id.is_some() {
+                    receipt.id = entry.id;
+                }
+                if entry.expires_at.is_some() {
+                    receipt.expires_at = entry.expires_at;
+                }
+                if !entry.logs.is_empty() {
+                    receipt.logs = entry.logs;
+                }
+            }
+            return Ok(false);
+        }
+        let receipt = TxnReceipt {
+            id: entry.id,
+            envelope: entry.envelope,
+            signer: entry.signer,
+            expires_at: entry.expires_at,
+            result: None,
+            block_num: 0,
+            logs: entry.logs,
+        };
+        let _ = txns.put(tx_hash, receipt);
+        Ok(true)
+    }
+
     async fn txn_commit(
         &self,
         tx_hash: TxHash,
@@ -813,13 +859,12 @@ impl Store for InMemoryStore {
                 Ok(NonceReservation::Won { fence: 1 })
             }
             Some(r) => {
-                // STATE-FIRST (BLOCKER A): a holder that FAILED or whose lease EXPIRED
-                // consumed NO nonce, so the slot is free for takeover by ANY tx — the
-                // SAME tx (retry) OR a DIFFERENT tx. A holder that is executing under a
-                // valid lease, or already released_success, has consumed the nonce / is
-                // in flight, so a DIFFERENT tx hard-rejects and the SAME tx dedups.
-                let takeover = matches!(r.state, ReservationState::ReleasedFailure)
-                    || (r.state == ReservationState::Executing && r.lease_expires_at <= now);
+                // A nonce slot is permanently bound to its first tx hash. Even a
+                // failed or expired attempt may have crossed an external side-effect
+                // boundary, so a different replacement can never take it over.
+                let takeover = r.tx_hash == tx_hash
+                    && (matches!(r.state, ReservationState::ReleasedFailure)
+                        || r.lease_expires_at <= now);
                 if takeover {
                     let fence = r.fence + 1;
                     reservations.insert(
@@ -841,6 +886,25 @@ impl Store for InMemoryStore {
         }
     }
 
+    async fn renew_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let key = (addr.to_lowercase(), nonce);
+        let mut reservations = self.nonce_reservations.write();
+        if let Some(r) = reservations.get_mut(&key)
+            && r.tx_hash == tx_hash
+            && !matches!(r.state, ReservationState::ReleasedFailure)
+        {
+            r.lease_expires_at = std::time::Instant::now() + lease;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     async fn release_reservation(
         &self,
         addr: &str,
@@ -859,6 +923,7 @@ impl Store for InMemoryStore {
             r.state = if success {
                 ReservationState::ReleasedSuccess
             } else {
+                r.lease_expires_at = std::time::Instant::now();
                 ReservationState::ReleasedFailure
             };
         }
@@ -890,8 +955,13 @@ impl Store for InMemoryStore {
         // write the reverted receipt when the hash is absent or already `failed`
         // (idempotent re-affirm).
         let may_write = match txns.peek(&tx_hash).map(|r| &r.result) {
-            None => true,                // absent
-            Some(None) => false,         // pending real receipt — keep it
+            None => true, // absent
+            Some(None) => !self
+                .tx_note_links
+                .read()
+                .contains_key(&format!("{tx_hash:#x}")),
+            // linked pending receipt is a real external handoff; an unlinked pending
+            // row is only the durable pre-admission intent and may be reverted
             Some(Some(Ok(()))) => false, // successful real receipt — keep it
             Some(Some(Err(_))) => true,  // already failed — re-affirm
         };
@@ -919,12 +989,133 @@ impl Store for InMemoryStore {
 
     // ── Claims ───────────────────────────────────────────────────
 
+    async fn try_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>> {
+        let now = self.claim_clock_now();
+        let mut claimed = self.claimed.write();
+        if claimed.contains_key(&global_index) {
+            return Ok(None);
+        }
+        claimed.insert(
+            global_index,
+            ClaimRecord {
+                owner_tx_hash: Some(owner_tx_hash),
+                state: ClaimState::Executing,
+                acquired_at: now,
+                lease_expires_at: Some(now + lease),
+                fence: 1,
+            },
+        );
+        Ok(Some(ClaimFence { fence: 1 }))
+    }
+
+    async fn try_reclaim_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>> {
+        let now = self.claim_clock_now();
+        let mut claimed = self.claimed.write();
+        let Some(record) = claimed.get_mut(&global_index) else {
+            return Ok(None);
+        };
+        let expired = record
+            .lease_expires_at
+            .is_some_and(|deadline| deadline <= now)
+            || (record.lease_expires_at.is_none()
+                && now.saturating_duration_since(record.acquired_at) >= lease);
+        if record.state != ClaimState::Executing || !expired {
+            return Ok(None);
+        }
+        record.owner_tx_hash = Some(owner_tx_hash);
+        record.acquired_at = now;
+        record.lease_expires_at = Some(now + lease);
+        record.fence += 1;
+        Ok(Some(ClaimFence {
+            fence: record.fence,
+        }))
+    }
+
+    async fn mark_claim_submitted_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+        tx_hash: TxHash,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool> {
+        let now = self.claim_clock_now();
+        let tx_key = format!("{tx_hash:#x}");
+        let mut claimed = self.claimed.write();
+        let Some(record) = claimed.get_mut(&global_index) else {
+            return Ok(false);
+        };
+        if record.owner_tx_hash != Some(owner_tx_hash)
+            || record.fence != fence
+            || record.state != ClaimState::Executing
+            || record
+                .lease_expires_at
+                .is_none_or(|deadline| deadline <= now)
+        {
+            return Ok(false);
+        }
+        if let Some(existing) = self.tx_note_links.read().get(&tx_key)
+            && existing != note_commitment
+        {
+            anyhow::bail!("transaction {tx_key} is already linked to a different claim note");
+        }
+        record.state = ClaimState::Submitted;
+        record.lease_expires_at = None;
+        self.tx_note_links
+            .write()
+            .entry(tx_key.clone())
+            .or_insert_with(|| note_commitment.to_string());
+        self.note_tx_links
+            .write()
+            .entry(note_commitment.to_string())
+            .or_insert(tx_key);
+        Ok(true)
+    }
+
+    async fn unclaim_fenced(
+        &self,
+        global_index: &U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+    ) -> anyhow::Result<bool> {
+        let mut claimed = self.claimed.write();
+        let removable = claimed.get(global_index).is_some_and(|record| {
+            record.owner_tx_hash == Some(owner_tx_hash)
+                && record.fence == fence
+                && record.state == ClaimState::Executing
+        });
+        if removable {
+            claimed.remove(global_index);
+        }
+        Ok(removable)
+    }
+
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
         let mut claimed = self.claimed.write();
         if claimed.contains_key(&global_index) {
             anyhow::bail!("claim already submitted for global_index {global_index}");
         }
-        claimed.insert(global_index, self.claim_clock_now());
+        let now = self.claim_clock_now();
+        claimed.insert(
+            global_index,
+            ClaimRecord {
+                owner_tx_hash: None,
+                state: ClaimState::Executing,
+                acquired_at: now,
+                lease_expires_at: None,
+                fence: 0,
+            },
+        );
         Ok(())
     }
 
@@ -938,8 +1129,12 @@ impl Store for InMemoryStore {
         let now = self.claim_clock_now();
         let mut claimed = self.claimed.write();
         match claimed.get_mut(&global_index) {
-            Some(acquired_at) if now.saturating_duration_since(*acquired_at) >= ttl => {
-                *acquired_at = now;
+            Some(record)
+                if record.owner_tx_hash.is_none()
+                    && record.state == ClaimState::Executing
+                    && now.saturating_duration_since(record.acquired_at) >= ttl =>
+            {
+                record.acquired_at = now;
                 Ok(true)
             }
             _ => Ok(false),

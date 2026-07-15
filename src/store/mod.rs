@@ -137,6 +137,12 @@ pub enum NonceReservation {
     HeldByOther(TxHash),
 }
 
+/// Fenced ownership token for an in-progress claim submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimFence {
+    pub fence: u64,
+}
+
 /// Record of a claim we dropped because the destination could not be resolved to a
 /// Miden AccountId. See RD-860: storing these lets operators inspect the backlog and
 /// audit what happened to a user's funds when support asks about a specific deposit.
@@ -454,6 +460,9 @@ pub trait Store: Send + Sync + 'static {
 
     // === Transactions ===
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()>;
+    /// Durably admit a transaction before advancing its nonce. Idempotent for the
+    /// same tx hash; returns true when this call inserted the pending row.
+    async fn txn_begin_if_absent(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<bool>;
     async fn txn_commit(
         &self,
         tx_hash: TxHash,
@@ -497,8 +506,9 @@ pub trait Store: Send + Sync + 'static {
     ///     execute — the owner produces the receipt);
     ///   * the SAME tx after the lease EXPIRED or a `released_failure` → takeover:
     ///     [`NonceReservation::Won`] with a bumped fence (retry admission).
-    /// `lease` is how long the winner owns admission before another replica may
-    /// take over on expiry (crash recovery).
+    /// `lease` is how long the winner owns admission before another replica
+    /// presenting the SAME hash may take over on expiry (crash recovery). The
+    /// slot remains permanently bound to its first hash.
     async fn reserve_nonce(
         &self,
         addr: &str,
@@ -507,13 +517,17 @@ pub trait Store: Send + Sync + 'static {
         lease: std::time::Duration,
     ) -> anyhow::Result<NonceReservation>;
 
-    /// #55 BLOCKER 1 — release the admission lease won by [`Store::reserve_nonce`].
-    /// Transitions the reservation to `released_success` (admission completed — the
-    /// SAME tx henceforth dedups) or `released_failure` (admission failed — the SAME
-    /// tx may retry via takeover). FENCED: only applies while the row is still
-    /// `executing` under the given `fence` token, so a delayed prior owner whose
-    /// lease expired and was taken over (fence bumped) CANNOT clobber the new
-    /// owner's state. A no-op if already released or fenced out.
+    /// Extend the lease for the same durable transaction while it is queued or running.
+    async fn renew_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool>;
+
+    /// Fenced completion of a won admission. Success retains its recovery lease;
+    /// failure becomes immediately retryable by the same hash only.
     async fn release_reservation(
         &self,
         addr: &str,
@@ -560,6 +574,37 @@ pub trait Store: Send + Sync + 'static {
     ) -> anyhow::Result<bool>;
 
     // === Claims ===
+    /// Acquire a new claim lease. A conflict returns None.
+    async fn try_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>>;
+    /// Reclaim only an expired executing lease and bump its fence.
+    async fn try_reclaim_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>>;
+    /// Seal the current fence before the first external submission side effect.
+    async fn mark_claim_submitted_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+        tx_hash: TxHash,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool>;
+    /// Release only the current executing owner; stale owners cannot delete successors.
+    async fn unclaim_fenced(
+        &self,
+        global_index: &U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+    ) -> anyhow::Result<bool>;
+
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()>;
     async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()>;
     async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool>;

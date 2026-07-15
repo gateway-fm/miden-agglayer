@@ -784,6 +784,7 @@ async fn publish_claim_internal(
     latest_block_num: BlockNumber,
     reject_zero_padding: bool,
     expected_mints: Option<&Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
+    submission_fence: crate::service_send_raw_txn::ClaimSubmissionFence,
     // Opt-in local prover used as a fallback when the remote prover
     // configured on the surrounding `MidenClient` fails. `None` when
     // either (a) no remote prover is configured (the active prover IS
@@ -939,6 +940,10 @@ async fn publish_claim_internal(
     // prove step for the remote→local prover fallback above), so it must
     // call the chokepoint check itself before touching the node.
     crate::miden_client::ensure_writable(accounts.service.0)?;
+    // Atomically seal the current claim fence and persist the note handoff
+    // before the first external side effect. A stale reclaimed owner cannot
+    // submit or overwrite the successor note link.
+    submission_fence.mark_submitted(&note_commitment).await?;
     let _submission_height = client
         .submit_proven_transaction(proven_tx, &tx_result)
         .await?;
@@ -1076,7 +1081,7 @@ async fn publish_claim_internal(
 /// Miden consumption block) when it observes the CLAIM note consumed — no
 /// synthetic log, tip advance, or receipt completion happens in this path.
 #[allow(clippy::too_many_arguments)]
-pub async fn publish_claim(
+pub(crate) async fn publish_claim(
     params: claimAssetCall,
     client: &MidenClient,
     accounts: crate::AccountsConfig,
@@ -1087,6 +1092,7 @@ pub async fn publish_claim(
     signer: alloy::primitives::Address,
     reject_zero_padding: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
+    submission_fence: crate::service_send_raw_txn::ClaimSubmissionFence,
 ) -> anyhow::Result<PublishClaimTxn> {
     // Submit with runtime self-heal, mirroring the pattern in
     // `src/ger.rs::insert_ger`. If the inner Miden submission rejects with
@@ -1114,11 +1120,23 @@ pub async fn publish_claim(
         signer,
         reject_zero_padding,
         expected_mints.clone(),
+        submission_fence.clone(),
     )
     .await
     {
         Ok(value) => Ok(value),
         Err(err) if crate::account_recovery::is_recoverable_account_error(&err) => {
+            if store
+                .get_note_link_for_tx(&format!("{txn_hash:#x}"))
+                .await?
+                .is_some()
+            {
+                tracing::error!(
+                    eth_tx = %txn_hash, error = %err,
+                    "claim outcome is ambiguous after durable handoff; refusing to build a second note"
+                );
+                return Err(err);
+            }
             tracing::warn!(
                 err = %err,
                 eth_tx = %txn_hash,
@@ -1136,6 +1154,7 @@ pub async fn publish_claim(
                 signer,
                 reject_zero_padding,
                 expected_mints,
+                submission_fence,
             )
             .await
         }
@@ -1155,6 +1174,7 @@ async fn attempt_publish_claim(
     signer: alloy::primitives::Address,
     reject_zero_padding: bool,
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
+    submission_fence: crate::service_send_raw_txn::ClaimSubmissionFence,
 ) -> anyhow::Result<PublishClaimTxn> {
     // Snapshot the opt-in local-prover fallback BEFORE entering the
     // `client.with(...)` closure — the closure receives a
@@ -1177,6 +1197,7 @@ async fn attempt_publish_claim(
                     latest_block_num,
                     reject_zero_padding,
                     expected_mints.as_ref(),
+                    submission_fence,
                     local_prover_fallback,
                 )
                 .await?;
@@ -1186,7 +1207,7 @@ async fn attempt_publish_claim(
                 // Miden block — so the receipt block == the log block. This path
                 // records ONLY a PENDING receipt (txn_begin) + the tx↔note link below.
                 store
-                    .txn_begin(
+                    .txn_begin_if_absent(
                         txn_hash,
                         crate::store::TxnEntry {
                             // id: None hides this tx from the StoreSyncListener's
