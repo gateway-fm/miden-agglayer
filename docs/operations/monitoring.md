@@ -161,7 +161,7 @@ Treat each one as a hard-page criterion at any non-zero rate.
 | `spent-before-import recovery: bridge-consumed B2AGG verified via sync_transactions` | R1 catcher 3 success. | None |
 | `spent-before-import recovery: consumed B2AGG was NOT consumed by any bridge transaction ...` | MA#3 fail-closed skip (reclaim/unknown consumer). | Investigate |
 | `note reconciler failed (transient — will retry next tick)` | One reconciler pass failed; retried. Sustained repetition = node RPC trouble. | Investigate if sustained |
-| `nonce mismatch for 0x...: tx.nonce = N, expected M` | Out-of-order / replayed submission rejected (R4 guard). A background *churn* of these from autoclaim is benign — aggkit retries; the churn is eliminated by the writer worker's future-nonce wait (`AGGLAYER_ENABLE_WRITER_WORKER=true` waits up to 30 s for the gap nonce; `rpc_future_nonce_wait_total` counts the waits). | None unless a signer is stuck |
+| `nonce mismatch for 0x...: tx.nonce = N, expected M` | Out-of-order / replayed submission rejected (R4 guard). The single writer waits up to 30 s for a future-nonce gap; `rpc_future_nonce_wait_total` counts those waits. | None unless a signer is stuck |
 | `JSON-RPC unsupported method: web3_clientVersion` (also `parity_netPeers`, `debug_*`, `net_peerCount`, …) | Internet wallet-scanner probe noise — observed continuously on a host whose 8546 was bound to `0.0.0.0`. | Verify the port is loopback/private (runbook §1.2); otherwise ignore |
 | `account data wasn't found` / `incorrect account initial commitment` followed by `reimported from node` | R3 self-heal firing and (usually) curing. | Investigate only if it loops |
 | `reset_miden_store: deleted` / `=== RESTORE: complete ===` | R2 one-shot markers — should only appear during an operator-initiated recovery. | Confirm an operator is driving |
@@ -351,10 +351,8 @@ groups:
 # RD-940 writer worker
 
 This section codifies the alert thresholds for the eight Prometheus
-metrics introduced by the RD-940 async writer worker
-(`docs/design/RD-940-async-writer.md` Spec F §4). All series are
-registered unconditionally in `src/metrics.rs::init_metrics`; they are
-silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
+metrics introduced by the RD-940 single writer
+(`docs/design/RD-940-async-writer.md` Spec F §4).
 
 ## Metric reference
 

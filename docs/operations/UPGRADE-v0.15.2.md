@@ -104,23 +104,18 @@ being claimed within minutes of the swap, no redeploy).
 | Healing re-sweep (per ~1k Miden blocks of history) | a few minutes; scales with history — chunked 200 blocks/tick, non-blocking, normal traffic continues |
 | Full verification | ~10 min |
 
-## 4b. Recommended: enable the writer worker at upgrade time
+## 4b. Writer worker is mandatory
 
 The large rehearsal surfaced a **pre-existing** (also-in-v0.15.2) race: a
 node hiccup can make aggkit's ethtxmanager emit GER txs out of nonce order;
 the proxy's R4 replay-guard rejects the early nonce and **aggkit's
 ethtxmanager wedges permanently** (observed: no self-recovery in 20 min —
-one rejected nonce and it stops sending). This build ships the fix — the
-future-nonce wait — but it is only active with the writer worker enabled:
+one rejected nonce and it stops sending). This build ships the bounded
+future-nonce wait in the mandatory single-writer path. No feature flag is
+required. The path also eliminates benign nonce-mismatch churn from autoclaim
+bursts.
 
-```
-AGGLAYER_ENABLE_WRITER_WORKER=true    # + AGGLAYER_WRITER_QUEUE_DEPTH / _TX_TTL defaults
-```
-
-Enable it as part of the upgrade (or immediately after verification). Also
-eliminates the benign nonce-mismatch log churn from autoclaim bursts.
-
-**If the wedge is hit anyway** (writer worker off): symptom is a deposit
+**If the wedge is hit anyway**: symptom is a deposit
 stuck `ready_for_claim=false` while aggkit logs show an R4 nonce rejection
 and no sends since. Remedy, in order of preference: (1) replay aggkit's own
 already-signed raw txs from its logs via `eth_sendRawTransaction` in nonce

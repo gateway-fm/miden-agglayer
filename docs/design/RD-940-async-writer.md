@@ -91,7 +91,7 @@ In-flight map (`DashMap<TxHash, JobState>`) is a hot read cache backing `eth_get
 - On `TrySendError::Full`: JSON-RPC error `-32005 "writer queue saturated; retry"`. HTTP 200 JSON-body (axum-jrpc convention). Spec E confirms aggkit's ethtxmanager retries on `-32005`.
 - Single worker task mirroring `L1InfoTreeIndexer::spawn`, with a `oneshot` shutdown signal. Worker is a **translator only** — no retry logic of its own; existing self-heal at `src/claim.rs:591-628` and `src/ger.rs:201-224` already handles recoverable errors. A pool adds nothing because `MidenClient::with(...)` is a channel-of-1 (`src/miden_client.rs:126`).
 - `WriteJob` carries decoded params + `eth_tx_hash` (idempotency key). Decode on the request thread so malformed payloads cannot poison the queue.
-- Per-signer lock (`src/service_state.rs:21-44`): serialises nonce classification and admission. Writer mode releases it after durable admission/enqueue; the legacy synchronous mode remains serial for the full dispatch.
+- Per-signer lock (`src/service_state.rs:21-44`): serialises nonce classification and admission, then releases it after durable admission/enqueue. The bounded single writer is the only production dispatch path.
 
 ### 2.2 ClaimGuard placement — Spec B, recommendation (b) with amendments
 

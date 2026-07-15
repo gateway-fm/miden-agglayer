@@ -320,9 +320,7 @@ pub fn init_metrics() {
          other call sites). Recorded on both success and error paths."
     );
 
-    // RD-940 — async writer worker observability (Spec F §4). Registered
-    // unconditionally so the metric series exist even when
-    // `enable_writer_worker = false`; the sync path simply never emits.
+    // RD-940 — single writer observability (Spec F §4).
     describe_gauge!(
         "agglayer_writer_queue_depth",
         "RD-940: current number of WriteJobs sitting in the writer-worker \

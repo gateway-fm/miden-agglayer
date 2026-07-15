@@ -373,13 +373,12 @@ e2e-cantina10: e2e-up ## Spin up stack + Cantina #10 concurrent first-claim fauc
 	$(COMPOSE_ENV) ./scripts/e2e-cantina10-concurrent-faucet.sh
 
 # --- RD-940 e2e -----------------------------------------------------------
-# All RD-940 e2e scripts require the writer worker active. The `e2e-rd940-up`
-# helper sets AGGLAYER_ENABLE_WRITER_WORKER=true before bringing up the stack.
+# The single writer is always active; this helper only applies worker-specific
+# queue/receipt settings used by the RD-940 scenarios.
 
 .PHONY: e2e-rd940-up
-e2e-rd940-up: e2e-clean-data ## Bring up the stack with the RD-940 writer worker enabled
-	AGGLAYER_ENABLE_WRITER_WORKER=true \
-	  AGGLAYER_WRITER_QUEUE_DEPTH=$${AGGLAYER_WRITER_QUEUE_DEPTH:-64} \
+e2e-rd940-up: e2e-clean-data ## Bring up the stack with RD-940 test settings
+	AGGLAYER_WRITER_QUEUE_DEPTH=$${AGGLAYER_WRITER_QUEUE_DEPTH:-64} \
 	  AGGLAYER_WRITER_TX_TTL=$${AGGLAYER_WRITER_TX_TTL:-300} \
 	  AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS=$${AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS:-120} \
 	  $(E2E_COMPOSE) up -d --build --wait

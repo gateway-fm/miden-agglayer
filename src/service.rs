@@ -442,7 +442,6 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                     "durable_lowest_pending": pending_frontier.lowest_pending,
                     "durable_lowest_unlinked": pending_frontier.lowest_unlinked,
                     "returned_nonce": returned_nonce,
-                    "writer_enabled": service.enable_writer_worker,
                     "writer_handle_present": service.writer_handle.is_some(),
                 })
             );

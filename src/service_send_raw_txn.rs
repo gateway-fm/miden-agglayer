@@ -331,9 +331,9 @@ pub(crate) async fn repair_commit_gap_nonce(
 
 /// Handle a `claimAsset` transaction: skip zero-amount or publish the claim.
 ///
-/// This is the unified dispatcher for both the sync path and writer worker. It
-/// runs only after the signed envelope is durable and the nonce CAS has accepted
-/// the transaction. It never advances or reopens the nonce itself; any later
+/// This is the writer-worker dispatcher. It runs only after the signed envelope
+/// is durable and the nonce CAS has accepted the transaction. It never
+/// advances or reopens the nonce itself; any later
 /// failure becomes a status-0 receipt for the already-accepted hash.
 pub(crate) async fn worker_handle_claim_asset(
     service: &ServiceState,
@@ -566,8 +566,8 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
-/// #55 BLOCKER 1 — execute a WON admission (dispatch to the writer worker or the
-/// legacy sync path) and return the tx hash. Extracted so `service_send_raw_txn` can
+/// #55 BLOCKER 1 — execute a WON admission through the writer worker and return
+/// the tx hash. Extracted so `service_send_raw_txn` can
 /// wrap it with the reservation-lease RELEASE (success → future same-hash dedups;
 /// failure → the same tx may retry via lease takeover). Only ever called after the
 /// caller won the `(signer, nonce)` reservation.
@@ -712,12 +712,7 @@ async fn dispatch_after_reservation(
         return Ok(txn_hash);
     }
 
-    if service.enable_writer_worker {
-        let handle = service.writer_handle.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "enable_writer_worker=true but no writer_handle plumbed into ServiceState"
-            )
-        })?;
+    if let Some(handle) = service.writer_handle.as_ref() {
         if handle.available_capacity() == 0 {
             return Err(crate::writer_worker::WriterQueueSaturatedError.into());
         }
@@ -741,41 +736,52 @@ async fn dispatch_after_reservation(
             }
         }
     } else {
-        durably_admit_and_advance_nonce(
-            service,
-            txn_hash,
-            &txn_envelope,
-            signer,
-            signer_str,
-            tx_nonce,
-        )
-        .await?;
-        let dispatch: anyhow::Result<()> = match decoded {
-            crate::writer_worker::DecodedWriteCall::Claim { params } => {
-                worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer).await
+        #[cfg(not(test))]
+        anyhow::bail!("single writer handle missing from production ServiceState");
+
+        // Lower-level unit tests deliberately omit the background runtime so
+        // they can assert dispatch results synchronously. This path is not
+        // compiled into production.
+        #[cfg(test)]
+        {
+            durably_admit_and_advance_nonce(
+                service,
+                txn_hash,
+                &txn_envelope,
+                signer,
+                signer_str,
+                tx_nonce,
+            )
+            .await?;
+            let dispatch: anyhow::Result<()> = match decoded {
+                crate::writer_worker::DecodedWriteCall::Claim { params } => {
+                    worker_handle_claim_asset(service, *params, txn_hash, txn_envelope, signer)
+                        .await
+                }
+                crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
+                    worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer)
+                        .await
+                }
+            };
+            if let Err(err) = dispatch {
+                // Once the durable row and nonce CAS commit, the transaction is accepted.
+                // Any later sync failure is represented as a status-0 receipt instead of
+                // reopening the nonce slot after an outcome-ambiguous external call.
+                let block_num = service.store.get_latest_block_number().await?;
+                let block_hash = service.block_state.get_block_hash(block_num);
+                service
+                    .store
+                    .txn_commit(
+                        txn_hash,
+                        Err(format!("sync dispatch failed: {err:#}")),
+                        block_num,
+                        block_hash,
+                    )
+                    .await?;
+                tracing::error!(%txn_hash, error = %err, "accepted sync transaction reverted");
             }
-            crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
-                worker_handle_ger_insert(service, ger_bytes, txn_hash, txn_envelope, signer).await
-            }
-        };
-        if let Err(err) = dispatch {
-            // Once the durable row and nonce CAS commit, the transaction is accepted.
-            // Any later sync failure is represented as a status-0 receipt instead of
-            // reopening the nonce slot after an outcome-ambiguous external call.
-            let block_num = service.store.get_latest_block_number().await?;
-            let block_hash = service.block_state.get_block_hash(block_num);
-            service
-                .store
-                .txn_commit(
-                    txn_hash,
-                    Err(format!("sync dispatch failed: {err:#}")),
-                    block_num,
-                    block_hash,
-                )
-                .await?;
-            tracing::error!(%txn_hash, error = %err, "accepted sync transaction reverted");
+            Ok(txn_hash)
         }
-        Ok(txn_hash)
     }
 }
 
@@ -1248,7 +1254,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             "known_store_linked": known_store_linked,
             "known_store_prepared": handoff.as_ref().is_some_and(|handoff| handoff.state == crate::store::NoteHandoffState::Prepared),
             "known_durable_intent": known_durable_intent,
-            "writer_enabled": service.enable_writer_worker,
             "writer_handle_present": service.writer_handle.is_some(),
         })
     );
@@ -1275,15 +1280,14 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // Deterministic and side-effect-free rejection belongs before the signer
     // lock. Stateful checks repeat after reservation to close landing races.
     validate_before_nonce_reservation(&service, &decoded).await?;
-    if service.enable_writer_worker {
-        let handle = service.writer_handle.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "enable_writer_worker=true but no writer_handle plumbed into ServiceState"
-            )
-        })?;
-        if handle.available_capacity() == 0 {
-            return Err(crate::writer_worker::WriterQueueSaturatedError.into());
-        }
+    if let Some(handle) = service.writer_handle.as_ref()
+        && handle.available_capacity() == 0
+    {
+        return Err(crate::writer_worker::WriterQueueSaturatedError.into());
+    }
+    #[cfg(not(test))]
+    if service.writer_handle.is_none() {
+        anyhow::bail!("single writer handle missing from production ServiceState");
     }
 
     // R4 follow-up — serialise the entire nonce-check + enqueue/handler
@@ -1345,7 +1349,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         }
         let durable_resume_nonce =
             known_durable_intent && expected_nonce == tx_nonce.saturating_add(1);
-        let can_wait_for_future_nonce = service.enable_writer_worker
+        let can_wait_for_future_nonce = service.writer_handle.is_some()
             && tx_nonce > expected_nonce
             && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
         let nonce_action = if tx_nonce == expected_nonce || durable_resume_nonce {
@@ -1369,7 +1373,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 "durable_resume": durable_resume_nonce,
                 "action": nonce_action,
                 "future_nonce_wait_ms": future_nonce_wait_started.elapsed().as_millis(),
-                "writer_enabled": service.enable_writer_worker,
                 "writer_handle_present": service.writer_handle.is_some(),
             })
         );
@@ -1825,8 +1828,7 @@ mod tests {
         );
     }
 
-    /// PR #127 review point 3 — writer mode. Pre-fix, with
-    /// `enable_writer_worker = true` the C6 gate only ran inside the worker,
+    /// PR #127 review point 3. Pre-fix, the C6 gate only ran inside the worker,
     /// AFTER `try_enqueue` had consumed the nonce and admitted the tx hash
     /// into the inflight dedup cache. The gate must run on the REQUEST path:
     /// a claim whose GER is unpublished is rejected with no nonce consumed,
@@ -1835,7 +1837,6 @@ mod tests {
     #[tokio::test]
     async fn c6_writer_mode_missing_ger_rejected_before_enqueue_then_retryable() {
         let mut service = create_test_service();
-        service.enable_writer_worker = true;
         let (handle, _shutdown) = crate::writer_worker::WriterWorker::spawn(
             service.clone(),
             8,
@@ -1935,7 +1936,6 @@ mod tests {
     #[tokio::test]
     async fn c6_writer_mode_zero_amount_claim_not_ger_gated() {
         let mut service = create_test_service();
-        service.enable_writer_worker = true;
         let (handle, _shutdown) = crate::writer_worker::WriterWorker::spawn(
             service.clone(),
             8,
@@ -2344,7 +2344,6 @@ mod tests {
             64,
             std::time::Duration::from_secs(60),
         );
-        service.enable_writer_worker = true;
         service.writer_handle = Some(std::sync::Arc::new(handle));
 
         let calldata = insertGlobalExitRootCall {
@@ -3400,7 +3399,6 @@ mod tests {
             64,
             std::time::Duration::from_secs(60),
         );
-        service.enable_writer_worker = true;
         service.writer_handle = Some(std::sync::Arc::new(handle));
         seed_zero_ger(&store).await;
 
@@ -3436,7 +3434,6 @@ mod tests {
             64,
             std::time::Duration::from_secs(60),
         );
-        service.enable_writer_worker = true;
         service.writer_handle = Some(std::sync::Arc::new(handle));
         seed_zero_ger(&store).await;
 
@@ -4080,7 +4077,6 @@ mod tests {
             std::time::Duration::from_secs(60),
         );
         let handle = std::sync::Arc::new(handle);
-        service.enable_writer_worker = true;
         service.writer_handle = Some(handle.clone());
         let store = service.store.clone();
 
@@ -4110,7 +4106,6 @@ mod tests {
             std::time::Duration::from_secs(60),
         );
         let handle2 = std::sync::Arc::new(handle2);
-        service2.enable_writer_worker = true;
         service2.writer_handle = Some(handle2.clone());
 
         // Arm a one-shot CAS store failure.
@@ -4202,7 +4197,6 @@ mod tests {
             std::time::Duration::from_secs(60),
         );
         let handle = std::sync::Arc::new(handle);
-        service.enable_writer_worker = true;
         service.writer_handle = Some(handle.clone());
         let retried = service_send_raw_txn(service, input_hex).await.unwrap();
         assert_eq!(retried, tx_hash);
@@ -4322,7 +4316,6 @@ mod tests {
             64,
             std::time::Duration::from_secs(60),
         );
-        service.enable_writer_worker = true;
         service.writer_handle = Some(std::sync::Arc::new(handle));
         // gi LANDED; GER deliberately NOT seeded → C6 would reject "not observed yet".
         let gi = U256::from(0x55c3u64);

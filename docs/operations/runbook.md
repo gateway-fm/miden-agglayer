@@ -73,7 +73,6 @@ its shape for new environments.
 
 | Flag / env | Default | Notes |
 |---|---|---|
-| `--enable-writer-worker` / `AGGLAYER_ENABLE_WRITER_WORKER` | `false` | Async `eth_sendRawTransaction` dispatch. Runtime toggle; see the RD-940 section at the end of this doc for the flag-flip procedure and restart-loss contract. Also enables the bounded future-nonce wait (out-of-order submissions wait up to 30 s for the missing nonce instead of erroring). |
 | `AGGLAYER_WRITER_QUEUE_DEPTH` (env only) | `64` | mpsc capacity. |
 | `AGGLAYER_WRITER_TX_TTL` (env only) | `300` | Maximum queue age before the consuming worker fails a job prior to dispatch; also terminal-cache retention. Submitting work is never failed by the sweeper. |
 | `AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS` (env only) | `120` | Miden-block lifetime of pending claim receipts waiting for the projector to observe claim-note consumption. |
@@ -804,50 +803,44 @@ snapshotting residual jobs. Kubernetes' default
 `terminationGracePeriodSeconds = 30 s` includes the time between the
 SIGTERM and the SIGKILL that follows; with axum's own shutdown delay
 plus the 20 s drain plus a small buffer, **bali's pod spec MUST set
-`terminationGracePeriodSeconds: 45`** before `AGGLAYER_ENABLE_WRITER_WORKER`
-is flipped to `true` in production.
+`terminationGracePeriodSeconds: 45`** before deploying this release.
 
 This change lives in the downstream `gateway-deploy` repo (not in
-miden-agglayer). Coordinate the deploy-spec edit with the agglayer
-flag-flip; rolling them out in lockstep avoids a window where the drain
-is silently truncated by SIGKILL.
+miden-agglayer). Coordinate the deploy-spec edit with the agglayer rollout;
+deploying it first avoids a window where the drain is silently truncated by
+SIGKILL.
 
 There is no HPA or PDB on the miden-agglayer pod today, so the bump has
 no cascading effect.
 
-## Flag-flip procedure (enabling the writer worker)
+## Single-writer deployment procedure
 
 1. **Pre-flight checks.**
    - `kubectl get deploy/miden-agglayer -o yaml` shows
      `terminationGracePeriodSeconds: 45`.
    - Latest miden-agglayer build includes the RD-940 commits.
-   - Prometheus is scraping the new metrics
-     (`agglayer_writer_queue_depth` should be present even when the
-     flag is off — registered unconditionally).
+   - Prometheus is scraping the writer metrics.
    - Alerts in `monitoring.md` are armed.
-2. **Set the env var.** `AGGLAYER_ENABLE_WRITER_WORKER=true` in the
-   bali deployment spec. Restart the pod.
+2. **Deploy and restart the pod.** The single writer starts unconditionally.
 3. **First 10 minutes — eyes on the dashboard.**
    - `agglayer_writer_queue_depth` should stay well under 0.5 × cap
      (32 with the default cap of 64).
    - `agglayer_writer_job_failures_total{reason="ttl"}` should stay 0.
      Any non-zero rate means a job waited in the local queue longer than
      `AGGLAYER_WRITER_TX_TTL` (default 300 s) before dispatch began.
-   - `agglayer_writer_dropped_on_restart_total` must be 0 (this is the
-     first boot under the flag; non-zero here means the previous boot
-     was already running the worker and left residue).
+   - `agglayer_writer_dropped_on_restart_total` must be 0; non-zero means the
+     previous boot left queued or submitting work.
 4. **First 24 hours.** Compare `agglayer_writer_job_duration_seconds`
    p99 against aggkit's `WaitTxToBeMined` budget (2 m). Stay below 60
    s; alert if the p99 climbs above 90 s for 10 min.
-5. **Rollback.** Set `AGGLAYER_ENABLE_WRITER_WORKER=false` and restart.
-   The proxy reverts to the legacy synchronous handler with zero code
-   change. The flag is a runtime toggle, not a build feature.
+5. **Rollback.** There is no synchronous-mode toggle: it violates the invariant
+   that accepted work outlives the HTTP request. Roll back the whole release
+   only after draining or accounting for all pending transactions.
 
 ## Environment-variable overrides
 
 | Env var | Default | Effect |
 |---|---|---|
-| `AGGLAYER_ENABLE_WRITER_WORKER` | `false` | Master toggle for the RD-940 async path. Also enables the bounded future-nonce wait (30 s) that absorbs out-of-order autoclaim submissions. |
 | `AGGLAYER_WRITER_QUEUE_DEPTH` | `64` | mpsc capacity. At 64 + p50 commit ≈ 10 s, sustainable throughput tops near 6 jobs/s. Bump if `queue_full_rejections` rate climbs. |
 | `AGGLAYER_WRITER_TX_TTL` | `300` (5 min) | Maximum queue age before the consuming worker writes `status:0x0` without starting dispatch; also retention time for terminal in-memory entries. The sweeper renews live reservations and evicts terminal entries, but never fails Submitting work concurrently. |
 | `AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS` | `120` | Miden-block lifetime for pending claim receipts that wait for the projector to observe claim-note consumption. Increase if valid claims expire before projection under load. |
