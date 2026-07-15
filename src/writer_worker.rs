@@ -52,6 +52,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument;
 use ulid::Ulid;
 
 /// Default writer-worker mpsc capacity. Spec §6 decision #5: at queue cap 64
@@ -246,9 +247,8 @@ pub enum JobState {
     /// Worker successfully committed the receipt and emitted the synthetic
     /// log. `block_number` is the synthetic block the success was recorded at.
     Committed { block_number: u64 },
-    /// Worker exhausted its inline retries (or caught a panic via
-    /// `AssertUnwindSafe`). A failure receipt was best-effort written; the
-    /// caller's `eth_getTransactionReceipt` returns `status:0x0`.
+    /// Worker returned an error or its supervised dispatch task panicked. A failure
+    /// receipt was best-effort written; the caller's `eth_getTransactionReceipt` returns `status:0x0`.
     Failed,
 }
 
@@ -330,6 +330,27 @@ pub enum TryEnqueueError {
 #[derive(Debug, thiserror::Error)]
 #[error("writer queue saturated; retry")]
 pub struct WriterQueueSaturatedError;
+
+#[derive(Debug, thiserror::Error)]
+#[error("writer dispatch task panicked: {0}")]
+struct WriterDispatchPanic(String);
+
+/// Run one dispatch behind a Tokio task boundary so a panic becomes a normal
+/// job failure and cannot terminate the sole writer loop.
+async fn supervise_dispatch<F>(future: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    match tokio::spawn(future.in_current_span()).await {
+        Ok(result) => result,
+        Err(join_err) if join_err.is_panic() => {
+            Err(WriterDispatchPanic(join_err.to_string()).into())
+        }
+        Err(join_err) => Err(anyhow::anyhow!(
+            "writer dispatch task was cancelled: {join_err}"
+        )),
+    }
+}
 
 // ─── Public handle ───────────────────────────────────────────────────────────
 
@@ -764,14 +785,9 @@ impl WriterWorker {
         }
 
         let outcome_label;
-        let dispatch_result = std::panic::AssertUnwindSafe(dispatch_job(&self.service, job));
-        // FutureExt::catch_unwind would be cleaner but pulls in
-        // `futures-util`; we don't ship it as a dep. The bare AssertUnwindSafe
-        // here is enough because dispatch_job is itself an `async fn` — if it
-        // panics, the panic propagates through the .await and is caught by
-        // tokio::spawn's panic boundary. We log it via the worker
-        // supervision below.
-        let result: anyhow::Result<()> = dispatch_result.0.await;
+        let dispatch_service = self.service.clone();
+        let result =
+            supervise_dispatch(async move { dispatch_job(&dispatch_service, job).await }).await;
         match result {
             Ok(()) => {
                 // Best-effort: read the freshly-bumped tip to attribute the
@@ -842,10 +858,15 @@ impl WriterWorker {
                              eth_getTransactionReceipt will return null"
                         );
                     }
+                    let reason = if err.downcast_ref::<WriterDispatchPanic>().is_some() {
+                        "panic"
+                    } else {
+                        "miden"
+                    };
                     ::metrics::counter!(
                         "agglayer_writer_job_failures_total",
                         "kind" => kind.as_str(),
-                        "reason" => "miden",
+                        "reason" => reason,
                     )
                     .increment(1);
                 }
@@ -1008,6 +1029,22 @@ mod tests {
             eth_tx_hash: hash,
             job_id: Ulid::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_panic_is_contained_and_next_task_still_runs() {
+        let err = supervise_dispatch(async {
+            panic!("injected writer dispatch panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await
+        .expect_err("the panic must be converted into a job error");
+        assert!(err.downcast_ref::<WriterDispatchPanic>().is_some());
+
+        supervise_dispatch(async { Ok(()) })
+            .await
+            .expect("the supervisor must remain usable after a panic");
     }
 
     #[tokio::test]

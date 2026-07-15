@@ -30,6 +30,35 @@ fn calldata_selector(input: &alloy::primitives::Bytes) -> String {
     )
 }
 
+fn decode_write_call(
+    params_encoded: &alloy::primitives::Bytes,
+) -> anyhow::Result<crate::writer_worker::DecodedWriteCall> {
+    if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
+        tracing::debug!("claimAsset call");
+        let params = claimAssetCall::abi_decode(params_encoded)?;
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
+        Ok(crate::writer_worker::DecodedWriteCall::Claim {
+            params: Box::new(params),
+        })
+    } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
+        tracing::debug!("insertGlobalExitRoot call");
+        let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
+        Ok(crate::writer_worker::DecodedWriteCall::Ger {
+            ger_bytes: params.root.0,
+        })
+    } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
+        tracing::debug!("updateExitRoot call");
+        let params = updateExitRootCall::abi_decode(params_encoded)?;
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
+        Ok(crate::writer_worker::DecodedWriteCall::Ger {
+            ger_bytes: ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0),
+        })
+    } else {
+        anyhow::bail!("unhandled txn method {params_encoded:?}")
+    }
+}
+
 fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionData> {
     let data = match txn_envelope {
         TxEnvelope::Eip1559(txn_signed) => {
@@ -1160,6 +1189,18 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     let selector = calldata_selector(&txn.input);
     tracing::debug!(target: concat!(module_path!(), "::debug"), "raw transaction hash: {txn_hash}");
 
+    // Reject unauthorized signers before any store read or per-signer lock
+    // allocation. In fail-closed mode this keeps untrusted addresses from
+    // growing the lock registry or consuming database capacity.
+    if !service.allow_any_signer && !is_signer_allowed(service.allowed_signers.as_deref(), &signer)
+    {
+        ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
+        anyhow::bail!(
+            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or ALLOWED_SIGNERS), \
+             or set --insecure-allow-any-signer to explicitly opt into open mode"
+        );
+    }
+
     // RD-940 Decision 3 — tx-hash dedup early-return, BEFORE the R4 nonce check.
     //
     // aggkit's ethtxmanager re-broadcasts stuck txs within its
@@ -1218,7 +1259,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         .is_some_and(|handoff| handoff.state == crate::store::NoteHandoffState::Submitted);
     // A pending row without a note handoff is the durable queue intent. It must
     // be resumed after a crashed process loses its in-memory mpsc contents.
-    let known_durable_intent = known_store_entry
+    let mut known_durable_intent = known_store_entry
         .as_ref()
         .is_some_and(|entry| entry.result.is_none() && !known_store_linked);
     tracing::info!(
@@ -1259,6 +1300,21 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         return Ok(txn_hash);
     }
 
+    let decoded = decode_write_call(&txn.input)?;
+    // Deterministic and side-effect-free rejection belongs before the signer
+    // lock. Stateful checks repeat after reservation to close landing races.
+    validate_before_nonce_reservation(&service, &decoded).await?;
+    if service.enable_writer_worker {
+        let handle = service.writer_handle.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "enable_writer_worker=true but no writer_handle plumbed into ServiceState"
+            )
+        })?;
+        if handle.available_capacity() == 0 {
+            return Err(crate::writer_worker::WriterQueueSaturatedError.into());
+        }
+    }
+
     // R4 follow-up — serialise the entire nonce-check + enqueue/handler
     // critical section for this signer. Without the mutex, two concurrent
     // same-nonce txs both pass the equality check before either calls
@@ -1276,6 +1332,27 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
 
     let _lock = loop {
         let lock = service.per_signer_locks.lock(signer).await;
+
+        // Close the race between the optimistic dedup read above and this lock.
+        // A concurrent identical request may have admitted the hash while we
+        // waited; it must deduplicate here instead of failing as a stale nonce.
+        if service
+            .writer_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_inflight(&txn_hash))
+        {
+            return Ok(txn_hash);
+        }
+        if !known_durable_intent
+            && let Some(refreshed_entry) = service.store.txn_get(txn_hash).await?
+        {
+            let refreshed_handoff = service.store.get_note_handoff_for_tx(&tx_key).await?;
+            if refreshed_entry.result.is_some() || refreshed_handoff.is_some() {
+                repair_commit_gap_nonce(&service, &signer_str, tx_nonce).await?;
+                return Ok(txn_hash);
+            }
+            known_durable_intent = true;
+        }
 
         // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce
         // only on success and never compared the incoming `tx.nonce` against
@@ -1345,73 +1422,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; this guards against replay and out-of-order submission (R4)"
         );
     };
-
-    // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
-    // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
-    // calldata. The proxy then runs Miden tx work on the service account's behalf
-    // (auto-creates faucets, advances LET, marks GERs injected), letting an
-    // attacker burn fees, poison registries, or feed fabricated GERs to
-    // bridge-service. Reject any signer not in the configured allow-list.
-    // Audit C2 — `None` is fail-closed (no signer accepted); legacy open mode
-    // requires the explicit `allow_any_signer` opt-in.
-    if !service.allow_any_signer && !is_signer_allowed(service.allowed_signers.as_deref(), &signer)
-    {
-        ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
-        anyhow::bail!(
-            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or ALLOWED_SIGNERS), \
-             or set --insecure-allow-any-signer to explicitly opt into open mode"
-        );
-    }
-
-    // ── Method decode ───────────────────────────────────────────────────
-    //
-    // Decoding the selector + ABI on the request thread (rather than inside
-    // the worker) keeps malformed payloads from poisoning the queue and lets
-    // both the legacy sync path and the worker path share the same dispatch
-    // shape downstream. The `DecodedWriteCall` enum is defined in
-    // `writer_worker` so it can also serve as the wire shape for the v1.5
-    // durable-queue migration sketched in `docs/design/RD-940-async-writer.md`.
-    let params_encoded = &txn.input;
-    let decoded = if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
-        tracing::debug!("claimAsset call");
-        let params = claimAssetCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
-        crate::writer_worker::DecodedWriteCall::Claim {
-            params: Box::new(params),
-        }
-    } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
-        tracing::debug!("insertGlobalExitRoot call");
-        let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
-        let ger_bytes: [u8; 32] = params.root.0;
-        crate::writer_worker::DecodedWriteCall::Ger { ger_bytes }
-    } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
-        tracing::debug!("updateExitRoot call");
-        let params = updateExitRootCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-        let combined_ger =
-            ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
-        crate::writer_worker::DecodedWriteCall::Ger {
-            ger_bytes: combined_ger,
-        }
-    } else {
-        tracing::error!("unhandled txn method {params_encoded:?}");
-        anyhow::bail!("unhandled txn method {params_encoded:?}");
-    };
-
-    // All deterministic claim rejection happens before the permanent
-    // reservation row is created, so a corrected transaction may reuse nonce N.
-    validate_before_nonce_reservation(&service, &decoded).await?;
-    if service.enable_writer_worker {
-        let handle = service.writer_handle.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "enable_writer_worker=true but no writer_handle plumbed into ServiceState"
-            )
-        })?;
-        if handle.available_capacity() == 0 {
-            return Err(crate::writer_worker::WriterQueueSaturatedError.into());
-        }
-    }
 
     // ── #55 BLOCKER 1 — atomic (signer, nonce) reservation ──────────────
     //
@@ -2418,6 +2428,45 @@ mod tests {
             store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
             1,
             "dedup must not double-advance the nonce"
+        );
+    }
+
+    /// A duplicate can pass the optimistic dedup read while the original request
+    /// owns the signer lock. Recheck after lock acquisition so it returns the same
+    /// hash instead of observing the advanced nonce as stale.
+    #[tokio::test]
+    async fn concurrent_same_hash_rechecks_dedup_inside_signer_lock() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xCDu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+
+        // Hold the signer lock while both calls complete their initial empty-store
+        // dedup reads, forcing the race this regression covers.
+        let gate = service.per_signer_locks.lock(signer).await;
+        let first_service = service.clone();
+        let first_input = input_hex.clone();
+        let first =
+            tokio::spawn(async move { service_send_raw_txn(first_service, first_input).await });
+        let second_service = service.clone();
+        let second =
+            tokio::spawn(async move { service_send_raw_txn(second_service, input_hex).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(gate);
+
+        let first = first.await.unwrap().expect("first submit must succeed");
+        let second = second
+            .await
+            .unwrap()
+            .expect("concurrent rebroadcast must deduplicate");
+        assert_eq!(first, second);
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            1,
+            "concurrent dedup must advance the nonce exactly once"
         );
     }
 
