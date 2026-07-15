@@ -1204,6 +1204,45 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn txn_commit_confirmed_duplicate(
+        &self,
+        tx_hash: TxHash,
+        result: Result<(), String>,
+        block_num: u64,
+    ) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let hash = format!("{tx_hash:#x}");
+        let (status, error_message) = match &result {
+            Ok(()) => ("success", None),
+            Err(message) => ("failed", Some(message.as_str())),
+        };
+        let updated = tx
+            .execute(
+                "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4 AND status = $5",
+                &[
+                    &status,
+                    &error_message as &(dyn ToSql + Sync),
+                    &(block_num as i64),
+                    &hash,
+                    &"pending",
+                ],
+            )
+            .await?;
+        if updated == 1 {
+            tx.execute("DELETE FROM transaction_logs WHERE tx_hash = $1", &[&hash])
+                .await?;
+        } else if tx
+            .query_opt("SELECT 1 FROM transactions WHERE tx_hash = $1", &[&hash])
+            .await?
+            .is_none()
+        {
+            anyhow::bail!("PgStore: transaction {tx_hash} not found");
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,

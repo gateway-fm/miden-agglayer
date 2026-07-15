@@ -543,6 +543,15 @@ pub trait Store: Send + Sync + 'static {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()>;
+    /// Finalize a note-linked pending transaction only after bridge state and its
+    /// exact NoteId prove another transaction applied the operation. This emits no
+    /// event and must not overwrite an existing terminal receipt.
+    async fn txn_commit_confirmed_duplicate(
+        &self,
+        tx_hash: TxHash,
+        result: Result<(), String>,
+        block_num: u64,
+    ) -> anyhow::Result<()>;
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,

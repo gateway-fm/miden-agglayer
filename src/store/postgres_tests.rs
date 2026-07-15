@@ -450,6 +450,46 @@ async fn test_pgstore_txn_commit_missing_row_errors() {
     assert!(err.to_string().contains("not found"));
 }
 
+#[tokio::test]
+async fn test_pgstore_confirmed_duplicate_finalizes_linked_pending() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let mut hash_bytes = [0xdeu8; 32];
+    hash_bytes[16..].copy_from_slice(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_be_bytes(),
+    );
+    let tx_hash = TxHash::from(hash_bytes);
+    let tx_key = format!("{tx_hash:#x}");
+    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    store
+        .prepare_note_handoff(&tx_key, "confirmed-duplicate-commitment", "note-id", 10)
+        .await
+        .unwrap();
+    store
+        .txn_commit(tx_hash, Err("raw Miden error".into()), 10, [0; 32])
+        .await
+        .unwrap();
+    assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+
+    store
+        .txn_commit_confirmed_duplicate(
+            tx_hash,
+            Err("execution reverted: AlreadyClaimed()".into()),
+            11,
+        )
+        .await
+        .unwrap();
+    let (result, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+    assert!(result.is_err());
+    assert_eq!(block, 11);
+    assert!(store.get_logs_for_tx(&tx_key).await.unwrap().is_empty());
+}
+
 // ── Nonces ───────────────────────────────────────────────────
 
 #[tokio::test]

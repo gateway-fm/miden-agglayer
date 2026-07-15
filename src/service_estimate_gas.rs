@@ -8,16 +8,11 @@
 //! propagated normally creates no transaction at all, and the manager simply
 //! retries the estimate later.
 //!
-//! This proxy used to answer every `eth_estimateGas` with a flat `0x0`,
-//! which admitted claims whose GER the proxy had not yet published; the
-//! branch then compensated with propagation sleeps inside the serialized
-//! Miden client (removed by this fix). Instead, mirror the EVM bridge:
-//! decode `claimAsset` calldata, compute the combined GER from the two exit
-//! roots, and return a deterministic `execution reverted:
-//! GlobalExitRootInvalid()` while the projected/published GER flag
-//! (`Store::is_ger_injected`) is false. The literal string
-//! `execution reverted` MUST stay in the message — bridge-service keys its
-//! retry classification on it.
+//! This is a compatibility shim, not a simulator: it only reads the landed
+//! projection and the local synchronized Miden bridge account. A spent claim
+//! returns `AlreadyClaimed()` before the GER check; otherwise an absent GER
+//! returns `GlobalExitRootInvalid()`. No transaction is executed or proved.
+//! The literal `execution reverted` prefix is load-bearing for ClaimTxManager.
 
 use crate::claim::claimAssetCall;
 use crate::hex::hex_decode_prefixed;
@@ -35,6 +30,9 @@ alloy_core::sol! {
     // Selector: 0x002f6fad.
     #[derive(Debug)]
     error GlobalExitRootInvalid();
+    // Selector: 0x646cf558.
+    #[derive(Debug)]
+    error AlreadyClaimed();
 }
 
 /// The JSON-RPC error code geth uses for `execution reverted` responses
@@ -52,6 +50,17 @@ pub(crate) fn global_exit_root_invalid_error() -> JsonRpcError {
         serde_json::Value::String(format!(
             "0x{}",
             alloy::hex::encode(GlobalExitRootInvalid::SELECTOR)
+        )),
+    )
+}
+
+pub(crate) fn already_claimed_error() -> JsonRpcError {
+    JsonRpcError::new(
+        JsonRpcErrorReason::ApplicationError(EXECUTION_REVERTED_CODE),
+        "execution reverted: AlreadyClaimed()".to_string(),
+        serde_json::Value::String(format!(
+            "0x{}",
+            alloy::hex::encode(AlreadyClaimed::SELECTOR)
         )),
     )
 }
@@ -96,26 +105,21 @@ pub(crate) async fn service_estimate_gas(
         && data.starts_with(&claimAssetCall::SELECTOR)
         && let Ok(call) = claimAssetCall::abi_decode(&data)
     {
-        // Same combined-GER computation and publication flag as the C6
-        // pre-admission gate in `eth_sendRawTransaction`
-        // (`is_ger_injected`, i.e. the SyntheticProjector has published
-        // the GER event — NOT merely `has_seen_ger`, which the
-        // L1InfoTreeIndexer pre-populates before the L2 inject exists).
         let combined = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
-        if !service
-            .store
-            .is_ger_injected(&combined)
-            .await
-            .map_err(|e| store_error(answer_id.clone(), e))?
-        {
+        let (claimed, ger_applied) =
+            crate::applied_state::claim_and_ger_applied(&service, call.globalIndex, &combined)
+                .await
+                .map_err(|error| store_error(answer_id.clone(), error))?;
+        if claimed {
+            ::metrics::counter!("rpc_estimate_gas_already_claimed_total").increment(1);
+            return Err(JsonRpcResponse::error(answer_id, already_claimed_error()));
+        }
+        if !ger_applied {
             ::metrics::counter!("rpc_estimate_gas_ger_not_ready_total").increment(1);
             tracing::info!(
                 global_index = %call.globalIndex,
-                mainnet_exit_root = %alloy::hex::encode(call.mainnetExitRoot.0),
-                rollup_exit_root = %alloy::hex::encode(call.rollupExitRoot.0),
                 combined_ger = %alloy::hex::encode(combined),
-                "eth_estimateGas(claimAsset): GER not yet published — reverting \
-                 GlobalExitRootInvalid() so the ClaimTxManager retries later"
+                "eth_estimateGas(claimAsset): GER is not applied; returning GlobalExitRootInvalid()"
             );
             return Err(JsonRpcResponse::error(
                 answer_id,
@@ -146,6 +150,13 @@ mod tests {
         assert_eq!(GlobalExitRootInvalid::SELECTOR, [0x00, 0x2f, 0x6f, 0xad]);
     }
 
+    #[test]
+    fn already_claimed_selector_is_646cf558() {
+        let hash = Keccak256::digest(b"AlreadyClaimed()");
+        assert_eq!(&hash[..4], &[0x64, 0x6c, 0xf5, 0x58]);
+        assert_eq!(AlreadyClaimed::SELECTOR, [0x64, 0x6c, 0xf5, 0x58]);
+    }
+
     fn claim_calldata(mainnet: [u8; 32], rollup: [u8; 32]) -> String {
         let calldata = claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
@@ -174,11 +185,34 @@ mod tests {
         }
     }
 
-    /// Missing GER → deterministic `execution reverted:
-    /// GlobalExitRootInvalid()` with the 0x002f6fad selector in `data`, so
-    /// the official ClaimTxManager's pre-nonce `eth_estimateGas` probe fails
-    /// exactly as it would against the real EVM bridge and no transaction is
-    /// created (fail-fast/retry-later — no polling anywhere).
+    /// Applied claim wins over GER readiness and returns the exact AggKit shim shape.
+    #[tokio::test]
+    async fn estimate_gas_already_claimed_reverts_with_aggkit_shape() {
+        let service = create_test_service();
+        service
+            .store
+            .mark_claim_note_processed(
+                "already-applied".to_string(),
+                U256::from(7u64).to_be_bytes::<32>(),
+                1,
+            )
+            .await
+            .unwrap();
+        let request = estimate_request(&claim_calldata([0xAA; 32], [0xBB; 32]));
+
+        let response = service_estimate_gas(service, request)
+            .await
+            .expect_err("applied claim must revert during estimate");
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["error"]["code"], 3);
+        assert_eq!(
+            json["error"]["message"],
+            "execution reverted: AlreadyClaimed()"
+        );
+        assert_eq!(json["error"]["data"], "0x646cf558");
+    }
+
+    /// Missing GER returns GlobalExitRootInvalid() with the pinned selector.
     #[tokio::test]
     async fn estimate_gas_claim_missing_ger_reverts_with_selector() {
         let service = create_test_service();

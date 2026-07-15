@@ -30,7 +30,7 @@ fn calldata_selector(input: &alloy::primitives::Bytes) -> String {
     )
 }
 
-fn decode_write_call(
+pub(crate) fn decode_write_call(
     params_encoded: &alloy::primitives::Bytes,
 ) -> anyhow::Result<crate::writer_worker::DecodedWriteCall> {
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
@@ -83,6 +83,13 @@ fn unwrap_txn_envelope(txn_envelope: TxEnvelope) -> anyhow::Result<TransactionDa
         }
     };
     Ok(data)
+}
+
+pub(crate) fn decode_envelope_write_call(
+    txn_envelope: &TxEnvelope,
+) -> anyhow::Result<crate::writer_worker::DecodedWriteCall> {
+    let transaction = unwrap_txn_envelope(txn_envelope.clone())?;
+    decode_write_call(&transaction.input)
 }
 
 async fn handle_ger_result(
@@ -484,16 +491,6 @@ pub(crate) async fn worker_handle_claim_asset(
         return Ok(());
     }
 
-    // C6 — pre-publish GER publication gate. In writer mode the SAME gate already
-    // ran on the request path before `try_enqueue` (PR #127 review point 3); this
-    // second run is cheap defense-in-depth. On rejection RELEASE the lock (cheap
-    // retryable surface — the claim didn't publish) and return the retryable error.
-    // See `ensure_claim_ger_published` for the full rationale.
-    if let Err(err) = ensure_claim_ger_published(&service.store, &params).await {
-        guard.release_explicitly().await;
-        return Err(err);
-    }
-
     let result = publish_and_record_claim(
         service,
         params.clone(),
@@ -515,50 +512,6 @@ pub(crate) async fn worker_handle_claim_asset(
     // the guard to forget so its Drop is a no-op.
     guard.commit();
 
-    Ok(())
-}
-
-/// C6 — the pre-admission GER publication gate (Cantina #21 / PR #127 review).
-///
-/// The CLAIM note's leaf proof is internally consistent (built from L1
-/// calldata), but on-chain the bridge MASM verifies it against the GER
-/// currently stored in the bridge account. Mirroring the real EVM bridge
-/// (`AgglayerBridge._verifyLeaf` reads `globalExitRootMap[combinedGER]` once
-/// and reverts `GlobalExitRootInvalid()` when zero — it never waits), a claim
-/// whose GER the proxy has not yet PUBLISHED is rejected fail-fast with a
-/// retryable error: no nonce is consumed, no globalIndex lock is taken, no
-/// receipt or queued job is created, and the SAME signed transaction can be
-/// re-submitted after GER publication.
-///
-/// This gate MUST run before durable admission, nonce CAS, or enqueue.
-/// `dispatch_after_reservation` does so on the request thread for both sync and
-/// writer modes. `worker_handle_claim_asset` repeats it after fenced acquisition
-/// as defense in depth against GER state changing while a queued job waits.
-///
-/// `is_ger_injected` rather than `has_seen_ger`: the L1InfoTreeIndexer
-/// pre-populates ger_entries rows for L1 pairs it has indexed but that
-/// haven't yet been injected/published on L2. C6 requires the GER event to be
-/// published on L2, not merely indexed; the `is_injected` flag captures that
-/// intent (it also holds while the #30 visibility barrier keeps the projector
-/// from publishing the consumption event). The final race/security gate stays
-/// on-chain: the CLAIM's FPI runs the MASM `assert_valid_ger` against the
-/// authoritative bridge-account storage and fails closed with
-/// `ERR_GER_NOT_FOUND` — C6 is scheduling/visibility policy, MASM is the hard
-/// safety boundary.
-pub(crate) async fn ensure_claim_ger_published(
-    store: &std::sync::Arc<dyn crate::store::Store>,
-    params: &claimAssetCall,
-) -> anyhow::Result<()> {
-    let combined = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
-    if !store.is_ger_injected(&combined).await? {
-        ::metrics::counter!("rpc_claim_ger_not_seen_total").increment(1);
-        anyhow::bail!(
-            "claim references a GER that aggkit has not observed yet \
-             (mainnet={}, rollup={}); retry after the GER is injected. C6.",
-            ::hex::encode(params.mainnetExitRoot.0),
-            ::hex::encode(params.rollupExitRoot.0)
-        );
-    }
     Ok(())
 }
 
@@ -657,10 +610,37 @@ async fn durably_admit_and_advance_nonce(
     Ok(())
 }
 
-/// Run every deterministic / side-effect-free rejection before binding the
-/// `(signer, nonce)` reservation to a hash. A malformed claim can therefore be
-/// corrected and re-signed at the same nonce. Stateful checks are repeated by
-/// the dispatcher after reservation only to close a landed-claim race.
+/// State-only compatibility gate for `claimAsset`. One bridge snapshot answers
+/// both questions in EVM order: already-claimed wins; otherwise a missing GER
+/// fails before nonce consumption. Returns true only for an applied claim.
+async fn claim_state_gate(service: &ServiceState, params: &claimAssetCall) -> anyhow::Result<bool> {
+    let combined = crate::ger::combined_ger(&params.mainnetExitRoot.0, &params.rollupExitRoot.0);
+    let (claimed, ger_applied) =
+        crate::applied_state::claim_and_ger_applied(service, params.globalIndex, &combined).await?;
+    if claimed {
+        return Ok(true);
+    }
+    if !params.amount.is_zero()
+        && crate::address_mapper::resolve_address(
+            &*service.store,
+            params.destinationAddress,
+            &service.accounts.0,
+        )
+        .await
+        .is_ok()
+        && !ger_applied
+    {
+        ::metrics::counter!("rpc_claim_ger_not_seen_total").increment(1);
+        anyhow::bail!(
+            "claim references a GER that aggkit has not observed yet or that is not applied on the Miden bridge \
+             (mainnet={}, rollup={}); retry after the GER is injected. C6.",
+            ::hex::encode(params.mainnetExitRoot.0),
+            ::hex::encode(params.rollupExitRoot.0)
+        );
+    }
+    Ok(false)
+}
+
 async fn validate_before_nonce_reservation(
     service: &ServiceState,
     decoded: &crate::writer_worker::DecodedWriteCall,
@@ -676,25 +656,8 @@ async fn validate_before_nonce_reservation(
         );
     }
 
-    // A landed claim must bypass C6 and be accepted-and-reverted.
-    if service
-        .store
-        .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
-        .await?
-    {
-        return Ok(());
-    }
-    if !params.amount.is_zero()
-        && crate::address_mapper::resolve_address(
-            &*service.store,
-            params.destinationAddress,
-            &service.accounts.0,
-        )
-        .await
-        .is_ok()
-    {
-        ensure_claim_ger_published(&service.store, params).await?;
-    }
+    // One state-only bridge snapshot answers both compatibility questions.
+    let _already_claimed = claim_state_gate(service, params).await?;
     Ok(())
 }
 
@@ -707,13 +670,10 @@ async fn dispatch_after_reservation(
     signer_str: &str,
     tx_nonce: u64,
 ) -> anyhow::Result<TxHash> {
-    // Landed classification is repeated after reservation to close the race
-    // with a claim that lands immediately after pre-validation.
+    // Repeat the single state snapshot after reservation to close the landing
+    // race. The bridge maps are monotonic, so no third pre-publish read is needed.
     if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-        && service
-            .store
-            .has_claim_event_for_global_index(&params.globalIndex.to_be_bytes::<32>())
-            .await?
+        && claim_state_gate(service, params).await?
     {
         accept_and_revert_landed_claim(
             service,
@@ -727,18 +687,29 @@ async fn dispatch_after_reservation(
         .await?;
         return Ok(txn_hash);
     }
-    if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-        && params.destinationNetwork == service.network_id
-        && !params.amount.is_zero()
-        && crate::address_mapper::resolve_address(
-            &*service.store,
-            params.destinationAddress,
-            &service.accounts.0,
-        )
-        .await
-        .is_ok()
+
+    if let crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } = &decoded
+        && crate::applied_state::ger_applied(service, ger_bytes).await?
     {
-        ensure_claim_ger_published(&service.store, params).await?;
+        durably_admit_and_advance_nonce(
+            service,
+            txn_hash,
+            &txn_envelope,
+            signer,
+            signer_str,
+            tx_nonce,
+        )
+        .await?;
+        handle_ger_result(
+            Ok(false),
+            txn_hash,
+            txn_envelope,
+            signer,
+            service,
+            *ger_bytes,
+        )
+        .await?;
+        return Ok(txn_hash);
     }
 
     if service.enable_writer_worker {
@@ -1671,6 +1642,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn already_registered_ger_returns_success_without_second_event() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let ger = [0xacu8; 32];
+        store
+            .commit_ger_event_atomic(1, [0u8; 32], "0xoriginal-ger", &ger, None, None, 0)
+            .await
+            .unwrap();
+        let filter = crate::log_synthesis::LogFilter {
+            from_block: Some("0x0".to_string()),
+            to_block: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+        let events_before = store
+            .get_logs(&filter, 0xffff)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|log| {
+                log.topics.first().map(String::as_str)
+                    == Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .count();
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from(ger),
+        }
+        .abi_encode();
+        let (raw, signer) = encode_legacy_tx(calldata);
+        let tx_hash = service_send_raw_txn(service.clone(), raw)
+            .await
+            .expect("already-registered GER must be accepted");
+        let receipt = crate::service_get_txn_receipt::service_get_txn_receipt(
+            service,
+            format!("{tx_hash:#x}"),
+        )
+        .await
+        .unwrap()
+        .expect("duplicate GER receipt must be terminal");
+        assert!(matches!(
+            receipt.inner.as_receipt().unwrap().status,
+            alloy::consensus::Eip658Value::Eip658(true)
+        ));
+        assert!(receipt.inner.as_receipt().unwrap().logs.is_empty());
+        assert_eq!(store.nonce_get(&format!("{signer:#x}")).await.unwrap(), 1);
+        let events_after = store
+            .get_logs(&filter, 0xffff)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|log| {
+                log.topics.first().map(String::as_str)
+                    == Some(crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC)
+            })
+            .count();
+        assert_eq!(events_after, events_before, "duplicate GER emits no event");
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_claim_asset_zero_amount_skipped() {
         let service = create_test_service();
         let store = service.store.clone();
@@ -1899,10 +1930,8 @@ mod tests {
         );
     }
 
-    /// Writer-mode C6 precedence mirror: claims the worker would swallow
-    /// WITHOUT reaching C6 (zero-amount genesis claims) must NOT be gated on
-    /// GER publication at admission — the gate only covers claims that would
-    /// actually reach `ensure_claim_ger_published` in the worker.
+    /// Zero-amount genesis claims do not require a GER. The combined state gate
+    /// still checks AlreadyClaimed first, then deliberately skips GER validation.
     #[tokio::test]
     async fn c6_writer_mode_zero_amount_claim_not_ger_gated() {
         let mut service = create_test_service();

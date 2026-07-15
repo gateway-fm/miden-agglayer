@@ -4,6 +4,83 @@ use alloy::primitives::TxHash;
 use alloy_rpc_types_eth::{Log, Receipt, ReceiptEnvelope, ReceiptWithBloom, TransactionReceipt};
 use std::str::FromStr;
 
+async fn reconcile_pending_duplicate(service: &ServiceState, txn_hash: TxHash) {
+    let Some(transaction) = service.store.txn_get(txn_hash).await.ok().flatten() else {
+        return;
+    };
+    if transaction.result.is_some() {
+        return;
+    }
+    let tx_key = format!("{txn_hash:#x}");
+    let Some(handoff) = service
+        .store
+        .get_note_handoff_for_tx(&tx_key)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Some(note_id) = handoff.note_id else {
+        return;
+    };
+    let decoded = match crate::service_send_raw_txn::decode_envelope_write_call(
+        &transaction.envelope,
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            tracing::warn!(%txn_hash, error = %error, "cannot decode pending handoff; keeping receipt null");
+            return;
+        }
+    };
+    let outcome = match &decoded {
+        crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } => {
+            crate::applied_state::reconcile_ger_handoff(service, *ger_bytes, note_id).await
+        }
+        crate::writer_worker::DecodedWriteCall::Claim { params } => {
+            crate::applied_state::reconcile_claim_handoff(service, params.globalIndex, note_id)
+                .await
+        }
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(%txn_hash, error = %error, "authoritative duplicate reconciliation is uncertain; keeping receipt null");
+            return;
+        }
+    };
+    let result = match (decoded, outcome) {
+        (
+            _,
+            crate::applied_state::ExactNoteOutcome::NotApplied
+            | crate::applied_state::ExactNoteOutcome::AppliedByExactNote
+            | crate::applied_state::ExactNoteOutcome::Uncertain,
+        ) => return,
+        (
+            crate::writer_worker::DecodedWriteCall::Ger { .. },
+            crate::applied_state::ExactNoteOutcome::AppliedElsewhere,
+        ) => Ok(()),
+        (
+            crate::writer_worker::DecodedWriteCall::Claim { .. },
+            crate::applied_state::ExactNoteOutcome::AppliedElsewhere,
+        ) => Err("execution reverted: AlreadyClaimed()".to_string()),
+    };
+    let block_num = match service.store.get_latest_block_number().await {
+        Ok(block_num) => block_num,
+        Err(error) => {
+            tracing::warn!(%txn_hash, error = %error, "cannot finalize confirmed duplicate; keeping receipt null");
+            return;
+        }
+    };
+    if let Err(error) = service
+        .store
+        .txn_commit_confirmed_duplicate(txn_hash, result, block_num)
+        .await
+    {
+        tracing::warn!(%txn_hash, error = %error, "failed to persist confirmed duplicate receipt; keeping receipt null");
+    }
+}
+
 // polycli polls receipts to get the eth_sendRawTransaction status
 // it logs cumulativeGasUsed and transactionHash
 // return null if the transaction is not yet included onto the blockchain, return status=0 for errors
@@ -12,6 +89,7 @@ pub async fn service_get_txn_receipt(
     txn_hash: String,
 ) -> anyhow::Result<Option<TransactionReceipt<ReceiptEnvelope<Log>>>> {
     let txn_hash = TxHash::from_str(&txn_hash)?;
+    reconcile_pending_duplicate(&service, txn_hash).await;
     let (status, block_num) = match service.store.txn_receipt(txn_hash).await? {
         Some((result, block_num)) => (result.is_ok(), block_num),
         None => {
@@ -201,6 +279,66 @@ mod tests {
         assert!(
             result.is_none(),
             "pre-commit receipt MUST be None — aggkit reads it as 'keep polling'"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_state_with_missing_exact_note_stays_pending() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::{FixedBytes, Signature};
+        use alloy_core::sol_types::SolCall;
+
+        let service = create_test_service();
+        let ger = [0x5au8; 32];
+        service
+            .store
+            .commit_ger_event_atomic(1, [0u8; 32], "0xother-ger", &ger, None, None, 0)
+            .await
+            .unwrap();
+        let calldata = crate::ger::insertGlobalExitRootCall {
+            root: FixedBytes::from(ger),
+        }
+        .abi_encode();
+        let tx_hash = TxHash::from([0x5bu8; 32]);
+        let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy {
+                input: calldata.into(),
+                ..Default::default()
+            },
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        service
+            .store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::from([0x5cu8; 20]),
+                    expires_at: Some(10),
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .store
+            .prepare_note_handoff(
+                &format!("{tx_hash:#x}"),
+                "commitment",
+                "missing-note-id",
+                10,
+            )
+            .await
+            .unwrap();
+
+        let receipt = service_get_txn_receipt(service, format!("{tx_hash:#x}"))
+            .await
+            .unwrap();
+        assert!(
+            receipt.is_none(),
+            "applied state without the exact NoteId is uncertain"
         );
     }
 

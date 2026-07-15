@@ -958,6 +958,24 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn txn_commit_confirmed_duplicate(
+        &self,
+        tx_hash: TxHash,
+        result: Result<(), String>,
+        block_num: u64,
+    ) -> anyhow::Result<()> {
+        let mut txns = self.transactions.lock();
+        let Some(receipt) = txns.get_mut(&tx_hash) else {
+            anyhow::bail!("Store: transaction {tx_hash} not found");
+        };
+        if receipt.result.is_none() {
+            receipt.result = Some(result);
+            receipt.block_num = block_num;
+            receipt.logs.clear();
+        }
+        Ok(())
+    }
+
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,
@@ -2671,6 +2689,65 @@ mod tests {
                 .0
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_duplicate_finalizes_linked_pending_without_event() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+
+        let store = InMemoryStore::new();
+        let tx_hash = TxHash::from([0x79u8; 32]);
+        let tx_key = format!("{tx_hash:#x}");
+        let envelope = alloy::consensus::TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy::default(),
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::ZERO,
+                    expires_at: Some(10),
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .prepare_note_handoff(&tx_key, "commitment", "note-id", 10)
+            .await
+            .unwrap();
+        store
+            .txn_commit(tx_hash, Err("raw Miden error".into()), 10, [0; 32])
+            .await
+            .unwrap();
+        assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+
+        store
+            .txn_commit_confirmed_duplicate(
+                tx_hash,
+                Err("execution reverted: AlreadyClaimed()".into()),
+                11,
+            )
+            .await
+            .unwrap();
+        let (result, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+        assert!(result.is_err());
+        assert_eq!(block, 11);
+        assert!(
+            store
+                .txn_get(tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .logs
+                .is_empty()
+        );
+        assert!(store.get_logs_for_tx(&tx_key).await.unwrap().is_empty());
     }
 
     #[tokio::test]
