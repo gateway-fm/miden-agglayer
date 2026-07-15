@@ -83,6 +83,9 @@ pub struct InMemoryStore {
     hash_chain_value: RwLock<[u8; 32]>,
     injected_gers: RwLock<HashSet<[u8; 32]>>,
 
+    #[cfg(test)]
+    test_fail_next_ger_evidence_write: std::sync::atomic::AtomicBool,
+
     // Transactions
     transactions: Mutex<LruCache<TxHash, TxnReceipt>>,
 
@@ -159,6 +162,25 @@ pub struct InMemoryStore {
     // Store::get_reconcile_cursor.
     reconcile_cursor: RwLock<u64>,
 
+    // L1 InfoTree indexer cursor — last L1 block the indexer processed
+    // (field-backed mirror of the PgStore `l1_indexer_state.last_processed`
+    // column, migration 005). Persisted here (not left on the default no-op
+    // impl) so the strict-H6 finality gate can read the observed L1 head via
+    // `get_l1_indexer_cursor` even on an in-memory deployment.
+    l1_indexer_cursor: RwLock<u64>,
+
+    // Last observed L1 `finalized`/`safe` block (audit H6 BLOCKER 3) — tracked
+    // separately from the head cursor so the strict gate can qualify evidence by
+    // finality tag. Field-backed mirror of the PgStore `l1_indexer_state
+    // .finalized_block` column (migration 013).
+    l1_finalized_block: RwLock<u64>,
+
+    // Progress cursor of the indexer's finalized-pinned scan (audit H6 BLOCKER 1).
+    l1_finalized_scan_cursor: RwLock<u64>,
+
+    // Canonical EvidenceTag that produced the persisted finality state.
+    l1_evidence_policy: RwLock<Option<String>>,
+
     // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
     // first-write-wins evm_tx_hash -> note_commitment, with the reverse index
     // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
@@ -188,6 +210,8 @@ impl InMemoryStore {
             latest_ger: RwLock::new(None),
             hash_chain_value: RwLock::new([0u8; 32]),
             injected_gers: RwLock::new(HashSet::new()),
+            #[cfg(test)]
+            test_fail_next_ger_evidence_write: std::sync::atomic::AtomicBool::new(false),
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
             nonces: RwLock::new(HashMap::new()),
             nonce_reservations: RwLock::new(HashMap::new()),
@@ -209,6 +233,10 @@ impl InMemoryStore {
             monitor_expected_mints: RwLock::new(HashMap::new()),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
+            l1_indexer_cursor: RwLock::new(0),
+            l1_finalized_block: RwLock::new(0),
+            l1_finalized_scan_cursor: RwLock::new(0),
+            l1_evidence_policy: RwLock::new(None),
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
         }
@@ -256,6 +284,12 @@ impl InMemoryStore {
     #[cfg(test)]
     pub fn test_land_gi_after_next_has_claim_miss(&self, global_index: [u8; 32]) {
         *self.test_land_after_next_has_claim_miss.write() = Some(global_index);
+    }
+
+    #[cfg(test)]
+    pub fn test_fail_next_ger_evidence_write(&self) {
+        self.test_fail_next_ger_evidence_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test hook (#55 BLOCKER B): arm the store so the NEXT `nonce_advance_cas`
@@ -368,6 +402,61 @@ impl Store for InMemoryStore {
 
     async fn set_reconcile_cursor(&self, block: u64) -> anyhow::Result<()> {
         *self.reconcile_cursor.write() = block;
+        Ok(())
+    }
+
+    // ── L1 InfoTree indexer cursor ───────────────────────────────
+
+    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+        Ok(*self.l1_indexer_cursor.read())
+    }
+
+    async fn set_l1_indexer_cursor(&self, block: u64) -> anyhow::Result<()> {
+        *self.l1_indexer_cursor.write() = block;
+        Ok(())
+    }
+
+    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
+        Ok(*self.l1_finalized_block.read())
+    }
+
+    async fn set_l1_finalized_block(&self, block: u64) -> anyhow::Result<()> {
+        *self.l1_finalized_block.write() = block;
+        Ok(())
+    }
+
+    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
+        Ok(*self.l1_finalized_scan_cursor.read())
+    }
+
+    async fn set_l1_finalized_scan_cursor(&self, block: u64) -> anyhow::Result<()> {
+        *self.l1_finalized_scan_cursor.write() = block;
+        Ok(())
+    }
+
+    async fn bind_l1_evidence_policy(&self, policy: &str) -> anyhow::Result<()> {
+        let mut bound = self.l1_evidence_policy.write();
+        match bound.as_deref() {
+            Some(existing) if existing == policy => return Ok(()),
+            Some(existing) => anyhow::bail!(
+                "L1 evidence policy mismatch: store is bound to `{existing}`, configured `{policy}`; stop the service and reset/rebuild finality markers before changing policy"
+            ),
+            None => {}
+        }
+
+        let has_untagged_state = *self.l1_finalized_block.read() != 0
+            || *self.l1_finalized_scan_cursor.read() != 0
+            || self
+                .seen_gers
+                .read()
+                .values()
+                .any(|entry| entry.finalized_verified);
+        if has_untagged_state {
+            anyhow::bail!(
+                "L1 finality state exists without an evidence policy; reset/rebuild finality markers before serving"
+            );
+        }
+        *bound = Some(policy.to_owned());
         Ok(())
     }
 
@@ -753,19 +842,43 @@ impl Store for InMemoryStore {
         l1_block_number: u64,
         l1_timestamp: u64,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .test_fail_next_ger_evidence_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected fault: durable evidence write failed");
+        }
         let mut seen = self.seen_gers.write();
         let entry = seen.entry(*ger).or_insert(GerEntry {
             mainnet_exit_root: None,
             rollup_exit_root: None,
             block_number: 0,
             timestamp: 0,
+            finalized_verified: false,
         });
+        // NOTE: `finalized_verified` is deliberately NOT touched here — the
+        // latest scan (this method) must never reset a flag the finalized scan
+        // set (monotone). New rows default to `false` via `or_insert` above.
         entry.mainnet_exit_root = Some(mainnet_exit_root);
         entry.rollup_exit_root = Some(rollup_exit_root);
         // Mirror the PgStore semantics: indexer is authoritative for L1
         // origin metadata, so overwrite unconditionally on every call.
         entry.block_number = l1_block_number;
         entry.timestamp = l1_timestamp;
+        Ok(())
+    }
+
+    async fn mark_ger_finalized(&self, ger: &[u8; 32]) -> anyhow::Result<()> {
+        let mut seen = self.seen_gers.write();
+        let entry = seen.entry(*ger).or_insert(GerEntry {
+            mainnet_exit_root: None,
+            rollup_exit_root: None,
+            block_number: 0,
+            timestamp: 0,
+            finalized_verified: false,
+        });
+        entry.finalized_verified = true;
         Ok(())
     }
 
@@ -807,6 +920,7 @@ impl Store for InMemoryStore {
                         rollup_exit_root,
                         block_number,
                         timestamp,
+                        finalized_verified: false,
                     },
                 );
                 *self.latest_ger.write() = Some(*global_exit_root);
@@ -944,25 +1058,44 @@ impl Store for InMemoryStore {
             let Some(receipt) = txns.get_mut(&tx_hash) else {
                 anyhow::bail!("Store: transaction {tx_hash} not found");
             };
-            receipt.result = Some(result);
-            receipt.block_num = block_num;
-
-            match &receipt.result {
-                Some(Ok(_)) => {
+            // A real Miden landing must always beat a failure observation, and a
+            // landed success must never be clobbered. Pending failures are
+            // terminal; a later real landing may still heal one to success.
+            enum St {
+                Pending,
+                Failed,
+                Success,
+            }
+            let st = match &receipt.result {
+                None => St::Pending,
+                Some(Ok(_)) => St::Success,
+                Some(Err(_)) => St::Failed,
+            };
+            let apply = match (&st, result.is_ok()) {
+                (St::Success, _) => false,
+                (_, true) => true,
+                (St::Pending, false) => true,
+                (St::Failed, false) => false,
+            };
+            if !apply {
+                tracing::debug!(
+                    "Store: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
+                );
+                None
+            } else {
+                let is_ok = result.is_ok();
+                receipt.result = Some(result);
+                receipt.block_num = block_num;
+                if is_ok {
                     tracing::info!(
                         "Store: committed txn {tx_hash}; miden txn: {:?}",
                         receipt.id
                     );
                     Some(receipt.logs.clone())
-                }
-                Some(Err(err)) => {
-                    tracing::error!(
-                        "Store: failed txn {tx_hash}; miden txn: {:?}; reason: {err}",
-                        receipt.id
-                    );
+                } else {
+                    tracing::error!("Store: failed txn {tx_hash}; miden txn: {:?}", receipt.id);
                     None
                 }
-                None => None,
             }
         }; // Mutex dropped before any .await
 
@@ -1961,6 +2094,36 @@ mod tests {
     use crate::log_synthesis::{CLAIM_EVENT_TOPIC, TopicFilter};
 
     #[tokio::test]
+    async fn l1_evidence_policy_binding_is_immutable() {
+        let store = InMemoryStore::new();
+        store.bind_l1_evidence_policy("finalized").await.unwrap();
+        store.bind_l1_evidence_policy("finalized").await.unwrap();
+
+        let err = store
+            .bind_l1_evidence_policy("safe")
+            .await
+            .expect_err("a database policy change must fail closed");
+        assert!(format!("{err:#}").contains("bound to `finalized`"));
+    }
+
+    #[tokio::test]
+    async fn untagged_finality_markers_are_rejected() {
+        let store = InMemoryStore::new();
+        let ger = [0xA7; 32];
+        store
+            .set_ger_exit_roots(&ger, [1; 32], [2; 32], 10, 20)
+            .await
+            .unwrap();
+        store.mark_ger_finalized(&ger).await.unwrap();
+
+        let err = store
+            .bind_l1_evidence_policy("finalized")
+            .await
+            .expect_err("untagged verification evidence is ambiguous");
+        assert!(format!("{err:#}").contains("without an evidence policy"));
+    }
+
+    #[tokio::test]
     async fn set_ger_exit_roots_persists_l1_block_and_timestamp() {
         // Before this change, both columns were hardcoded to 0 in PgStore and
         // ignored in InMemoryStore. The indexer is the authoritative writer
@@ -2658,6 +2821,151 @@ mod tests {
         );
         // And it must not have invented a receipt.
         assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+    }
+
+    /// Build a minimal pending `txn_begin` entry for the CAS tests below.
+    async fn seed_pending_txn(store: &InMemoryStore, tx_hash: TxHash) {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let envelope = alloy::consensus::TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy::default(),
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::ZERO,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// BLOCKER 2 (success-always-wins CAS) — a SUCCESS receipt must survive a
+    /// later failure commit. Models the TTL-sweeper race: the worker commits
+    /// SUCCESS (status 0x1) first, then the sweeper's `write_failure_receipt`
+    /// fires `txn_commit(Err)` for the same hash. Pre-fix the Err overwrote the
+    /// success (status 0x1 → 0x0) and aggkit resubmitted a Miden op that had
+    /// already landed. The success must be preserved verbatim.
+    ///
+    /// Mutation check: dropping the `(Some(Ok(_)), _) => Cas::NoOp` arm in
+    /// `txn_commit` makes this assertion fail (the failure clobbers success).
+    #[tokio::test]
+    async fn test_txn_commit_terminal_success_not_clobbered_by_failure() {
+        let store = InMemoryStore::new();
+        let tx_hash = TxHash::from([0x51u8; 32]);
+        seed_pending_txn(&store, tx_hash).await;
+
+        // Worker commits SUCCESS at block 7.
+        store
+            .txn_commit(tx_hash, Ok(()), 7, [0xAAu8; 32])
+            .await
+            .unwrap();
+
+        // TTL sweeper races in with a failure commit for the same hash.
+        store
+            .txn_commit(
+                tx_hash,
+                Err("TTL expired (>300s in non-terminal state)".to_string()),
+                9,
+                [0xBBu8; 32],
+            )
+            .await
+            .expect("late failure commit must be an accepted no-op, not an error");
+
+        // The landed success is preserved: status stays 0x1, block unchanged.
+        let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+        assert!(
+            res.is_ok(),
+            "first terminal (success) must win; got failure: {res:?}"
+        );
+        assert_eq!(block_num, 7, "success block must be preserved");
+    }
+
+    /// BLOCKER 2 (success-always-wins CAS) — a REAL Miden landing supersedes a
+    /// prior (TTL/timeout) FAILURE, and the ClaimEvent the failure suppressed is
+    /// re-materialised. Models the reverse race: the TTL sweeper commits a
+    /// terminal FAILURE for a job whose worker is still running; Miden then
+    /// LANDS; the projector's later `txn_commit(Ok)` must win so the durable
+    /// receipt ends SUCCESS (status 0x1) WITH its ClaimEvent — never a stuck
+    /// TTL-failure for a claim that actually landed.
+    ///
+    /// Mutation check: revert the override (make `(Some(Err(_)), true)` a
+    /// `Cas::NoOp` / first-terminal-wins) → the receipt stays failed and the
+    /// ClaimEvent is missing, failing both assertions.
+    #[tokio::test]
+    async fn test_txn_commit_success_supersedes_prior_failure_with_claimevent() {
+        use alloy::primitives::{B256, Bytes, LogData};
+        let store = InMemoryStore::new();
+        let tx_hash = TxHash::from([0x52u8; 32]);
+
+        // Pending row carrying a ClaimEvent-shaped attached log.
+        let claim_topic = B256::from([0xC1u8; 32]);
+        let envelope =
+            alloy::consensus::TxEnvelope::Legacy(alloy::consensus::Signed::new_unchecked(
+                alloy::consensus::TxLegacy::default(),
+                alloy::primitives::Signature::test_signature(),
+                tx_hash,
+            ));
+        store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::ZERO,
+                    expires_at: None,
+                    logs: vec![LogData::new_unchecked(
+                        vec![claim_topic],
+                        Bytes::from(vec![0xAB]),
+                    )],
+                },
+            )
+            .await
+            .unwrap();
+
+        // TTL sweeper fails the still-running job first.
+        store
+            .txn_commit(tx_hash, Err("TTL expired".to_string()), 3, [0u8; 32])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_logs_for_tx(&format!("{tx_hash:#x}"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failure must NOT materialise the ClaimEvent"
+        );
+
+        // Miden actually landed → the projector commits success for the SAME hash.
+        store
+            .txn_commit(tx_hash, Ok(()), 5, [0u8; 32])
+            .await
+            .expect("a real landing must supersede the provisional failure");
+
+        let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+        assert!(
+            res.is_ok(),
+            "success must supersede the TTL failure; got {res:?}"
+        );
+        assert_eq!(block_num, 5, "success block must win");
+        let logs = store
+            .get_logs_for_tx(&format!("{tx_hash:#x}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "the ClaimEvent the failure suppressed must be materialised on the success override"
+        );
+        assert_eq!(logs[0].topics[0], format!("{claim_topic:#x}"));
     }
 
     #[tokio::test]

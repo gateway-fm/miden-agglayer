@@ -43,8 +43,8 @@ its shape for new environments.
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
-| `--l1-rpc-url` | `L1_RPC_URL` | unset | L1 RPC for resolving exit roots. Without it, GERs injected via legacy `insertGlobalExitRoot` store `(NULL, NULL)` roots (see [`../ger-decomposition.md`](../ger-decomposition.md)). |
-| `--ger-l1-address` | `GER_L1_ADDRESS` | unset | L1 GER contract address the indexer scrapes for `UpdateL1InfoTree`. |
+| `--l1-rpc-url` | `L1_RPC_URL` | unset | L1 RPC for resolving exit roots. Required at startup when strict H6 (`REJECT_UNVERIFIED_GER_INJECTION` / `REQUIRE_HARDENING`) is on. |
+| `--ger-l1-address` | `GER_L1_ADDRESS` | unset | L1 GER contract address the indexer scrapes for `UpdateL1InfoTree`. Required at startup when strict H6 is on. |
 | `--l1-indexer-from-block` | `L1_INDEXER_FROM_BLOCK` | unset | Operator override: force a forward walk from this L1 block on next boot (STATE-C orphan backfill — Part 3, failure mode F). Remove once the cursor has walked past it. |
 
 ### Miden proving
@@ -61,13 +61,21 @@ its shape for new environments.
 | Flag | Env | Default | Notes |
 |---|---|---|---|
 | `--admin-api-key` | `ADMIN_API_KEY` | unset | Gates `admin_*` JSON-RPC (Bearer token, constant-time compare). Unset ⇒ `admin_*` rejected entirely. |
-| `--allowed-signers` | `ALLOWED_SIGNERS` | unset | Comma-separated signer allow-list for `eth_sendRawTransaction`. Unset = open mode — only safe behind a private network boundary. |
+| `--allowed-signers` | `ALLOWED_SIGNERS` | unset | Comma-separated signer allow-list for `eth_sendRawTransaction`. Unset is fail-closed; open mode requires the explicit dev-only `--insecure-allow-any-signer`. |
 | `--cors-allowed-origins` | `CORS_ALLOWED_ORIGINS` | unset | Omit to disable CORS (safe production default). `*` is DEV ONLY. |
 | `--rate-limit-per-second` / `--rate-limit-burst` | `RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST` | `500` / `500` | Per-IP rate limit. |
 | `--reject-zero-padding-addresses` | `REJECT_ZERO_PADDING_ADDRESSES` | `false` | Refuse the address-mapper zero-padding fallback (production posture). |
 | `--disable-hardhat-alias` | `DISABLE_HARDHAT_ALIAS` | `false` | Refuse the well-known Hardhat address remap (Cantina MA#8). **MUST be set in production.** |
-| `--require-hardening` | `REQUIRE_HARDENING` | `false` | Startup invariant: refuse to boot unless `ADMIN_API_KEY`, `ALLOWED_SIGNERS`, `MIDEN_PROVER_URL`, `DISABLE_HARDHAT_ALIAS` are set and CORS is not `*`. Set it on any internet-adjacent deployment. |
+| `--reject-unverified-ger-injection` | `REJECT_UNVERIFIED_GER_INJECTION` | `false` | Audit H6: refuse GER injection unless the independent L1 indexer observed its decomposition under the configured evidence policy. Production must enable this (or `REQUIRE_HARDENING`). Strict startup requires valid `L1_RPC_URL` and `GER_L1_ADDRESS`; a fresh database also requires `L1_INDEXER_FROM_BLOCK` at or before rollup deployment. Rejections are side-effect-free and retryable. |
+| `--l1-evidence-tag` | `L1_EVIDENCE_TAG` | `confirmations:64` | Canonical evidence policy: `confirmations:<N>`, `safe`, or `finalized`. The database is bound to this exact value; hardened mode requires `finalized`. |
+| `--require-hardening` | `REQUIRE_HARDENING` | `false` | Startup invariant: refuse to boot unless `ADMIN_API_KEY`, `ALLOWED_SIGNERS`, `MIDEN_PROVER_URL`, `DISABLE_HARDHAT_ALIAS` are set and CORS is not `*`. Also enables strict H6 and requires its L1 evidence source. Set it on any internet-adjacent deployment. |
 | `--miden-debug` | `MIDEN_DEBUG` | `false` | Verbose Miden VM traces. Disable in production. |
+
+Evidence policy is immutable for a running database. To change it, stop the
+service and clear policy-derived state in one PostgreSQL transaction:
+`BEGIN; UPDATE ger_entries SET finalized_verified = FALSE; UPDATE l1_indexer_state SET finalized_block = 0, finalized_scan_cursor = 0, evidence_tag = NULL; COMMIT;`.
+Restart with the new `L1_EVIDENCE_TAG`; the finality scan rebuilds from block
+0. Never edit only `evidence_tag`, because that would relabel old evidence.
 
 ### Writer worker (RD-940)
 
