@@ -162,23 +162,11 @@ pub struct InMemoryStore {
     // Store::get_reconcile_cursor.
     reconcile_cursor: RwLock<u64>,
 
-    // L1 InfoTree indexer cursor — last L1 block the indexer processed
-    // (field-backed mirror of the PgStore `l1_indexer_state.last_processed`
-    // column, migration 005). Persisted here (not left on the default no-op
-    // impl) so the strict-H6 finality gate can read the observed L1 head via
-    // `get_l1_indexer_cursor` even on an in-memory deployment.
-    l1_indexer_cursor: RwLock<u64>,
+    // Cursor of the one configured L1 evidence scan. PostgreSQL stores this in
+    // the legacy `finalized_scan_cursor` column for upgrade-safe provenance.
+    l1_evidence_cursor: RwLock<u64>,
 
-    // Last observed L1 `finalized`/`safe` block (audit H6 BLOCKER 3) — tracked
-    // separately from the head cursor so the strict gate can qualify evidence by
-    // finality tag. Field-backed mirror of the PgStore `l1_indexer_state
-    // .finalized_block` column (migration 013).
-    l1_finalized_block: RwLock<u64>,
-
-    // Progress cursor of the indexer's finalized-pinned scan (audit H6 BLOCKER 1).
-    l1_finalized_scan_cursor: RwLock<u64>,
-
-    // Canonical EvidenceTag that produced the persisted finality state.
+    // Canonical EvidenceTag that produced the persisted selected-scan state.
     l1_evidence_policy: RwLock<Option<String>>,
 
     // Receipts map (synthetic-indexer redesign, Phase 2b substrate) —
@@ -233,9 +221,7 @@ impl InMemoryStore {
             monitor_expected_mints: RwLock::new(HashMap::new()),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
-            l1_indexer_cursor: RwLock::new(0),
-            l1_finalized_block: RwLock::new(0),
-            l1_finalized_scan_cursor: RwLock::new(0),
+            l1_evidence_cursor: RwLock::new(0),
             l1_evidence_policy: RwLock::new(None),
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
@@ -405,32 +391,14 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    // ── L1 InfoTree indexer cursor ───────────────────────────────
+    // ── Selected L1 evidence scan ────────────────────────────────
 
-    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
-        Ok(*self.l1_indexer_cursor.read())
+    async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
+        Ok(*self.l1_evidence_cursor.read())
     }
 
-    async fn set_l1_indexer_cursor(&self, block: u64) -> anyhow::Result<()> {
-        *self.l1_indexer_cursor.write() = block;
-        Ok(())
-    }
-
-    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
-        Ok(*self.l1_finalized_block.read())
-    }
-
-    async fn set_l1_finalized_block(&self, block: u64) -> anyhow::Result<()> {
-        *self.l1_finalized_block.write() = block;
-        Ok(())
-    }
-
-    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
-        Ok(*self.l1_finalized_scan_cursor.read())
-    }
-
-    async fn set_l1_finalized_scan_cursor(&self, block: u64) -> anyhow::Result<()> {
-        *self.l1_finalized_scan_cursor.write() = block;
+    async fn set_l1_evidence_cursor(&self, block: u64) -> anyhow::Result<()> {
+        *self.l1_evidence_cursor.write() = block;
         Ok(())
     }
 
@@ -439,21 +407,20 @@ impl Store for InMemoryStore {
         match bound.as_deref() {
             Some(existing) if existing == policy => return Ok(()),
             Some(existing) => anyhow::bail!(
-                "L1 evidence policy mismatch: store is bound to `{existing}`, configured `{policy}`; stop the service and reset/rebuild finality markers before changing policy"
+                "L1 evidence policy mismatch: store is bound to `{existing}`, configured `{policy}`; stop the service and reset/rebuild L1 evidence before changing policy"
             ),
             None => {}
         }
 
-        let has_untagged_state = *self.l1_finalized_block.read() != 0
-            || *self.l1_finalized_scan_cursor.read() != 0
+        let has_untagged_state = *self.l1_evidence_cursor.read() != 0
             || self
                 .seen_gers
                 .read()
                 .values()
-                .any(|entry| entry.finalized_verified);
+                .any(|entry| entry.evidence_verified);
         if has_untagged_state {
             anyhow::bail!(
-                "L1 finality state exists without an evidence policy; reset/rebuild finality markers before serving"
+                "L1 evidence state exists without an evidence policy; reset/rebuild L1 evidence before serving"
             );
         }
         *bound = Some(policy.to_owned());
@@ -855,30 +822,17 @@ impl Store for InMemoryStore {
             rollup_exit_root: None,
             block_number: 0,
             timestamp: 0,
-            finalized_verified: false,
+            evidence_verified: false,
         });
-        // NOTE: `finalized_verified` is deliberately NOT touched here — the
-        // latest scan (this method) must never reset a flag the finalized scan
-        // set (monotone). New rows default to `false` via `or_insert` above.
         entry.mainnet_exit_root = Some(mainnet_exit_root);
         entry.rollup_exit_root = Some(rollup_exit_root);
         // Mirror the PgStore semantics: indexer is authoritative for L1
         // origin metadata, so overwrite unconditionally on every call.
         entry.block_number = l1_block_number;
         entry.timestamp = l1_timestamp;
-        Ok(())
-    }
-
-    async fn mark_ger_finalized(&self, ger: &[u8; 32]) -> anyhow::Result<()> {
-        let mut seen = self.seen_gers.write();
-        let entry = seen.entry(*ger).or_insert(GerEntry {
-            mainnet_exit_root: None,
-            rollup_exit_root: None,
-            block_number: 0,
-            timestamp: 0,
-            finalized_verified: false,
-        });
-        entry.finalized_verified = true;
+        // Legacy physical name: this now means "written by the configured
+        // latest/safe/finalized scan".
+        entry.evidence_verified = true;
         Ok(())
     }
 
@@ -920,7 +874,7 @@ impl Store for InMemoryStore {
                         rollup_exit_root,
                         block_number,
                         timestamp,
-                        finalized_verified: false,
+                        evidence_verified: false,
                     },
                 );
                 *self.latest_ger.write() = Some(*global_exit_root);
@@ -2107,14 +2061,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untagged_finality_markers_are_rejected() {
+    async fn untagged_evidence_state_is_rejected() {
         let store = InMemoryStore::new();
         let ger = [0xA7; 32];
         store
             .set_ger_exit_roots(&ger, [1; 32], [2; 32], 10, 20)
             .await
             .unwrap();
-        store.mark_ger_finalized(&ger).await.unwrap();
 
         let err = store
             .bind_l1_evidence_policy("finalized")
@@ -2144,6 +2097,7 @@ mod tests {
         assert_eq!(entry.rollup_exit_root, Some(rollup));
         assert_eq!(entry.block_number, 10_900_000);
         assert_eq!(entry.timestamp, 1_779_300_000);
+        assert!(entry.evidence_verified);
 
         // Second write at a later L1 block (same GER hash): indexer is
         // authoritative, so the new L1 origin metadata overwrites the old.

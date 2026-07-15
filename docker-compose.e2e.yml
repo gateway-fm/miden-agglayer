@@ -266,7 +266,7 @@ services:
       L1_RPC_URL: "http://anvil:8545"
       GER_L1_ADDRESS: "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
       L1_INDEXER_FROM_BLOCK: "1"
-      L1_EVIDENCE_TAG: "${L1_EVIDENCE_TAG:-confirmations:1}"
+      L1_EVIDENCE_TAG: "${L1_EVIDENCE_TAG:-latest}"
       REJECT_UNVERIFIED_GER_INJECTION: "${REJECT_UNVERIFIED_GER_INJECTION:-true}"
     volumes:
       # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
@@ -291,17 +291,11 @@ services:
       # deterministic 0x133e6a88… orphan). Anvil's history is ~100s of blocks
       # so a from-genesis scan is trivial (max_range chunks it).
       - "--l1-indexer-from-block=1"
-      # Audit H6 — the SINGLE evidence-finality setting the STRICT gate uses
-      # (there is exactly one knob; the old --l1-indexer-confirmations flag is
-      # gone). Values: `confirmations:<N>` (depth below head), `finalized`, or
-      # `safe`; normal decomposition always uses `latest` and is never delayed.
-      # Production hardened uses `finalized`. The e2e L1 is a single-node anvil
-      # with instant finality and no reorgs, so use the safe MINIMUM depth
-      # `confirmations:1` (strict mode refuses `confirmations:0`). Phase A of
-      # e2e-ger-l1-verification.sh waits for the fresh GER to reach this depth
-      # before submitting. Override via L1_EVIDENCE_TAG (e.g. `finalized`) to
-      # exercise the production posture.
-      - "--l1-evidence-tag=${L1_EVIDENCE_TAG:-confirmations:1}"
+      # Audit H6 — the one frontier used by the entire L1 evidence scan.
+      # Values: `latest`, `safe`, or `finalized`. Hardened deployments must use
+      # `safe` or `finalized`; the single-node anvil e2e defaults to `latest`
+      # for low latency and can be overridden to exercise either hardened tag.
+      - "--l1-evidence-tag=${L1_EVIDENCE_TAG:-latest}"
       # Audit C2 — the signer default is now fail-closed: with no
       # `--allowed-signers` configured, `eth_sendRawTransaction` rejects EVERY
       # signer. The e2e stack's legitimate submitters (aggoracle/aggsender GER +

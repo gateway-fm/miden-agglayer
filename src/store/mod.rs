@@ -354,51 +354,25 @@ pub trait Store: Send + Sync + 'static {
     /// Increment block number by 1 and return the new value.
     async fn advance_block_number(&self) -> anyhow::Result<u64>;
 
-    // === L1 indexer cursor (RD-862 follow-up) ===
-    /// Last successfully-polled L1 block. Returns 0 if the indexer has
-    /// never persisted a cursor on this deployment.
-    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+    // === Selected L1 evidence scan ===
+    /// Last block processed by the one configured scan. PostgreSQL uses the
+    /// legacy `finalized_scan_cursor` column for upgrade-safe provenance.
+    async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
     /// Persist the last-processed L1 block. Called after each successful
     /// batch so a restart resumes from here instead of jumping to L1 head.
-    async fn set_l1_indexer_cursor(&self, _block: u64) -> anyhow::Result<()> {
+    async fn set_l1_evidence_cursor(&self, _block: u64) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Last observed L1 `finalized` (or `safe`) block number — tracked SEPARATELY
-    /// from the head cursor (audit H6 BLOCKER 3). The `L1InfoTreeIndexer` updates
-    /// this each poll when configured with a finality evidence tag; the strict-H6
-    /// indexer's canonical finality scan uses this as its upper bound and marks
-    /// the evidence rows it observes. Returns 0 if never recorded (fresh
-    /// deployment or confirmation-depth mode), so the scan remains idle and the
-    /// strict gate stays fail-closed.
-    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
-        Ok(0)
-    }
-    /// Persist the last observed L1 finality-tag block. Written best-effort by
-    /// the indexer; a stale value only ever DELAYS strict authorization
-    /// (fail-closed), never over-authorizes.
-    async fn set_l1_finalized_block(&self, _block: u64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Progress cursor of the indexer's FINALIZED-pinned scan (audit H6 BLOCKER
-    /// 1) — the last block it has scanned for finalized `(mainnet, rollup)` pairs
-    /// and marked via `mark_ger_finalized`. Distinct from `l1_indexer_cursor`
-    /// (the head/latest scan). Returns 0 if never persisted.
-    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
-        Ok(0)
-    }
-    async fn set_l1_finalized_scan_cursor(&self, _block: u64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Bind finality markers and their scan cursor to the configured evidence
+    /// Bind the selected-scan marker and cursor to the configured evidence
     /// policy. The first clean serving boot records `policy`; later boots must
     /// present the exact same canonical value. Implementations must reject an
-    /// unbound store that already contains finality progress or verified markers,
-    /// because the policy that produced them cannot be inferred safely.
+    /// unbound store that already contains scan progress or verified evidence,
+    /// because the policy that produced it cannot be inferred safely. A
+    /// persistent implementation may bootstrap `latest` from its legacy latest
+    /// cursor; safe/finalized must never inherit that cursor.
     async fn bind_l1_evidence_policy(&self, _policy: &str) -> anyhow::Result<()> {
         anyhow::bail!("store does not support persistent L1 evidence-policy binding")
     }
@@ -529,14 +503,14 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool>;
     async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>>;
     async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>>;
-    /// Set the `(mainnet, rollup)` decomposition and L1 origin metadata for a
-    /// GER. Called by `L1InfoTreeIndexer` after observing the source
+    /// Atomically set the `(mainnet, rollup)` decomposition, L1 origin metadata,
+    /// and selected-scan provenance marker for a GER. Called by the one
+    /// configured `L1InfoTreeIndexer` scan after observing the source
     /// `UpdateL1InfoTree` / `UpdateGlobalExitRoot` event on L1, so the
     /// `l1_block_number` / `l1_timestamp` here are the L1 block where the
     /// event was emitted (the authoritative source for `zkevm_getExitRootsByGER`).
-    /// UPSERTs: on conflict, all four columns are overwritten — the indexer's
-    /// L1-sourced view supersedes any earlier hardcoded-0 row that may have
-    /// been left by an L2-side write path that didn't know the L1 origin yet.
+    /// UPSERTs roots and provenance together so pre-upgrade unqualified roots
+    /// cannot be trusted under a different policy.
     async fn set_ger_exit_roots(
         &self,
         ger: &[u8; 32],
@@ -545,18 +519,6 @@ pub trait Store: Send + Sync + 'static {
         l1_block_number: u64,
         l1_timestamp: u64,
     ) -> anyhow::Result<()>;
-    /// Audit H6 BLOCKER 1 — mark a GER's `(mainnet, rollup)` decomposition as
-    /// confirmed on the L1 FINALIZED / `safe` canonical chain. Called by the
-    /// `L1InfoTreeIndexer`'s finalized-pinned scan for each pair it reads at/below
-    /// the finality block; the `finalized`/`safe` strict gate authorizes ONLY
-    /// rows for which this ran, so a `latest`-observed-then-reorged fork row (this
-    /// never ran for it) cannot authorize. Monotone: once set, stays set. Upserts
-    /// the row so an ordering where the finalized scan runs before the latest scan
-    /// still records the flag (roots are filled by the latest scan). Default
-    /// no-op so test-double stores compile.
-    async fn mark_ger_finalized(&self, _ger: &[u8; 32]) -> anyhow::Result<()> {
-        Ok(())
-    }
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
     /// Atomically, in a single all-or-nothing operation: mark the GER seen,
     /// idempotently roll the hash chain + emit the `UpdateHashChainValue`

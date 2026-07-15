@@ -1291,10 +1291,11 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         anyhow::bail!("single writer handle missing from production ServiceState");
     }
 
-    // Strict-H6 GER preflight may wait for configured L1 finality. Keep it
-    // outside the signer lock so one lagging GER cannot block unrelated
-    // submissions. The mandatory writer repeats the stateful gate immediately
-    // before Miden submission, after durable admission, to close landing races.
+    // Strict-H6 GER preflight may wait for the configured L1 scan to reach the
+    // GER. Keep it outside the signer lock so one lagging GER cannot block
+    // unrelated submissions. The mandatory writer repeats the stateful gate
+    // immediately before Miden submission, after durable admission, to close
+    // landing races.
     //
     // The optimistic stale-nonce check is deliberately scoped to this waiting
     // path. Applying it to every call would bypass #140's authoritative
@@ -1999,10 +2000,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h6_finality_wait_does_not_hold_the_signer_nonce_lock() {
+    async fn h6_evidence_wait_does_not_hold_the_signer_nonce_lock() {
         let mut service = create_test_service();
         service.reject_unverified_ger = true;
-        service.l1_evidence_tag = crate::ger::EvidenceTag::Finalized;
+        service.l1_evidence_tag = crate::ger::EvidenceTag::Safe;
         let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
             service.clone(),
             8,
@@ -2011,12 +2012,6 @@ mod tests {
         service.writer_handle = Some(std::sync::Arc::new(handle));
 
         let ger = [0xD7; 32];
-        service
-            .store
-            .set_ger_exit_roots(&ger, [0x11; 32], [0x22; 32], 10, 20)
-            .await
-            .unwrap();
-
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let waiting_input = encode_legacy_tx_signed(
             &signer,
@@ -2048,10 +2043,10 @@ mod tests {
         let waiting_service = service.clone();
         let waiting =
             tokio::spawn(async move { service_send_raw_txn(waiting_service, waiting_input).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert!(
             !waiting.is_finished(),
-            "observed-but-unfinalized GER must wait"
+            "a GER not yet reached by the selected scan must wait"
         );
 
         let ready = tokio::time::timeout(
@@ -2059,7 +2054,7 @@ mod tests {
             service_send_raw_txn(service, ready_input),
         )
         .await
-        .expect("same-signer ready work must not wait behind L1 finality");
+        .expect("same-signer ready work must not wait behind L1 evidence");
         assert!(
             ready.is_ok(),
             "ready same-signer call should be admitted: {ready:?}"
@@ -2116,7 +2111,7 @@ mod tests {
             .await
             .expect_err("writer mode must reject an unverified GER at admission");
         assert!(
-            format!("{err}").contains("not observed on L1"),
+            format!("{err}").contains("not observed by the configured L1"),
             "unexpected: {err}"
         );
 
@@ -2150,15 +2145,13 @@ mod tests {
             "no job may be queued (channel must remain at full capacity)"
         );
 
-        // The indexer catches up (writes the (mainnet, rollup) decomposition
-        // it observed on L1 at block 100, and its cursor advances past the
-        // strict confirmation depth) — the IDENTICAL signed transaction, same
+        // The configured scan catches up and atomically writes the roots plus
+        // provenance marker. The IDENTICAL signed transaction, with the same
         // nonce, must now be accepted.
         store
             .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
             .await
             .unwrap();
-        store.set_l1_indexer_cursor(1_000).await.unwrap();
         let accepted_hash = service_send_raw_txn(service.clone(), input_hex)
             .await
             .expect("the identical signed tx must be accepted after the indexer catches up");
@@ -2236,7 +2229,7 @@ mod tests {
             .await
             .expect_err("the handler must reject an unverified GER under strict H6");
         assert!(
-            format!("{err}").contains("not observed on L1"),
+            format!("{err}").contains("not observed by the configured L1"),
             "unexpected: {err}"
         );
 
@@ -2255,13 +2248,12 @@ mod tests {
             "H6 rejection must not create a receipt"
         );
 
-        // Indexer catches up (decomposition at block 100, cursor advances past
-        // the strict confirmation depth) → the identical tx (same nonce) succeeds.
+        // The configured scan catches up and atomically writes roots plus its
+        // provenance marker; the identical tx (same nonce) now succeeds.
         store
             .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
             .await
             .unwrap();
-        store.set_l1_indexer_cursor(1_000).await.unwrap();
         let accepted_hash = service_send_raw_txn(service.clone(), input_hex)
             .await
             .expect("the identical signed tx must be accepted after the indexer catches up");
@@ -4483,7 +4475,6 @@ mod tests {
             .set_ger_exit_roots(&[0xc7; 32], [0x11; 32], [0x22; 32], 100, 1_700_000_000)
             .await
             .unwrap();
-        concrete.set_l1_indexer_cursor(1_000).await.unwrap();
         let NonceReservation::Won { .. } = concrete
             .reserve_nonce(&signer_str, 0, tx_hash, reservation_lease())
             .await
