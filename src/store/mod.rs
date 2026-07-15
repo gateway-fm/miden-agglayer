@@ -366,6 +366,43 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Last observed L1 `finalized` (or `safe`) block number — tracked SEPARATELY
+    /// from the head cursor (audit H6 BLOCKER 3). The `L1InfoTreeIndexer` updates
+    /// this each poll when configured with a finality evidence tag; the strict-H6
+    /// indexer's canonical finality scan uses this as its upper bound and marks
+    /// the evidence rows it observes. Returns 0 if never recorded (fresh
+    /// deployment or confirmation-depth mode), so the scan remains idle and the
+    /// strict gate stays fail-closed.
+    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    /// Persist the last observed L1 finality-tag block. Written best-effort by
+    /// the indexer; a stale value only ever DELAYS strict authorization
+    /// (fail-closed), never over-authorizes.
+    async fn set_l1_finalized_block(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Progress cursor of the indexer's FINALIZED-pinned scan (audit H6 BLOCKER
+    /// 1) — the last block it has scanned for finalized `(mainnet, rollup)` pairs
+    /// and marked via `mark_ger_finalized`. Distinct from `l1_indexer_cursor`
+    /// (the head/latest scan). Returns 0 if never persisted.
+    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn set_l1_finalized_scan_cursor(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Bind finality markers and their scan cursor to the configured evidence
+    /// policy. The first clean serving boot records `policy`; later boots must
+    /// present the exact same canonical value. Implementations must reject an
+    /// unbound store that already contains finality progress or verified markers,
+    /// because the policy that produced them cannot be inferred safely.
+    async fn bind_l1_evidence_policy(&self, _policy: &str) -> anyhow::Result<()> {
+        anyhow::bail!("store does not support persistent L1 evidence-policy binding")
+    }
+
     // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
     /// Last fully-projected Miden block height owned by the `SyntheticProjector`
     /// (`docs/SYNTHETIC-INDEXER-REDESIGN.md`). Returns 0 if the projector has
@@ -508,6 +545,18 @@ pub trait Store: Send + Sync + 'static {
         l1_block_number: u64,
         l1_timestamp: u64,
     ) -> anyhow::Result<()>;
+    /// Audit H6 BLOCKER 1 — mark a GER's `(mainnet, rollup)` decomposition as
+    /// confirmed on the L1 FINALIZED / `safe` canonical chain. Called by the
+    /// `L1InfoTreeIndexer`'s finalized-pinned scan for each pair it reads at/below
+    /// the finality block; the `finalized`/`safe` strict gate authorizes ONLY
+    /// rows for which this ran, so a `latest`-observed-then-reorged fork row (this
+    /// never ran for it) cannot authorize. Monotone: once set, stays set. Upserts
+    /// the row so an ordering where the finalized scan runs before the latest scan
+    /// still records the flag (roots are filled by the latest scan). Default
+    /// no-op so test-double stores compile.
+    async fn mark_ger_finalized(&self, _ger: &[u8; 32]) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
     /// Atomically, in a single all-or-nothing operation: mark the GER seen,
     /// idempotently roll the hash chain + emit the `UpdateHashChainValue`

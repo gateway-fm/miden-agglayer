@@ -289,6 +289,13 @@ pub struct GerEntry {
     pub rollup_exit_root: Option<[u8; 32]>,
     pub block_number: u64,
     pub timestamp: u64,
+    /// Audit H6 BLOCKER 1 — the `(mainnet, rollup)` decomposition has been
+    /// confirmed on the L1 FINALIZED (or `safe`) canonical chain by a scan
+    /// pinned to that block tag. Only such rows may authorize a strict injection
+    /// in `finalized`/`safe` mode: a `latest`-observed row from a reorged-away
+    /// fork is NEVER marked, so it cannot authorize despite a block-height
+    /// coincidence. Always `false` for rows recorded only from the latest scan.
+    pub finalized_verified: bool,
 }
 
 // LogStore has been replaced by the Store trait — see src/store/mod.rs

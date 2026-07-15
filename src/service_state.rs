@@ -99,6 +99,22 @@ pub struct ServiceState {
     /// of `allowed_signers`. ONLY safe behind a loopback bind / network
     /// boundary. Refused by `--require-hardening`.
     pub allow_any_signer: bool,
+    /// Audit H6 — refuse to inject a GER whose `(mainnet, rollup)`
+    /// decomposition was NOT corroborated by the independent L1 InfoTree
+    /// indexer. Defends against a compromised aggoracle key injecting a forged
+    /// GER onto Miden. Default false (allow through, but flag via the
+    /// `ger_injection_unverified_total` metric) to tolerate indexer lag;
+    /// `--require-hardening` implies true.
+    pub reject_unverified_ger: bool,
+    /// Audit H6 — the SINGLE strict-H6 evidence-finality setting (parsed from
+    /// `--l1-evidence-tag` / `L1_EVIDENCE_TAG`): `confirmations:<N>` (depth below
+    /// the indexer head cursor), `finalized`, or `safe`. This one value fully
+    /// specifies how the gate qualifies an L1 observation as final — there is no
+    /// second confirmation-depth knob. Enforced at the gate
+    /// (`ger::ensure_ger_l1_observed`); normal decomposition is unaffected.
+    /// Mandatory `finalized` under `--require-hardening`. Defaults to
+    /// `confirmations:DEFAULT_CONFIRMATIONS`.
+    pub l1_evidence_tag: crate::ger::EvidenceTag,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one
     /// signer cannot both pass the equality check before either increments.
@@ -166,6 +182,8 @@ impl ServiceState {
             admin_api_key: None,
             allowed_signers: None,
             allow_any_signer: false,
+            reject_unverified_ger: false,
+            l1_evidence_tag: crate::ger::EvidenceTag::default(),
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
