@@ -319,6 +319,33 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Last observed L1 `finalized` (or `safe`) block number — tracked SEPARATELY
+    /// from the head cursor (audit H6 BLOCKER 3). The `L1InfoTreeIndexer` updates
+    /// this each poll when configured with a finality evidence tag; the strict-H6
+    /// gate (`ger::ensure_ger_l1_observed`) qualifies an evidence row as final
+    /// when `evidence_block <= finalized_block`. Returns 0 if never recorded
+    /// (fresh deployment or confirmation-depth mode) — the gate then fail-closes.
+    async fn get_l1_finalized_block(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    /// Persist the last observed L1 finality-tag block. Written best-effort by
+    /// the indexer; a stale value only ever DELAYS strict authorization
+    /// (fail-closed), never over-authorizes.
+    async fn set_l1_finalized_block(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Progress cursor of the indexer's FINALIZED-pinned scan (audit H6 BLOCKER
+    /// 1) — the last block it has scanned for finalized `(mainnet, rollup)` pairs
+    /// and marked via `mark_ger_finalized`. Distinct from `l1_indexer_cursor`
+    /// (the head/latest scan). Returns 0 if never persisted.
+    async fn get_l1_finalized_scan_cursor(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn set_l1_finalized_scan_cursor(&self, _block: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
     /// Last fully-projected Miden block height owned by the `SyntheticProjector`
     /// (`docs/SYNTHETIC-INDEXER-REDESIGN.md`). Returns 0 if the projector has
@@ -420,6 +447,18 @@ pub trait Store: Send + Sync + 'static {
         l1_block_number: u64,
         l1_timestamp: u64,
     ) -> anyhow::Result<()>;
+    /// Audit H6 BLOCKER 1 — mark a GER's `(mainnet, rollup)` decomposition as
+    /// confirmed on the L1 FINALIZED / `safe` canonical chain. Called by the
+    /// `L1InfoTreeIndexer`'s finalized-pinned scan for each pair it reads at/below
+    /// the finality block; the `finalized`/`safe` strict gate authorizes ONLY
+    /// rows for which this ran, so a `latest`-observed-then-reorged fork row (this
+    /// never ran for it) cannot authorize. Monotone: once set, stays set. Upserts
+    /// the row so an ordering where the finalized scan runs before the latest scan
+    /// still records the flag (roots are filled by the latest scan). Default
+    /// no-op so test-double stores compile.
+    async fn mark_ger_finalized(&self, _ger: &[u8; 32]) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool>;
     /// Atomically, in a single all-or-nothing operation: mark the GER seen,
     /// idempotently roll the hash chain + emit the `UpdateHashChainValue`
@@ -461,6 +500,26 @@ pub trait Store: Send + Sync + 'static {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()>;
+    /// BLOCKER 2 (re-review) — write a PROVISIONAL TTL-expiry for a still-live
+    /// job's receipt. Unlike `txn_commit(Err)`, this is NON-terminal: only a
+    /// still-PENDING row is affected, and `txn_receipt` serves it as `None`
+    /// (null, "keep polling"), NOT status 0x0. A real later landing supersedes it
+    /// to success BEFORE it is ever observable-terminal, so no observer sees a
+    /// terminal `0x0 → 0x1` flip. A missing row is a best-effort no-op (the TTL
+    /// sweeper only calls this when it saw a row; it never seeds — BLOCKER 1). The
+    /// default impl falls back to a plain terminal `txn_commit(Err)` so
+    /// non-overriding test-double stores compile; the memory + pg stores provide
+    /// the genuine provisional behaviour.
+    async fn txn_commit_ttl_expired(
+        &self,
+        tx_hash: TxHash,
+        reason: String,
+        block_num: u64,
+        block_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        self.txn_commit(tx_hash, Err(reason), block_num, block_hash)
+            .await
+    }
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,

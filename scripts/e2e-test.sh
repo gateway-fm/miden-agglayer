@@ -32,6 +32,11 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-ger-decomposition.sh"
         echo ""
+        # Audit H6 — L1 GER corroboration (positive + negative phases). Needs
+        # the compose default REJECT_UNVERIFIED_GER_INJECTION=true; SKIPs
+        # itself (with a warning) when the container runs lenient.
+        "$SCRIPT_DIR/e2e-ger-l1-verification.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-security.sh"
         echo ""
         "$SCRIPT_DIR/e2e-cantina12-getlogs-returns-all.sh"
@@ -124,6 +129,9 @@ case "$test_filter" in
     ger-decomposition)
         "$SCRIPT_DIR/e2e-ger-decomposition.sh"
         ;;
+    ger-l1-verification)
+        "$SCRIPT_DIR/e2e-ger-l1-verification.sh"
+        ;;
     security)
         "$SCRIPT_DIR/e2e-security.sh"
         ;;
@@ -187,7 +195,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|ger-l1-verification|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
         echo "       (l2l2 is optional and not part of 'all' — it needs the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;

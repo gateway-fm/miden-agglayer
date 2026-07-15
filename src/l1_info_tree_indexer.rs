@@ -92,6 +92,12 @@ pub struct L1InfoTreeIndexer {
     /// cursor advances forward normally; remove the flag for subsequent
     /// boots.
     from_block_override: Option<u64>,
+    /// Strict-H6 evidence qualification tag (audit H6 BLOCKER 3). When a
+    /// finality tag (`finalized`/`safe`) is configured, each poll also fetches
+    /// that L1 block and persists its number via `set_l1_finalized_block`, which
+    /// the strict gate uses to qualify evidence. In `Confirmations` mode the
+    /// indexer does no extra work (the gate uses the head cursor + depth).
+    evidence_tag: crate::ger::EvidenceTag,
 }
 
 impl L1InfoTreeIndexer {
@@ -103,6 +109,48 @@ impl L1InfoTreeIndexer {
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_range: DEFAULT_MAX_RANGE,
             from_block_override: None,
+            evidence_tag: crate::ger::EvidenceTag::default(),
+        }
+    }
+
+    /// Configure the strict-H6 evidence tag. In `Finalized`/`Safe` mode the
+    /// indexer tracks the corresponding L1 finality block (BLOCKER 3).
+    pub fn with_evidence_tag(mut self, tag: crate::ger::EvidenceTag) -> Self {
+        self.evidence_tag = tag;
+        self
+    }
+
+    /// The L1 block tag to poll for finality tracking, or `None` in
+    /// confirmation-depth mode (no finality block needed).
+    fn finality_block_tag(&self) -> Option<BlockNumberOrTag> {
+        match self.evidence_tag {
+            crate::ger::EvidenceTag::Confirmations(_) => None,
+            crate::ger::EvidenceTag::Finalized => Some(BlockNumberOrTag::Finalized),
+            crate::ger::EvidenceTag::Safe => Some(BlockNumberOrTag::Safe),
+        }
+    }
+
+    /// Best-effort refresh of the persisted L1 finality-tag block (BLOCKER 3).
+    /// A no-op in confirmation-depth mode. A fetch/persist failure just leaves
+    /// the previous value — the strict gate stays fail-closed (never
+    /// over-authorizes on a stale finality block).
+    async fn refresh_finality_block<P: Provider>(&self, provider: &P) {
+        let Some(tag) = self.finality_block_tag() else {
+            return;
+        };
+        match provider.get_block_by_number(tag).await {
+            Ok(Some(block)) => {
+                let n = block.header.number;
+                if let Err(e) = self.store.set_l1_finalized_block(n).await {
+                    tracing::warn!(error = %e, tag = ?tag, "L1InfoTreeIndexer: failed to persist L1 finality block");
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(tag = ?tag, "L1InfoTreeIndexer: L1 finality block not available yet");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, tag = ?tag, "L1InfoTreeIndexer: failed to fetch L1 finality block");
+            }
         }
     }
 
@@ -227,11 +275,26 @@ impl L1InfoTreeIndexer {
         provider: &P,
         last_processed: &mut u64,
     ) -> anyhow::Result<()> {
+        // Keep the L1 finality-tag block fresh for the strict gate (no-op in
+        // confirmation-depth mode). Done before the head check so it still
+        // advances while the head is idle.
+        self.refresh_finality_block(provider).await;
+        // BLOCKER 1 — mark finalized-chain evidence (no-op in confirmation-depth
+        // mode). Runs regardless of head progress so finality marking keeps up.
+        self.poll_finalized_scan(provider).await?;
+
         let head = provider.get_block_number().await?;
         if head <= *last_processed {
             return Ok(());
         }
 
+        // Index the `(mainnet, rollup)` decomposition up to LATEST — ordinary
+        // decomposition / bridge readiness (`zkevm_getExitRootsByGER`) must not
+        // be delayed. H6 reorg-safety for the IRREVERSIBLE strict injection is
+        // enforced at the gate instead (`ger::ensure_ger_l1_observed` requires
+        // the observation to be `confirmations`-deep on L1, using this indexer's
+        // persisted cursor as the head), so a not-yet-final observation is
+        // recorded for normal use but not trusted for strict authorization.
         let from = *last_processed + 1;
         let to = head.min(from + self.max_range - 1);
 
@@ -267,16 +330,32 @@ impl L1InfoTreeIndexer {
                 Ok(true) => indexed += 1,
                 Ok(false) => {}
                 Err(e) => {
-                    // Don't fail the whole batch on one bad event; advance the
-                    // cursor anyway so we don't get stuck retrying the same
-                    // poison log forever.
+                    // Audit H6 / BLOCKER 3 — a durable evidence-write failure
+                    // must keep the batch RETRYABLE. `process_log` only returns
+                    // Err from the `set_ger_exit_roots` write (a malformed log
+                    // returns Ok(false), never Err), so this is always a
+                    // transient store failure, NOT a poison log. Advancing the
+                    // cursor past it would drop a legitimate GER's evidence
+                    // permanently, and under strict mode that GER would stay
+                    // unverified forever (the side-effect-free retry never
+                    // clears within the process lifetime). Propagate WITHOUT
+                    // touching `*last_processed`, so the next poll re-runs
+                    // exactly this window; `set_ger_exit_roots` is an idempotent
+                    // UPSERT, so re-indexing already-written pairs is safe.
                     tracing::warn!(
                         error = %e,
                         block = block_number,
                         tx = ?log.transaction_hash,
-                        "L1InfoTreeIndexer: failed to index log"
+                        from,
+                        to,
+                        "L1InfoTreeIndexer: durable evidence write failed; leaving batch \
+                         unadvanced for retry"
                     );
                     metrics::counter!("l1_info_tree_indexer_log_errors_total").increment(1);
+                    return Err(e.context(format!(
+                        "L1InfoTreeIndexer: evidence write failed at block {block_number}; \
+                         batch [{from}, {to}] left unadvanced (retryable)"
+                    )));
                 }
             }
         }
@@ -314,6 +393,78 @@ impl L1InfoTreeIndexer {
             metrics::counter!("l1_info_tree_indexer_cursor_persist_errors_total").increment(1);
         }
 
+        Ok(())
+    }
+
+    /// Audit H6 BLOCKER 1 — the FINALIZED-pinned scan. In a finality-tag mode,
+    /// scan `(mainnet, rollup)` events over `[finalized_scan_cursor+1,
+    /// finalized_block]` and `mark_ger_finalized` each pair. Because the window
+    /// ends at the L1 finalized/safe block, every log it returns is on the
+    /// canonical finalized chain — a fork's event at a height <= finalized is NOT
+    /// returned, so it is never marked and can never authorize. A no-op in
+    /// confirmation-depth mode. A mark-write failure keeps the batch retryable
+    /// (cursor not advanced), exactly like the latest scan.
+    async fn poll_finalized_scan<P: Provider>(&self, provider: &P) -> anyhow::Result<()> {
+        if !self.evidence_tag.is_finality_tag() {
+            return Ok(());
+        }
+        let finalized = self.store.get_l1_finalized_block().await?;
+        if finalized == 0 {
+            return Ok(());
+        }
+        let cursor = self.store.get_l1_finalized_scan_cursor().await?;
+        if finalized <= cursor {
+            return Ok(());
+        }
+        let from = cursor + 1;
+        let to = finalized.min(from + self.max_range - 1);
+
+        let filter = Filter::new()
+            .address(self.contract_address)
+            .from_block(from)
+            .to_block(to)
+            .event_signature(vec![
+                UpdateL1InfoTree::SIGNATURE_HASH,
+                UpdateGlobalExitRoot::SIGNATURE_HASH,
+            ]);
+        let logs: Vec<Log> = provider.get_logs(&filter).await?;
+
+        let mut marked = 0usize;
+        for log in &logs {
+            let topics = log.topics();
+            if topics.len() < 3 {
+                continue;
+            }
+            let mainnet: [u8; 32] = topics[1].0;
+            let rollup: [u8; 32] = topics[2].0;
+            let combined = combined_ger(&mainnet, &rollup);
+            if let Err(e) = self.store.mark_ger_finalized(&combined).await {
+                metrics::counter!("l1_info_tree_indexer_log_errors_total").increment(1);
+                return Err(e.context(format!(
+                    "L1InfoTreeIndexer: finalized mark failed at block {}; finalized batch \
+                     [{from}, {to}] left unadvanced (retryable)",
+                    log.block_number.unwrap_or(0)
+                )));
+            }
+            marked += 1;
+        }
+
+        if marked > 0 {
+            tracing::info!(
+                from,
+                to,
+                finalized,
+                marked,
+                "L1InfoTreeIndexer: marked finalized-chain evidence"
+            );
+        }
+        if let Err(e) = self.store.set_l1_finalized_scan_cursor(to).await {
+            tracing::warn!(
+                error = %e,
+                cursor = to,
+                "L1InfoTreeIndexer: failed to persist finalized-scan cursor; continuing in-memory"
+            );
+        }
         Ok(())
     }
 
@@ -422,6 +573,14 @@ fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_synthesis::{GerEntry, LogFilter, SyntheticLog};
+    use crate::store::memory::InMemoryStore;
+    use crate::store::{FaucetEntry, TxnData, TxnEntry, UnclaimableClaim};
+    use alloy::primitives::{B256, Bytes, LogData, TxHash, U64, U256};
+    use alloy::providers::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+    use miden_protocol::account::AccountId;
+    use miden_protocol::transaction::TransactionId;
 
     #[test]
     fn combined_ger_matches_ger_module() {
@@ -444,5 +603,520 @@ mod tests {
             UpdateL1InfoTree::SIGNATURE_HASH,
             UpdateGlobalExitRoot::SIGNATURE_HASH
         );
+    }
+
+    // ── H6 reorg-safety + retryable-batch regressions (PR #121 re-review) ──
+
+    /// Construct a bare indexer over `store`. The RPC URL is never dialled
+    /// (poll_once is driven with a mock provider).
+    fn test_indexer(store: Arc<dyn Store>) -> L1InfoTreeIndexer {
+        L1InfoTreeIndexer::new(
+            "http://mock.invalid".to_string(),
+            Address::from([0x99u8; 20]),
+            store,
+        )
+    }
+
+    /// Build an `UpdateL1InfoTree` log carrying the `(mainnet, rollup)` pair at
+    /// `block`, shaped exactly as `process_log` decodes it (topic0 = event sig,
+    /// topic1 = mainnet, topic2 = rollup).
+    fn pair_log(mainnet: B256, rollup: B256, block: u64) -> alloy::rpc::types::Log {
+        let data = LogData::new_unchecked(
+            vec![UpdateL1InfoTree::SIGNATURE_HASH, mainnet, rollup],
+            Bytes::new(),
+        );
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::from([0x99u8; 20]),
+                data,
+            },
+            block_hash: None,
+            block_number: Some(block),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    /// BLOCKER 1 — the indexer records the decomposition up to LATEST (NO
+    /// confirmation delay for ordinary decomposition), while the STRICT gate
+    /// enforces finality using the indexer cursor as the L1 head. Drives the
+    /// REAL `poll_once` with a mock L1: a pair only 2 blocks deep is recorded
+    /// immediately (so `get_ger_entry` / `zkevm_getExitRootsByGER` see it with no
+    /// delay), yet the strict gate REFUSES it until the cursor advances past the
+    /// confirmation depth — which is exactly what keeps a short-lived reorg from
+    /// authorizing an irreversible injection while never delaying normal ops.
+    ///
+    /// Mutation check: dropping the gate's `l1_head - block >= confirmations`
+    /// clause makes the shallow observation wrongly authorize (phase-1 pass).
+    #[tokio::test]
+    async fn h6_indexes_to_latest_but_strict_gate_waits_for_finality() {
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let indexer = test_indexer(store.clone());
+
+        let mainnet = B256::from([0x0Au8; 32]);
+        let rollup = B256::from([0x0Bu8; 32]);
+        let ger = combined_ger(&mainnet.0, &rollup.0);
+        let tx = TxHash::from([0x01u8; 32]);
+        const CONF: u64 = 64;
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut last_processed = 0u64;
+
+        // Phase 1 — L1 head 10: poll_once indexes the pair at block 8 IMMEDIATELY
+        // (only 2 deep) and advances the cursor to head. Ordinary decomposition
+        // sees it at once; the strict gate refuses it (2 < 64) — transiently.
+        asserter.push_success(&U64::from(10u64));
+        asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
+        asserter.push_success(&Option::<serde_json::Value>::None); // block ts → 0
+        indexer
+            .poll_once(&provider, &mut last_processed)
+            .await
+            .unwrap();
+        assert_eq!(
+            last_processed, 10,
+            "cursor tracks latest (no confirmation delay)"
+        );
+        let entry = store
+            .get_ger_entry(&ger)
+            .await
+            .unwrap()
+            .expect("decomposition must be recorded immediately (no delay for normal ops)");
+        assert!(entry.mainnet_exit_root.is_some() && entry.rollup_exit_root.is_some());
+
+        let err = crate::ger::ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            crate::ger::EvidenceTag::Confirmations(CONF),
+            tx,
+        )
+        .await
+        .expect_err("strict gate must refuse a not-yet-confirmation-deep observation");
+        assert!(
+            err.to_string().contains("not yet"),
+            "must cite the finality guard: {err:#}"
+        );
+
+        // Phase 2 — L1 advances to 80: poll_once moves the cursor to 80, so the
+        // block-8 observation is now 72 deep (>= 64) and the strict gate passes.
+        asserter.push_success(&U64::from(80u64));
+        asserter.push_success(&Vec::<alloy::rpc::types::Log>::new()); // no new events
+        indexer
+            .poll_once(&provider, &mut last_processed)
+            .await
+            .unwrap();
+        assert_eq!(last_processed, 80, "cursor advanced to the new head");
+        crate::ger::ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            crate::ger::EvidenceTag::Confirmations(CONF),
+            tx,
+        )
+        .await
+        .expect("strict gate must authorize once the observation is confirmation-deep");
+    }
+
+    /// BLOCKER 3 (retryable batch) — a durable evidence-write failure must keep
+    /// the batch retryable: `poll_once` must propagate the error and leave the
+    /// cursor UNADVANCED so the next poll re-attempts the same window (the
+    /// `set_ger_exit_roots` UPSERT makes retries idempotent). Pre-fix the loop
+    /// logged the error and advanced the cursor anyway, dropping the GER's
+    /// evidence permanently — under strict mode that GER stays unverified for
+    /// the whole process lifetime.
+    ///
+    /// Mutation check: reverting to the old "log + continue" arm (no early
+    /// return) makes poll_once return Ok and advance the cursor to 36 — this
+    /// test fails on both assertions.
+    #[tokio::test]
+    async fn h6_evidence_write_failure_leaves_batch_retryable() {
+        let store: Arc<dyn Store> = Arc::new(FailingGerStore::new());
+        let indexer = test_indexer(store);
+
+        let mainnet = B256::from([0x0Cu8; 32]);
+        let rollup = B256::from([0x0Du8; 32]);
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&U64::from(100u64));
+        asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
+        asserter.push_success(&Option::<serde_json::Value>::None);
+
+        let mut last_processed = 0u64;
+        let err = indexer
+            .poll_once(&provider, &mut last_processed)
+            .await
+            .expect_err("a durable evidence-write failure must fail the batch");
+        assert!(
+            err.to_string().contains("evidence write failed"),
+            "error must identify the retryable batch: {err:#}"
+        );
+        assert_eq!(
+            last_processed, 0,
+            "cursor MUST NOT advance past a batch whose evidence write failed"
+        );
+    }
+
+    /// BLOCKER 1 (re-review) — the FINALIZED-pinned scan is the finalized-chain
+    /// tie. In `finalized` mode it scans `[cursor+1, finalized_block]` (whose logs
+    /// ARE the canonical finalized chain) and marks each pair `finalized_verified`
+    /// — which is exactly what the strict `finalized` gate then requires. A
+    /// `latest`-observed pair NOT covered by this scan is never marked and cannot
+    /// authorize (proved in `ger::tests::h6_finalized_tag_gate_requires_finalized_chain_tie`).
+    ///
+    /// Mutation check: making `poll_finalized_scan` a no-op leaves the row
+    /// unverified → the authorize step below fails.
+    #[tokio::test]
+    async fn poll_finalized_scan_marks_finalized_chain_evidence() {
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let indexer =
+            test_indexer(store.clone()).with_evidence_tag(crate::ger::EvidenceTag::Finalized);
+
+        let mainnet = B256::from([0x0Au8; 32]);
+        let rollup = B256::from([0x0Bu8; 32]);
+        let ger = combined_ger(&mainnet.0, &rollup.0);
+        // The latest scan already recorded roots (block 8); NOT finalized yet.
+        store
+            .set_ger_exit_roots(&ger, mainnet.0, rollup.0, 8, 0)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get_ger_entry(&ger)
+                .await
+                .unwrap()
+                .unwrap()
+                .finalized_verified,
+            "must start un-finalized"
+        );
+
+        // The L1 finalized block (100) is well above block 8; the finalized scan
+        // covers [1, 100] and reads the canonical pair.
+        store.set_l1_finalized_block(100).await.unwrap();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
+        indexer.poll_finalized_scan(&provider).await.unwrap();
+
+        assert!(
+            store
+                .get_ger_entry(&ger)
+                .await
+                .unwrap()
+                .unwrap()
+                .finalized_verified,
+            "the finalized-pinned scan must mark the canonical pair finalized_verified"
+        );
+        assert_eq!(store.get_l1_finalized_scan_cursor().await.unwrap(), 100);
+
+        // The strict `finalized` gate now authorizes it (roots + finalized_verified).
+        crate::ger::ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            crate::ger::EvidenceTag::Finalized,
+            TxHash::from([0x01u8; 32]),
+        )
+        .await
+        .expect("a finalized-chain-verified observation must authorize");
+    }
+
+    /// A Store that fails only `set_ger_exit_roots` (the indexer's durable
+    /// evidence write) and delegates everything else to a real InMemoryStore.
+    /// Used by `h6_evidence_write_failure_leaves_batch_retryable`.
+    struct FailingGerStore {
+        inner: InMemoryStore,
+    }
+    impl FailingGerStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryStore::new(),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Store for FailingGerStore {
+        async fn set_ger_exit_roots(
+            &self,
+            _ger: &[u8; 32],
+            _mainnet_exit_root: [u8; 32],
+            _rollup_exit_root: [u8; 32],
+            _l1_block_number: u64,
+            _l1_timestamp: u64,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("injected fault: durable evidence write failed")
+        }
+        async fn get_latest_block_number(&self) -> anyhow::Result<u64> {
+            self.inner.get_latest_block_number().await
+        }
+        async fn set_latest_block_number(&self, n: u64) -> anyhow::Result<()> {
+            self.inner.set_latest_block_number(n).await
+        }
+        async fn advance_block_number(&self) -> anyhow::Result<u64> {
+            self.inner.advance_block_number().await
+        }
+        async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {
+            self.inner.add_log(log).await
+        }
+        async fn get_logs(
+            &self,
+            filter: &LogFilter,
+            current_block: u64,
+        ) -> anyhow::Result<Vec<SyntheticLog>> {
+            self.inner.get_logs(filter, current_block).await
+        }
+        async fn get_logs_for_tx(&self, tx_hash: &str) -> anyhow::Result<Vec<SyntheticLog>> {
+            self.inner.get_logs_for_tx(tx_hash).await
+        }
+        async fn has_seen_ger(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
+            self.inner.has_seen_ger(ger).await
+        }
+        async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool> {
+            self.inner.mark_ger_seen(ger, entry).await
+        }
+        async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>> {
+            self.inner.get_latest_ger().await
+        }
+        async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>> {
+            self.inner.get_ger_entry(ger).await
+        }
+        async fn is_ger_injected(&self, ger: &[u8; 32]) -> anyhow::Result<bool> {
+            self.inner.is_ger_injected(ger).await
+        }
+        async fn commit_ger_event_atomic(
+            &self,
+            block_number: u64,
+            block_hash: [u8; 32],
+            tx_hash: &str,
+            global_exit_root: &[u8; 32],
+            mainnet_exit_root: Option<[u8; 32]>,
+            rollup_exit_root: Option<[u8; 32]>,
+            timestamp: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .commit_ger_event_atomic(
+                    block_number,
+                    block_hash,
+                    tx_hash,
+                    global_exit_root,
+                    mainnet_exit_root,
+                    rollup_exit_root,
+                    timestamp,
+                )
+                .await
+        }
+        async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()> {
+            self.inner.txn_begin(tx_hash, entry).await
+        }
+        async fn txn_commit(
+            &self,
+            tx_hash: TxHash,
+            result: Result<(), String>,
+            block_num: u64,
+            block_hash: [u8; 32],
+        ) -> anyhow::Result<()> {
+            self.inner
+                .txn_commit(tx_hash, result, block_num, block_hash)
+                .await
+        }
+        async fn txn_receipt(
+            &self,
+            tx_hash: TxHash,
+        ) -> anyhow::Result<Option<(Result<(), String>, u64)>> {
+            self.inner.txn_receipt(tx_hash).await
+        }
+        async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>> {
+            self.inner.txn_get(tx_hash).await
+        }
+        async fn txn_pending_by_miden_id(
+            &self,
+            id: TransactionId,
+        ) -> anyhow::Result<Option<TxHash>> {
+            self.inner.txn_pending_by_miden_id(id).await
+        }
+        async fn txn_commit_pending(
+            &self,
+            ids: &[TransactionId],
+            block_num: u64,
+            block_hash: [u8; 32],
+        ) -> anyhow::Result<()> {
+            self.inner
+                .txn_commit_pending(ids, block_num, block_hash)
+                .await
+        }
+        async fn txn_expire_pending(
+            &self,
+            block_num: u64,
+            block_hash: [u8; 32],
+        ) -> anyhow::Result<()> {
+            self.inner.txn_expire_pending(block_num, block_hash).await
+        }
+        async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
+            self.inner.nonce_get(addr).await
+        }
+        async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64> {
+            self.inner.nonce_increment(addr).await
+        }
+        async fn reserve_nonce(
+            &self,
+            addr: &str,
+            nonce: u64,
+            tx_hash: TxHash,
+            lease: std::time::Duration,
+        ) -> anyhow::Result<crate::store::NonceReservation> {
+            self.inner.reserve_nonce(addr, nonce, tx_hash, lease).await
+        }
+        async fn release_reservation(
+            &self,
+            addr: &str,
+            nonce: u64,
+            tx_hash: TxHash,
+            fence: u64,
+            success: bool,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .release_reservation(addr, nonce, tx_hash, fence, success)
+                .await
+        }
+        async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool> {
+            self.inner.nonce_advance_cas(addr, expected).await
+        }
+        async fn commit_reverted_receipt_and_advance_nonce(
+            &self,
+            tx_hash: TxHash,
+            entry: TxnEntry,
+            reason: String,
+            block_num: u64,
+            block_hash: [u8; 32],
+            addr: &str,
+            expected_nonce: u64,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .commit_reverted_receipt_and_advance_nonce(
+                    tx_hash,
+                    entry,
+                    reason,
+                    block_num,
+                    block_hash,
+                    addr,
+                    expected_nonce,
+                )
+                .await
+        }
+        async fn try_claim(&self, global_index: U256) -> anyhow::Result<()> {
+            self.inner.try_claim(global_index).await
+        }
+        async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()> {
+            self.inner.unclaim(global_index).await
+        }
+        async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool> {
+            self.inner.is_claimed(global_index).await
+        }
+        async fn try_reclaim_expired(
+            &self,
+            global_index: U256,
+            ttl: std::time::Duration,
+        ) -> anyhow::Result<bool> {
+            self.inner.try_reclaim_expired(global_index, ttl).await
+        }
+        async fn record_unclaimable_claim(&self, entry: UnclaimableClaim) -> anyhow::Result<bool> {
+            self.inner.record_unclaimable_claim(entry).await
+        }
+        async fn get_unclaimable_claim(
+            &self,
+            global_index: &U256,
+        ) -> anyhow::Result<Option<UnclaimableClaim>> {
+            self.inner.get_unclaimable_claim(global_index).await
+        }
+        async fn get_address_mapping(&self, eth: &Address) -> anyhow::Result<Option<AccountId>> {
+            self.inner.get_address_mapping(eth).await
+        }
+        async fn set_address_mapping(&self, eth: Address, miden: AccountId) -> anyhow::Result<()> {
+            self.inner.set_address_mapping(eth, miden).await
+        }
+        async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
+            self.inner.is_note_processed(note_id).await
+        }
+        async fn get_deposit_count(&self) -> anyhow::Result<u64> {
+            self.inner.get_deposit_count().await
+        }
+        async fn commit_b2agg_event_atomic(
+            &self,
+            note_id: String,
+            bridge_address: &str,
+            block_number: u64,
+            block_hash: [u8; 32],
+            tx_hash: &str,
+            leaf_type: u8,
+            origin_network: u32,
+            origin_address: &[u8; 20],
+            destination_network: u32,
+            destination_address: &[u8; 20],
+            amount: u128,
+            metadata: &[u8],
+        ) -> anyhow::Result<u32> {
+            self.inner
+                .commit_b2agg_event_atomic(
+                    note_id,
+                    bridge_address,
+                    block_number,
+                    block_hash,
+                    tx_hash,
+                    leaf_type,
+                    origin_network,
+                    origin_address,
+                    destination_network,
+                    destination_address,
+                    amount,
+                    metadata,
+                )
+                .await
+        }
+        async fn is_claim_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
+            self.inner.is_claim_note_processed(note_id).await
+        }
+        async fn mark_claim_note_processed(
+            &self,
+            note_id: String,
+            global_index: [u8; 32],
+            block_number: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .mark_claim_note_processed(note_id, global_index, block_number)
+                .await
+        }
+        async fn has_claim_event_for_global_index(
+            &self,
+            global_index: &[u8; 32],
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .has_claim_event_for_global_index(global_index)
+                .await
+        }
+        async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+            self.inner.register_faucet(entry).await
+        }
+        async fn get_faucet_by_origin(
+            &self,
+            origin_address: &[u8; 20],
+            origin_network: u32,
+        ) -> anyhow::Result<Option<FaucetEntry>> {
+            self.inner
+                .get_faucet_by_origin(origin_address, origin_network)
+                .await
+        }
+        async fn get_faucet_by_id(
+            &self,
+            faucet_id: AccountId,
+        ) -> anyhow::Result<Option<FaucetEntry>> {
+            self.inner.get_faucet_by_id(faucet_id).await
+        }
+        async fn list_faucets(&self) -> anyhow::Result<Vec<FaucetEntry>> {
+            self.inner.list_faucets().await
+        }
     }
 }
