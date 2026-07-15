@@ -619,19 +619,41 @@ sponsor_nonce() {
         | python3 -c "import json,sys; print(int(json.load(sys.stdin)['result'],16))"
 }
 
-# ── #55 accept-and-revert observability ──────────────────────────────────────
-# The proxy exposes Prometheus counters on the L2_RPC port's /metrics. The
-# `claim_landed_dedup_reverted_total` counter increments each time a claimAsset
-# targeting an ALREADY-LANDED globalIndex is ACCEPTED with a reverted (status
-# 0x0) receipt instead of hard-rejected — the geth-faithful AlreadyClaimed that
-# keeps the sponsor's nonce sequence in lockstep. metric_value reads it (missing
-# => 0, it is only emitted after the first increment); an unreachable /metrics is
-# a HARD fail — a down proxy must not read as "0" (task #26 sweep lesson).
+# ── #55 already-claimed reconciliation observability ─────────────────────────
+# AggKit may encounter an already-landed claim in either of two valid places:
+# before submission, where eth_estimateGas returns AlreadyClaimed() and
+# isClaimed(...) returns true; or after a transaction was already signed, where
+# eth_sendRawTransaction accepts it and exposes a status-0/no-log receipt. Pin
+# both counters so the test can prove which path healed the sponsor. A later
+# deterministic resubmission still requires the receipt path explicitly.
 DEDUP_METRIC="claim_landed_dedup_reverted_total"
+ESTIMATE_ALREADY_CLAIMED_METRIC="rpc_estimate_gas_already_claimed_total"
 metric_value() { # <metric-name>
     local body
     body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
     awk -v n="$1" '$1==n{print $2; f=1; exit} END{if(!f)print 0}' <<<"$body" | sed 's/\..*//'
+}
+
+proxy_is_claimed() { # <Solidity globalIndex>
+    local gi="$1" leaf source calldata result
+    read -r leaf source <<<"$(python3 -c '
+import sys
+gi = int(sys.argv[1], 0)
+leaf = gi & 0xffffffff
+rollup = (gi >> 32) & 0xffffffff
+mainnet = (gi >> 64) & 0xffffffff
+if mainnet == 1 and rollup == 0:
+    source = 0
+elif mainnet == 0 and rollup < 0xffffffff:
+    source = rollup + 1
+else:
+    raise SystemExit("invalid globalIndex layout")
+print(leaf, source)
+' "$gi")" || return 1
+    calldata=$(cast calldata 'isClaimed(uint32,uint32)' "$leaf" "$source") || return 1
+    result=$(rpc eth_call "[{\"to\":\"$BRIDGE_ADDRESS\",\"data\":\"$calldata\"},\"latest\"]" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or '')") || return 1
+    [[ -n "$result" ]] && [[ $((result)) -eq 1 ]]
 }
 
 # send_sponsor_noop <nonce> — consume one sponsor nonce with a ZERO-AMOUNT
@@ -746,14 +768,9 @@ verify_sponsor_functional() {
 }
 
 # verify_sponsor_recovers_automatically <label> — the HARD #55 regression. After
-# the user front-ran a globalIndex the sponsor had already signed + persisted a
-# monitored tx for, the sponsor is wedged PRE-FIX: its doomed tx is hard-rejected
-# at RPC ("already submitted") without consuming its nonce, so ClaimTxManager
-# re-broadcasts forever ("nonce mismatch") and every later claim queues behind
-# it. WITH the #55 accept-and-revert fix the sponsor recovers on its own: when it
-# re-broadcasts the doomed tx (the gi has since LANDED), the proxy ACCEPTS it and
-# writes a reverted (status 0x0) receipt, consuming the nonce, so ethtxmanager
-# marks it mined-failed and advances — geth-faithful AlreadyClaimed.
+# the user front-ran a globalIndex, AggKit must reconcile it without a nonce
+# wedge. It may do that before submission via estimateGas AlreadyClaimed() +
+# isClaimed=true, or after signing via an accepted status-0/no-log receipt.
 #
 # This asserts that recovery WITHOUT ANY MANUAL HEAL (deliberately NO
 # drain_sponsor_wedge / zero-amount no-ops — the whole point is the fix heals it
@@ -761,13 +778,13 @@ verify_sponsor_functional() {
 #   1. a fresh deposit the user never touches is autoclaimed BY THE SPONSOR
 #      within a bound (pre-fix this hangs forever → the regression);
 #   2. no PERMANENT nonce-mismatch wedge — after a settle window the sponsor's
-#      account nonce has advanced and there is ZERO fresh sponsor nonce-mismatch
-#      spam in the most recent proxy-log window (transient mismatches DURING the
-#      heal are expected; a permanent wedge is a continuous stream);
-#   3. the `claim_landed_dedup_reverted_total` metric incremented over the run —
-#      positive proof the recovery came via accept-and-revert, not luck.
+#      account nonce is stable or advancing and there is ZERO fresh
+#      nonce-mismatch spam (transient mismatches DURING a receipt-path heal are
+#      expected; a permanent wedge is a continuous stream);
+#   3. one reconciliation-path metric incremented, with isClaimed=true required
+#      for the estimateGas path — positive proof recovery was not luck.
 verify_sponsor_recovers_automatically() {
-    local label="$1" vgi deadline now c t nonce_a nonce_b settle_ts fresh_mismatch dedup_after
+    local label="$1" vgi deadline now c t nonce_a nonce_b settle_ts fresh_mismatch dedup_after estimate_after
     step "Sponsor AUTO-recovery ($label) — #55: fresh deposit MUST autoclaim with NO manual heal"
     do_l1_deposit
     fetch_deposit_json "$L1_DEP_CNT" 300
@@ -809,23 +826,32 @@ verify_sponsor_recovers_automatically() {
         || fail "sponsor STILL emitting nonce-mismatch spam ($fresh_mismatch lines in ~15s after a settle) — permanent wedge NOT healed (#55 regression)"
     pass "no permanent sponsor nonce-mismatch wedge ($label): 0 fresh mismatch lines since settle"
 
-    # (3) The accept-and-revert metric incremented over the run — positive proof
-    # the sponsor's doomed tx was accept-and-reverted (nonce consumed), i.e. the
-    # recovery came through the #55 fix.
+    # (3) Positive proof of the exact reconciliation path. The deterministic
+    # race leg below separately pins the sendRaw status-0/no-log contract.
     dedup_after=$(metric_value "$DEDUP_METRIC")
+    estimate_after=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
     log "$DEDUP_METRIC: baseline=$DEDUP_BEFORE now=$dedup_after"
-    [[ "$dedup_after" -gt "$DEDUP_BEFORE" ]] \
-        || fail "$DEDUP_METRIC did not increment ($DEDUP_BEFORE → $dedup_after) — the sponsor's already-landed claim was NOT accept-and-reverted; recovery was not via the #55 fix"
-    pass "$DEDUP_METRIC incremented ($DEDUP_BEFORE → $dedup_after): sponsor's landed-gi claim was accepted-and-reverted"
+    log "$ESTIMATE_ALREADY_CLAIMED_METRIC: baseline=$ESTIMATE_ALREADY_CLAIMED_BEFORE now=$estimate_after"
+    if [[ "$dedup_after" -gt "$DEDUP_BEFORE" ]]; then
+        pass "$DEDUP_METRIC incremented ($DEDUP_BEFORE → $dedup_after): signed duplicate received status-0/no-log reconciliation"
+    elif [[ "$estimate_after" -gt "$ESTIMATE_ALREADY_CLAIMED_BEFORE" ]]; then
+        proxy_is_claimed "$LEG1_GI" \
+            || fail "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented but isClaimed for exact front-run gi=$LEG1_GI is not true"
+        pass "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented ($ESTIMATE_ALREADY_CLAIMED_BEFORE → $estimate_after) and isClaimed(gi=$LEG1_GI)=true: AggKit reconciled before submission"
+    else
+        fail "neither already-claimed reconciliation metric incremented: sendRaw $DEDUP_BEFORE→$dedup_after, estimateGas $ESTIMATE_ALREADY_CLAIMED_BEFORE→$estimate_after"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Leg 1 — manual user claim (user submits instead of waiting for the sponsor)
 # ══════════════════════════════════════════════════════════════════════════════
-# #55 — snapshot the accept-and-revert counter BEFORE any front-run so the
-# inter-leg auto-recovery assertion can prove it incremented.
+# #55 — snapshot both valid already-claimed reconciliation counters before the
+# front-run so the inter-leg assertion can prove which path healed AggKit.
 DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
+ESTIMATE_ALREADY_CLAIMED_BEFORE=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
 log "baseline $DEDUP_METRIC = $DEDUP_BEFORE"
+log "baseline $ESTIMATE_ALREADY_CLAIMED_METRIC = $ESTIMATE_ALREADY_CLAIMED_BEFORE"
 
 step "Leg 1 — deposit L1→L2, then the USER claims it manually"
 
