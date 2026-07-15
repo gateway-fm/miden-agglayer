@@ -32,9 +32,9 @@ pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
 # closes the pipe early.
 AGGLAYER_CONT="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME:-miden-agglayer}-miden-agglayer-1}"
 LOGS=$(docker logs "$AGGLAYER_CONT" 2>&1)
-if ! grep -q "RD-940 writer worker spawned" <<<"$LOGS"; then
-    fail "writer worker not active — start stack with \
-         AGGLAYER_ENABLE_WRITER_WORKER=true AGGLAYER_WRITER_QUEUE_DEPTH=1 make e2e-up"
+if ! grep -q "single writer worker spawned" <<<"$LOGS"; then
+    fail "single writer not active — start stack with \
+         AGGLAYER_WRITER_QUEUE_DEPTH=1 make e2e-up"
 fi
 
 OUTDIR=$(mktemp -d)

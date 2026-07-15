@@ -450,6 +450,46 @@ async fn test_pgstore_txn_commit_missing_row_errors() {
     assert!(err.to_string().contains("not found"));
 }
 
+#[tokio::test]
+async fn test_pgstore_confirmed_duplicate_finalizes_linked_pending() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let mut hash_bytes = [0xdeu8; 32];
+    hash_bytes[16..].copy_from_slice(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_be_bytes(),
+    );
+    let tx_hash = TxHash::from(hash_bytes);
+    let tx_key = format!("{tx_hash:#x}");
+    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    store
+        .prepare_note_handoff(&tx_key, "confirmed-duplicate-commitment", "note-id", 10)
+        .await
+        .unwrap();
+    store
+        .txn_commit(tx_hash, Err("raw Miden error".into()), 10, [0; 32])
+        .await
+        .unwrap();
+    assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+
+    store
+        .txn_commit_confirmed_duplicate(
+            tx_hash,
+            Err("execution reverted: AlreadyClaimed()".into()),
+            11,
+        )
+        .await
+        .unwrap();
+    let (result, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+    assert!(result.is_err());
+    assert_eq!(block, 11);
+    assert!(store.get_logs_for_tx(&tx_key).await.unwrap().is_empty());
+}
+
 // ── Nonces ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -635,9 +675,9 @@ async fn test_pgstore_has_claim_event_for_global_index_finds_both_sources() {
     assert!(store.has_claim_event_for_global_index(&gi_b).await.unwrap());
 }
 
-/// `commit_manual_claim_event_atomic`: a single PG txn folds mark +
-/// log insert + cursor advance. Verify cursor lands at the expected
-/// block and a fresh ClaimEvent log appears.
+/// `commit_manual_claim_event_atomic`: a single PG txn folds the processed
+/// marker, log insert, and linked receipt completion. Block-tip advancement is
+/// intentionally left to the projector after the full block.
 #[tokio::test]
 async fn test_pgstore_commit_manual_claim_event_atomic() {
     let Some(store) = pg_store().await else {
@@ -674,8 +714,6 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
         .await
         .unwrap();
 
-    // Cursor advanced.
-    assert!(store.get_latest_block_number().await.unwrap() >= block);
     // Note processed.
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());
     // ClaimEvent dedup query finds the row.
@@ -1451,4 +1489,514 @@ fn rand_u64() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
         ^ (std::process::id() as u64).wrapping_mul(2_654_435_761)
+}
+
+// ── #55 accept-and-revert — BLOCKER 1 & 2 regressions on the real store ──────
+//
+// PG-gated (skip when DATABASE_URL is unset; run in the postgres-feature CI).
+// The service-level routing logic (`acquire_claim_lock` typed outcome, the
+// crash-gap nonce repair) is exercised against a genuine PgStore so the atomic
+// landed classification and the nonce-repair primitive are proven on BOTH stores.
+
+/// BLOCKER 1 — `acquire_claim_lock` classifies a claim submission atomically on
+/// PgStore: fresh → Acquired; locked+no-event(in TTL) → InFlight; locked+ClaimEvent
+/// → Landed (the authoritative landed detection that closes the TOCTOU); orphaned
+/// (locked+no-event, TTL expired) → Acquired. LANDED beats TTL-expiry recovery.
+#[tokio::test]
+async fn test_pgstore_acquire_claim_lock_outcomes() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store);
+    use crate::service_send_raw_txn::{ClaimLockOutcome, acquire_claim_lock};
+    let ttl = std::time::Duration::from_secs(3600);
+
+    let base = rand_u64();
+    let gi_fresh = U256::from(base.wrapping_add(1));
+    let gi_inflight = U256::from(base.wrapping_add(2));
+    let gi_landed = U256::from(base.wrapping_add(3));
+    let gi_orphan = U256::from(base.wrapping_add(4));
+
+    // 1. Fresh index → Acquired.
+    assert_eq!(
+        acquire_claim_lock(&store, gi_fresh, TxHash::ZERO, ttl)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::Acquired { fence: 1 }
+    );
+
+    // 2. Locked, no ClaimEvent, within TTL → InFlight.
+    store.try_claim(gi_inflight).await.unwrap();
+    assert_eq!(
+        acquire_claim_lock(&store, gi_inflight, TxHash::ZERO, ttl)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::InFlight
+    );
+
+    // 3. Locked + ClaimEvent → Landed (BLOCKER 1: atomic landed classification).
+    store.try_claim(gi_landed).await.unwrap();
+    store
+        .commit_manual_claim_event_atomic(
+            format!("pg-landed-note-{base}"),
+            "0xbridge",
+            base % 1_000_000,
+            [0u8; 32],
+            "0xwatchertx",
+            gi_landed.to_be_bytes::<32>(),
+            0,
+            &[0u8; 20],
+            &[0u8; 20],
+            1234,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        acquire_claim_lock(&store, gi_landed, TxHash::ZERO, ttl)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::Landed
+    );
+    // LANDED beats TTL-expiry recovery.
+    assert_eq!(
+        acquire_claim_lock(&store, gi_landed, TxHash::ZERO, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::Landed
+    );
+
+    // 4. Orphaned (locked, no ClaimEvent, TTL expired) → Acquired (superseded).
+    store.try_claim(gi_orphan).await.unwrap();
+    assert_eq!(
+        acquire_claim_lock(&store, gi_orphan, TxHash::ZERO, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        ClaimLockOutcome::Acquired { fence: 1 }
+    );
+}
+
+/// BLOCKER 2 — the crash-gap nonce repair on PgStore, via a PgStore-backed
+/// service. Simulate the exact durable state a crash between the receipt write and
+/// `nonce_increment` leaves (a known tx row, but a STALE expected nonce), then run
+/// the repair: the nonce advances exactly once (idempotent), so a rebroadcast heals
+/// the nonce rather than serving stale forever — the sponsor is not wedged.
+#[tokio::test]
+async fn test_pgstore_crash_gap_nonce_repair() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(store);
+    let service = crate::test_helpers::create_test_service_with_store(store.clone());
+
+    let signer = Address::from([0x5au8; 20]);
+    let signer_str = format!("{signer:#x}");
+    let tx_hash = TxHash::from([0x5bu8; 32]);
+
+    // Precondition: expected nonce starts at 0.
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+    // Simulate the crash-gap durable state: a KNOWN tx (receipt persisted) at nonce
+    // 0, with the nonce NOT advanced.
+    store
+        .txn_begin(tx_hash, dummy_txn_entry_for(signer))
+        .await
+        .unwrap();
+    store
+        .txn_commit(tx_hash, Err("crash-gap".into()), 0, [0u8; 32])
+        .await
+        .unwrap();
+    assert!(store.txn_get(tx_hash).await.unwrap().is_some());
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+
+    // The repair (crash-gap signature: expected == tx.nonce == 0) advances once.
+    let repaired = crate::service_send_raw_txn::repair_commit_gap_nonce(&service, &signer_str, 0)
+        .await
+        .unwrap();
+    assert!(repaired, "the crash-gap must be repaired");
+    assert_eq!(
+        store.nonce_get(&signer_str).await.unwrap(),
+        1,
+        "crash-gap nonce advanced to complete the interrupted accept"
+    );
+
+    // Idempotent: a further repair for the same tx.nonce is a no-op (expected 1 != 0).
+    let repaired_again =
+        crate::service_send_raw_txn::repair_commit_gap_nonce(&service, &signer_str, 0)
+            .await
+            .unwrap();
+    assert!(!repaired_again, "repair must be idempotent");
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+
+    // A normally-advanced tx (expected 1 > tx.nonce 0) is never repaired.
+    assert!(
+        !crate::service_send_raw_txn::repair_commit_gap_nonce(&service, &signer_str, 0)
+            .await
+            .unwrap()
+    );
+}
+
+/// A TxnEntry carrying a real signer for the crash-gap fixture.
+fn dummy_txn_entry_for(signer: Address) -> TxnEntry {
+    let tx = TxEip1559::default();
+    TxnEntry {
+        id: None,
+        envelope: TxEnvelope::Eip1559(alloy::consensus::Signed::new_unchecked(
+            tx,
+            Signature::test_signature(),
+            TxHash::default(),
+        )),
+        signer,
+        expires_at: None,
+        logs: vec![],
+    }
+}
+
+/// BLOCKER D — `nonce_advance_cas` on PgStore: advances only WHERE the stored nonce
+/// equals `expected`, returning whether it won. Fresh address is nonce 0.
+#[tokio::test]
+async fn test_pgstore_nonce_advance_cas() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let addr = format!("0x{:040x}", rand_u64() as u128);
+
+    // Fresh (no row = 0): CAS(0) wins → 1; a second CAS(0) loses (now 1).
+    assert!(store.nonce_advance_cas(&addr, 0).await.unwrap());
+    assert_eq!(store.nonce_get(&addr).await.unwrap(), 1);
+    assert!(!store.nonce_advance_cas(&addr, 0).await.unwrap());
+    assert_eq!(store.nonce_get(&addr).await.unwrap(), 1);
+
+    // CAS at the wrong expected loses; at the right expected wins.
+    assert!(!store.nonce_advance_cas(&addr, 5).await.unwrap());
+    assert!(store.nonce_advance_cas(&addr, 1).await.unwrap());
+    assert_eq!(store.nonce_get(&addr).await.unwrap(), 2);
+}
+
+/// BLOCKER C — `commit_reverted_receipt_and_advance_nonce` on PgStore: one
+/// transaction writes a COMMITTED reverted receipt (never pending) AND CAS-advances
+/// the nonce; idempotent on tx_hash, and the CAS is a no-op once the nonce moved.
+#[tokio::test]
+async fn test_pgstore_commit_reverted_receipt_and_advance_nonce() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let base = rand_u64();
+    let signer = Address::from([(base % 251) as u8 + 1; 20]);
+    let signer_str = format!("{signer:#x}");
+    let tx_hash = TxHash::from([(base % 241) as u8 + 2; 32]);
+
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+
+    // First call: receipt committed-reverted + nonce CAS-advanced (expected 0 → 1).
+    let advanced = store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_hash,
+            dummy_txn_entry_for(signer),
+            "landed (AlreadyClaimed) #55".into(),
+            7,
+            [0u8; 32],
+            &signer_str,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        advanced,
+        "the nonce CAS wins on the sync accept path (expected == 0)"
+    );
+    // Receipt is COMMITTED (non-null) and reverted (status 0x0).
+    let (result, block) = store
+        .txn_receipt(tx_hash)
+        .await
+        .unwrap()
+        .expect("receipt is committed, never pending");
+    assert!(result.is_err(), "status 0x0 reverted");
+    assert_eq!(block, 7);
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+
+    // Idempotent re-entry (expected 0 again): receipt re-affirmed, nonce NOT
+    // double-advanced (the CAS no-ops because the nonce already moved to 1).
+    let advanced_again = store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_hash,
+            dummy_txn_entry_for(signer),
+            "landed (AlreadyClaimed) #55".into(),
+            7,
+            [0u8; 32],
+            &signer_str,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !advanced_again,
+        "re-entry must not double-advance the nonce"
+    );
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+    assert!(store.txn_receipt(tx_hash).await.unwrap().is_some());
+}
+
+/// BLOCKER 1 — `reserve_nonce` on PgStore: the first tx to reserve a (signer, nonce)
+/// wins; a different tx at the same slot loses (HeldBy the winner); the same tx is
+/// idempotent (HeldBy itself); a different nonce is free.
+#[tokio::test]
+async fn test_pgstore_reserve_nonce() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let base = rand_u64();
+    let addr = format!("0x{:040x}", base as u128);
+    let h1 = TxHash::from([(base % 251) as u8 + 1; 32]);
+    let h2 = TxHash::from([(base % 241) as u8 + 2; 32]);
+    let lease = std::time::Duration::from_secs(90);
+
+    // Fresh → Won(fence).
+    let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 5, h1, lease).await.unwrap()
+    else {
+        panic!("fresh slot must be Won");
+    };
+    // Same tx, valid lease → OwnedBySame.
+    assert_eq!(
+        store.reserve_nonce(&addr, 5, h1, lease).await.unwrap(),
+        NonceReservation::OwnedBySame
+    );
+    // Different tx, same slot → HeldByOther(winner h1).
+    assert_eq!(
+        store.reserve_nonce(&addr, 5, h2, lease).await.unwrap(),
+        NonceReservation::HeldByOther(h1)
+    );
+    // release-FAILURE → same tx takes over (fence bumps).
+    store
+        .release_reservation(&addr, 5, h1, fence, false)
+        .await
+        .unwrap();
+    let NonceReservation::Won { fence: fence2 } =
+        store.reserve_nonce(&addr, 5, h1, lease).await.unwrap()
+    else {
+        panic!("after release-failure the same tx must retake ownership");
+    };
+    assert!(fence2 > fence, "takeover bumps the fence");
+    // release-SUCCESS → the exact durable tx can resume after restart.
+    store
+        .release_reservation(&addr, 5, h1, fence2, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.reserve_nonce(&addr, 5, h1, lease).await.unwrap(),
+        NonceReservation::Won { fence } if fence > fence2
+    ));
+    // Different nonce → free.
+    assert!(matches!(
+        store.reserve_nonce(&addr, 6, h2, lease).await.unwrap(),
+        NonceReservation::Won { .. }
+    ));
+}
+
+/// BLOCKER 1 — FULL two-replica shared-PostgreSQL races. Two PgStore handles over
+/// the SAME database (two "replicas") reserve the SAME (signer, nonce) slot.
+#[tokio::test]
+async fn test_pgstore_two_replica_reservation_races() {
+    let Some(replica_a) = pg_store().await else {
+        return;
+    };
+    let Some(replica_b) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let lease = std::time::Duration::from_secs(90);
+    let base = rand_u64();
+
+    // (1) DIFFERENT-hash race at the same slot: exactly one wins, the other is
+    //     HeldByOther and must NOT execute.
+    let addr = format!("0x{:040x}", base as u128);
+    let ha = TxHash::from([(base % 251) as u8 + 7; 32]);
+    let hb = TxHash::from([(base % 241) as u8 + 8; 32]);
+    let ra = replica_a.reserve_nonce(&addr, 3, ha, lease).await.unwrap();
+    let rb = replica_b.reserve_nonce(&addr, 3, hb, lease).await.unwrap();
+    let a_won = matches!(ra, NonceReservation::Won { .. });
+    let b_won = matches!(rb, NonceReservation::Won { .. });
+    // Replica A reserved first (sequential here), so A wins and B is HeldByOther.
+    assert!(a_won, "the first replica to reserve wins: {ra:?}");
+    assert!(
+        !b_won,
+        "the second replica with a DIFFERENT hash must not win: {rb:?}"
+    );
+    assert_eq!(rb, NonceReservation::HeldByOther(ha));
+
+    // (2) SAME-hash race at another slot: replica A wins ownership; replica B
+    //     submitting the IDENTICAL tx while A's lease is valid gets OwnedBySame and
+    //     must DEDUP (not execute) — no double Miden work.
+    let addr2 = format!("0x{:040x}", base.wrapping_add(1) as u128);
+    let h = TxHash::from([(base % 233) as u8 + 9; 32]);
+    let ra2 = replica_a.reserve_nonce(&addr2, 4, h, lease).await.unwrap();
+    assert!(
+        matches!(ra2, NonceReservation::Won { .. }),
+        "A wins: {ra2:?}"
+    );
+    let rb2 = replica_b.reserve_nonce(&addr2, 4, h, lease).await.unwrap();
+    assert_eq!(
+        rb2,
+        NonceReservation::OwnedBySame,
+        "the same tx on another replica while the owner's lease is valid must dedup, \
+         not double-execute"
+    );
+}
+
+/// BLOCKER 4 — `commit_reverted_receipt_and_advance_nonce` on PgStore is CONDITIONAL:
+/// it never overwrites a REAL receipt (pending or successful) with status 0.
+#[tokio::test]
+async fn test_pgstore_reverted_receipt_conditional() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let base = rand_u64();
+    let signer = Address::from([(base % 251) as u8 + 3; 20]);
+    let signer_str = format!("{signer:#x}");
+
+    // (a) SUCCESS receipt must survive.
+    let tx_ok = TxHash::from([(base % 239) as u8 + 4; 32]);
+    store
+        .txn_begin(tx_ok, dummy_txn_entry_for(signer))
+        .await
+        .unwrap();
+    store.txn_commit(tx_ok, Ok(()), 5, [0u8; 32]).await.unwrap();
+    store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_ok,
+            dummy_txn_entry_for(signer),
+            "revert".into(),
+            9,
+            [0u8; 32],
+            &signer_str,
+            0,
+        )
+        .await
+        .unwrap();
+    let (r_ok, _) = store.txn_receipt(tx_ok).await.unwrap().expect("receipt");
+    assert!(
+        r_ok.is_ok(),
+        "a REAL success receipt must NOT be overwritten to failed"
+    );
+
+    // (b) PENDING receipt must stay pending.
+    let tx_pending = TxHash::from([(base % 233) as u8 + 5; 32]);
+    store
+        .txn_begin(tx_pending, dummy_txn_entry_for(signer))
+        .await
+        .unwrap();
+    store
+        .record_tx_note_link(&format!("{tx_pending:#x}"), "real-note")
+        .await
+        .unwrap();
+    store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_pending,
+            dummy_txn_entry_for(signer),
+            "revert".into(),
+            9,
+            [0u8; 32],
+            &signer_str,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.txn_receipt(tx_pending).await.unwrap().is_none(),
+        "a REAL pending receipt must stay pending, not be finalised to failed"
+    );
+
+    // (c) ABSENT hash → reverted receipt IS written.
+    let tx_new = TxHash::from([(base % 229) as u8 + 6; 32]);
+    store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_new,
+            dummy_txn_entry_for(signer),
+            "revert".into(),
+            9,
+            [0u8; 32],
+            &signer_str,
+            2,
+        )
+        .await
+        .unwrap();
+    let (r_new, _) = store.txn_receipt(tx_new).await.unwrap().expect("receipt");
+    assert!(
+        r_new.is_err(),
+        "an absent hash gets the reverted (status 0x0) receipt"
+    );
+}
+
+/// PostgreSQL claim reclaim is fenced through the atomic submitted-state + note-link seal.
+#[tokio::test]
+async fn test_pgstore_claim_reclaim_fences_stale_owner() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let base = rand_u64();
+    let gi = U256::from(base);
+    let tx_a = TxHash::from([(base % 211) as u8 + 12; 32]);
+    let tx_b = TxHash::from([(base % 199) as u8 + 13; 32]);
+    let a = store
+        .try_claim_fenced(gi, tx_a, std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    let b = store
+        .try_reclaim_claim_fenced(gi, tx_b, std::time::Duration::from_secs(90))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(b.fence > a.fence);
+    assert!(
+        !store
+            .prepare_claim_submission_fenced(gi, tx_a, a.fence, tx_a, "stale", "stale-id", 100,)
+            .await
+            .unwrap()
+    );
+    assert!(!store.unclaim_fenced(&gi, tx_a, a.fence).await.unwrap());
+    assert!(
+        store
+            .prepare_claim_submission_fenced(gi, tx_b, b.fence, tx_b, "winner", "winner-id", 100,)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_note_link_for_tx(&format!("{tx_b:#x}"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("winner")
+    );
+}
+
+/// PostgreSQL must permanently bind an ambiguous nonce slot to the first hash.
+#[tokio::test]
+async fn test_pgstore_different_tx_cannot_take_over() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let lease = std::time::Duration::from_secs(90);
+    let base = rand_u64();
+    let addr = format!("0x{:040x}", base as u128);
+    let ha = TxHash::from([(base % 251) as u8 + 10; 32]);
+    let hb = TxHash::from([(base % 241) as u8 + 11; 32]);
+
+    let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 1, ha, lease).await.unwrap()
+    else {
+        panic!("fresh must win");
+    };
+    store
+        .release_reservation(&addr, 1, ha, fence, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reserve_nonce(&addr, 1, hb, lease).await.unwrap(),
+        NonceReservation::HeldByOther(ha)
+    );
+    assert!(matches!(
+        store.reserve_nonce(&addr, 1, ha, lease).await.unwrap(),
+        NonceReservation::Won { .. }
+    ));
 }

@@ -1212,6 +1212,13 @@ pub(crate) async fn project_claim_note(
         return Ok(ClaimProjectOutcome::Skipped);
     }
 
+    // Exact local observation is authoritative even if an earlier projector
+    // already emitted the event. Promote the durable handoff before either
+    // dedup return so expiration recovery cannot later reopen this claim.
+    let observed_tx_hash = store
+        .confirm_note_handoff_by_commitment(&note_id_str)
+        .await?;
+
     // Dedup 1: was this CLAIM already replayed by an earlier restore (or by the
     // live watcher)?
     if store.is_claim_note_processed(&note_id_str).await? {
@@ -1267,9 +1274,12 @@ pub(crate) async fn project_claim_note(
     // aggkit fails "input too short: 0 bytes" and never settles the certificate.
     // Fall back to the derived hash only for notes with no recorded link (e.g.
     // restore replaying history predating the link, or notes submitted out-of-band).
-    let (tx_hash, linked) = match store.get_tx_for_note(&note_id_str).await? {
-        Some(real_tx) => (real_tx, true),
-        None => (derive_manual_claim_tx_hash(&note_id_str), false),
+    let tx_hash = match observed_tx_hash {
+        Some(real_tx) => real_tx,
+        None => match store.get_tx_for_note(&note_id_str).await? {
+            Some(real_tx) => real_tx,
+            None => derive_manual_claim_tx_hash(&note_id_str),
+        },
     };
 
     store
@@ -1286,25 +1296,6 @@ pub(crate) async fn project_claim_note(
             decoded.amount,
         )
         .await?;
-
-    // The projector OWNS receipt completion: finalise the real claim tx's receipt
-    // at THIS (consumption) block — the same block the ClaimEvent is emitted — so the
-    // receipt block == the log block. `publish_claim` left it pending (`id: None`) for
-    // exactly this. Tolerate a missing pending entry (derived-hash fallback, which has
-    // no real `txn_begin`; or an expired/pruned tx, or restore predating the tx
-    // record): the receipt is then synthesised from the log by `service_get_txn_receipt`,
-    // so a missing entry must not abort the projection.
-    if let Some(h) = linked
-        .then(|| tx_hash.parse::<alloy::primitives::TxHash>().ok())
-        .flatten()
-    {
-        let _ = store
-            .txn_commit(h, Ok(()), block_number, block_hash)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(tx = %tx_hash, "claim receipt not finalised: {e}");
-            });
-    }
 
     ::metrics::counter!("claim_watcher_synthesised_total").increment(1);
     tracing::info!(
@@ -1514,6 +1505,13 @@ pub(crate) async fn project_ger_note(
         }
     }
 
+    let note_commitment = hex::encode(note.details_commitment().as_bytes());
+    // Promote before storage/dedup exits: seeing our exact note proves that a
+    // prepared handoff must not be cleared and rebuilt after expiration.
+    let observed_tx_hash = store
+        .confirm_note_handoff_by_commitment(&note_commitment)
+        .await?;
+
     let storage = details.storage();
     let items = storage.items();
     if items.len() < UpdateGerNote::NUM_STORAGE_ITEMS {
@@ -1550,15 +1548,17 @@ pub(crate) async fn project_ger_note(
     // the note↔tx link `insert_ger` recorded), falling back to a derived hash only
     // for notes with no recorded link (restore replaying history predating the link,
     // or out-of-band injects).
-    let note_commitment = hex::encode(note.details_commitment().as_bytes());
-    let (tx_hash, linked) = match store.get_tx_for_note(&note_commitment).await? {
-        Some(real_tx) => (real_tx, true),
-        None => {
-            let mut hasher = Keccak256::new();
-            hasher.update(b"restore-ger-miden-");
-            hasher.update(note_commitment.as_bytes());
-            (format!("0x{}", hex::encode(hasher.finalize())), false)
-        }
+    let tx_hash = match observed_tx_hash {
+        Some(real_tx) => real_tx,
+        None => match store.get_tx_for_note(&note_commitment).await? {
+            Some(real_tx) => real_tx,
+            None => {
+                let mut hasher = Keccak256::new();
+                hasher.update(b"restore-ger-miden-");
+                hasher.update(note_commitment.as_bytes());
+                format!("0x{}", hex::encode(hasher.finalize()))
+            }
+        },
     };
 
     store
@@ -1572,24 +1572,6 @@ pub(crate) async fn project_ger_note(
             timestamp,
         )
         .await?;
-
-    // The projector OWNS receipt completion: finalise the real insertGlobalExitRoot
-    // tx's receipt at THIS (consumption) block — the same block the GER log is emitted
-    // — so receipt block == log block. `insert_ger` left it pending (`id: None`).
-    // Tolerate a missing pending entry (derived-hash fallback, or restore predating the
-    // link): the receipt is then synthesised from the log by `service_get_txn_receipt`,
-    // so a missing entry must not abort the projection.
-    if let Some(h) = linked
-        .then(|| tx_hash.parse::<alloy::primitives::TxHash>().ok())
-        .flatten()
-    {
-        let _ = store
-            .txn_commit(h, Ok(()), block_number, block_hash)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(tx = %tx_hash, "GER receipt not finalised: {e}");
-            });
-    }
 
     tracing::info!(
         note_id = %hex::encode(note.details_commitment().as_bytes()),
@@ -1955,7 +1937,11 @@ mod tests {
 
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
-        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            0,
+            "an individual note projection must not seal its block"
+        );
 
         // Idempotency: Dedup 1 short-circuits on a second pass. We model
         // this by checking the predicate restore_claims uses BEFORE doing
@@ -3103,11 +3089,14 @@ mod tests {
         let real_tx = TxHash::from([0xEEu8; 32]);
         let real_tx_str = format!("{real_tx:#x}");
         let note_commitment = hex::encode(note.details_commitment().as_bytes());
+        let note_id = "test-ger-note-id";
         let signer = alloy::primitives::Address::from([0x42u8; 20]);
         crate::ger::record_ger_submission_handoff(
             &*store,
             real_tx,
             &note_commitment,
+            note_id,
+            1_000,
             test_ger_envelope(real_tx),
             signer,
         )

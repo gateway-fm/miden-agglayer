@@ -22,23 +22,15 @@
 #        USER (hard), and the wallet balance == EXACTLY the deposits sent so
 #        far × the per-deposit mint (deposit-linked accounting).
 #
-#   Sponsor heal + functional verification (between the legs AND as the
+#   Sponsor recovery + functional verification (between the legs AND as the
 #   epilogue — both HARD):
-#     Front-running the sponsor wedges aggkit/bridge-service's ClaimTxManager:
-#     it has signed its own claim tx for the raced gi at its next nonce; the
-#     proxy rejects that tx FOREVER ("claim already submitted" — hard dedup),
-#     the R4 nonce gate never advances, and every later sponsor claim queues
-#     behind it ("nonce mismatch" spam every ~2s). On a real EVM chain the
-#     sponsor's claimAsset would MINE as an AlreadyClaimed revert and consume
-#     the nonce; the proxy rejects at RPC submission, so the nonce never burns.
-#     THE HEAL (validated live, 2026-07-13 rel-v0158): consume each wedged
-#     head nonce with a benign zero-amount claimAsset no-op signed by the
-#     sponsor key (the proxy accepts zero-amount claims immediately, RPC-only:
-#     no Miden publish, no ClaimEvent, no claim lock — src/service_send_raw_txn.rs
-#     "skipping zero-amount claim"), until the sponsor's submissions stop being
-#     nonce-frozen. Then HARD-assert the sponsor is functional: a fresh deposit
-#     must autoclaim with receipt.from == the sponsor. The test FAILS if the
-#     sponsor cannot be healed — never a warning.
+#     Front-running used to wedge aggkit/bridge-service's ClaimTxManager: the
+#     proxy hard-rejected the sponsor's already-signed transaction without
+#     consuming its nonce. The fixed behavior accepts that exact transaction,
+#     returns a terminal status-0 receipt, and consumes its nonce just as an EVM
+#     AlreadyClaimed revert would. The inter-leg check proves automatic recovery
+#     without a manual nonce drain. The epilogue retains the zero-amount no-op
+#     helper only as cleanup for stacks that were already wedged before the test.
 #
 #   Leg 2 — dedup race on the same globalIndex (sponsor participation PROVEN):
 #     Second deposit; wait until it is ready_for_claim, then fire the user's
@@ -46,11 +38,10 @@
 #     Whoever wins, assert: exactly ONE ClaimEvent for the gi; and POSITIVE
 #     sponsor participation —
 #       · sponsor won → the winning receipt's from == the SPONSOR address;
-#       · user won   → after the user's last (deterministic, dedup-rejected)
-#         submission, NEW "claim already submitted" rejections for this gi
-#         keep appearing in the proxy log (only the sponsor submits it by
-#         then), AND the sponsor signer's eth_sendRawTransaction submissions
-#         are visible in the proxy's nonce_snoop log.
+#       · user won   → capture the sponsor's exact transaction hash from
+#         the nonce-snoop submissions beginning at the pre-race timestamp,
+#         decode that transaction's claimAsset globalIndex, and prove that exact
+#         hash reaches a terminal status-0 receipt with no logs.
 #     The test FAILS if the sponsor never raced gi2.
 #
 #   Optional ALLOWLIST_LEG=1 phase (DISPOSABLE STACKS ONLY — restarts the
@@ -417,10 +408,34 @@ submit_user_claim() {
         result=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or '')" 2>/dev/null || true)
         errmsg=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',{}).get('message') or '')" 2>/dev/null || true)
         if [[ -n "$result" ]]; then
-            SUBMIT_OUTCOME="user_won"; USER_TX="$result"; return 0
+            USER_TX="$result"
+            # #55 — a returned hash is NOT automatically a user win. If the sponsor
+            # already LANDED this gi, the proxy ACCEPTS the user's tx and writes a
+            # status-0x0 (reverted) receipt with EMPTY logs / NO ClaimEvent
+            # (geth-faithful AlreadyClaimed) — the user did NOT win. A genuine win's
+            # receipt finalises to status 0x1.
+            #
+            # BLOCKER 5 — in WRITER (async) mode the accept-and-revert receipt is
+            # written by the worker AFTER the queue, so a single 1s re-check is not
+            # enough. POLL until the receipt reaches a TERMINAL status: 0x1 → genuine
+            # user win (exit immediately); 0x0 → accept-and-reverted. If it never
+            # terminalises within the bound it is a slow projector on a genuine win,
+            # so default to user_won and let the downstream status-1 wait confirm it.
+            local st="" polled=0
+            while (( polled < 180 )); do
+                st=$(receipt_status "$result")
+                [[ "$st" == "0x0" || "$st" == "0x1" ]] && break
+                sleep 2; polled=$((polled+2))
+            done
+            if [[ "$st" == "0x0" ]]; then
+                SUBMIT_OUTCOME="accept_reverted"; return 0
+            fi
+            SUBMIT_OUTCOME="user_won"; return 0
         fi
         LAST_ERR="$errmsg"
         if [[ "$errmsg" == *"already submitted"* ]]; then
+            # Sponsor's claim is IN FLIGHT (no ClaimEvent yet): the proxy hard-rejects
+            # a second submitter (InFlight). Once it LANDS, a resubmit accept-reverts.
             SUBMIT_OUTCOME="dedup_rejected"; return 0
         fi
         # C6 GER-not-seen and transient rejections: retry quickly.
@@ -474,9 +489,94 @@ receipt_status_ok() { # <tx-hash>
         | python3 -c "import json,sys; r=json.load(sys.stdin).get('result'); exit(0 if r and r.get('status')=='0x1' else 1)"
 }
 
+# receipt_status <tx-hash> → raw status ("0x0" | "0x1") or "" when the receipt is
+# still null (pending). #55: accept-and-revert writes an IMMEDIATE status-0x0
+# receipt; a genuine claim is null until the projector finalises it, then 0x1.
+receipt_status() { # <tx-hash>
+    rpc eth_getTransactionReceipt "[\"$1\"]" \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result') or {}; print(r.get('status') or '')"
+}
+
+# receipt_logs_empty <tx-hash> → exit 0 iff the receipt exists and carries ZERO
+# logs (the accept-and-revert shape: no ClaimEvent). Non-existent/1+ logs → non-zero.
+receipt_logs_empty() { # <tx-hash>
+    rpc eth_getTransactionReceipt "[\"$1\"]" \
+        | python3 -c "import json,sys; r=json.load(sys.stdin).get('result'); exit(0 if r and len(r.get('logs') or [])==0 else 1)"
+}
+
 receipt_from() { # <tx-hash> → lowercase from address (empty if absent)
     rpc eth_getTransactionReceipt "[\"$1\"]" \
         | python3 -c "import json,sys; r=json.load(sys.stdin).get('result') or {}; f=r.get('from') or ''; print('' if f=='null' else f.lower())"
+}
+
+# sponsor_submission_hashes_since <ISO timestamp> → unique sponsor hashes
+# observed by eth_sendRawTransaction from the start of the race. This is only a
+# candidate set: the sponsor may submit unrelated claims concurrently, so the
+# caller MUST decode each transaction and match the exact globalIndex.
+sponsor_submission_hashes_since() {
+    local since="$1"
+    docker logs --tail 20000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
+        | awk -v ts="$since" '$1 >= ts' \
+        | grep -E '"event": ?"eth_sendRawTransaction_received"' \
+        | grep -iE "\"signer\": ?\"$SPONSOR_ADDR_LC\"" \
+        | python3 -c '
+import re, sys
+seen = set()
+for line in sys.stdin:
+    for tx_hash in re.findall(r"\"tx_hash\"\s*:\s*\"(0x[0-9a-fA-F]{64})\"", line):
+        tx_hash = tx_hash.lower()
+        if tx_hash not in seen:
+            seen.add(tx_hash)
+            print(tx_hash)
+' || true
+}
+
+# sponsor_claim_global_index <tx-hash> → decimal globalIndex, or no output
+# when the hash is not yet queryable, is not sponsor-signed, or is not a full
+# claimAsset call. The two bytes32[32] proofs occupy the first 64 ABI words;
+# globalIndex is the next word after the four-byte selector.
+sponsor_claim_global_index() {
+    local tx_hash="$1"
+    rpc eth_getTransactionByHash "[\"$tx_hash\"]" | python3 -c '
+import json, sys
+expected = sys.argv[1].lower()
+try:
+    tx = json.load(sys.stdin).get("result") or {}
+except Exception:
+    sys.exit(0)
+if (tx.get("from") or "").lower() != expected:
+    sys.exit(0)
+data = (tx.get("input") or "").removeprefix("0x")
+word_start = 8 + (64 * 64)
+if len(data) < word_start + 64:
+    sys.exit(0)
+try:
+    print(int(data[word_start:word_start + 64], 16))
+except ValueError:
+    pass
+' "$SPONSOR_ADDR_LC"
+}
+
+# find_exact_sponsor_racer <ISO timestamp> <globalIndex> <timeout-secs>
+# Prints the exact sponsor tx hash whose signed claimAsset calldata names the
+# raced globalIndex. Rejected early attempts may not be queryable immediately;
+# keep polling until the same signed hash is durably accepted.
+find_exact_sponsor_racer() {
+    local since="$1" expected_gi="$2" timeout="$3" deadline hash observed_gi
+    expected_gi=$(python3 -c 'import sys; v=sys.argv[1]; print(int(v, 16) if v.lower().startswith("0x") else int(v, 10))' "$expected_gi")
+    deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) < deadline )); do
+        while read -r hash; do
+            [[ -n "$hash" ]] || continue
+            observed_gi=$(sponsor_claim_global_index "$hash" || true)
+            if [[ "$observed_gi" == "$expected_gi" ]]; then
+                echo "$hash"
+                return 0
+            fi
+        done < <(sponsor_submission_hashes_since "$since")
+        sleep 2
+    done
+    return 1
 }
 
 # assert_receipt_signer <tx-hash> <expected-addr-lc> <who> — HARD: a receipt
@@ -517,6 +617,43 @@ ZERO_PROOF="[$(python3 -c "print(','.join(['0x' + '00'*32] * 32))")]"
 sponsor_nonce() {
     rpc eth_getTransactionCount "[\"$SPONSOR_ADDR\",\"latest\"]" \
         | python3 -c "import json,sys; print(int(json.load(sys.stdin)['result'],16))"
+}
+
+# ── #55 already-claimed reconciliation observability ─────────────────────────
+# AggKit may encounter an already-landed claim in either of two valid places:
+# before submission, where eth_estimateGas returns AlreadyClaimed() and
+# isClaimed(...) returns true; or after a transaction was already signed, where
+# eth_sendRawTransaction accepts it and exposes a status-0/no-log receipt. Pin
+# both counters so the test can prove which path healed the sponsor. A later
+# deterministic resubmission still requires the receipt path explicitly.
+DEDUP_METRIC="claim_landed_dedup_reverted_total"
+ESTIMATE_ALREADY_CLAIMED_METRIC="rpc_estimate_gas_already_claimed_total"
+metric_value() { # <metric-name>
+    local body
+    body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
+    awk -v n="$1" '$1==n{print $2; f=1; exit} END{if(!f)print 0}' <<<"$body" | sed 's/\..*//'
+}
+
+proxy_is_claimed() { # <Solidity globalIndex>
+    local gi="$1" leaf source calldata result
+    read -r leaf source <<<"$(python3 -c '
+import sys
+gi = int(sys.argv[1], 0)
+leaf = gi & 0xffffffff
+rollup = (gi >> 32) & 0xffffffff
+mainnet = (gi >> 64) & 0xffffffff
+if mainnet == 1 and rollup == 0:
+    source = 0
+elif mainnet == 0 and rollup < 0xffffffff:
+    source = rollup + 1
+else:
+    raise SystemExit("invalid globalIndex layout")
+print(leaf, source)
+' "$gi")" || return 1
+    calldata=$(cast calldata 'isClaimed(uint32,uint32)' "$leaf" "$source") || return 1
+    result=$(rpc eth_call "[{\"to\":\"$BRIDGE_ADDRESS\",\"data\":\"$calldata\"},\"latest\"]" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or '')") || return 1
+    [[ -n "$result" ]] && [[ $((result)) -eq 1 ]]
 }
 
 # send_sponsor_noop <nonce> — consume one sponsor nonce with a ZERO-AMOUNT
@@ -630,9 +767,92 @@ verify_sponsor_functional() {
     pass "sponsor is functional ($label): fresh deposit gi=$vgi autoclaimed by the sponsor (tx $t)"
 }
 
+# verify_sponsor_recovers_automatically <label> — the HARD #55 regression. After
+# the user front-ran a globalIndex, AggKit must reconcile it without a nonce
+# wedge. It may do that before submission via estimateGas AlreadyClaimed() +
+# isClaimed=true, or after signing via an accepted status-0/no-log receipt.
+#
+# This asserts that recovery WITHOUT ANY MANUAL HEAL (deliberately NO
+# drain_sponsor_wedge / zero-amount no-ops — the whole point is the fix heals it
+# for us):
+#   1. a fresh deposit the user never touches is autoclaimed BY THE SPONSOR
+#      within a bound (pre-fix this hangs forever → the regression);
+#   2. no PERMANENT nonce-mismatch wedge — after a settle window the sponsor's
+#      account nonce is stable or advancing and there is ZERO fresh
+#      nonce-mismatch spam (transient mismatches DURING a receipt-path heal are
+#      expected; a permanent wedge is a continuous stream);
+#   3. one reconciliation-path metric incremented, with isClaimed=true required
+#      for the estimateGas path — positive proof recovery was not luck.
+verify_sponsor_recovers_automatically() {
+    local label="$1" vgi deadline now c t nonce_a nonce_b settle_ts fresh_mismatch dedup_after estimate_after
+    step "Sponsor AUTO-recovery ($label) — #55: fresh deposit MUST autoclaim with NO manual heal"
+    do_l1_deposit
+    fetch_deposit_json "$L1_DEP_CNT" 300
+    vgi=$(echo "$DEP_JSON" | dep_field global_index)
+    log "auto-recovery deposit: cnt=$L1_DEP_CNT gi=$vgi (user will NOT claim it; NO nonce drain will be issued)"
+
+    # NO drain_sponsor_wedge here — the fix must heal the sponsor by itself.
+    deadline=$(( $(date +%s) + 600 ))
+    while :; do
+        read -r c t <<<"$(claim_events_for_gi "$vgi" || echo "0 -")"
+        [[ "${c:-0}" -ge 1 ]] && break
+        now=$(date +%s)
+        (( now >= deadline )) \
+            && fail "sponsor never autoclaimed gi=$vgi within 600s WITHOUT a manual heal — sponsor did NOT auto-recover from the front-run wedge (#55 regression)"
+        log "auto-recovery claim not landed yet — waiting on the sponsor to self-heal ($(( deadline - now ))s left)"
+        sleep 10
+    done
+
+    read -r c t <<<"$(claim_events_for_gi "$vgi")"
+    [[ "$c" == "1" ]] || fail "expected exactly 1 ClaimEvent for auto-recovery gi=$vgi, got $c"
+    wait_for "auto-recovery claim receipt (status 0x1)" "receipt_status_ok '$t'" 300 5
+    assert_receipt_signer "$t" "$SPONSOR_ADDR_LC" "SPONSOR"
+    pass "sponsor AUTO-recovered ($label): fresh deposit gi=$vgi autoclaimed by the sponsor (tx $t), NO manual heal"
+
+    # (2) No PERMANENT nonce-mismatch wedge. Settle, then require ZERO fresh
+    # sponsor nonce-mismatch lines in the most-recent window (ANSI-strip;
+    # `--tail` seeks from the END — reliable on long-lived stacks, unlike
+    # `--since` which can truncate at a corrupt entry).
+    nonce_a=$(sponsor_nonce)
+    sleep 15
+    nonce_b=$(sponsor_nonce)
+    settle_ts=$(date -u +%Y-%m-%dT%H:%M:%S)
+    sleep 15
+    fresh_mismatch=$(docker logs --tail 8000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
+        | awk -v ts="$settle_ts" '$1 >= ts' \
+        | grep -cE "nonce mismatch for $SPONSOR_ADDR_LC" || true)
+    log "sponsor nonce: before-settle=$nonce_a after-settle=$nonce_b; fresh nonce-mismatch lines since settle=$fresh_mismatch"
+    [[ "${fresh_mismatch:-0}" -eq 0 ]] \
+        || fail "sponsor STILL emitting nonce-mismatch spam ($fresh_mismatch lines in ~15s after a settle) — permanent wedge NOT healed (#55 regression)"
+    pass "no permanent sponsor nonce-mismatch wedge ($label): 0 fresh mismatch lines since settle"
+
+    # (3) Positive proof of the exact reconciliation path. The deterministic
+    # race leg below separately pins the sendRaw status-0/no-log contract.
+    dedup_after=$(metric_value "$DEDUP_METRIC")
+    estimate_after=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+    log "$DEDUP_METRIC: baseline=$DEDUP_BEFORE now=$dedup_after"
+    log "$ESTIMATE_ALREADY_CLAIMED_METRIC: baseline=$ESTIMATE_ALREADY_CLAIMED_BEFORE now=$estimate_after"
+    if [[ "$dedup_after" -gt "$DEDUP_BEFORE" ]]; then
+        pass "$DEDUP_METRIC incremented ($DEDUP_BEFORE → $dedup_after): signed duplicate received status-0/no-log reconciliation"
+    elif [[ "$estimate_after" -gt "$ESTIMATE_ALREADY_CLAIMED_BEFORE" ]]; then
+        proxy_is_claimed "$LEG1_GI" \
+            || fail "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented but isClaimed for exact front-run gi=$LEG1_GI is not true"
+        pass "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented ($ESTIMATE_ALREADY_CLAIMED_BEFORE → $estimate_after) and isClaimed(gi=$LEG1_GI)=true: AggKit reconciled before submission"
+    else
+        fail "neither already-claimed reconciliation metric incremented: sendRaw $DEDUP_BEFORE→$dedup_after, estimateGas $ESTIMATE_ALREADY_CLAIMED_BEFORE→$estimate_after"
+    fi
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Leg 1 — manual user claim (user submits instead of waiting for the sponsor)
 # ══════════════════════════════════════════════════════════════════════════════
+# #55 — snapshot both valid already-claimed reconciliation counters before the
+# front-run so the inter-leg assertion can prove which path healed AggKit.
+DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
+ESTIMATE_ALREADY_CLAIMED_BEFORE=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+log "baseline $DEDUP_METRIC = $DEDUP_BEFORE"
+log "baseline $ESTIMATE_ALREADY_CLAIMED_METRIC = $ESTIMATE_ALREADY_CLAIMED_BEFORE"
+
 step "Leg 1 — deposit L1→L2, then the USER claims it manually"
 
 LEG1_GI=""; LEG1_TX=""
@@ -656,8 +876,14 @@ for attempt in $(seq 1 "$MAX_LEG1_ATTEMPTS"); do
             break
             ;;
         dedup_rejected)
-            warn "sponsor won the claim for gi=$GI (user got the dedup rejection: '$LAST_ERR')"
+            warn "sponsor's claim is in flight for gi=$GI (user got the dedup rejection: '$LAST_ERR')"
             warn "retrying leg 1 with a fresh deposit"
+            ;;
+        accept_reverted)
+            # #55 — the sponsor already LANDED this gi; the user's tx was
+            # accept-and-reverted (status-0x0 receipt). The user did NOT win —
+            # retry with a fresh deposit to demonstrate the manual-win path.
+            warn "sponsor already landed gi=$GI; user's tx was accept-and-reverted (tx $USER_TX) — retrying with a fresh deposit"
             ;;
         timeout)
             fail "user claim never accepted nor dedup-rejected within 420s (last error: '$LAST_ERR')"
@@ -686,13 +912,14 @@ assert_receipt_signer "$LEG1_TX" "$USER_ADDR_LC" "USER"
 wait_balance_exact "$((DEPOSITS_SENT * EXPECTED_UNITS_PER_DEPOSIT))"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Between the legs — heal the sponsor the leg-1 front-run just wedged, and
-# HARD-verify it works, so leg 2 races a live sponsor (not a corpse whose head
-# nonce is stuck on the leg-1 gi).
+# Between the legs — #55 REGRESSION: the leg-1 front-run wedged the sponsor's
+# head nonce (it signed + persisted its own claim tx for the raced gi). PRE-FIX
+# this was un-healable without operator intervention (drain_sponsor_wedge
+# consuming the wedged nonces by hand). WITH the accept-and-revert fix the
+# sponsor RECOVERS AUTOMATICALLY — HARD-assert that, WITHOUT any manual heal, so
+# leg 2 races a genuinely self-healed sponsor (and #55 stays fixed forever).
 # ══════════════════════════════════════════════════════════════════════════════
-step "Inter-leg sponsor heal — leg 2 needs a LIVE sponsor to race"
-drain_sponsor_wedge 10
-verify_sponsor_functional "inter-leg"
+verify_sponsor_recovers_automatically "inter-leg"
 wait_balance_exact "$((DEPOSITS_SENT * EXPECTED_UNITS_PER_DEPOSIT))"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -733,13 +960,26 @@ case "$SUBMIT_OUTCOME" in
         pass "race: USER won (tx=$USER_TX); sponsor is the loser"
         ;;
     dedup_rejected)
+        # Sponsor's claim was IN FLIGHT (locked, no ClaimEvent yet) when the user
+        # submitted → InFlight hard-reject. The sponsor won the lock.
         WINNER="sponsor"
         [[ "$LAST_ERR" == *"already submitted"* ]] \
-            || fail "loser's rejection is not the dedup path: '$LAST_ERR'"
-        pass "race: SPONSOR won; user (loser) got the dedup rejection: '$LAST_ERR'"
+            || fail "loser's rejection is not the in-flight dedup path: '$LAST_ERR'"
+        pass "race: SPONSOR won (in-flight lock); user (loser) got the dedup rejection: '$LAST_ERR'"
+        ;;
+    accept_reverted)
+        # #55 — the sponsor had already LANDED gi2 when the user submitted; the
+        # user's tx was ACCEPT-AND-REVERTED (status-0x0 receipt, empty logs, NO
+        # ClaimEvent). The SPONSOR won.
+        WINNER="sponsor"
+        [[ "$(receipt_status "$USER_TX")" == "0x0" ]] \
+            || fail "accept_reverted outcome but user tx $USER_TX receipt is not status 0x0"
+        receipt_logs_empty "$USER_TX" \
+            || fail "accept-and-revert receipt for $USER_TX must carry EMPTY logs (no ClaimEvent)"
+        pass "race: SPONSOR won (already landed); user's tx accept-and-reverted (status-0x0, no ClaimEvent): $USER_TX"
         ;;
     timeout)
-        fail "race leg: user claim neither accepted nor dedup-rejected in 420s (last: '$LAST_ERR')"
+        fail "race leg: user claim neither accepted, dedup-rejected, nor accept-and-reverted in 420s (last: '$LAST_ERR')"
         ;;
 esac
 
@@ -767,46 +1007,51 @@ if [[ "$WINNER" == "sponsor" ]]; then
     assert_receipt_signer "$WINNER_TX" "$SPONSOR_ADDR_LC" "SPONSOR"
     pass "sponsor participation proven: the sponsor's own tx won gi=$GI2"
 else
-    # User won → first force the DETERMINISTIC loser: one more user submission
-    # for the same (now claimed) gi must be dedup-rejected...
+    # User won → force the DETERMINISTIC loser. #55: the user's claim has LANDED
+    # (its receipt is status 0x1, ClaimEvent exists — asserted above), so ONE more
+    # user submission for the SAME gi is now ACCEPT-AND-REVERTED (geth-faithful
+    # AlreadyClaimed): it returns a hash with a status-0x0 receipt, EMPTY logs, NO
+    # new ClaimEvent, and increments the dedup-reverted metric — it is NOT a hard
+    # "already submitted" error anymore.
+    DEDUP_BEFORE_RESUB=$(metric_value "$DEDUP_METRIC")
     RAW=$(build_user_claim_raw "$DEP_JSON")
-    [[ -n "$RAW" ]] || fail "could not rebuild the user claim for the deterministic dedup check"
+    [[ -n "$RAW" ]] || fail "could not rebuild the user claim for the deterministic accept-and-revert check"
     RESP=$(rpc eth_sendRawTransaction "[\"$RAW\"]")
-    ERRMSG=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',{}).get('message') or '')" 2>/dev/null || true)
-    [[ "$ERRMSG" == *"already submitted"* ]] \
-        || fail "post-race user resubmission for gi=$GI2 was not dedup-rejected (got: '$ERRMSG', resp: $RESP)"
-    pass "post-race user resubmission dedup-rejected: '$ERRMSG'"
+    RESUB_TX=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or '')" 2>/dev/null || true)
+    RESUB_ERR=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error',{}).get('message') or '')" 2>/dev/null || true)
+    [[ -n "$RESUB_TX" ]] \
+        || fail "post-race user resubmission for gi=$GI2 was NOT accepted — expected #55 accept-and-revert, got error '$RESUB_ERR' (resp: $RESP)"
+    # Its receipt must be an immediate status-0x0 revert with empty logs.
+    wait_for "resubmission accept-and-revert receipt (status 0x0)" \
+        "[[ \"\$(receipt_status '$RESUB_TX')\" == '0x0' ]]" 60 2
+    receipt_logs_empty "$RESUB_TX" \
+        || fail "accept-and-revert receipt for the resubmission $RESUB_TX must carry EMPTY logs (no ClaimEvent)"
+    DEDUP_AFTER_RESUB=$(metric_value "$DEDUP_METRIC")
+    [[ "$DEDUP_AFTER_RESUB" -gt "$DEDUP_BEFORE_RESUB" ]] \
+        || fail "$DEDUP_METRIC did not increment on the post-win user resubmission ($DEDUP_BEFORE_RESUB → $DEDUP_AFTER_RESUB) — accept-and-revert did not fire"
+    # Still exactly ONE ClaimEvent for gi2 (accept-and-revert emits none).
+    read -r EV2B_COUNT _ <<<"$(claim_events_for_gi "$GI2")"
+    [[ "$EV2B_COUNT" == "1" ]] || fail "post-resubmission gi2 has $EV2B_COUNT ClaimEvents — accept-and-revert must not emit a second"
+    pass "post-race user resubmission ACCEPT-AND-REVERTED (status-0x0 $RESUB_TX, no ClaimEvent, metric $DEDUP_BEFORE_RESUB→$DEDUP_AFTER_RESUB)"
 
-    # ...then prove the SPONSOR is racing gi2, positively: after the user's
-    # LAST submission above, any further "claim already submitted" rejection
-    # for THIS gi can only come from the sponsor's ClaimTxManager (2s retry
-    # loop on its signed gi2 tx). Anchor strictly after the resubmission, then
-    # require fresh gi2 dedup rejections AND the sponsor signer's own
-    # eth_sendRawTransaction submissions in the proxy log. If the sponsor
-    # never raced, this FAILS — dedup evidence manufactured by the user's own
-    # resubmission cannot satisfy it (it is before the anchor).
-    sleep 2
-    SPONSOR_PROOF_TS=$(date -u +%Y-%m-%dT%H:%M:%S)
-    log "observing 15s for the sponsor's own gi=$GI2 submissions (anchor $SPONSOR_PROOF_TS)..."
-    sleep 15
-    PROOF_WINDOW=$(docker logs --tail 8000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
-        | awk -v ts="$SPONSOR_PROOF_TS" '$1 >= ts')
-    GI2_DEDUP_HITS=$(printf '%s\n' "$PROOF_WINDOW" \
-        | grep -cE "already submitted for global_index ${GI2}([^0-9]|$)" || true)
-    SPONSOR_SUBS=$(printf '%s\n' "$PROOF_WINDOW" \
-        | grep -E "\"event\": ?\"eth_sendRawTransaction_received\"" \
-        | grep -cE "\"signer\": ?\"$SPONSOR_ADDR_LC\"" || true)
-    # Race window submissions (from ready_for_claim onwards) for the log line.
-    RACE_WINDOW_SUBS=$(docker logs --tail 12000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
-        | awk -v ts="$RACE_START_TS" '$1 >= ts' \
-        | grep -E "\"event\": ?\"eth_sendRawTransaction_received\"" \
-        | grep -cE "\"signer\": ?\"$SPONSOR_ADDR_LC\"" || true)
-    log "post-anchor gi2 dedup rejections: ${GI2_DEDUP_HITS:-0}; sponsor submissions post-anchor: ${SPONSOR_SUBS:-0} (since race start: ${RACE_WINDOW_SUBS:-0})"
-    [[ "${GI2_DEDUP_HITS:-0}" -ge 1 ]] \
-        || fail "no NEW dedup rejection for gi=$GI2 after the user's last submission — the sponsor never raced this gi (leg 2 had no second racer)"
-    [[ "${SPONSOR_SUBS:-0}" -ge 1 ]] \
-        || fail "no eth_sendRawTransaction from the sponsor signer $SPONSOR_ADDR_LC in the proxy log after the user's last submission — cannot attribute the gi2 rejections to the sponsor"
-    pass "sponsor participation proven: sponsor kept submitting gi=$GI2 after the user stopped ($GI2_DEDUP_HITS dedup rejections, $SPONSOR_SUBS sponsor submissions in 15s)"
+    # ...then prove the SPONSOR was the actual second racer, not merely that
+    # unrelated sponsor traffic happened later. Start from the pre-race anchor,
+    # enumerate sponsor-signed submissions, fetch each exact transaction, and
+    # decode claimAsset.globalIndex. The matching hash must itself reach a
+    # terminal status-0 receipt with empty logs. This is causal evidence for the
+    # raced gi; no global metric delta or post-finalisation traffic inference can
+    # satisfy it.
+    SPONSOR_LOSER_TX=$(find_exact_sponsor_racer "$RACE_START_TS" "$GI2" 300) \
+        || fail "no sponsor-signed claimAsset transaction for raced gi=$GI2 was captured from race anchor $RACE_START_TS"
+    wait_for "exact sponsor racer receipt (status 0x0)" \
+        "[[ \"\$(receipt_status '$SPONSOR_LOSER_TX')\" == '0x0' ]]" 300 2
+    receipt_logs_empty "$SPONSOR_LOSER_TX" \
+        || fail "exact sponsor racer $SPONSOR_LOSER_TX for gi=$GI2 must have empty logs"
+    assert_receipt_signer "$SPONSOR_LOSER_TX" "$SPONSOR_ADDR_LC" "SPONSOR"
+    read -r EV2C_COUNT _ <<<"$(claim_events_for_gi "$GI2")"
+    [[ "$EV2C_COUNT" == "1" ]] \
+        || fail "exact sponsor loser produced another ClaimEvent for gi=$GI2 (count=$EV2C_COUNT)"
+    pass "sponsor participation proven exactly: sponsor tx $SPONSOR_LOSER_TX targeted gi=$GI2 and terminally reverted (status-0x0, no logs)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -828,8 +1073,8 @@ echo ""
 log "======================================================================"
 log "  MANUAL USER CLAIM e2e DONE"
 log "    leg 1: user tx $LEG1_TX claimed gi=$LEG1_GI"
-log "    leg 2: winner=$WINNER tx=$WINNER_TX gi=$GI2 (single ClaimEvent, loser dedup-rejected, sponsor participation proven)"
-log "    sponsor: healed + verified functional ($SPONSOR_NOOPS_SENT wedged nonce(s) consumed)"
+log "    leg 2: winner=$WINNER tx=$WINNER_TX gi=$GI2 (single ClaimEvent, sponsor participation proven by exact tx)"
+log "    sponsor: recovery + functionality verified ($SPONSOR_NOOPS_SENT pre-existing wedged nonce(s) cleaned up)"
 log "    deposits: $DEPOSITS_SENT sent, balance exactly $((DEPOSITS_SENT * EXPECTED_UNITS_PER_DEPOSIT)) units"
 log "======================================================================"
 
@@ -933,11 +1178,12 @@ print('\n'.join(out))
     case "$SUBMIT_OUTCOME" in
         user_won)
             pass "allow-listed USER's manual claim accepted under allow-list mode (tx $USER_TX)" ;;
-        dedup_rejected)
-            # The sponsor (also allow-listed) beat the user; the user's own
-            # submission still traversed the allow-list gate (the dedup lock
-            # sits BEHIND it), so membership is proven either way.
-            pass "sponsor (also allow-listed) won the claim; user's submission passed the allow-list gate into the dedup path" ;;
+        dedup_rejected|accept_reverted)
+            # The sponsor (also allow-listed) beat the user — via in-flight dedup
+            # (dedup_rejected) or, if it already landed, #55 accept-and-revert. The
+            # user's submission still traversed the allow-list gate (the claim lock /
+            # landed classification sits BEHIND it), so membership is proven either way.
+            pass "sponsor (also allow-listed) won the claim ($SUBMIT_OUTCOME); user's submission passed the allow-list gate" ;;
         timeout)
             fail "no claim landed for gi=$gi_al under allow-list mode — allow-list config broke the claim path" ;;
     esac

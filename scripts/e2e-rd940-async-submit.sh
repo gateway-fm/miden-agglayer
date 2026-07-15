@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # RD-940 e2e — async-submit golden path
 #
-# With AGGLAYER_ENABLE_WRITER_WORKER=true on the agglayer service,
-# eth_sendRawTransaction should return the tx hash within ~100ms (request-thread
+# The mandatory single writer makes eth_sendRawTransaction return the tx hash
+# within ~100ms (request-thread
 # validate + enqueue, no Miden round-trip held inline). The receipt then arrives
 # asynchronously after the worker dispatches.
 #
@@ -16,8 +16,7 @@
 #      and stays at the pre-tx value on `latest` until commit.
 #
 # Pre-req:
-#   - Stack up with AGGLAYER_ENABLE_WRITER_WORKER=true
-#       AGGLAYER_ENABLE_WRITER_WORKER=true make e2e-up
+#   - Stack up with `make e2e-up`
 #   - L1→L2 path seeded (script depends on aggsender having submitted a GER
 #     recently so we can submit insertGlobalExitRoot against a fresh root)
 set -euo pipefail
@@ -46,12 +45,11 @@ pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
 worker_active() {
     local logs
     logs=$(docker logs "$AGGLAYER_CONTAINER" 2>&1) || return 1
-    grep -q "RD-940 writer worker spawned" <<<"$logs"
+    grep -q "single writer worker spawned" <<<"$logs"
 }
 
 if ! worker_active; then
-    fail "agglayer container is not running with AGGLAYER_ENABLE_WRITER_WORKER=true. \
-         Restart the stack with: AGGLAYER_ENABLE_WRITER_WORKER=true make e2e-up"
+    fail "single writer is not active; restart the stack with: make e2e-up"
 fi
 pass "writer worker is active in $AGGLAYER_CONTAINER"
 

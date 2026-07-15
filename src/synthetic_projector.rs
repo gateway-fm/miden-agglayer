@@ -62,6 +62,8 @@ use crate::restore::{
     project_claim_note, project_ger_note,
 };
 use crate::store::Store;
+use crate::writer_worker::DecodedWriteCall;
+use alloy::primitives::TxHash;
 use miden_client::rpc::NodeRpcClient;
 use miden_client::rpc::domain::note::FetchedNote;
 use miden_client::rpc::domain::transaction::TransactionRecord;
@@ -94,6 +96,11 @@ const RECONCILE_CHUNK: u64 = 1_000;
 /// [`RECONCILE_CONCURRENCY_MAX`] to stay a polite RPC citizen.
 const RECONCILE_CONCURRENCY_DEFAULT: usize = 8;
 const RECONCILE_CONCURRENCY_MAX: usize = 16;
+
+/// Maximum exact-note duplicate checks per projector tick. The projector tick
+/// is single-flight; this bound prevents a damaged backlog from starving normal
+/// projection while guaranteeing steady progress.
+const PENDING_DUPLICATE_RECONCILE_LIMIT: usize = 16;
 
 /// Per-tick time budget for the reconciler's catch-up loop, in milliseconds.
 /// Env-tunable via `RECONCILE_TICK_BUDGET_MS`. Projection runs AFTER the
@@ -181,6 +188,12 @@ fn is_private_note_import_error<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
 /// and, when registered as the live [`SyncListener`], is the **sole** assigner
 /// of the synthetic tip (`Store::latest_block_number`) — so there is no
 /// reservation race (Finding #5 eliminated by construction).
+struct PendingDuplicate {
+    tx_hash: TxHash,
+    call: DecodedWriteCall,
+    note_id: String,
+}
+
 pub struct SyntheticProjector {
     store: Arc<dyn Store>,
     block_state: Arc<BlockState>,
@@ -245,6 +258,9 @@ pub struct SyntheticProjector {
     /// Per-tick catch-up time budget (`RECONCILE_TICK_BUDGET_MS` env override,
     /// default [`RECONCILE_TICK_BUDGET_MS_DEFAULT`]).
     reconcile_budget: Duration,
+    // Last transaction hash considered by the bounded duplicate sweep. This
+    // process-local cursor is sufficient because one projector owns reconciliation.
+    pending_duplicate_cursor: std::sync::Mutex<Option<TxHash>>,
     /// In-flight B2AGG note BODIES keyed by nullifier — the projector's authoritative
     /// body-resolution source, bounded to imported-but-not-yet-projected notes.
     ///
@@ -369,12 +385,139 @@ impl SyntheticProjector {
             reconcile_chunk,
             reconcile_concurrency,
             reconcile_budget,
+            pending_duplicate_cursor: std::sync::Mutex::new(None),
             recovered_bodies: std::sync::Mutex::new(HashMap::new()),
             fetch_miss_attempts: std::sync::Mutex::new(HashMap::new()),
             last_source_window_to: AtomicU64::new(0),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
         })
+    }
+
+    async fn load_pending_duplicate(
+        &self,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<Option<PendingDuplicate>> {
+        let Some(transaction) = self.store.txn_get(tx_hash).await? else {
+            return Ok(None);
+        };
+        if transaction.result.is_some() {
+            return Ok(None);
+        }
+        let Some(handoff) = self
+            .store
+            .get_note_handoff_for_tx(&format!("{tx_hash:#x}"))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(note_id) = handoff.note_id else {
+            return Ok(None);
+        };
+        let call = crate::service_send_raw_txn::decode_envelope_write_call(&transaction.envelope)?;
+        Ok(Some(PendingDuplicate {
+            tx_hash,
+            call,
+            note_id,
+        }))
+    }
+
+    async fn resolve_pending_duplicate(
+        &self,
+        client: &mut MidenClientLib,
+        pending: &PendingDuplicate,
+    ) -> anyhow::Result<crate::applied_state::ExactNoteOutcome> {
+        match &pending.call {
+            DecodedWriteCall::Ger { ger_bytes } => {
+                crate::applied_state::reconcile_ger_handoff_with_client(
+                    self.store.as_ref(),
+                    client,
+                    self.bridge_id,
+                    *ger_bytes,
+                    pending.note_id.clone(),
+                )
+                .await
+            }
+            DecodedWriteCall::Claim { params } => {
+                crate::applied_state::reconcile_claim_handoff_with_client(
+                    self.store.as_ref(),
+                    client,
+                    self.bridge_id,
+                    params.globalIndex,
+                    pending.note_id.clone(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn finalize_pending_duplicate(
+        &self,
+        pending: PendingDuplicate,
+        outcome: crate::applied_state::ExactNoteOutcome,
+    ) -> anyhow::Result<()> {
+        if outcome != crate::applied_state::ExactNoteOutcome::AppliedElsewhere {
+            // The exact note was consumed, or the evidence is absent/uncertain.
+            // Normal projection owns exact-note finalization; otherwise stay pending.
+            return Ok(());
+        }
+        let result = match pending.call {
+            DecodedWriteCall::Ger { .. } => Ok(()),
+            DecodedWriteCall::Claim { .. } => {
+                Err("execution reverted: AlreadyClaimed()".to_string())
+            }
+        };
+        let block_num = self.store.get_latest_block_number().await?;
+        self.store
+            .txn_commit_confirmed_duplicate(pending.tx_hash, result, block_num)
+            .await
+    }
+
+    async fn reconcile_pending_duplicate(
+        &self,
+        client: &mut MidenClientLib,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<()> {
+        let Some(pending) = self.load_pending_duplicate(tx_hash).await? else {
+            return Ok(());
+        };
+        let outcome = self.resolve_pending_duplicate(client, &pending).await?;
+        self.finalize_pending_duplicate(pending, outcome).await
+    }
+
+    async fn reconcile_pending_duplicates(
+        &self,
+        client: &mut MidenClientLib,
+    ) -> anyhow::Result<()> {
+        let after = *self
+            .pending_duplicate_cursor
+            .lock()
+            .expect("pending duplicate cursor mutex poisoned");
+        let mut pending = self
+            .store
+            .pending_note_handoff_txs(after, PENDING_DUPLICATE_RECONCILE_LIMIT)
+            .await?;
+        if pending.is_empty() && after.is_some() {
+            pending = self
+                .store
+                .pending_note_handoff_txs(None, PENDING_DUPLICATE_RECONCILE_LIMIT)
+                .await?;
+        }
+        *self
+            .pending_duplicate_cursor
+            .lock()
+            .expect("pending duplicate cursor mutex poisoned") = pending.last().copied();
+
+        for tx_hash in pending {
+            if let Err(error) = self.reconcile_pending_duplicate(client, tx_hash).await {
+                tracing::warn!(
+                    %tx_hash,
+                    error = %format!("{error:#}"),
+                    "authoritative duplicate reconciliation is uncertain; keeping receipt null"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The next sweep window `[from, to]` the note-visibility reconciler will
@@ -491,6 +634,17 @@ impl SyntheticProjector {
                         self.reconcile_cursor.load(Ordering::Acquire)
                     )
                 })?;
+                // PREPARED handoffs persist the exact Miden NoteId before the
+                // external submit. `sync_notes` is the authoritative,
+                // inclusive creation feed, so seeing that id confirms the
+                // handoff even when a crash happened before the local client
+                // applied the accepted transaction. Do this on the raw ids,
+                // before body import/fetch (which may lag) and before the
+                // durable cursor advances past the transaction's expiry.
+                if !candidates.is_empty() {
+                    let note_ids: Vec<String> = candidates.iter().map(NoteId::to_hex).collect();
+                    self.store.confirm_prepared_note_handoffs(&note_ids).await?;
+                }
                 if !candidates.is_empty() {
                     let client = client.as_deref_mut().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -1394,6 +1548,14 @@ impl SyntheticProjector {
                 "note reconciler failed (transient — will retry next tick)"
             );
         }
+        // Receipt polling is store-only. Resolve confirmed duplicates here, on
+        // the existing single-flight projector task, with a bounded batch.
+        if let Err(error) = self.reconcile_pending_duplicates(client).await {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "pending duplicate reconciliation failed (transient — will retry next tick)"
+            );
+        }
         // #30 VISIBILITY BARRIER: never seal a synthetic block the reconciler
         // has not fully swept. `reconcile_notes` (above) advances
         // `reconcile_cursor` to its last completed sweep window; every external
@@ -2112,13 +2274,19 @@ mod tests {
     struct FakeFetcher {
         calls: std::sync::Mutex<Vec<(u64, u64)>>,
         fail_from: Option<u64>,
+        note_ids: Vec<NoteId>,
     }
 
     impl FakeFetcher {
         fn new(fail_from: Option<u64>) -> StdArc<Self> {
+            Self::with_note_ids(fail_from, Vec::new())
+        }
+
+        fn with_note_ids(fail_from: Option<u64>, note_ids: Vec<NoteId>) -> StdArc<Self> {
             StdArc::new(Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 fail_from,
+                note_ids,
             })
         }
 
@@ -2134,8 +2302,80 @@ mod tests {
             if self.fail_from == Some(from) {
                 anyhow::bail!("injected window-fetch failure ({from}..{to})");
             }
-            Ok(Vec::new())
+            Ok(self.note_ids.clone())
         }
+    }
+
+    /// A raw `sync_notes` NoteId is enough to close a PREPARED handoff even
+    /// when the subsequent body import cannot run. Conversely, a failed fetch
+    /// must neither confirm the handoff nor move the durable low-water mark.
+    #[tokio::test]
+    async fn reconcile_raw_note_id_confirmation_is_ordered_before_cursor_advance() {
+        let note_id = NoteId::from_raw(Word::new([Felt::new(0x42).unwrap(); 4]));
+        let tx_hash = "0xprepared-note";
+
+        // Successful raw-id observation: confirmation happens first. Supplying
+        // no client deliberately fails the later body-import step, proving the
+        // cursor is still held while the exact handoff is already confirmed.
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        store
+            .prepare_note_handoff(tx_hash, "details-commitment", &note_id.to_hex(), 100)
+            .await
+            .unwrap();
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 1, Duration::ZERO);
+        let fetcher = FakeFetcher::with_note_ids(None, vec![note_id]);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher;
+        let err = projector
+            .reconcile_notes_with(None, None, &f, 200)
+            .await
+            .expect_err("candidate import without a client must fail");
+        assert!(format!("{err:#}").contains("no client handle"));
+        assert_eq!(
+            store
+                .get_note_handoff_for_tx(tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::store::NoteHandoffState::Submitted,
+            "raw NoteId observation must confirm before body import"
+        );
+        assert_eq!(
+            store.get_reconcile_cursor().await.unwrap(),
+            0,
+            "cursor must not advance when later window work fails"
+        );
+
+        // Failed window fetch: no raw ids were authoritatively observed, so
+        // neither confirmation nor cursor advancement is allowed.
+        let failed_store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        failed_store
+            .prepare_note_handoff(tx_hash, "details-commitment", &note_id.to_hex(), 100)
+            .await
+            .unwrap();
+        let failed_projector = test_projector(&failed_store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 1, Duration::ZERO);
+        let failed_fetcher = FakeFetcher::with_note_ids(Some(1), vec![note_id]);
+        let failed: StdArc<dyn ReconcileFetcher> = failed_fetcher;
+        failed_projector
+            .reconcile_notes_with(None, None, &failed, 200)
+            .await
+            .expect_err("injected fetch failure must fail the window");
+        assert_eq!(
+            failed_store
+                .get_note_handoff_for_tx(tx_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::store::NoteHandoffState::Prepared,
+            "a failed fetch must not confirm an unobserved NoteId"
+        );
+        assert_eq!(failed_store.get_reconcile_cursor().await.unwrap(), 0);
     }
 
     /// Catch-up throughput contract: when the sweep is behind the tip, ONE
@@ -3261,5 +3501,245 @@ mod tests {
             outcome.audited, 0,
             "gated notes are excluded before the log check"
         );
+    }
+
+    fn duplicate_test_call(global_index: alloy::primitives::U256) -> DecodedWriteCall {
+        use alloy::primitives::{Address, FixedBytes};
+        DecodedWriteCall::Claim {
+            params: Box::new(crate::claim::claimAssetCall {
+                smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+                smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+                globalIndex: global_index,
+                mainnetExitRoot: FixedBytes::ZERO,
+                rollupExitRoot: FixedBytes::ZERO,
+                originNetwork: 0,
+                originTokenAddress: Address::ZERO,
+                destinationNetwork: 1,
+                destinationAddress: Address::ZERO,
+                amount: alloy::primitives::U256::from(1u8),
+                metadata: Default::default(),
+            }),
+        }
+    }
+
+    fn duplicate_test_envelope(
+        call: &DecodedWriteCall,
+        tx_hash: TxHash,
+    ) -> alloy::consensus::TxEnvelope {
+        use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
+        use alloy::primitives::{FixedBytes, Signature};
+        use alloy_core::sol_types::SolCall;
+
+        let input = match call {
+            DecodedWriteCall::Claim { params } => params.abi_encode(),
+            DecodedWriteCall::Ger { ger_bytes } => crate::ger::insertGlobalExitRootCall {
+                root: FixedBytes::from(*ger_bytes),
+            }
+            .abi_encode(),
+        };
+        TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy {
+                input: input.into(),
+                ..Default::default()
+            },
+            Signature::test_signature(),
+            tx_hash,
+        ))
+    }
+
+    async fn begin_duplicate_test_tx(
+        store: &StdArc<dyn Store>,
+        tx_hash: TxHash,
+        call: &DecodedWriteCall,
+    ) {
+        store
+            .txn_begin(
+                tx_hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope: duplicate_test_envelope(call, tx_hash),
+                    signer: alloy::primitives::Address::from([0x77u8; 20]),
+                    expires_at: Some(100),
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_reconciliation_finalizes_duplicate_claim_and_ger() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        store.set_latest_block_number(42).await.unwrap();
+        let projector = test_projector(&store, &StdArc::new(BlockState::new())).await;
+
+        let claim_hash = TxHash::from([0x91u8; 32]);
+        let claim = duplicate_test_call(alloy::primitives::U256::from(9u8));
+        begin_duplicate_test_tx(&store, claim_hash, &claim).await;
+        projector
+            .finalize_pending_duplicate(
+                PendingDuplicate {
+                    tx_hash: claim_hash,
+                    call: claim,
+                    note_id: "claim-note".into(),
+                },
+                crate::applied_state::ExactNoteOutcome::AppliedElsewhere,
+            )
+            .await
+            .unwrap();
+        let (claim_result, claim_block) = store
+            .txn_receipt(claim_hash)
+            .await
+            .unwrap()
+            .expect("duplicate claim receipt");
+        assert!(claim_result.is_err());
+        assert_eq!(claim_block, 42);
+
+        let ger_hash = TxHash::from([0x92u8; 32]);
+        let ger = DecodedWriteCall::Ger {
+            ger_bytes: [0x92u8; 32],
+        };
+        begin_duplicate_test_tx(&store, ger_hash, &ger).await;
+        projector
+            .finalize_pending_duplicate(
+                PendingDuplicate {
+                    tx_hash: ger_hash,
+                    call: ger,
+                    note_id: "ger-note".into(),
+                },
+                crate::applied_state::ExactNoteOutcome::AppliedElsewhere,
+            )
+            .await
+            .unwrap();
+        let (ger_result, ger_block) = store
+            .txn_receipt(ger_hash)
+            .await
+            .unwrap()
+            .expect("duplicate GER receipt");
+        assert!(ger_result.is_ok());
+        assert_eq!(ger_block, 42);
+    }
+
+    #[tokio::test]
+    async fn exact_or_uncertain_note_remains_pending_for_normal_projection() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let projector = test_projector(&store, &StdArc::new(BlockState::new())).await;
+        let tx_hash = TxHash::from([0x93u8; 32]);
+        let call = DecodedWriteCall::Ger {
+            ger_bytes: [0x93u8; 32],
+        };
+        begin_duplicate_test_tx(&store, tx_hash, &call).await;
+
+        for outcome in [
+            crate::applied_state::ExactNoteOutcome::AppliedByExactNote,
+            crate::applied_state::ExactNoteOutcome::NotApplied,
+            crate::applied_state::ExactNoteOutcome::Uncertain,
+        ] {
+            projector
+                .finalize_pending_duplicate(
+                    PendingDuplicate {
+                        tx_hash,
+                        call: call.clone(),
+                        note_id: "exact-or-unknown".into(),
+                    },
+                    outcome,
+                )
+                .await
+                .unwrap();
+            assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_claim_event_short_circuits_miden_and_missing_ger() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        store.set_latest_block_number(55).await.unwrap();
+        let projector = test_projector(&store, &StdArc::new(BlockState::new())).await;
+        let global_index = alloy::primitives::U256::from(0x5514u64);
+        let tx_hash = TxHash::from([0x94u8; 32]);
+        let call = duplicate_test_call(global_index);
+        begin_duplicate_test_tx(&store, tx_hash, &call).await;
+        store
+            .prepare_note_handoff(
+                &format!("{tx_hash:#x}"),
+                "pending-claim-commitment",
+                "not-present-in-offline-miden",
+                100,
+            )
+            .await
+            .unwrap();
+        store.try_claim(global_index).await.unwrap();
+        store
+            .commit_manual_claim_event_atomic(
+                "other-claim-note".into(),
+                "0x00000000000000000000000000000000000000aa",
+                54,
+                [0u8; 32],
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+                global_index.to_be_bytes::<32>(),
+                0,
+                &[0u8; 20],
+                &[0u8; 20],
+                1,
+            )
+            .await
+            .unwrap();
+
+        let combined_zero_ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
+        assert!(!store.is_ger_injected(&combined_zero_ger).await.unwrap());
+        let mut unavailable_miden = crate::test_helpers::offline_miden_client_lib().await;
+        projector
+            .reconcile_pending_duplicate(&mut unavailable_miden, tx_hash)
+            .await
+            .expect("durable ClaimEvent must avoid unavailable Miden state");
+
+        let (result, block) = store
+            .txn_receipt(tx_hash)
+            .await
+            .unwrap()
+            .expect("known duplicate claim is terminal");
+        assert!(result.is_err());
+        assert_eq!(block, 55);
+        assert!(
+            store
+                .pending_note_handoff_txs(None, PENDING_DUPLICATE_RECONCILE_LIMIT)
+                .await
+                .unwrap()
+                .is_empty(),
+            "terminal receipts must not be reconciled again"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_duplicate_query_is_bounded_and_cursor_ordered() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let call = DecodedWriteCall::Ger {
+            ger_bytes: [0xa5u8; 32],
+        };
+        let hashes = [
+            TxHash::from([1u8; 32]),
+            TxHash::from([2u8; 32]),
+            TxHash::from([3u8; 32]),
+        ];
+        for (index, tx_hash) in hashes.into_iter().enumerate() {
+            begin_duplicate_test_tx(&store, tx_hash, &call).await;
+            store
+                .prepare_note_handoff(
+                    &format!("{tx_hash:#x}"),
+                    &format!("commitment-{index}"),
+                    &format!("note-{index}"),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = store.pending_note_handoff_txs(None, 2).await.unwrap();
+        assert_eq!(first, hashes[..2]);
+        let second = store
+            .pending_note_handoff_txs(first.last().copied(), 2)
+            .await
+            .unwrap();
+        assert_eq!(second, hashes[2..]);
     }
 }

@@ -70,6 +70,32 @@ pub fn init_metrics() {
          and the sponsor's resubmission accepted. Nonzero after a crash in the submit window is \
          the recovery WORKING; a steady climb without restarts means claims are failing to land."
     );
+    describe_counter!(
+        "claim_landed_dedup_reverted_total",
+        "#55 accept-and-revert: a claimAsset targeting an ALREADY-LANDED globalIndex (a real \
+         ClaimEvent already exists) was ACCEPTED with a reverted (status 0x0) receipt instead of \
+         hard-rejected at the JSON-RPC layer — so the submitter's nonce is consumed, geth-faithful \
+         AlreadyClaimed. Nonzero means a sponsor/user cross-claimed the same gi and the sponsor's \
+         nonce sequence was kept in lockstep (autoclaim NOT wedged). A steady climb means heavy \
+         claim front-running, not a bug."
+    );
+    describe_counter!(
+        "rpc_nonce_repaired_after_commit_gap_total",
+        "#55 BLOCKER-2 crash-gap repair: on a same-hash rebroadcast, the signer's expected \
+         nonce was still equal to the known tx's nonce — meaning the tx's durable receipt was \
+         persisted but its nonce advance was lost to a crash BETWEEN the two on the sync accept \
+         path — so the nonce was advanced to complete the interrupted accept. Nonzero after a \
+         crash in the receipt→nonce window is the recovery WORKING (the signer is NOT wedged); a \
+         steady climb without restarts would signal a store that is losing nonce writes."
+    );
+    describe_counter!(
+        "rpc_nonce_reservation_lost_total",
+        "#55 BLOCKER 1 cross-replica guard: a submission LOST the atomic (signer, nonce) \
+         reservation to a DIFFERENT tx that already owned the slot, so it was rejected without \
+         executing (no enqueue/dispatch/receipt). Nonzero means two txs raced the same nonce \
+         slot (across replicas or a stale replacement) and the reservation kept exactly one; the \
+         winner advances the nonce and the loser is dropped, mirroring geth."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",
@@ -294,9 +320,7 @@ pub fn init_metrics() {
          other call sites). Recorded on both success and error paths."
     );
 
-    // RD-940 — async writer worker observability (Spec F §4). Registered
-    // unconditionally so the metric series exist even when
-    // `enable_writer_worker = false`; the sync path simply never emits.
+    // RD-940 — single writer observability (Spec F §4).
     describe_gauge!(
         "agglayer_writer_queue_depth",
         "RD-940: current number of WriteJobs sitting in the writer-worker \
@@ -334,9 +358,9 @@ pub fn init_metrics() {
         "agglayer_writer_dropped_on_restart_total",
         "RD-940: queue-depth snapshot read on boot from the previous \
          process's graceful shutdown. A non-zero value means the previous \
-         restart dropped that many in-flight jobs whose hashes had already \
-         been returned to callers — those callers MUST re-submit. \
-         **Hard page on increase[1h]>0** — v1 tripwire (no on-disk queue). \
+         restart lost that many in-memory dispatches whose signed envelopes \
+         remain durable — those callers MUST re-submit the SAME hash. \
+         **Hard page on increase[1h]>0** — restart-pressure tripwire. \
          The metric is silent under SIGKILL because the tmpfile is only \
          written on graceful drain; combined with pre-kill queue-depth \
          history this still pinpoints the loss window."

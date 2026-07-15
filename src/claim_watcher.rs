@@ -320,7 +320,7 @@ mod tests {
 
     /// The store-side dedup contract the projector's claim derivation relies on:
     /// feeding the same global_index twice through the store paths must produce a
-    /// single ClaimEvent and a single cursor advance. Drives the store primitives
+    /// single ClaimEvent without sealing a partial synthetic block. Drives the store primitives
     /// directly to pin the dedup logic.
     #[tokio::test]
     async fn store_dedup_paths_are_idempotent() {
@@ -351,15 +351,11 @@ mod tests {
         // Both dedup predicates now return true.
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
-        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 0);
 
-        // A second commit with the same note_id must NOT advance the block
-        // or duplicate the log — note that the InMemoryStore default impl
-        // re-inserts (the HashMap upsert), but the cursor advance is to the
-        // same block_number, and downstream dedup catches re-emission.
-        // The PgStore variant uses `ON CONFLICT DO NOTHING` so it's a true
-        // no-op. The InMemoryStore observable invariant is "ClaimEvent
-        // lookup still returns true and cursor doesn't go BACKWARD".
+        // A second commit with the same note_id is a true no-op: it neither
+        // duplicates the log nor advances the block tip. The projector owns
+        // block sealing after every note in that block has been processed.
         store
             .commit_manual_claim_event_atomic(
                 note_id.clone(),
@@ -377,6 +373,6 @@ mod tests {
             .unwrap();
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
-        assert!(store.get_latest_block_number().await.unwrap() >= 1);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 0);
     }
 }

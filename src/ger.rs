@@ -49,21 +49,13 @@ pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
 /// `InputNoteRecord::details_commitment()`) AND the pending receipt row
 /// (`txn_begin`).
 ///
-/// Handoff-before-projection (PR #127 review, point 6 + follow-up): BOTH the
-/// link and the pending receipt are written INSIDE this closure, immediately
-/// after the Miden tx commits and strictly BEFORE the serialized
-/// `MidenClient::with` slot is released. The SyntheticProjector observes note
-/// consumption through the same serialized client, so it cannot tick between
-/// the note landing and the handoff existing — the GER event always rides the
-/// REAL eth-tx hash (never the derived fallback) and `txn_commit` always
-/// finds the pending row to finalise. (Pre-fix, the link was recorded here
-/// but the pending row was only created by `handle_ger_result` AFTER
-/// `insert_ger` returned and released the client; the projector could acquire
-/// the client in that gap, resolve the real linked hash, and try to finalise
-/// a receipt whose `txn_begin` didn't exist yet — on PostgreSQL that
-/// silently finalised zero rows and the late `txn_begin` then left the real
-/// receipt pending forever.) Mirrors the identical pattern in
-/// `claim::attempt_publish_claim`.
+/// Crash-safe handoff: after local execution and proof succeed, BOTH the exact
+/// note link and pending receipt are written inside this closure immediately
+/// BEFORE `submit_proven_transaction`. A crash or ambiguous RPC result can
+/// therefore never leave an externally submitted random note without its real
+/// eth transaction identity, and a same-hash retry observes the link and does
+/// not submit a second note. The serialized client also keeps projection behind
+/// this handoff. This mirrors the claim submission boundary.
 ///
 /// Cantina #21 (PR #127 review, points 1/4): this function deliberately does
 /// NOT wait for the NTX builder to consume the note into the bridge account.
@@ -92,6 +84,7 @@ async fn submit_update_ger_note(
                 let bridge_id = inner_accounts.bridge.0;
                 let ger = ExitRoot::new(ger_bytes);
                 let note = UpdateGerNote::create(ger, ger_manager_id, bridge_id, client.rng())?;
+                let note_id = note.id().to_string();
                 // Commitment of the on-chain note, matching the projector's
                 // consumed-note key (`InputNoteRecord::details_commitment()`).
                 let note_commitment = hex::encode(
@@ -107,11 +100,41 @@ async fn submit_update_ger_note(
                 let tx_request = TransactionRequestBuilder::new()
                     .own_output_notes(vec![note])
                     .build()?;
-                let tx_id = crate::metrics::meter_proof(
+                crate::miden_client::ensure_writable(ger_manager_id)?;
+                let tx_result = client
+                    .execute_transaction(ger_manager_id, tx_request)
+                    .await?;
+                let tx_id = tx_result.executed_transaction().id();
+                let expiration_block = tx_result
+                    .executed_transaction()
+                    .expiration_block_num()
+                    .as_u64();
+                let proven_tx = crate::metrics::meter_proof(
                     crate::metrics::ProofKind::Ger,
-                    crate::miden_client::submit_new_transaction(client, ger_manager_id, tx_request),
+                    client.prove_transaction(&tx_result),
                 )
                 .await?;
+
+                // The note identity and pending receipt become durable immediately
+                // before the first external submit. A crash after this point is
+                // fail-closed: same-hash rebroadcasts observe the link and never
+                // build a second random UpdateGerNote.
+                record_ger_submission_handoff(
+                    &*store,
+                    txn_hash,
+                    &note_commitment,
+                    &note_id,
+                    expiration_block,
+                    txn_envelope,
+                    signer,
+                )
+                .await?;
+                let submission_height = client
+                    .submit_proven_transaction(proven_tx, &tx_result)
+                    .await?;
+                client
+                    .apply_transaction(&tx_result, submission_height)
+                    .await?;
                 tracing::info!(
                     tx_id = %tx_id,
                     ger = %hex::encode(ger_bytes),
@@ -128,61 +151,38 @@ async fn submit_update_ger_note(
                 if !committed {
                     anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
                 }
+                let tx_key = format!("{txn_hash:#x}");
+                if !store
+                    .confirm_note_handoff(&tx_key, &note_commitment)
+                    .await?
+                {
+                    anyhow::bail!("GER note handoff changed before commit confirmation");
+                }
                 tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
-
-                // Record the durable handoff (link + pending receipt) WHILE
-                // STILL HOLDING the serialized client — see the function
-                // docstring (handoff-before-projection). Recording after the
-                // commit (not before the submit) keeps the recoverable-retry
-                // path in `insert_ger` correct: a failed attempt records
-                // nothing, so the retry's fresh note gets the first (and
-                // only) link for this eth-tx and a single pending row.
-                record_ger_submission_handoff(
-                    &*store,
-                    txn_hash,
-                    &note_commitment,
-                    txn_envelope,
-                    signer,
-                )
-                .await?;
                 Ok(())
             })
         })
         .await
 }
 
-/// The durable eth-tx handoff for a committed `UpdateGerNote` submission:
-/// record the eth-tx ↔ note link AND create the pending receipt row that the
-/// SyntheticProjector finalises (`txn_commit`) when it observes the note
-/// consumed. This is the EXACT code `submit_update_ger_note` runs inside the
-/// serialized `MidenClient::with` closure, factored out so tests can drive
-/// the real submission ordering (handoff → client released → projection)
-/// without a live Miden node.
-///
-/// Ordering within the handoff — link FIRST, pending row SECOND — is what
-/// makes a partial failure retry-safe (no stray pending row):
-///
-///   - Link write fails → nothing durable exists; a resubmission of the same
-///     eth-tx re-runs the whole path cleanly.
-///   - Link lands but `txn_begin` fails → there is a link but NO pending row.
-///     The projector tolerates the missing row (`let _ = txn_commit` in
-///     `project_ger_note`; both stores now error identically on the missing
-///     row) and still emits the GER event under the real linked hash, from
-///     which `service_get_txn_receipt` can synthesise the receipt. A
-///     resubmission re-runs the path: `record_tx_note_link` is first-write-
-///     wins (no-op) and `txn_begin` creates the one pending row.
-///   - The reverse order would allow the original bug shape: a pending row
-///     with no link, which the projector can never finalise (derived-hash
-///     fallback) — pending forever.
+/// Durable pre-submit handoff for an `UpdateGerNote`: record the exact note link
+/// and idempotently create or enrich the pending receipt before the external
+/// submit. In normal RPC flow the unlinked pending row already exists as the
+/// durable admission intent. Link failure leaves that intent retryable; once the
+/// link lands, recovery is fail-closed and cannot build a second random note.
+/// The projector can always attribute a later consumption to the real eth hash.
 pub(crate) async fn record_ger_submission_handoff(
     store: &dyn crate::store::Store,
     txn_hash: TxHash,
     note_commitment: &str,
+    note_id: &str,
+    expiration_block: u64,
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<()> {
+    let tx_key = format!("{txn_hash:#x}");
     store
-        .record_tx_note_link(&format!("{txn_hash:#x}"), note_commitment)
+        .prepare_note_handoff(&tx_key, note_commitment, note_id, expiration_block)
         .await?;
     // `id: None` hides this row from the StoreSyncListener's commit-pending
     // sweep (which finalises by Miden tx id at the note's CREATION block);
@@ -190,7 +190,7 @@ pub(crate) async fn record_ger_submission_handoff(
     // block == GER-log block. No `expires_at`: GER receipts are finalised by
     // consumption, not TTL (matches the pre-existing pending-row semantics).
     store
-        .txn_begin(
+        .txn_begin_if_absent(
             txn_hash,
             crate::store::TxnEntry {
                 id: None,
@@ -262,6 +262,17 @@ pub async fn insert_ger(
         {
             Ok(()) => {}
             Err(err) if crate::account_recovery::is_recoverable_account_error(&err) => {
+                if store
+                    .get_note_link_for_tx(&format!("{txn_hash:#x}"))
+                    .await?
+                    .is_some()
+                {
+                    tracing::error!(
+                        %txn_hash, error = %err,
+                        "GER submission outcome is ambiguous after durable handoff; refusing to rebuild a second note"
+                    );
+                    return Err(err);
+                }
                 tracing::warn!(
                     err = %err,
                     ger = %hex::encode(ger_bytes),
@@ -279,11 +290,8 @@ pub async fn insert_ger(
                     "ger_manager",
                 )
                 .await?;
-                // Retry-safety: the first attempt failed BEFORE its handoff
-                // (account errors surface at submit/commit time, and the
-                // handoff only runs after commit confirmation), so no link or
-                // pending row exists yet — the retry's fresh note records
-                // both exactly once.
+                // No durable link exists, so the failure occurred before the
+                // external submission boundary and a fresh local retry is safe.
                 submit_update_ger_note(
                     miden_client,
                     accounts.clone(),

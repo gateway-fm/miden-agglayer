@@ -15,6 +15,11 @@ pub async fn service_get_txn_receipt(
     let (status, block_num) = match service.store.txn_receipt(txn_hash).await? {
         Some((result, block_num)) => (result.is_ok(), block_num),
         None => {
+            // A known transaction without a terminal result is still pending.
+            // Synthetic-log fallback is only for hashes with no transaction row.
+            if service.store.txn_get(txn_hash).await?.is_some() {
+                return Ok(None);
+            }
             // Synthetic-log receipt fallback (receipts contract). A bridge-out
             // `BridgeEvent` (and a projected GER `UpdateHashChain`) has NO real txn
             // record: it was never an `eth_sendRawTransaction` — the
@@ -173,6 +178,7 @@ mod tests {
     #[tokio::test]
     async fn rd940_specd_pending_receipt_is_none() {
         let service = create_test_service();
+        let miden = service.miden_client.clone();
         let txn_hash = TxHash::from([0x77u8; 32]);
         let txn_envelope = TxEnvelope::Legacy(alloy::consensus::Signed::new_unchecked(
             alloy::consensus::TxLegacy::default(),
@@ -194,6 +200,21 @@ mod tests {
             .await
             .unwrap();
         // Deliberately NOT committing.
+        service
+            .store
+            .add_log(crate::log_synthesis::SyntheticLog {
+                address: Address::ZERO.to_string(),
+                topics: vec![],
+                data: "0x".to_string(),
+                block_number: 1,
+                block_hash: [0u8; 32],
+                transaction_hash: format!("{txn_hash:#x}"),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            })
+            .await
+            .unwrap();
 
         let result = service_get_txn_receipt(service, txn_hash.to_string())
             .await
@@ -202,6 +223,140 @@ mod tests {
             result.is_none(),
             "pre-commit receipt MUST be None — aggkit reads it as 'keep polling'"
         );
+        assert_eq!(
+            miden.test_call_count(),
+            0,
+            "receipt polling must perform no Miden-client request"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_receipt_returns_promptly_while_miden_writer_is_blocked() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let block_state = std::sync::Arc::new(crate::block_state::BlockState::new());
+        let (miden, release_writer) = crate::MidenClient::new_test_blocked();
+        let service = ServiceState::new(
+            miden,
+            crate::test_helpers::test_accounts_config(),
+            1,
+            1,
+            store,
+            block_state,
+        );
+        let txn_hash = TxHash::from([0x78u8; 32]);
+        let envelope = TxEnvelope::Legacy(alloy::consensus::Signed::new_unchecked(
+            alloy::consensus::TxLegacy::default(),
+            alloy::primitives::Signature::test_signature(),
+            txn_hash,
+        ));
+        service
+            .store
+            .txn_begin(
+                txn_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::from([0x98u8; 20]),
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let writer_client = service.miden_client.clone();
+        let blocked_writer = tokio::spawn(async move {
+            writer_client
+                .with(|_client| Box::new(async { Ok::<(), anyhow::Error>(()) }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while service.miden_client.test_call_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer request must enter the serialized Miden lane");
+
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service_get_txn_receipt(service.clone(), format!("{txn_hash:#x}")),
+        )
+        .await
+        .expect("store-only receipt polling must not queue behind the Miden writer")
+        .unwrap();
+        assert!(receipt.is_none());
+        assert_eq!(
+            service.miden_client.test_call_count(),
+            1,
+            "receipt polling must not issue a second Miden-client request"
+        );
+
+        release_writer.send(()).unwrap();
+        blocked_writer.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn note_linked_pending_receipt_does_not_reconcile_inline() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::{FixedBytes, Signature};
+        use alloy_core::sol_types::SolCall;
+
+        let service = create_test_service();
+        let miden = service.miden_client.clone();
+        let ger = [0x5au8; 32];
+        service
+            .store
+            .commit_ger_event_atomic(1, [0u8; 32], "0xother-ger", &ger, None, None, 0)
+            .await
+            .unwrap();
+        let calldata = crate::ger::insertGlobalExitRootCall {
+            root: FixedBytes::from(ger),
+        }
+        .abi_encode();
+        let tx_hash = TxHash::from([0x5bu8; 32]);
+        let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy {
+                input: calldata.into(),
+                ..Default::default()
+            },
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        service
+            .store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::from([0x5cu8; 20]),
+                    expires_at: Some(10),
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .store
+            .prepare_note_handoff(
+                &format!("{tx_hash:#x}"),
+                "commitment",
+                "missing-note-id",
+                10,
+            )
+            .await
+            .unwrap();
+
+        let receipt = service_get_txn_receipt(service, format!("{tx_hash:#x}"))
+            .await
+            .unwrap();
+        assert!(
+            receipt.is_none(),
+            "applied state without the exact NoteId is uncertain"
+        );
+        assert_eq!(miden.test_call_count(), 0);
     }
 
     /// Receipts contract — a tx that emitted a synthetic log (a projected

@@ -419,6 +419,44 @@ impl MidenClient {
         }
     }
 
+    /// Test stub whose first serialized client request remains blocked until
+    /// the returned sender is signalled. Used to prove read-only RPC polling
+    /// never queues behind an in-progress Miden writer.
+    #[cfg(test)]
+    pub fn new_test_blocked() -> (Self, std::sync::mpsc::Sender<()>) {
+        let store_dir = tempfile::tempdir().unwrap().keep();
+        let keystore_path = store_dir.join("keystore");
+        std::fs::create_dir_all(&keystore_path).unwrap();
+        let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).unwrap());
+        let (sender, mut receiver) = mpsc::channel::<Request>(1);
+        let (done_sender, _done_receiver) = oneshot::channel::<()>();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        thread::spawn(move || {
+            if let Some(req) = receiver.blocking_recv() {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                let _ = release_receiver.recv();
+                let _ = req.response_sender.send(Ok(()));
+            }
+        });
+
+        (
+            Self {
+                keystore,
+                task: std::sync::Mutex::new(None),
+                sender,
+                done_sender: std::sync::Mutex::new(Some(done_sender)),
+                alive: Arc::new(AtomicBool::new(true)),
+                local_prover_fallback: None,
+                listeners_paused: Arc::new(AtomicBool::new(false)),
+                call_count,
+            },
+            release_sender,
+        )
+    }
+
     /// Returns the number of times `.with()` was called on this test stub.
     #[cfg(test)]
     pub fn test_call_count(&self) -> usize {

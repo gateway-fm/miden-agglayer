@@ -161,7 +161,7 @@ Treat each one as a hard-page criterion at any non-zero rate.
 | `spent-before-import recovery: bridge-consumed B2AGG verified via sync_transactions` | R1 catcher 3 success. | None |
 | `spent-before-import recovery: consumed B2AGG was NOT consumed by any bridge transaction ...` | MA#3 fail-closed skip (reclaim/unknown consumer). | Investigate |
 | `note reconciler failed (transient — will retry next tick)` | One reconciler pass failed; retried. Sustained repetition = node RPC trouble. | Investigate if sustained |
-| `nonce mismatch for 0x...: tx.nonce = N, expected M` | Out-of-order / replayed submission rejected (R4 guard). A background *churn* of these from autoclaim is benign — aggkit retries; the churn is eliminated by the writer worker's future-nonce wait (`AGGLAYER_ENABLE_WRITER_WORKER=true` waits up to 30 s for the gap nonce; `rpc_future_nonce_wait_total` counts the waits). | None unless a signer is stuck |
+| `nonce mismatch for 0x...: tx.nonce = N, expected M` | Out-of-order / replayed submission rejected (R4 guard). The single writer waits up to 30 s for a future-nonce gap; `rpc_future_nonce_wait_total` counts those waits. | None unless a signer is stuck |
 | `JSON-RPC unsupported method: web3_clientVersion` (also `parity_netPeers`, `debug_*`, `net_peerCount`, …) | Internet wallet-scanner probe noise — observed continuously on a host whose 8546 was bound to `0.0.0.0`. | Verify the port is loopback/private (runbook §1.2); otherwise ignore |
 | `account data wasn't found` / `incorrect account initial commitment` followed by `reimported from node` | R3 self-heal firing and (usually) curing. | Investigate only if it loops |
 | `reset_miden_store: deleted` / `=== RESTORE: complete ===` | R2 one-shot markers — should only appear during an operator-initiated recovery. | Confirm an operator is driving |
@@ -351,10 +351,8 @@ groups:
 # RD-940 writer worker
 
 This section codifies the alert thresholds for the eight Prometheus
-metrics introduced by the RD-940 async writer worker
-(`docs/design/RD-940-async-writer.md` Spec F §4). All series are
-registered unconditionally in `src/metrics.rs::init_metrics`; they are
-silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
+metrics introduced by the RD-940 single writer
+(`docs/design/RD-940-async-writer.md` Spec F §4).
 
 ## Metric reference
 
@@ -364,7 +362,7 @@ silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
 | `agglayer_writer_inflight_jobs` | gauge | `try_enqueue`, worker, TTL sweeper | Size of the inflight DashMap — Queued + Submitting + pre-eviction terminal. |
 | `agglayer_writer_job_duration_seconds{kind,outcome}` | histogram | worker `process` | Time from dequeue to terminal. `kind=claim\|ger_insert`, `outcome=committed\|failed`. |
 | `agglayer_writer_queue_full_rejections_total{kind}` | counter | `try_enqueue` | Backpressure events (returns JSON-RPC `-32005`). |
-| `agglayer_writer_job_failures_total{kind,reason}` | counter | worker fail path + TTL sweeper | Terminal Failed transitions. `reason=miden\|ttl\|panic\|store`. |
+| `agglayer_writer_job_failures_total{kind,reason}` | counter | worker fail path | Terminal Failed transitions. `reason=ttl` means queue age expired before dispatch; Submitting work is never failed by the maintenance sweeper. |
 | `agglayer_writer_dropped_on_restart_total` | counter | main.rs at boot | Residual jobs read from `/tmp/agglayer-writer-queue-snapshot`. |
 | `agglayer_writer_drain_outcome_total{outcome}` | counter | main.rs after `service::serve` | `outcome=clean\|partial`. |
 | `rpc_future_nonce_wait_total` | counter | `service_send_raw_txn` | Out-of-order submissions that entered the bounded future-nonce wait instead of erroring (writer mode only). Dashboard-level: measures how much reordering the worker absorbs. |
@@ -376,8 +374,8 @@ silent when `AGGLAYER_ENABLE_WRITER_WORKER=false`.
 | **WriterQueueWarn** | `agglayer_writer_queue_depth > 0.8 * AGGLAYER_WRITER_QUEUE_DEPTH` for 10 m | warn | Sustained backpressure; queue is filling faster than the single worker can drain. Capacity-plan or bump `AGGLAYER_WRITER_QUEUE_DEPTH`. |
 | **WriterQueueCritical** | `agglayer_writer_queue_depth > 0.95 * AGGLAYER_WRITER_QUEUE_DEPTH` for 2 m | page | One step from `-32005` rejections; aggkit ethtxmanager retry budgets will start tripping. |
 | **WriterJobDurationP99** | `histogram_quantile(0.99, rate(agglayer_writer_job_duration_seconds_bucket[10m])) > 60` | page | p99 > 60 s breaks aggkit's `WaitTxToBeMined = 2 m` envelope (Spec E). Miden submission is degraded. |
-| **WriterJobFailures** | `rate(agglayer_writer_job_failures_total[5m]) > 0.5` for 5 m | page | Burst of dispatch failures. Drill down by `kind` + `reason` to distinguish Miden errors from TTL expiries. |
-| **WriterDroppedOnRestart** | `increase(agglayer_writer_dropped_on_restart_total[1h]) > 0` | **hard page** | v1 tripwire: real unrecovered work. See `docs/operations/runbook.md` Failure mode I. |
+| **WriterJobFailures** | `rate(agglayer_writer_job_failures_total[5m]) > 0.5` for 5 m | page | Burst of worker failures. Drill down by `kind` + `reason`; `ttl` identifies queue saturation/age before dispatch, while `miden` identifies a completed dispatch error. |
+| **WriterDroppedOnRestart** | `increase(agglayer_writer_dropped_on_restart_total[1h]) > 0` | **hard page** | Restart-pressure tripwire: dispatch was lost but the signed envelope remains durable for same-hash recovery. See `docs/operations/runbook.md` Failure mode I. |
 | **WriterQueueFullRejections** | `rate(agglayer_writer_queue_full_rejections_total[5m]) > 0.1` for 5 m | page | aggkit retries `-32005` transparently up to its budget; sustained backpressure exhausts the budget and surfaces as a stuck tx. |
 | **WriterDrainOutcomePartial** | none — dashboard only | n/a | Counts non-clean shutdowns over time; correlate with restart events when investigating `dropped_on_restart` increments. |
 | **WriterInflightSize** | none — dashboard only | n/a | Informational; size of the DashMap. Should track `queue_depth + jobs in flight at Miden`. |

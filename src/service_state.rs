@@ -122,21 +122,10 @@ pub struct ServiceState {
     /// call. `None` when talking to the node directly; `Some(...)` when fronted by a
     /// gateway that rate-limits unauthenticated traffic. Redact if you ever log this.
     pub miden_api_key: Option<String>,
-    /// RD-940 async writer-worker dispatch toggle. When `false` (the default
-    /// until Phase 7 of the RD-940 rollout), `eth_sendRawTransaction` runs the
-    /// existing synchronous handler unchanged. When `true`, requests are
-    /// validated on the request thread and the actual Miden submission is
-    /// enqueued to the single writer-worker task. See
-    /// `docs/design/RD-940-async-writer.md` for the full design.
-    pub enable_writer_worker: bool,
-    /// RD-940 writer-worker producer handle. `None` when
-    /// `enable_writer_worker = false` *or* when the flag is set but the
-    /// worker failed to spawn at startup (logged-but-non-fatal — the sync
-    /// path remains usable as the fallback). `Some(handle)` is the live
-    /// `try_enqueue` surface plumbed into `service_send_raw_txn` and the
-    /// upcoming Phase 4 `eth_getTransactionByHash` in-flight reader. The
-    /// `Arc` shares the underlying channel + in-flight DashMap across every
-    /// `ServiceState::clone()` the dispatcher hands out.
+    /// Single writer-worker producer handle. Production startup always sets
+    /// this before serving RPC traffic. It remains optional only so lower-level
+    /// unit tests can construct a state without starting a background runtime.
+    /// The `Arc` shares the bounded channel and in-flight map across requests.
     pub writer_handle: Option<Arc<crate::writer_worker::WriterWorkerHandle>>,
 }
 
@@ -183,7 +172,6 @@ impl ServiceState {
             reject_zero_padding_addresses: false,
             expected_mints,
             miden_api_key: None,
-            enable_writer_worker: false,
             writer_handle: None,
         }
     }

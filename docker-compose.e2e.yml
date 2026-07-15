@@ -244,11 +244,6 @@ services:
       # miden-client's on-disk store fails at startup with
       # "Invalid cross-device link".
       TMPDIR: /var/lib/miden-agglayer-service/tmp
-      # RD-940 — async writer worker. Default false to keep the baseline
-      # e2e suite running the legacy synchronous handler unchanged; the
-      # RD-940 e2e scripts flip it via
-      # `AGGLAYER_ENABLE_WRITER_WORKER=true make e2e-up`.
-      AGGLAYER_ENABLE_WRITER_WORKER: "${AGGLAYER_ENABLE_WRITER_WORKER:-false}"
       AGGLAYER_WRITER_QUEUE_DEPTH: "${AGGLAYER_WRITER_QUEUE_DEPTH:-64}"
       AGGLAYER_WRITER_TX_TTL: "${AGGLAYER_WRITER_TX_TTL:-300}"
       AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS: "${AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS:-120}"
