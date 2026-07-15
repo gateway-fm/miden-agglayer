@@ -2985,7 +2985,8 @@ mod tests {
         let gi_real = U256::from(0x5005u64);
         assert_ne!(resolvable_dest(), addr_c);
         let calldata = claim_calldata(gi_real, resolvable_dest(), U256::from(1_000_000u64));
-        let (input_hex, tx_real) = encode_tx_signed_with_nonce(&key_c, calldata, 0);
+        let nonce_real = store.nonce_get(&format!("{addr_c:#x}")).await.unwrap();
+        let (input_hex, tx_real) = encode_tx_signed_with_nonce(&key_c, calldata, nonce_real);
         let accepted = service_send_raw_txn(service.clone(), input_hex)
             .await
             .expect("permissionless structurally valid claim is accepted");
@@ -3019,7 +3020,8 @@ mod tests {
         let someone_else = Address::from([0x77u8; 20]);
         assert_ne!(someone_else, addr_c);
         let calldata = claim_calldata(gi_swallow, someone_else, U256::from(1_000_000u64));
-        let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&key_c, calldata, 0);
+        let nonce_swallow = store.nonce_get(&format!("{addr_c:#x}")).await.unwrap();
+        let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&key_c, calldata, nonce_swallow);
         let accepted = service_send_raw_txn(service2, input_hex)
             .await
             .expect("permissionless claim for someone else's deposit must be accepted");
