@@ -5,7 +5,11 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - |
-        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 &
+        # AggSender reads RollupManager state at RollupCreationBlockL1. Anvil
+        # 1.7 retains only 3,600 historical states on disk by default, while a
+        # full E2E pass (notably the real H6 timeout) mines beyond that window.
+        # Keep enough history for the full pass plus the N=30 release gate.
+        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 --max-persisted-states=12000 &
         ANVIL_PID=$$!
         sleep 2
         # Fund deployment accounts and replay contract deployment transactions
