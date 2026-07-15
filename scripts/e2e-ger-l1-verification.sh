@@ -290,7 +290,7 @@ log "signer=$SIGNER nonce=$NONCE_B chainId=$CHAIN_DEC forged=$FORGED"
 
 # Build + sign a REAL insertGlobalExitRoot(bytes32) tx so eth_sendRawTransaction
 # actually reaches the H6 gate (a placeholder string would only ever produce a
-# DECODE error, never the "not observed on L1" refusal → a false-pass). cast
+# DECODE error, never the configured-L1 refusal → a false-pass). cast
 # mktx signs OFFLINE and does NOT broadcast.
 RAW_B=$(cast mktx "$L2_GER_ADDRESS" "insertGlobalExitRoot(bytes32)" "$FORGED" \
     --private-key "$SIGNER_KEY" --chain "$CHAIN_DEC" --nonce "$NONCE_B" \
@@ -302,7 +302,7 @@ OUT_B=$(rpc_call eth_sendRawTransaction "[\"$RAW_B\"]")
 RES_B=$(echo "$OUT_B" | json_field result)
 ERR_B=$(echo "$OUT_B" | json_field error)
 
-grep -q "not observed on L1" <<<"$OUT_B" \
+grep -q "not observed by the configured L1" <<<"$OUT_B" \
     || fail "forged GER was not refused (audit H6 regression); response: $OUT_B"
 [[ -z "$RES_B" ]] || fail "refusal must NOT return an accepted tx hash (got $RES_B) — the aggoracle would poll a receipt that can never exist"
 pass "forged GER refused with the H6 error and no accepted hash"
@@ -319,7 +319,7 @@ pass "signer nonce not consumed ($NONCE_B)"
 # the hash into the inflight cache before the gate, so the re-broadcast
 # short-circuited to Ok and the caller polled a receipt forever).
 OUT_B2=$(rpc_call eth_sendRawTransaction "[\"$RAW_B\"]")
-grep -q "not observed on L1" <<<"$OUT_B2" \
+grep -q "not observed by the configured L1" <<<"$OUT_B2" \
     || fail "re-broadcast of the rejected tx was not refused again (dedup admitted a rejected hash?): $OUT_B2"
 pass "identical re-broadcast refused again (no phantom dedup admission)"
 
