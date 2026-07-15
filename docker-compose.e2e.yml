@@ -264,6 +264,14 @@ services:
       # is seconds. e2e-ger-l1-verification.sh asserts both phases; override
       # with REJECT_UNVERIFIED_GER_INJECTION=false to run the lenient
       # (warn + metric only) mode, which makes that script SKIP itself.
+      # Keep the evidence source in environment as well as the normal service
+      # command. `docker compose run ... <one-shot flags>` replaces `command`,
+      # but inherits environment; restore/recovery must therefore retain the
+      # exact policy already bound to this database.
+      L1_RPC_URL: "http://anvil:8545"
+      GER_L1_ADDRESS: "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+      L1_INDEXER_FROM_BLOCK: "1"
+      L1_EVIDENCE_TAG: "${L1_EVIDENCE_TAG:-confirmations:1}"
       REJECT_UNVERIFIED_GER_INJECTION: "${REJECT_UNVERIFIED_GER_INJECTION:-true}"
     volumes:
       # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
