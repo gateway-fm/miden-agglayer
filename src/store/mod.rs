@@ -327,6 +327,15 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Bind finality markers and their scan cursor to the configured evidence
+    /// policy. The first clean serving boot records `policy`; later boots must
+    /// present the exact same canonical value. Implementations must reject an
+    /// unbound store that already contains finality progress or verified markers,
+    /// because the policy that produced them cannot be inferred safely.
+    async fn bind_l1_evidence_policy(&self, _policy: &str) -> anyhow::Result<()> {
+        anyhow::bail!("store does not support persistent L1 evidence-policy binding")
+    }
+
     // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
     /// Last fully-projected Miden block height owned by the `SyntheticProjector`
     /// (`docs/SYNTHETIC-INDEXER-REDESIGN.md`). Returns 0 if the projector has
@@ -481,26 +490,6 @@ pub trait Store: Send + Sync + 'static {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()>;
-    /// BLOCKER 2 (re-review) — write a PROVISIONAL TTL-expiry for a still-live
-    /// job's receipt. Unlike `txn_commit(Err)`, this is NON-terminal: only a
-    /// still-PENDING row is affected, and `txn_receipt` serves it as `None`
-    /// (null, "keep polling"), NOT status 0x0. A real later landing supersedes it
-    /// to success BEFORE it is ever observable-terminal, so no observer sees a
-    /// terminal `0x0 → 0x1` flip. A missing row is a best-effort no-op (the TTL
-    /// sweeper only calls this when it saw a row; it never seeds — BLOCKER 1). The
-    /// default impl falls back to a plain terminal `txn_commit(Err)` so
-    /// non-overriding test-double stores compile; the memory + pg stores provide
-    /// the genuine provisional behaviour.
-    async fn txn_commit_ttl_expired(
-        &self,
-        tx_hash: TxHash,
-        reason: String,
-        block_num: u64,
-        block_hash: [u8; 32],
-    ) -> anyhow::Result<()> {
-        self.txn_commit(tx_hash, Err(reason), block_num, block_hash)
-            .await
-    }
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,

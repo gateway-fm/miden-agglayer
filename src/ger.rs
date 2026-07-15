@@ -548,7 +548,7 @@ pub async fn ensure_ger_l1_observed(
         match entry.as_ref() {
             Some(e) => match evidence_tag {
                 EvidenceTag::Confirmations(depth) => {
-                    let l1_head = store.get_l1_indexer_cursor().await.unwrap_or(0);
+                    let l1_head = store.get_l1_indexer_cursor().await?;
                     e.block_number > 0 && l1_head.saturating_sub(e.block_number) >= depth
                 }
                 EvidenceTag::Finalized | EvidenceTag::Safe => e.finalized_verified,

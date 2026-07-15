@@ -323,11 +323,19 @@ pub fn init_metrics() {
          Labels: kind=claim|ger_insert. Alert: rate >0.1/s for 5 min → page."
     );
 
-    // RD-940 Phase 5 observability — the remaining 3 metrics from Spec F §4.
+    // RD-940 writer observability, including serial timeout-retry signals.
+    describe_counter!(
+        "agglayer_writer_retry_requests_total",
+        "RD-940: active submission attempts that exceeded the configured TTL. The sweeper only requests a retry; it never submits work or writes a receipt."
+    );
+    describe_counter!(
+        "agglayer_writer_retries_total",
+        "RD-940: timeout retry requests consumed by the sole worker after the active attempt returned an error. Labels: kind=claim|ger_insert."
+    );
     describe_counter!(
         "agglayer_writer_job_failures_total",
         "RD-940: writer-worker jobs that reached a terminal Failed state. \
-         Labels: kind=claim|ger_insert|unknown, reason=miden|ttl|panic|store. \
+         Labels: kind=claim|ger_insert, reason=miden|panic. \
          Alert: burst >0.5/s for 5 min → page."
     );
     describe_counter!(

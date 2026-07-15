@@ -61,14 +61,17 @@ its shape for new environments.
 | Flag | Env | Default | Notes |
 |---|---|---|---|
 | `--admin-api-key` | `ADMIN_API_KEY` | unset | Gates `admin_*` JSON-RPC (Bearer token, constant-time compare). Unset ⇒ `admin_*` rejected entirely. |
-| `--allowed-signers` | `ALLOWED_SIGNERS` | unset | Comma-separated signer allow-list for `eth_sendRawTransaction`. Unset = open mode — only safe behind a private network boundary. |
+| `--allowed-signers` | `ALLOWED_SIGNERS` | unset | Comma-separated signer allow-list for `eth_sendRawTransaction`. Unset is fail-closed; open mode requires the explicit dev-only `--insecure-allow-any-signer`. |
 | `--cors-allowed-origins` | `CORS_ALLOWED_ORIGINS` | unset | Omit to disable CORS (safe production default). `*` is DEV ONLY. |
 | `--rate-limit-per-second` / `--rate-limit-burst` | `RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST` | `500` / `500` | Per-IP rate limit. |
 | `--reject-zero-padding-addresses` | `REJECT_ZERO_PADDING_ADDRESSES` | `false` | Refuse the address-mapper zero-padding fallback (production posture). |
 | `--disable-hardhat-alias` | `DISABLE_HARDHAT_ALIAS` | `false` | Refuse the well-known Hardhat address remap (Cantina MA#8). **MUST be set in production.** |
 | `--reject-unverified-ger-injection` | `REJECT_UNVERIFIED_GER_INJECTION` | `false` | Audit H6: refuse to inject a GER whose `(mainnet, rollup)` decomposition the L1 InfoTree indexer never observed on L1 (compromised-aggoracle forged-GER defense). **MUST be set in production (or use `REQUIRE_HARDENING`, which implies it) — the code being merged does NOT close H6 while this is `false`.** Lenient default exists only for dev/e2e indexer lag (unverified GERs pass with a warn + `ger_injection_unverified_total`). Strict mode requires `L1_RPC_URL` + `GER_L1_ADDRESS` at startup — the boot **aborts loudly** if either is unset OR syntactically invalid (a malformed L1 RPC URL / GER address is a config error, distinct from a valid-but-currently-unreachable RPC, which stays fail-closed and retries). On a **fresh database** (no persisted indexer cursor) strict boot **also aborts** unless `L1_INDEXER_FROM_BLOCK` is set to a block at or before the rollup deployment — without it the indexer would start at the current L1 head and reject every pre-existing GER forever (this is now a hard invariant, not advisory). Rejections are side-effect-free and transient: no nonce/receipt is consumed and the aggoracle's identical retry succeeds once the indexer catches up. |
+| `--l1-evidence-tag` | `L1_EVIDENCE_TAG` | `confirmations:64` | Canonical evidence policy (`confirmations:<N>`, `safe`, or `finalized`). The database is bound to the exact value on first clean serving boot; a mismatch or untagged existing finality state aborts startup. Hardened mode requires `finalized`. |
 | `--require-hardening` | `REQUIRE_HARDENING` | `false` | Startup invariant: refuse to boot unless `ADMIN_API_KEY`, `ALLOWED_SIGNERS`, `MIDEN_PROVER_URL`, `DISABLE_HARDHAT_ALIAS` are set and CORS is not `*`. Also implies `REJECT_UNVERIFIED_GER_INJECTION` (audit H6), so it additionally requires the L1 indexer evidence source (`L1_RPC_URL` + `GER_L1_ADDRESS`) at boot. Set it on any internet-adjacent deployment. |
 | `--miden-debug` | `MIDEN_DEBUG` | `false` | Verbose Miden VM traces. Disable in production. |
+
+Evidence policy is immutable for a running database. To change it, stop the service, then clear policy-derived state in one PostgreSQL transaction: `UPDATE ger_entries SET finalized_verified = FALSE; UPDATE l1_indexer_state SET finalized_block = 0, finalized_scan_cursor = 0, evidence_tag = NULL;`. Restart with the new `L1_EVIDENCE_TAG`; startup binds the new canonical value and the finality scan rebuilds from block 0. Never edit only `evidence_tag`, because that would relabel old evidence.
 
 ### Writer worker (RD-940)
 
@@ -76,7 +79,7 @@ its shape for new environments.
 |---|---|---|
 | `--enable-writer-worker` / `AGGLAYER_ENABLE_WRITER_WORKER` | `false` | Async `eth_sendRawTransaction` dispatch. Runtime toggle; see the RD-940 section at the end of this doc for the flag-flip procedure and restart-loss contract. Also enables the bounded future-nonce wait (out-of-order submissions wait up to 30 s for the missing nonce instead of erroring). |
 | `AGGLAYER_WRITER_QUEUE_DEPTH` (env only) | `64` | mpsc capacity. |
-| `AGGLAYER_WRITER_TX_TTL` (env only) | `300` | Seconds before a stuck job is forced to Failed. |
+| `AGGLAYER_WRITER_TX_TTL` (env only) | `300` | Active-attempt timeout. The sweeper requests a retry; the sole worker retries only after the timed-out attempt returns an error. Queue wait does not consume this TTL. |
 | `AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS` (env only) | `120` | Miden-block lifetime of pending claim receipts waiting for the projector to observe claim-note consumption. |
 
 ### One-shot / recovery flags
@@ -870,9 +873,7 @@ no cascading effect.
 3. **First 10 minutes — eyes on the dashboard.**
    - `agglayer_writer_queue_depth` should stay well under 0.5 × cap
      (32 with the default cap of 64).
-   - `agglayer_writer_job_failures_total{reason="ttl"}` should stay 0.
-     Any non-zero rate means a Miden submission is stuck longer than
-     `AGGLAYER_WRITER_TX_TTL` (default 300 s).
+   - `agglayer_writer_retry_requests_total` should stay 0. Any increase means an active Miden submission exceeded `AGGLAYER_WRITER_TX_TTL` (default 300 s); correlate it with `agglayer_writer_retries_total` to see whether the worker subsequently retried.
    - `agglayer_writer_dropped_on_restart_total` must be 0 (this is the
      first boot under the flag; non-zero here means the previous boot
      was already running the worker and left residue).
@@ -889,5 +890,5 @@ no cascading effect.
 |---|---|---|
 | `AGGLAYER_ENABLE_WRITER_WORKER` | `false` | Master toggle for the RD-940 async path. Also enables the bounded future-nonce wait (30 s) that absorbs out-of-order autoclaim submissions. |
 | `AGGLAYER_WRITER_QUEUE_DEPTH` | `64` | mpsc capacity. At 64 + p50 commit ≈ 10 s, sustainable throughput tops near 6 jobs/s. Bump if `queue_full_rejections` rate climbs. |
-| `AGGLAYER_WRITER_TX_TTL` | `300` (5 min) | Seconds before the TTL sweeper forcibly transitions a stuck non-terminal hash to Failed + writes a `status:0x0` receipt. Sits inside aggkit's `WaitTxToBeMined = 2 m` with margin. |
+| `AGGLAYER_WRITER_TX_TTL` | `300` (5 min) | Active-submission timeout. The sweeper marks the attempt retry-requested but never writes a receipt or launches work. If that attempt returns an error, the sole worker consumes the request and retries serially. Queued jobs do not expire. |
 | `AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS` | `120` | Miden-block lifetime for pending claim receipts that wait for the projector to observe claim-note consumption. Increase if valid claims expire before projection under load. |

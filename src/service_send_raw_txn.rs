@@ -660,12 +660,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         .writer_handle
         .as_ref()
         .is_some_and(|handle| handle.is_inflight(&txn_hash));
-    let known_store_tx = service
-        .store
-        .txn_get(txn_hash)
-        .await
-        .map(|entry| entry.is_some())
-        .unwrap_or(false);
+    let known_store_tx = service.store.txn_get(txn_hash).await?.is_some();
     tracing::info!(
         target: "rpc::nonce_snoop",
         "{}",
@@ -698,6 +693,109 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             "tx-hash dedup (committed): returning OK without re-running R4"
         );
         return Ok(txn_hash);
+    }
+
+    // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
+    // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
+    // calldata. The proxy then runs Miden tx work on the service account's behalf
+    // (auto-creates faucets, advances LET, marks GERs injected), letting an
+    // attacker burn fees, poison registries, or feed fabricated GERs to
+    // bridge-service. Reject any signer not in the configured allow-list.
+    // Audit C2 — `None` is fail-closed (no signer accepted); legacy open mode
+    // requires the explicit `allow_any_signer` opt-in.
+    if !service.allow_any_signer && !is_signer_allowed(service.allowed_signers.as_deref(), &signer)
+    {
+        ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
+        anyhow::bail!(
+            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or ALLOWED_SIGNERS), \
+             or set --insecure-allow-any-signer to explicitly opt into open mode"
+        );
+    }
+
+    // ── Method decode ───────────────────────────────────────────────────
+    //
+    // Decoding the selector + ABI on the request thread (rather than inside
+    // the worker) keeps malformed payloads from poisoning the queue and lets
+    // both the legacy sync path and the worker path share the same dispatch
+    // shape downstream. The `DecodedWriteCall` enum is defined in
+    // `writer_worker` so it can also serve as the wire shape for the v1.5
+    // durable-queue migration sketched in `docs/design/RD-940-async-writer.md`.
+    let params_encoded = &txn.input;
+    let decoded = if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
+        tracing::debug!("claimAsset call");
+        let params = claimAssetCall::abi_decode(params_encoded)?;
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
+        crate::writer_worker::DecodedWriteCall::Claim {
+            params: Box::new(params),
+        }
+    } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
+        tracing::debug!("insertGlobalExitRoot call");
+        let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
+        let ger_bytes: [u8; 32] = params.root.0;
+        crate::writer_worker::DecodedWriteCall::Ger { ger_bytes }
+    } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
+        tracing::debug!("updateExitRoot call");
+        let params = updateExitRootCall::abi_decode(params_encoded)?;
+        tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
+        let combined_ger =
+            ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
+        crate::writer_worker::DecodedWriteCall::Ger {
+            ger_bytes: combined_ger,
+        }
+    } else {
+        tracing::error!("unhandled txn method {params_encoded:?}");
+        anyhow::bail!("unhandled txn method {params_encoded:?}");
+    };
+
+    // Writer-only preflight is side-effect free and may wait for L1 finality.
+    // Run it before the per-signer nonce lock so one lagging GER cannot block
+    // unrelated submissions from the same signer. The worker repeats the gates
+    // immediately before submission as defense in depth.
+    if service.enable_writer_worker {
+        service.writer_handle.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "enable_writer_worker=true but no writer_handle plumbed into ServiceState; boot order bug — see main.rs writer spawn block"
+            )
+        })?;
+
+        // Reject an already-stale replay before a potentially long finality
+        // wait. This is only an optimistic read; the locked R4 check below
+        // remains authoritative for races with another same-signer request.
+        let expected_before_preflight = service.store.nonce_get(&format!("{signer:#x}")).await?;
+        if tx_nonce < expected_before_preflight {
+            ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+            anyhow::bail!(
+                "nonce mismatch for {signer:#x}: tx.nonce = {tx_nonce}, expected {expected_before_preflight}; this guards against replay and out-of-order submission (R4)"
+            );
+        }
+
+        if service.reject_unverified_ger
+            && let crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } = &decoded
+        {
+            crate::ger::wait_for_ger_l1_observed(
+                &service.store,
+                ger_bytes,
+                true,
+                service.l1_evidence_tag,
+                txn_hash,
+            )
+            .await?;
+        }
+
+        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
+            && params.destinationNetwork == service.network_id
+            && !params.amount.is_zero()
+            && crate::address_mapper::resolve_address(
+                &*service.store,
+                params.destinationAddress,
+                &service.accounts.0,
+            )
+            .await
+            .is_ok()
+        {
+            ensure_claim_ger_published(&service.store, params).await?;
+        }
     }
 
     // R4 follow-up — serialise the entire nonce-check + enqueue/handler
@@ -770,59 +868,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         );
     };
 
-    // R2 — signer allow-list. Without this, anyone who can hit the JSON-RPC port
-    // can sign and submit `claimAsset` / `insertGlobalExitRoot` / `updateExitRoot`
-    // calldata. The proxy then runs Miden tx work on the service account's behalf
-    // (auto-creates faucets, advances LET, marks GERs injected), letting an
-    // attacker burn fees, poison registries, or feed fabricated GERs to
-    // bridge-service. Reject any signer not in the configured allow-list.
-    // Audit C2 — `None` is fail-closed (no signer accepted); legacy open mode
-    // requires the explicit `allow_any_signer` opt-in.
-    if !service.allow_any_signer && !is_signer_allowed(service.allowed_signers.as_deref(), &signer)
-    {
-        ::metrics::counter!("rpc_unauthorized_signer_total").increment(1);
-        anyhow::bail!(
-            "signer {signer:#x} is not on the allow-list; configure --allowed-signers (or ALLOWED_SIGNERS), \
-             or set --insecure-allow-any-signer to explicitly opt into open mode"
-        );
-    }
-
-    // ── Method decode ───────────────────────────────────────────────────
-    //
-    // Decoding the selector + ABI on the request thread (rather than inside
-    // the worker) keeps malformed payloads from poisoning the queue and lets
-    // both the legacy sync path and the worker path share the same dispatch
-    // shape downstream. The `DecodedWriteCall` enum is defined in
-    // `writer_worker` so it can also serve as the wire shape for the v1.5
-    // durable-queue migration sketched in `docs/design/RD-940-async-writer.md`.
-    let params_encoded = &txn.input;
-    let decoded = if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
-        tracing::debug!("claimAsset call");
-        let params = claimAssetCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
-        crate::writer_worker::DecodedWriteCall::Claim {
-            params: Box::new(params),
-        }
-    } else if params_encoded.starts_with(&insertGlobalExitRootCall::SELECTOR) {
-        tracing::debug!("insertGlobalExitRoot call");
-        let params = insertGlobalExitRootCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "insertGlobalExitRoot call params: {params:?}");
-        let ger_bytes: [u8; 32] = params.root.0;
-        crate::writer_worker::DecodedWriteCall::Ger { ger_bytes }
-    } else if params_encoded.starts_with(&updateExitRootCall::SELECTOR) {
-        tracing::debug!("updateExitRoot call");
-        let params = updateExitRootCall::abi_decode(params_encoded)?;
-        tracing::debug!(target: concat!(module_path!(), "::debug"), "updateExitRoot call params: {params:?}");
-        let combined_ger =
-            ger::combined_ger(&params.newMainnetExitRoot.0, &params.newRollupExitRoot.0);
-        crate::writer_worker::DecodedWriteCall::Ger {
-            ger_bytes: combined_ger,
-        }
-    } else {
-        tracing::error!("unhandled txn method {params_encoded:?}");
-        anyhow::bail!("unhandled txn method {params_encoded:?}");
-    };
-
     // ── Dispatch fork (RD-940) ──────────────────────────────────────────
     //
     // `enable_writer_worker` defaults to false — the legacy synchronous
@@ -848,69 +893,6 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                  boot order bug — see main.rs writer spawn block"
             )
         })?;
-        // Audit H6 on the REQUEST path (PR #121 review). Pre-fix, with the
-        // writer enabled the L1-corroboration gate only ran inside the worker
-        // — AFTER `try_enqueue` had consumed the nonce, admitted the tx hash
-        // into the inflight dedup cache, and returned the hash to the caller.
-        // A normal indexer-lag rejection then failed in the worker BEFORE
-        // `txn_begin`, so the failure-receipt `txn_commit` updated zero rows:
-        // returned hash, burned nonce, and eth_getTransactionReceipt = null
-        // forever — an aggoracle/ethtxmanager wedge. Run the gate here, before
-        // any side-effect, so a strict-mode rejection leaves NOTHING behind
-        // (no accepted hash, no nonce, no tx row/receipt, no queued job) and
-        // the request waits here before admission when the GER is already observed
-        // but not final. Unknown roots are rejected immediately, leaving the same
-        // signed transaction retryable once the indexer observes them. The worker's own `insert_ger` gate remains as
-        // defense-in-depth.
-        //
-        // Only run under strict mode: in lenient mode the gate never rejects,
-        // and the worker's `insert_ger` already emits the unverified warn +
-        // `ger_injection_unverified_total` metric — running it here too would
-        // double-count the metric for one submission.
-        if service.reject_unverified_ger
-            && let crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } = &decoded
-        {
-            crate::ger::wait_for_ger_l1_observed(
-                &service.store,
-                ger_bytes,
-                true,
-                service.l1_evidence_tag,
-                txn_hash,
-            )
-            .await?;
-        }
-
-        // C6 on the REQUEST path (PR #127 review point 3). Pre-fix, with the
-        // writer enabled the gate only ran inside the worker — AFTER
-        // `try_enqueue` had consumed the nonce and admitted the tx hash into
-        // the inflight dedup cache, so a GER-not-yet-published claim burned a
-        // sequence slot and its re-broadcast short-circuited as a "known"
-        // hash. Run the gate here, before any side-effect, so pre-admission
-        // failure leaves NOTHING behind: no tx hash/receipt, no nonce, no
-        // globalIndex lock, no queued job — the same signed transaction (same
-        // nonce) is accepted verbatim once the GER is published.
-        //
-        // Only claims that would actually reach C6 in the worker are gated,
-        // mirroring `worker_handle_claim_asset`'s short-circuit precedence:
-        // wrong-network claims hard-fail in the worker regardless of GER,
-        // zero-amount claims are swallowed as immediate successes, and
-        // unresolvable destinations are swallowed permanently (RD-860 runs
-        // BEFORE C6 because that state is permanent while a missing GER is
-        // transient).
-        if let crate::writer_worker::DecodedWriteCall::Claim { params } = &decoded
-            && params.destinationNetwork == service.network_id
-            && !params.amount.is_zero()
-            && crate::address_mapper::resolve_address(
-                &*service.store,
-                params.destinationAddress,
-                &service.accounts.0,
-            )
-            .await
-            .is_ok()
-        {
-            ensure_claim_ger_published(&service.store, params).await?;
-        }
-
         let job = decoded.into_job(txn_envelope, signer, txn_hash);
         match handle.try_enqueue(job) {
             Ok(()) => {
@@ -1352,6 +1334,78 @@ mod tests {
         service_send_raw_txn(service, input_hex)
             .await
             .expect("zero-amount claim must not be GER-gated at admission");
+    }
+
+    #[tokio::test]
+    async fn h6_finality_wait_does_not_hold_the_signer_nonce_lock() {
+        let mut service = create_test_service();
+        service.enable_writer_worker = true;
+        service.reject_unverified_ger = true;
+        service.l1_evidence_tag = crate::ger::EvidenceTag::Finalized;
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+
+        let ger = [0xD7; 32];
+        service
+            .store
+            .set_ger_exit_roots(&ger, [0x11; 32], [0x22; 32], 10, 20)
+            .await
+            .unwrap();
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let waiting_input = encode_legacy_tx_signed(
+            &signer,
+            insertGlobalExitRootCall {
+                root: FixedBytes::from(ger),
+            }
+            .abi_encode(),
+            1,
+        );
+        let ready_input = encode_legacy_tx_signed(
+            &signer,
+            claimAssetCall {
+                smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+                smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+                globalIndex: U256::from(902u64),
+                mainnetExitRoot: FixedBytes::ZERO,
+                rollupExitRoot: FixedBytes::ZERO,
+                originNetwork: 0,
+                originTokenAddress: Address::ZERO,
+                destinationNetwork: 1,
+                destinationAddress: Address::ZERO,
+                amount: U256::ZERO,
+                metadata: Default::default(),
+            }
+            .abi_encode(),
+            2,
+        );
+
+        let waiting_service = service.clone();
+        let waiting =
+            tokio::spawn(async move { service_send_raw_txn(waiting_service, waiting_input).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "observed-but-unfinalized GER must wait"
+        );
+
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service_send_raw_txn(service, ready_input),
+        )
+        .await
+        .expect("same-signer ready work must not wait behind L1 finality");
+        assert!(
+            ready.is_ok(),
+            "ready same-signer call should be admitted: {ready:?}"
+        );
+
+        waiting.abort();
+        let _ = shutdown.send(());
     }
 
     /// Audit H6, PR #121 review (MAIN blocker) — writer mode. Pre-fix, with

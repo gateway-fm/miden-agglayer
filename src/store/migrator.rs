@@ -94,6 +94,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "012_finalized_verified.sql",
         include_str!("../../migrations/012_finalized_verified.sql"),
     ),
+    (
+        "013_l1_evidence_policy.sql",
+        include_str!("../../migrations/013_l1_evidence_policy.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be
@@ -110,7 +114,7 @@ pub struct MigrationReport {
 /// Connect to `db_url`, apply any pending migrations from the embedded
 /// list, return a report. Errors abort proxy startup.
 pub async fn run_migrations(db_url: &str) -> Result<MigrationReport> {
-    let (client, connection) = tokio_postgres::connect(db_url, NoTls)
+    let (mut client, connection) = tokio_postgres::connect(db_url, NoTls)
         .await
         .context("connecting to Postgres for migrations")?;
     tokio::spawn(async move {
@@ -118,14 +122,14 @@ pub async fn run_migrations(db_url: &str) -> Result<MigrationReport> {
             tracing::error!(error = %e, "migrator: postgres connection task ended with error");
         }
     });
-    let result = run_migrations_with_client(&client).await;
+    let result = run_migrations_with_client(&mut client).await;
     drop(client);
     result
 }
 
 /// Inner: takes an already-connected client so tests can pass a
 /// pg_temporary or testcontainer client.
-async fn run_migrations_with_client(client: &Client) -> Result<MigrationReport> {
+async fn run_migrations_with_client(client: &mut Client) -> Result<MigrationReport> {
     ensure_schema_migrations_table(client).await?;
 
     // Take the advisory lock; held for the rest of this connection's
@@ -154,17 +158,25 @@ async fn run_migrations_with_client(client: &Client) -> Result<MigrationReport> 
             None => {
                 // Apply
                 tracing::info!(migration = %name, "applying migration");
-                client
+                let transaction = client
+                    .transaction()
+                    .await
+                    .with_context(|| format!("starting transaction for migration {name}"))?;
+                transaction
                     .batch_execute(sql)
                     .await
                     .with_context(|| format!("applying migration {name}"))?;
-                client
+                transaction
                     .execute(
                         "INSERT INTO schema_migrations (name, checksum) VALUES ($1, $2)",
                         &[name, &checksum.as_str()],
                     )
                     .await
                     .with_context(|| format!("recording applied migration {name}"))?;
+                transaction
+                    .commit()
+                    .await
+                    .with_context(|| format!("committing migration {name}"))?;
                 report.applied.push((*name).into());
             }
             Some(existing) => {

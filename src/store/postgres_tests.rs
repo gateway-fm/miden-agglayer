@@ -631,6 +631,59 @@ async fn test_pgstore_l1_finalized_block_roundtrip() {
     assert_eq!(store.get_l1_finalized_block().await.unwrap(), 12_345);
 }
 
+/// Evidence provenance binding requires a dedicated freshly-migrated database
+/// because the singleton policy is intentionally immutable.
+#[tokio::test]
+#[ignore = "requires a dedicated fresh PostgreSQL database"]
+async fn test_pgstore_l1_evidence_policy_binding_is_immutable() {
+    let store = pg_store().await.expect("DATABASE_URL must be set");
+    store.bind_l1_evidence_policy("finalized").await.unwrap();
+    store.bind_l1_evidence_policy("finalized").await.unwrap();
+    let err = store
+        .bind_l1_evidence_policy("safe")
+        .await
+        .expect_err("a PostgreSQL evidence policy change must fail closed");
+    assert!(format!("{err:#}").contains("bound to `finalized`"));
+}
+
+/// An upgraded database with policy-derived state but no provenance is
+/// ambiguous and must not be silently labelled with the current setting.
+#[tokio::test]
+#[ignore = "requires a dedicated fresh PostgreSQL database"]
+async fn test_pgstore_untagged_finality_state_is_rejected() {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect for test setup");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(
+            "UPDATE l1_indexer_state
+             SET evidence_tag = NULL, finalized_block = 1, finalized_scan_cursor = 0;
+             UPDATE ger_entries SET finalized_verified = FALSE;",
+        )
+        .await
+        .expect("seed ambiguous pre-policy state");
+
+    let store = PgStore::new(&db_url).await.expect("create PgStore");
+    let err = store
+        .bind_l1_evidence_policy("finalized")
+        .await
+        .expect_err("untagged finality progress must fail closed");
+    assert!(format!("{err:#}").contains("without an evidence policy"));
+
+    client
+        .execute(
+            "UPDATE l1_indexer_state
+             SET evidence_tag = NULL, finalized_block = 0, finalized_scan_cursor = 0",
+            &[],
+        )
+        .await
+        .expect("restore clean singleton state");
+}
+
 /// BLOCKER 1 (re-review) — `mark_ger_finalized` sets the finalized-chain tie
 /// flag (migration 012), and `set_ger_exit_roots` (the latest scan) never resets
 /// it (monotone). PG-gated: skips when `DATABASE_URL` is unset.
@@ -680,49 +733,6 @@ async fn test_pgstore_mark_ger_finalized_monotone() {
             .unwrap()
             .finalized_verified,
         "set_ger_exit_roots must preserve finalized_verified"
-    );
-}
-
-/// BLOCKER 2 (re-review) — a PROVISIONAL TTL-expiry is served as null (NOT
-/// terminal 0x0), and a real later landing supersedes it to success — so no
-/// observable `0x0 → 0x1` flip. A genuine `txn_commit(Err)` remains observable
-/// 0x0. PG-gated: skips when `DATABASE_URL` is unset.
-#[tokio::test]
-async fn test_pgstore_ttl_expiry_is_provisional_then_superseded() {
-    let Some(store) = pg_store().await else {
-        return;
-    };
-    reset_state(&store).await;
-
-    // Provisional path.
-    let a = TxHash::from([0x6Au8; 32]);
-    store.txn_begin(a, dummy_txn_entry()).await.unwrap();
-    store
-        .txn_commit_ttl_expired(a, "TTL expired".into(), 3, [0u8; 32])
-        .await
-        .unwrap();
-    assert!(
-        store.txn_receipt(a).await.unwrap().is_none(),
-        "a provisional TTL-expiry must read as null, not terminal 0x0"
-    );
-    store.txn_commit(a, Ok(()), 5, [0u8; 32]).await.unwrap();
-    let (res, _) = store.txn_receipt(a).await.unwrap().unwrap();
-    assert!(
-        res.is_ok(),
-        "a real landing must supersede the provisional expiry"
-    );
-
-    // Genuine worker failure remains observable 0x0.
-    let b = TxHash::from([0x6Bu8; 32]);
-    store.txn_begin(b, dummy_txn_entry()).await.unwrap();
-    store
-        .txn_commit(b, Err("boom".into()), 3, [0u8; 32])
-        .await
-        .unwrap();
-    let (res, _) = store.txn_receipt(b).await.unwrap().unwrap();
-    assert!(
-        res.is_err(),
-        "a genuine worker failure must be observable status 0x0"
     );
 }
 

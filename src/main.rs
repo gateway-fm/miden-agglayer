@@ -646,6 +646,17 @@ async fn main() -> anyhow::Result<()> {
     if let Err(reason) = check_h6_evidence_source(&command) {
         anyhow::bail!("{reason}");
     }
+    // Parse once for every serving mode. Silently defaulting an invalid value
+    // would bind the database to evidence the operator did not configure.
+    let l1_evidence_tag = miden_agglayer_service::ger::EvidenceTag::parse(
+        &command.l1_evidence_tag,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "unrecognised --l1-evidence-tag (L1_EVIDENCE_TAG) `{}`; expected `confirmations:<N>`, `finalized`, or `safe`",
+            command.l1_evidence_tag
+        )
+    })?;
 
     // Startup probe — when --require-hardening is set AND a remote prover is
     // configured, dial the gRPC endpoint once at boot so a misconfigured
@@ -790,6 +801,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(InMemoryStore::new())
     };
+
+    store
+        .bind_l1_evidence_policy(&l1_evidence_tag.describe())
+        .await
+        .context("binding persisted L1 evidence to the configured policy")?;
 
     // Reset the persisted note-reconciler sweep cursor BEFORE the
     // SyntheticProjector is constructed (it loads the cursor in `new()`):
@@ -960,10 +976,12 @@ async fn main() -> anyhow::Result<()> {
     // ServiceState. Under strict H6 a fresh DB (cursor 0) with no explicit
     // from-block would silently start the indexer at the L1 head and reject
     // every pre-existing GER forever; abort with an operator-actionable error
-    // instead. `get_l1_indexer_cursor` failing is treated as cursor 0 (the
-    // fail-closed reading) so a broken store can't mask the invariant.
+    // instead. A store read failure is a startup failure, not an empty cursor.
     {
-        let persisted_cursor = store.get_l1_indexer_cursor().await.unwrap_or(0);
+        let persisted_cursor = store
+            .get_l1_indexer_cursor()
+            .await
+            .context("loading the persisted L1 indexer cursor")?;
         if let Err(reason) = check_h6_backfill_invariant(
             command.reject_unverified_ger,
             command.require_hardening,
@@ -990,22 +1008,9 @@ async fn main() -> anyhow::Result<()> {
     state.allow_any_signer = command.insecure_allow_any_signer;
     // H6 — strict L1 GER corroboration is implied by --require-hardening.
     state.reject_unverified_ger = command.reject_unverified_ger || command.require_hardening;
-    // H6 — the SINGLE evidence-finality setting. `check_h6_evidence_source`
-    // already rejected an unparsable value (and a non-`finalized` value under
-    // hardening, and a sub-minimum `confirmations:<N>`) under strict; in lenient
-    // mode an unparsable value defaults to `confirmations:DEFAULT` (the gate
-    // never gates in lenient mode anyway).
-    state.l1_evidence_tag = miden_agglayer_service::ger::EvidenceTag::parse(
-        &command.l1_evidence_tag,
-    )
-    .unwrap_or_else(|| {
-        tracing::warn!(
-            value = %command.l1_evidence_tag,
-            "unrecognised --l1-evidence-tag; defaulting to `confirmations:{}`",
-            miden_agglayer_service::ger::DEFAULT_CONFIRMATIONS
-        );
-        miden_agglayer_service::ger::EvidenceTag::default()
-    });
+    // H6 — the canonical, startup-validated setting is also persisted by the
+    // store binding above, so its markers cannot be reused under another tag.
+    state.l1_evidence_tag = l1_evidence_tag;
     state.rate_limit_per_second = command.rate_limit_per_second;
     state.rate_limit_burst = command.rate_limit_burst;
     state.reject_zero_padding_addresses = command.reject_zero_padding_addresses;
