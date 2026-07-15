@@ -437,6 +437,15 @@ pub trait Store: Send + Sync + 'static {
     }
     /// Return the durable prepared/submitted state for an exact note handoff.
     async fn get_note_handoff_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<NoteHandoff>>;
+    /// Return at most `limit` terminal-less transactions with an exact durable
+    /// note handoff whose hash sorts after `after`. The background projector
+    /// uses this bounded cursor query to reconcile confirmed duplicates fairly;
+    /// receipt polling never calls it.
+    async fn pending_note_handoff_txs(
+        &self,
+        after: Option<TxHash>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TxHash>>;
     /// Persist an exact note identity immediately before the external submit.
     async fn prepare_note_handoff(
         &self,

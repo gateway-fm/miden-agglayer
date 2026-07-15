@@ -259,6 +259,39 @@ impl Store for PgStore {
         .transpose()
     }
 
+    async fn pending_note_handoff_txs(
+        &self,
+        after: Option<TxHash>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TxHash>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await?;
+        let after = after.map(|tx_hash| format!("{tx_hash:#x}"));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = client
+            .query(
+                "SELECT t.tx_hash
+                 FROM transactions t
+                 INNER JOIN tx_note_links l ON l.tx_hash = t.tx_hash
+                 WHERE t.status = 'pending' AND l.note_id IS NOT NULL
+                   AND ($1::TEXT IS NULL OR t.tx_hash > $1)
+                 ORDER BY t.tx_hash ASC
+                 LIMIT $2",
+                &[&after, &limit],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let hash: String = row.get(0);
+                hash.parse::<TxHash>().map_err(|error| {
+                    anyhow::anyhow!("invalid pending transaction hash {hash}: {error}")
+                })
+            })
+            .collect()
+    }
+
     async fn prepare_note_handoff(
         &self,
         tx_hash: &str,

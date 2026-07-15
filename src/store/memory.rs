@@ -427,6 +427,34 @@ impl Store for InMemoryStore {
             }))
     }
 
+    async fn pending_note_handoff_txs(
+        &self,
+        after: Option<TxHash>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TxHash>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let txns = self.transactions.lock();
+        let links = self.tx_note_links.read();
+        let mut pending: Vec<TxHash> = txns
+            .iter()
+            .filter(|(tx_hash, txn)| {
+                txn.result.is_none()
+                    && links
+                        .get(&format!("{tx_hash:#x}"))
+                        .is_some_and(|link| link.note_id.is_some())
+            })
+            .map(|(tx_hash, _)| *tx_hash)
+            .collect();
+        pending.sort_unstable();
+        Ok(pending
+            .into_iter()
+            .filter(|tx_hash| after.is_none_or(|after| *tx_hash > after))
+            .take(limit)
+            .collect())
+    }
+
     async fn prepare_note_handoff(
         &self,
         tx_hash: &str,

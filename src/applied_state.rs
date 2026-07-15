@@ -5,14 +5,14 @@
 //! synthetic landed projection exists or the synchronized Miden bridge account
 //! contains the corresponding GER/nullifier entry.
 
+use crate::miden_client::MidenClientLib;
 use crate::service_state::ServiceState;
+use crate::store::Store;
 use alloy::primitives::U256;
 use anyhow::Context;
-use miden_base_agglayer::AggLayerBridge;
-#[cfg(not(test))]
-use miden_base_agglayer::ExitRoot;
+use miden_base_agglayer::{AggLayerBridge, ExitRoot};
+use miden_protocol::account::AccountId;
 use miden_protocol::crypto::hash::poseidon2::Poseidon2;
-#[cfg(not(test))]
 use miden_protocol::note::NoteId;
 use miden_protocol::{Felt, Word};
 #[cfg(not(test))]
@@ -88,6 +88,50 @@ fn claim_is_set(
     Ok(value == Word::from([1u32, 0, 0, 0]))
 }
 
+async fn bridge_snapshot_with_client(
+    client: &mut MidenClientLib,
+    bridge_id: AccountId,
+    ger: Option<[u8; 32]>,
+    claim: Option<U256>,
+    note_id: Option<String>,
+) -> anyhow::Result<BridgeSnapshot> {
+    let bridge = client
+        .get_account(bridge_id)
+        .await
+        .context("reading Miden bridge account")?
+        .context("Miden bridge account is not available locally after sync")?;
+
+    let ger_applied = ger
+        .map(|root| {
+            AggLayerBridge::is_ger_registered(ExitRoot::new(root), &bridge)
+                .context("reading bridge GER map")
+        })
+        .transpose()?;
+    let claim_applied = claim
+        .map(|gi| claim_is_set(bridge.storage(), gi))
+        .transpose()?;
+    let note = match note_id {
+        None => NoteObservation::NotRequested,
+        Some(note_id) => {
+            let note_id = NoteId::try_from_hex(&note_id).context("parsing exact handoff NoteId")?;
+            match client
+                .get_output_note(note_id)
+                .await
+                .context("reading exact handoff output note")?
+            {
+                None => NoteObservation::Missing,
+                Some(note) if note.is_consumed() => NoteObservation::Consumed,
+                Some(_) => NoteObservation::Unconsumed,
+            }
+        }
+    };
+    Ok(BridgeSnapshot {
+        ger_applied,
+        claim_applied,
+        note,
+    })
+}
+
 #[cfg(test)]
 async fn bridge_snapshot(
     _service: &ServiceState,
@@ -121,52 +165,19 @@ async fn bridge_snapshot(
         .miden_client
         .with(move |client| {
             Box::new(async move {
-                let bridge = client
-                    .get_account(bridge_id)
-                    .await
-                    .context("reading Miden bridge account")?
-                    .context("Miden bridge account is not available locally after sync")?;
-
-                let ger_applied = ger
-                    .map(|root| {
-                        AggLayerBridge::is_ger_registered(ExitRoot::new(root), &bridge)
-                            .context("reading bridge GER map")
-                    })
-                    .transpose()?;
-                let claim_applied = claim
-                    .map(|gi| claim_is_set(bridge.storage(), gi))
-                    .transpose()?;
-                let note = match note_id {
-                    None => NoteObservation::NotRequested,
-                    Some(note_id) => {
-                        let note_id = NoteId::try_from_hex(&note_id)
-                            .context("parsing exact handoff NoteId")?;
-                        match client
-                            .get_output_note(note_id)
-                            .await
-                            .context("reading exact handoff output note")?
-                        {
-                            None => NoteObservation::Missing,
-                            Some(note) if note.is_consumed() => NoteObservation::Consumed,
-                            Some(_) => NoteObservation::Unconsumed,
-                        }
-                    }
-                };
-                *result_in.lock().expect("bridge snapshot mutex poisoned") = Some(BridgeSnapshot {
-                    ger_applied,
-                    claim_applied,
-                    note,
-                });
+                let snapshot =
+                    bridge_snapshot_with_client(client, bridge_id, ger, claim, note_id).await?;
+                *result_in.lock().expect("bridge snapshot mutex poisoned") = Some(snapshot);
                 Ok(())
             })
         })
         .await?;
 
-    let snapshot = result
+    result
         .lock()
         .expect("bridge snapshot mutex poisoned")
-        .take();
-    snapshot.context("Miden bridge-state request completed without a snapshot")
+        .take()
+        .context("Miden bridge-state request completed without a snapshot")
 }
 
 pub(crate) async fn ger_applied(service: &ServiceState, ger: &[u8; 32]) -> anyhow::Result<bool> {
@@ -234,31 +245,46 @@ fn classify_exact_note(applied: bool, note: NoteObservation) -> ExactNoteOutcome
     }
 }
 
-pub(crate) async fn reconcile_ger_handoff(
-    service: &ServiceState,
+pub(crate) async fn reconcile_ger_handoff_with_client(
+    store: &dyn Store,
+    client: &mut MidenClientLib,
+    bridge_id: AccountId,
     ger: [u8; 32],
     note_id: String,
 ) -> anyhow::Result<ExactNoteOutcome> {
-    let projected = service.store.is_ger_injected(&ger).await?;
-    let snapshot = bridge_snapshot(service, Some(ger), None, Some(note_id)).await?;
+    if store.is_ger_injected(&ger).await? {
+        // GER event + a still-pending receipt can only be another transaction:
+        // normal projection persists the event and its linked receipt atomically.
+        return Ok(ExactNoteOutcome::AppliedElsewhere);
+    }
+    let snapshot =
+        bridge_snapshot_with_client(client, bridge_id, Some(ger), None, Some(note_id)).await?;
     Ok(classify_exact_note(
-        projected || snapshot.ger_applied.unwrap_or(false),
+        snapshot.ger_applied.unwrap_or(false),
         snapshot.note,
     ))
 }
 
-pub(crate) async fn reconcile_claim_handoff(
-    service: &ServiceState,
+pub(crate) async fn reconcile_claim_handoff_with_client(
+    store: &dyn Store,
+    client: &mut MidenClientLib,
+    bridge_id: AccountId,
     global_index: U256,
     note_id: String,
 ) -> anyhow::Result<ExactNoteOutcome> {
-    let projected = service
-        .store
+    if store
         .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())
-        .await?;
-    let snapshot = bridge_snapshot(service, None, Some(global_index), Some(note_id)).await?;
+        .await?
+    {
+        // ClaimEvent + a still-pending receipt can only be another transaction:
+        // normal projection persists the event and its linked receipt atomically.
+        return Ok(ExactNoteOutcome::AppliedElsewhere);
+    }
+    let snapshot =
+        bridge_snapshot_with_client(client, bridge_id, None, Some(global_index), Some(note_id))
+            .await?;
     Ok(classify_exact_note(
-        projected || snapshot.claim_applied.unwrap_or(false),
+        snapshot.claim_applied.unwrap_or(false),
         snapshot.note,
     ))
 }
