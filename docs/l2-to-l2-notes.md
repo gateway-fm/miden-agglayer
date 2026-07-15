@@ -27,7 +27,7 @@ flowchart LR
     subgraph B["Rollup 2: L2B"]
         BE["Anvil, chain ID 31338"]
         BC["AgglayerBridgeL2 and AgglayerGERL2"]
-        BA["AggKit instance"]
+        L2B_AGGKIT["AggKit instance"]
         BS["L2B bridge-service and DB"]
     end
 
@@ -36,13 +36,13 @@ flowchart LR
     MP <--> MN
     MA <--> MP
     MS <--> MP
-    BA <--> BE
+    L2B_AGGKIT <--> BE
     BS <--> BE
     BE <--> BC
     MA --> L1
-    BA --> L1
+    L2B_AGGKIT --> L1
     L1 --> MA
-    L1 --> BA
+    L1 --> L2B_AGGKIT
 ```
 
 The two bridge-service instances and PostgreSQL databases are isolated by
