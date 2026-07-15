@@ -30,6 +30,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 COPY --from=builder /usr/src/app/bin/miden-agglayer-service /usr/local/bin/
 COPY --from=builder /usr/src/app/bin/bridge-out-tool /usr/local/bin/
 COPY --from=builder /usr/src/app/bin/bridge-autoclaim /usr/local/bin/
+COPY LICENSE-APACHE LICENSE-MIT /usr/share/licenses/miden-agglayer/
+COPY axum-jrpc/LICENSE /usr/share/licenses/miden-agglayer/LICENSE-axum-jrpc-MIT
 RUN mkdir -p /var/lib/miden-agglayer-service
 
 # 8546 - JSON-RPC HTTP
