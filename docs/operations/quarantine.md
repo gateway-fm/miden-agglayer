@@ -1,142 +1,169 @@
-# B2AGG quarantine — diagnosis & recovery runbook
+# B2AGG quarantine
 
-What to do when a bridge-out (B2AGG) note was consumed by the bridge **on-chain** but the
-proxy **refused to emit its BridgeEvent** — most importantly the case where the exit came
-from a **Miden-originated (native) faucet that was never registered/allowlisted**.
+A quarantine row means the bridge consumed a B2AGG note on Miden, but the
+service could not derive a fully validated synthetic `BridgeEvent`. Emitting a
+guessed event would poison certificates and immutable `eth_getLogs` history, so
+the projector fails closed: it records the note in
+`unbridgeable_bridge_outs`, increments a labelled counter, and emits no event.
 
-## 1. What quarantine is (and why it's fail-closed)
+This is a funds-impacting incident. The on-chain bridge consumption and LET
+advance have already happened, while AggKit cannot see an exit to certify.
 
-The proxy never emits a BridgeEvent it cannot fully derive and validate: a wrong or
-half-filled event would enter certificates and the L1 exit tree (a consensus-level fault),
-and getLogs immutability forbids fixing an emitted event later. So an underivable exit is
-**quarantined**: recorded in the `unbridgeable_bridge_outs` store table, logged, counted in
-metrics — and **no event is emitted**. The projector advances (a quarantine never wedges
-the chain).
+## Detection
 
-**The sharp edge:** by the time the proxy quarantines, the depositor's asset is already
-**locked in the bridge on-chain**. The exit stays invisible to aggkit/agglayer until an
-operator completes the recovery below. Funds are safe (locked, not lost) but stranded
-until then.
+Alert on any increase in:
 
-### Quarantine reasons (`unbridgeable_bridge_outs.reason`)
-
-| Reason | Meaning | Typical cause |
-|---|---|---|
-| `UnknownFaucet` | The asset's faucet has no `faucet_registry` row | **Native faucet bridged out without `admin_registerNativeFaucet`**; or a foreign faucet whose registry row was lost |
-| `StorageParseFailed` | Note storage missing/truncated/overflowing ("erased note", MA#18) | Note erased by the node (created+consumed in one batch) and unrecoverable |
-| `NoFungibleAsset` | The consumed B2AGG carried no fungible asset | Malformed/dust note |
-| (metadata refusal) | ERC-20 metadata empty and not validatable against the bridge's hash | Poisoned/lost registry metadata (see cantina13) — logged as *"refusing to emit empty/unvalidated metadata"* |
-
-## 2. The unregistered-native-faucet scenario, step by step
-
-1. An external party deploys a native faucet (e.g. `bridge-out-tool --create-native-faucet`)
-   and mints — **but the admin allowlist step is skipped**.
-2. A user bridges out: the B2AGG note is created and the bridge **consumes it on-chain**
-   (the asset is now locked in the bridge vault).
-3. The proxy projects the consumption, calls `resolve_faucet_origin` → **no registry row** →
-   error *"unknown faucet ID …: not found in faucet registry. Register the faucet via
-   admin_registerFaucet or bridge a claim first."*
-4. The exit is quarantined as `UnknownFaucet`. No BridgeEvent. The user's wrapped tokens
-   never appear on the destination chain.
-
-## 3. Diagnosis
-
-**Logs** (the proxy, ANSI-strip before grepping):
-
-```sh
-docker logs <proxy> 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' \
-  | grep -aiE "unknown faucet|refusing to emit|quarantin|unbridgeable"
-# restore path warn:  "restore: B2AGG unknown faucet: …"
+```text
+bridge_out_quarantined_erased_b2agg_total{reason=...}
 ```
 
-**Metrics** (must-watch; alert on any increase):
+Also watch `bridge_out_unknown_faucet_total`,
+`bridge_out_metadata_unrecoverable_total`, and
+`bridge_out_b2agg_metadata_too_large_total`.
 
-| Metric | Meaning |
-|---|---|
-| `bridge_out_unknown_faucet_total` | exits hitting the unknown-faucet path |
-| `bridge_out_quarantined_erased_b2agg_total` | quarantine rows written (MA#18) |
-| `bridge_out_metadata_unrecoverable_total` | metadata-refusal deferrals |
-| `synthetic_projector_completeness_missing_total` | in-proxy completeness auditor — a quarantine is *excluded* here (deliberate non-emit), so this staying 0 while the above rise is the expected quarantine signature |
-
-**Store** (the operator's concrete handle — one row per quarantined exit):
+The persisted handle is:
 
 ```sql
-SELECT note_id, reason, detail, observed_block, created_at
-FROM unbridgeable_bridge_outs ORDER BY created_at DESC;
+SELECT note_id, bridge_account, reason, detail,
+       observed_block, created_at
+FROM unbridgeable_bridge_outs
+ORDER BY created_at DESC;
 ```
 
-`detail` carries the human-readable cause (including the faucet id for `UnknownFaucet`);
-`note_dump` carries the full note for offline analysis. (No admin RPC lists this table
-yet — query the store directly; postgres in production deployments.)
+Retrieve `note_dump` only into a restricted forensic workspace; it can be
+large and contains the note's captured script/storage/asset material:
 
-**External cross-check:** `scripts/monitoring/watch-completeness.sh` classifies deliberate
-refusals as `EXPECTED-QUARANTINE` (matching the proxy's refusal warns by faucet) and only
-prints `COMPLETENESS VIOLATION` for unexplained absences. A quarantine therefore shows as
-EXPECTED-QUARANTINE there — if you see VIOLATION instead, you are NOT looking at a
-quarantine; treat it as a completeness incident.
-
-## 4. Recovery (unregistered native faucet)
-
-> Order matters: **register first, then restore**. The live path deliberately does NOT
-> retro-emit after a mere registry fix (getLogs immutability — the block is sealed);
-> recovery of already-quarantined exits goes through `--restore`, which rebuilds the
-> synthetic chain with the fixed registry so the event exists at its exact historical
-> block.
-
-1. **Verify the faucet is legitimate** before registering — the registry is a security
-   boundary (allowlist). Confirm with the token issuer: faucet account id, intended L1
-   token address, symbol, decimals. A quarantine can also be *someone probing with a
-   garbage faucet* — in that case, register nothing; the row is the audit trail.
-
-2. **Register (allowlist) the native faucet** via the admin API (auth: `ADMIN_API_KEY`):
-
-```sh
-curl -s -X POST http://<proxy>:8546 \
-  -H "content-type: application/json" -H "Authorization: Bearer $ADMIN_API_KEY" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"admin_registerNativeFaucet","params":[{
-        "faucet_id":       "0x<miden faucet account id>",
-        "origin_token_address": "0x<20-byte canonical token address>",
-        "symbol":          "XYZ",
-        "decimals":        18,
-        "name":            "XYZ Token"
-      }]}'
-# verify:
-#   method admin_listFaucets → the new row with is_native=true, origin_network=1
+```sql
+SELECT note_id, note_dump
+FROM unbridgeable_bridge_outs
+WHERE note_id = :'note_id';
 ```
 
-3. **Run `--restore`** (rebuilds the store from the Miden node + L1, then exits — see
-   `docs/operations/runbook.md` §R2 for the full procedure and flags):
+Correlate the row with logs from target `bridge_out::quarantine`, the Miden
+consumption block/transaction, bridge LET state, and AggKit certificate range.
 
-```sh
-docker compose stop miden-agglayer
-docker compose run --rm --no-deps miden-agglayer \
-    <normal command line...> --reset-miden-store --restore
-docker compose up -d miden-agglayer
+## Current reason values
+
+The enum and Postgres decoder currently support:
+
+| `reason` | Meaning |
+|---|---|
+| `storage_parse_failed` | B2AGG storage was absent, truncated, or contained a value that could not be decoded |
+| `no_fungible_asset` | The consumed note had no fungible asset |
+| `unknown_faucet` | The asset faucet had no local registry identity, so origin token fields could not be derived |
+| `amount_overflow` | Reverse decimal scaling could not fit the L1 amount |
+| `atomic_commit_failed` | The atomic synthetic-event/processed-state store commit failed and rolled back |
+| `metadata_too_large` | Validated metadata exceeded the 64 KiB event cap |
+
+Rows are first-write-wins by `note_id`; repeated observation does not replace
+the original evidence.
+
+Two related fail-close cases are not guaranteed to create this table row:
+
+- unrecoverable empty ERC-20 metadata increments
+  `bridge_out_metadata_unrecoverable_total` and remains retryable by a later
+  restore after authoritative metadata becomes available;
+- a B2AGG targeting the local network increments
+  `bridge_out_self_targeted_total` and is refused as a poison leaf.
+
+Investigate those from their logs and note ID even if the table is empty.
+
+## Immediate response
+
+1. Preserve current/previous logs, the quarantine row including `note_dump`,
+   the matching Miden note/transaction evidence, image digest, account-config
+   checksum, and a Postgres snapshot.
+2. Pause new bridge-outs if subsequent certificates would include the bad LET
+   leaf or if the cause can affect more notes.
+3. Confirm that no synthetic `BridgeEvent` exists for the note/deposit. Do not
+   manufacture one with SQL.
+4. Classify whether the missing data can be established authoritatively or is
+   intrinsically unavailable.
+5. Escalate to the bridge/AggLayer owner before any restore or governance
+   action. The proxy has no live per-note replay/admin endpoint.
+
+Do not delete the row, mark the note processed, increment the deposit counter,
+or insert a synthetic log manually. Those actions bypass atomic ordering,
+hash-chain, receipt, and immutability rules.
+
+## Unknown faucet
+
+First determine whether the faucet is legitimate and whether it is already
+registered in the bridge account. An absent local row can mean store loss, an
+out-of-band admin action, or an unsupported/hostile faucet. The
+`FaucetRegistryReconciler` treats an on-chain registration without a valid local
+row as a security tripwire and can halt the process.
+
+For a legitimate externally deployed Miden-native faucet that has **not yet
+produced a quarantined exit**, the supported allow-list call is
+`admin_registerNativeFaucet`. It requires `ADMIN_API_KEY` and derives
+`origin_network` from this service's configured `NETWORK_ID`:
+
+```bash
+curl -fsS -X POST "$PROXY_RPC" \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"admin_registerNativeFaucet",
+    "params":[{
+      "faucet_id":"0xACCOUNT_ID",
+      "origin_token_address":"0x20_BYTE_ADDRESS",
+      "symbol":"TOKEN",
+      "decimals":8,
+      "name":"Token name"
+    }]
+  }'
 ```
 
-4. **Verify recovery:**
-   - the exit's BridgeEvent now exists at its consumption block:
-     `eth_getLogs` at that block for topic `0x501781…62f9b`;
-   - the quarantine row for that note is gone / superseded after restore;
-   - the user's claim proceeds normally on the destination chain (autoclaim or manual);
-   - completeness watcher back to plain `OK` lines.
+The endpoint sends a Miden bridge-configuration transaction and persists the
+registry row; it is not a read-only repair. Verify identity, ownership, symbol,
+decimals, canonical origin address, and approval before calling it.
 
-## 5. Recovery (other reasons)
+Registering a faucet does **not** retroactively emit an event for an existing
+quarantine row. It only prevents/fixes the identity prerequisite. Historical
+reconstruction requires an offline-rehearsed full-store restore or a future
+purpose-built recovery implementation.
 
-- **Metadata refusal** — backfill `faucet_registry.metadata` (or wire an L1 RPC for the
-  token's origin network so the proxy can fetch + keccak-validate it), then `--restore`.
-  The exact operator hint is printed in the warn itself.
-- **`StorageParseFailed` / `NoFungibleAsset`** — genuinely unrecoverable from the proxy's
-  side (the note's content is gone or empty). The row is the audit trail; resolution is a
-  token-issuer/bridge-governance question, not a proxy operation.
+## Recovery boundary
 
-## 6. Prevention
+The current service does not implement the recovery RPC sketched in migration
+`006_unbridgeable_bridge_outs.sql`. Therefore there is no supported command to
+replay one quarantined note into a live, already-exposed synthetic chain.
 
-- **Allowlist before announcing**: a native token must be registered
-  (`admin_registerNativeFaucet`) *before* users can bridge it — the on-chain bridge will
-  lock assets regardless of proxy registration.
-- Alert on `bridge_out_unknown_faucet_total` > 0 — it is always either a badly ordered
-  rollout (register late) or a probe.
-- Release follow-up (task #47): e2e covering this exact scenario end-to-end
-  (lock → quarantine → register → restore → claimable), plus a live-projection-path unit
-  test with a native-shaped unregistered faucet.
+Some causes can be made derivable in a clean reconstruction:
+
+- restore the exact existing faucet identity from authoritative bridge/Miden
+  state;
+- make authoritative ERC-20 metadata available and validate its hash;
+- deploy code that fixes a deterministic parse/atomic-store bug.
+
+Others (`no_fungible_asset`, irretrievably absent storage, self-targeted poison
+leaf) cannot be repaired by supplying local metadata.
+
+If a full `--restore` into a clean coordinated store is proposed:
+
+1. Treat it as disaster recovery, not a row-level fix.
+2. Rehearse against cloned Postgres and Miden stores with `--read-only` where
+   chain mutation is not intended.
+3. Prove every previously exposed log remains byte-identical at its historical
+   block and the recovered event is derived from authoritative data.
+4. Coordinate downtime, backups, AggKit/certificate state, and rollback with
+   the chain owners.
+5. Never wipe the keystore or `bridge_accounts.toml`.
+
+If those proofs cannot be made, resolution belongs to bridge governance/token
+issuers rather than an operator database edit.
+
+## Prevention
+
+- Register and independently verify Miden-native faucets before enabling user
+  bridge-outs.
+- Keep Postgres, Miden store, keystore, and account config under coordinated
+  backup/restore procedures.
+- Keep `L1_RPC_URL` available for ERC-20 metadata recovery where applicable.
+- Alert on every quarantine/integrity counter increase.
+- Validate destination network/address and token route before creating a B2AGG.
+- Run the repository completeness and immutability monitors during load and
+  release acceptance.

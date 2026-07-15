@@ -1,16 +1,34 @@
-# External monitoring tools (instrumentation harness)
+# External monitoring harness
 
-Independent-of-the-proxy watchdogs used during certification, upgrade testing and soaks.
-They complement the IN-proxy completeness auditor (`synthetic_projector_completeness_missing_total`)
-with an outside view: the node's own DB and the public RPC are the only inputs.
+These tools observe the Miden node database and the proxy's public RPC during
+certification, upgrades and soak tests. They complement the in-process
+`synthetic_projector_completeness_missing_total` metric with an independent
+view.
 
-- `watch-completeness.sh` — every 10s, diff node-DB consumed B2AGG notes vs proxy
-  `eth_getLogs` BridgeEvents up to (synthetic tip − margin). Prints
-  `COMPLETENESS VIOLATION` on an unexplained miss (harness fast-fail grep target);
-  deliberate emit refusals (poisoned-registry quarantine) classify as
-  `EXPECTED-QUARANTINE`. WAL-aware node snapshots.
-- `immutability-monitor.py` — records every block's log-set hash from `eth_getLogs`
-  and flags ANY change after first exposure (the strong getLogs-immutability invariant);
-  baseline resets on chain regression (fresh bringup).
-- Usage: run detached alongside any e2e/loadtest/soak run; grep the output for
-  `VIOLATION` as a stop-the-line signal.
+| Tool | Purpose | Important output |
+|---|---|---|
+| `watch-completeness.sh` | Every `INTERVAL` seconds, compares consumed B2AGG notes in a WAL-aware node snapshot with synthetic `BridgeEvent` logs below `tip - MARGIN` | `COMPLETENESS VIOLATION` for an unexplained miss; deliberate quarantine is reported as `EXPECTED-QUARANTINE` |
+| `immutability-monitor.py` | Hashes each synthetic block's log set and detects a change after first exposure | `IMMUTABILITY VIOLATION`; its final summary includes poll and violation counts |
+| `soak-loop.sh` | Alternates clean and fault-injected mixed-load phases, runs a Miden-origin round trip each phase, and records a TSV ledger | Stops on completeness/immutability violations or a proxy tip that cannot recover within ten minutes |
+
+The completeness watcher needs Docker access to the running node and proxy
+containers, plus `curl`, Python 3 and SQLite support in Python. Override
+`COMPOSE_PROJECT_NAME`, `PROXY_CONTAINER`, `NODE_CONTAINER`, `L2_RPC`,
+`INTERVAL`, `MARGIN` or `B2AGG_ROOT` when the defaults do not match the stack.
+
+```bash
+# Run beside an existing Compose stack
+COMPOSE_PROJECT_NAME=miden-agglayer \
+  ./scripts/monitoring/watch-completeness.sh
+
+# Monitor the default RPC for one hour (duration is seconds)
+python3 ./scripts/monitoring/immutability-monitor.py 3600
+
+# Alternate clean/chaos phases until the stop file is created
+SOAK_DIR=/tmp/miden-soak ./scripts/monitoring/soak-loop.sh
+touch /tmp/miden-soak/SOAK_STOP
+```
+
+Run the monitors detached when a test owns the foreground. Treat their
+violation strings as stop-the-line signals; a monitor that never completed a
+poll is not positive evidence of correctness.

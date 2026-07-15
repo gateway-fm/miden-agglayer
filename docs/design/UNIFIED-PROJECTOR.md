@@ -1,69 +1,100 @@
-# Unified projector — authoritative per-block consumption sourcing
+# Unified projector: authoritative B2AGG consumption sourcing
 
-**Goal:** make the strong invariants (`getLogs` immutability, 0 late notes, reconcile-before-project)
-hold **by construction** instead of by enforcement, by removing the store-consumption *lag* that is
-the root of every late note. See `docs/SYNTHETIC-INDEXER-REDESIGN.md` → STRONG invariants.
+Status: implemented on `main`.
 
-## The root problem (why late notes exist)
+This design note explains why `SyntheticProjector` uses two consumption
+sources. It supersedes the former late-consumption sweep and direct-recovery
+queue.
 
-The projector reads consumptions from the **miden-client store**, which is filled by two independent,
-eventually-consistent processes:
-- the **reconciler** imports note *bodies* via `sync_notes` (creation feed), advancing `reconcile_cursor`;
-- **`sync_state`** discovers *consumptions* via a nullifier scan.
+## The consistency problem
 
-"bodies imported", "consumption known", and "projected" are three different frontiers moving at
-different speeds. Every late note = those frontiers out of step. The #30 barrier, the one-tick lag,
-Option 3, and the late-consumption sweep are all machinery to paper over that skew.
+The local miden-client store is interest based. An external wallet can create a
+public B2AGG note and the network transaction builder can consume it before the
+proxy's next `sync_state`. A note-body import sweep can recover the body, but
+waiting for the local store to later discover the spend is not a safe basis for
+sealing an immutable synthetic block.
 
-## The fix: source consumptions authoritatively per block
+CLAIM and GER notes have a different lifecycle: this proxy creates them through
+its serialized Miden client, records their output metadata and receipt linkage,
+and observes their consumed state locally.
 
-A finalized Miden block `N` (`N ≤ tip`) holds its **complete, immutable** consumption set — every
-nullifier spent in `N` is baked into the block. Read that, not the lagging store.
+## Implemented source split
 
-**New `project_block(N)`:**
-1. **B2AGG (BridgeEvents):** `sync_transactions(N, N, [bridge_id])` → the bridge's txs in block `N` →
-   their consumed nullifiers = the *authoritative, complete* set of B2AGG consumptions at `N`
-   (MA#3: consumer == bridge is exactly what `classify_b2agg_consumer == Emit` encodes). For each
-   nullifier, resolve the note **body** (details) from the imported store notes (keyed by nullifier;
-   `get_notes_by_id` as authoritative backfill if a body is missing), derive the `BridgeEvent`
-   (`restore_one_b2agg_note`), emit at block `N`. Order intra-block by `(consumed_tx_order, note_id)`.
-2. **CLAIM / GER:** proxy-created notes — the proxy *makes* these when it processes claims / GER
-   injections, so they are known synchronously with no lag. Keep the current derivation unchanged.
-3. Advance the synthetic tip to `N`.
+```mermaid
+flowchart TD
+    TIP["Miden sync tip"]
+    SWEEP["sync_notes tag-0 body sweep"]
+    CEILING["Projection ceiling"]
+    TXS["sync_transactions for bridge account"]
+    LOCAL["Local consumed-note store"]
+    B2AGG["B2AGG consumptions"]
+    INTERNAL["CLAIM and GER consumptions"]
+    ORDER["Order by block, transaction order, commitment"]
+    EMIT["Shared project_* derivations"]
 
-## Barrier: what stays, what goes
+    TIP --> CEILING
+    SWEEP --> CEILING
+    CEILING -->|"cursor plus one through ceiling"| TXS
+    TXS --> B2AGG
+    LOCAL --> INTERNAL
+    B2AGG --> ORDER
+    INTERNAL --> ORDER
+    ORDER --> EMIT
+```
 
-- **KEEP** `reconcile_cursor` = "note **bodies** imported up to here" (the `sync_notes` sweep). A note
-  consumed at `N` was created at `C ≤ N`, so `reconcile_cursor ≥ N` ⇒ its body is imported. Gate
-  `project_to = min(tip, reconcile_cursor)` so a body is always present when we project its
-  consumption. This frontier is reliable (creation feed), unlike the consumption frontier.
-- **DELETE** everything that existed only to fight the *consumption* lag:
-  - the late-consumption sweep + `swept` cache + `projector_late_sweep_anomaly_total`
-    (structurally impossible now — consumptions are authoritative, never late);
-  - `confirm_window_consumptions` (Option 3) + the one-tick lag (`reconcile_cursor_prev`);
-  - `recover_spent_before_import` + `direct_recovered` queue (subsumed: consumptions are sourced
-    directly, not "recovered");
-  - the store-`Consumed`-feed B2AGG path in `project_block` (replaced by `sync_transactions`).
+The ceiling is `min(tip, reconcile_cursor)`, where `reconcile_cursor` is the
+last fully completed note-body sweep window.
 
-## Correctness / invariants
+For B2AGG, `sync_transactions` is filtered to the configured bridge account.
+It supplies the finalized block number, consuming transaction order, input
+nullifiers, and an unauthenticated note id when the transaction carries one.
+The projector accepts a body only after the normal B2AGG script and
+bridge-consumer checks pass.
 
-- **getLogs immutable:** block `N` is projected from `N`'s finalized consumption set, which never
-  changes ⇒ its log set never changes.
-- **0 late, all types:** there is no second (consumption) frontier to lag ⇒ the late-sweep cannot
-  fire; it is deleted, not silenced. Non-B2AGG notes are never consulted (they aren't bridge txs).
-- **reconcile-before-project:** projecting `N` *is* reconciling `N` (authoritative fetch) — one step.
-- **Determinism unchanged:** same `(consumed_tx_order, note_id)` ordering; `is_*_processed` dedup kept.
+For CLAIM and GER, the projector groups records from
+`get_input_notes(NoteFilter::Consumed)` by their consumed block. B2AGG records
+are explicitly excluded from this local path so the sources remain disjoint.
 
-## Risks / open items
+## B2AGG body resolution
 
-- **Note-body availability:** relies on `reconcile_cursor ≥ N` ⇒ body imported. If `sync_notes` ever
-  misses a created note, `get_notes_by_id` (authoritative) backfills before emit; fail-closed if a
-  body truly cannot be fetched (never emit a BridgeEvent without the note).
-- **Perf:** `sync_transactions(N,N,[bridge])` per block. Batch per tick over `[cursor+1, project_to]`
-  in one `sync_transactions(cursor+1, project_to, [bridge])` call (it already accepts a range), then
-  bucket by `block_num` — O(1 RPC/tick), same cost model as today's single consumed-feed fetch.
-- **Nullifier→body map:** build once per tick from the imported store notes (`get_input_notes(All)`
-  → map by `nullifier()`), same as today's single feed fetch.
-- **Validation:** unit tests for the derivations stay; **3× full e2e** (this touches the hot path) +
-  the `getLogs` immutability monitor + `anomaly == 0` (the sweep is gone, so the metric must simply
-  not exist / be 0) + N=30.
+A consumed external input record no longer exposes the metadata needed to
+recompute its nullifier. The projector therefore caches canonical B2AGG bodies
+while they are still committed and keyed by nullifier.
+
+Resolution order is:
+
+1. body captured from an imported, still-committed local note;
+2. body recovered during the spent-before-import reconciliation path;
+3. authoritative `get_notes_by_id` fetch when the transaction supplies a note
+   id.
+
+The node's transaction feed can briefly lead its note database. Missing
+unauthenticated bodies are retried for a bounded number of ticks. A body that
+still cannot be authenticated is skipped loudly rather than freezing the
+synthetic tip or fabricating a `BridgeEvent`. Cache entries are removed only
+after the corresponding projector cursor has been persisted.
+
+## Removed behavior
+
+The live projector no longer:
+
+- projects notes from an earlier sealed Miden block into a later synthetic
+  block;
+- treats the local B2AGG consumed-note feed as authoritative;
+- runs a late-consumption sweep;
+- maintains a separate direct-recovered event queue; or
+- advances a consumption-reconciliation frontier from the note-creation feed.
+
+The note sweep remains, but only as a body-availability frontier. Holding the
+tip at that frontier preserves exact-block `eth_getLogs` behavior.
+
+## Operational checks
+
+`projector_visibility_barrier_held_blocks` shows how far projection is held
+behind the Miden tip. The completeness auditor periodically checks older
+consumed B2AGG notes against exact-block logs and de-duplicates alarms in
+memory. It is detection only and never repairs an exposed block.
+
+The correctness gate is the independent node-versus-log verifier in
+`scripts/verify-event-completeness.sh` and the isolated-wallet load test in
+`scripts/e2e-bridge-loadtest-isolated.sh`.
