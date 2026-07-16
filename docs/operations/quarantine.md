@@ -82,9 +82,11 @@ Investigate those from their logs and note ID even if the table is empty.
 5. Escalate to the bridge/AggLayer owner before any restore or governance
    action. The proxy has no live per-note replay/admin endpoint.
 
-Do not delete the row, mark the note processed, increment the deposit counter,
-or insert a synthetic log manually. Those actions bypass atomic ordering,
-hash-chain, receipt, and immutability rules.
+The leaf's exact deposit index was already reserved before quarantine; it remains
+`emitted = false`. Do not delete or alter that reservation, delete the quarantine
+row, mark the note processed, change the deposit counter, or insert a synthetic log
+manually. Those actions bypass execution ordering, hash-chain, receipt, and
+immutability rules.
 
 ## Unknown faucet
 

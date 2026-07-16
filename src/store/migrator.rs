@@ -110,6 +110,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "016_deposit_reservations.sql",
         include_str!("../../migrations/016_deposit_reservations.sql"),
     ),
+    (
+        "017_b2agg_identity_backfill.sql",
+        include_str!("../../migrations/017_b2agg_identity_backfill.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

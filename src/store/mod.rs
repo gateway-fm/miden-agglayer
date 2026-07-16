@@ -20,6 +20,7 @@ use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
+use miden_protocol::note::{NoteId, Nullifier};
 use miden_protocol::transaction::TransactionId;
 use std::sync::Arc;
 
@@ -199,12 +200,10 @@ impl UnclaimableReason {
 ///
 /// The on-chain consumption already advanced the LET frontier — funds are
 /// effectively burned on L2 — but aggkit failed to parse or process the
-/// note. Without this quarantine row, the failure was only surfaced as a
-/// symptom by the LET-divergence monitor (Cantina #9); operators had no
-/// concrete handle for an individual stranded B2AGG.
+/// note. This row gives operators a concrete handle for the stranded B2AGG.
 ///
-/// `note_id` is the primary key because erased B2AGGs by definition never
-/// reached the deposit-counter stage that would assign a `global_index`.
+/// `note_id` is the primary key because distinct notes may share a details commitment.
+/// The projector reserves the LET index before any quarantine branch.
 /// `note_dump` captures everything we knew about the note at quarantine
 /// time so a future recovery RPC can re-attempt the BridgeEvent
 /// synthesis once the underlying cause is fixed (faucet registered, parse
@@ -224,8 +223,7 @@ pub struct UnbridgeableBridgeOut {
     /// operator to identify the depositor and decide on a recovery path.
     pub note_dump: String,
     /// The aggkit synthetic block number at which the consumption was
-    /// observed. Useful for cross-referencing with the LET-divergence
-    /// monitor that fires in the same on_post_sync tick.
+    /// observed. Useful for cross-referencing with the Miden transaction feed.
     pub observed_block: u64,
 }
 
@@ -823,66 +821,40 @@ pub trait Store: Send + Sync + 'static {
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
 
-    /// Cantina #7 — reserve the AUTHORITATIVE LET deposit index for a bridge-consumed
-    /// B2AGG leaf WITHOUT emitting an event (quarantined / metadata-deferred /
-    /// self-targeted classes occupy an on-chain LET leaf by consumption, so skipping them
-    /// without reserving shifts every later exit's deposit_count off its true LET index —
-    /// wrong globalIndex, sealed forever). Reuse-or-allocate, atomic and idempotent: an
-    /// existing reservation (emitted or not) returns its original index, so retries,
-    /// restarts and a later successful emission (`commit_b2agg_event_atomic` with the same
-    /// key) all see ONE stable index. Does NOT mark the note processed — a deferred leaf
-    /// must remain re-attemptable.
+    /// Reserve a stable LET index for a bridge-consumed B2AGG leaf without marking it
+    /// processed. This includes leaves that are quarantined or deferred and emit no event.
     async fn reserve_deposit_index(&self, note_key: &str) -> anyhow::Result<u32>;
 
-    /// The reserved LET index for `note_key`, if any (emitted or not). Used by the LET
-    /// cardinality gate to compute the window's not-yet-reserved pending count without
-    /// double-counting crash-replayed blocks.
-    async fn get_reserved_deposit_index(&self, note_key: &str) -> anyhow::Result<Option<u32>>;
+    /// Atomically rename a pre-upgrade details-commitment key to its authoritative NoteId.
+    async fn migrate_legacy_deposit_key(
+        &self,
+        legacy_key: &str,
+        note_key: &str,
+        block_number: u64,
+        tx_hash: &str,
+    ) -> anyhow::Result<()>;
 
-    /// Cantina #7 (part 2): persisted LET cardinality gate state — `(baseline, halted)`.
-    /// The baseline is captured ONCE at first arming and never re-absorbed (a restart that
-    /// re-baselined would convert a standing unsafe gap into accepted history), and a halt
-    /// survives restarts (the gate comes back halted and re-evaluates against the
-    /// persisted baseline).
-    async fn get_let_gate_state(&self) -> anyhow::Result<(Option<u64>, bool)>;
-    async fn set_let_gate_baseline(&self, baseline: u64) -> anyhow::Result<()>;
-    async fn set_let_gate_halted(&self, halted: bool) -> anyhow::Result<()>;
-    /// Read the current deposit_counter (number of B2AGG-out notes aggkit has
-    /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
-    /// to compare against the bridge account's `let_num_leaves` storage slot.
+    /// Existing reservations for the requested keys.
+    async fn get_deposit_indices(
+        &self,
+        note_keys: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, u32>>;
+
+    /// Append to the durable identity ledger used to resolve headerless B2AGG
+    /// consumptions after restart. Existing nullifier mappings are immutable.
+    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()>;
+    async fn get_b2agg_note_ids(
+        &self,
+        nullifiers: &[Nullifier],
+    ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>>;
+
+    /// `deposit_counter` plus the operator-audited legacy LET offset, read atomically.
+    async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64>;
+    #[cfg(test)]
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;
 
-    /// Atomic, idempotent commit for a B2AGG bridge-out `BridgeEvent`. Folds:
-    ///   1. allocate (or reuse) the note's `deposit_count` and record the note
-    ///      as processed
-    ///   2. the BridgeEvent synthetic-log emission
-    /// into a single all-or-nothing operation. This is the SOLE write path for
-    /// the B2AGG processed-set that `is_note_processed` reads.
-    ///
-    /// Why this exists (audit H1): the legacy two-step mark-processed +
-    /// bridge-event emission sequence left a crash window — a process kill
-    /// between the two calls recorded the note as processed (and bumped
-    /// `deposit_counter`) with NO matching `BridgeEvent`. On restart the note
-    /// was silently skipped, stranding the exit: aggkit never certified it and
-    /// the L1 autoclaim never fired. The Claim path already had the atomic
-    /// pattern (`commit_manual_claim_event_atomic`); the B2AGG path did not.
-    ///
-    /// It is also idempotent on retry (audit H3): re-running for an
-    /// already-committed note reuses the original `deposit_count`, does NOT
-    /// bump the counter again, and does NOT emit a duplicate log. Allocating a
-    /// fresh `deposit_count` on retry would create a permanent gap in the
-    /// sequence, desynchronising leaf indices from the on-chain Local Exit
-    /// Tree (Cantina MA#15).
-    ///
-    /// REQUIRED — there is deliberately no default impl. A default that ran
-    /// the two steps sequentially would NOT be all-or-nothing (a failure
-    /// after the processed-marker write but before the event emission reopens
-    /// exactly the Cantina MA#15 crash window this method exists to close).
-    /// Each backend MUST provide a genuine single-transaction implementation:
-    /// `PgStore` uses one postgres txn; `InMemoryStore` folds the
-    /// reuse-or-allocate and the at-most-once emission under its in-process
-    /// locks.
-    /// Returns the `deposit_count` assigned to (or reused for) this note.
+    /// Atomically emit a previously reserved B2AGG leaf at most once. Retries reuse the
+    /// reservation and return its stable `deposit_count`.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
         &self,
@@ -916,12 +888,6 @@ pub trait Store: Send + Sync + 'static {
     ) -> anyhow::Result<bool> {
         Ok(true)
     }
-
-    /// Number of quarantined (unbridgeable) B2AGG rows — each one occupies an on-chain
-    /// LET leaf that deliberately has NO emitted BridgeEvent, so honest LET accounting is
-    /// `deposit_count + this` (Cantina #7/#9). Kept a COUNT (not a list fetch): it is read
-    /// on every divergence-monitor pass.
-    async fn count_unbridgeable_bridge_outs(&self) -> anyhow::Result<u64>;
 
     /// Look up an unbridgeable B2AGG by `note_id`. `None` if not quarantined.
     ///

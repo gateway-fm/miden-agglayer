@@ -10,11 +10,17 @@ use crate::log_synthesis::{
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use lru::LruCache;
 use miden_protocol::account::AccountId;
+use miden_protocol::note::{NoteId, Nullifier};
 use miden_protocol::transaction::TransactionId;
 use parking_lot::{Mutex, RwLock};
 use sha3::{Digest, Keccak256};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+
+fn bridge_event_deposit_count(data: &str) -> Option<u32> {
+    let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).ok()?;
+    Some(u32::from_be_bytes(bytes.get(252..256)?.try_into().ok()?))
+}
 
 struct TxnReceipt {
     id: Option<TransactionId>,
@@ -128,8 +134,9 @@ pub struct InMemoryStore {
     // quarantined/deferred/self-targeted classes — they occupy a LET leaf with no event);
     // the atomic commit reuses the reservation and flips emitted=true.
     processed_notes: RwLock<HashMap<String, (u32, bool)>>,
-    // Cantina #7 (part 2): persisted-equivalent gate state (baseline, halted).
-    let_gate_state: RwLock<(Option<u64>, bool)>,
+    b2agg_note_ids: RwLock<HashMap<Nullifier, NoteId>>,
+    // Explicit upgrade offset for legacy LET leaves not in deposit_counter.
+    let_gate_baseline: RwLock<u64>,
     deposit_counter: RwLock<u32>,
 
     // Claim watcher (independent from bridge-out so CLAIM observations do not
@@ -217,7 +224,8 @@ impl InMemoryStore {
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashMap::new()),
-            let_gate_state: RwLock::new((None, false)),
+            b2agg_note_ids: RwLock::new(HashMap::new()),
+            let_gate_baseline: RwLock::new(0),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             #[cfg(test)]
@@ -306,13 +314,33 @@ impl InMemoryStore {
         r.lease_expires_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     }
 
-    /// Emit a synthetic BridgeEvent log. Private helper for the atomic B2AGG
-    /// commit — it used to be a `Store` trait convenience method, but the only
-    /// remaining caller is `commit_b2agg_event_atomic` below (PgStore inlines
-    /// its own INSERT), so it lives here as a plain inherent method rather than
-    /// widening the trait surface.
+    #[cfg(test)]
+    pub(crate) fn set_let_gate_baseline_for_test(&self, baseline: u64) {
+        *self.let_gate_baseline.write() = baseline;
+    }
+
+    fn insert_log(&self, mut log: SyntheticLog) {
+        let mut counter = self.log_counter.write();
+        log.log_index = *counter;
+        *counter += 1;
+        drop(counter);
+
+        let tx_hash = log.transaction_hash.to_lowercase();
+        self.logs_by_block
+            .write()
+            .entry(log.block_number)
+            .or_default()
+            .push(log.clone());
+        self.logs_by_tx
+            .write()
+            .entry(tx_hash)
+            .or_default()
+            .push(log.clone());
+        self.pending_events.write().push(log);
+    }
+
     #[allow(clippy::too_many_arguments)]
-    async fn add_bridge_event(
+    fn add_bridge_event(
         &self,
         bridge_address: &str,
         block_number: u64,
@@ -326,7 +354,7 @@ impl InMemoryStore {
         amount: u128,
         metadata: &[u8],
         deposit_count: u32,
-    ) -> anyhow::Result<()> {
+    ) {
         let log = SyntheticLog {
             address: bridge_address.to_string(),
             topics: vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()],
@@ -347,7 +375,7 @@ impl InMemoryStore {
             log_index: 0,
             removed: false,
         };
-        self.add_log(log).await
+        self.insert_log(log);
     }
 }
 
@@ -680,35 +708,14 @@ impl Store for InMemoryStore {
 
     // ── Logs ─────────────────────────────────────────────────────
 
-    async fn add_log(&self, mut log: SyntheticLog) -> anyhow::Result<()> {
-        let mut counter = self.log_counter.write();
-        log.log_index = *counter;
-        *counter += 1;
-        drop(counter);
-
-        let block_num = log.block_number;
-        let tx_hash = log.transaction_hash.to_lowercase();
-
+    async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()> {
         tracing::debug!(
-            tx_hash = %tx_hash,
-            block_number = block_num,
+            tx_hash = %log.transaction_hash,
+            block_number = log.block_number,
             topic0 = log.topics.first().map(|t| &t[..20.min(t.len())]).unwrap_or("none"),
             "Store: adding log"
         );
-
-        self.logs_by_block
-            .write()
-            .entry(block_num)
-            .or_default()
-            .push(log.clone());
-
-        self.logs_by_tx
-            .write()
-            .entry(tx_hash)
-            .or_default()
-            .push(log.clone());
-
-        self.pending_events.write().push(log);
+        self.insert_log(log);
         Ok(())
     }
 
@@ -1608,10 +1615,6 @@ impl Store for InMemoryStore {
         }
     }
 
-    async fn count_unbridgeable_bridge_outs(&self) -> anyhow::Result<u64> {
-        Ok(self.unbridgeable_bridge_outs.read().len() as u64)
-    }
-
     async fn get_unbridgeable_bridge_out(
         &self,
         note_id: &str,
@@ -1643,18 +1646,11 @@ impl Store for InMemoryStore {
             .is_some_and(|(_, emitted)| *emitted))
     }
 
-    async fn get_let_gate_state(&self) -> anyhow::Result<(Option<u64>, bool)> {
-        Ok(*self.let_gate_state.read())
-    }
-
-    async fn set_let_gate_baseline(&self, baseline: u64) -> anyhow::Result<()> {
-        self.let_gate_state.write().0 = Some(baseline);
-        Ok(())
-    }
-
-    async fn set_let_gate_halted(&self, halted: bool) -> anyhow::Result<()> {
-        self.let_gate_state.write().1 = halted;
-        Ok(())
+    async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64> {
+        self.let_gate_baseline
+            .read()
+            .checked_add(*self.deposit_counter.read() as u64)
+            .ok_or_else(|| anyhow::anyhow!("LET accounting overflow"))
     }
 
     async fn reserve_deposit_index(&self, note_key: &str) -> anyhow::Result<u32> {
@@ -1662,44 +1658,92 @@ impl Store for InMemoryStore {
         if let Some(&(existing, _)) = processed.get(note_key) {
             return Ok(existing);
         }
-        // Cantina #7 (review blocker 2): the ABSOLUTE LET index = baseline + raw counter.
-        // The persisted gate baseline absorbs pre-fix leaves the raw counter never counted;
-        // adding it makes each new leaf's emitted deposit_count == its true on-chain LET
-        // index / globalIndex (baseline is 0 for a clean genesis replay, so no-op there).
-        let baseline = self.let_gate_state.read().0.unwrap_or(0) as u32;
+        // Reservations use absolute LET indices; the baseline covers audited legacy leaves
+        // that are absent from the raw counter.
+        let baseline = u32::try_from(*self.let_gate_baseline.read())?;
         let mut counter = self.deposit_counter.write();
         let raw = *counter;
-        *counter += 1;
-        let absolute = baseline + raw;
+        let next = counter
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("deposit counter overflow"))?;
+        let absolute = baseline
+            .checked_add(raw)
+            .ok_or_else(|| anyhow::anyhow!("deposit index overflow"))?;
+        *counter = next;
         processed.insert(note_key.to_string(), (absolute, false));
         Ok(absolute)
     }
 
-    async fn get_reserved_deposit_index(&self, note_key: &str) -> anyhow::Result<Option<u32>> {
-        Ok(self.processed_notes.read().get(note_key).map(|(i, _)| *i))
+    async fn migrate_legacy_deposit_key(
+        &self,
+        legacy_key: &str,
+        note_key: &str,
+        block_number: u64,
+        tx_hash: &str,
+    ) -> anyhow::Result<()> {
+        let mut processed = self.processed_notes.write();
+        let Some(reservation) = processed.get(legacy_key).copied() else {
+            return Ok(());
+        };
+        if processed.contains_key(note_key) {
+            return Ok(());
+        }
+        let matching_log =
+            self.logs_by_block
+                .read()
+                .get(&block_number)
+                .is_some_and(|logs| {
+                    logs.iter().any(|log| {
+                        log.transaction_hash.eq_ignore_ascii_case(tx_hash)
+                            && log.topics.first().is_some_and(|topic| {
+                                topic == crate::log_synthesis::BRIDGE_EVENT_TOPIC
+                            })
+                            && bridge_event_deposit_count(&log.data) == Some(reservation.0)
+                    })
+                });
+        if matching_log {
+            processed.remove(legacy_key);
+            processed.insert(note_key.to_string(), reservation);
+        }
+        Ok(())
     }
 
+    async fn get_deposit_indices(
+        &self,
+        note_keys: &[String],
+    ) -> anyhow::Result<HashMap<String, u32>> {
+        let processed = self.processed_notes.read();
+        Ok(note_keys
+            .iter()
+            .filter_map(|key| processed.get(key).map(|(index, _)| (key.clone(), *index)))
+            .collect())
+    }
+
+    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
+        let mut stored = self.b2agg_note_ids.write();
+        for (nullifier, note_id) in entries {
+            stored.entry(*nullifier).or_insert(*note_id);
+        }
+        Ok(())
+    }
+
+    async fn get_b2agg_note_ids(
+        &self,
+        nullifiers: &[Nullifier],
+    ) -> anyhow::Result<HashMap<Nullifier, NoteId>> {
+        let cached = self.b2agg_note_ids.read();
+        Ok(nullifiers
+            .iter()
+            .filter_map(|nullifier| cached.get(nullifier).map(|id| (*nullifier, *id)))
+            .collect())
+    }
+
+    #[cfg(test)]
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
         Ok(*self.deposit_counter.read() as u64)
     }
 
-    /// Atomic, idempotent B2AGG commit (audit H1/H3). Reuses the original
-    /// `deposit_count` (no gap on retry) and emits the BridgeEvent at most once.
-    ///
-    /// Locking note: the `processed_notes` + `deposit_counter` write guards are
-    /// held ONLY for the step-1 allocation block below, then dropped at the end
-    /// of that scope; step 2 (the already-emitted check + `add_bridge_event`)
-    /// runs without them held. That is sound because of the SINGLE-WRITER SERIAL
-    /// INVARIANT: `commit_b2agg_event_atomic` is called ONLY from the projector
-    /// path, which is strictly serial. The projector `tick()` borrows
-    /// `&mut MidenClientLib` (one non-reentrant client) and commits one block at
-    /// a time, write-before-advance:
-    ///     while cursor < tip { project_block_notes(next).await?; set_projector_cursor(next).await? }
-    /// so at most one commit is ever in flight for a given store. The
-    /// `RECONCILE_CONCURRENCY` fan-out is FETCH-only (`sync_note_ids`), never the
-    /// commit. No concurrent writer can therefore slip between the read and the
-    /// insert here — the "TOCTOU" a reviewer might flag is not reachable, which
-    /// is why no coarser lock (or tx_hash UNIQUE constraint) is needed.
+    /// Atomically emit a previously reserved B2AGG leaf, at most once.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
         &self,
@@ -1716,36 +1760,12 @@ impl Store for InMemoryStore {
         amount: u128,
         metadata: &[u8],
     ) -> anyhow::Result<u32> {
-        // 1. Allocate / reuse the reserved deposit index atomically, and mark it emitted.
-        //    `already_emitted` (a prior successful commit for THIS note key) drives the
-        //    log-emission idempotence — NOT the tx hash, which two distinct notes sharing
-        //    a details commitment legitimately share (the unique-identity blocker: both
-        //    leaves must emit, with distinct deposit counts).
-        let (deposit_count, already_emitted) = {
-            let mut processed = self.processed_notes.write();
-            match processed.get_mut(&note_id) {
-                Some((existing, emitted)) => {
-                    let was = *emitted;
-                    *emitted = true;
-                    (*existing, was)
-                }
-                None => {
-                    let mut counter = self.deposit_counter.write();
-                    let dc = *counter;
-                    *counter += 1;
-                    processed.insert(note_id.clone(), (dc, true));
-                    (dc, false)
-                }
-            }
-        };
-
-        // 2. Emit the BridgeEvent. Idempotence is keyed on THIS note's reservation state
-        //    (`already_emitted` above): a retry of a committed note skips, while a DISTINCT
-        //    note that happens to share the derived tx_hash (same details commitment —
-        //    the unique-identity blocker) still emits its own event with its own reserved
-        //    deposit_count. Race-free under the single-writer serial invariant (the
-        //    projector is the only, strictly-serial caller).
-        if !already_emitted {
+        let mut processed = self.processed_notes.write();
+        let (deposit_count, emitted) = processed
+            .get_mut(&note_id)
+            .ok_or_else(|| anyhow::anyhow!("missing deposit reservation for {note_id}"))?;
+        let deposit_count = *deposit_count;
+        if !*emitted {
             self.add_bridge_event(
                 bridge_address,
                 block_number,
@@ -1759,8 +1779,8 @@ impl Store for InMemoryStore {
                 amount,
                 metadata,
                 deposit_count,
-            )
-            .await?;
+            );
+            *emitted = true;
         }
         Ok(deposit_count)
     }
@@ -2398,6 +2418,7 @@ mod tests {
     async fn test_bridge_out_tracker() {
         let store = InMemoryStore::new();
         assert!(!store.is_note_processed("note1").await.unwrap());
+        store.reserve_deposit_index("note1").await.unwrap();
         let c = store
             .commit_b2agg_event_atomic(
                 "note1".to_string(),
@@ -2417,6 +2438,7 @@ mod tests {
             .unwrap();
         assert_eq!(c, 0);
         assert!(store.is_note_processed("note1").await.unwrap());
+        store.reserve_deposit_index("note2").await.unwrap();
         let c2 = store
             .commit_b2agg_event_atomic(
                 "note2".to_string(),
@@ -2448,6 +2470,7 @@ mod tests {
         let store = InMemoryStore::new();
         let note = "0xb2agg-note-1".to_string();
         let block = 10u64;
+        store.reserve_deposit_index(&note).await.unwrap();
 
         let dc1 = store
             .commit_b2agg_event_atomic(
@@ -2513,6 +2536,75 @@ mod tests {
             bridge_logs.len(),
             1,
             "retry must not emit a duplicate BridgeEvent"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_deposit_key_migrates_only_to_its_exact_event() {
+        let store = InMemoryStore::new();
+        let legacy = "shared-details";
+        let future = "future-note-id";
+        let original = "original-note-id";
+        let tx_hash = "0xshared-details-tx";
+
+        assert_eq!(store.reserve_deposit_index(legacy).await.unwrap(), 0);
+        store
+            .commit_b2agg_event_atomic(
+                legacy.into(),
+                "0xbridge",
+                10,
+                [0u8; 32],
+                tx_hash,
+                0,
+                0,
+                &[0u8; 20],
+                1,
+                &[0u8; 20],
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // A later same-details event has the same tx hash but a different deposit index.
+        assert_eq!(store.reserve_deposit_index("later-row").await.unwrap(), 1);
+        store
+            .commit_b2agg_event_atomic(
+                "later-row".into(),
+                "0xbridge",
+                11,
+                [0u8; 32],
+                tx_hash,
+                0,
+                0,
+                &[0u8; 20],
+                1,
+                &[0u8; 20],
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        store
+            .migrate_legacy_deposit_key(legacy, future, 11, tx_hash)
+            .await
+            .unwrap();
+        assert!(store.is_note_processed(legacy).await.unwrap());
+        assert!(!store.is_note_processed(future).await.unwrap());
+
+        store
+            .migrate_legacy_deposit_key(legacy, original, 10, tx_hash)
+            .await
+            .unwrap();
+        assert!(!store.is_note_processed(legacy).await.unwrap());
+        assert!(store.is_note_processed(original).await.unwrap());
+        assert_eq!(
+            store
+                .get_deposit_indices(&[original.into(), "later-row".into()])
+                .await
+                .unwrap(),
+            HashMap::from([(original.into(), 0), ("later-row".into(), 1)])
         );
     }
 

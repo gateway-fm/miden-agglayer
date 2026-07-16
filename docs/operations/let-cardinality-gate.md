@@ -1,78 +1,64 @@
-# LET cardinality gate (Cantina #7, part 2)
+# LET cardinality gate
 
-The synthetic projector refuses to seal a block while the bridge account's on-chain
-**Local Exit Tree leaf count** and the proxy's **feed-visible B2AGG consumption
-accounting** disagree. A stalled tick is recoverable; a misnumbered `deposit_count`
-(= LET leaf index = the claim's `globalIndex`) is poison — every later exit shifts
-with it, and getLogs immutability seals the wrong numbering forever.
+The projector seals synthetic blocks only when it can assign every Miden-to-AggLayer
+`BridgeEvent` its exact Local Exit Tree (LET) index. A wrong `depositCount` produces a
+wrong `globalIndex`, and sealed `eth_getLogs` history cannot be repaired in place.
 
-## The identity
+At the Miden tip, the gate requires:
 
-Only a **bridge-executed consumption of a B2AGG note** appends a LET leaf. That
-includes exits the proxy deliberately does NOT emit an event for — quarantined
-(`unbridgeable_bridge_outs`), metadata-deferred (Cantina #13 `Unrecoverable`), and
-self-targeted (#13 poison-leaf) exits all advanced the on-chain LET at consumption
-time. Reclaims never touch bridge storage. So, measured at the chain tip:
-
-```
-read_let_num_leaves(bridge) == baseline + visible
+```text
+bridge LET leaves
+  == let_gate_baseline + deposit_counter + current unreserved B2AGG leaves
 ```
 
-- `visible` — B2AGG records produced by the AUTHORITATIVE feed
-  (`sync_transactions` → the projector's resolve step) for sealed blocks plus the
-  window about to be sealed. **Counting happens upstream of the emit gates**, so
-  quarantine/deferral/self-target are all counted — a quarantine happening can
-  never trip the gate (checkers must mirror emit gates).
-- `baseline` — leaves attributed to pre-boot history, captured once when the gate
-  **arms** (first tick whose projection ceiling reaches the chain tip). History is
-  not re-derivable exactly from durable state (deferred and self-targeted skips
-  leave no row by design), so it is absorbed rather than wrongly judged.
+- `deposit_counter` counts durable reservations, including leaves that emit no event
+  because they are quarantined, deferred, or self-targeted.
+- Current unreserved leaves are bridge-consumed B2AGG NoteIds in the projection window
+  that have not yet received a durable reservation.
+- `let_gate_baseline` is an explicit offset for pre-upgrade LET leaves that are absent
+  from `deposit_counter`. It defaults to `0` and is never inferred at runtime.
 
-The gate **evaluates only at-tip** (`project_to == tip`, the steady-state norm —
-every tick). While arming, during catch-up, or while the visibility barrier holds,
-it stays out of the way: a fresh restore or a long catch-up can never halt.
+If note reconciliation is behind the Miden tip, the projector waits without sealing an
+older frontier. At the tip, a missing bridge account or either cardinality mismatch
+returns an error before any block is sealed. The normal projector retry runs the same
+check again; there is no strike counter or persisted halt state.
 
-## Verdicts and the retry policy
+## Upgrade procedure
 
-| Verdict | Meaning | Action |
-|---|---|---|
-| Aligned | identity holds | seal normally; strikes reset |
-| `invisible_gap` | chain has leaves no visible consumption accounts for | emission **blocked immediately**; quiet retry for `LET_GATE_RETRY_TICKS` (default 5) ticks — visibility races heal; past the budget → **HALT loud** |
-| `local_ahead` | about to emit more exits than the chain has leaves | **HALT immediately** — data corruption; retry cannot heal it |
+Most deployments should leave `let_gate_baseline` at `0`. If an existing database has
+historical LET leaves that did not advance `deposit_counter`:
 
-Halt = `bridge_let_assignment_gate_halted_total{kind}` + a standing error each
-tick + tick returns an error. Nothing seals, the cursor does not move; the block
-is retried every tick, so a genuine heal (e.g. the reconciler importing the
-missing note) resumes projection automatically at the exact blocks.
+1. Stop the proxy.
+2. Compare the bridge account's LET leaf count with the durable reservations and audit
+   the difference against known pre-upgrade skipped leaves. The offset is safe only for
+   an unrepresented trailing suffix, or after proving every existing event already has its
+   exact LET index. A missing interior leaf means sealed later events are already shifted;
+   rebuild that history instead of adding an offset.
+3. Set only the verified safe difference:
 
-## Diagnosing a halt
+   ```sql
+   UPDATE service_state
+   SET let_gate_baseline = <verified_offset>
+   WHERE id = 1;
+   ```
 
-1. Read the standing error: it carries `kind`, `gap`, `on_chain`, and the pending
-   visible count.
-2. Compare the ledgers yourself:
-   - on-chain: `read_let_num_leaves` (the #9 monitor logs it as `on_chain`);
-   - local: `SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = <BridgeEvent topic>`
-     (== `deposit_counter`) **plus** `SELECT COUNT(*) FROM unbridgeable_bridge_outs`.
-   - The difference between on-chain and that sum should equal the gate's `gap`
-     plus any metadata-deferred / self-targeted skips (which have **no rows** —
-     grep proxy logs for `bridge_out_self_targeted_total` /
-     `metadata ... could not be recovered`).
-3. Likely causes of `invisible_gap`:
-   - a B2AGG consumption the node's `sync_transactions` feed never returned
-     (feed omission — the class the gate exists to catch);
-   - a note body unresolvable by the projector (see
-     `synthetic_projector_b2agg_fetch_missing_total` — a loud-skipped exit is a
-     dropped BridgeEvent AND an unaccounted leaf);
-   - node/store rollback skew after a restore.
-4. `local_ahead` means the local store double-counted (crash-replay bug, foreign
-   note misattributed as bridge-consumed) — treat as corruption; do not restart
-   into it repeatedly, snapshot the store and escalate.
+4. Restart the proxy and confirm the gate stays aligned.
 
-## Relationship to the Cantina #9 monitor
+Never derive the offset from a live pending projection window, and never change it just
+to clear a mismatch. Snapshot the database and investigate the node transaction feed,
+note-body availability, cursor state, and reservations first.
 
-`run_let_divergence_check` (alarm-only, post-emit) remains as the independent
-second view — now quarantine-aware (`deposit_count + unbridgeable rows`). It still
-alarms `on_chain_ahead` for deferred/self-targeted history (no durable rows); the
-gate's baseline absorbs those instead. An invisible leaf that predates the current
-boot is absorbed into the gate's baseline and only the #9 monitor will show it —
-that is the deliberate trade against false halts on by-design states.
+A full `--restore` replays the complete LET from index `0` and therefore requires
+`let_gate_baseline = 0`. A deployment using a nonzero audited offset needs an offline
+history reconstruction; do not change the offset to force a restore through.
+
+## Signals
+
+`bridge_let_assignment_gate_halted_total{kind}` increments for:
+
+- `invisible_gap`: the bridge LET has more leaves than local accounting;
+- `local_ahead`: local accounting has more leaves than the bridge LET.
+
+`synthetic_projector_b2agg_fetch_missing_total` identifies node lookups that returned no
+body for an identified bridge input. That omission directly fails the tick before the
+gate. Cardinality remains an independent defense for an unmapped/headerless exit.

@@ -6,11 +6,13 @@
 //!
 //! ## Algorithm
 //!
-//! Phase 1: Sync miden state → get current block number
-//! Phase 2: Scan miden consumed B2AGG notes → rebuild bridge-out + deposit counter
-//! Phase 3: Scan consumed UpdateGerNote notes on Miden → rebuild GER set + hash chain
-//! Phase 4: Update block number to cover all synthetic logs
-//! Phase 5: Verify counts
+//! 0. Re-import configured accounts, then sync one Miden tip/LET snapshot.
+//! 1. Scan canonical public B2AGG bodies and bridge transactions; prove exact
+//!    NoteId, execution order, reservation prefix, and LET cardinality.
+//! 2. Rebuild faucet identities, then replay B2AGG, CLAIM, and GER events at
+//!    their original consumption blocks.
+//! 3. Finalize the synthetic tip/projector cursor, reset the identity-reconcile
+//!    cursor for its historical sweep, and verify counts.
 //!
 //! ## GER restoration via consumed notes
 //!
@@ -40,12 +42,14 @@ use crate::bridge_out::{
 };
 use crate::claim_watcher::{derive_manual_claim_tx_hash, parse_claim_event_from_storage};
 use crate::metadata_recovery::{EmitMetadata, METADATA_UNRECOVERABLE_METRIC};
-use crate::miden_client::{MidenClient, MidenClientLib};
+use crate::miden_client::{
+    MidenClient, MidenClientLib, ensure_complete_note_response, ordered_account_transactions,
+};
 use crate::store::Store;
 use miden_base_agglayer::UpdateGerNote;
 use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_protocol::account::AccountId;
-use miden_protocol::note::{NoteAttachments, NoteMetadata};
+use miden_protocol::note::{NoteAttachments, NoteDetails, NoteId, NoteMetadata, Nullifier};
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 
@@ -208,13 +212,9 @@ fn note_consumed_block(note: &InputNoteRecord, fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
-/// Order consumed notes into the [`SyntheticProjector`](crate::synthetic_projector)'s
-/// canonical projection order: `(consumed_block_height, consumed_tx_order,
-/// details-commitment bytes)`. Restore MUST replay in this exact order so its
-/// per-note synthetic block numbers, the `deposit_count` assignment, and the
-/// order-sensitive GER hash chain are byte-identical to a fresh live projection.
-/// (Byte compare on the 32-byte commitment — same order as a hex compare, no
-/// allocation.)
+/// Deterministically order the locally sourced CLAIM/GER records by consumed block,
+/// transaction order and details commitment. B2AGG restore uses the authoritative
+/// transaction-input order in `restore_bridge_replay` instead.
 fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
     notes.sort_by(|a, b| {
         a.state()
@@ -234,74 +234,21 @@ fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
     });
 }
 
-/// Cantina #7: the FULL projection sort key, shared shape with the live projector —
-/// `(consumed_block_height, consumed_tx_order, within_tx_pos, details_commitment,
-/// NoteId)`, where `within_tx_pos` is looked up by the note's UNIQUE NoteId (distinct
-/// notes can share a details commitment — the id is the ordering identity) and is the
-/// position within the consuming tx's ordered `input_notes()` = the on-chain LET
-/// append order. Restore's B2AGG replay MUST use this with the authoritative position
-/// feed ([`restore_bridge_positions`]) so its `deposit_count` sequence is
-/// byte-identical to the live projection. This is a deliberate second implementation
-/// of the projector's comparator, pinned identical by the
-/// `restore_sort_replays_the_live_projection_order` test.
-/// Rebuild a consumer-unknown consumed record with the AUTHORITATIVE (block, tx_order) in
-/// its `ConsumedExternal` state + `consumer = Some(bridge)` — so restore's sort and
-/// projection read authoritative order (imported/historical records carry neither locally).
-/// The identity-through-join (#136) rebuilds the same way; the shapes unify at merge.
-pub(crate) fn rebuild_consumed_external(
-    note: &InputNoteRecord,
-    bridge_id: AccountId,
-    block: u64,
-    tx_order: u32,
-) -> InputNoteRecord {
-    use miden_client::store::InputNoteState;
-    use miden_client::store::input_note_states::ConsumedExternalNoteState;
-    use miden_protocol::block::BlockNumber;
-    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
-        nullifier_block_height: BlockNumber::from(block as u32),
-        consumer_account: Some(bridge_id),
-        consumed_tx_order: Some(tx_order),
-    });
-    InputNoteRecord::new(
-        note.details().clone(),
-        note.attachments().clone(),
-        None,
-        state,
-    )
+struct RecoveredBridgeBody {
+    details: NoteDetails,
+    attachments: NoteAttachments,
 }
 
-pub(crate) fn sort_consumed_for_projection_with(
-    notes: &mut [(Option<miden_protocol::note::NoteId>, &InputNoteRecord)],
-    within_tx_pos: &std::collections::HashMap<miden_protocol::note::NoteId, u32>,
-) {
-    notes.sort_by(|(ida, a), (idb, b)| {
-        a.state()
-            .consumed_block_height()
-            .map(|h| h.as_u64())
-            .cmp(&b.state().consumed_block_height().map(|h| h.as_u64()))
-            .then_with(|| {
-                a.state()
-                    .consumed_tx_order()
-                    .cmp(&b.state().consumed_tx_order())
-            })
-            .then_with(|| {
-                let pa = ida
-                    .and_then(|i| within_tx_pos.get(&i))
-                    .copied()
-                    .unwrap_or(0);
-                let pb = idb
-                    .and_then(|i| within_tx_pos.get(&i))
-                    .copied()
-                    .unwrap_or(0);
-                pa.cmp(&pb)
-            })
-            .then_with(|| {
-                a.details_commitment()
-                    .as_bytes()
-                    .cmp(&b.details_commitment().as_bytes())
-            })
-            .then_with(|| ida.map(|i| i.as_bytes()).cmp(&idb.map(|i| i.as_bytes())))
-    });
+struct RecoveredBridgeOuts {
+    id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
+    by_id: std::collections::HashMap<NoteId, RecoveredBridgeBody>,
+}
+
+struct ReplayBridgeOut {
+    id: NoteId,
+    body: RecoveredBridgeBody,
+    block: u64,
+    tx_order: u32,
 }
 
 /// Run the full restore algorithm.
@@ -317,7 +264,7 @@ pub async fn restore(
     local_network_id: u32,
     block_state: &Arc<BlockState>,
     l1_rpc_url: Option<String>,
-    node_url: Option<&str>,
+    node_url: &str,
     api_key: Option<&str>,
 ) -> anyhow::Result<RestoreResult> {
     tracing::info!("=== RESTORE: starting state reconstruction ===");
@@ -356,70 +303,90 @@ pub async fn restore(
     // chain catches up to under Miden-1:1. Each restored event is attributed to
     // its OWN consumed block (below); `miden_tip` is only the orphan fallback.
     tracing::info!("Phase 1: syncing miden state...");
-    let miden_tip = sync_miden_block(miden_client).await?;
-    tracing::info!("Phase 1 complete: miden tip {miden_tip}");
+    let (miden_tip, let_leaves) = sync_miden_snapshot(miden_client, accounts.bridge.0).await?;
+    tracing::info!("Phase 1 complete: miden tip {miden_tip}, LET leaves {let_leaves}");
 
     let mut total_logs = 0usize;
 
-    // Phase 1.5 (PRST-4035): recover bridge-out notes the local store never
-    // recorded (consumed by the bridge via network txs). Tag-scan the node and
-    // import them so the Phase 2 NoteFilter::Consumed scan below can see them.
-    // Best-effort: a failure must not abort restore.
-    //
-    // Cantina #7: `bridge_positions` (unique NoteId → (commitment, block, tx_order,
-    // within_tx_pos)) is the authoritative ordering feed for Phase 2's replay. Built
-    // fail-closed (review blocker 5): a scan error or an absent node URL aborts restore
-    // rather than replaying with a partial/local-only view.
-    let bridge_positions: std::collections::HashMap<
-        miden_protocol::note::NoteId,
-        ([u8; 32], u64, u32, u32),
-    > = if let Some(url) = node_url {
-        let from_block: u32 = std::env::var("RECOVER_FROM_BLOCK")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        tracing::info!(
-            from_block,
-            "Phase 1.5: recovering missed bridge-out notes from the node..."
-        );
-        // Review blocker 5: FAIL CLOSED on an incomplete authoritative scan. A node URL is
-        // present, so the identity + position feeds MUST be recoverable; a scan error means
-        // we cannot establish authoritative identity/order for the B2AGG replay, and
-        // proceeding with a partial/local-only view risks misattributed consumers and
-        // misnumbered deposit_counts (sealed forever). Abort restore and retry rather than
-        // silently produce a wrong projection.
-        let (n, identity_index) =
-            recover_missed_bridge_outs(miden_client, url, api_key, accounts.bridge.0, from_block)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "restore Phase 1.5 recovery scan failed — refusing to restore with \
-                         incomplete authoritative identity (fail-closed): {e:#}"
-                    )
-                })?;
-        tracing::info!("Phase 1.5 complete: recovered {n} B2AGG note(s) from the node");
-        // Cantina #7 — Phase 1.6: the authoritative per-exit position feed for the Phase 2
-        // B2AGG replay ordering. Also fail-closed: without it, same-block multi-tx ordering
-        // and same-tx sibling ordering cannot be established authoritatively.
-        restore_bridge_positions(url, api_key, accounts.bridge.0, &identity_index)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "restore Phase 1.6 authoritative position feed failed — refusing to restore \
-                     with incomplete order (fail-closed): {e:#}"
-                )
-            })?
-    } else {
-        // No node URL: authoritative identity/order cannot be built. Fail closed rather than
-        // silently restore B2AGG with local-only (metadata-lost) identity. The documented
-        // launch always resolves a URL (MidenClient::effective_node_url), so this only fires
-        // on a genuine misconfiguration.
+    // Recover full public B2AGG bodies and join them directly to the bridge transaction
+    // feed. This bypasses miden-client 0.15.0's details-commitment-keyed SQLite table,
+    // which cannot retain two distinct NoteIds with identical details.
+    let scan_tip = u32::try_from(miden_tip)
+        .map_err(|_| anyhow::anyhow!("Miden tip {miden_tip} exceeds u32"))?;
+    let endpoint = crate::miden_client::parse_node_url(node_url)?;
+    let rpc = crate::miden_client::build_rpc_client(&endpoint, 30_000, api_key);
+    tracing::info!(
+        scan_tip,
+        "Phase 1.5: scanning bridge-out notes from the node..."
+    );
+    let recovered = scan_bridge_out_bodies(&*rpc, accounts.bridge.0, scan_tip)
+        .await
+        .map_err(|e| anyhow::anyhow!("restore bridge-out body scan failed: {e:#}"))?;
+    tracing::info!(
+        "Phase 1.5 complete: found {} B2AGG note(s)",
+        recovered.by_id.len()
+    );
+    let bridge_replay = restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
+        .await
+        .map_err(|e| anyhow::anyhow!("restore bridge-out ordering scan failed: {e:#}"))?;
+    if bridge_replay.len() as u64 != let_leaves {
         anyhow::bail!(
-            "restore: no --miden-node URL — cannot build the authoritative identity/position \
-             feed for the B2AGG replay; refusing to restore with local-only identity \
-             (fail-closed). Pass the resolved node URL (MidenClient::effective_node_url)."
+            "restore bridge-out cardinality mismatch at Miden block {miden_tip}: \
+             replayable={}, LET leaves={let_leaves}",
+            bridge_replay.len()
         );
-    };
+    }
+
+    // Normalize crash-era commitment keys before checking the same accounting identity as
+    // the live gate. This happens before replay can reserve or emit anything.
+    for replay in &bridge_replay {
+        let legacy_key = hex::encode(replay.body.details.commitment().as_bytes());
+        let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&legacy_key);
+        store
+            .migrate_legacy_deposit_key(&legacy_key, &replay.id.to_hex(), replay.block, &tx_hash)
+            .await?;
+    }
+    let replay_keys: Vec<String> = bridge_replay.iter().map(|item| item.id.to_hex()).collect();
+    let existing = store.get_deposit_indices(&replay_keys).await?;
+    let first_missing = replay_keys
+        .iter()
+        .position(|key| !existing.contains_key(key))
+        .unwrap_or(replay_keys.len());
+    if replay_keys[first_missing..]
+        .iter()
+        .any(|key| existing.contains_key(key))
+    {
+        anyhow::bail!("restore reservations are not a contiguous execution-order prefix");
+    }
+    for (ordinal, key) in replay_keys[..first_missing].iter().enumerate() {
+        let expected_index = u32::try_from(ordinal)?;
+        if existing.get(key) != Some(&expected_index) {
+            anyhow::bail!(
+                "restore reservation order mismatch for {key}: stored={:?}, expected={expected_index}",
+                existing.get(key)
+            );
+        }
+    }
+    let expected = store
+        .get_accounted_deposit_count()
+        .await?
+        .checked_add(u64::try_from(replay_keys.len() - existing.len())?)
+        .ok_or_else(|| anyhow::anyhow!("restore LET accounting overflow"))?;
+    if expected != let_leaves {
+        anyhow::bail!(
+            "restore LET accounting mismatch before replay: expected={expected}, \
+             on-chain={let_leaves}"
+        );
+    }
+    for (ordinal, key) in replay_keys.iter().enumerate().skip(first_missing) {
+        let expected_index = u32::try_from(ordinal)?;
+        let reserved = store.reserve_deposit_index(key).await?;
+        if reserved != expected_index {
+            anyhow::bail!(
+                "restore reserved LET index {reserved} for {key}, expected {expected_index}"
+            );
+        }
+    }
 
     // Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet identity rows from the
     // bridge's authoritative `faucet_metadata_map` BEFORE replaying bridge-outs.
@@ -441,12 +408,11 @@ pub async fn restore(
     let (bridge_outs, logs) = restore_bridge_outs(
         store,
         miden_client,
-        accounts,
+        accounts.bridge.0,
         local_network_id,
         block_state,
-        miden_tip,
         l1_rpc_url.clone(),
-        bridge_positions,
+        bridge_replay,
     )
     .await?;
     total_logs += logs;
@@ -477,6 +443,14 @@ pub async fn restore(
         restore_gers(store, miden_client, accounts, block_state, miden_tip).await?;
     total_logs += ger_logs;
     tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
+
+    let accounted = store.get_accounted_deposit_count().await?;
+    if accounted != let_leaves {
+        anyhow::bail!(
+            "restore LET accounting mismatch after replay: local={accounted}, \
+             on-chain={let_leaves}"
+        );
+    }
 
     // Phase 4: cursor finalization (factored into a helper so the reconcile-
     // cursor reset is unit-testable — see `finalize_restore_cursors`).
@@ -527,134 +501,87 @@ pub(crate) async fn finalize_restore_cursors(
 
 /// Phase 1: sync miden and return the current MIDEN tip (sync height) — the
 /// block the synthetic chain catches up to under Miden-1:1.
-async fn sync_miden_block(miden_client: &MidenClient) -> anyhow::Result<u64> {
-    let height = Arc::new(std::sync::Mutex::new(0u64));
-    let height_inner = height.clone();
+async fn sync_miden_snapshot(
+    miden_client: &MidenClient,
+    bridge_id: AccountId,
+) -> anyhow::Result<(u64, u64)> {
+    let snapshot = Arc::new(std::sync::Mutex::new(None));
+    let snapshot_inner = snapshot.clone();
     miden_client
         .with(move |client| {
             Box::new(async move {
                 client.sync_state().await?;
-                *height_inner.lock().unwrap() = client
+                let height = client
                     .get_sync_height()
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
                     .as_u64();
+                let bridge = client
+                    .get_account(bridge_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to read bridge account {bridge_id}: {e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("bridge account {bridge_id} is unavailable"))?;
+                let leaves = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge);
+                *snapshot_inner.lock().unwrap() = Some((height, leaves));
                 Ok(())
             })
         })
         .await?;
-    let h = *height.lock().unwrap();
-    Ok(h)
+    snapshot
+        .lock()
+        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("Miden snapshot was not captured"))
 }
 
-/// Phase 2: scan miden consumed B2AGG notes and rebuild bridge-out state.
-/// Returns (notes_processed, logs_created).
-/// PRST-4035 — recover bridge-out notes the local store never saw.
-///
-/// The bridge account consumes B2AGG bridge-out notes via NETWORK transactions
-/// (executed by the ntx-builder, not the proxy's client). Those consumptions are
-/// never recorded in the proxy's local miden-client store, so the
-/// `NoteFilter::Consumed` scan that both the live [`crate::bridge_out::BridgeOutScanner`]
-/// and [`restore_bridge_outs`] rely on cannot see them — the exit is invisible,
-/// aggsender never certifies it, and it can't be claimed on L1.
-///
-/// The notes are still on the node (public, nullifier committed). This
-/// re-discovers them by **block-scanning** the node from `from_block` to the
-/// chain tip: for every block it enumerates the notes created in it
-/// (`ProvenBlock::body().output_notes()`), fetches their full bodies via
-/// `get_notes_by_id` (public notes resolve to `FetchedNote::Public` even after
-/// they've been consumed), filters to the B2AGG script root with
-/// [`is_b2agg_note`], and imports the matches by id (`NoteFile::NoteId`, which
-/// fetches from the node and stores). A follow-up `sync_state()` marks each
-/// consumed, so they appear in `NoteFilter::Consumed` for [`restore_bridge_outs`]
-/// to rebuild the BridgeEvent from. (A tag-sync on `with_account_target(bridge)`
-/// returns zero — the bridge's B2AGG notes don't carry that tag — so the tag
-/// path is not usable here.)
-///
-/// Returns the number of B2AGG notes imported. Best-effort: a scan/RPC failure is
-/// surfaced to the caller, which logs and continues with the local-only restore.
-async fn recover_missed_bridge_outs(
-    miden_client: &MidenClient,
-    node_url: &str,
-    api_key: Option<&str>,
+/// Scans every block in a fixed snapshot and retains public B2AGG bodies by unique NoteId.
+/// Any incomplete RPC response aborts restore; a partial identity set is unsafe to replay.
+async fn scan_bridge_out_bodies(
+    rpc: &dyn miden_client::rpc::NodeRpcClient,
     bridge_id: AccountId,
-    from_block: u32,
-) -> anyhow::Result<(
-    usize,
-    std::collections::HashMap<
-        miden_protocol::note::Nullifier,
-        (miden_protocol::note::NoteId, [u8; 32]),
-    >,
-)> {
+    to_block: u32,
+) -> anyhow::Result<RecoveredBridgeOuts> {
     use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
-    use miden_protocol::note::{NoteDetails, NoteFile, NoteId};
-
-    let endpoint = crate::miden_client::parse_node_url(node_url)?;
-    let rpc = crate::miden_client::build_rpc_client(&endpoint, 30_000, api_key);
-
-    let (tip_header, _) = rpc
-        .get_block_header_by_number(None, false)
-        .await
-        .map_err(|e| anyhow::anyhow!("recovery: get chain tip: {e}"))?;
-    let to_block = tip_header.block_num().as_u32();
-    if from_block > to_block {
-        tracing::warn!(
-            from_block,
-            to_block,
-            "recovery: from_block is past the chain tip; nothing to scan"
-        );
-        return Ok((0, std::collections::HashMap::new()));
-    }
-
-    // Tag-independent block scan. The bridge's B2AGG notes are NOT tagged with the
-    // bridge as the target account (a tag-sync on `with_account_target(bridge)`
-    // returns zero), so walk every block in `[from_block, to_block]`, enumerate
-    // the notes it created (`body().output_notes()`), fetch their full bodies via
-    // `get_notes_by_id` (public notes come back as `FetchedNote::Public` even when
-    // already consumed), and keep the ones whose script root is the B2AGG script.
-    // This is the explorer-style "scan blocks, filter is-b2agg" path. The on-chain
-    // `consumer == bridge` gating is enforced downstream by `restore_bridge_outs`
-    // once the notes are imported and observed consumed.
-    let mut b2agg_ids: Vec<NoteId> = Vec::new();
-    // Identity index for restore's authoritative ordering (Cantina #7): nullifier →
-    // (unique NoteId, details commitment) for every public B2AGG note on the node.
-    // Computable HERE because the fetched note carries its metadata; a consumed
-    // local-store record does not (its nullifier AND id are both unrecoverable there).
-    let mut identity_index: std::collections::HashMap<
-        miden_protocol::note::Nullifier,
-        (NoteId, [u8; 32]),
-    > = std::collections::HashMap::new();
+    let mut by_id = std::collections::HashMap::new();
+    let mut id_by_nullifier = std::collections::HashMap::new();
     let mut scanned = 0usize;
-    for b in from_block..=to_block {
-        let block = match rpc.get_block_by_number(BlockNumber::from(b), false).await {
-            Ok(block) => block,
-            Err(e) => {
-                tracing::warn!(block = b, err = %e, "recovery: get_block_by_number failed; skipping");
-                continue;
-            }
-        };
+    for b in 0..=to_block {
+        let block = rpc
+            .get_block_by_number(BlockNumber::from(b), false)
+            .await
+            .map_err(|e| anyhow::anyhow!("recovery: get block {b}: {e}"))?;
 
-        // All notes created in this block (public + private), by id.
         let ids: Vec<NoteId> = block.body().output_notes().map(|(_, n)| n.id()).collect();
         if !ids.is_empty() {
-            match rpc.get_notes_by_id(&ids).await {
-                Ok(fetched) => {
-                    for f in fetched {
-                        if let FetchedNote::Public(note, _) = f {
-                            let details: NoteDetails = note.clone().into();
-                            if is_b2agg_note(&details) {
-                                b2agg_ids.push(note.id());
-                                identity_index.insert(
-                                    note.nullifier(),
-                                    (note.id(), details.commitment().as_bytes()),
-                                );
-                            }
+            let fetched = rpc
+                .get_notes_by_id(&ids)
+                .await
+                .map_err(|e| anyhow::anyhow!("recovery: get notes for block {b}: {e}"))?;
+            let returned_ids: Vec<_> = fetched.iter().map(|note| note.id()).collect();
+            ensure_complete_note_response(&ids, &returned_ids)?;
+            for fetched_note in fetched {
+                if let FetchedNote::Public(note, _) = fetched_note {
+                    let id = note.id();
+                    let nullifier = note.nullifier();
+                    let attachments = note.attachments().clone();
+                    let details: NoteDetails = note.into();
+                    if is_b2agg_note(&details) {
+                        if by_id
+                            .insert(
+                                id,
+                                RecoveredBridgeBody {
+                                    details,
+                                    attachments,
+                                },
+                            )
+                            .is_some()
+                        {
+                            anyhow::bail!("recovery: duplicate B2AGG NoteId {id}");
+                        }
+                        if id_by_nullifier.insert(nullifier, id).is_some() {
+                            anyhow::bail!("recovery: duplicate B2AGG nullifier {nullifier}");
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(block = b, err = %e, "recovery: get_notes_by_id failed; skipping block");
                 }
             }
         }
@@ -665,7 +592,7 @@ async fn recover_missed_bridge_outs(
                 at_block = b,
                 to_block,
                 scanned,
-                b2agg = b2agg_ids.len(),
+                b2agg = by_id.len(),
                 "recovery scan: progress"
             );
         }
@@ -673,117 +600,81 @@ async fn recover_missed_bridge_outs(
 
     tracing::info!(
         bridge = %bridge_id,
-        from_block,
+        from_block = 0,
         to_block,
         blocks_scanned = scanned,
-        b2agg = b2agg_ids.len(),
+        b2agg = by_id.len(),
         "recovery scan complete: B2AGG bridge-out notes found on the node"
     );
 
-    if b2agg_ids.is_empty() {
-        return Ok((0, identity_index));
-    }
-
-    let note_files: Vec<NoteFile> = b2agg_ids.iter().copied().map(NoteFile::NoteId).collect();
-    let imported = b2agg_ids.len();
-
-    miden_client
-        .with(move |client| {
-            Box::new(async move {
-                client
-                    .import_notes(&note_files)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("recovery: import_notes: {e}"))?;
-                // Mark the freshly-imported notes consumed (their nullifiers are
-                // committed) so they land in NoteFilter::Consumed for Phase 2.
-                client
-                    .sync_state()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("recovery: sync_state after import: {e}"))?;
-                Ok(())
-            })
-        })
-        .await?;
-
-    Ok((imported, identity_index))
+    Ok(RecoveredBridgeOuts {
+        id_by_nullifier,
+        by_id,
+    })
 }
 
-/// Cantina #7 (review blocker 2) — the AUTHORITATIVE per-exit position feed for restore's
-/// B2AGG replay, SHARED KEY SHAPE with the live projector (and with PR #136's Phase 1.6
-/// attribution, which re-keys to the same shape — merge #136 first, then unify):
-///
-/// ```text
-/// unique NoteId -> (consumption block, per-block bridge-tx order, within-tx position)
-/// ```
-///
-/// Sourced from the bridge's own `sync_transactions` feed: UNAUTHENTICATED inputs carry
-/// their `NoteHeader` (id direct); AUTHENTICATED inputs carry only the nullifier and are
-/// resolved through the Phase 1.5 identity index (nullifier → NoteId, built from fetched
-/// PUBLIC notes, which carry the metadata needed to compute both). The within-tx position
-/// is the input's index in the tx header's ordered `input_notes()` — the on-chain LET
-/// append order — so restore's `(block, tx_order, within_tx_pos, commitment, id)` sort
-/// replays the exact deposit_count sequence the live projection produced.
-async fn restore_bridge_positions(
-    node_url: &str,
-    api_key: Option<&str>,
+/// Joins the recovered bodies to bridge-consumed inputs. The execution-chain helper and
+/// input iteration already produce exact `(block, tx, input)` order, so no second sort or
+/// commitment-based identity recovery is needed.
+async fn restore_bridge_replay(
+    rpc: &dyn miden_client::rpc::NodeRpcClient,
     bridge_id: AccountId,
-    identity_index: &std::collections::HashMap<
-        miden_protocol::note::Nullifier,
-        (miden_protocol::note::NoteId, [u8; 32]),
-    >,
-) -> anyhow::Result<
-    std::collections::HashMap<miden_protocol::note::NoteId, ([u8; 32], u64, u32, u32)>,
-> {
+    recovered: RecoveredBridgeOuts,
+    to_block: u32,
+) -> anyhow::Result<Vec<ReplayBridgeOut>> {
     use miden_protocol::block::BlockNumber;
 
-    let endpoint = crate::miden_client::parse_node_url(node_url)?;
-    let rpc = crate::miden_client::build_rpc_client(&endpoint, 30_000, api_key);
-    let (tip_header, _) = rpc
-        .get_block_header_by_number(None, false)
-        .await
-        .map_err(|e| anyhow::anyhow!("positions: get chain tip: {e}"))?;
-    let tip = tip_header.block_num();
     let txs = rpc
-        .sync_transactions(BlockNumber::from(0u32), tip, vec![bridge_id])
+        .sync_transactions(
+            BlockNumber::from(0u32),
+            BlockNumber::from(to_block),
+            vec![bridge_id],
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("positions: sync_transactions(0..{tip}): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("restore: sync bridge transactions 0..{to_block}: {e}"))?;
 
-    let mut out: std::collections::HashMap<
-        miden_protocol::note::NoteId,
-        ([u8; 32], u64, u32, u32),
-    > = std::collections::HashMap::new();
-    let mut per_block_order: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    for tx in &txs {
-        if tx.transaction_header.account_id() != bridge_id {
-            continue;
-        }
-        let block = tx.block_num.as_u64();
-        let order = *per_block_order
-            .entry(block)
-            .and_modify(|i| *i += 1)
-            .or_insert(0u32);
-        for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
-            if let Some(header) = input.header() {
-                out.insert(
-                    header.id(),
-                    (
-                        header.details_commitment().as_bytes(),
-                        block,
-                        order,
-                        pos as u32,
-                    ),
-                );
-            } else if let Some((id, commitment)) = identity_index.get(&input.nullifier()) {
-                out.insert(*id, (*commitment, block, order, pos as u32));
+    build_bridge_replay(&txs, bridge_id, recovered)
+}
+
+fn build_bridge_replay(
+    txs: &[miden_client::rpc::domain::transaction::TransactionRecord],
+    bridge_id: AccountId,
+    recovered: RecoveredBridgeOuts,
+) -> anyhow::Result<Vec<ReplayBridgeOut>> {
+    let RecoveredBridgeOuts {
+        id_by_nullifier,
+        mut by_id,
+    } = recovered;
+    let mut replay = Vec::new();
+    for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
+        for input in tx.transaction_header.input_notes().iter() {
+            let id = input
+                .header()
+                .map(|header| header.id())
+                .or_else(|| id_by_nullifier.get(&input.nullifier()).copied());
+            let Some(id) = id else { continue };
+            let Some(body) = by_id.remove(&id) else {
+                continue;
+            };
+            if let Some(header) = input.header()
+                && header.details_commitment() != body.details.commitment()
+            {
+                anyhow::bail!("restore: NoteId {id} body/transaction commitment mismatch");
             }
+            replay.push(ReplayBridgeOut {
+                id,
+                body,
+                block,
+                tx_order: order,
+            });
         }
     }
     tracing::info!(
         bridge = %bridge_id,
-        positions = out.len(),
-        "restore: authoritative per-exit positions built from sync_transactions"
+        bridge_outs = replay.len(),
+        "restore: authoritative bridge-out replay built from transaction execution order"
     );
-    Ok(out)
+    Ok(replay)
 }
 
 /// Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet `faucet_registry` rows
@@ -923,121 +814,53 @@ async fn restore_faucet_identities(
     Ok(n)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn restore_bridge_outs(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
-    accounts: &AccountsConfig,
+    bridge_id: AccountId,
     local_network_id: u32,
     block_state: &Arc<BlockState>,
-    restore_block: u64,
     l1_rpc_url: Option<String>,
-    bridge_positions: std::collections::HashMap<
-        miden_protocol::note::NoteId,
-        ([u8; 32], u64, u32, u32),
-    >,
+    bridge_replay: Vec<ReplayBridgeOut>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
-    // Cantina MA#3 — the configured bridge account is the only legitimate
-    // consumer of a *bridge-out* B2AGG note; reclaim/untracked consumptions are
-    // gated out in `project_b2agg_note`.
-    let bridge_id = accounts.bridge.0;
-
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
-    // Owned copy moved into the 'static closure (Cantina #13 L2 recovery).
-    let l1_url = l1_rpc_url;
 
     miden_client
         .with(move |client| {
             Box::new(async move {
-                let consumed_notes = client
-                    .get_input_notes(NoteFilter::Consumed)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
-
+                use miden_client::store::InputNoteState;
+                use miden_client::store::input_note_states::ConsumedExternalNoteState;
+                use miden_protocol::block::BlockNumber;
                 let bridge_address = get_bridge_address();
                 let mut count = 0usize;
                 let mut logs = 0usize;
-
-                // Miden-1:1: replay each B2AGG note at its OWN Miden consumption
-                // block, in the projector's canonical (block, tx_order, note_id)
-                // order. This keeps deposit_count assignment deterministic across
-                // restore runs AND byte-identical to a fresh live projection —
-                // the Miden client returns consumed notes in store-arrival order,
-                // which varies between runs.
-                // Pair each consumed record with its UNIQUE NoteId via the authoritative
-                // position feed. A consumed record has lost both its id and its nullifier
-                // (metadata gone), so the join is by details commitment — and because
-                // distinct notes CAN share one, each commitment keeps a QUEUE of candidate
-                // ids (sorted for determinism) and every matching record pops one: both
-                // siblings get distinct ids/positions, none is collapsed or double-assigned.
-                let mut ids_by_commitment: std::collections::HashMap<
-                    [u8; 32],
-                    Vec<miden_protocol::note::NoteId>,
-                > = std::collections::HashMap::new();
-                for (id, (commitment, _, _, _)) in &bridge_positions {
-                    ids_by_commitment.entry(*commitment).or_default().push(*id);
-                }
-                for ids in ids_by_commitment.values_mut() {
-                    ids.sort_by_key(|i| i.as_bytes());
-                    ids.reverse(); // pop() takes the smallest first
-                }
-                // Review blocker 4: carry the FULL authoritative tuple (block, tx_order,
-                // within_tx_pos) — imported/historical consumed records lack a local order,
-                // so taking block/tx_order from the local state would fall through to
-                // position/hash order for multi-tx blocks. Rebuild each bridge-attributed
-                // consumer-unknown record with the authoritative (block, tx_order) in its
-                // ConsumedExternal state (so the sort reads authoritative values), keep the
-                // within_tx_pos map for the sibling tie-break, and project at the
-                // authoritative block.
-                let within_tx_pos: std::collections::HashMap<miden_protocol::note::NoteId, u32> =
-                    bridge_positions
-                        .iter()
-                        .map(|(id, (_, _, _, pos))| (*id, *pos))
-                        .collect();
-                // Owned rebuilt records + their resolved id + authoritative block.
-                // Attributed consumer-unknown records are rebuilt with the authoritative
-                // (block, tx_order) IN their ConsumedExternal state — so both the sort AND
-                // `note_consumed_block` (the projection block) read authoritative values, no
-                // separate block-tracking needed.
-                let rebuilt: Vec<(Option<miden_protocol::note::NoteId>, InputNoteRecord)> =
-                    consumed_notes
-                        .iter()
-                        .map(|note| {
-                            let id = ids_by_commitment
-                                .get_mut(&note.details_commitment().as_bytes())
-                                .and_then(|q| q.pop());
-                            match id.and_then(|i| bridge_positions.get(&i)) {
-                                Some((_, block, order, _)) => (
-                                    id,
-                                    rebuild_consumed_external(note, bridge_id, *block, *order),
-                                ),
-                                None => (id, note.clone()),
-                            }
-                        })
-                        .collect();
-                let mut sorted: Vec<(Option<miden_protocol::note::NoteId>, &InputNoteRecord)> =
-                    rebuilt.iter().map(|(id, note)| (*id, note)).collect();
-                sort_consumed_for_projection_with(&mut sorted, &within_tx_pos);
-
-                for (note_unique_id, note) in sorted {
-                    // Authoritative block for a rebuilt record (nullifier_block_height); local
-                    // fallback for an unattributed one.
-                    let blk = note_consumed_block(note, restore_block);
-                    let block_hash = block_state_clone.get_block_hash(blk);
+                for replay in bridge_replay {
+                    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+                        nullifier_block_height: BlockNumber::from(replay.block as u32),
+                        consumer_account: Some(bridge_id),
+                        consumed_tx_order: Some(replay.tx_order),
+                    });
+                    let note = InputNoteRecord::new(
+                        replay.body.details,
+                        replay.body.attachments,
+                        None,
+                        state,
+                    );
+                    let block_hash = block_state_clone.get_block_hash(replay.block);
                     let outcome = project_b2agg_note(
                         &store_clone,
-                        note,
-                        note_unique_id,
+                        &note,
+                        replay.id,
                         bridge_id,
                         local_network_id,
-                        blk,
+                        replay.block,
                         block_hash,
                         bridge_address,
                         Some(&mut *client),
-                        l1_url.as_deref(),
+                        l1_rpc_url.as_deref(),
                     )
                     .await?;
                     if outcome == B2AggRestoreOutcome::Emitted {
@@ -1083,12 +906,8 @@ pub(crate) enum B2AggRestoreOutcome {
 pub(crate) async fn project_b2agg_note(
     store: &Arc<dyn Store>,
     note: &InputNoteRecord,
-    // The note's UNIQUE on-chain NoteId when the caller knows it (the authoritative
-    // projector path always does; store-fed ConsumedExternal records and legacy restore
-    // replays don't — their metadata is gone). Identity blocker (Cantina #7 review):
-    // distinct notes CAN share a details commitment, and commitment-keyed dedup would
-    // collapse two real LET leaves into one emitted event.
-    unique_id: Option<miden_protocol::note::NoteId>,
+    // The unique on-chain NoteId. Distinct notes may have identical details.
+    note_id: miden_protocol::note::NoteId,
     bridge_id: AccountId,
     local_network_id: u32,
     restore_block: u64,
@@ -1102,15 +921,12 @@ pub(crate) async fn project_b2agg_note(
         return Ok(B2AggRestoreOutcome::Skipped);
     }
 
-    // The EMISSION identity string: derived tx hashes, deposit rows and legacy dedup rows
-    // all key on the details-commitment hex (immutable history — never change it). The
-    // DEDUP identity is the unique NoteId when known, with the commitment as the legacy
-    // fallback so pre-fix rows keep deduping historical replays.
-    let note_id_str = hex::encode(note.details_commitment().as_bytes());
-    let dedup_key = unique_id
-        .map(|i| i.to_hex())
-        .unwrap_or_else(|| note_id_str.clone());
-
+    // The derived tx hash remains details-commitment-based for immutable history
+    // compatibility. Reservation, dedup and quarantine identity is always the unique
+    // NoteId: distinct on-chain notes may have identical details.
+    let details_commitment_hex = hex::encode(note.details_commitment().as_bytes());
+    let dedup_key = note_id.to_hex();
+    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&details_commitment_hex);
     // Cantina MA#3 — reclaim gate. A B2AGG note has a reclaim branch (consumer ==
     // sender, asset stays on Miden) and a bridge branch (consumer == bridge, asset
     // leaves). Only the latter is a real bridge-out; rebuilding a synthetic
@@ -1124,19 +940,15 @@ pub(crate) async fn project_b2agg_note(
     // BridgeEvent for a reclaim/untracked consumption. Surface it (warn + metric)
     // rather than silently skipping, so operators can detect legacy bad state and
     // reset/rebuild. We do not auto-remove the stale event here.
-    // Dual-key check: the unique-id key (new events) OR the legacy commitment key
-    // (historical events emitted before unique-identity dedup) — either one means this
-    // exact consumption was already handled. Two distinct notes sharing a commitment are
-    // NOT collapsed: the first emits under its id key; the second's id key is unseen and
-    // the legacy key only matches rows written by PRE-fix builds (a documented one-time
-    // migration edge, preferred over double-emitting all historical replays).
-    let processed = store.is_note_processed(&dedup_key).await?
-        || (dedup_key != note_id_str && store.is_note_processed(&note_id_str).await?);
+    // NoteId is the identity whenever the authoritative caller has it. Restore handles the
+    // one-time commitment-keyed legacy alias before entering this function; consulting that
+    // key here would collapse every later note that happens to share the same details.
+    let processed = store.is_note_processed(&dedup_key).await?;
     if processed {
         if !matches!(class, B2AggConsumerClass::Emit) {
             ::metrics::counter!("restore_b2agg_legacy_processed_gated_total").increment(1);
             tracing::warn!(
-                note_id = %note_id_str,
+                note_id = %dedup_key,
                 consumer = ?consumer,
                 bridge = %bridge_id,
                 "restore: already-processed B2AGG note would now be gated out (consumer != \
@@ -1162,7 +974,7 @@ pub(crate) async fn project_b2agg_note(
         B2AggConsumerClass::Reclaimed => {
             ::metrics::counter!("bridge_out_reclaimed_b2agg_total").increment(1);
             tracing::info!(
-                note_id = %note_id_str,
+                note_id = %dedup_key,
                 consumer = ?consumer,
                 bridge = %bridge_id,
                 "restore: B2AGG note was reclaimed by user (consumed by non-bridge \
@@ -1173,7 +985,7 @@ pub(crate) async fn project_b2agg_note(
         B2AggConsumerClass::UntrackedConsumer => {
             ::metrics::counter!("bridge_out_b2agg_untracked_consumer_total").increment(1);
             tracing::info!(
-                note_id = %note_id_str,
+                note_id = %dedup_key,
                 bridge = %bridge_id,
                 "restore: B2AGG note consumed by untracked account (consumer_account \
                  = None); fail-closed skip (Cantina MA#3)"
@@ -1189,11 +1001,11 @@ pub(crate) async fn project_b2agg_note(
             // is unparsable, so we cannot reconstruct the destination. Quarantine
             // (record unbridgeable) so it is surfaced for operator rescue instead of
             // silently skipped. Ported from `project_b2agg_note`.
-            tracing::warn!(note_id = %note_id_str, "restore: B2AGG storage unparsable: {e:#}");
+            tracing::warn!(note_id = %dedup_key, "restore: B2AGG storage unparsable: {e:#}");
             crate::bridge_out::quarantine_unbridgeable_b2agg(
                 &**store,
                 bridge_id,
-                &note_id_str,
+                &dedup_key,
                 note,
                 restore_block,
                 crate::store::UnbridgeableBridgeOutReason::StorageParseFailed,
@@ -1216,7 +1028,7 @@ pub(crate) async fn project_b2agg_note(
     if destination_network == local_network_id {
         ::metrics::counter!("bridge_out_self_targeted_total").increment(1);
         tracing::error!(
-            note_id = %note_id_str,
+            note_id = %dedup_key,
             destination_network,
             local_network_id,
             "POISON LEAF: B2AGG bridge-out targets the local network; the on-chain LET \
@@ -1230,11 +1042,11 @@ pub(crate) async fn project_b2agg_note(
     let Some(fungible_asset) = details.assets().iter_fungible().next() else {
         // MA#18 — bridge-consumed B2AGG with no fungible asset is malformed: the LET
         // advanced but there is nothing to bridge out. Quarantine, don't silently drop.
-        tracing::warn!(note_id = %note_id_str, "restore: B2AGG has no fungible asset");
+        tracing::warn!(note_id = %dedup_key, "restore: B2AGG has no fungible asset");
         crate::bridge_out::quarantine_unbridgeable_b2agg(
             &**store,
             bridge_id,
-            &note_id_str,
+            &dedup_key,
             note,
             restore_block,
             crate::store::UnbridgeableBridgeOutReason::NoFungibleAsset,
@@ -1250,11 +1062,11 @@ pub(crate) async fn project_b2agg_note(
         Err(e) => {
             // MA#18 — bridge consumed the B2AGG but its faucet is unknown to us, so
             // we can't reconstruct the origin token. Quarantine for operator rescue.
-            tracing::warn!(note_id = %note_id_str, "restore: B2AGG unknown faucet: {e:#}");
+            tracing::warn!(note_id = %dedup_key, "restore: B2AGG unknown faucet: {e:#}");
             crate::bridge_out::quarantine_unbridgeable_b2agg(
                 &**store,
                 bridge_id,
-                &note_id_str,
+                &dedup_key,
                 note,
                 restore_block,
                 crate::store::UnbridgeableBridgeOutReason::UnknownFaucet,
@@ -1268,11 +1080,11 @@ pub(crate) async fn project_b2agg_note(
         Ok(v) => v,
         Err(e) => {
             // MA#18 — the scaled L1 amount overflows. Quarantine, don't silently drop.
-            tracing::warn!(note_id = %note_id_str, "restore: B2AGG amount overflow: {e:#}");
+            tracing::warn!(note_id = %dedup_key, "restore: B2AGG amount overflow: {e:#}");
             crate::bridge_out::quarantine_unbridgeable_b2agg(
                 &**store,
                 bridge_id,
-                &note_id_str,
+                &dedup_key,
                 note,
                 restore_block,
                 crate::store::UnbridgeableBridgeOutReason::AmountOverflow,
@@ -1320,14 +1132,14 @@ pub(crate) async fn project_b2agg_note(
                 entry.metadata = bytes.clone();
                 if let Err(e) = store.register_faucet(entry).await {
                     tracing::warn!(
-                        note_id = %note_id_str,
+                        note_id = %dedup_key,
                         faucet_id = %faucet_id,
                         error = ?e,
                         "restore: Cantina #13 L2 metadata backfill failed (recovery will re-run)"
                     );
                 } else {
                     tracing::info!(
-                        note_id = %note_id_str,
+                        note_id = %dedup_key,
                         faucet_id = %faucet_id,
                         "restore: Cantina #13 L2 recovered + backfilled ERC-20 metadata"
                     );
@@ -1341,7 +1153,7 @@ pub(crate) async fn project_b2agg_note(
             // the registry is backfilled / an L1 RPC is wired) retries it.
             ::metrics::counter!(METADATA_UNRECOVERABLE_METRIC).increment(1);
             tracing::warn!(
-                note_id = %note_id_str,
+                note_id = %dedup_key,
                 faucet_id = %faucet_id,
                 origin_network = origin.origin_network,
                 "restore: Cantina #13 L2 — ERC-20 bridge-out has empty metadata that could not \
@@ -1360,7 +1172,7 @@ pub(crate) async fn project_b2agg_note(
     if emit_metadata.len() > crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES {
         ::metrics::counter!("bridge_out_b2agg_metadata_too_large_total").increment(1);
         tracing::warn!(
-            note_id = %note_id_str,
+            note_id = %dedup_key,
             metadata_len = emit_metadata.len(),
             cap = crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES,
             "restore: B2AGG metadata exceeds cap; skipping synthetic BridgeEvent (DoS guard)"
@@ -1368,7 +1180,7 @@ pub(crate) async fn project_b2agg_note(
         crate::bridge_out::quarantine_unbridgeable_b2agg(
             &**store,
             bridge_id,
-            &note_id_str,
+            &dedup_key,
             note,
             restore_block,
             crate::store::UnbridgeableBridgeOutReason::MetadataTooLarge,
@@ -1385,19 +1197,15 @@ pub(crate) async fn project_b2agg_note(
     // B5 — share the versioned domain-separated helper with bridge_out so the
     // tx_hash is byte-identical across first-observation and restore paths
     // (dedup-stable).
-    let tx_hash = crate::bridge_out::derive_bridge_out_tx_hash(&note_id_str);
-
-    // H1 — atomic B2AGG commit. The legacy two-step mark-processed +
-    // emit-bridge-event sequence left a crash window: a process kill between
-    // the steps recorded the note as processed (deposit_counter bumped) with
-    // NO matching BridgeEvent, silently stranding the exit.
-    // `commit_b2agg_event_atomic` folds both into a single DB transaction and
-    // is idempotent on retry (reuses the original deposit_count, emits no
-    // duplicate log — H3).
+    // H1 — atomic B2AGG emission. The LET index was reserved before any
+    // quarantine/deferral gate. This commit atomically marks that reservation
+    // emitted and inserts its BridgeEvent, closing the crash window between the
+    // old processed-marker and event writes. Retry reuses the reserved index and
+    // emits no duplicate log.
     let deposit_count = store
         .commit_b2agg_event_atomic(
-            // Processed/dedup key: the UNIQUE id when known (commitment only as legacy
-            // fallback) — the tx hash above stays commitment-derived for history compat.
+            // Reservation/dedup key: unique NoteId. The tx hash above stays
+            // commitment-derived for historical compatibility.
             dedup_key.clone(),
             bridge_address,
             restore_block,
@@ -1419,7 +1227,7 @@ pub(crate) async fn project_b2agg_note(
     // which was misleading on the live path and which downstream tooling / e2e
     // greps for under the legacy wording.)
     tracing::info!(
-        note_id = %note_id_str,
+        note_id = %dedup_key,
         deposit_count,
         "emitted BridgeEvent"
     );
@@ -1660,13 +1468,18 @@ async fn restore_claims(
                 let mut log_count = 0usize;
 
                 // Miden-1:1: replay each CLAIM at its OWN Miden consumption block,
-                // in the projector's canonical (block, tx_order, note_id) order
+                // in deterministic (block, tx_order, details commitment) order
                 // (deterministic across runs + parity with the live projector).
                 let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
                 sort_consumed_for_projection(&mut sorted_notes);
 
                 for note in sorted_notes {
                     let blk = note_consumed_block(note, restore_block);
+                    // The background client may sync past the fixed restore snapshot while
+                    // listeners are paused. Leave newer notes for the live projector.
+                    if blk > restore_block {
+                        continue;
+                    }
                     let block_hash = block_state_clone.get_block_hash(blk);
                     // Per-note CLAIM derivation lives in `project_claim_note` so
                     // the live cursor-driven projector and this recovery phase
@@ -1939,7 +1752,7 @@ async fn restore_gers(
 
                 // The GER hash chain is ORDER-SENSITIVE (each value mixes into a
                 // rolling Keccak), so restore MUST replay in the projector's exact
-                // (block, tx_order, note_id) order — otherwise the restored chain
+                // (block, tx_order, details commitment) order — otherwise the restored chain
                 // diverges from a fresh live projection (and from aggkit's view).
                 // Each GER is also emitted at its OWN Miden consumption block
                 // (Miden-1:1), with that block's hash + timestamp.
@@ -1948,6 +1761,9 @@ async fn restore_gers(
 
                 for note in sorted_notes {
                     let blk = note_consumed_block(note, restore_block);
+                    if blk > restore_block {
+                        continue;
+                    }
                     let block_hash = block_state_clone.get_block_hash(blk);
                     let timestamp = block_state_clone.get_block_timestamp(blk);
                     // Per-note GER derivation (MA#28 provenance + hash-chain
@@ -1988,16 +1804,11 @@ mod tests {
     use crate::store::Store;
     use crate::store::memory::InMemoryStore;
     use miden_protocol::note::{
-        NoteAttachment, NoteAttachments, NoteId, NoteMetadata, NoteType, PartialNoteMetadata,
+        NoteAttachment, NoteAttachments, NoteMetadata, NoteType, PartialNoteMetadata,
     };
     use miden_protocol::{Felt, Word};
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
-
-    /// Distinct synthetic NoteIds for identity-keyed ordering tests.
-    fn test_note_id(byte: u64) -> NoteId {
-        NoteId::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
-    }
 
     // Test AccountIds — four distinct, valid protocol-0.15 (version-1) ids.
     // Protocol 0.15 dropped the 0.14 v0 id encoding (and folded the old
@@ -2352,42 +2163,6 @@ mod tests {
         )
     }
 
-    /// Build a consumed B2AGG `InputNoteRecord` (current miden-client API, mirrors
-    /// `bridge_out::tests::build_b2agg_note_with_consumer`) carrying a fungible
-    /// asset from `faucet_id` and recording `consumer` as the consuming account.
-    /// The gate keys on the note's script root + `consumer_account()` (the note
-    /// STATE), so only `faucet_id` and `consumer` matter here. The asset is
-    /// present so restore's emit path is actually reached when the gate is
-    /// absent — i.e. the RED test fails on the missing gate, not a no-asset skip.
-    /// Like [`ma3_b2agg_input_note`] but with a caller-chosen amount → DISTINCT commitment.
-    fn ma3_b2agg_note_amount(
-        faucet_id: AccountId,
-        consumer: Option<AccountId>,
-        amount: u64,
-    ) -> InputNoteRecord {
-        use miden_base_agglayer::B2AggNote;
-        use miden_client::store::InputNoteState;
-        use miden_client::store::input_note_states::ConsumedExternalNoteState;
-        use miden_protocol::asset::{Asset, FungibleAsset};
-        use miden_protocol::block::BlockNumber;
-        use miden_protocol::note::{
-            NoteAssets, NoteAttachments, NoteDetails, NoteRecipient, NoteStorage,
-        };
-        use miden_protocol::{Felt, Word};
-
-        let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
-        let recipient = NoteRecipient::new(Word::default(), B2AggNote::script(), storage);
-        let asset: Asset = FungibleAsset::new(faucet_id, amount).unwrap().into();
-        let assets = NoteAssets::new(vec![asset]).unwrap();
-        let details = NoteDetails::new(assets, recipient);
-        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
-            nullifier_block_height: BlockNumber::from(0u32),
-            consumer_account: consumer,
-            consumed_tx_order: None,
-        });
-        InputNoteRecord::new(details, NoteAttachments::default(), None, state)
-    }
-
     fn ma3_b2agg_input_note(faucet_id: AccountId, consumer: Option<AccountId>) -> InputNoteRecord {
         use miden_base_agglayer::B2AggNote;
         use miden_client::store::InputNoteState;
@@ -2412,6 +2187,84 @@ mod tests {
             consumed_tx_order: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
+    fn ma3_note_id(note: &InputNoteRecord, bridge_id: AccountId) -> miden_protocol::note::NoteId {
+        let attachments = NoteAttachments::default();
+        let metadata = NoteMetadata::new(
+            PartialNoteMetadata::new(bridge_id, NoteType::Public),
+            &attachments,
+        );
+        miden_protocol::note::NoteId::new(note.details_commitment(), &metadata)
+    }
+
+    #[test]
+    fn restore_replay_is_complete_and_preserves_same_details_note_ids() {
+        use miden_client::rpc::domain::transaction::TransactionRecord;
+        use miden_protocol::asset::FungibleAsset;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{NoteHeader, Nullifier};
+        use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
+
+        let (faucet_id, bridge_id, sender_id) = ma3_accounts();
+        let details = ma3_b2agg_input_note(faucet_id, None).details().clone();
+        let attachments = NoteAttachments::default();
+        let metadata = |sender| {
+            NoteMetadata::new(
+                PartialNoteMetadata::new(sender, NoteType::Public),
+                &attachments,
+            )
+        };
+        let first = NoteHeader::new(details.commitment(), metadata(bridge_id));
+        let second = NoteHeader::new(details.commitment(), metadata(sender_id));
+        assert_ne!(first.id(), second.id());
+        let ids = [first.id(), second.id()];
+
+        let nullifier = |value| Nullifier::from_raw(Word::new([Felt::new(value).unwrap(); 4]));
+        let second_nullifier = nullifier(2);
+        let inputs = InputNotes::new(vec![
+            InputNoteCommitment::from_parts_unchecked(nullifier(1), Some(first)),
+            InputNoteCommitment::from_parts_unchecked(second_nullifier, None),
+        ])
+        .unwrap();
+        let tx = TransactionRecord {
+            block_num: BlockNumber::from(7u32),
+            transaction_header: TransactionHeader::new(
+                bridge_id,
+                Word::default(),
+                Word::new([Felt::new(1).unwrap(); 4]),
+                inputs,
+                vec![],
+                FungibleAsset::new(faucet_id, 0).unwrap(),
+            ),
+            output_notes: vec![],
+            erased_output_notes: vec![],
+        };
+        assert!(ensure_complete_note_response(&ids, &ids[..1]).is_err());
+
+        let recovered = RecoveredBridgeOuts {
+            id_by_nullifier: std::collections::HashMap::from([(second_nullifier, second.id())]),
+            by_id: ids
+                .iter()
+                .copied()
+                .map(|id| {
+                    (
+                        id,
+                        RecoveredBridgeBody {
+                            details: details.clone(),
+                            attachments: attachments.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let replay = build_bridge_replay(&[tx], bridge_id, recovered).unwrap();
+        assert_eq!(replay.iter().map(|item| item.id).collect::<Vec<_>>(), ids);
+        assert!(
+            replay
+                .iter()
+                .all(|item| item.block == 7 && item.tx_order == 0)
+        );
     }
 
     async fn ma3_register_faucet(store: &StdArc<dyn Store>, faucet_id: AccountId) {
@@ -2443,12 +2296,12 @@ mod tests {
 
         // Reclaim branch: consumer == sender (the user), NOT the bridge.
         let note = ma3_b2agg_input_note(faucet_id, Some(sender_id));
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
 
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2482,12 +2335,12 @@ mod tests {
 
         // consumer == bridge → real bridge-out.
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
 
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2526,13 +2379,13 @@ mod tests {
 
         // Bridge-consumed (would otherwise emit), destination network 0.
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
 
         // local_network_id == 0 == the note's destination network → poison self-target.
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             0, // local_network_id == dest-network 0 → self-target
             1,
@@ -2565,12 +2418,12 @@ mod tests {
         ma3_register_faucet(&store, faucet_id).await;
 
         let note = ma3_b2agg_input_note(faucet_id, None);
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
 
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2606,12 +2459,12 @@ mod tests {
         // A third account, distinct from BOTH the bridge and the sender.
         let other = id(TEST_TARGET_OTHER);
         let note = ma3_b2agg_input_note(faucet_id, Some(other));
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
 
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2647,7 +2500,8 @@ mod tests {
         // Reclaim consumer, but a pre-fix run already marked it processed
         // (seeded via the sole processed-set write path).
         let note = ma3_b2agg_input_note(faucet_id, Some(id(TEST_SENDER_MANAGER)));
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
+        store.reserve_deposit_index(&note_id).await.unwrap();
         store
             .commit_b2agg_event_atomic(
                 note_id.clone(),
@@ -2669,7 +2523,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2698,7 +2552,8 @@ mod tests {
 
         // An earlier run committed this note through the atomic write path.
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
+        store.reserve_deposit_index(&note_id).await.unwrap();
         store
             .commit_b2agg_event_atomic(
                 note_id.clone(),
@@ -2720,7 +2575,7 @@ mod tests {
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2761,12 +2616,12 @@ mod tests {
             .unwrap();
 
         let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        let note_id = ma3_note_id(&note, bridge_id).to_hex();
 
         let outcome = project_b2agg_note(
             &store,
             &note,
-            note.id(),
+            ma3_note_id(&note, bridge_id),
             bridge_id,
             7, // local_network_id (test notes target dest-network 0, so no self-target gate)
             1,
@@ -2838,11 +2693,20 @@ mod tests {
         bridge_id: AccountId,
         reason: crate::store::UnbridgeableBridgeOutReason,
     ) {
-        let note_id = hex::encode(note.details_commitment().as_bytes());
+        use miden_protocol::note::{
+            NoteAttachments, NoteId, NoteMetadata, NoteType, PartialNoteMetadata,
+        };
+
+        let metadata = NoteMetadata::new(
+            PartialNoteMetadata::new(bridge_id, NoteType::Public),
+            &NoteAttachments::default(),
+        );
+        let note_id = NoteId::new(note.details_commitment(), &metadata);
+        let note_key = note_id.to_hex();
         let outcome = project_b2agg_note(
             store,
             note,
-            note.id(),
+            note_id,
             bridge_id,
             7, // local_network_id (well-formed test notes target dest-network 0)
             42,
@@ -2860,17 +2724,17 @@ mod tests {
             "untranslatable B2AGG must be a quarantine skip, not an emit",
         );
         let row = store
-            .get_unbridgeable_bridge_out(&note_id)
+            .get_unbridgeable_bridge_out(&note_key)
             .await
             .unwrap()
             .expect("restore skip must write a quarantine row (MA#18)");
-        assert_eq!(row.note_id, note_id);
+        assert_eq!(row.note_id, note_key);
         assert_eq!(row.bridge_account, bridge_id);
         assert_eq!(row.reason, reason);
         assert_eq!(row.observed_block, 42);
         assert!(!row.detail.is_empty(), "detail must carry the skip cause");
         assert!(
-            !store.is_note_processed(&note_id).await.unwrap(),
+            !store.is_note_processed(&note_key).await.unwrap(),
             "quarantined note must stay un-processed for later rescue",
         );
         // No synthetic BridgeEvent was emitted for the quarantined note.
@@ -3616,108 +3480,6 @@ mod tests {
             store.txn_receipt(real_tx).await.unwrap().is_none(),
             "contract half 2: a row begun after projection stays pending forever — \
              which is why txn_begin must be inside the serialized-client handoff",
-        );
-    }
-
-    /// REVIEW BLOCKER 4 (re-review) — imported/historical consumed records carry NO local
-    /// order (consumed_tx_order = None), so taking block/tx_order from the LOCAL state would
-    /// collapse a multi-tx block to hash order. `rebuild_consumed_external` must fold the
-    /// AUTHORITATIVE (block, tx_order) into each record's state so the shared sort orders by
-    /// it. This is the production-shape regression the parity test (which fabricates local
-    /// order fields) misses.
-    #[tokio::test]
-    async fn imported_records_missing_local_order_sort_by_authoritative_tuple() {
-        let (faucet_id, bridge_id, _sender) = ma3_accounts();
-        // Two DISTINCT records (distinct commitments), both consumed in block 9 by different
-        // bridge txs, both imported-shape: consumer=None, consumed_tx_order=None.
-        let a = ma3_b2agg_note_amount(faucet_id, None, 11);
-        let b = ma3_b2agg_note_amount(faucet_id, None, 22);
-        assert_eq!(
-            a.state().consumed_tx_order(),
-            None,
-            "imported: no local order"
-        );
-        assert_eq!(b.state().consumed_tx_order(), None);
-
-        // Authoritative feed: `a` is tx_order 1, `b` is tx_order 0 — i.e. b BEFORE a on-chain.
-        let ra = rebuild_consumed_external(&a, bridge_id, 9, 1);
-        let rb = rebuild_consumed_external(&b, bridge_id, 9, 0);
-        // The rebuilt records now carry authoritative block + order in their state.
-        assert_eq!(
-            ra.state().consumed_block_height().map(|h| h.as_u64()),
-            Some(9)
-        );
-        assert_eq!(ra.state().consumed_tx_order(), Some(1));
-        assert_eq!(rb.state().consumed_tx_order(), Some(0));
-
-        let id_a = test_note_id(0xAA);
-        let id_b = test_note_id(0xBB);
-        let within_tx_pos: std::collections::HashMap<miden_protocol::note::NoteId, u32> =
-            [(id_a, 0), (id_b, 0)].into_iter().collect();
-        // Feed in the WRONG (arrival) order to prove the sort, not arrival, decides.
-        let mut sorted: Vec<(Option<miden_protocol::note::NoteId>, &InputNoteRecord)> =
-            vec![(Some(id_a), &ra), (Some(id_b), &rb)];
-        sort_consumed_for_projection_with(&mut sorted, &within_tx_pos);
-
-        // b (authoritative tx_order 0) must sort BEFORE a (tx_order 1) — authoritative order,
-        // NOT the commitment/hash order.
-        assert_eq!(
-            sorted[0].1.details_commitment().as_bytes(),
-            rb.details_commitment().as_bytes(),
-            "the authoritative-earlier tx (order 0) sorts first, from the rebuilt state"
-        );
-        assert_eq!(
-            sorted[1].1.details_commitment().as_bytes(),
-            ra.details_commitment().as_bytes()
-        );
-    }
-
-    /// REVIEW BLOCKER 5 (re-review) — fail-closed FLOOR at the join: a consumer-unknown
-    /// record with NO authoritative position entry (an incomplete/partial scan, or a
-    /// genuine non-bridge consumption) is NEVER given a fabricated bridge identity/order —
-    /// it is left untouched, so `project_b2agg_note` skips it fail-closed (MA#3
-    /// UntrackedConsumer). (The restore()-level guard is stronger: a scan ERROR or an absent
-    /// node URL aborts restore entirely — `?`-propagated Err — rather than replaying with a
-    /// partial feed; that path is exercised by the restore e2e.)
-    #[tokio::test]
-    async fn incomplete_scan_leaves_records_unattributed_no_fabrication() {
-        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
-        let (faucet_id, bridge_id, _sender) = ma3_accounts();
-        ma3_register_faucet(&store, faucet_id).await;
-
-        // Consumer-unknown record; EMPTY position map (simulating a scan that recovered
-        // nothing for it — the incomplete-scan case reaching the join).
-        let note = ma3_b2agg_input_note(faucet_id, None);
-        let positions: std::collections::HashMap<NoteId, ([u8; 32], u64, u32, u32)> =
-            std::collections::HashMap::new();
-        let resolved_id = positions.keys().find(|_| false).copied(); // no id resolves from an empty map
-        assert!(resolved_id.is_none());
-
-        // Not attributed → the record is NOT rebuilt (no consumer=bridge fabricated).
-        assert_eq!(
-            note.consumer_account(),
-            None,
-            "an unattributed consumer-unknown record keeps consumer=None"
-        );
-        // project_b2agg_note (unique_id=None, no known consumer) fail-closed skips it.
-        let outcome = project_b2agg_note(
-            &store,
-            &note,
-            None,
-            bridge_id,
-            1,
-            5,
-            [5u8; 32],
-            get_bridge_address(),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            outcome,
-            B2AggRestoreOutcome::Skipped,
-            "no authoritative identity → fail-closed skip, never a guessed emission"
         );
     }
 }

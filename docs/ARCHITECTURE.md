@@ -145,14 +145,15 @@ sequenceDiagram
     M->>P: on_post_sync with exclusive client access
     P->>N: sync_notes for tag-0 note bodies
     P->>S: persist completed body-sweep frontier
-    P->>P: projection ceiling = min(Miden tip, body-sweep frontier)
+    P->>P: require body-sweep frontier >= current Miden tip
     P->>N: sync_transactions for bridge account and block window
     N-->>P: finalized bridge transactions and consumed nullifiers
     P->>M: read locally consumed CLAIM and GER notes
-    loop Each block from cursor plus one to ceiling
-        P->>P: order notes by block, transaction order, commitment
+    loop Each block from cursor plus one to Miden tip
+        P->>P: order notes by transaction and input-note position
+        P->>S: reserve B2AGG LET indices in that exact order
         P->>S: atomically commit derived events and receipt updates
-        P->>S: advance exposed tip after every event is stored
+        P->>S: advance exposed tip after the complete block is stored
         P->>S: persist projector cursor
     end
 ```
@@ -172,11 +173,13 @@ Each event path validates provenance and fails closed:
 - CLAIM notes must be attributable to this bridge or this service account.
 - GER notes must be attributable to the configured GER manager and bridge.
 
-Per-event store operations are idempotent and transactional. B2AGG commits bind
-the note, deposit counter, and `BridgeEvent`; CLAIM commits bind the note,
-`ClaimEvent`, and linked receipt; GER commits bind injection state, hash-chain
-roll, log, and linked receipt. A crash before the tip advance leaves the partial
-block unexposed, and the persisted projector cursor makes replay idempotent.
+Per-event store operations are idempotent and transactional. Every bridge-consumed
+B2AGG first receives its durable execution-order LET reservation, including a leaf
+later quarantined or deferred. A successful B2AGG commit atomically marks that
+reservation emitted and inserts its `BridgeEvent`; CLAIM commits bind the note,
+`ClaimEvent`, and linked receipt; GER commits bind injection state, hash-chain roll,
+log, and linked receipt. A crash before the tip advance leaves the partial block
+unexposed, and the persisted projector cursor makes replay idempotent.
 
 Synthetic block headers form a deterministic RLP-hashed parent chain derived
 from block number and fixed header fields. They do not contain a log root; log
@@ -229,9 +232,10 @@ and Miden decimal metadata used for the reverse bridge.
 
 The Miden client synchronizes on startup and every five seconds. Listener order
 is store receipt maintenance, block-header cache, security monitors, then the
-projector. The `BridgeOutScanner` is monitor-only: it checks LET divergence,
-faucet ownership, twin notes, burn serials, MINT targets, and expected MINTs; it
-does not write synthetic events or advance the tip.
+projector. The `BridgeOutScanner` is monitor-only: it checks faucet ownership,
+twin notes, burn serials, MINT targets, and expected MINTs; it does not write
+synthetic events or advance the tip. The projector enforces LET cardinality
+before sealing.
 
 `--restore` is an offline reconstruction mode. It pauses post-sync listener
 side effects, reimports configured accounts, syncs to the Miden tip, recovers

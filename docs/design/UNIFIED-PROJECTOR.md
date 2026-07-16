@@ -24,12 +24,12 @@ and observes their consumed state locally.
 flowchart TD
     TIP["Miden sync tip"]
     SWEEP["sync_notes tag-0 body sweep"]
-    CEILING["Projection ceiling"]
+    CEILING["Full-tip visibility gate"]
     TXS["sync_transactions for bridge account"]
     LOCAL["Local consumed-note store"]
     B2AGG["B2AGG consumptions"]
     INTERNAL["CLAIM and GER consumptions"]
-    ORDER["Order by block, transaction order, commitment"]
+    ORDER["Order by block, transaction order, input position, NoteId"]
     EMIT["Shared project_* derivations"]
 
     TIP --> CEILING
@@ -42,12 +42,13 @@ flowchart TD
     ORDER --> EMIT
 ```
 
-The ceiling is `min(tip, reconcile_cursor)`, where `reconcile_cursor` is the
-last fully completed note-body sweep window.
+Projection waits until `reconcile_cursor >= tip`, then processes through that tip.
 
 For B2AGG, `sync_transactions` is filtered to the configured bridge account.
 It supplies the finalized block number, consuming transaction order, input
-nullifiers, and an unauthenticated note id when the transaction carries one.
+nullifiers, and input order. The pinned miden-client drops protocol input
+headers, so the reconciler persists the B2AGG nullifier-to-NoteId join before
+advancing its cursor.
 The projector accepts a body only after the normal B2AGG script and
 bridge-consumer checks pass.
 
@@ -58,21 +59,21 @@ are explicitly excluded from this local path so the sources remain disjoint.
 ## B2AGG body resolution
 
 A consumed external input record no longer exposes the metadata needed to
-recompute its nullifier. The projector therefore caches canonical B2AGG bodies
-while they are still committed and keyed by nullifier.
+recompute its nullifier. Before that transition, the projector persists the
+minimal nullifier-to-NoteId join. Canonical bodies remain in the node.
 
 Resolution order is:
 
-1. body captured from an imported, still-committed local note;
-2. body recovered during the spent-before-import reconciliation path;
-3. authoritative `get_notes_by_id` fetch when the transaction supplies a note
-   id.
+1. NoteId retained by a corrected transaction-header decoder, when available;
+2. otherwise, durable NoteId recovered by nullifier;
+3. canonical body fetched with `get_notes_by_id`.
 
-The node's transaction feed can briefly lead its note database. Missing
-unauthenticated bodies are retried for a bounded number of ticks. A body that
-still cannot be authenticated is skipped loudly rather than freezing the
-synthetic tip or fabricating a `BridgeEvent`. Cache entries are removed only
-after the corresponding projector cursor has been persisted.
+The node's transaction feed can briefly lead its note database. If an identified
+input is omitted from `get_notes_by_id`, the projector fails the tick and retries;
+it never relies on cardinality after an index may already have been reserved. No
+synthetic block is sealed with a missing leaf. The minimal nullifier-to-NoteId identity ledger is
+append-only and grows with observed B2AGG note history, so restart recovery never depends on
+cache lifetime or cleanup ordering. It can contain notes that never emit a bridge event.
 
 ## Removed behavior
 
@@ -95,6 +96,5 @@ behind the Miden tip. The completeness auditor periodically checks older
 consumed B2AGG notes against exact-block logs and de-duplicates alarms in
 memory. It is detection only and never repairs an exposed block.
 
-The correctness gate is the independent node-versus-log verifier in
-`scripts/verify-event-completeness.sh` and the isolated-wallet load test in
-`scripts/e2e-bridge-loadtest-isolated.sh`.
+The pre-seal LET cardinality gate is the production correctness gate. The
+node-versus-log verifier and isolated-wallet load test provide independent checks.

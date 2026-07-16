@@ -41,11 +41,11 @@ progress signal.
 | `projector_visibility_barrier_held_blocks` | `0` in steady state | Positive and not falling: projection is held behind note visibility |
 | `synthetic_projector_completeness_audit_lag` | Highest audited block advances | Flat while projector advances |
 | `synthetic_projector_completeness_missing_total` | No increase | Any increase is a missing historical `BridgeEvent`; page |
-| `synthetic_projector_b2agg_authoritative_fetch_total` | May increase under load; authoritative fallback is working | Correlate with fetch-missing or event loss |
-| `synthetic_projector_b2agg_authenticated_skip_total` | Expected for authenticated non-B2AGG bridge consumptions | Investigate only with missing events |
-| `synthetic_projector_b2agg_fetch_missing_total` | No increase | Any increase means a reported bridge consumption body stayed unavailable after bounded retry; page |
+| `synthetic_projector_b2agg_authoritative_fetch_total` | Tracks successful body-resolution attempts | Compare with bridge-out volume; retries before cursor advance can make it higher |
+| `synthetic_projector_b2agg_headerless_skip_total` | Expected for headerless non-B2AGG bridge inputs | Investigate if paired with a held LET gate |
+| `synthetic_projector_b2agg_fetch_missing_total` | No increase | Any increase means an identified bridge consumption body was unavailable; the projector fails the tick before sealing |
+| `bridge_let_assignment_gate_halted_total` | No increase | Any increase means LET and local reservation cardinality disagree; projection is held before sealing |
 | `synthetic_reconciler_notes_imported_total` | May increase during catch-up | Sustained burst indicates ordinary sync missed notes; inspect node/sync health |
-| `synthetic_reconciler_import_dropped_total` | May increase when miden-client drops already-consumed imports and direct recovery takes over | Page only if paired with recovery/projector failure |
 | `synthetic_reconciler_private_skipped_total` | May increase for historical private tag-0 notes | Informational unless sweep cursor stops |
 
 Also compare the durable `service_state.projector_cursor`,
