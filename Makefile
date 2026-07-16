@@ -249,9 +249,11 @@ e2e-clean-data: ## Wipe .miden-agglayer-data/ + .b2agg-store/ + node_data volume
 		echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
 		ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; fi
 	mkdir -p .miden-agglayer-data/tmp
-	@out=$$(docker volume rm miden-agglayer_node_data 2>&1) || { \
+	@project="$${COMPOSE_PROJECT_NAME:-$(notdir $(CURDIR))}"; \
+	volume="$${project}_node_data"; \
+	out=$$(docker volume rm "$$volume" 2>&1) || { \
 		echo "$$out" | grep -qi "no such volume" || { \
-			echo "e2e-clean-data: cannot remove node_data volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
+			echo "e2e-clean-data: cannot remove $$volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)
