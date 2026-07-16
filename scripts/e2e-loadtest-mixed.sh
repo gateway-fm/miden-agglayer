@@ -153,10 +153,12 @@ forward_bridge() {
 }
 forward_bridge "$FWD_SEED_WEI" || fail "seed forward bridge failed"
 
-# Client-submit the seed claim on Miden (nudge_until drives L2B cert cycles so the
-# covering GER reaches Miden; the predicate submits claimAsset + checks ClaimEvent).
-wait_for "seed L2B->Miden deposit ready_for_claim" 600 5 \
-    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$MOP_LOWER" "$MIDEN_NETWORK_ID" "$L2B_BRIDGE_SERVICE_URL"
+# Wait only for source-chain indexing. The bounded nudge_until below deliberately
+# drives ready_for_claim too: bridge-service can observe an L2 GER just before its
+# matching L1 GER and needs the next cert cycle to repair that external ordering
+# race. Waiting passively here would deadlock before the recovery loop can start.
+wait_for "seed L2B->Miden deposit indexed" 120 5 \
+    _pred_deposit_indexed "$DEST_ADDR" "$L2B_NETWORK_ID" "$MOP_LOWER" "$L2B_BRIDGE_SERVICE_URL"
 SEED_DEP=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$MOP_LOWER" "$L2B_BRIDGE_SERVICE_URL")
 [[ -n "$SEED_DEP" ]] || fail "seed deposit not indexed on the L2B service"
 SEED_CNT=$(dep_field "$SEED_DEP" deposit_cnt); SEED_GI=$(dep_field "$SEED_DEP" global_index)
