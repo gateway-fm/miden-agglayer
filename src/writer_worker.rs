@@ -115,11 +115,9 @@ pub fn write_drop_snapshot(count: u64) {
 // ─── DecodedWriteCall ───────────────────────────────────────────────────────
 
 /// Method-decoded `eth_sendRawTransaction` payload — the *output* of
-/// `service_send_raw_txn`'s request-thread decode step, the *input* to either
-/// the legacy sync dispatch or the writer-worker enqueue. Decoupling the
-/// dispatch shape from the wire shape lets the worker fork in
-/// `service_send_raw_txn` be a single `match` instead of duplicating selector
-/// detection.
+/// `service_send_raw_txn`'s request-thread decode step and the input to the
+/// mandatory writer-worker enqueue. Keeping this shape separate from the wire
+/// representation avoids duplicating selector detection in the worker.
 // `claimAssetCall` is much larger than the Ger payload (multiple FixedBytes<32>
 // arrays + U256 + addresses, ~1 KB worst case). Box it so the enum variant size
 // stays small — clippy::large_enum_variant gates this above 200 bytes and the
@@ -420,7 +418,7 @@ impl WriterWorkerHandle {
 
     /// Count process-local non-terminal jobs for diagnostics and drain tests.
     /// Transaction-count RPCs use the store's durable pending frontier, which
-    /// also covers sync mode and survives process restart.
+    /// survives process restart.
     pub fn count_non_terminal_for_signer(&self, signer: &Address) -> usize {
         self.inflight
             .iter()
@@ -885,9 +883,9 @@ impl WriterWorker {
 }
 
 /// Dispatch a `WriteJob` to the matching Phase-1 translator in
-/// `service_send_raw_txn`. Each variant calls the same publish/insert path the
-/// legacy sync handler does, minus the per-signer `nonce_increment` (the
-/// request thread durably admitted the envelope and advanced the nonce before enqueue.
+/// `service_send_raw_txn`. Each variant calls the corresponding publish/insert
+/// handler without a per-signer `nonce_increment`: the request thread durably
+/// admitted the envelope and advanced the nonce before enqueue.
 async fn dispatch_job(service: &ServiceState, job: WriteJob) -> anyhow::Result<()> {
     match job {
         WriteJob::Claim {

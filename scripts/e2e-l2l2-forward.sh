@@ -136,8 +136,10 @@ evidence_settlement "leg2" forward "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST
 # proof-backed claimAsset to the Miden proxy, which accepts it
 # (worker_handle_claim_asset) and auto-creates the foreign faucet + mints.
 step "Leg 2b: submit proof-backed claimAsset to Miden proxy + (OPT0, net $L2B_NETWORK_ID) faucet asserts"
-wait_for "L2B->Miden deposit ready_for_claim in bridge-service" 600 5 \
-    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$OPT0_LOWER" "$MIDEN_NETWORK_ID" "$L2B_BRIDGE_SERVICE_URL"
+# Do not passively wait for ready_for_claim: nudge_until below is the bounded
+# recovery when bridge-service indexes the L2 GER just before the matching L1 GER.
+wait_for "L2B->Miden deposit indexed in bridge-service" 120 5 \
+    _pred_deposit_indexed "$DEST_ADDR" "$L2B_NETWORK_ID" "$OPT0_LOWER" "$L2B_BRIDGE_SERVICE_URL"
 FWD_DEPOSIT=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "$OPT0_LOWER" "$L2B_BRIDGE_SERVICE_URL")
 [[ -n "$FWD_DEPOSIT" ]] || fail "forward deposit vanished from bridge-service"
 FWD_GI=$(dep_field "$FWD_DEPOSIT" global_index)

@@ -5,7 +5,11 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - |
-        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 &
+        # AggSender reads RollupManager state at RollupCreationBlockL1. Anvil
+        # 1.7 retains only 3,600 historical states on disk by default, while a
+        # full E2E pass (notably the real H6 timeout) mines beyond that window.
+        # Keep enough history for the full pass plus the N=30 release gate.
+        anvil --host=0.0.0.0 --chain-id=271828 --block-time=1 --base-fee=1 --max-persisted-states=12000 &
         ANVIL_PID=$$!
         sleep 2
         # Fund deployment accounts and replay contract deployment transactions
@@ -251,6 +255,23 @@ services:
       # the tripwire e2e sets these short (e.g. 5s × 2) to observe the halt quickly.
       FAUCET_RECONCILER_POLL_SECS: "${FAUCET_RECONCILER_POLL_SECS:-30}"
       FAUCET_RECONCILER_GRACE_TICKS: "${FAUCET_RECONCILER_GRACE_TICKS:-3}"
+      # Audit H6 — strict L1 GER corroboration, ON by default in the e2e stack
+      # (the required production posture; merging the H6 code with the flag
+      # off does not close the finding). Rejections are side-effect-free and
+      # transient — the aggoracle's retry succeeds once the from-genesis L1
+      # indexer (--l1-indexer-from-block=1 below) catches up, which on anvil
+      # is seconds. e2e-ger-l1-verification.sh asserts both phases; override
+      # with REJECT_UNVERIFIED_GER_INJECTION=false to run the lenient
+      # (warn + metric only) mode, which makes that script SKIP itself.
+      # Keep the evidence source in environment as well as the normal service
+      # command. `docker compose run ... <one-shot flags>` replaces `command`,
+      # but inherits environment; restore/recovery must therefore retain the
+      # exact policy already bound to this database.
+      L1_RPC_URL: "http://anvil:8545"
+      GER_L1_ADDRESS: "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
+      L1_INDEXER_FROM_BLOCK: "1"
+      L1_EVIDENCE_TAG: "${L1_EVIDENCE_TAG:-latest}"
+      REJECT_UNVERIFIED_GER_INJECTION: "${REJECT_UNVERIFIED_GER_INJECTION:-true}"
     volumes:
       # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
       # shares the miden-client sqlite store + keystore + bridge_accounts.toml with
@@ -274,6 +295,11 @@ services:
       # deterministic 0x133e6a88… orphan). Anvil's history is ~100s of blocks
       # so a from-genesis scan is trivial (max_range chunks it).
       - "--l1-indexer-from-block=1"
+      # Audit H6 — the one frontier used by the entire L1 evidence scan.
+      # Values: `latest`, `safe`, or `finalized`. Hardened deployments must use
+      # `safe` or `finalized`; the single-node anvil e2e defaults to `latest`
+      # for low latency and can be overridden to exercise either hardened tag.
+      - "--l1-evidence-tag=${L1_EVIDENCE_TAG:-latest}"
       # Audit C2 — the signer default is now fail-closed: with no
       # `--allowed-signers` configured, `eth_sendRawTransaction` rejects EVERY
       # signer. The e2e stack's legitimate submitters (aggoracle/aggsender GER +

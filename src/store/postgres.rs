@@ -96,31 +96,86 @@ impl Store for PgStore {
         Ok(val as u64)
     }
 
-    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+    async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT last_processed FROM l1_indexer_state WHERE id = 1",
+                "SELECT finalized_scan_cursor FROM l1_indexer_state WHERE id = 1",
                 &[],
             )
             .await?;
-        match row {
-            Some(r) => {
-                let val: i64 = r.get(0);
-                Ok(val as u64)
-            }
-            None => Ok(0),
-        }
+        Ok(row.map(|r| r.get::<_, i64>(0) as u64).unwrap_or(0))
     }
 
-    async fn set_l1_indexer_cursor(&self, block: u64) -> anyhow::Result<()> {
+    async fn set_l1_evidence_cursor(&self, block: u64) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
-                "UPDATE l1_indexer_state SET last_processed = $1, updated_at = now() WHERE id = 1",
+                "UPDATE l1_indexer_state SET finalized_scan_cursor = $1, updated_at = now() WHERE id = 1",
                 &[&(block as i64)],
             )
             .await?;
+        Ok(())
+    }
+
+    async fn bind_l1_evidence_policy(&self, policy: &str) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let row = tx
+            .query_one(
+                "SELECT evidence_tag, finalized_block, finalized_scan_cursor, last_processed \
+                 FROM l1_indexer_state WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await?;
+        let existing: Option<String> = row.get(0);
+        if let Some(existing) = existing {
+            if existing == policy {
+                tx.commit().await?;
+                return Ok(());
+            }
+            tx.rollback().await?;
+            anyhow::bail!(
+                "L1 evidence policy mismatch: database is bound to `{existing}`, configured `{policy}`; stop the service and reset/rebuild L1 evidence before changing policy"
+            );
+        }
+
+        let finalized_block: i64 = row.get(1);
+        let finalized_scan_cursor: i64 = row.get(2);
+        let legacy_latest_cursor: i64 = row.get(3);
+        let has_verified: bool = tx
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM ger_entries WHERE finalized_verified = TRUE)",
+                &[],
+            )
+            .await?
+            .get(0);
+        if finalized_block != 0 || finalized_scan_cursor != 0 || has_verified {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "L1 evidence state exists without an evidence policy; reset/rebuild L1 evidence before serving"
+            );
+        }
+        if policy == "latest" {
+            // Migration 005 already persisted the old sole latest-scan cursor
+            // in `last_processed`. Preserve that progress on upgrade so events
+            // emitted during the restart are not skipped. Safe/finalized must
+            // never inherit a latest frontier.
+            tx.execute(
+                "UPDATE l1_indexer_state \
+                 SET evidence_tag = $1, finalized_scan_cursor = $2, updated_at = now() \
+                 WHERE id = 1",
+                &[&policy, &legacy_latest_cursor],
+            )
+            .await?;
+        } else {
+            tx.execute(
+                "UPDATE l1_indexer_state SET evidence_tag = $1, updated_at = now() WHERE id = 1",
+                &[&policy],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -774,7 +829,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT mainnet_exit_root, rollup_exit_root, block_number, timestamp FROM ger_entries WHERE ger_hash = $1",
+                "SELECT mainnet_exit_root, rollup_exit_root, block_number, timestamp, finalized_verified FROM ger_entries WHERE ger_hash = $1",
                 &[&ger.as_slice()],
             )
             .await
@@ -788,6 +843,7 @@ impl Store for PgStore {
                 rollup_exit_root: rollup.filter(|v| v.len() == 32).map(bytes_to_array_32),
                 block_number: r.get::<_, i64>(2) as u64,
                 timestamp: r.get::<_, i64>(3) as u64,
+                evidence_verified: r.get::<_, bool>(4),
             }
         }))
     }
@@ -805,13 +861,14 @@ impl Store for PgStore {
         let rollup = rollup_exit_root.to_vec();
         client
             .execute(
-                "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp)
-                 VALUES ($1, $2, $3, $4, $5)
+                "INSERT INTO ger_entries (ger_hash, mainnet_exit_root, rollup_exit_root, block_number, timestamp, finalized_verified)
+                 VALUES ($1, $2, $3, $4, $5, TRUE)
                  ON CONFLICT (ger_hash) DO UPDATE
                  SET mainnet_exit_root = EXCLUDED.mainnet_exit_root,
                      rollup_exit_root  = EXCLUDED.rollup_exit_root,
                      block_number      = EXCLUDED.block_number,
-                     timestamp         = EXCLUDED.timestamp",
+                     timestamp         = EXCLUDED.timestamp,
+                     finalized_verified = TRUE",
                 &[
                     &ger.as_slice(),
                     &mainnet,
@@ -1109,54 +1166,79 @@ impl Store for PgStore {
         // any partial log inserts.
         let tx = client.transaction().await?;
 
-        let updated = tx
-            .execute(
-                "UPDATE transactions
-                 SET status = $1, error_message = $2, block_number = $3, updated_at = now()
-                 WHERE tx_hash = $4
-                   AND ($1 <> 'failed' OR NOT EXISTS (
-                       SELECT 1 FROM tx_note_links WHERE tx_note_links.tx_hash = $4
-                   ))",
-                &[
-                    &status,
-                    &error_msg as &(dyn ToSql + Sync),
-                    &(block_num as i64),
-                    &hash_str,
-                ],
+        // BLOCKER 2 (re-review) — SINGLE-SNAPSHOT success-always-wins CAS. Pin
+        // the row with `SELECT ... FOR UPDATE` inside this transaction so the
+        // "absent vs present" classification AND the conditional UPDATE both
+        // come from ONE consistent, row-locked snapshot. The previous
+        // UPDATE-then-separate-SELECT could, under READ COMMITTED, observe two
+        // DIFFERENT committed snapshots: a concurrent `txn_begin` committing
+        // between the UPDATE and the existence SELECT was visible only to the
+        // SELECT, so a row genuinely missing at decision time was misclassified
+        // as an existing terminal and wrongly returned Ok (the caller's
+        // failure/success was silently dropped, leaving the receipt pending).
+        // FOR UPDATE takes the decision off ONE read; the subsequent UPDATE
+        // runs against the locked row, so no interleaving can flip the class.
+        let current_status: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM transactions WHERE tx_hash = $1 FOR UPDATE",
+                &[&hash_str],
             )
-            .await?;
+            .await?
+            .map(|r| r.get::<_, String>(0));
 
-        // PR #127 review — finalising a transaction that has no `txn_begin`
-        // row must be an ERROR, matching `InMemoryStore::txn_commit`
-        // ("transaction {tx_hash} not found"). Pre-fix this UPDATE silently
-        // affected zero rows and the method still committed the synthetic
-        // logs below and returned Ok — so a projector racing a submitter
-        // could "finalise" a receipt that was never durably begun, and the
-        // late `txn_begin` would then park the real receipt as pending
-        // forever. Every caller either creates the row first or explicitly
-        // tolerates this error (`project_ger_note` / `project_claim_note`
-        // use `let _ = ... inspect_err`, the pending/expiry sweeps log and
-        // continue), so erroring here is safe and makes the two stores
-        // behave identically. Bailing before `tx.commit()` rolls the whole
-        // transaction back — no partial log/counter writes escape.
-        if updated == 0 && result.is_err() {
-            let protected = tx
-                .query_opt(
-                    "SELECT 1 FROM transactions t
-                     JOIN tx_note_links l ON l.tx_hash = t.tx_hash
-                     WHERE t.tx_hash = $1",
-                    &[&hash_str],
-                )
-                .await?
-                .is_some();
-            if protected {
-                tx.commit().await?;
-                return Ok(());
-            }
-        }
-        if updated == 0 {
+        let Some(current_status) = current_status else {
+            // No row at the locked snapshot → contract error (PR #127):
+            // finalising a receipt that was never durably begun must fail so a
+            // projector racing a submitter cannot silently "finalise" a phantom.
+            // A concurrent `txn_begin` that commits AFTER this read cannot flip
+            // us to a wrong Ok — the classification is fixed here. Callers either
+            // create the row first or tolerate this error (`project_ger_note` /
+            // `project_claim_note` use `let _ = ... inspect_err`; the
+            // pending/expiry sweeps log and continue).
+            tx.rollback().await?;
             anyhow::bail!("PgStore: transaction {tx_hash} not found");
+        };
+
+        // Once an exact handoff exists, a dispatch error is outcome-ambiguous.
+        // Keep the receipt pending for projection/reconciliation; the dedicated
+        // confirmed-duplicate commit is the only failure path allowed to close it.
+        let has_handoff = if result.is_err() {
+            tx.query_opt(
+                "SELECT 1 FROM tx_note_links WHERE tx_hash = $1",
+                &[&hash_str],
+            )
+            .await?
+            .is_some()
+        } else {
+            false
+        };
+
+        // A real landing may heal a pending/failed observation to success;
+        // success itself is monotonic and the first failure remains stable.
+        let apply = match (current_status.as_str(), result.is_ok()) {
+            ("success", _) => false,
+            (_, true) => true,
+            ("pending", false) => !has_handoff,
+            (_, false) => false,
+        };
+        if !apply {
+            tx.rollback().await?;
+            tracing::debug!(
+                "PgStore: txn {tx_hash} terminal transition ignored or deferred (monotonic/handoff CAS)"
+            );
+            return Ok(());
         }
+
+        tx.execute(
+            "UPDATE transactions SET status = $1, error_message = $2, block_number = $3, updated_at = now() WHERE tx_hash = $4",
+            &[
+                &status,
+                &error_msg as &(dyn ToSql + Sync),
+                &(block_num as i64),
+                &hash_str,
+            ],
+        )
+        .await?;
 
         if result.is_ok() {
             // C11 — fold the latest_block_number advance into the same

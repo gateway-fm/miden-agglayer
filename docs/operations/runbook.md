@@ -74,6 +74,29 @@ and `zkevm_getExitRootsByGER` returns `null` for them. There is no safe
 latest-root fallback because a combined GER cannot be decomposed after the
 fact. Monitor `l1_indexer_state` and the indexer error metrics.
 
+`L1_EVIDENCE_TAG=latest|safe|finalized` selects the indexer's only L1 frontier;
+the default is `latest`. `REJECT_UNVERIFIED_GER_INJECTION=true` makes GER
+admission wait for roots written by that scan. `REQUIRE_HARDENING=true` implies
+strict admission and requires `safe` or `finalized`.
+
+The database binds its evidence marker and cursor to the exact selected tag.
+Changing it requires stopping the service, clearing the policy-derived marker,
+cursor, and binding in one transaction, then restarting with a trusted
+`L1_INDEXER_FROM_BLOCK`:
+
+```sql
+BEGIN;
+UPDATE ger_entries SET finalized_verified = FALSE;
+UPDATE l1_indexer_state
+SET finalized_block = 0, finalized_scan_cursor = 0, evidence_tag = NULL;
+COMMIT;
+```
+
+The `finalized_*` column names are retained for migration compatibility; they
+store the selected policy's state, not a second scan. On first upgrade,
+`latest` resumes the legacy `last_processed` cursor. `safe` and `finalized`
+never inherit latest-scan progress and require an explicit first backfill.
+
 ### Termination
 
 SIGTERM stops HTTP acceptance and signals the writer. A job already executing

@@ -132,9 +132,8 @@ async fn handle_ger_result(
                 // re-broadcast racing the closure would miss dedup, hit the R4
                 // nonce check against the already-advanced nonce, and wedge
                 // ethtxmanager. Idempotent: a no-op when the closure already
-                // produced the row (production sync mode, and the writer path
-                // once the worker has run it — where the inflight cache covers
-                // the accept-path gap regardless); it materialises the row
+                // produced the row once the writer has run it (the inflight
+                // cache covers the accept-path gap regardless); it materialises the row
                 // only when the boundary handoff hasn't. Production therefore
                 // always writes link+receipt behind the boundary; this is a
                 // synchronous dedup safety net, never a second write.
@@ -294,13 +293,13 @@ async fn accept_and_revert_landed_claim(
 
 /// #55 BLOCKER C/D — idempotent crash-gap nonce repair via store-level CAS.
 ///
-/// On the sync accept path the durable receipt write and the nonce advance are
+/// On the accept path the durable receipt write and the nonce advance are
 /// separate steps; a crash / store error BETWEEN them leaves the tx KNOWN (receipt
 /// persisted) but the signer's expected nonce STALE at that tx's nonce. Called from
 /// the RD-940 same-hash dedup path on a rebroadcast: the store-level
 /// `nonce_advance_cas(signer, tx_nonce)` advances the nonce EXACTLY ONCE iff it is
 /// still stuck at `tx_nonce` (the crash-gap signature — a normally-advanced tx has
-/// `expected > tx.nonce`, and async mode advances at enqueue so likewise), so the
+/// `expected > tx.nonce`, and admission advances before returning), so the
 /// rebroadcast HEALS the nonce rather than serving stale forever.
 ///
 /// The CAS is atomic at the store level, so this is correct even when two replicas
@@ -1065,9 +1064,9 @@ async fn publish_and_record_claim(
     }
 }
 
-/// Unified GER-insert / updateExitRoot dispatcher used by both the legacy sync
-/// path and the writer-worker path. **Does NOT advance the per-signer
-/// nonce** — see the matching note on `worker_handle_claim_asset`.
+/// GER-insert / updateExitRoot dispatcher used by the mandatory writer worker.
+/// **Does NOT advance the per-signer nonce** — admission already did that; see
+/// the matching note on `worker_handle_claim_asset`.
 ///
 /// The GER synthetic log (and the decomposed exit roots it carried) is now
 /// emitted by the `SyntheticProjector` from the consumed `UpdateGerNote`, so
@@ -1087,6 +1086,8 @@ pub(crate) async fn worker_handle_ger_insert(
             service.accounts.clone(),
             &service.store,
             txn_hash,
+            service.reject_unverified_ger,
+            service.l1_evidence_tag,
             // The envelope + signer ride into `insert_ger` so the pending
             // receipt row is created INSIDE the serialized Miden-client
             // closure, together with the tx↔note link (handoff-before-
@@ -1290,12 +1291,44 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         anyhow::bail!("single writer handle missing from production ServiceState");
     }
 
+    // Strict-H6 GER preflight may wait for the configured L1 scan to reach the
+    // GER. Keep it outside the signer lock so one lagging GER cannot block
+    // unrelated submissions. The mandatory writer repeats the stateful gate
+    // immediately before Miden submission, after durable admission, to close
+    // landing races.
+    //
+    // The optimistic stale-nonce check is deliberately scoped to this waiting
+    // path. Applying it to every call would bypass #140's authoritative
+    // same-hash durable-intent recovery below (where nonce N has already
+    // advanced to N+1 but the exact accepted envelope still needs enqueue).
+    if service.reject_unverified_ger
+        && let crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } = &decoded
+    {
+        if !known_durable_intent {
+            let expected_before_preflight = service.store.nonce_get(&signer_str).await?;
+            if tx_nonce < expected_before_preflight {
+                ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+                anyhow::bail!(
+                    "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_before_preflight}; this guards against replay and out-of-order submission (R4)"
+                );
+            }
+        }
+        crate::ger::wait_for_ger_l1_observed(
+            &service.store,
+            ger_bytes,
+            true,
+            service.l1_evidence_tag,
+            txn_hash,
+        )
+        .await?;
+    }
+
     // R4 follow-up — serialise the entire nonce-check + enqueue/handler
     // critical section for this signer. Without the mutex, two concurrent
     // same-nonce txs both pass the equality check before either calls
     // `nonce_increment`.
     //
-    // With the writer worker enabled, also tolerate bounded future-nonce
+    // The mandatory writer also tolerates bounded future-nonce
     // reordering from concurrent HTTP delivery: if nonce N+1 reaches us before
     // nonce N, release the lock, wait briefly for N to be accepted, then
     // re-check. This is a small in-process txpool behavior; stale/replay nonces
@@ -1964,6 +1997,276 @@ mod tests {
         service_send_raw_txn(service, input_hex)
             .await
             .expect("zero-amount claim must not be GER-gated at admission");
+    }
+
+    #[tokio::test]
+    async fn h6_evidence_wait_does_not_hold_the_signer_nonce_lock() {
+        let mut service = create_test_service();
+        service.reject_unverified_ger = true;
+        service.l1_evidence_tag = crate::ger::EvidenceTag::Safe;
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+
+        let ger = [0xD7; 32];
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let waiting_input = encode_legacy_tx_signed(
+            &signer,
+            insertGlobalExitRootCall {
+                root: FixedBytes::from(ger),
+            }
+            .abi_encode(),
+            1,
+        );
+        let ready_input = encode_legacy_tx_signed(
+            &signer,
+            claimAssetCall {
+                smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+                smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+                globalIndex: U256::from(902u64),
+                mainnetExitRoot: FixedBytes::ZERO,
+                rollupExitRoot: FixedBytes::ZERO,
+                originNetwork: 0,
+                originTokenAddress: Address::ZERO,
+                destinationNetwork: 1,
+                destinationAddress: Address::ZERO,
+                amount: U256::ZERO,
+                metadata: Default::default(),
+            }
+            .abi_encode(),
+            2,
+        );
+
+        let waiting_service = service.clone();
+        let waiting =
+            tokio::spawn(async move { service_send_raw_txn(waiting_service, waiting_input).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a GER not yet reached by the selected scan must wait"
+        );
+
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service_send_raw_txn(service, ready_input),
+        )
+        .await
+        .expect("same-signer ready work must not wait behind L1 evidence");
+        assert!(
+            ready.is_ok(),
+            "ready same-signer call should be admitted: {ready:?}"
+        );
+
+        waiting.abort();
+        let _ = shutdown.send(());
+    }
+
+    /// Audit H6, PR #121 review (MAIN blocker) — mandatory writer. Pre-fix, the
+    /// H6 L1-corroboration gate only ran inside the worker, AFTER
+    /// `try_enqueue` had consumed the nonce, admitted
+    /// the tx hash into the inflight dedup cache, and returned the hash to the
+    /// caller; the worker's failure-receipt `txn_commit` then updated zero
+    /// rows (no prior `txn_begin`), so `eth_getTransactionReceipt` stayed null
+    /// forever — an aggoracle/ethtxmanager wedge on a NORMAL indexer-lag
+    /// rejection.
+    ///
+    /// The gate must run on the REQUEST path: a strict-mode rejection returns
+    /// no accepted hash and leaves NOTHING behind — no nonce, no tx
+    /// row/receipt, no inflight admission, no queued job — and the IDENTICAL
+    /// signed transaction (same nonce) is accepted once the indexer catches
+    /// up.
+    #[tokio::test]
+    async fn h6_writer_mode_unverified_ger_rejected_before_enqueue_then_retryable() {
+        let mut service = create_test_service();
+        // Strict H6 — set BEFORE spawn so the worker clone shares the posture.
+        service.reject_unverified_ger = true;
+        let (handle, _shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        let handle = std::sync::Arc::new(handle);
+        service.writer_handle = Some(handle.clone());
+        let store = service.store.clone();
+
+        let mainnet = [0x0Eu8; 32];
+        let rollup = [0x0Fu8; 32];
+        let ger = crate::ger::combined_ger(&mainnet, &rollup);
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from(ger),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+        let payload = crate::hex::hex_decode_prefixed(&input_hex).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut payload.as_slice()).unwrap();
+        let tx_hash = *envelope.tx_hash();
+
+        // The indexer has NOT observed this GER on L1 (no resolved
+        // ger_entries decomposition) → strict rejection at admission, before
+        // any side-effect.
+        let err = service_send_raw_txn(service.clone(), input_hex.clone())
+            .await
+            .expect_err("writer mode must reject an unverified GER at admission");
+        assert!(
+            format!("{err}").contains("not observed by the configured L1"),
+            "unexpected: {err}"
+        );
+
+        // Side-effect-free rejection: nothing left behind.
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            0,
+            "pre-admission failure must not consume the nonce"
+        );
+        assert!(
+            store.txn_get(tx_hash).await.unwrap().is_none(),
+            "pre-admission failure must not create a tx row"
+        );
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_none(),
+            "pre-admission failure must not create a receipt"
+        );
+        assert!(
+            !handle.is_inflight(&tx_hash),
+            "pre-admission failure must not admit the hash into the inflight cache \
+             (a re-broadcast would short-circuit as 'known' and never retry)"
+        );
+        assert_eq!(
+            handle.inflight_len(),
+            0,
+            "no job may be tracked after a pre-admission rejection"
+        );
+        assert_eq!(
+            handle.available_capacity(),
+            handle.queue_depth(),
+            "no job may be queued (channel must remain at full capacity)"
+        );
+
+        // The configured scan catches up and atomically writes the roots plus
+        // provenance marker. The IDENTICAL signed transaction, with the same
+        // nonce, must now be accepted.
+        store
+            .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
+            .await
+            .unwrap();
+        let accepted_hash = service_send_raw_txn(service.clone(), input_hex)
+            .await
+            .expect("the identical signed tx must be accepted after the indexer catches up");
+        assert_eq!(accepted_hash, tx_hash);
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            1,
+            "acceptance advances the nonce exactly once"
+        );
+        assert!(
+            handle.is_inflight(&tx_hash),
+            "accepted GER insert must be admitted to the writer queue"
+        );
+    }
+
+    /// Audit H6 — request-path gate precedence mirror: an ALREADY-INJECTED
+    /// GER must not be refused at admission even under strict mode with an
+    /// unresolved decomposition (dedup runs before the gate, exactly as in
+    /// `insert_ger`). Refusing it would wedge the aggoracle's idempotent
+    /// re-submissions after a restart/restore replay.
+    #[tokio::test]
+    async fn h6_writer_mode_already_injected_ger_not_refused_under_strict() {
+        let mut service = create_test_service();
+        service.reject_unverified_ger = true;
+        let (handle, _shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+        let store = service.store.clone();
+
+        // Injected on a previous run, decomposition never resolved — the
+        // exact state that must stay a duplicate no-op, not an H6 refusal.
+        let ger = [0xABu8; 32];
+        store
+            .commit_ger_event_atomic(1, [0u8; 32], "0xTxDup", &ger, None, None, 0)
+            .await
+            .unwrap();
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from(ger),
+        }
+        .abi_encode();
+        let (input_hex, _) = encode_legacy_tx(calldata);
+        service_send_raw_txn(service, input_hex)
+            .await
+            .expect("already-injected GER must pass admission as a duplicate, not an H6 refusal");
+    }
+
+    /// Audit H6, PR #121 review — deterministic test-only dispatch helper. The
+    /// production service always has the writer; tests without a handle use the
+    /// lower-level helper to pin the handler's defense-in-depth gate. Rejection
+    /// happens before nonce advancement and `txn_begin`, so the identical
+    /// signed transaction retries after the indexer catches up.
+    #[tokio::test]
+    async fn h6_test_dispatch_unverified_ger_rejected_side_effect_free_then_retryable() {
+        let mut service = create_test_service();
+        service.reject_unverified_ger = true;
+        let store = service.store.clone();
+
+        let mainnet = [0x1Eu8; 32];
+        let rollup = [0x1Fu8; 32];
+        let ger = crate::ger::combined_ger(&mainnet, &rollup);
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from(ger),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata);
+        let payload = crate::hex::hex_decode_prefixed(&input_hex).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut payload.as_slice()).unwrap();
+        let tx_hash = *envelope.tx_hash();
+
+        let err = service_send_raw_txn(service.clone(), input_hex.clone())
+            .await
+            .expect_err("the handler must reject an unverified GER under strict H6");
+        assert!(
+            format!("{err}").contains("not observed by the configured L1"),
+            "unexpected: {err}"
+        );
+
+        // Side-effect-free rejection.
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            0,
+            "H6 rejection must not consume the nonce"
+        );
+        assert!(
+            store.txn_get(tx_hash).await.unwrap().is_none(),
+            "H6 rejection must not create a tx row (a retry would dedup as 'known')"
+        );
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_none(),
+            "H6 rejection must not create a receipt"
+        );
+
+        // The configured scan catches up and atomically writes roots plus its
+        // provenance marker; the identical tx (same nonce) now succeeds.
+        store
+            .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
+            .await
+            .unwrap();
+        let accepted_hash = service_send_raw_txn(service.clone(), input_hex)
+            .await
+            .expect("the identical signed tx must be accepted after the indexer catches up");
+        assert_eq!(accepted_hash, tx_hash);
+        assert_eq!(
+            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
+            1,
+            "acceptance advances the nonce exactly once"
+        );
+        assert!(
+            store.txn_get(tx_hash).await.unwrap().is_some(),
+            "acceptance records the pending tx row (receipt lands on note consumption)"
+        );
     }
 
     #[tokio::test]
@@ -4158,6 +4461,7 @@ mod tests {
         use crate::store::NonceReservation;
         let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
         let mut service = crate::test_helpers::create_test_service_with_store(concrete.clone());
+        service.reject_unverified_ger = true;
         let calldata = insertGlobalExitRootCall {
             root: FixedBytes::from([0xc7u8; 32]),
         }
@@ -4167,6 +4471,10 @@ mod tests {
         let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
         let tx_hash = unwrap_txn_envelope(envelope.clone()).unwrap().hash;
         let signer_str = format!("{signer:#x}");
+        concrete
+            .set_ger_exit_roots(&[0xc7; 32], [0x11; 32], [0x22; 32], 100, 1_700_000_000)
+            .await
+            .unwrap();
         let NonceReservation::Won { .. } = concrete
             .reserve_nonce(&signer_str, 0, tx_hash, reservation_lease())
             .await

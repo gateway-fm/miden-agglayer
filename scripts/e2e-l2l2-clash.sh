@@ -123,8 +123,10 @@ log "  COL bridged from BOTH origins (net 0: $COL_L1_WEI wei, net 2: $COL_L2B_WE
 # exactly like the forward leg — we client-submit a proof-backed claimAsset (proof
 # fetched from the L2B service) to the Miden proxy. nudge_until drives L2B cert cycles
 # so Miden sees the covering GER (proxy C6 has_seen_ger gate).
-wait_for "COL net-2 deposit ready_for_claim" 600 5 \
-    _pred_deposit_ready "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER" "" "$L2B_BRIDGE_SERVICE_URL"
+# Source indexing is sufficient to identify the exact deposit. nudge_until below
+# owns the bounded recovery if ready_for_claim missed an L2-before-L1 GER race.
+wait_for "COL net-2 deposit indexed" 120 5 \
+    _pred_deposit_indexed "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER" "$L2B_BRIDGE_SERVICE_URL"
 COL_DEP_NET2_SUBMIT=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$COL_LOWER" "$L2B_BRIDGE_SERVICE_URL")
 [[ -n "$COL_DEP_NET2_SUBMIT" ]] || fail "COL net-2 deposit not found in L2B service for claim submission"
 CN2_CNT=$(dep_field "$COL_DEP_NET2_SUBMIT" deposit_cnt)

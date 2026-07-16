@@ -289,6 +289,9 @@ pub struct GerEntry {
     pub rollup_exit_root: Option<[u8; 32]>,
     pub block_number: u64,
     pub timestamp: u64,
+    /// The roots were written by the database-bound selected scan. The
+    /// PostgreSQL column retains its legacy `finalized_verified` name.
+    pub evidence_verified: bool,
 }
 
 // LogStore has been replaced by the Store trait — see src/store/mod.rs

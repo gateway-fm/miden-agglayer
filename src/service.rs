@@ -410,8 +410,8 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
             //
             // `store.nonce_get` is the next-accepted nonce (`pending`). For
             // committed tags, use the oldest durable pending row as the
-            // boundary. This works in sync mode and survives a writer restart;
-            // the old DashMap subtraction lost both properties.
+            // boundary. This survives a writer restart; the old DashMap
+            // subtraction did not.
             //
             // claim-sponsor's `nonce_cache.go:35` LRU reads `latest`; without
             // this branch it sees queued/submitting txs leak into `latest`

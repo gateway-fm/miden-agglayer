@@ -92,6 +92,9 @@ pub struct L1InfoTreeIndexer {
     /// cursor advances forward normally; remove the flag for subsequent
     /// boots.
     from_block_override: Option<u64>,
+    /// The one L1 frontier this indexer scans. Roots are learned exclusively
+    /// from `latest`, `safe`, or `finalized` according to this setting.
+    evidence_tag: crate::ger::EvidenceTag,
 }
 
 impl L1InfoTreeIndexer {
@@ -103,7 +106,30 @@ impl L1InfoTreeIndexer {
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_range: DEFAULT_MAX_RANGE,
             from_block_override: None,
+            evidence_tag: crate::ger::EvidenceTag::default(),
         }
+    }
+
+    /// Configure the single L1 scan frontier.
+    pub fn with_evidence_tag(mut self, tag: crate::ger::EvidenceTag) -> Self {
+        self.evidence_tag = tag;
+        self
+    }
+
+    fn scan_block_tag(&self) -> BlockNumberOrTag {
+        match self.evidence_tag {
+            crate::ger::EvidenceTag::Latest => BlockNumberOrTag::Latest,
+            crate::ger::EvidenceTag::Safe => BlockNumberOrTag::Safe,
+            crate::ger::EvidenceTag::Finalized => BlockNumberOrTag::Finalized,
+        }
+    }
+
+    async fn scan_head<P: Provider>(&self, provider: &P) -> anyhow::Result<u64> {
+        let tag = self.scan_block_tag();
+        let block = provider.get_block_by_number(tag).await?.ok_or_else(|| {
+            anyhow::anyhow!("L1 `{}` block is unavailable", self.evidence_tag.describe())
+        })?;
+        Ok(block.header.number)
     }
 
     /// Operator override for the indexer start block. Overrides both the
@@ -113,6 +139,12 @@ impl L1InfoTreeIndexer {
     pub fn with_from_block_override(mut self, from_block: u64) -> Self {
         self.from_block_override = Some(from_block);
         self
+    }
+
+    fn initial_cursor(&self, stored: u64, selected_head: u64) -> u64 {
+        self.from_block_override
+            .map(|from| from.saturating_sub(1))
+            .unwrap_or_else(|| if stored == 0 { selected_head } else { stored })
     }
 
     /// Spawn the indexer as a tokio task. Returns a oneshot sender for graceful
@@ -138,29 +170,29 @@ impl L1InfoTreeIndexer {
                 "L1InfoTreeIndexer starting"
             );
 
-            // Resume from the persisted cursor if we have one, else start at
-            // current L1 head. The persisted cursor closes the gap that
+            // Resume from the selected-policy cursor if we have one, else start
+            // at the configured L1 frontier. The persisted cursor closes the gap that
             // stranded GERs every time the proxy restarted (OOMKills,
             // planned deploys): historic `UpdateL1InfoTree` events emitted
             // during downtime are now indexed on the next boot and the
             // orphan ger_entries rows from that window get their (M, R)
             // filled in by the indexer's `set_ger_exit_roots` UPSERT.
             //
-            // Fresh deployments (cursor = 0) start at head — same behaviour
+            // Fresh lenient deployments (cursor = 0) start at the selected head — same behaviour
             // as before persistence. Pre-existing deployments inherit a 0
             // cursor on first boot after the migration; treat 0 as "no
             // cursor recorded yet" and fall back to head to avoid a
             // multi-million-block backfill on the first boot.
-            let head = provider.get_block_number().await.unwrap_or_else(|e| {
-                tracing::error!(error = %e, "L1InfoTreeIndexer: failed to fetch initial L1 block; starting at 0");
+            let head = self.scan_head(&provider).await.unwrap_or_else(|e| {
+                tracing::error!(error = %e, tag = %self.evidence_tag.describe(), "L1InfoTreeIndexer: failed to fetch initial selected L1 block; starting at 0");
                 0
             });
-            let stored = match self.store.get_l1_indexer_cursor().await {
+            let stored = match self.store.get_l1_evidence_cursor().await {
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(
                         error = %e,
-                        "L1InfoTreeIndexer: failed to load persisted cursor; falling back to L1 head"
+                        "L1InfoTreeIndexer: failed to load selected-policy cursor; falling back to selected L1 head"
                     );
                     0
                 }
@@ -169,9 +201,9 @@ impl L1InfoTreeIndexer {
             //   1. Operator override (`--l1-indexer-from-block <N>`) wins
             //      unconditionally — used to backfill historic orphan GERs
             //      whose events predate the persisted cursor.
-            //   2. Else persisted cursor minus reorg margin, if non-zero.
-            //   3. Else current L1 head (fresh deployment).
-            let mut last_processed: u64 = if let Some(forced) = self.from_block_override {
+            //   2. Else the persisted selected-policy cursor, if non-zero.
+            //   3. Else the selected L1 head (fresh lenient deployment).
+            if let Some(forced) = self.from_block_override {
                 tracing::warn!(
                     from_block = forced,
                     stored_cursor = stored,
@@ -179,20 +211,13 @@ impl L1InfoTreeIndexer {
                     "L1InfoTreeIndexer: operator override active — starting from forced block. \
                      Remove --l1-indexer-from-block after this boot's backfill completes."
                 );
-                forced.saturating_sub(1)
-            } else if stored == 0 {
-                head
-            } else {
-                // Re-process a small reorg window so we don't miss reorg'd
-                // events. Sepolia 64 blocks ≈ 12 minutes, well inside what
-                // `get_logs` can chunk through quickly via max_range.
-                const REORG_MARGIN: u64 = 64;
-                stored.saturating_sub(REORG_MARGIN)
-            };
+            }
+            let mut last_processed = self.initial_cursor(stored, head);
             tracing::info!(
                 start_block = last_processed,
                 stored_cursor = stored,
-                l1_head = head,
+                selected_head = head,
+                evidence_tag = %self.evidence_tag.describe(),
                 from_block_override = ?self.from_block_override,
                 "L1InfoTreeIndexer cursor initialized"
             );
@@ -227,11 +252,23 @@ impl L1InfoTreeIndexer {
         provider: &P,
         last_processed: &mut u64,
     ) -> anyhow::Result<()> {
-        let head = provider.get_block_number().await?;
+        let head = self.scan_head(provider).await?;
+        self.poll_to_head(provider, last_processed, head).await
+    }
+
+    async fn poll_to_head<P: Provider>(
+        &self,
+        provider: &P,
+        last_processed: &mut u64,
+        head: u64,
+    ) -> anyhow::Result<()> {
         if head <= *last_processed {
             return Ok(());
         }
 
+        // One configured scan is the sole source of L1 root evidence. In
+        // `safe`/`finalized` mode, decomposition intentionally becomes visible
+        // only when that frontier reaches the event.
         let from = *last_processed + 1;
         let to = head.min(from + self.max_range - 1);
 
@@ -267,16 +304,32 @@ impl L1InfoTreeIndexer {
                 Ok(true) => indexed += 1,
                 Ok(false) => {}
                 Err(e) => {
-                    // Don't fail the whole batch on one bad event; advance the
-                    // cursor anyway so we don't get stuck retrying the same
-                    // poison log forever.
+                    // Audit H6 / BLOCKER 3 — a durable evidence-write failure
+                    // must keep the batch RETRYABLE. `process_log` only returns
+                    // Err from the `set_ger_exit_roots` write (a malformed log
+                    // returns Ok(false), never Err), so this is always a
+                    // transient store failure, NOT a poison log. Advancing the
+                    // cursor past it would drop a legitimate GER's evidence
+                    // permanently, and under strict mode that GER would stay
+                    // unverified forever (the side-effect-free retry never
+                    // clears within the process lifetime). Propagate WITHOUT
+                    // touching `*last_processed`, so the next poll re-runs
+                    // exactly this window; `set_ger_exit_roots` is an idempotent
+                    // UPSERT, so re-indexing already-written pairs is safe.
                     tracing::warn!(
                         error = %e,
                         block = block_number,
                         tx = ?log.transaction_hash,
-                        "L1InfoTreeIndexer: failed to index log"
+                        from,
+                        to,
+                        "L1InfoTreeIndexer: durable evidence write failed; leaving batch \
+                         unadvanced for retry"
                     );
                     metrics::counter!("l1_info_tree_indexer_log_errors_total").increment(1);
+                    return Err(e.context(format!(
+                        "L1InfoTreeIndexer: evidence write failed at block {block_number}; \
+                         batch [{from}, {to}] left unadvanced (retryable)"
+                    )));
                 }
             }
         }
@@ -301,15 +354,15 @@ impl L1InfoTreeIndexer {
 
         *last_processed = to;
 
-        // Persist the cursor so a restart resumes from here instead of
-        // jumping back to L1 head. Failure to persist is logged but does
+        // Persist the selected-policy cursor so a restart resumes from here.
+        // Failure to persist is logged but does
         // not abort the loop — we'd rather keep indexing on a transient
         // DB blip than wedge the service.
-        if let Err(e) = self.store.set_l1_indexer_cursor(to).await {
+        if let Err(e) = self.store.set_l1_evidence_cursor(to).await {
             tracing::warn!(
                 error = %e,
                 cursor = to,
-                "L1InfoTreeIndexer: failed to persist cursor; continuing in-memory"
+                "L1InfoTreeIndexer: failed to persist selected-policy cursor; continuing in-memory"
             );
             metrics::counter!("l1_info_tree_indexer_cursor_persist_errors_total").increment(1);
         }
@@ -422,6 +475,10 @@ fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::memory::InMemoryStore;
+    use alloy::primitives::{B256, Bytes, LogData, TxHash};
+    use alloy::providers::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
 
     #[test]
     fn combined_ger_matches_ger_module() {
@@ -444,5 +501,139 @@ mod tests {
             UpdateL1InfoTree::SIGNATURE_HASH,
             UpdateGlobalExitRoot::SIGNATURE_HASH
         );
+    }
+
+    // ── H6 reorg-safety + retryable-batch regressions (PR #121 re-review) ──
+
+    /// Construct a bare indexer over `store`. The RPC URL is never dialled
+    /// (poll_once is driven with a mock provider).
+    fn test_indexer(store: Arc<dyn Store>) -> L1InfoTreeIndexer {
+        L1InfoTreeIndexer::new(
+            "http://mock.invalid".to_string(),
+            Address::from([0x99u8; 20]),
+            store,
+        )
+    }
+
+    /// Build an `UpdateL1InfoTree` log carrying the `(mainnet, rollup)` pair at
+    /// `block`, shaped exactly as `process_log` decodes it (topic0 = event sig,
+    /// topic1 = mainnet, topic2 = rollup).
+    fn pair_log(mainnet: B256, rollup: B256, block: u64) -> alloy::rpc::types::Log {
+        let data = LogData::new_unchecked(
+            vec![UpdateL1InfoTree::SIGNATURE_HASH, mainnet, rollup],
+            Bytes::new(),
+        );
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::from([0x99u8; 20]),
+                data,
+            },
+            block_hash: None,
+            block_number: Some(block),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    /// The one selected scan writes roots and provenance together, then advances
+    /// its one cursor. The strict gate can therefore trust exactly those rows.
+    #[tokio::test]
+    async fn selected_scan_persists_roots_provenance_and_cursor() {
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let indexer = test_indexer(store.clone()).with_evidence_tag(crate::ger::EvidenceTag::Safe);
+
+        let mainnet = B256::from([0x0Au8; 32]);
+        let rollup = B256::from([0x0Bu8; 32]);
+        let ger = combined_ger(&mainnet.0, &rollup.0);
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut last_processed = 0u64;
+
+        asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
+        asserter.push_success(&Option::<serde_json::Value>::None); // block ts → 0
+        indexer
+            .poll_to_head(&provider, &mut last_processed, 10)
+            .await
+            .unwrap();
+        assert_eq!(last_processed, 10);
+        assert_eq!(store.get_l1_evidence_cursor().await.unwrap(), 10);
+        let entry = store
+            .get_ger_entry(&ger)
+            .await
+            .unwrap()
+            .expect("selected scan must persist the decomposition");
+        assert!(entry.mainnet_exit_root.is_some() && entry.rollup_exit_root.is_some());
+        assert!(entry.evidence_verified);
+
+        crate::ger::ensure_ger_l1_observed(
+            &store,
+            &ger,
+            true,
+            crate::ger::EvidenceTag::Safe,
+            TxHash::from([0x01u8; 32]),
+        )
+        .await
+        .expect("selected-scan evidence must authorize strict admission");
+    }
+
+    /// BLOCKER 3 (retryable batch) — a durable evidence-write failure must keep
+    /// the batch retryable: `poll_once` must propagate the error and leave the
+    /// cursor UNADVANCED so the next poll re-attempts the same window (the
+    /// `set_ger_exit_roots` UPSERT makes retries idempotent). Pre-fix the loop
+    /// logged the error and advanced the cursor anyway, dropping the GER's
+    /// evidence permanently — under strict mode that GER stays unverified for
+    /// the whole process lifetime.
+    ///
+    /// Mutation check: reverting to the old "log + continue" arm (no early
+    /// return) makes poll_once return Ok and advance the cursor to 36 — this
+    /// test fails on both assertions.
+    #[tokio::test]
+    async fn h6_evidence_write_failure_leaves_batch_retryable() {
+        let store = Arc::new(InMemoryStore::new());
+        store.test_fail_next_ger_evidence_write();
+        let indexer = test_indexer(store);
+
+        let mainnet = B256::from([0x0Cu8; 32]);
+        let rollup = B256::from([0x0Du8; 32]);
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![pair_log(mainnet, rollup, 8)]);
+        asserter.push_success(&Option::<serde_json::Value>::None);
+
+        let mut last_processed = 0u64;
+        let err = indexer
+            .poll_to_head(&provider, &mut last_processed, 100)
+            .await
+            .expect_err("a durable evidence-write failure must fail the batch");
+        assert!(
+            err.to_string().contains("evidence write failed"),
+            "error must identify the retryable batch: {err:#}"
+        );
+        assert_eq!(
+            last_processed, 0,
+            "cursor MUST NOT advance past a batch whose evidence write failed"
+        );
+    }
+
+    #[test]
+    fn one_tag_and_from_block_drive_the_single_cursor() {
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let latest = test_indexer(store.clone());
+        let safe = test_indexer(store.clone()).with_evidence_tag(crate::ger::EvidenceTag::Safe);
+        let finalized = test_indexer(store)
+            .with_evidence_tag(crate::ger::EvidenceTag::Finalized)
+            .with_from_block_override(12_345);
+
+        assert_eq!(latest.scan_block_tag(), BlockNumberOrTag::Latest);
+        assert_eq!(safe.scan_block_tag(), BlockNumberOrTag::Safe);
+        assert_eq!(finalized.scan_block_tag(), BlockNumberOrTag::Finalized);
+        assert_eq!(finalized.initial_cursor(0, 20_000_000), 12_344);
+        assert_eq!(safe.initial_cursor(77, 100), 77);
+        assert_eq!(latest.initial_cursor(0, 100), 100);
     }
 }

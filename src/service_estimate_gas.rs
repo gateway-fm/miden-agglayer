@@ -272,6 +272,7 @@ mod tests {
                     rollup_exit_root: Some([0x22; 32]),
                     block_number: 1,
                     timestamp: 0,
+                    evidence_verified: false,
                 },
             )
             .await

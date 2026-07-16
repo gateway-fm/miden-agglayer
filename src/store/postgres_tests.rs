@@ -152,6 +152,7 @@ async fn test_pgstore_ger_lifecycle() {
         rollup_exit_root: Some([0x02; 32]),
         block_number: 100,
         timestamp: 1234567890,
+        evidence_verified: false,
     };
 
     // Initially not seen
@@ -488,6 +489,254 @@ async fn test_pgstore_confirmed_duplicate_finalizes_linked_pending() {
     assert!(result.is_err());
     assert_eq!(block, 11);
     assert!(store.get_logs_for_tx(&tx_key).await.unwrap().is_empty());
+}
+
+/// BLOCKER 2 (success-always-wins CAS) — PG twin of
+/// `memory::tests::test_txn_commit_terminal_success_not_clobbered_by_failure`.
+/// Once a receipt is 'success', the failure-commit CAS predicate
+/// (`status = 'pending'`) excludes it, so a later failure is a zero-row no-op
+/// that returns Ok, preserving status 0x1. Models the TTL sweeper racing a
+/// worker that already landed the Miden op — the pre-fix overwrite made aggkit
+/// resubmit a landed op. PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_terminal_success_not_clobbered_by_failure() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let tx_hash = TxHash::from([0x5Au8; 32]);
+    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    store
+        .txn_commit(tx_hash, Ok(()), 12, [0u8; 32])
+        .await
+        .unwrap();
+
+    // Late failure commit for the already-terminal (success) row: accepted,
+    // but a NO-OP — the success must survive.
+    store
+        .txn_commit(
+            tx_hash,
+            Err("TTL expired (>300s in non-terminal state)".to_string()),
+            15,
+            [0u8; 32],
+        )
+        .await
+        .expect("late failure commit must be an accepted no-op, not an error");
+
+    let (res, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+    assert!(res.is_ok(), "success must win; got failure: {res:?}");
+    assert_eq!(block, 12, "success block preserved");
+}
+
+/// BLOCKER 2 (success-always-wins CAS) — PG twin of
+/// `memory::tests::test_txn_commit_success_supersedes_prior_failure_with_claimevent`.
+/// A real Miden landing supersedes a prior (TTL) failure: the success-commit CAS
+/// predicate (`status <> 'success'`) updates the 'failed' row to 'success' and
+/// materialises the attached ClaimEvent. Guarantees a claim that actually landed
+/// never ends stuck at a TTL-failure. PG-gated: skips when `DATABASE_URL` unset.
+#[tokio::test]
+async fn test_pgstore_success_supersedes_prior_failure() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let tx_hash = TxHash::from([0x5Bu8; 32]);
+    // Attach a ClaimEvent-shaped log so the override's materialisation is checked.
+    let mut entry = dummy_txn_entry();
+    entry.logs = vec![alloy::primitives::LogData::new_unchecked(
+        vec![alloy::primitives::B256::from([0xC1u8; 32])],
+        alloy::primitives::Bytes::from(vec![0xAB]),
+    )];
+    store.txn_begin(tx_hash, entry).await.unwrap();
+
+    // TTL sweeper fails the still-running job first (no logs materialised).
+    store
+        .txn_commit(tx_hash, Err("TTL expired".to_string()), 3, [0u8; 32])
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_logs_for_tx(&format!("{tx_hash:#x}"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a failure must NOT materialise the ClaimEvent"
+    );
+
+    // Miden landed → projector commits success for the same hash → override.
+    store
+        .txn_commit(tx_hash, Ok(()), 5, [0u8; 32])
+        .await
+        .expect("a real landing must supersede the provisional failure");
+
+    let (res, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+    assert!(
+        res.is_ok(),
+        "success must supersede the TTL failure; got {res:?}"
+    );
+    assert_eq!(block, 5, "success block wins");
+    assert_eq!(
+        store
+            .get_logs_for_tx(&format!("{tx_hash:#x}"))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the ClaimEvent must be materialised on the success override"
+    );
+}
+
+/// BLOCKER 2 (re-review) — single-snapshot CAS under concurrency. Many
+/// `txn_commit`s race `txn_begin`s for distinct hashes. The invariant that the
+/// old UPDATE-then-separate-SELECT could violate under READ COMMITTED: a
+/// `txn_commit` returning Ok must correspond to a row that is ACTUALLY terminal
+/// (never a silent wrong-Ok that leaves the row pending). The SELECT ... FOR
+/// UPDATE takes the classify + update off one locked snapshot, so this holds.
+/// PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_txn_commit_concurrent_begin_single_snapshot() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+    let store = std::sync::Arc::new(store);
+
+    let mut handles = Vec::new();
+    for i in 0..64u8 {
+        let store = store.clone();
+        handles.push(tokio::spawn(async move {
+            let tx_hash = TxHash::from([i; 32]);
+            // Racer A: begin then a failure commit.
+            let a = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store.txn_begin(tx_hash, dummy_txn_entry()).await.ok();
+                    store
+                        .txn_commit(tx_hash, Err("x".into()), 1, [0u8; 32])
+                        .await
+                })
+            };
+            // Racer B: a failure commit that may observe the row missing or present.
+            let b = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .txn_commit(tx_hash, Err("y".into()), 1, [0u8; 32])
+                        .await
+                })
+            };
+            let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+            // INVARIANT: any commit that returned Ok must have left a terminal
+            // receipt — never a wrong-Ok over a still-pending/absent row.
+            if ra.is_ok() || rb.is_ok() {
+                let receipt = store.txn_receipt(tx_hash).await.unwrap();
+                assert!(
+                    receipt.is_some(),
+                    "a committed-Ok hash must have a terminal receipt (no wrong-Ok): {tx_hash}"
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+/// The one selected evidence-scan cursor round-trips through the legacy
+/// `l1_indexer_state.finalized_scan_cursor` column. PG-gated: skips when
+/// `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_l1_evidence_cursor_roundtrip() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    store.set_l1_evidence_cursor(0).await.unwrap();
+    assert_eq!(store.get_l1_evidence_cursor().await.unwrap(), 0);
+    store.set_l1_evidence_cursor(12_345).await.unwrap();
+    assert_eq!(store.get_l1_evidence_cursor().await.unwrap(), 12_345);
+}
+
+/// Evidence provenance binding requires a dedicated freshly-migrated database
+/// because the singleton policy is intentionally immutable.
+#[tokio::test]
+#[ignore = "requires a dedicated fresh PostgreSQL database"]
+async fn test_pgstore_l1_evidence_policy_binding_is_immutable() {
+    let store = pg_store().await.expect("DATABASE_URL must be set");
+    store.bind_l1_evidence_policy("finalized").await.unwrap();
+    store.bind_l1_evidence_policy("finalized").await.unwrap();
+    let err = store
+        .bind_l1_evidence_policy("safe")
+        .await
+        .expect_err("a PostgreSQL evidence policy change must fail closed");
+    assert!(format!("{err:#}").contains("bound to `finalized`"));
+}
+
+/// An upgraded database with policy-derived state but no provenance is
+/// ambiguous and must not be silently labelled with the current setting.
+#[tokio::test]
+#[ignore = "requires a dedicated fresh PostgreSQL database"]
+async fn test_pgstore_untagged_evidence_state_is_rejected() {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect for test setup");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(
+            "UPDATE l1_indexer_state
+             SET evidence_tag = NULL, finalized_block = 0, finalized_scan_cursor = 1;
+             UPDATE ger_entries SET finalized_verified = FALSE;",
+        )
+        .await
+        .expect("seed ambiguous pre-policy state");
+
+    let store = PgStore::new(&db_url).await.expect("create PgStore");
+    let err = store
+        .bind_l1_evidence_policy("finalized")
+        .await
+        .expect_err("untagged evidence progress must fail closed");
+    assert!(format!("{err:#}").contains("without an evidence policy"));
+
+    client
+        .execute(
+            "UPDATE l1_indexer_state
+             SET evidence_tag = NULL, finalized_block = 0, finalized_scan_cursor = 0",
+            &[],
+        )
+        .await
+        .expect("restore clean singleton state");
+}
+
+/// The configured scan writes roots, L1 metadata, and its provenance marker in
+/// one UPSERT. The PostgreSQL marker retains its legacy physical column name.
+/// PG-gated: skips when `DATABASE_URL` is unset.
+#[tokio::test]
+async fn test_pgstore_set_ger_exit_roots_verifies_evidence() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    let ger = [0x3Au8; 32];
+    store
+        .set_ger_exit_roots(&ger, [0x01u8; 32], [0x02u8; 32], 100, 1_700_000_000)
+        .await
+        .unwrap();
+    let entry = store.get_ger_entry(&ger).await.unwrap().unwrap();
+    assert!(
+        entry.evidence_verified,
+        "the selected scan must set its provenance marker with the roots"
+    );
+    assert_eq!(entry.mainnet_exit_root, Some([0x01u8; 32]));
+    assert_eq!(entry.rollup_exit_root, Some([0x02u8; 32]));
+    assert_eq!(entry.block_number, 100);
+    assert_eq!(entry.timestamp, 1_700_000_000);
 }
 
 // ── Nonces ───────────────────────────────────────────────────

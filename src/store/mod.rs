@@ -354,16 +354,27 @@ pub trait Store: Send + Sync + 'static {
     /// Increment block number by 1 and return the new value.
     async fn advance_block_number(&self) -> anyhow::Result<u64>;
 
-    // === L1 indexer cursor (RD-862 follow-up) ===
-    /// Last successfully-polled L1 block. Returns 0 if the indexer has
-    /// never persisted a cursor on this deployment.
-    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+    // === Selected L1 evidence scan ===
+    /// Last block processed by the one configured scan. PostgreSQL uses the
+    /// legacy `finalized_scan_cursor` column for upgrade-safe provenance.
+    async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
     /// Persist the last-processed L1 block. Called after each successful
     /// batch so a restart resumes from here instead of jumping to L1 head.
-    async fn set_l1_indexer_cursor(&self, _block: u64) -> anyhow::Result<()> {
+    async fn set_l1_evidence_cursor(&self, _block: u64) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Bind the selected-scan marker and cursor to the configured evidence
+    /// policy. The first clean serving boot records `policy`; later boots must
+    /// present the exact same canonical value. Implementations must reject an
+    /// unbound store that already contains scan progress or verified evidence,
+    /// because the policy that produced it cannot be inferred safely. A
+    /// persistent implementation may bootstrap `latest` from its legacy latest
+    /// cursor; safe/finalized must never inherit that cursor.
+    async fn bind_l1_evidence_policy(&self, _policy: &str) -> anyhow::Result<()> {
+        anyhow::bail!("store does not support persistent L1 evidence-policy binding")
     }
 
     // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
@@ -492,14 +503,14 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool>;
     async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>>;
     async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>>;
-    /// Set the `(mainnet, rollup)` decomposition and L1 origin metadata for a
-    /// GER. Called by `L1InfoTreeIndexer` after observing the source
+    /// Atomically set the `(mainnet, rollup)` decomposition, L1 origin metadata,
+    /// and selected-scan provenance marker for a GER. Called by the one
+    /// configured `L1InfoTreeIndexer` scan after observing the source
     /// `UpdateL1InfoTree` / `UpdateGlobalExitRoot` event on L1, so the
     /// `l1_block_number` / `l1_timestamp` here are the L1 block where the
     /// event was emitted (the authoritative source for `zkevm_getExitRootsByGER`).
-    /// UPSERTs: on conflict, all four columns are overwritten — the indexer's
-    /// L1-sourced view supersedes any earlier hardcoded-0 row that may have
-    /// been left by an L2-side write path that didn't know the L1 origin yet.
+    /// UPSERTs roots and provenance together so pre-upgrade unqualified roots
+    /// cannot be trusted under a different policy.
     async fn set_ger_exit_roots(
         &self,
         ger: &[u8; 32],
