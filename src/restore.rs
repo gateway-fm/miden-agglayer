@@ -1331,10 +1331,7 @@ pub(crate) async fn persist_synthetic_claim_tx(
     block_number: u64,
     block_hash: [u8; 32],
 ) -> anyhow::Result<bool> {
-    use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
-    use alloy::primitives::{Address, Signature, TxHash, TxKind, U256};
-
-    let tx_hash: TxHash = tx_hash_str
+    let tx_hash: alloy::primitives::TxHash = tx_hash_str
         .parse()
         .map_err(|e| anyhow::anyhow!("derived claim tx hash {tx_hash_str}: {e}"))?;
     // Idempotent AND crash-safe (review blocker 3): synthesis re-runs (restore replay,
@@ -1363,50 +1360,11 @@ pub(crate) async fn persist_synthetic_claim_tx(
         None => {}
     }
 
-    let full = parse_full_claim_from_storage(note_storage)?;
-    let Some(metadata) = resolve_claim_metadata(
-        store,
-        full.origin_network,
-        &full.origin_address,
-        &full.metadata_hash,
-    )
-    .await?
+    let Some((envelope, bridge_addr, calldata_bytes)) =
+        build_synthetic_claim_envelope(store, note_storage, note_id_str, tx_hash).await?
     else {
-        ::metrics::counter!("synthetic_claim_calldata_unrecoverable_total").increment(1);
-        tracing::error!(
-            note_id = %note_id_str,
-            tx_hash = %tx_hash_str,
-            origin_network = full.origin_network,
-            origin_address = %hex::encode(full.origin_address),
-            metadata_hash = %hex::encode(full.metadata_hash),
-            "synthesized claim: metadata preimage NOT recoverable from the faucet registry — \
-             refusing to fabricate calldata; the tx keeps an empty input (aggkit will surface \
-             this claim as unparsable — operator action: register/repair the faucet metadata, \
-             the backfill then heals on the next tick)"
-        );
         return Ok(false);
     };
-
-    let call = build_claim_asset_call(&full, metadata);
-    let input = alloy_core::sol_types::SolCall::abi_encode(&call);
-    let calldata_bytes = input.len();
-    let bridge_addr: Address = get_bridge_address()
-        .parse()
-        .map_err(|e| anyhow::anyhow!("bridge address: {e}"))?;
-    let tx = TxLegacy {
-        chain_id: None,
-        nonce: 0,
-        gas_price: 0,
-        gas_limit: 0,
-        to: TxKind::Call(bridge_addr),
-        value: U256::ZERO,
-        input: input.into(),
-    };
-    // Placeholder signature (v=27, r=1, s=1) matching the synthetic-tx wire shape —
-    // consumers (aggkit) parse the calldata, they don't verify signatures. The envelope is
-    // sealed with the DERIVED hash so every read path reports the hash the ClaimEvent rides.
-    let signature = Signature::new(U256::from(1), U256::from(1), false);
-    let envelope = TxEnvelope::Legacy(Signed::new_unchecked(tx, signature, tx_hash));
     store
         .txn_begin(
             tx_hash,
@@ -1432,8 +1390,140 @@ pub(crate) async fn persist_synthetic_claim_tx(
         block_number,
         calldata_bytes,
         "synthesized claim: persisted authoritative full claimAsset calldata under the \
-         derived tx hash"
+         derived tx hash (backfill path — the block is already sealed)"
     );
+    Ok(true)
+}
+
+/// Reconstruct the authoritative full `claimAsset` transaction envelope for a consumed
+/// CLAIM note from its on-chain storage + the faucet registry, sealed under `tx_hash`.
+///
+/// Returns `Ok(None)` when the faucet metadata preimage is unrecoverable — the caller then
+/// leaves the envelope absent (the serve path keeps an empty input and alarms; the operator
+/// registers/repairs the faucet, and the projector backfill heals on the next tick). This is
+/// the single reconstruction shared by the backfill ([`persist_synthetic_claim_tx`]) and the
+/// projection ([`insert_pending_claim_calldata`]) paths so both emit byte-identical calldata.
+async fn build_synthetic_claim_envelope(
+    store: &Arc<dyn Store>,
+    note_storage: &miden_protocol::note::NoteStorage,
+    note_id_str: &str,
+    tx_hash: alloy::primitives::TxHash,
+) -> anyhow::Result<
+    Option<(
+        alloy::consensus::TxEnvelope,
+        alloy::primitives::Address,
+        usize,
+    )>,
+> {
+    use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
+    use alloy::primitives::{Address, Signature, TxKind, U256};
+
+    let full = parse_full_claim_from_storage(note_storage)?;
+    let Some(metadata) = resolve_claim_metadata(
+        store,
+        full.origin_network,
+        &full.origin_address,
+        &full.metadata_hash,
+    )
+    .await?
+    else {
+        ::metrics::counter!("synthetic_claim_calldata_unrecoverable_total").increment(1);
+        tracing::error!(
+            note_id = %note_id_str,
+            tx_hash = %tx_hash,
+            origin_network = full.origin_network,
+            origin_address = %hex::encode(full.origin_address),
+            metadata_hash = %hex::encode(full.metadata_hash),
+            "synthesized claim: metadata preimage NOT recoverable from the faucet registry — \
+             refusing to fabricate calldata; the tx keeps an empty input (aggkit will surface \
+             this claim as unparsable — operator action: register/repair the faucet metadata, \
+             the backfill then heals on the next tick)"
+        );
+        return Ok(None);
+    };
+
+    let call = build_claim_asset_call(&full, metadata);
+    let input = alloy_core::sol_types::SolCall::abi_encode(&call);
+    let calldata_bytes = input.len();
+    let bridge_addr: Address = get_bridge_address()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bridge address: {e}"))?;
+    let tx = TxLegacy {
+        chain_id: None,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        to: TxKind::Call(bridge_addr),
+        value: U256::ZERO,
+        input: input.into(),
+    };
+    // Placeholder signature (v=27, r=1, s=1) matching the synthetic-tx wire shape —
+    // consumers (aggkit) parse the calldata, they don't verify signatures. The envelope is
+    // sealed with `tx_hash` so every read path reports the hash the ClaimEvent rides.
+    let signature = Signature::new(U256::from(1), U256::from(1), false);
+    let envelope = TxEnvelope::Legacy(Signed::new_unchecked(tx, signature, tx_hash));
+    Ok(Some((envelope, bridge_addr, calldata_bytes)))
+}
+
+/// Reconstruct + durably insert the full `claimAsset` calldata as a **PENDING** transaction
+/// under `tx_hash_str`, idempotently (a no-op when any row — pending or committed — already
+/// exists). The pending receipt is finalised — **without sealing the block** — by
+/// [`Store::commit_manual_claim_event_atomic`], so `project_block_notes` stays the SOLE
+/// advancer of `latest_block_number` (at end-of-block).
+///
+/// This is the projection-path counterpart of [`persist_synthetic_claim_tx`] (the
+/// after-the-fact backfill, which commits-with-seal because its block is already sealed).
+/// One idempotent primitive covers every case the projector meets:
+///   * derived-hash synthesis (no real eth-tx) — no prior row → insert reconstructed;
+///   * linked hash, normal — `publish_claim` already inserted the real pending row → no-op
+///     (the real envelope wins, and the atomic finalises it);
+///   * linked hash, **crash window** — the note→hash link survived but the envelope did NOT
+///     (crash before persisting it): reconstruct here rather than emit a ClaimEvent that
+///     points at empty calldata, which the derived-hash-only backfill would never repair.
+///
+/// Returns `Ok(false)` iff the faucet metadata preimage is unrecoverable (envelope left
+/// absent; the projector backfill heals once the faucet is registered).
+pub(crate) async fn insert_pending_claim_calldata(
+    store: &Arc<dyn Store>,
+    note_storage: &miden_protocol::note::NoteStorage,
+    note_id_str: &str,
+    tx_hash_str: &str,
+) -> anyhow::Result<bool> {
+    let tx_hash: alloy::primitives::TxHash = tx_hash_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("claim tx hash {tx_hash_str}: {e}"))?;
+    if store.txn_get(tx_hash).await?.is_some() {
+        return Ok(true);
+    }
+    let Some((envelope, bridge_addr, calldata_bytes)) =
+        build_synthetic_claim_envelope(store, note_storage, note_id_str, tx_hash).await?
+    else {
+        return Ok(false);
+    };
+    let inserted = store
+        .txn_begin_if_absent(
+            tx_hash,
+            crate::store::TxnEntry {
+                id: None,
+                envelope,
+                signer: bridge_addr,
+                expires_at: None,
+                // MUST stay empty: the ClaimEvent log is emitted by
+                // `commit_manual_claim_event_atomic`; a copy here would double-emit it.
+                logs: Vec::new(),
+            },
+        )
+        .await?;
+    if inserted {
+        ::metrics::counter!("synthetic_claim_calldata_persisted_total").increment(1);
+        tracing::info!(
+            note_id = %note_id_str,
+            tx_hash = %tx_hash_str,
+            calldata_bytes,
+            "synthesized claim: inserted authoritative full claimAsset calldata as a PENDING \
+             tx (finalised by the atomic ClaimEvent commit, never a mid-block seal)"
+        );
+    }
     Ok(true)
 }
 
@@ -1575,16 +1665,39 @@ pub(crate) async fn project_claim_note(
     // aggkit fails "input too short: 0 bytes" and never settles the certificate.
     // Fall back to the derived hash only for notes with no recorded link (e.g.
     // restore replaying history predating the link, or notes submitted out-of-band).
-    // `linked` = the tx hash came from a REAL recorded link (observed handoff or
-    // stored note→tx), not the derived fallback. A real hash → finalise its pending
-    // receipt; the derived fallback → persist the recovered full claimAsset calldata.
-    let (tx_hash, linked) = match observed_tx_hash {
-        Some(real_tx) => (real_tx, true),
+    let tx_hash = match observed_tx_hash {
+        Some(real_tx) => real_tx,
         None => match store.get_tx_for_note(&note_id_str).await? {
-            Some(real_tx) => (real_tx, true),
-            None => (derive_manual_claim_tx_hash(&note_id_str), false),
+            Some(real_tx) => real_tx,
+            None => derive_manual_claim_tx_hash(&note_id_str),
         },
     };
+
+    // Write-before-seal: reconstruct + durably insert the full claimAsset calldata as a
+    // PENDING tx under `tx_hash` BEFORE the atomic, so `commit_manual_claim_event_atomic`
+    // finalises the envelope's receipt TOGETHER with the ClaimEvent — at THIS consumption
+    // block (receipt block == log block) and WITHOUT advancing the tip. This mirrors the
+    // GER path (`project_ger_note`), which likewise finalises inside its atomic and never
+    // calls `txn_commit`. `insert_pending_claim_calldata` is idempotent: a no-op when the
+    // row already exists (the normal linked case — `publish_claim` durably inserted the real
+    // envelope), a reconstruct when it is ABSENT — either derived-hash synthesis (no real
+    // eth-tx), OR the crash window where the note→hash link survived but the envelope did
+    // NOT (which the derived-hash-only backfill would never repair, so the ClaimEvent would
+    // otherwise ride a hash with empty calldata forever). Best-effort: unrecoverable faucet
+    // metadata leaves the envelope absent (empty calldata; operator registers the faucet,
+    // backfill heals) — non-fatal, the ClaimEvent still commits below.
+    if let Err(e) =
+        insert_pending_claim_calldata(store, details.storage(), &note_id_str, &tx_hash).await
+    {
+        tracing::warn!(
+            target: "restore::claims",
+            note_id = %note_id_str,
+            tx_hash = %tx_hash,
+            error = %format!("{e:#}"),
+            "synthesised claim: calldata pre-insert failed (transient — the projector \
+             backfill retries next tick)"
+        );
+    }
 
     store
         .commit_manual_claim_event_atomic(
@@ -1600,50 +1713,15 @@ pub(crate) async fn project_claim_note(
             decoded.amount,
         )
         .await?;
-
-    // The projector OWNS receipt completion: finalise the real claim tx's receipt
-    // at THIS (consumption) block — the same block the ClaimEvent is emitted — so the
-    // receipt block == the log block. `publish_claim` left it pending (`id: None`) for
-    // exactly this. Tolerate a missing pending entry (derived-hash fallback, which has
-    // no real `txn_begin`; or an expired/pruned tx, or restore predating the tx
-    // record): the receipt is then synthesised from the log by `service_get_txn_receipt`,
-    // so a missing entry must not abort the projection.
-    if let Some(h) = linked
-        .then(|| tx_hash.parse::<alloy::primitives::TxHash>().ok())
-        .flatten()
-    {
-        let _ = store
-            .txn_commit(h, Ok(()), block_number, block_hash)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(tx = %tx_hash, "claim receipt not finalised: {e}");
-            });
-    } else {
-        // DERIVED-hash synthesis (no real eth-tx): persist the recovered FULL claimAsset
-        // calldata under the derived hash so aggkit's full-claim parser gets the truthful
-        // claim (both SMT proofs, both exit roots, networks, addresses, amount, hash-verified
-        // metadata) from `eth_getTransactionByHash`. Non-fatal on failure — the ClaimEvent is
-        // already committed; the projector's per-tick backfill retries until it persists.
-        if let Err(e) = persist_synthetic_claim_tx(
-            store,
-            details.storage(),
-            &note_id_str,
-            &tx_hash,
-            block_number,
-            block_hash,
-        )
-        .await
-        {
-            tracing::warn!(
-                target: "restore::claims",
-                note_id = %note_id_str,
-                tx_hash = %tx_hash,
-                error = %format!("{e:#}"),
-                "synthesised claim: calldata persistence failed (transient — the projector \
-                 backfill retries next tick)"
-            );
-        }
-    }
+    // `commit_manual_claim_event_atomic` emits the ClaimEvent AND finalises the pending
+    // envelope's receipt inline (a derived hash with no pending row is a harmless no-op —
+    // the receipt is then synthesised from the log by `service_get_txn_receipt`), all
+    // WITHOUT advancing `latest_block_number`. Deliberately NO `txn_commit` here: it would
+    // duplicate that finalise and, on Postgres, seal block N mid-loop — before this block's
+    // later B2AGG/GER/Claim notes are written — so aggkit could scan a partial block N,
+    // advance its cursor, and permanently miss the later logs. `project_block_notes` is the
+    // SOLE advancer of the tip, at end-of-block (the projector's write-before-advance
+    // invariant).
 
     ::metrics::counter!("claim_watcher_synthesised_total").increment(1);
     tracing::info!(
@@ -3851,6 +3929,127 @@ mod tests {
             data.envelope.input().len() > 4 + 64 * 32,
             "full calldata (proofs included), not a stub"
         );
+    }
+
+    /// Reviewer concern #1 — the ambiguous crash window: the note→ETH-tx-hash LINK was
+    /// durably recorded and the claim was submitted + consumed on Miden, but the proxy
+    /// crashed BEFORE persisting the ETH tx envelope. Recovery sees the surviving link (so
+    /// `tx_hash` is the REAL hash), and PRE-FIX it emitted a ClaimEvent under that hash while
+    /// the transaction row was absent — `eth_getTransactionByHash` then returned EMPTY
+    /// calldata, and the derived-hash-only backfill never repairs a real-hash event, so
+    /// aggkit's full-claim parser wedges forever. POST-FIX `project_claim_note` reconstructs
+    /// the full claimAsset calldata under the linked hash (pending) BEFORE the atomic, which
+    /// finalises it — so the served tx carries the truthful calldata, not the empty-wedge.
+    #[tokio::test]
+    async fn project_claim_note_reconstructs_calldata_for_linked_hash_missing_envelope() {
+        use alloy::consensus::Transaction;
+        use alloy_core::sol_types::SolCall;
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        // Empty metadata → truthful by hash → reconstructable with no registry entry.
+        let note = claim_input_note(Some(id(TEST_TARGET_BRIDGE)), 0x91);
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        // The crash window: the note→hash LINK survived, the envelope did NOT.
+        let real_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        store
+            .record_tx_note_link(real_hash, &note_id)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .txn_get(real_hash.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "precondition: the linked envelope is absent (crash before persisting it)"
+        );
+
+        let outcome = project_claim_note(
+            &store,
+            &note,
+            &std::collections::HashMap::new(),
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            8831,
+            [0xAA; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ClaimProjectOutcome::Emitted);
+
+        // The ClaimEvent rides the REAL linked hash …
+        assert!(
+            !store.get_logs_for_tx(real_hash).await.unwrap().is_empty(),
+            "the ClaimEvent must ride the real linked hash"
+        );
+        // … and that hash now serves the FULL claimAsset calldata, finalised at the block.
+        let data = store
+            .txn_get(real_hash.parse().unwrap())
+            .await
+            .unwrap()
+            .expect("the linked envelope was reconstructed, not left absent (concern #1)");
+        assert!(
+            crate::claim::claimAssetCall::abi_decode(data.envelope.input()).is_ok(),
+            "the served input is the full claimAsset calldata, not the empty-calldata wedge"
+        );
+        assert!(
+            data.envelope.input().len() > 4 + 64 * 32,
+            "full calldata (both SMT proofs included), not a stub"
+        );
+        let (res, blk) = store
+            .txn_receipt(real_hash.parse().unwrap())
+            .await
+            .unwrap()
+            .expect("the linked receipt is finalised together with the ClaimEvent");
+        assert!(res.is_ok());
+        assert_eq!(blk, 8831, "receipt block == ClaimEvent block");
+    }
+
+    /// Reviewer concern #2 (building block) — `insert_pending_claim_calldata` inserts the
+    /// calldata as a PENDING tx (no receipt, no block seal); finalisation is the atomic's
+    /// job. PRE-FIX the projection path used `persist_synthetic_claim_tx`, which COMMITS
+    /// (and, on Postgres, folds a `latest_block_number` advance — sealing the block mid-loop,
+    /// before its later notes are written). The seal itself is Postgres-only (asserted in
+    /// `store::postgres_tests`); here we pin the in-memory-observable half: the insert leaves
+    /// the tx PENDING and is idempotent.
+    #[tokio::test]
+    async fn insert_pending_claim_calldata_leaves_tx_pending_and_is_idempotent() {
+        use alloy::consensus::Transaction;
+        use alloy_core::sol_types::SolCall;
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let storage = full_claim_fixture(&[]);
+        let note_id = "pending-insert";
+        let derived = derive_manual_claim_tx_hash(note_id);
+        let tx_hash: alloy::primitives::TxHash = derived.parse().unwrap();
+
+        assert!(
+            insert_pending_claim_calldata(&store, &storage, note_id, &derived)
+                .await
+                .unwrap()
+        );
+        // Full calldata is present …
+        let data = store
+            .txn_get(tx_hash)
+            .await
+            .unwrap()
+            .expect("calldata inserted");
+        assert!(
+            crate::claim::claimAssetCall::abi_decode(data.envelope.input()).is_ok(),
+            "the pending row carries the full claimAsset calldata"
+        );
+        // … but the tx is PENDING — NOT committed/sealed (that is the atomic's job).
+        assert!(
+            store.txn_receipt(tx_hash).await.unwrap().is_none(),
+            "insert_pending must NOT finalise/seal — no receipt until the atomic commits"
+        );
+        // Idempotent no-op on a second call (row already present).
+        assert!(
+            insert_pending_claim_calldata(&store, &storage, note_id, &derived)
+                .await
+                .unwrap()
+        );
+        assert!(store.txn_get(tx_hash).await.unwrap().is_some());
     }
 
     /// Test-local mirror of the eth envelope aggkit signs for

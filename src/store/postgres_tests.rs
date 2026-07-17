@@ -967,6 +967,62 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());
     // ClaimEvent dedup query finds the row.
     assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+
+    // ── Reviewer concern #2 (write-before-seal): the atomic must NOT advance the tip. ──
+    // `insert_pending_claim_calldata` leaves a PENDING envelope; the atomic finalises that
+    // receipt AND emits the ClaimEvent, but sealing block N is the projector's job at
+    // end-of-block (`project_block_notes`). If the atomic — or a stray `txn_commit` in the
+    // claim path — advanced `latest_block_number` mid-block, aggkit could scan a partial
+    // block N and permanently miss its later logs. (Invisible to the in-memory store, whose
+    // `txn_commit` never touches the tip — this is the Postgres-only half of the fix.)
+    let before = store.get_latest_block_number().await.unwrap();
+    let seal_block = before + 50_000; // strictly above the current tip
+    let seal_hash: TxHash = {
+        let mut h = [0u8; 32];
+        h[..16].copy_from_slice(&(now_ns + 5).to_be_bytes());
+        TxHash::from(h)
+    };
+    let seal_hash_str = format!("{seal_hash:#x}");
+    let seal_note = format!("claim_seal_note_{now_ns}");
+    let seal_gi = {
+        let mut g = [0u8; 32];
+        g[..16].copy_from_slice(&(now_ns + 6).to_be_bytes());
+        g
+    };
+    // A pending envelope under `seal_hash` (exactly what insert_pending_claim_calldata leaves).
+    store.txn_begin(seal_hash, dummy_txn_entry()).await.unwrap();
+    assert!(
+        store.txn_receipt(seal_hash).await.unwrap().is_none(),
+        "pending before the atomic finalises it"
+    );
+    store
+        .commit_manual_claim_event_atomic(
+            seal_note,
+            "0xbridge",
+            seal_block,
+            [0u8; 32],
+            &seal_hash_str,
+            seal_gi,
+            0,
+            &[0u8; 20],
+            &[0u8; 20],
+            42,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.get_latest_block_number().await.unwrap() < seal_block,
+        "the atomic ClaimEvent commit must NOT seal the block — only project_block_notes \
+         advances latest_block_number, at end-of-block (write-before-seal)"
+    );
+    // The linked receipt IS finalised together with the ClaimEvent, at the claim's block.
+    let (res, blk) = store
+        .txn_receipt(seal_hash)
+        .await
+        .unwrap()
+        .expect("the linked receipt is finalised inline by the atomic");
+    assert!(res.is_ok());
+    assert_eq!(blk, seal_block, "receipt block == ClaimEvent block");
 }
 
 /// Audit H1/H3 — a reservation assigns the index before the atomic BridgeEvent commit.
