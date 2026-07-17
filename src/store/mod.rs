@@ -849,6 +849,20 @@ pub trait Store: Send + Sync + 'static {
     ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>>;
 
     /// `deposit_counter` plus the operator-audited legacy LET offset, read atomically.
+    /// Lowest reserved-but-UNEMITTED LET leaf: a leaf that took a deposit index
+    /// (`reserve_deposit_index`) but whose synthetic `BridgeEvent` was never emitted
+    /// (quarantined / deferred / unrecoverable-metadata / self-target). Returns
+    /// `(deposit_count, note_id)`, or `None` when every reservation has been emitted.
+    ///
+    /// The LET cardinality gate enforces `accounted == on_chain let_num_leaves` (both
+    /// count the reservation) but NOT `emitted_events == accounted`. A reserved-but-
+    /// unemitted leaf therefore passes that gate yet leaves a permanent GAP in the
+    /// getLogs `depositCount` sequence — and aggkit's L2 bridgesync requires contiguous
+    /// indices, so it halts ("state is inconsistent") on the gap, wedging every later
+    /// certificate. The projector uses this to fail-closed (halt) instead of sealing
+    /// past such a leaf.
+    async fn first_unemitted_reservation(&self) -> anyhow::Result<Option<(u32, String)>>;
+
     async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64>;
     #[cfg(test)]
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;

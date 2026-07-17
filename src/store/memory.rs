@@ -1646,6 +1646,17 @@ impl Store for InMemoryStore {
             .is_some_and(|(_, emitted)| *emitted))
     }
 
+    async fn first_unemitted_reservation(&self) -> anyhow::Result<Option<(u32, String)>> {
+        // processed_notes: note_key -> (reserved deposit index, emitted).
+        Ok(self
+            .processed_notes
+            .read()
+            .iter()
+            .filter(|(_, (_, emitted))| !*emitted)
+            .min_by_key(|(_, (idx, _))| *idx)
+            .map(|(note, (idx, _))| (*idx, note.clone())))
+    }
+
     async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64> {
         self.let_gate_baseline
             .read()

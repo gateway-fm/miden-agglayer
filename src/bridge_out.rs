@@ -1382,13 +1382,15 @@ mod tests {
             == crate::restore::B2AggRestoreOutcome::Emitted
     }
 
-    /// Cantina #13 Layer 2 — FAIL-SAFE GATE, wired end-to-end. A bridge-consumed
-    /// ERC-20 bridge-out whose faucet row has EMPTY metadata must NOT emit when
-    /// the metadata can't be recovered + validated (here: no live client, so the
-    /// bridge's metadata hash is unreadable). It must defer: no log, and the note
-    /// must stay un-processed so it re-surfaces once an operator backfills.
+    /// Cantina #13 Layer 2 — FAIL-CLOSED (no tombstone). A bridge-consumed ERC-20
+    /// whose metadata is unrecoverable (here: no live client → bridge hash unreadable)
+    /// must NOT emit (empty metadata → spoofed wrapped token) AND must NOT silently skip
+    /// (a reserved-but-unemitted leaf gaps getLogs → aggkit halts). So it BAILS loudly.
+    /// The leaf's index is reserved (so it stays visible to the emitted-frontier gate),
+    /// no BridgeEvent is emitted, and recovery is operator-driven (fix metadata / a full
+    /// DB drop + `--restore` rebuild from on-chain).
     #[tokio::test]
-    async fn cantina13_l2_erc20_empty_metadata_unrecoverable_is_gated() {
+    async fn cantina13_l2_erc20_unrecoverable_fails_closed() {
         use crate::block_state::BlockState;
         use crate::store::memory::InMemoryStore;
         use std::sync::Arc as StdArc;
@@ -1396,11 +1398,10 @@ mod tests {
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        // A real fungible-faucet id (so FungibleAsset::new accepts it).
         let faucet_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
-        // Register an ERC-20 faucet (non-zero origin address) with EMPTY metadata
-        // — the exact legacy/DB-loss state Layer 2 must guard.
+        // ERC-20 faucet (non-zero origin address) with EMPTY metadata — the legacy/DB-loss
+        // state Layer 2 must guard.
         store
             .register_faucet(crate::store::FaucetEntry {
                 faucet_id,
@@ -1418,23 +1419,39 @@ mod tests {
         let note = build_b2agg_bridge_out_note(faucet_id, bridge_id);
         let note_id = test_b2agg_note_id(&note, bridge_id).to_hex();
 
-        // No client → bridge metadata hash unreadable → Unrecoverable → gated.
-        let advanced = run_b2agg_emit(&store, &block_state, &note, bridge_id, 100).await;
+        // No client → bridge metadata hash unreadable → Unrecoverable → FAIL CLOSED (Err).
+        let outcome = crate::restore::project_b2agg_note(
+            &store,
+            &note,
+            test_b2agg_note_id(&note, bridge_id),
+            bridge_id,
+            7,
+            100,
+            block_state.get_block_hash(100),
+            crate::bridge_address::get_bridge_address(),
+            None,
+            None,
+        )
+        .await;
         assert!(
-            !advanced,
-            "ERC-20 empty-metadata bridge-out must NOT advance/emit"
+            outcome.is_err(),
+            "unrecoverable ERC-20 metadata must FAIL CLOSED (Err), not silently skip"
+        );
+        // The leaf reserved its index but never emitted → the emitted-frontier gate must see
+        // it, and NO BridgeEvent may exist.
+        assert_eq!(
+            store
+                .first_unemitted_reservation()
+                .await
+                .unwrap()
+                .as_ref()
+                .map(|(_, n)| n.as_str()),
+            Some(note_id.as_str()),
+            "reserved-but-unemitted poison leaf must be visible to the emitted-frontier gate"
         );
         assert!(
             !store.is_note_processed(&note_id).await.unwrap(),
-            "gated bridge-out must stay un-processed so it can re-surface after backfill",
-        );
-        let logs = store
-            .get_logs(&crate::log_synthesis::LogFilter::default(), 1000)
-            .await
-            .unwrap_or_default();
-        assert!(
-            logs.is_empty(),
-            "no synthetic BridgeEvent may be emitted with empty ERC-20 metadata"
+            "no BridgeEvent may be emitted for an unrecoverable-metadata leaf"
         );
     }
 

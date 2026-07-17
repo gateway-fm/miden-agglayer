@@ -1426,6 +1426,28 @@ impl SyntheticProjector {
                  expected={expected}; see docs/operations/let-cardinality-gate.md"
             );
         }
+        // EMITTED-FRONTIER GATE (complements the LET cardinality gate above).
+        // The cardinality gate enforces `accounted == on_chain let_num_leaves` — but a
+        // leaf can be RESERVED (counted) yet never EMITTED (quarantined / deferred /
+        // unrecoverable-metadata / self-target). That leaf occupies its LET slot with NO
+        // BridgeEvent, leaving a permanent GAP in the getLogs `depositCount` sequence.
+        // aggkit's L2 bridgesync requires contiguous deposit indices, so it HALTS
+        // ("state is inconsistent") on the gap and every later Miden certificate wedges.
+        // Fail-closed: refuse to seal past a reserved-but-unemitted leaf so aggkit sees a
+        // contiguous prefix and WAITS instead of wedging. The LER simply does not advance
+        // for the withheld leaf. Recovery is operator-driven: fix the leaf's metadata
+        // (registry backfill / a full DB drop + `--restore` rebuild from on-chain) so the
+        // leaf emits its real event.
+        if let Some((idx, note)) = self.store.first_unemitted_reservation().await? {
+            ::metrics::counter!("bridge_unemitted_reservation_halt_total").increment(1);
+            anyhow::bail!(
+                "projector halted (fail-closed): note {note} (LET index {idx}) is reserved \
+                 but its BridgeEvent was never emitted (unrecoverable metadata / quarantined \
+                 leaf). Sealing past it would leave a getLogs gap that halts aggkit bridgesync. \
+                 Fix the leaf's metadata (registry backfill, or back up + drop the DB and \
+                 re-run `--restore` to rebuild from on-chain), then restart."
+            );
+        }
         let no_notes: Vec<(Option<NoteId>, &InputNoteRecord)> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;

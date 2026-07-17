@@ -1148,20 +1148,28 @@ pub(crate) async fn project_b2agg_note(
             bytes
         }
         EmitMetadata::Unrecoverable => {
-            // FAIL-SAFE GATE: refuse to rebuild an ERC-20 BridgeEvent with empty
-            // metadata. Skip without marking processed so a later restore (after
-            // the registry is backfilled / an L1 RPC is wired) retries it.
+            // FAIL-CLOSED, LOUD. The bridge already consumed this B2AGG (the on-chain LET
+            // advanced and reserved this leaf's index), but we cannot recover + validate its
+            // ERC-20 metadata. We must NOT emit (empty/unvalidated metadata would let the
+            // destination deploy a spoofed wrapped token — Cantina #13), and we must NOT
+            // silently skip: a reserved-but-unemitted leaf gaps the getLogs depositCount
+            // sequence and halts aggkit bridgesync (the projector's emitted-frontier gate
+            // will also refuse to seal past it). There is no safe "tombstone" — any faked
+            // event either double-spends a balance (BalanceUnderflow) or advances the LER
+            // with a leaf that isn't the real exit. So bail: the operator recovers by fixing
+            // the metadata/identity — the safe path being a full DB backup + drop +
+            // `--restore` rebuild from the authoritative on-chain state (never a partial
+            // patch of a corrupted row).
             ::metrics::counter!(METADATA_UNRECOVERABLE_METRIC).increment(1);
-            tracing::warn!(
-                note_id = %dedup_key,
-                faucet_id = %faucet_id,
-                origin_network = origin.origin_network,
-                "restore: Cantina #13 L2 — ERC-20 bridge-out has empty metadata that could not \
-                 be recovered + validated against the bridge's metadata hash; skipping (refusing \
-                 to emit empty/unvalidated metadata). Backfill the faucet registry or supply an \
-                 L1 RPC for the token's origin network, then re-run restore."
+            anyhow::bail!(
+                "restore: bridge-out note {dedup_key} (faucet {faucet_id}, origin_network {}) has \
+                 unrecoverable ERC-20 metadata — refusing to emit or skip past it (a reserved-but-\
+                 unemitted leaf gaps getLogs and halts aggkit bridgesync). This indicates a \
+                 corrupted/half-recovered faucet row. Recover by backing up, DROPPING the proxy DB, \
+                 and re-running `--restore` to rebuild the faucet identity + metadata from on-chain \
+                 (or backfill the faucet's registry metadata / L1 RPC), then restart.",
+                origin.origin_network,
             );
-            return Ok(B2AggRestoreOutcome::Skipped);
         }
     };
 

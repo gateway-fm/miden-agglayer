@@ -2233,6 +2233,25 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
+    async fn first_unemitted_reservation(&self) -> anyhow::Result<Option<(u32, String)>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT deposit_count, note_id FROM bridge_out_processed \
+                 WHERE NOT emitted ORDER BY deposit_count ASC LIMIT 1",
+                &[],
+            )
+            .await?;
+        match row {
+            Some(r) => {
+                let idx: i32 = r.get(0);
+                let note: String = r.get(1);
+                Ok(Some((u32::try_from(idx)?, note)))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let row = client
