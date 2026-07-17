@@ -311,10 +311,6 @@ e2e-claim-watcher-synthesis: e2e-claim-watcher ## After watcher happy path, simu
 e2e-claim-provenance: ## Deploy a FOREIGN bridge on the same chain, drive a claim through it, assert zero ClaimEvent leakage (stack must be up)
 	$(COMPOSE_ENV) ./scripts/e2e-claim-provenance.sh
 
-.PHONY: e2e-mint-monitor-provenance
-e2e-mint-monitor-provenance: ## Deploy a FOREIGN bridge, drive a mint through it, assert no false Cantina #2/#4 mint-monitor alert (stack must be up)
-	$(COMPOSE_ENV) ./scripts/e2e-mint-monitor-provenance.sh
-
 .PHONY: e2e-l2-to-l1
 e2e-l2-to-l1: e2e-l1-to-l2 ## Spin up stack + L1→L2 to fund wallet + run L2→L1 bridge-out test (strict)
 	$(COMPOSE_ENV) ./scripts/e2e-l2-to-l1.sh

@@ -845,21 +845,6 @@ async fn main() -> anyhow::Result<()> {
             bridge_out_local_network_id,
             accounts.0.bridge.0,
         )
-        // Copilot #16 fail-closed: register the known-LOCAL non-faucet accounts
-        // (service, ger_manager) so the #5/#6 consumer-provenance predicate
-        // does NOT mislabel a note one of OUR local flows consumed as
-        // "foreign" and suppress the alert. ger_manager is optional — include
-        // it only when configured. (wallet_hardhat was removed entirely in
-        // #125 — bridge-out wallets are now isolated per-store and never
-        // consume claim/mint notes, so they don't belong in this set.)
-        .with_local_accounts(
-            [
-                Some(accounts.0.service.0),
-                accounts.0.ger_manager.as_ref().map(|g| g.0),
-            ]
-            .into_iter()
-            .flatten(),
-        )
         // Cantina #13 Layer 2 — wire the L1 RPC so legacy ERC-20 faucet rows with
         // empty metadata can be recovered + validated before a bridge-out emits.
         .with_l1_rpc_url(command.l1_rpc_url.clone()),

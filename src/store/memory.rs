@@ -166,8 +166,8 @@ pub struct InMemoryStore {
     // history (mirror of monitor_claim_mint_serials): serial → full identity.
     monitor_claim_mint_serials: RwLock<HashMap<[u8; 32], crate::store::ExpectedMint>>,
     // Test hook: force `list_faucets` to fail so scanner tests can drive the
-    // registry-degraded fail-closed path (`bridge_out::note_positively_foreign`
-    // with `registered_faucets == None`). Never set outside tests.
+    // registry-degraded fail-closed path. Never compiled outside tests.
+    #[cfg(test)]
     fail_list_faucets: std::sync::atomic::AtomicBool,
 
     // Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) —
@@ -210,6 +210,7 @@ impl InMemoryStore {
     /// Test hook — see the `fail_list_faucets` field. Makes every subsequent
     /// `list_faucets()` call fail until reset, so tests can drive the
     /// registry-degraded fail-closed monitor path.
+    #[cfg(test)]
     pub fn set_fail_list_faucets(&self, fail: bool) {
         self.fail_list_faucets
             .store(fail, std::sync::atomic::Ordering::Relaxed);
@@ -250,6 +251,7 @@ impl InMemoryStore {
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
             monitor_claim_mint_serials: RwLock::new(HashMap::new()),
+            #[cfg(test)]
             fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
@@ -2052,6 +2054,7 @@ impl Store for InMemoryStore {
     }
 
     async fn list_faucets(&self) -> anyhow::Result<Vec<FaucetEntry>> {
+        #[cfg(test)]
         if self
             .fail_list_faucets
             .load(std::sync::atomic::Ordering::Relaxed)

@@ -187,14 +187,13 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "bridge_mint_target_mismatch_total",
-        "Cantina #2 mint-target alert, one-shot per MINT note id: either the \
+        "Cantina #2 mint-target alert: either the \
          consuming faucet differs from the MINT's NetworkAccountTarget \
          (cross-faucet exploit — the claimant receives the wrong wrapped \
          asset), or the intended faucet is not in aggkit's registry \
          (cross-faucet exploit against an unregistered faucet, or operator \
          misregistration). Only fires for MINTs attributable to OUR \
-         deployment (foreign deployments' notes are counted in \
-         bridge_mint_foreign_skipped_total instead). Page critical."
+         deployment; positively foreign notes are excluded. Page critical."
     );
     describe_counter!(
         "bridge_faucet_ownership_drift_total",
@@ -207,42 +206,15 @@ pub fn init_metrics() {
         "bridge_forged_mint_total",
         "MINT note observed consumed that does NOT reconcile to an \
          aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge note \
-         authorship. One-shot per MINT note id. Label reason=no_claim: the \
+         authorship. Label reason=no_claim: the \
          serial matches no recorded claim's PROOF_DATA_KEY (fires after a \
          short grace window that absorbs cross-tick note-import ordering). \
-         Label reason=detail_mismatch (blocker #1): the serial IS recorded \
-         but the observed MINT's identity (amount / asset) differs from the \
-         claim's derived expected MINT — a copied-serial forgery — fires \
+         Label reason=identity_undetermined: a claim exists but its expected \
+         identity remains unavailable after the grace window. \
+         Label reason=detail_mismatch: the serial IS recorded \
+         but the observed MINT's identity (recipient / amount / asset) differs \
+         from the claim's derived expected MINT — a copied-serial forgery — fires \
          immediately, no grace. Page critical, freeze claim processing."
-    );
-    describe_counter!(
-        "bridge_mint_foreign_skipped_total",
-        "UNIQUE consumed MINT notes positively attributed to a FOREIGN \
-         agglayer deployment sharing the chain (created by a non-ours bridge \
-         and referencing no registered faucet — the note scripts and the \
-         tag-0 family the reconciler sweeps are deployment-independent). \
-         Skipped by the #2/#4 provenance gate instead of raising a false \
-         cross-faucet/forged alert. Deduplicated by note id per process \
-         lifetime (counts foreign notes, not sync ticks). Do NOT page; \
-         informational/audit only."
-    );
-    describe_counter!(
-        "bridge_twin_note_foreign_skipped_total",
-        "UNIQUE consumed notes (any monitored script) excluded from the \
-         twin-detector (Cantina #6) because the note's own content — creator, \
-         NetworkAccountTarget, or carried asset — positively names another \
-         deployment's bridge/faucet and nothing of ours. Keeps another \
-         deployment's note-graph out of our twin tracker. Deduplicated by \
-         note id per process lifetime. Informational/audit."
-    );
-    describe_counter!(
-        "bridge_burn_foreign_skipped_total",
-        "UNIQUE consumed BURN notes excluded from the serial-collision \
-         tracker (Cantina #5) because the note positively belongs to another \
-         deployment (non-ours creator bridge / burned asset issued by a \
-         non-registered faucet). Keeps another deployment's serials out of \
-         our collision tracker. Deduplicated by note id per process \
-         lifetime. Informational/audit."
     );
     describe_counter!(
         "bridge_monitor_registry_unavailable_total",

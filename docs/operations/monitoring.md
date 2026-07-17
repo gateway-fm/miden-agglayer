@@ -145,37 +145,9 @@ aggoracle or GER-indexing lag, not writer saturation.
 
 | Metric | What it means | Cantina ref |
 |---|---|---|
-| `bridge_burn_serial_collision_total` | A BURN note's serial number was reused for a different leaf. `mint_and_send` token_supply is at risk of exhaustion. | #5 |
-| `bridge_twin_note_detected_total` | Second on-chain note with a previously-observed NoteId but different metadata — B2AGG reclaim attack signature. | #6 |
-| `bridge_mint_target_mismatch_total` | MINT note **in our deployment's flow** whose intended faucet is unregistered or differs from the faucet that consumed it. This covers both misregistration and the Cantina #2 cross-faucet exploit. Provenance-scoped: a foreign deployment's MINT does not trip this (see `bridge_mint_foreign_skipped_total`). | #2 |
-| `bridge_faucet_ownership_drift_total{kind=drift\|renounced}` | Faucet owner storage slot moved away from the configured bridge AccountId. `renounced` wedges the faucet permanently. | #4 |
-| `bridge_forged_mint_total{reason}` | MINT note **in our deployment's flow** that does not reconcile to an aggkit-recorded claim — forged via NoAuth. `reason=no_claim`: its serial matches no recorded claim's PROOF_DATA_KEY (after a short grace window). `reason=detail_mismatch`: its serial is recorded but the observed recipient, amount, or asset differs from the claim's expected MINT — fires immediately. Provenance-scoped (foreign MINTs skipped; native claims are never whitelisted). | #4 |
-| `bridge_out_self_targeted_total` | B2AGG whose `destination_network` equals our `network_id`. Each one is a poison leaf. | #13 |
-
-| Metric | Meaning |
-|---|---|
-| `bridge_out_unknown_faucet_total` | B2AGG referencing a faucet not in our registry. Quarantined to prevent re-loop; stuck until the registry is updated. Investigate any non-zero rate. |
-| `bridge_out_quarantined_erased_b2agg_total` | Consumed B2AGG skipped because its contents were unparsable / faucet unknown (MA#18); a quarantine-table row was written as the recovery handle. |
-| `bridge_unknown_wrapper_consumed_total` | Bridge consumed a note whose script root is neither B2AGG nor CLAIM (MA#4) — the LET advanced but no event can be synthesised. Investigate before more funds strand. |
-| `bridge_out_invalid_destination_total` | B2AGG with zero-address / EVM-precompile destination. Refused. Steady non-zero rate = upstream client bug. |
-| `claim_unclaimable_total{reason}` | Claim recorded as unclaimable (e.g. unresolvable destination). Each one is a user-visible stuck deposit. |
-
-### Foreign-deployment provenance skips — informational, DO NOT page
-
-The note scripts (MINT/BURN/CLAIM/B2AGG) are deployment-independent, so a chain
-shared with a FOREIGN agglayer deployment leaks that deployment's notes into our
-store. These counters record notes the provenance gates attributed to another
-deployment and skipped, so a false critical alert is never raised. A steady rate
-is normal on a shared chain; a sudden spike just means a foreign deployment got
-busier. Investigate only if it coincides with our own funds behaving oddly.
-
-| Metric | Meaning | Cantina ref |
-|---|---|---|
-| `bridge_mint_foreign_skipped_total` | Consumed MINT whose immutable content positively references another deployment. Skipped by the #2/#4 gate. | #2/#4 |
-| `bridge_twin_note_foreign_skipped_total` | Consumed note whose immutable content positively references another deployment and is skipped by the twin detector. | #6 |
-| `bridge_burn_foreign_skipped_total` | Consumed BURN whose immutable content positively references another deployment and is skipped by the serial tracker. | #5 |
-| `address_mapper_zero_padding_fallback_total` | No explicit eth→Miden mapping; fell back to zero-padding. Account existence NOT verified — alert on unusual rates. |
-| `address_mapper_hardhat_alias_rejected_total` | Hardhat-alias remap refused (`DISABLE_HARDHAT_ALIAS`). Non-zero in production = someone deposits to the well-known dev address. |
+| `bridge_mint_target_mismatch_total` | MINT note **in our deployment's flow** whose intended faucet is unregistered or differs from the faucet that consumed it. This covers both misregistration and the Cantina #2 cross-faucet exploit. Positively foreign deployments' MINTs are excluded. | #2 |
+| `bridge_forged_mint_total{reason}` | MINT note **in our deployment's flow** that does not reconcile to an aggkit-recorded claim. `reason=no_claim`: its serial matches no recorded claim's PROOF_DATA_KEY (after a short grace window). `reason=identity_undetermined`: a claim exists but its expected identity remains unavailable after the grace window. `reason=detail_mismatch`: its canonical recipient, amount, asset, callback flag, or routing attachment differs from the claim-derived expectation and fires immediately. Native claims create no authorization. | #4 |
+| `bridge_monitor_registry_unavailable_total` | The faucet registry was unreadable. Provenance fails closed: no note is classified foreign and no claim writes legitimacy without positive local evidence. | #2/#4 |
 
 ## Bridge integrity: page on increase
 

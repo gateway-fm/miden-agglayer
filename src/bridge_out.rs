@@ -17,6 +17,7 @@ use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
 use miden_protocol::note::{NoteDetails, NoteStorage};
 use sha3::{Digest, Keccak256};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 // B2AGG NOTE PARSING
@@ -233,7 +234,7 @@ pub fn classify_b2agg_consumer(
 
 /// Script-root classification of a consumed note for provenance purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MonitoredNoteKind {
+enum MonitoredNoteKind {
     Mint,
     Burn,
     Claim,
@@ -252,22 +253,21 @@ pub enum MonitoredNoteKind {
 ///   account the note is routed to for execution. CLAIM/B2AGG/UpdateGer notes
 ///   name their deployment's BRIDGE here; MINT notes name the intended FAUCET.
 /// - `asset_faucets` — faucet ids of the note's fungible assets. A BURN note
-///   carries exactly the asset being burned, whose faucet id names the
-///   deployment's faucet.
+///   carries the asset directly; an AggLayer MINT binds it in canonical storage.
 /// - `consumer` — miden-client's consumer attribution (OURS proof only, see
 ///   the module-section comment above).
 #[derive(Debug, Clone)]
-pub struct NoteProvenanceFacts {
-    pub kind: MonitoredNoteKind,
-    pub sender: Option<AccountId>,
-    pub attachment_target: Option<AccountId>,
-    pub asset_faucets: Vec<AccountId>,
-    pub consumer: Option<AccountId>,
+struct NoteProvenanceFacts {
+    kind: MonitoredNoteKind,
+    sender: Option<AccountId>,
+    attachment_target: Option<AccountId>,
+    asset_faucets: Vec<AccountId>,
+    consumer: Option<AccountId>,
 }
 
 impl NoteProvenanceFacts {
     /// Extract the provenance facts from a consumed-note record. No I/O.
-    pub fn from_note(note: &InputNoteRecord) -> Self {
+    fn from_note(note: &InputNoteRecord) -> Self {
         let script_root = note.details().script().root();
         let kind = if script_root == miden_standards::note::MintNote::script_root() {
             MonitoredNoteKind::Mint
@@ -284,12 +284,24 @@ impl NoteProvenanceFacts {
             miden_standards::note::NetworkAccountTarget::try_from(note.attachments())
                 .ok()
                 .map(|nat| nat.target_id());
-        let asset_faucets = note
+        let mut asset_faucets: Vec<AccountId> = note
             .details()
             .assets()
             .iter_fungible()
             .map(|fa| fa.faucet_id())
             .collect();
+        // Standard/AggLayer MINT notes intentionally have no outer NoteAssets.
+        // The asset which `mint_and_send` binds to the consuming faucet lives in
+        // the canonical 22-felt MINT storage instead. Treat that faucet as
+        // positive provenance too, otherwise a metadata-stripped MINT carrying
+        // one of OUR faucets but a foreign attachment could be misclassified as
+        // foreign and skipped by #2/#4.
+        if kind == MonitoredNoteKind::Mint
+            && let Some(identity) = observed_mint_identity(note)
+            && !asset_faucets.contains(&identity.faucet)
+        {
+            asset_faucets.push(identity.faucet);
+        }
         Self {
             kind,
             sender: note.metadata().map(|m| m.sender()),
@@ -300,100 +312,55 @@ impl NoteProvenanceFacts {
     }
 }
 
-/// Pure provenance predicate for ALL consumed-note monitors (#2/#4 mint,
-/// #5 burn-serial, #6 twin). Returns `true` iff the note POSITIVELY belongs to
-/// another agglayer deployment sharing the chain, decided from the note's own
-/// content ([`NoteProvenanceFacts`]):
+/// Tri-state deployment provenance for the consumed-note monitors, decided
+/// from the note's own content ([`NoteProvenanceFacts`]).
 ///
 /// 1. **OURS proofs (any one keeps the note monitored — fail-closed):** the
 ///    note's sender, consumer attribution, or `NetworkAccountTarget` is our
-///    bridge / a registered faucet / a known-local account, or any carried
-///    asset was issued by a registered faucet.
+///    bridge or a registered faucet, or any carried asset was issued by a
+///    registered faucet.
 /// 2. **FOREIGN proof (required to skip), per note type:**
-///    - MINT: `sender` (the bridge MASM creates MINTs from the emitting
-///      deployment's bridge account) or the `NetworkAccountTarget` (a MINT
-///      names the intended faucet of ITS OWN deployment) decodes and is none
-///      of ours. (A forged MINT drawn against OUR faucet must spoof
-///      `sender == our bridge` to pass the faucet's owner check, and a MINT
-///      aimed at our faucets names a registered faucet — both are OURS by
-///      proof 1 and stay monitored.)
+///    - MINT: its canonical storage decodes an asset issued by a non-ours
+///      faucet. The attachment alone is not foreign proof because a
+///      cross-faucet attack can deliberately name another target.
 ///    - BURN: `sender` (bridge-created, as above) decodes or the burned
 ///      asset's faucet id is present — and is none of ours.
 ///    - CLAIM / B2AGG: the `NetworkAccountTarget` attachment decodes and is
 ///      none of ours — the note is routed to a FOREIGN bridge for execution.
 ///    - Other: never foreign (fail-closed).
 ///
-/// `registered_faucets == None` means the faucet registry could not be loaded
-/// this tick. That is a DEGRADED state and the answer is always `false`:
-/// registry failure must never become fail-open alert suppression — every note
-/// stays monitored until the registry is readable again (the call site emits
-/// `bridge_monitor_registry_unavailable_total`).
-///
-/// An undecodable / absent field is never a foreign proof: notes the client
-/// has not fully recovered stay monitored. Pure (no I/O, no metrics) so it is
-/// unit-testable directly.
-pub fn note_positively_foreign(
-    facts: &NoteProvenanceFacts,
-    registered_faucets: Option<&std::collections::HashSet<AccountId>>,
-    local_accounts: &std::collections::HashSet<AccountId>,
-    bridge_id: AccountId,
-) -> bool {
-    // Back-compat thin wrapper: the SKIP decision is exactly FOREIGN. OURS and
-    // UNKNOWN both stay monitored. Recording of legitimacy state uses the
-    // tri-state directly ([`note_provenance`]) so a registry outage (all
-    // UNKNOWN) cannot write a foreign note's serial into the permanent history.
-    matches!(
-        note_provenance(facts, registered_faucets, local_accounts, bridge_id),
-        Provenance::Foreign
-    )
-}
-
-/// TRI-STATE provenance of a consumed note (blocker #2). The old boolean
-/// `note_positively_foreign` collapsed OURS and UNKNOWN, which let a registry
-/// outage — where every note is UNKNOWN — treat foreign/unknown CLAIMs as ours
-/// and PERMANENTLY record their serials into the claim→MINT legitimacy history.
 /// The three states are handled asymmetrically at the call sites:
 ///
-/// - **OURS** — the only state that may WRITE durable legitimacy (Pass 1's
-///   claim→MINT identity history). Positive ours-evidence: a note reference
-///   (sender / consumer / `NetworkAccountTarget`) names our bridge, a
-///   registered faucet, or a known-local account, or a carried asset was
-///   issued by a registered faucet.
+/// - **OURS** — monitored as local traffic.
 /// - **FOREIGN** — the only state that may SKIP the value monitors. Requires a
 ///   per-type foreign proof AND that nothing of ours matched AND the registry
 ///   is available (so registered-faucet membership was actually checked).
 /// - **UNKNOWN** — the registry is unreadable, or the note carries no decodable
-///   provenance either way. Fully MONITORED, but writes NOTHING. A store outage
-///   can therefore make a monitor noisier (fail-closed) but never blinder
-///   (fail-open) and never pollutes the permanent history.
+///   provenance either way. Fully MONITORED. A store outage can therefore make
+///   a monitor noisier (fail-closed) but never blinder (fail-open).
 ///
-/// Registry-independent ours-evidence (our bridge / a known-local account) is
-/// honoured EVEN in the degraded (registry-unavailable) state, so our own
-/// CLAIMs (`sender == service`, `NetworkAccountTarget == our bridge`) keep
-/// writing legitimacy through a transient store hiccup, while a foreign claim
-/// in the same window is UNKNOWN and records nothing.
+/// Durable CLAIM conclusions do not use this classifier: they require the
+/// authoritative tracked consumer to be the local bridge account.
 ///
 /// Pure (no I/O, no metrics) so it is unit-testable directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provenance {
+enum Provenance {
     Ours,
     Foreign,
     Unknown,
 }
 
-pub fn note_provenance(
+fn note_provenance(
     facts: &NoteProvenanceFacts,
     registered_faucets: Option<&std::collections::HashSet<AccountId>>,
-    local_accounts: &std::collections::HashSet<AccountId>,
     bridge_id: AccountId,
 ) -> Provenance {
     let Some(registered) = registered_faucets else {
         // DEGRADED: registered-faucet membership can't be checked this tick.
         // Still positively identify OURS by registry-INDEPENDENT evidence
-        // (our bridge / a known-local account). Everything else is UNKNOWN —
-        // never FOREIGN (a store outage must not suppress a monitor) and never
-        // a spurious OURS (a foreign note must not write legitimacy).
-        let ours = |a: &AccountId| *a == bridge_id || local_accounts.contains(a);
+        // (our bridge). Everything else is UNKNOWN —
+        // never FOREIGN (a store outage must not suppress a monitor).
+        let ours = |a: &AccountId| *a == bridge_id;
         if facts.sender.as_ref().is_some_and(ours)
             || facts.consumer.as_ref().is_some_and(ours)
             || facts.attachment_target.as_ref().is_some_and(ours)
@@ -402,8 +369,7 @@ pub fn note_provenance(
         }
         return Provenance::Unknown;
     };
-    let ours =
-        |a: &AccountId| *a == bridge_id || registered.contains(a) || local_accounts.contains(a);
+    let ours = |a: &AccountId| *a == bridge_id || registered.contains(a);
     if facts.sender.as_ref().is_some_and(ours)
         || facts.consumer.as_ref().is_some_and(ours)
         || facts.attachment_target.as_ref().is_some_and(ours)
@@ -411,16 +377,22 @@ pub fn note_provenance(
     {
         return Provenance::Ours;
     }
+    // A known consumer is a locally tracked account. Even when it is no
+    // longer registered, keep the note monitored so #2 can report the stale
+    // or missing faucet registration instead of classifying it Foreign.
+    if facts.consumer.is_some() {
+        return Provenance::Unknown;
+    }
     let foreign = match facts.kind {
         // Bridge-emitted note types: the creator (sender) is the emitting
         // deployment's bridge. miden-client DROPS metadata on the
         // ConsumedExternal state transition, so externally-consumed records
         // often have no sender — the notes' other embedded references cover
-        // that shape: a MINT's `NetworkAccountTarget` names the intended
-        // faucet of ITS deployment (the reviewer's "embedded faucet
-        // provenance"), and a BURN's carried asset names the faucet that
-        // issued it. Any one positive non-ours reference proves foreignness.
-        MonitoredNoteKind::Mint => facts.sender.is_some() || facts.attachment_target.is_some(),
+        // that shape: a MINT's canonical storage and a BURN's carried asset
+        // name the faucet that issued the value. For MINT, require the storage
+        // faucet: the attachment is attacker-selectable and is itself what #2
+        // checks, so it cannot safely prove foreignness.
+        MonitoredNoteKind::Mint => !facts.asset_faucets.is_empty(),
         MonitoredNoteKind::Burn => facts.sender.is_some() || !facts.asset_faucets.is_empty(),
         // Bridge-executed note types: the NetworkAccountTarget names the
         // bridge that will consume them.
@@ -443,7 +415,7 @@ pub fn note_provenance(
 /// aggkit's registry — cross-faucet exploit against an unregistered faucet, or
 /// operator misregistration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MintTargetAlert {
+enum MintTargetAlert {
     /// Healthy — no #2 signal.
     None,
     /// Cantina #2 proper: the consuming faucet is not the faucet the MINT's
@@ -463,7 +435,7 @@ pub enum MintTargetAlert {
 /// `registered_faucets == None` (registry unavailable) suppresses ONLY the
 /// registry-membership signal — the consumer-vs-intended comparison needs no
 /// registry and still fires.
-pub fn mint_cross_faucet_alert(
+fn mint_cross_faucet_alert(
     intended_faucet: Option<AccountId>,
     consumer: Option<AccountId>,
     registered_faucets: Option<&std::collections::HashSet<AccountId>>,
@@ -512,7 +484,7 @@ const CLAIM_STORAGE_FELTS: usize = 569;
 /// claim's key corresponds to NO claim and is forged.
 ///
 /// Returns `None` for storage that is not CLAIM-shaped (wrong felt count).
-pub fn claim_expected_mint_serial(storage_items: &[miden_protocol::Felt]) -> Option<[u8; 32]> {
+fn claim_expected_mint_serial(storage_items: &[miden_protocol::Felt]) -> Option<[u8; 32]> {
     if storage_items.len() != CLAIM_STORAGE_FELTS {
         return None;
     }
@@ -529,23 +501,22 @@ const OFFSET_MIDEN_CLAIM_AMOUNT: usize = 568;
 /// Result of deriving a consumed CLAIM note's expected-MINT identity
 /// ([`claim_expected_mint_identity`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimMintDerivation {
+enum ClaimMintDerivation {
     /// Storage is not CLAIM-shaped / undecodable — nothing derivable.
     NotClaim,
     /// A NATIVE-faucet claim (origin network == this deployment's network id):
     /// it executes the P2ID unlock path and produces NO MINT, so it must NOT
     /// write a claim→MINT legitimacy entry (blocker #1).
     Native,
-    /// A non-native claim that produces exactly one MINT with this serial
-    /// (PROOF_DATA_KEY) and this full derivable identity.
+    /// A non-native claim and the canonical content of its derived MINT.
     NonNative {
         serial: [u8; 32],
         identity: crate::store::ExpectedMint,
     },
 }
 
-/// Derive, from a consumed CLAIM note's storage, the serial AND the FULL
-/// expected-MINT identity the claim legitimises (blocker #1). Persisting and
+/// Derive, from a consumed CLAIM note's storage, the serial and canonical
+/// expected-MINT content (blocker #1). Persisting and
 /// comparing this identity — not just the serial — is what stops a NoAuth
 /// forger from copying a public legitimate serial while changing the actual
 /// MINT (recipient / asset / amount / destination).
@@ -554,7 +525,7 @@ pub enum ClaimMintDerivation {
 /// decoded `LeafData.origin_network` equals it is a native-faucet claim (no
 /// MINT) and is reported as [`ClaimMintDerivation::Native`] so the caller
 /// records nothing.
-pub fn claim_expected_mint_identity(
+fn claim_expected_mint_identity(
     storage: &NoteStorage,
     local_network_id: u32,
 ) -> ClaimMintDerivation {
@@ -562,9 +533,11 @@ pub fn claim_expected_mint_identity(
     let Some(serial) = claim_expected_mint_serial(items) else {
         return ClaimMintDerivation::NotClaim;
     };
-    // Decode the LeafData deposit fields (origin/destination/amount) from the
-    // same offsets the claim watcher pins.
-    let decoded = match crate::claim_watcher::parse_claim_event_from_storage(storage) {
+    // Use the full U256-safe decoder. `parse_claim_event_from_storage` also
+    // decodes these fields, but deliberately rejects origin-chain amounts over
+    // u64 for the legacy event-store API. Such an amount may still scale to a
+    // perfectly valid Miden amount at felt 568 and produce a legitimate MINT.
+    let decoded = match crate::claim_watcher::parse_full_claim_from_storage(storage) {
         Ok(d) => d,
         Err(_) => return ClaimMintDerivation::NotClaim,
     };
@@ -582,17 +555,94 @@ pub fn claim_expected_mint_identity(
     ClaimMintDerivation::NonNative { serial, identity }
 }
 
-/// Extract the single fungible asset (faucet + Miden amount) an observed MINT
-/// note carries, for identity reconciliation. `None` when the record carries
-/// no fungible asset (e.g. a stripped external record) — the caller treats
-/// that as "can't determine", fail-closed with grace rather than an immediate
-/// forged page.
-pub fn observed_mint_fungible_asset(note: &InputNoteRecord) -> Option<(AccountId, u64)> {
-    note.details()
-        .assets()
-        .iter_fungible()
-        .next()
-        .map(|fa| (fa.faucet_id(), u64::from(fa.amount())))
+/// Semantic identity recovered from the canonical AggLayer MINT storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedMintIdentity {
+    faucet: AccountId,
+    amount: u64,
+    destination: AccountId,
+    callbacks: miden_protocol::asset::AssetCallbackFlag,
+}
+
+const MONITOR_CACHE_CAPACITY: usize = 100_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MintScanState {
+    target_alerted: bool,
+    forged_alerted: bool,
+}
+
+fn monitor_cache<V>() -> lru::LruCache<[u8; 32], V> {
+    lru::LruCache::new(
+        NonZeroUsize::new(MONITOR_CACHE_CAPACITY).expect("monitor cache capacity is non-zero"),
+    )
+}
+
+/// Stable key for the MINT fields available on `ConsumedExternal` records.
+/// Attachments are outside `NoteDetails`, so details commitment alone is not
+/// sufficient for monitor dedupe.
+fn mint_observation_key(note: &InputNoteRecord) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"miden-agglayer/mint-monitor/v1\0");
+    hasher.update(note.details_commitment().as_bytes());
+    hasher.update([note.attachments().num_attachments()]);
+    for attachment in note.attachments().iter() {
+        hasher.update(attachment.attachment_scheme().as_u16().to_be_bytes());
+        hasher.update(attachment.to_commitment().as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// Decode the real AggLayer MINT representation.
+///
+/// MINT notes have an empty outer `NoteAssets`; the standard MINT script reads
+/// the asset and the P2ID output recipient from its 22-felt public storage:
+///
+/// - `[0..4]` P2ID script root
+/// - `[4..8]` P2ID serial (the claim proof-data key)
+/// - `[8..12]` asset key, `[12..16]` asset value
+/// - `[16]` P2ID destination tag, `[17..20]` zero padding
+/// - `[20..22]` P2ID destination account (suffix, prefix)
+///
+/// Any non-canonical/undecodable shape returns `None` and is handled as
+/// `Undetermined` by #4; it is never accepted as legitimate.
+fn observed_mint_identity(note: &InputNoteRecord) -> Option<ObservedMintIdentity> {
+    use miden_protocol::asset::FungibleAsset;
+    use miden_protocol::note::NoteTag;
+    use miden_protocol::{Felt, Word};
+    use miden_standards::note::{MintNote, P2idNote, P2idNoteStorage};
+
+    if note.details().script().root() != MintNote::script_root()
+        || !note.details().assets().is_empty()
+    {
+        return None;
+    }
+    let items = note.details().storage().items();
+    if items.len() != 22 || items[..4] != *P2idNote::script_root().as_elements() {
+        return None;
+    }
+
+    let p2id_serial = Word::from(<[Felt; 4]>::try_from(&items[4..8]).ok()?);
+    if p2id_serial != note.details().recipient().serial_num() {
+        return None;
+    }
+
+    let key = Word::from(<[Felt; 4]>::try_from(&items[8..12]).ok()?);
+    let value = Word::from(<[Felt; 4]>::try_from(&items[12..16]).ok()?);
+    let asset = FungibleAsset::from_key_value_words(key, value).ok()?;
+    let destination = P2idNoteStorage::try_from(&items[20..22]).ok()?.target();
+    if items[16] != Felt::from(NoteTag::with_account_target(destination))
+        || items[17..20].iter().any(|felt| *felt != Felt::ZERO)
+    {
+        return None;
+    }
+
+    Some(ObservedMintIdentity {
+        faucet: asset.faucet_id(),
+        amount: u64::from(asset.amount()),
+        destination,
+        callbacks: asset.callbacks(),
+    })
 }
 
 // BRIDGE OUT SCANNER
@@ -626,43 +676,23 @@ pub struct BridgeOutScanner {
     /// fallback (recovery then relies solely on the all-Miden candidate, and
     /// gates if that does not validate).
     l1_rpc_url: Option<String>,
-    /// KNOWN-LOCAL non-faucet accounts this deployment creates in `init.rs`
-    /// (the service account and the `ger_manager`). These
-    /// are OURS but are neither the bridge nor a registered faucet, so without
-    /// this set the provenance predicate ([`note_positively_foreign`]) would
-    /// mislabel a real twin/burn note that one of these local flows created or
-    /// consumed as "foreign" and SUPPRESS the alert (fail-open — wrong for a
-    /// security monitor). Wired via [`Self::with_local_accounts`]; empty by
-    /// default so tests and call sites that don't supply it keep the
-    /// bridge+faucets-only behaviour.
-    local_accounts: std::collections::HashSet<AccountId>,
     /// Cantina #4 — how many consecutive sync ticks a consumed OURS-MINT may
     /// stay unmatched against the recorded claim→MINT-serial history before
     /// the forged-MINT alert fires. Absorbs cross-tick import ordering (the
     /// reconciler can surface a MINT a few sweep ticks before the CLAIM that
     /// produced it). Builder-overridable for tests.
     forged_mint_grace_ticks: u32,
-    /// Item-5 dedupe: foreign note ids already counted in the
-    /// `bridge_*_foreign_skipped_total` counters. In-memory on purpose — the
-    /// metric registry also resets on restart, so "counted once per process
-    /// lifetime" keeps the counters truthful as unique-note counts.
-    foreign_counted: parking_lot::Mutex<std::collections::HashSet<[u8; 32]>>,
-    /// Cantina #4 cache: MINT note ids whose serial was already found in the
-    /// claim history (skip the per-tick store lookup for the full consumed
-    /// set). In-memory: a restart re-checks each MINT once against the
-    /// persistent history and re-populates.
-    mint_recognised: parking_lot::Mutex<std::collections::HashSet<[u8; 32]>>,
-    /// Cantina #4 grace state: MINT note id → consecutive ticks its serial
-    /// was NOT in the claim history. In-memory: a restart restarts the grace
-    /// window (delays, never suppresses, the alert).
+    /// Bounded per-MINT hot state. The persistent claim history remains the
+    /// authority; eviction only causes a re-check (or a later repeat alert),
+    /// never acceptance of a mismatch.
+    mint_scan_state: parking_lot::Mutex<lru::LruCache<[u8; 32], MintScanState>>,
+    /// Short-lived #4 grace state. Entries are removed on match, mismatch, or
+    /// alert, so this contains only currently unresolved observations rather
+    /// than the full consumed-note history.
     forged_mint_pending: parking_lot::Mutex<std::collections::HashMap<[u8; 32], u32>>,
-    /// One-shot #2/#4 alert dedupe per MINT note id, per process. A restart
-    /// re-fires at most once per still-anomalous note (fail-closed: better a
-    /// repeated page after restart than a suppressed one).
-    mint_alerted: parking_lot::Mutex<std::collections::HashSet<[u8; 32]>>,
-    /// CLAIM note ids whose expected-MINT serial has been recorded into the
-    /// persistent claim history (skip re-hashing 536 felts per tick).
-    claim_serial_recorded: parking_lot::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// Bounded CLAIM hot set used only to avoid re-hashing historical storage.
+    /// Eviction safely falls back to the idempotent persistent write.
+    claim_serial_recorded: parking_lot::Mutex<lru::LruCache<[u8; 32], ()>>,
 }
 
 impl BridgeOutScanner {
@@ -692,20 +722,38 @@ impl BridgeOutScanner {
             ownership_probe_every_n_ticks: 5, // every 5 sync ticks (~30s at 6s/tick)
             tick_counter: std::sync::atomic::AtomicU32::new(0),
             l1_rpc_url: None,
-            local_accounts: std::collections::HashSet::new(),
             forged_mint_grace_ticks: 10, // ~60s at the 6s sync cadence
-            foreign_counted: parking_lot::Mutex::new(std::collections::HashSet::new()),
-            mint_recognised: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            mint_scan_state: parking_lot::Mutex::new(monitor_cache()),
             forged_mint_pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            mint_alerted: parking_lot::Mutex::new(std::collections::HashSet::new()),
-            claim_serial_recorded: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            claim_serial_recorded: parking_lot::Mutex::new(monitor_cache()),
         }
+    }
+
+    fn mint_state(&self, key: &[u8; 32]) -> MintScanState {
+        self.mint_scan_state
+            .lock()
+            .get(key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn update_mint_state(
+        &self,
+        key: [u8; 32],
+        update: impl FnOnce(&mut MintScanState),
+    ) -> MintScanState {
+        let mut cache = self.mint_scan_state.lock();
+        let mut state = cache.pop(&key).unwrap_or_default();
+        update(&mut state);
+        cache.put(key, state);
+        state
     }
 
     /// Override the Cantina #4 forged-MINT grace window (sync ticks a MINT may
     /// stay unmatched against the claim history before alerting). Tests drive
     /// this to small values for deterministic lifecycles.
-    pub fn with_forged_mint_grace_ticks(mut self, ticks: u32) -> Self {
+    #[cfg(test)]
+    fn with_forged_mint_grace_ticks(mut self, ticks: u32) -> Self {
         self.forged_mint_grace_ticks = ticks.max(1);
         self
     }
@@ -715,22 +763,6 @@ impl BridgeOutScanner {
     /// tests that don't need recovery stay unchanged.
     pub fn with_l1_rpc_url(mut self, l1_rpc_url: Option<String>) -> Self {
         self.l1_rpc_url = l1_rpc_url;
-        self
-    }
-
-    /// Register the KNOWN-LOCAL non-faucet accounts (the service account and
-    /// `ger_manager`) so the provenance predicate ([`note_positively_foreign`])
-    /// does NOT mislabel a note one of these local flows created or consumed
-    /// as foreign and suppress its monitors (fail-closed). Our own CLAIM
-    /// notes, in particular, carry `sender == service`.
-    /// Builder so existing call sites and tests stay unchanged. Accepts any
-    /// iterator of ids; `None` entries (unconfigured optional accounts like
-    /// `ger_manager`) should be filtered by the caller.
-    pub fn with_local_accounts(
-        mut self,
-        local_accounts: impl IntoIterator<Item = AccountId>,
-    ) -> Self {
-        self.local_accounts = local_accounts.into_iter().collect();
         self
     }
 
@@ -856,31 +888,25 @@ pub(crate) fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
 }
 
 /// Per-scan outcome of the monitor pass — returned so wiring tests can assert
-/// alert/skip decisions directly instead of scraping global metrics.
+/// alert decisions directly instead of scraping global metrics.
 #[derive(Debug, Default)]
-pub(crate) struct ScanOutcome {
+struct ScanOutcome {
     /// CLAIM note ids seen consumed this tick (fed to the Cantina #7
     /// expected-MINT tracker).
-    pub landed_claim_ids: std::collections::HashSet<[u8; 32]>,
-    /// Note ids skipped as positively-foreign FOR THE FIRST TIME this scan
-    /// (the `bridge_*_foreign_skipped_total` increments — item-5 dedupe means
-    /// re-scans of the same consumed set contribute nothing here).
-    pub foreign_skipped: Vec<[u8; 32]>,
+    landed_claim_ids: std::collections::HashSet<[u8; 32]>,
     /// Cantina #2 alerts fired this scan (MINT note ids; one-shot per note).
-    pub cross_faucet_alerts: Vec<[u8; 32]>,
+    cross_faucet_alerts: Vec<[u8; 32]>,
     /// Cantina #4 forged-MINT alerts fired this scan (one-shot per note).
-    pub forged_mint_alerts: Vec<[u8; 32]>,
-    /// Cantina #6 twin detections fired this scan.
-    pub twin_alerts: Vec<[u8; 32]>,
+    forged_mint_alerts: Vec<[u8; 32]>,
     /// `list_faucets()` failed → fail-closed: NOTHING was skipped as foreign
     /// this tick and the registry-membership #2 signal was suppressed.
-    pub registry_degraded: bool,
+    registry_degraded: bool,
 }
 
 impl BridgeOutScanner {
     /// Cantina #23 / #19 — client-free, **MONITOR-ONLY** pass over the
-    /// consumed-note set. Records every observed OURS note into the twin (#6)
-    /// and burn-serial (#5) trackers, maintains the Cantina #4 claim→MINT
+    /// consumed-note set. Preserves the existing all-note twin observation,
+    /// scopes the MINT (#2/#4) monitors, and maintains the Cantina #4 claim→MINT
     /// serial history and reconciles observed MINTs against it, evaluates the
     /// Cantina #2 mint-target predicate, emits the matching metrics/logs, and
     /// returns the per-scan [`ScanOutcome`] (including the consumed CLAIM ids
@@ -906,9 +932,9 @@ impl BridgeOutScanner {
         // Deployment scoping inputs. A `list_faucets()` failure is a DEGRADED
         // state, not an empty registry: collapsing it to an empty set would
         // classify OUR OWN registered faucets as foreign and silently suppress
-        // their twin/burn/mint observations (fail-open). Fail closed instead:
-        // `None` makes `note_positively_foreign` return false for everything,
-        // so every note stays monitored until the registry is readable again.
+        // their burn/mint observations (fail-open). Fail closed instead:
+        // without the registry, no note is classified Foreign, so every value
+        // monitor continues to run until the registry is readable again.
         let registered_faucets: Option<std::collections::HashSet<AccountId>> =
             match self.store.list_faucets().await {
                 Ok(v) => Some(v.into_iter().map(|f| f.faucet_id).collect()),
@@ -919,7 +945,7 @@ impl BridgeOutScanner {
                         target: "bridge_out::provenance",
                         error = ?e,
                         "faucet registry unreadable — provenance gates fail CLOSED this tick: \
-                         no monitor is suppressed, every consumed note is treated as ours; \
+                         no monitor is suppressed, unproven notes remain unknown; \
                          the registry-membership Cantina #2 signal is paused until the \
                          registry is readable again"
                     );
@@ -927,42 +953,29 @@ impl BridgeOutScanner {
                 }
             };
 
-        // ── Pass 1 — Cantina #4 claim history. Every consumed CLAIM
-        // POSITIVELY attributable to our deployment proves the legitimacy of
-        // exactly one future MINT: the one whose serial is the claim's
-        // PROOF_DATA_KEY, with the full derivable identity (amount / asset /
+        // ── Pass 1 — Cantina #4 claim history. Every CLAIM consumed by our
+        // tracked bridge account records the canonical
+        // future MINT whose serial is the claim's PROOF_DATA_KEY, with its
+        // derivable content (amount / asset /
         // destination — see `claim_expected_mint_identity`). Record that
         // identity into the PERSISTENT history BEFORE pass 2 reconciles MINTs,
         // so a CLAIM and its MINT surfacing in the same tick (or the full
         // historical set on a fresh boot) reconcile without a false forged
         // alert.
         //
-        // Blocker #2 (tri-state): ONLY `Provenance::Ours` may write legitimacy.
-        // A registry outage makes every unproven note `Unknown` (never a
-        // spurious ours), so a foreign/unknown CLAIM during the outage no
-        // longer pollutes the permanent history. Our own CLAIMs stay `Ours`
-        // through the outage via registry-independent evidence (sender ==
-        // service, NetworkAccountTarget == our bridge).
+        // Consumer attribution is required for this durable write. The
+        // NetworkAccountTarget is routing metadata and cannot authorize a
+        // claim history row on its own; miden-client retains `Some(bridge)` for
+        // notes consumed by our tracked bridge even in ConsumedExternal state.
         for note in consumed_notes {
             let facts = NoteProvenanceFacts::from_note(note);
-            if facts.kind != MonitoredNoteKind::Claim {
-                continue;
-            }
-            if note_provenance(
-                &facts,
-                registered_faucets.as_ref(),
-                &self.local_accounts,
-                self.bridge_account_id,
-            ) != Provenance::Ours
+            if facts.kind != MonitoredNoteKind::Claim
+                || facts.consumer != Some(self.bridge_account_id)
             {
-                // FOREIGN or UNKNOWN — must NOT whitelist a MINT serial in OUR
-                // history. Foreign: its MINT is skipped as foreign anyway.
-                // Unknown (incl. registry-outage): fail-closed — record
-                // nothing until the CLAIM is POSITIVELY ours.
                 continue;
             }
             let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
-            if self.claim_serial_recorded.lock().contains(&id_bytes) {
+            if self.claim_serial_recorded.lock().get(&id_bytes).is_some() {
                 continue;
             }
             let (serial, identity) =
@@ -971,9 +984,9 @@ impl BridgeOutScanner {
                     ClaimMintDerivation::NonNative { serial, identity } => (serial, identity),
                     ClaimMintDerivation::Native => {
                         // Native-faucet claim: P2ID unlock, NO MINT produced —
-                        // record NOTHING (blocker #1). Cache the note id so we
+                        // record NOTHING (blocker #1). Cache the observation key so we
                         // don't re-decode it every tick.
-                        self.claim_serial_recorded.lock().insert(id_bytes);
+                        self.claim_serial_recorded.lock().put(id_bytes, ());
                         continue;
                     }
                     ClaimMintDerivation::NotClaim => {
@@ -989,7 +1002,7 @@ impl BridgeOutScanner {
                 .await
             {
                 Ok(()) => {
-                    self.claim_serial_recorded.lock().insert(id_bytes);
+                    self.claim_serial_recorded.lock().put(id_bytes, ());
                 }
                 Err(e) => {
                     // Not cached on failure — retried next tick. Until it
@@ -1007,67 +1020,48 @@ impl BridgeOutScanner {
         // ── Pass 2 — per-note monitors.
         for note in consumed_notes {
             let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
+            if let Some(commitment_word) = note.commitment() {
+                let commitment_bytes: [u8; 32] = commitment_word.as_bytes();
+                // Keep the main-branch tracker ordering: every metadata-bearing
+                // consumed note is observed before deployment provenance gates.
+                match self.twin_notes.record(id_bytes, commitment_bytes).await {
+                    Ok(crate::twin_note_detector::Outcome::TwinDetected { prior_commitments }) => {
+                        metrics::counter!("bridge_twin_note_detected_total").increment(1);
+                        tracing::error!(
+                            target: "bridge_out::twin",
+                            note_id = ?note.details_commitment(),
+                            observed_commitment = %hex::encode(commitment_bytes),
+                            prior_count = prior_commitments.len(),
+                            "Cantina #6: twin NoteId observed — different metadata, same NoteId"
+                        );
+                    }
+                    Ok(crate::twin_note_detector::Outcome::New)
+                    | Ok(crate::twin_note_detector::Outcome::LegitimateDuplicate) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "bridge_out::twin",
+                            note_id = ?note.details_commitment(),
+                            error = ?e,
+                            "RD-913: twin-note tracker store failure; \
+                             continuing without classification"
+                        );
+                    }
+                }
+            }
             let facts = NoteProvenanceFacts::from_note(note);
             let foreign = matches!(
-                note_provenance(
-                    &facts,
-                    registered_faucets.as_ref(),
-                    &self.local_accounts,
-                    self.bridge_account_id,
-                ),
+                note_provenance(&facts, registered_faucets.as_ref(), self.bridge_account_id,),
                 Provenance::Foreign
             );
 
-            // Cantina #6 twin scoping (blocker #4). The twin attack is
-            // B2AGG-specific, and the ONLY foreign signal a B2AGG carries is
-            // its MUTABLE `NetworkAccountTarget` — the exact field an attacker
-            // rewrites to a foreign account to dodge the comparison. So a
-            // B2AGG is ALWAYS fed to the twin tracker, keyed on its STABLE
-            // NoteId: a foreign deployment's unrelated B2AGG just makes a
-            // harmless singleton (distinct NoteId), while a clone sharing a
-            // victim's NoteId is compared regardless of its attachment. Other
-            // kinds keep full foreign scoping (their foreign proof is
-            // creator/asset-based, not the mutable attachment).
-            let twin_tracked = matches!(facts.kind, MonitoredNoteKind::B2Agg) || !foreign;
-            if twin_tracked {
-                self.record_twin_observation(note, id_bytes, &mut outcome)
-                    .await;
-            }
-
-            if foreign {
+            if foreign && facts.kind == MonitoredNoteKind::Mint {
                 // Positively another deployment's note — excluded from the
-                // VALUE monitors (#2/#4/#5) so it can neither raise a false
-                // alert nor pollute the serial trackers. Item 5: each unique
-                // note id is counted ONCE per process (the consumed-note set is
-                // re-scanned in full every sync; without the dedupe the skip
-                // counters measured sync cadence, not foreign-note volume).
-                if self.foreign_counted.lock().insert(id_bytes) {
-                    // The twin-skip counter must reflect reality: a B2AGG we
-                    // still twin-track (above) was NOT skipped by the twin
-                    // monitor, so don't count it there.
-                    if !twin_tracked {
-                        metrics::counter!("bridge_twin_note_foreign_skipped_total").increment(1);
-                    }
-                    match facts.kind {
-                        MonitoredNoteKind::Mint => {
-                            metrics::counter!("bridge_mint_foreign_skipped_total").increment(1);
-                        }
-                        MonitoredNoteKind::Burn => {
-                            metrics::counter!("bridge_burn_foreign_skipped_total").increment(1);
-                        }
-                        _ => {}
-                    }
-                    tracing::debug!(
-                        target: "bridge_out::provenance",
-                        note_id = ?note.details_commitment(),
-                        kind = ?facts.kind,
-                        sender = ?facts.sender,
-                        attachment_target = ?facts.attachment_target,
-                        "consumed note positively attributed to a foreign deployment — \
-                         skipped by the value monitors"
-                    );
-                    outcome.foreign_skipped.push(id_bytes);
-                }
+                // local #2/#4 MINT monitors. No
+                // process-lifetime skip set is kept: this full-history scan
+                // must remain memory-bounded.
+                self.forged_mint_pending
+                    .lock()
+                    .remove(&mint_observation_key(note));
                 continue;
             }
 
@@ -1077,12 +1071,13 @@ impl BridgeOutScanner {
                 // MINT, so a CLAIM in the consumed-set is the proxy "MINT
                 // landed" signal for this proxy's expected-MINT tracker.
                 MonitoredNoteKind::Claim => {
-                    outcome.landed_claim_ids.insert(id_bytes);
+                    if facts.consumer == Some(self.bridge_account_id) {
+                        outcome.landed_claim_ids.insert(id_bytes);
+                    }
                 }
-                // Cantina #5 — BURN serial collision tracking (ours-only: a
-                // foreign deployment's BURN was skipped above so it cannot
-                // pollute our serial space).
-                MonitoredNoteKind::Burn => {
+                // Cantina #5 — unchanged from main. PR #123 does not alter
+                // the legacy BURN monitor's behavior or persistence model.
+                MonitoredNoteKind::Burn if note.commitment().is_some() => {
                     let serial = note.details().recipient().serial_num();
                     match self.burn_serials.record(serial.as_bytes()).await {
                         Ok(crate::burn_serial_tracker::Outcome::Duplicate) => {
@@ -1106,6 +1101,10 @@ impl BridgeOutScanner {
                         }
                     }
                 }
+                // Preserve main's defensive skip for incomplete BURN records.
+                // Claim/MINT reconciliation intentionally continues because
+                // ConsumedExternal records lose metadata after sync.
+                MonitoredNoteKind::Burn => {}
                 // Cantina #2 + #4 — MINT monitors, see `scan_mint_monitors`.
                 MonitoredNoteKind::Mint => {
                     self.scan_mint_monitors(
@@ -1130,7 +1129,9 @@ impl BridgeOutScanner {
             // invisible exit. Detect post-hoc: notes consumed by the bridge
             // account whose script root is in neither the B2AGG-out set nor
             // the CLAIM-in set are the MA#4 signature.
-            if note.consumer_account() == Some(self.bridge_account_id) {
+            if note.commitment().is_some()
+                && note.consumer_account() == Some(self.bridge_account_id)
+            {
                 let b2agg_root_bytes = B2AggNote::script_root().as_bytes();
                 let claim_root_bytes = miden_base_agglayer::ClaimNote::script().root().as_bytes();
                 let observed_bytes = note.details().script().root().as_bytes();
@@ -1163,61 +1164,6 @@ impl BridgeOutScanner {
         outcome
     }
 
-    /// Cantina #6 — feed one observed note's `(NoteId, commitment)` into the
-    /// twin detector. Same-NoteId-different-commitment (different metadata) is
-    /// the B2AGG twin attack signature.
-    ///
-    /// Blocker #4 (commitment-lost external record): the metadata-inclusive
-    /// `note.commitment()` exists only while the record retains metadata;
-    /// miden-client DROPS it on the `ConsumedExternal` transition (the exact
-    /// shape a foreign-consumed clone takes). Pre-fix, such records recorded
-    /// NOTHING, so the tracker never had the clone to compare. Now a
-    /// metadata-lost record still registers its NoteId under a STABLE sentinel
-    /// (the NoteId itself), so a later metadata-bearing observation with a
-    /// different commitment is still caught. A note is consumed exactly once
-    /// (one terminal state), so it contributes exactly one commitment — the
-    /// sentinel never false-twins the same note against itself; two genuinely
-    /// metadata-lost twins are indistinguishable by construction (no metadata
-    /// to differ), which no consumed-record monitor can resolve.
-    ///
-    /// RD-913: the tracker is store-backed + async; a transient store failure
-    /// must NOT panic the sync — log and continue.
-    async fn record_twin_observation(
-        &self,
-        note: &InputNoteRecord,
-        id_bytes: [u8; 32],
-        outcome: &mut ScanOutcome,
-    ) {
-        let commitment_bytes: [u8; 32] = match note.commitment() {
-            Some(c) => c.as_bytes(),
-            None => id_bytes, // stable fallback: register the NoteId presence
-        };
-        match self.twin_notes.record(id_bytes, commitment_bytes).await {
-            Ok(crate::twin_note_detector::Outcome::TwinDetected { prior_commitments }) => {
-                metrics::counter!("bridge_twin_note_detected_total").increment(1);
-                tracing::error!(
-                    target: "bridge_out::twin",
-                    note_id = ?note.details_commitment(),
-                    observed_commitment = %hex::encode(commitment_bytes),
-                    prior_count = prior_commitments.len(),
-                    "Cantina #6: twin NoteId observed — different metadata, same NoteId"
-                );
-                outcome.twin_alerts.push(id_bytes);
-            }
-            Ok(crate::twin_note_detector::Outcome::New)
-            | Ok(crate::twin_note_detector::Outcome::LegitimateDuplicate) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "bridge_out::twin",
-                    note_id = ?note.details_commitment(),
-                    error = ?e,
-                    "RD-913: twin-note tracker store failure; \
-                     continuing without classification"
-                );
-            }
-        }
-    }
-
     /// Cantina #2 + #4 for one consumed OURS MINT.
     ///
     /// **#2 (cross-faucet):** [`mint_cross_faucet_alert`] wires the
@@ -1240,7 +1186,7 @@ impl BridgeOutScanner {
     ///   [`Self::forged_mint_grace_ticks`] consecutive ticks (grace absorbs
     ///   cross-tick import ordering — the reconciler can surface a MINT before
     ///   its CLAIM).
-    /// - **serial ∈ history but identity MISMATCH** (amount / asset differ from
+    /// - **serial ∈ history but identity MISMATCH** (recipient / amount / asset differ from
     ///   the claim's derived expected MINT) → Forged IMMEDIATELY, no grace:
     ///   the serial is recorded, so there is no import-ordering excuse; the
     ///   copied-serial-different-MINT signature is positive.
@@ -1249,9 +1195,12 @@ impl BridgeOutScanner {
     /// This deliberately does NOT equate "forged" with "missing decodable
     /// NetworkAccountTarget": a forger can attach a perfectly valid target;
     /// what they cannot fabricate is a consumed CLAIM whose PROOF_DATA_KEY
-    /// equals their serial AND whose derived amount/asset equals theirs.
+    /// equals their serial AND whose derived recipient/amount/asset equals theirs.
     ///
-    /// Both alerts are one-shot per note id per process (`mint_alerted`).
+    /// Alert dedupe is best-effort per details-and-attachments observation in
+    /// a bounded cache.
+    /// It is intentionally not described as NoteId-based: externally consumed
+    /// records do not retain metadata or a nullifier.
     async fn scan_mint_monitors(
         &self,
         note: &InputNoteRecord,
@@ -1260,53 +1209,58 @@ impl BridgeOutScanner {
         registered_faucets: Option<&std::collections::HashSet<AccountId>>,
         outcome: &mut ScanOutcome,
     ) {
-        if self.mint_alerted.lock().contains(&id_bytes) {
-            return;
+        let state_key = mint_observation_key(note);
+        // Cantina #2 — the storage asset faucet is the authoritative consuming
+        // faucet: standard `mint_and_send` rejects unless the active faucet owns
+        // that asset key. Prefer it over miden-client's optional consumer
+        // attribution, which is often absent for externally consumed notes.
+        if !self.mint_state(&state_key).target_alerted {
+            let consuming_faucet = observed_mint_identity(note)
+                .map(|identity| identity.faucet)
+                .or(facts.consumer);
+            match mint_cross_faucet_alert(
+                facts.attachment_target,
+                consuming_faucet,
+                registered_faucets,
+                self.bridge_account_id,
+            ) {
+                MintTargetAlert::ConsumerMismatch {
+                    intended,
+                    consuming,
+                } => {
+                    metrics::counter!("bridge_mint_target_mismatch_total").increment(1);
+                    tracing::error!(
+                        target: "bridge_out::mint_attach",
+                        note_id = ?note.details_commitment(),
+                        intended_faucet = %intended,
+                        consuming_faucet = %consuming,
+                        "Cantina #2: MINT consumed by a faucet other than its \
+                         NetworkAccountTarget — cross-faucet exploit"
+                    );
+                    self.update_mint_state(state_key, |state| state.target_alerted = true);
+                    outcome.cross_faucet_alerts.push(id_bytes);
+                }
+                MintTargetAlert::UnregisteredTarget { intended } => {
+                    metrics::counter!("bridge_mint_target_mismatch_total").increment(1);
+                    tracing::error!(
+                        target: "bridge_out::mint_attach",
+                        note_id = ?note.details_commitment(),
+                        intended_faucet = %intended,
+                        "Cantina #2: MINT NetworkAccountTarget points at a faucet \
+                         not in aggkit's registry — possible cross-faucet exploit \
+                         or misregistered faucet"
+                    );
+                    self.update_mint_state(state_key, |state| state.target_alerted = true);
+                    outcome.cross_faucet_alerts.push(id_bytes);
+                }
+                MintTargetAlert::None => {}
+            }
         }
-        // Cantina #2 — consuming faucet vs the MINT's declared target.
-        match mint_cross_faucet_alert(
-            facts.attachment_target,
-            facts.consumer,
-            registered_faucets,
-            self.bridge_account_id,
-        ) {
-            MintTargetAlert::ConsumerMismatch {
-                intended,
-                consuming,
-            } => {
-                metrics::counter!("bridge_mint_target_mismatch_total").increment(1);
-                tracing::error!(
-                    target: "bridge_out::mint_attach",
-                    note_id = ?note.details_commitment(),
-                    intended_faucet = %intended,
-                    consuming_faucet = %consuming,
-                    "Cantina #2: MINT consumed by a faucet other than its \
-                     NetworkAccountTarget — cross-faucet exploit"
-                );
-                self.mint_alerted.lock().insert(id_bytes);
-                outcome.cross_faucet_alerts.push(id_bytes);
-                return;
-            }
-            MintTargetAlert::UnregisteredTarget { intended } => {
-                metrics::counter!("bridge_mint_target_mismatch_total").increment(1);
-                tracing::error!(
-                    target: "bridge_out::mint_attach",
-                    note_id = ?note.details_commitment(),
-                    intended_faucet = %intended,
-                    "Cantina #2: MINT NetworkAccountTarget points at a faucet \
-                     not in aggkit's registry — possible cross-faucet exploit \
-                     or misregistered faucet"
-                );
-                self.mint_alerted.lock().insert(id_bytes);
-                outcome.cross_faucet_alerts.push(id_bytes);
-                return;
-            }
-            MintTargetAlert::None => {}
+        let state = self.mint_state(&state_key);
+        if state.forged_alerted {
+            return;
         }
         // Cantina #4 — reconcile against the recorded claim→MINT IDENTITY.
-        if self.mint_recognised.lock().contains(&id_bytes) {
-            return;
-        }
         let serial: [u8; 32] = note.details().recipient().serial_num().as_bytes();
         match self.store.claim_mint_expected_get(&serial).await {
             Ok(Some(expected)) => {
@@ -1314,8 +1268,7 @@ impl BridgeOutScanner {
                 // MINT's derivable identity matches (blocker #1).
                 match self.observed_mint_matches_expected(note, &expected).await {
                     MintIdentityCheck::Match => {
-                        self.mint_recognised.lock().insert(id_bytes);
-                        self.forged_mint_pending.lock().remove(&id_bytes);
+                        self.forged_mint_pending.lock().remove(&state_key);
                     }
                     MintIdentityCheck::Mismatch {
                         field,
@@ -1326,8 +1279,10 @@ impl BridgeOutScanner {
                         // import-ordering excuse — a MINT reusing a recorded
                         // serial with different details is the copied-serial
                         // forgery signature.
-                        self.forged_mint_pending.lock().remove(&id_bytes);
-                        self.mint_alerted.lock().insert(id_bytes);
+                        self.forged_mint_pending.lock().remove(&state_key);
+                        self.update_mint_state(state_key, |state| {
+                            state.forged_alerted = true;
+                        });
                         metrics::counter!("bridge_forged_mint_total", "reason" => "detail_mismatch")
                             .increment(1);
                         tracing::error!(
@@ -1349,13 +1304,20 @@ impl BridgeOutScanner {
                         // immediately page — accrue grace like the unmatched
                         // path so a transient shape doesn't false-fire but a
                         // persistent one eventually alerts (fail-closed).
-                        self.accrue_forged_grace(note, id_bytes, &serial, facts, outcome);
+                        self.accrue_forged_grace(
+                            note,
+                            state_key,
+                            id_bytes,
+                            &serial,
+                            "identity_undetermined",
+                            outcome,
+                        );
                     }
                 }
             }
             Ok(None) => {
                 // serial ∉ history — unmatched; forged after the grace window.
-                self.accrue_forged_grace(note, id_bytes, &serial, facts, outcome);
+                self.accrue_forged_grace(note, state_key, id_bytes, &serial, "no_claim", outcome);
             }
             Err(e) => {
                 tracing::warn!(
@@ -1369,40 +1331,113 @@ impl BridgeOutScanner {
         }
     }
 
-    /// Compare an observed MINT's derivable identity against the recorded
-    /// expected identity for its serial. Same-representation fields only:
-    /// - **amount** — the MINT's fungible-asset amount vs the claim's
-    ///   `miden_claim_amount` (always compared).
-    /// - **asset faucet** — the MINT's fungible-asset faucet vs the wrapped
-    ///   faucet the recorded origin token resolves to via the registry
-    ///   (compared only when the registry resolves the origin; otherwise the
-    ///   amount binding stands alone — fail-open on the faucet dimension so a
-    ///   not-yet-registered wrapped faucet can't false-page).
+    /// Compare an observed MINT's canonical storage identity against the
+    /// expected identity derived from its claim. Amount and P2ID recipient are
+    /// compared directly. The asset faucet is compared only after the origin
+    /// route resolves; a missing/failed registry lookup is `Undetermined` and
+    /// retried, never accepted and cached as legitimate.
     async fn observed_mint_matches_expected(
         &self,
         note: &InputNoteRecord,
         expected: &crate::store::ExpectedMint,
     ) -> MintIdentityCheck {
-        let Some((faucet, amount)) = observed_mint_fungible_asset(note) else {
+        if !note.details().assets().is_empty() {
+            return MintIdentityCheck::Mismatch {
+                field: "outer_assets",
+                expected: "0".to_string(),
+                observed: note.details().assets().num_assets().to_string(),
+            };
+        }
+        let Some(observed) = observed_mint_identity(note) else {
             return MintIdentityCheck::Undetermined;
         };
-        if amount != expected.minted_amount {
+        if observed.amount != expected.minted_amount {
             return MintIdentityCheck::Mismatch {
                 field: "minted_amount",
                 expected: expected.minted_amount.to_string(),
-                observed: amount.to_string(),
+                observed: observed.amount.to_string(),
             };
         }
-        if let Ok(Some(f)) = self
+        if observed.callbacks != miden_protocol::asset::AssetCallbackFlag::Enabled {
+            return MintIdentityCheck::Mismatch {
+                field: "asset_callbacks",
+                expected: "Enabled".to_string(),
+                observed: format!("{:?}", observed.callbacks),
+            };
+        }
+        // Mirror `bridge_in.masm`: the claim converts the 20-byte leaf
+        // destination directly with `eth_address::to_account_id`. Proxy-side
+        // address mappings cannot affect this on-chain output.
+        let Some(expected_destination) = crate::address_mapper::account_id_from_address(
+            alloy::primitives::Address::from(expected.destination_address),
+        ) else {
+            return MintIdentityCheck::Undetermined;
+        };
+        if observed.destination != expected_destination {
+            return MintIdentityCheck::Mismatch {
+                field: "destination_account",
+                expected: expected_destination.to_string(),
+                observed: observed.destination.to_string(),
+            };
+        }
+
+        let expected_faucet = match self
             .store
             .get_faucet_by_origin(&expected.origin_address, expected.origin_network)
             .await
-            && f.faucet_id != faucet
         {
+            Ok(Some(faucet)) => faucet.faucet_id,
+            Ok(None) => return MintIdentityCheck::Undetermined,
+            Err(error) => {
+                tracing::warn!(
+                    target: "bridge_out::forged_mint",
+                    origin_network = expected.origin_network,
+                    origin_address = %hex::encode(expected.origin_address),
+                    error = ?error,
+                    "expected-MINT faucet lookup failed; leaving identity undetermined"
+                );
+                return MintIdentityCheck::Undetermined;
+            }
+        };
+        if observed.faucet != expected_faucet {
             return MintIdentityCheck::Mismatch {
                 field: "asset_faucet",
-                expected: f.faucet_id.to_string(),
-                observed: faucet.to_string(),
+                expected: expected_faucet.to_string(),
+                observed: observed.faucet.to_string(),
+            };
+        }
+
+        // `bridge_in_output.masm` creates exactly one routing attachment for
+        // the MINT: NetworkAccountTarget(expected_faucet, Always). Attachments
+        // are outside NoteDetails, so bind them explicitly rather than
+        // accepting a storage-identical note with altered routing metadata.
+        if note.attachments().num_attachments() != 1 {
+            return MintIdentityCheck::Mismatch {
+                field: "routing_attachment_count",
+                expected: "1".to_string(),
+                observed: note.attachments().num_attachments().to_string(),
+            };
+        }
+        let Ok(target) = miden_standards::note::NetworkAccountTarget::try_from(note.attachments())
+        else {
+            return MintIdentityCheck::Mismatch {
+                field: "routing_attachment",
+                expected: format!("NetworkAccountTarget({expected_faucet}, Always)"),
+                observed: "undecodable".to_string(),
+            };
+        };
+        if target.target_id() != expected_faucet {
+            return MintIdentityCheck::Mismatch {
+                field: "routing_target",
+                expected: expected_faucet.to_string(),
+                observed: target.target_id().to_string(),
+            };
+        }
+        if target.execution_hint() != miden_standards::note::NoteExecutionHint::Always {
+            return MintIdentityCheck::Mismatch {
+                field: "routing_execution_hint",
+                expected: "Always".to_string(),
+                observed: format!("{:?}", target.execution_hint()),
             };
         }
         MintIdentityCheck::Match
@@ -1415,36 +1450,42 @@ impl BridgeOutScanner {
     fn accrue_forged_grace(
         &self,
         note: &InputNoteRecord,
+        state_key: [u8; 32],
         id_bytes: [u8; 32],
         serial: &[u8; 32],
-        facts: &NoteProvenanceFacts,
+        reason: &'static str,
         outcome: &mut ScanOutcome,
     ) {
         let ticks = {
             let mut pending = self.forged_mint_pending.lock();
-            let t = pending.entry(id_bytes).or_insert(0);
-            *t += 1;
-            *t
+            let ticks = pending.entry(state_key).or_insert(0);
+            *ticks = ticks.saturating_add(1);
+            *ticks
         };
-        if ticks >= self.forged_mint_grace_ticks
-            && matches!(
-                crate::forged_mint_detector::classify_observed_mint(false),
-                crate::forged_mint_detector::MintAttribution::Forged
-            )
-        {
-            self.forged_mint_pending.lock().remove(&id_bytes);
-            self.mint_alerted.lock().insert(id_bytes);
-            metrics::counter!("bridge_forged_mint_total", "reason" => "no_claim").increment(1);
-            tracing::error!(
-                target: "bridge_out::forged_mint",
-                note_id = ?note.details_commitment(),
-                serial = %hex::encode(serial),
-                intended_faucet = ?facts.attachment_target,
-                grace_ticks = ticks,
-                "Cantina #4: MINT note matches NO aggkit-recorded claim \
-                 (serial ∉ claim PROOF_DATA_KEY history) — forged via \
-                 NoAuth bridge note authorship"
-            );
+        if ticks >= self.forged_mint_grace_ticks {
+            self.forged_mint_pending.lock().remove(&state_key);
+            self.update_mint_state(state_key, |state| state.forged_alerted = true);
+            metrics::counter!("bridge_forged_mint_total", "reason" => reason).increment(1);
+            if reason == "no_claim" {
+                tracing::error!(
+                    target: "bridge_out::forged_mint",
+                    note_id = ?note.details_commitment(),
+                    serial = %hex::encode(serial),
+                    grace_ticks = ticks,
+                    "Cantina #4: MINT note matches NO aggkit-recorded claim \
+                     (serial ∉ claim PROOF_DATA_KEY history) — forged via \
+                     NoAuth bridge note authorship"
+                );
+            } else {
+                tracing::error!(
+                    target: "bridge_out::forged_mint",
+                    note_id = ?note.details_commitment(),
+                    serial = %hex::encode(serial),
+                    grace_ticks = ticks,
+                    "Cantina #4: a recorded claim exists, but its expected MINT \
+                     identity could not be reconciled after the grace window"
+                );
+            }
             outcome.forged_mint_alerts.push(id_bytes);
         }
     }
@@ -1479,7 +1520,7 @@ impl SyncListener for BridgeOutScanner {
             .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
         // Cantina #23 + #19 — the per-note pass is MONITOR-ONLY: it records into
-        // the twin (#6) / burn-serial (#5) / forged-MINT (#2/#4) trackers and
+        // the twin (#6) / forged-MINT (#2/#4) trackers and
         // emits metrics, and returns the CLAIM ids seen consumed (for the #7
         // expected-MINT tracker). It NEVER advances `latest_block_number` nor
         // writes a BridgeEvent — the pre-redesign scanner did both here, once per
@@ -2103,7 +2144,7 @@ mod tests {
         );
     }
 
-    // NOTE-PROVENANCE — Cantina #2 / #4 / #5 / #6 deployment-scoping tests
+    // NOTE-PROVENANCE — Cantina #2 / #4 deployment-scoping tests
     // ============================================================================================
 
     use crate::store::Store as _;
@@ -2166,98 +2207,102 @@ mod tests {
     /// bridge/faucet accounts are ordinarily `None`. Neither direction may be
     /// used as a foreign proof:
     ///  - `None` consumer + no content proof → monitored (was already true),
-    ///  - `Some(non-ours)` consumer + no content proof → STILL monitored
-    ///    (the first cut skipped here — a real twin consumed by any tracked
-    ///    non-ours account was suppressed).
+    ///  - `Some(non-ours)` consumer + no content proof → STILL monitored.
     #[test]
     fn consumer_attribution_alone_is_never_a_foreign_proof() {
         let ids = prov_ids();
         let reg = registry(&[ids.faucet_a]);
-        let locals = std::collections::HashSet::new();
         for consumer in [None, Some(ids.foreign_faucet)] {
             let f = facts(MonitoredNoteKind::Other, None, None, &[], consumer);
             assert!(
-                !note_positively_foreign(&f, Some(&reg), &locals, ids.bridge),
+                !matches!(
+                    note_provenance(&f, Some(&reg), ids.bridge),
+                    Provenance::Foreign
+                ),
                 "a note with no content-positive foreign proof must stay monitored \
                  (consumer = {consumer:?})"
             );
         }
     }
 
-    /// A foreign deployment's MINT/BURN prove their provenance via `sender`
-    /// (the bridge MASM creates them from the emitting bridge account) and,
-    /// for BURN, the burned asset's faucet id. CLAIM/B2AGG prove it via the
-    /// `NetworkAccountTarget` naming the executing bridge — including the
-    /// shared-chain reconciler-import shape with `consumer == None`.
+    /// A foreign deployment's MINT/BURN prove provenance through their asset
+    /// faucet (canonical storage for MINT, outer assets for BURN). CLAIM/B2AGG
+    /// prove it via the `NetworkAccountTarget` naming the executing bridge —
+    /// including the reconciler-import shape with `consumer == None`.
     #[test]
     fn foreign_notes_positively_identified_by_content() {
         let ids = prov_ids();
         let reg = registry(&[ids.faucet_a]);
-        let locals = registry(&[ids.local_service]);
 
         // Foreign MINT: sender = foreign bridge, target = foreign faucet.
-        assert!(note_positively_foreign(
-            &facts(
-                MonitoredNoteKind::Mint,
-                Some(ids.foreign_bridge),
-                Some(ids.foreign_faucet),
-                &[],
-                None
+        assert_eq!(
+            note_provenance(
+                &facts(
+                    MonitoredNoteKind::Mint,
+                    Some(ids.foreign_bridge),
+                    Some(ids.foreign_faucet),
+                    &[ids.foreign_faucet],
+                    None,
+                ),
+                Some(&reg),
+                ids.bridge,
             ),
-            Some(&reg),
-            &locals,
-            ids.bridge
-        ));
+            Provenance::Foreign
+        );
         // Foreign BURN: burned asset issued by the foreign faucet.
-        assert!(note_positively_foreign(
-            &facts(
-                MonitoredNoteKind::Burn,
-                Some(ids.foreign_bridge),
-                None,
-                &[ids.foreign_faucet],
-                None
+        assert_eq!(
+            note_provenance(
+                &facts(
+                    MonitoredNoteKind::Burn,
+                    Some(ids.foreign_bridge),
+                    None,
+                    &[ids.foreign_faucet],
+                    None,
+                ),
+                Some(&reg),
+                ids.bridge,
             ),
-            Some(&reg),
-            &locals,
-            ids.bridge
-        ));
+            Provenance::Foreign
+        );
         // Foreign CLAIM, consumer None (reconciler-imported, foreign bridge
         // untracked) — the exact shared-chain false-positive path.
-        assert!(note_positively_foreign(
-            &facts(
-                MonitoredNoteKind::Claim,
-                Some(ids.foreign_service),
-                Some(ids.foreign_bridge),
-                &[],
-                None
+        assert_eq!(
+            note_provenance(
+                &facts(
+                    MonitoredNoteKind::Claim,
+                    Some(ids.foreign_service),
+                    Some(ids.foreign_bridge),
+                    &[],
+                    None,
+                ),
+                Some(&reg),
+                ids.bridge,
             ),
-            Some(&reg),
-            &locals,
-            ids.bridge
-        ));
+            Provenance::Foreign
+        );
         // Foreign B2AGG targeting the foreign bridge.
-        assert!(note_positively_foreign(
-            &facts(
-                MonitoredNoteKind::B2Agg,
-                None,
-                Some(ids.foreign_bridge),
-                &[],
-                None
+        assert_eq!(
+            note_provenance(
+                &facts(
+                    MonitoredNoteKind::B2Agg,
+                    None,
+                    Some(ids.foreign_bridge),
+                    &[],
+                    None,
+                ),
+                Some(&reg),
+                ids.bridge,
             ),
-            Some(&reg),
-            &locals,
-            ids.bridge
-        ));
+            Provenance::Foreign
+        );
     }
 
-    /// Every OURS reference keeps a note monitored, whichever field carries
-    /// it — including the Copilot #16 regression (local non-faucet accounts)
-    /// and undecodable-field fail-closed shapes.
+    /// Every OURS reference keeps a note monitored, and undecodable shapes
+    /// fail closed.
     #[test]
     fn ours_references_and_undecodable_fields_stay_monitored() {
         let ids = prov_ids();
         let reg = registry(&[ids.faucet_a]);
-        let locals = registry(&[ids.local_service]);
         let cases = [
             // Our bridge minted it (includes the forged-MINT shape: the forger
             // MUST spoof sender == our bridge to pass the faucet owner check).
@@ -2270,6 +2315,15 @@ mod tests {
             ),
             // Targeting a registered faucet.
             facts(MonitoredNoteKind::Mint, None, Some(ids.faucet_a), &[], None),
+            // A foreign-looking attachment without a decodable storage asset
+            // is not enough to suppress the value monitors.
+            facts(
+                MonitoredNoteKind::Mint,
+                None,
+                Some(ids.foreign_faucet),
+                &[],
+                None,
+            ),
             // BURN of a registered faucet's asset.
             facts(
                 MonitoredNoteKind::Burn,
@@ -2278,7 +2332,7 @@ mod tests {
                 &[ids.faucet_a],
                 None,
             ),
-            // Our CLAIM: sender == service (local account) — Copilot #16.
+            // A CLAIM with no target is unknown, so it stays monitored.
             facts(
                 MonitoredNoteKind::Claim,
                 Some(ids.local_service),
@@ -2307,7 +2361,10 @@ mod tests {
         ];
         for f in &cases {
             assert!(
-                !note_positively_foreign(f, Some(&reg), &locals, ids.bridge),
+                !matches!(
+                    note_provenance(f, Some(&reg), ids.bridge),
+                    Provenance::Foreign
+                ),
                 "must stay monitored: {f:?}"
             );
         }
@@ -2321,7 +2378,6 @@ mod tests {
     #[test]
     fn registry_unavailable_is_never_a_skip() {
         let ids = prov_ids();
-        let locals = std::collections::HashSet::new();
         let blatantly_foreign = facts(
             MonitoredNoteKind::Mint,
             Some(ids.foreign_bridge),
@@ -2329,12 +2385,10 @@ mod tests {
             &[ids.foreign_faucet],
             Some(ids.foreign_faucet),
         );
-        assert!(!note_positively_foreign(
-            &blatantly_foreign,
-            None,
-            &locals,
-            ids.bridge
-        ));
+        assert_eq!(
+            note_provenance(&blatantly_foreign, None, ids.bridge),
+            Provenance::Unknown
+        );
     }
 
     /// Cantina #2 — the ACTUAL finding is `consuming_faucet != intended_faucet`
@@ -2546,69 +2600,64 @@ mod tests {
         InputNoteRecord::new(details, attachments, None, state)
     }
 
-    fn mint_note(
-        serial: miden_protocol::Word,
-        sender: Option<AccountId>,
-        attachment_target: Option<AccountId>,
-        consumer: Option<AccountId>,
-    ) -> InputNoteRecord {
-        build_monitor_note(
-            miden_standards::note::MintNote::script(),
-            NoteStorage::new(vec![]).unwrap(),
-            NoteAssets::new(vec![]).unwrap(),
-            serial,
-            sender,
-            attachment_target,
-            consumer,
-        )
+    fn embedded_address(account: AccountId) -> [u8; 20] {
+        miden_base_agglayer::EthEmbeddedAccountId::from(account).into()
     }
 
-    /// CLAIM-script note with valid 569-felt storage; returns the note and
-    /// the MINT serial WORD its consumption legitimises (the PROOF_DATA_KEY).
-    fn claim_note_with_storage(
-        seed: u32,
-        sender: Option<AccountId>,
-        attachment_target: Option<AccountId>,
-        consumer: Option<AccountId>,
-    ) -> (InputNoteRecord, miden_protocol::Word) {
-        use miden_protocol::Felt;
-        let items: Vec<Felt> = (0..CLAIM_STORAGE_FELTS as u32)
-            .map(|i| Felt::from(i.wrapping_add(seed)))
-            .collect();
-        let serial_word: miden_protocol::Word =
-            miden_protocol::Hasher::hash_elements(&items[..CLAIM_PROOF_DATA_FELTS]);
-        assert_eq!(
-            claim_expected_mint_serial(&items),
-            Some(serial_word.as_bytes()),
-            "helper must derive the same key as the production fn"
-        );
-        let note = build_monitor_note(
-            miden_base_agglayer::ClaimNote::script(),
-            NoteStorage::new(items).unwrap(),
-            NoteAssets::new(vec![]).unwrap(),
-            miden_protocol::Word::from([seed.wrapping_add(11); 4].map(Felt::from)),
-            sender,
-            attachment_target,
-            consumer,
-        );
-        (note, serial_word)
-    }
-
-    /// A MINT-script note carrying a single fungible asset (faucet + amount),
-    /// the live shape the Cantina #4 identity reconciler compares.
+    /// A canonical AggLayer MINT: empty outer assets and the fungible asset +
+    /// public P2ID output recipient encoded in the real 22-felt storage.
     fn mint_note_with_asset(
         serial: miden_protocol::Word,
         faucet: AccountId,
         amount: u64,
+        destination: AccountId,
         sender: Option<AccountId>,
         attachment_target: Option<AccountId>,
         consumer: Option<AccountId>,
     ) -> InputNoteRecord {
-        let asset = miden_protocol::asset::FungibleAsset::new(faucet, amount).unwrap();
+        mint_note_with_callbacks(
+            serial,
+            faucet,
+            amount,
+            destination,
+            miden_protocol::asset::AssetCallbackFlag::Enabled,
+            sender,
+            attachment_target,
+            consumer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mint_note_with_callbacks(
+        serial: miden_protocol::Word,
+        faucet: AccountId,
+        amount: u64,
+        destination: AccountId,
+        callbacks: miden_protocol::asset::AssetCallbackFlag,
+        sender: Option<AccountId>,
+        attachment_target: Option<AccountId>,
+        consumer: Option<AccountId>,
+    ) -> InputNoteRecord {
+        use miden_protocol::asset::FungibleAsset;
+        use miden_protocol::note::{NoteStorage, NoteTag};
+        use miden_standards::note::{MintNoteStorage, P2idNoteStorage};
+
+        let asset = FungibleAsset::new(faucet, amount)
+            .unwrap()
+            .with_callbacks(callbacks);
+        let p2id_recipient = P2idNoteStorage::new(destination).into_recipient(serial);
+        let storage = NoteStorage::from(
+            MintNoteStorage::new_public(
+                p2id_recipient,
+                asset,
+                miden_protocol::Felt::from(NoteTag::with_account_target(destination)),
+            )
+            .unwrap(),
+        );
         build_monitor_note(
             miden_standards::note::MintNote::script(),
-            NoteStorage::new(vec![]).unwrap(),
-            NoteAssets::new(vec![asset.into()]).unwrap(),
+            storage,
+            NoteAssets::new(vec![]).unwrap(),
             serial,
             sender,
             attachment_target,
@@ -2616,15 +2665,41 @@ mod tests {
         )
     }
 
-    /// A REALISTIC CLAIM note built from an actual `ClaimNoteStorage` so it
-    /// round-trips through the production `parse_claim_event_from_storage`
-    /// decoder. Returns the note, the derived expected-MINT serial WORD, and
-    /// the `ExpectedMint` identity the scanner should record for it.
+    /// A realistic CLAIM note built from actual `ClaimNoteStorage`.
     #[allow(clippy::too_many_arguments)]
     fn claim_note_realistic(
         origin_network: u32,
         origin_addr: [u8; 20],
         dest_addr: [u8; 20],
+        miden_amount: u64,
+        sender: Option<AccountId>,
+        attachment_target: Option<AccountId>,
+        consumer: Option<AccountId>,
+    ) -> (
+        InputNoteRecord,
+        miden_protocol::Word,
+        crate::store::ExpectedMint,
+    ) {
+        let mut amount_bytes = [0u8; 32];
+        amount_bytes[24..].copy_from_slice(&miden_amount.to_be_bytes());
+        claim_note_realistic_with_raw_amount(
+            origin_network,
+            origin_addr,
+            dest_addr,
+            amount_bytes,
+            miden_amount,
+            sender,
+            attachment_target,
+            consumer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claim_note_realistic_with_raw_amount(
+        origin_network: u32,
+        origin_addr: [u8; 20],
+        dest_addr: [u8; 20],
+        raw_amount: [u8; 32],
         miden_amount: u64,
         sender: Option<AccountId>,
         attachment_target: Option<AccountId>,
@@ -2640,12 +2715,6 @@ mod tests {
         };
         use miden_protocol::Felt;
 
-        // L1 amount = miden_amount here (scale doesn't matter for the monitor;
-        // only miden_claim_amount is compared against the MINT). Keep it ≤ u32
-        // so the watcher's overflow guard is satisfied.
-        let mut amount_bytes = [0u8; 32];
-        amount_bytes[28..32].copy_from_slice(&(miden_amount as u32).to_be_bytes());
-
         let storage = ClaimNoteStorage {
             proof_data: ProofData {
                 smt_proof_local_exit_root: [SmtNode::new([0u8; 32]); 32],
@@ -2659,7 +2728,7 @@ mod tests {
                 origin_token_address: EthAddress::new(origin_addr),
                 destination_network: 7,
                 destination_address: EthAddress::new(dest_addr),
-                amount: EthAmount::new(amount_bytes),
+                amount: EthAmount::new(raw_amount),
                 metadata_hash: MetadataHash::from_abi_encoded(&[]),
             },
             miden_claim_amount: Felt::new(miden_amount).unwrap(),
@@ -2694,11 +2763,13 @@ mod tests {
         BridgeOutScanner,
     ) {
         let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
-        for f in faucets {
+        for (index, f) in faucets.iter().enumerate() {
+            let mut origin_address = [0u8; 20];
+            origin_address[19] = u8::try_from(index).expect("small test faucet set");
             concrete
                 .register_faucet(crate::store::FaucetEntry {
                     faucet_id: *f,
-                    origin_address: [0u8; 20],
+                    origin_address,
                     origin_network: 0,
                     symbol: "ETH".into(),
                     origin_decimals: 18,
@@ -2713,72 +2784,322 @@ mod tests {
         (concrete, BridgeOutScanner::new(store, 7, bridge))
     }
 
+    #[test]
+    fn canonical_mint_storage_decodes_asset_and_p2id_recipient() {
+        let ids = prov_ids();
+        let serial = miden_protocol::Word::from([miden_protocol::Felt::from(7u32); 4]);
+        let note = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            5_000,
+            ids.local_service,
+            None,
+            Some(ids.faucet_a),
+            None,
+        );
+        assert!(
+            note.details().assets().is_empty(),
+            "standard MINT notes have no outer assets"
+        );
+        assert_eq!(note.details().storage().num_items(), 22);
+        assert_eq!(
+            observed_mint_identity(&note),
+            Some(ObservedMintIdentity {
+                faucet: ids.faucet_a,
+                amount: 5_000,
+                destination: ids.local_service,
+                callbacks: miden_protocol::asset::AssetCallbackFlag::Enabled,
+            })
+        );
+        assert!(
+            NoteProvenanceFacts::from_note(&note)
+                .asset_faucets
+                .contains(&ids.faucet_a),
+            "MINT storage faucet must participate in provenance"
+        );
+    }
+
+    #[test]
+    fn claim_identity_accepts_raw_u256_over_u64_when_scaled_amount_is_valid() {
+        let ids = prov_ids();
+        let mut raw_amount = [0u8; 32];
+        raw_amount[20] = 1; // 2^88: over u64, valid claimAsset uint256.
+        let (claim, serial, _) = claim_note_realistic_with_raw_amount(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            raw_amount,
+            5_000,
+            None,
+            Some(ids.bridge),
+            None,
+        );
+        assert!(matches!(
+            claim_expected_mint_identity(claim.details().storage(), 7),
+            ClaimMintDerivation::NonNative {
+                serial: observed,
+                identity: crate::store::ExpectedMint { minted_amount: 5_000, .. }
+            } if observed == serial.as_bytes()
+        ));
+    }
+
+    #[tokio::test]
+    async fn mint_identity_binds_destination_and_never_accepts_missing_registry() {
+        let ids = prov_ids();
+        let (_store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        let serial = miden_protocol::Word::from([miden_protocol::Felt::from(9u32); 4]);
+        let expected = crate::store::ExpectedMint {
+            minted_amount: 5_000,
+            destination_address: embedded_address(ids.local_service),
+            origin_network: 0,
+            origin_address: [0; 20],
+        };
+        let matching = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            5_000,
+            ids.local_service,
+            None,
+            Some(ids.faucet_a),
+            None,
+        );
+        assert_eq!(
+            scanner
+                .observed_mint_matches_expected(&matching, &expected)
+                .await,
+            MintIdentityCheck::Match
+        );
+
+        let outer_asset = miden_protocol::asset::FungibleAsset::new(ids.faucet_a, 1)
+            .unwrap()
+            .into();
+        let outer_details = PNoteDetails::new(
+            NoteAssets::new(vec![outer_asset]).unwrap(),
+            matching.details().recipient().clone(),
+        );
+        let non_empty_outer = InputNoteRecord::new(
+            outer_details,
+            matching.attachments().clone(),
+            matching.created_at(),
+            matching.state().clone(),
+        );
+        assert!(matches!(
+            scanner
+                .observed_mint_matches_expected(&non_empty_outer, &expected)
+                .await,
+            MintIdentityCheck::Mismatch {
+                field: "outer_assets",
+                ..
+            }
+        ));
+
+        let callbacks_disabled = mint_note_with_callbacks(
+            serial,
+            ids.faucet_a,
+            5_000,
+            ids.local_service,
+            miden_protocol::asset::AssetCallbackFlag::Disabled,
+            None,
+            Some(ids.faucet_a),
+            None,
+        );
+        assert!(matches!(
+            scanner
+                .observed_mint_matches_expected(&callbacks_disabled, &expected)
+                .await,
+            MintIdentityCheck::Mismatch {
+                field: "asset_callbacks",
+                ..
+            }
+        ));
+
+        let missing_route = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            5_000,
+            ids.local_service,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            scanner
+                .observed_mint_matches_expected(&missing_route, &expected)
+                .await,
+            MintIdentityCheck::Mismatch {
+                field: "routing_attachment_count",
+                ..
+            }
+        ));
+
+        let delayed_attachment = NoteAttachment::from(
+            miden_standards::note::NetworkAccountTarget::new(
+                ids.faucet_a,
+                miden_standards::note::NoteExecutionHint::None,
+            )
+            .unwrap(),
+        );
+        let delayed_route = InputNoteRecord::new(
+            matching.details().clone(),
+            NoteAttachments::from(delayed_attachment),
+            matching.created_at(),
+            matching.state().clone(),
+        );
+        assert!(matches!(
+            scanner
+                .observed_mint_matches_expected(&delayed_route, &expected)
+                .await,
+            MintIdentityCheck::Mismatch {
+                field: "routing_execution_hint",
+                ..
+            }
+        ));
+
+        let extra_routes = NoteAttachments::new(vec![
+            NoteAttachment::from(
+                miden_standards::note::NetworkAccountTarget::new(
+                    ids.faucet_a,
+                    miden_standards::note::NoteExecutionHint::Always,
+                )
+                .unwrap(),
+            ),
+            NoteAttachment::from(
+                miden_standards::note::NetworkAccountTarget::new(
+                    ids.faucet_b,
+                    miden_standards::note::NoteExecutionHint::Always,
+                )
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+        let extra_route = InputNoteRecord::new(
+            matching.details().clone(),
+            extra_routes,
+            matching.created_at(),
+            matching.state().clone(),
+        );
+        assert!(matches!(
+            scanner
+                .observed_mint_matches_expected(&extra_route, &expected)
+                .await,
+            MintIdentityCheck::Mismatch {
+                field: "routing_attachment_count",
+                ..
+            }
+        ));
+
+        let wrong_route = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            5_000,
+            ids.local_service,
+            None,
+            Some(ids.faucet_b),
+            None,
+        );
+        assert!(matches!(
+            scanner
+                .observed_mint_matches_expected(&wrong_route, &expected)
+                .await,
+            MintIdentityCheck::Mismatch {
+                field: "routing_target",
+                ..
+            }
+        ));
+
+        let wrong_recipient = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            5_000,
+            ids.foreign_service,
+            None,
+            Some(ids.faucet_a),
+            None,
+        );
+        assert!(matches!(
+            scanner
+                .observed_mint_matches_expected(&wrong_recipient, &expected)
+                .await,
+            MintIdentityCheck::Mismatch {
+                field: "destination_account",
+                ..
+            }
+        ));
+
+        let unresolved = crate::store::ExpectedMint {
+            origin_network: 99,
+            origin_address: [0x42; 20],
+            ..expected
+        };
+        assert_eq!(
+            scanner
+                .observed_mint_matches_expected(&matching, &unresolved)
+                .await,
+            MintIdentityCheck::Undetermined,
+            "an unresolved origin route must retry, never become cached legitimacy"
+        );
+    }
+
     /// A foreign deployment's tag-0 MINT (sender = foreign bridge, target =
     /// foreign faucet, consumer untracked) reaching the scanner must be
-    /// skipped by EVERY monitor — counted once (item 5) — and must never
-    /// enter the twin tracker.
+    /// skipped by the deployment-scoped value monitors.
     ///
     /// RED pin (first cut): with consumer == None this note was NOT
-    /// `note_positively_foreign`, entered the twin tracker, and its
-    /// unregistered intended faucet raised a false Cantina #2 page.
+    /// classified foreign and its unregistered intended faucet raised a false
+    /// Cantina #2 page.
     #[tokio::test]
-    async fn wiring_foreign_mint_skipped_once_by_all_monitors() {
+    async fn wiring_foreign_mint_skipped_by_all_monitors() {
         let ids = prov_ids();
-        let (concrete, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        let (_concrete, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
 
         // Live shape: reconciler-imported + externally consumed → metadata
         // (sender) dropped, consumer untracked. Provenance comes from the
-        // MINT's embedded NetworkAccountTarget: the foreign faucet.
-        let note = mint_note(
+        // canonical MINT storage asset issued by the foreign faucet.
+        let note = mint_note_with_asset(
             miden_protocol::Word::default(),
+            ids.foreign_faucet,
+            100,
+            ids.foreign_service,
             None,
             Some(ids.foreign_faucet),
             None,
         );
-        let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
-
         let out = scanner
             .scan_consumed_notes_monitors(std::slice::from_ref(&note))
             .await;
-        assert_eq!(out.foreign_skipped, vec![id_bytes], "skipped + counted");
         assert!(out.cross_faucet_alerts.is_empty(), "no false Cantina #2");
         assert!(out.forged_mint_alerts.is_empty(), "no false Cantina #4");
-        assert!(
-            concrete
-                .twin_note_commitments(&id_bytes)
-                .await
-                .unwrap()
-                .is_empty(),
-            "foreign note must not pollute the twin tracker"
-        );
-
-        // Item 5 — the full consumed set is re-scanned every sync; the same
-        // foreign note contributes to the skip counters exactly once.
+        // The full consumed set is re-scanned every sync; the same foreign
+        // note remains excluded without retaining an unbounded dedupe set.
         for _ in 0..3 {
             let again = scanner
                 .scan_consumed_notes_monitors(std::slice::from_ref(&note))
                 .await;
-            assert!(
-                again.foreign_skipped.is_empty(),
-                "foreign note must be counted once, not once per sync"
-            );
+            assert!(again.cross_faucet_alerts.is_empty());
+            assert!(again.forged_mint_alerts.is_empty());
         }
     }
 
-    /// A foreign CLAIM (consumer None — the reconciler-import shape) is
-    /// skipped, does not feed the #7 landed set, and does NOT whitelist its
-    /// PROOF_DATA_KEY in OUR claim→MINT history.
+    /// Routing metadata alone cannot authorize a durable claim conclusion.
+    /// Even with NetworkAccountTarget == our bridge, consumer=None must not
+    /// feed #7 or the claim→MINT history.
     #[tokio::test]
-    async fn wiring_foreign_claim_skipped_and_not_recorded() {
+    async fn wiring_claim_attachment_without_local_consumer_records_nothing() {
         let ids = prov_ids();
         let (concrete, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
-        let (note, serial) = claim_note_with_storage(3, None, Some(ids.foreign_bridge), None);
-        let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
+        let (note, serial, _) = claim_note_realistic(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            5000,
+            None,
+            Some(ids.bridge),
+            None,
+        );
 
         let out = scanner
             .scan_consumed_notes_monitors(std::slice::from_ref(&note))
             .await;
-        assert_eq!(out.foreign_skipped, vec![id_bytes]);
         assert!(out.landed_claim_ids.is_empty());
         assert!(
             concrete
@@ -2786,7 +3107,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "a foreign claim must not legitimise a MINT identity in OUR history"
+            "routing metadata without local consumption must not write claim history"
         );
     }
 
@@ -2797,14 +3118,17 @@ mod tests {
         let ids = prov_ids();
         let (_concrete, scanner) =
             scanner_with_faucets(&[ids.faucet_a, ids.faucet_b], ids.bridge).await;
-        // Live shape: MINTs are consumed by network faucets (externally),
-        // so the record carries no sender metadata; the consuming faucet is
-        // attributed because our client tracks it.
-        let note = mint_note(
+        // Live externally-consumed shape: sender and consumer attribution are
+        // both absent. The canonical storage binds the real consuming faucet
+        // (B), while the attachment claims A.
+        let note = mint_note_with_asset(
             miden_protocol::Word::default(),
+            ids.faucet_b,
+            100,
+            ids.local_service,
             None,
             Some(ids.faucet_a),
-            Some(ids.faucet_b),
+            None,
         );
         let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
 
@@ -2817,6 +3141,36 @@ mod tests {
             .scan_consumed_notes_monitors(std::slice::from_ref(&note))
             .await;
         assert!(again.cross_faucet_alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_mint_can_alert_for_target_mismatch_and_forgery() {
+        let ids = prov_ids();
+        let (_store, scanner) =
+            scanner_with_faucets(&[ids.faucet_a, ids.faucet_b], ids.bridge).await;
+        let scanner = scanner.with_forged_mint_grace_ticks(1);
+        let note = mint_note_with_asset(
+            miden_protocol::Word::default(),
+            ids.faucet_b,
+            100,
+            ids.local_service,
+            None,
+            Some(ids.faucet_a),
+            None,
+        );
+        let id: [u8; 32] = note.details_commitment().as_bytes();
+
+        let out = scanner
+            .scan_consumed_notes_monitors(std::slice::from_ref(&note))
+            .await;
+        assert_eq!(out.cross_faucet_alerts, vec![id]);
+        assert_eq!(out.forged_mint_alerts, vec![id]);
+
+        let again = scanner
+            .scan_consumed_notes_monitors(std::slice::from_ref(&note))
+            .await;
+        assert!(again.cross_faucet_alerts.is_empty());
+        assert!(again.forged_mint_alerts.is_empty());
     }
 
     /// Cantina #4 wired end-to-end: an OURS MINT (sender == our bridge — the
@@ -2835,22 +3189,30 @@ mod tests {
         // MINT whose serial is that claim's PROOF_DATA_KEY carrying the SAME
         // 5000 units.
         let (claim, legit_serial, _identity) = claim_note_realistic(
-            99,
-            [0x11; 20],
-            [0x22; 20],
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
             5000,
             None,
             Some(ids.bridge),
-            None,
+            Some(ids.bridge),
         );
         let legit_mint = mint_note_with_asset(
             legit_serial,
             ids.faucet_a,
             5000,
+            ids.local_service,
             None,
             Some(ids.faucet_a),
             Some(ids.faucet_a),
         );
+        let altered_route = InputNoteRecord::new(
+            legit_mint.details().clone(),
+            NoteAttachments::default(),
+            legit_mint.created_at(),
+            legit_mint.state().clone(),
+        );
+        let legit_id: [u8; 32] = legit_mint.details_commitment().as_bytes();
         // Forged: aimed at our registered faucet (OURS by target — the NoAuth
         // forgery must reference our deployment to drain it) but matching no
         // recorded claim.
@@ -2858,6 +3220,7 @@ mod tests {
             miden_protocol::Word::from([miden_protocol::Felt::from(99u32); 4]),
             ids.faucet_a,
             1234,
+            ids.local_service,
             None,
             Some(ids.faucet_a),
             Some(ids.faucet_a),
@@ -2880,6 +3243,13 @@ mod tests {
         // Tick 3+: one-shot.
         let out = scanner.scan_consumed_notes_monitors(&notes).await;
         assert!(out.forged_mint_alerts.is_empty(), "one-shot per note id");
+
+        // Attachments are outside NoteDetails. A canonical observation must
+        // not cache-recognise a later same-details note with altered routing.
+        let out = scanner
+            .scan_consumed_notes_monitors(std::slice::from_ref(&altered_route))
+            .await;
+        assert_eq!(out.forged_mint_alerts, vec![legit_id]);
     }
 
     /// Blocker #1 — a MINT reusing a RECORDED claim's serial but with DIFFERENT
@@ -2894,19 +3264,20 @@ mod tests {
 
         // Legit non-native claim → records identity {amount: 5000, ...}.
         let (claim, serial, _identity) = claim_note_realistic(
-            99,
-            [0x11; 20],
-            [0x22; 20],
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
             5000,
             None,
             Some(ids.bridge),
-            None,
+            Some(ids.bridge),
         );
         // A forger copies the recorded serial but mints a DIFFERENT amount.
         let forged = mint_note_with_asset(
             serial,
             ids.faucet_a,
             9999, // ≠ 5000
+            ids.local_service,
             None,
             Some(ids.faucet_a),
             Some(ids.faucet_a),
@@ -2944,11 +3315,11 @@ mod tests {
         let (claim, serial, _identity) = claim_note_realistic(
             7,
             [0x11; 20],
-            [0x22; 20],
+            embedded_address(ids.local_service),
             5000,
             None,
             Some(ids.bridge),
-            None,
+            Some(ids.bridge),
         );
 
         let out = scanner
@@ -2981,9 +3352,9 @@ mod tests {
         // non-native storage, in the reconciler-import (metadata-lost) shape.
         // During the outage it is UNKNOWN, not OURS.
         let (claim, serial, _identity) = claim_note_realistic(
-            99,
-            [0x11; 20],
-            [0x22; 20],
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
             5000,
             None,
             Some(ids.foreign_bridge),
@@ -3008,42 +3379,30 @@ mod tests {
 
     /// Item 3 wired end-to-end: a `list_faucets()` failure must not suppress
     /// any monitor. The same blatantly-foreign MINT that is skipped with a
-    /// healthy registry is MONITORED (twin-tracked, not skip-counted) while
-    /// the registry is unreadable, and the registry-membership #2 signal is
-    /// paused rather than false-firing.
+    /// healthy registry is monitored (not skip-counted) while the registry is
+    /// unreadable, and the registry-membership #2 signal is paused rather than
+    /// false-firing.
     #[tokio::test]
     async fn wiring_registry_failure_fails_closed() {
         let ids = prov_ids();
         let (concrete, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
         concrete.set_fail_list_faucets(true);
 
-        // Metadata-carrying shape (so the twin tracker CAN record it) that a
-        // healthy registry classifies foreign: sender = foreign bridge,
-        // target = foreign faucet.
-        let note = mint_note(
+        // A canonical MINT that a healthy registry classifies foreign by its
+        // storage asset faucet.
+        let note = mint_note_with_asset(
             miden_protocol::Word::default(),
-            Some(ids.foreign_bridge),
+            ids.foreign_faucet,
+            100,
+            ids.foreign_service,
+            None,
             Some(ids.foreign_faucet),
-            Some(ids.foreign_faucet),
+            None,
         );
-        let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
-
         let out = scanner
             .scan_consumed_notes_monitors(std::slice::from_ref(&note))
             .await;
         assert!(out.registry_degraded, "degraded state must be surfaced");
-        assert!(
-            out.foreign_skipped.is_empty(),
-            "fail-CLOSED: nothing may be skipped while the registry is unreadable"
-        );
-        assert!(
-            !concrete
-                .twin_note_commitments(&id_bytes)
-                .await
-                .unwrap()
-                .is_empty(),
-            "the note stays MONITORED (twin-tracked) in the degraded state"
-        );
         assert!(
             out.cross_faucet_alerts.is_empty(),
             "registry-membership #2 signal pauses (cannot be evaluated) — no page storm"
@@ -3056,183 +3415,30 @@ mod tests {
             .scan_consumed_notes_monitors(std::slice::from_ref(&note))
             .await;
         assert!(!out.registry_degraded);
-        assert_eq!(out.foreign_skipped, vec![id_bytes]);
+        assert!(out.cross_faucet_alerts.is_empty());
+        assert!(out.forged_mint_alerts.is_empty());
     }
 
-    /// Cantina #6 wired end-to-end with an ACTUAL twin: two OURS notes with
-    /// the same NoteId (details commitment) but different metadata →
-    /// different note commitment → TwinDetected on the second observation.
+    /// A known consumer is locally tracked even when its faucet registration
+    /// is missing. Keep the MINT monitored so #2 reports the stale registry.
     #[tokio::test]
-    async fn wiring_actual_twin_detected_for_ours_notes() {
-        let ids = prov_ids();
-        let (concrete, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
-
-        // Same details (script/storage/serial ⇒ same NoteId), different
-        // SENDER metadata ⇒ different commitment. Both OURS via the
-        // NetworkAccountTarget naming our bridge.
-        let user_1 = ids.foreign_service; // any two distinct senders work —
-        let user_2 = ids.foreign_faucet; //  ours-ness comes from the target
-        let mk = |sender: AccountId| {
-            build_monitor_note(
-                B2AggNote::script(),
-                NoteStorage::new(vec![miden_protocol::Felt::from(0u32); 6]).unwrap(),
-                NoteAssets::new(vec![]).unwrap(),
-                miden_protocol::Word::default(),
-                Some(sender),
-                Some(ids.bridge),
-                Some(ids.bridge),
-            )
-        };
-        let n1 = mk(user_1);
-        let n2 = mk(user_2);
-        let id_bytes: [u8; 32] = n1.details_commitment().as_bytes();
-        assert_eq!(id_bytes, n2.details_commitment().as_bytes(), "same NoteId");
-        assert_ne!(n1.commitment(), n2.commitment(), "different commitments");
-
-        let out = scanner
-            .scan_consumed_notes_monitors(std::slice::from_ref(&n1))
-            .await;
-        assert!(out.twin_alerts.is_empty(), "first sighting is not a twin");
-        let out = scanner
-            .scan_consumed_notes_monitors(std::slice::from_ref(&n2))
-            .await;
-        assert_eq!(
-            out.twin_alerts,
-            vec![id_bytes],
-            "second commitment under the same NoteId is the Cantina #6 signature"
-        );
-        assert_eq!(
-            concrete
-                .twin_note_commitments(&id_bytes)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-
-    /// Blocker #4 — the twin comparison must not be evadable by mutating the
-    /// (attacker-controlled) NetworkAccountTarget. A B2AGG clone sharing a
-    /// victim's stable NoteId but pointing its attachment at a FOREIGN account
-    /// is classified foreign-by-attachment, yet it must STILL reach the twin
-    /// tracker and trip Cantina #6. Deleting the B2AGG twin-scoping carve-out
-    /// (letting the attachment scope the clone out) makes this FAIL.
-    #[tokio::test]
-    async fn blocker4_mutated_attachment_clone_still_twin_detected() {
+    async fn wiring_tracked_unregistered_faucet_alerts() {
         let ids = prov_ids();
         let (_concrete, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
-
-        let storage = || NoteStorage::new(vec![miden_protocol::Felt::from(0u32); 6]).unwrap();
-        // Victim's OURS B2AGG: attachment names our bridge, sender = user 1.
-        let victim = build_monitor_note(
-            B2AggNote::script(),
-            storage(),
-            NoteAssets::new(vec![]).unwrap(),
+        let note = mint_note_with_asset(
             miden_protocol::Word::default(),
-            Some(ids.foreign_service),
-            Some(ids.bridge),
-            Some(ids.bridge),
-        );
-        // Attacker's clone: SAME details (⇒ same NoteId) but attachment target
-        // rewritten to a FOREIGN account and a different sender (⇒ different
-        // commitment). Foreign-by-attachment — the evasion vector.
-        let clone = build_monitor_note(
-            B2AggNote::script(),
-            storage(),
-            NoteAssets::new(vec![]).unwrap(),
-            miden_protocol::Word::default(),
-            Some(ids.foreign_faucet),
-            Some(ids.foreign_bridge),
-            Some(ids.foreign_service),
-        );
-        let id_bytes: [u8; 32] = victim.details_commitment().as_bytes();
-        assert_eq!(
-            id_bytes,
-            clone.details_commitment().as_bytes(),
-            "same NoteId"
-        );
-
-        let out = scanner
-            .scan_consumed_notes_monitors(std::slice::from_ref(&victim))
-            .await;
-        assert!(out.twin_alerts.is_empty(), "first sighting is not a twin");
-        let out = scanner
-            .scan_consumed_notes_monitors(std::slice::from_ref(&clone))
-            .await;
-        assert_eq!(
-            out.twin_alerts,
-            vec![id_bytes],
-            "the mutated-attachment clone must still trip the twin monitor"
-        );
-    }
-
-    /// Blocker #4 — the metadata-lost external-record shape (miden-client drops
-    /// the commitment on `ConsumedExternal`) must not silently record NOTHING.
-    /// The NoteId is registered under a stable fallback, so a later
-    /// metadata-bearing observation with a different commitment is still
-    /// caught. Deleting the commitment-lost fallback makes this FAIL (the first
-    /// observation records nothing, so the second is a benign `New`).
-    #[tokio::test]
-    async fn blocker4_commitment_lost_external_record_still_registers() {
-        let ids = prov_ids();
-        let (concrete, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
-
-        let storage = || NoteStorage::new(vec![miden_protocol::Felt::from(1u32); 6]).unwrap();
-        // External record: sender = None ⇒ ConsumedExternal ⇒ commitment() None.
-        let external = build_monitor_note(
-            B2AggNote::script(),
-            storage(),
-            NoteAssets::new(vec![]).unwrap(),
-            miden_protocol::Word::default(),
+            ids.unregistered,
+            100,
+            ids.local_service,
             None,
-            Some(ids.bridge),
-            None,
-        );
-        assert!(
-            external.commitment().is_none(),
-            "external record must have no metadata-inclusive commitment"
-        );
-        let id_bytes: [u8; 32] = external.details_commitment().as_bytes();
-
-        let out = scanner
-            .scan_consumed_notes_monitors(std::slice::from_ref(&external))
-            .await;
-        assert!(out.twin_alerts.is_empty(), "first sighting is not a twin");
-        // The NoteId WAS registered despite the missing commitment.
-        assert_eq!(
-            concrete
-                .twin_note_commitments(&id_bytes)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "metadata-lost external record must still register its NoteId"
+            Some(ids.unregistered),
+            Some(ids.unregistered),
         );
 
-        // A later metadata-bearing observation with a DIFFERENT commitment is
-        // caught as a twin.
-        let bearing = build_monitor_note(
-            B2AggNote::script(),
-            storage(),
-            NoteAssets::new(vec![]).unwrap(),
-            miden_protocol::Word::default(),
-            Some(ids.foreign_service),
-            Some(ids.bridge),
-            Some(ids.bridge),
-        );
-        assert_eq!(
-            id_bytes,
-            bearing.details_commitment().as_bytes(),
-            "same NoteId"
-        );
         let out = scanner
-            .scan_consumed_notes_monitors(std::slice::from_ref(&bearing))
+            .scan_consumed_notes_monitors(std::slice::from_ref(&note))
             .await;
-        assert_eq!(
-            out.twin_alerts,
-            vec![id_bytes],
-            "a metadata-bearing observation after a metadata-lost one trips the twin monitor"
-        );
+        assert_eq!(out.cross_faucet_alerts.len(), 1);
     }
 
     /// Build a minimal B2AGG `InputNoteRecord` in a chosen consumed state for

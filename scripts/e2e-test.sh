@@ -53,12 +53,6 @@ case "$test_filter" in
         # tests (it needs the steady-state reconciler/projector, no restarts).
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         echo ""
-        # Same foreign-deployment machinery, MINT path: a foreign deployment
-        # minting must not raise a false Cantina #2/#4 alert on our monitors.
-        # Steady-state (no restarts) — keep it with the claim-provenance test,
-        # before the restart tests.
-        "$SCRIPT_DIR/e2e-mint-monitor-provenance.sh"
-        echo ""
         # Proxy-restarting tests run LAST (they must not race the other
         # scripts' steady-state assumptions), in this order: the cursor test
         # does a plain restart and asserts the sweep RESUMES from the
@@ -162,9 +156,6 @@ case "$test_filter" in
     claim-provenance)
         "$SCRIPT_DIR/e2e-claim-provenance.sh"
         ;;
-    mint-monitor-provenance)
-        "$SCRIPT_DIR/e2e-mint-monitor-provenance.sh"
-        ;;
     manual-user-claim)
         "$SCRIPT_DIR/e2e-manual-user-claim.sh"
         ;;
@@ -204,7 +195,7 @@ case "$test_filter" in
         ;;
     *)
         echo -e "${RED}Unknown test: $test_filter${NC}" >&2
-        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|ger-l1-verification|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|mint-monitor-provenance|manual-user-claim|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
+        echo "Usage: $0 [all|tip-consistency|l1-to-l2|l2-to-l1|dynamic-erc20|cantina13|cantina10|ger-decomposition|ger-l1-verification|security|cantina12-getlogs-returns-all|cantina6-faucet-identity-restore|fuzz|reconciler-private-note|reconciler-cursor|ger-atomic|claim-provenance|l2l2|l2l2-forward|l2l2-clash|l2l2-back]" >&2
         echo "       (l2l2 is optional and not part of 'all' — it needs the docker-compose.l2l2.yml overlay)" >&2
         exit 1
         ;;
