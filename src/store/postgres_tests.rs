@@ -967,6 +967,62 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());
     // ClaimEvent dedup query finds the row.
     assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+
+    // ── Reviewer concern #2 (write-before-seal): the atomic must NOT advance the tip. ──
+    // `insert_pending_claim_calldata` leaves a PENDING envelope; the atomic finalises that
+    // receipt AND emits the ClaimEvent, but sealing block N is the projector's job at
+    // end-of-block (`project_block_notes`). If the atomic — or a stray `txn_commit` in the
+    // claim path — advanced `latest_block_number` mid-block, aggkit could scan a partial
+    // block N and permanently miss its later logs. (Invisible to the in-memory store, whose
+    // `txn_commit` never touches the tip — this is the Postgres-only half of the fix.)
+    let before = store.get_latest_block_number().await.unwrap();
+    let seal_block = before + 50_000; // strictly above the current tip
+    let seal_hash: TxHash = {
+        let mut h = [0u8; 32];
+        h[..16].copy_from_slice(&(now_ns + 5).to_be_bytes());
+        TxHash::from(h)
+    };
+    let seal_hash_str = format!("{seal_hash:#x}");
+    let seal_note = format!("claim_seal_note_{now_ns}");
+    let seal_gi = {
+        let mut g = [0u8; 32];
+        g[..16].copy_from_slice(&(now_ns + 6).to_be_bytes());
+        g
+    };
+    // A pending envelope under `seal_hash` (exactly what insert_pending_claim_calldata leaves).
+    store.txn_begin(seal_hash, dummy_txn_entry()).await.unwrap();
+    assert!(
+        store.txn_receipt(seal_hash).await.unwrap().is_none(),
+        "pending before the atomic finalises it"
+    );
+    store
+        .commit_manual_claim_event_atomic(
+            seal_note,
+            "0xbridge",
+            seal_block,
+            [0u8; 32],
+            &seal_hash_str,
+            seal_gi,
+            0,
+            &[0u8; 20],
+            &[0u8; 20],
+            42,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.get_latest_block_number().await.unwrap() < seal_block,
+        "the atomic ClaimEvent commit must NOT seal the block — only project_block_notes \
+         advances latest_block_number, at end-of-block (write-before-seal)"
+    );
+    // The linked receipt IS finalised together with the ClaimEvent, at the claim's block.
+    let (res, blk) = store
+        .txn_receipt(seal_hash)
+        .await
+        .unwrap()
+        .expect("the linked receipt is finalised inline by the atomic");
+    assert!(res.is_ok());
+    assert_eq!(blk, seal_block, "receipt block == ClaimEvent block");
 }
 
 /// Audit H1/H3 — a reservation assigns the index before the atomic BridgeEvent commit.
@@ -2312,4 +2368,78 @@ async fn cantina7_pg_reservation_and_emitted_accounting() {
         .await
         .unwrap();
     assert_eq!(dc2, i1, "index stable across retry");
+}
+
+/// Review blocker 4 — the DERIVED hash must survive a real PG store→decode round-trip.
+/// A synthetic claim tx is stored under its derived hash (keccak(tag||note_id), NOT an RLP
+/// hash) while PG persists only EIP-2718/RLP bytes; txn_get decodes and the envelope's hash
+/// is RECOMPUTED as the RLP hash. `to_rpc_transaction` MUST re-assert the store key so a
+/// client that fetched by the derived hash gets back `.hash == derived hash`.
+#[tokio::test]
+async fn cantina136_derived_hash_survives_pg_round_trip() {
+    use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
+    use alloy::primitives::TxKind;
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let block_state = crate::block_state::BlockState::new();
+
+    // A synthetic claim tx keyed by a DERIVED hash unrelated to its RLP encoding.
+    let derived =
+        crate::claim_watcher::derive_manual_claim_tx_hash(&format!("rt-{:x}", rand_u64()));
+    let tx_hash: TxHash = derived.parse().unwrap();
+    let bridge_addr = Address::from([0xC8; 20]);
+    let tx = TxLegacy {
+        chain_id: None,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        to: TxKind::Call(bridge_addr),
+        value: U256::ZERO,
+        input: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+    };
+    let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+        tx,
+        Signature::new(U256::from(1), U256::from(1), false),
+        tx_hash,
+    ));
+    // Sanity: the envelope's RLP-recomputed hash is NOT the derived key (that is the trap).
+    assert_ne!(
+        format!("{:#x}", envelope.tx_hash()),
+        derived,
+        "fixture: the derived key must differ from the RLP hash"
+    );
+
+    store
+        .txn_begin(
+            tx_hash,
+            TxnEntry {
+                id: None,
+                envelope,
+                signer: bridge_addr,
+                expires_at: None,
+                logs: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .txn_commit(tx_hash, Ok(()), 8831, [0xAA; 32])
+        .await
+        .unwrap();
+
+    // Round-trip through PG: read back (decodes RLP → recomputes envelope hash) and render.
+    let data = store
+        .txn_get(tx_hash)
+        .await
+        .unwrap()
+        .expect("row persisted under the derived hash");
+    let json = data.to_rpc_transaction(tx_hash, &block_state);
+    assert_eq!(
+        json["hash"].as_str().unwrap().to_lowercase(),
+        derived.to_lowercase(),
+        "getTransactionByHash(derived).hash MUST equal the derived hash after a PG round-trip"
+    );
+    // The calldata is also intact (the e2e asserts .input; this pins .hash too).
+    assert_eq!(json["input"].as_str().unwrap().to_lowercase(), "0xdeadbeef");
 }

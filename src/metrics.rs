@@ -272,6 +272,49 @@ pub fn init_metrics() {
          (crash recovery or foreign-CLAIM observation)."
     );
     describe_counter!(
+        "restore_b2agg_same_details_multiplicity_quarantined_total",
+        "restore FAIL-CLOSED: B2AGG exits quarantined because the authoritative feed shows ≥2 \
+         distinct on-chain consumptions sharing a details_commitment that the commitment-keyed \
+         client store cannot disambiguate — quarantined rather than emit a wrong/collapsed \
+         BridgeEvent (review). MUST be rare; each is an operator-recoverable exit."
+    );
+    describe_counter!(
+        "synthetic_claim_calldata_finalized_pending_total",
+        "synthesized-claim calldata rows found PENDING (txn_begin ran, txn_commit did not — a \
+         crash between them) and finalized by a later persist pass, rather than being stranded \
+         pending forever (review blocker 3)."
+    );
+    describe_counter!(
+        "restore_b2agg_authoritative_attributed_total",
+        "restore Phase 2 (task #56): consumed B2AGG notes whose consumer the LOCAL store did \
+         not know (consumer_account=None — NTX-consumed, the normal bridge path, observed \
+         after a store rebuild) but that the bridge's on-chain sync_transactions feed \
+         authoritatively attributes to the bridge — rebuilt and re-projected instead of \
+         fail-closed skipped. Without this, restore ERASED already-settled BridgeEvents \
+         (getLogs-immutability break) and halted aggkit's L2BridgeSyncer."
+    );
+    describe_counter!(
+        "synthetic_claim_calldata_persisted_total",
+        "synthesized (derived-hash) claims whose FULL authoritative claimAsset calldata was \
+         recovered (CLAIM note storage: both SMT proofs, both exit roots, networks, addresses, \
+         amount; faucet registry: hash-verified metadata preimage) and persisted under the \
+         derived tx hash for eth_getTransactionByHash / aggkit's full-claim parser."
+    );
+    describe_counter!(
+        "synthetic_claim_calldata_unrecoverable_total",
+        "synthesized claims whose metadata preimage could NOT be recovered authoritatively \
+         (no registry entry hashing to the note's metadata_hash) — calldata deliberately NOT \
+         fabricated; the tx keeps an empty input and aggkit will stall on it. Operator action: \
+         register/repair the faucet metadata; the per-tick backfill then self-heals. MUST stay \
+         0 in a healthy stack."
+    );
+    describe_counter!(
+        "synthetic_claim_tx_missing_calldata_total",
+        "ClaimEvent-bearing synthetic txs served with EMPTY input by eth_getTransactionByHash \
+         (no persisted calldata record — unrecoverable, or the backfill has not caught up). \
+         Every increment stalls aggkit on that claim; must stay 0 in steady state."
+    );
+    describe_counter!(
         "claim_event_foreign_skipped_total",
         "A consumed CLAIM-shaped note was NOT provably ours (consumer is not \
          our bridge, and it was not minted by our service targeting our \

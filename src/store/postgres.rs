@@ -2172,6 +2172,7 @@ impl Store for PgStore {
             "amount_overflow" => UnbridgeableBridgeOutReason::AmountOverflow,
             "atomic_commit_failed" => UnbridgeableBridgeOutReason::AtomicCommitFailed,
             "metadata_too_large" => UnbridgeableBridgeOutReason::MetadataTooLarge,
+            "same_details_multiplicity" => UnbridgeableBridgeOutReason::SameDetailsMultiplicity,
             other => anyhow::bail!("unknown unbridgeable_bridge_outs.reason value: {other}"),
         };
 
