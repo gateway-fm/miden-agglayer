@@ -23,6 +23,22 @@ const GER_EVIDENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 const GER_EVIDENCE_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// L1-GER evidence wait budget. Defaults to `GER_EVIDENCE_WAIT_TIMEOUT` (15 min in
+/// production, 100 ms in tests). Override with the `GER_EVIDENCE_WAIT_TIMEOUT_SECS`
+/// env var — e.g. `30` on the single-node Anvil e2e stack, where a FORGED GER never
+/// corroborates and would otherwise burn the full 15 min (twice) per e2e run. A legit
+/// GER resolves in milliseconds regardless, so shortening the budget only speeds up
+/// the negative (refusal) path; production keeps the finality-safe default.
+fn ger_evidence_wait_timeout() -> Duration {
+    match std::env::var("GER_EVIDENCE_WAIT_TIMEOUT_SECS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(_) => GER_EVIDENCE_WAIT_TIMEOUT,
+        },
+        Err(_) => GER_EVIDENCE_WAIT_TIMEOUT,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum GerL1GateError {
     #[error(
@@ -513,7 +529,7 @@ pub async fn wait_for_ger_l1_observed(
         require_l1_observed,
         evidence_tag,
         txn_hash,
-        GER_EVIDENCE_WAIT_TIMEOUT,
+        ger_evidence_wait_timeout(),
         GER_EVIDENCE_POLL_INTERVAL,
     )
     .await

@@ -272,6 +272,11 @@ services:
       L1_INDEXER_FROM_BLOCK: "1"
       L1_EVIDENCE_TAG: "${L1_EVIDENCE_TAG:-latest}"
       REJECT_UNVERIFIED_GER_INJECTION: "${REJECT_UNVERIFIED_GER_INJECTION:-true}"
+      # Shorten the H6 GER-evidence wait on the single-node Anvil e2e (default 15min).
+      # A legit GER corroborates in ms; only a FORGED GER (e2e-ger-l1-verification.sh
+      # Phase B) waits the full budget — twice — and would otherwise cost ~30min per
+      # e2e run. Production keeps the finality-safe 15min default (unset).
+      GER_EVIDENCE_WAIT_TIMEOUT_SECS: "${GER_EVIDENCE_WAIT_TIMEOUT_SECS:-30}"
     volumes:
       # Bind mount so `docker compose run --rm --no-deps miden-agglayer --restore`
       # shares the miden-client sqlite store + keystore + bridge_accounts.toml with
