@@ -938,9 +938,19 @@ impl SyntheticProjector {
             } // lock dropped before the awaits below
             let note_id_str = hex::encode(key);
             let derived = crate::claim_watcher::derive_manual_claim_tx_hash(&note_id_str);
-            let logs = self.store.get_logs_for_tx(&derived).await?;
-            let resolved = if let Some(log) = logs.first() {
-                // A derived-hash ClaimEvent exists → the full calldata must be servable.
+            // The ClaimEvent may ride the DERIVED hash (derived-hash synthesis, no real
+            // eth-tx) OR the REAL linked eth-tx hash (`publish_claim`'s recorded link — the
+            // normal case). Repair under WHICHEVER hash actually carries the event. The old
+            // derived-only check silently marked a real-hash event "resolved forever" without
+            // verifying its envelope existed, so it never healed the {processed note +
+            // real-hash ClaimEvent + missing transaction envelope} crash window — a state
+            // that also survives an upgrade (the note is already processed, so the projection
+            // path never re-runs). `persist_synthetic_claim_tx` is idempotent: a no-op when
+            // the envelope is already present + committed, a reconstruct when it is absent,
+            // and returns `false` (stay unresolved, retry next tick) when the faucet metadata
+            // is still unrecoverable.
+            let derived_logs = self.store.get_logs_for_tx(&derived).await?;
+            let resolved = if let Some(log) = derived_logs.first() {
                 crate::restore::persist_synthetic_claim_tx(
                     &self.store,
                     note.details().storage(),
@@ -950,11 +960,29 @@ impl SyntheticProjector {
                     log.block_hash,
                 )
                 .await?
+            } else if let Some(real) = self.store.get_tx_for_note(&note_id_str).await? {
+                // A real link exists. If a ClaimEvent rides it, ensure its full calldata is
+                // servable under that hash (the crash-window heal). Only resolve once valid
+                // calldata is stored; if no event rides it yet the note is not projected —
+                // re-check next tick, do NOT resolve.
+                match self.store.get_logs_for_tx(&real).await?.first() {
+                    Some(log) => {
+                        crate::restore::persist_synthetic_claim_tx(
+                            &self.store,
+                            note.details().storage(),
+                            &note_id_str,
+                            &real,
+                            log.block_number,
+                            log.block_hash,
+                        )
+                        .await?
+                    }
+                    None => false,
+                }
             } else {
-                // No derived-hash event. Once the note's consumption block is projected,
-                // its ClaimEvent (if any) rides a real eth-tx hash — nothing to backfill,
-                // resolved forever. Before that, re-check next tick (the synthesis path
-                // usually persists it first; this is only the crash backstop).
+                // No derived-hash event AND no recorded real link. Once the consumption block
+                // is projected and no event exists anywhere, there is nothing to backfill (a
+                // skipped/foreign claim) — resolved forever. Before that, re-check next tick.
                 note.state()
                     .consumed_block_height()
                     .map(|h| h.as_u64())
@@ -1349,6 +1377,25 @@ impl SyntheticProjector {
                 "reconcile cursor is ahead of the Miden tip"
             );
         }
+        // Claim-calldata REPAIR runs EVERY tick — including at the tip — so a historical
+        // broken ClaimEvent (full calldata never stored: an older-build synthesis, or a crash
+        // between recording the note→hash link and persisting the envelope) heals on the very
+        // next tick, NOT only when new traffic advances the cursor past the tip. It therefore
+        // runs BEFORE the at-tip early return. The consumed feed it needs is also used by
+        // block projection and the completeness auditor below, so fetch it once here.
+        let consumed = client
+            .get_input_notes(NoteFilter::Consumed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?;
+        if let Err(e) = self
+            .backfill_synthetic_claim_calldata(&consumed, cursor)
+            .await
+        {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "synthesized-claim calldata backfill failed (non-fatal — retried next tick)"
+            );
+        }
         if cursor >= tip {
             return Ok(cursor);
         }
@@ -1374,10 +1421,8 @@ impl SyntheticProjector {
         // every bridge consumption through the B2AGG body path) is what keeps a GER/CLAIM
         // consumption — whose body the authoritative feed reports before the store's B2AGG
         // import frontier would have it — from wedging the tip.
-        let consumed = client
-            .get_input_notes(NoteFilter::Consumed)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?;
+        // `consumed` was fetched above (before the at-tip early return, for the calldata
+        // backfill) and is reused here for block projection.
         // CLAIM / GER from the store's consumed feed, at their finalized consumption block.
         // B2AGG is skipped here — sourced authoritatively below (keeping the two sources
         // disjoint keeps the reasoning clean; `is_note_processed` would dedup either way).
@@ -1538,19 +1583,7 @@ impl SyntheticProjector {
             self.cursor.store(next, Ordering::Release);
             cursor = next;
         }
-        // Synthesized-claim calldata backfill (every tick, O(new CLAIM notes) via the
-        // resolved-set): heals derived-hash ClaimEvents whose full claimAsset calldata is
-        // not yet persisted — older-build synthesis, or a crash between the event commit
-        // and the calldata persist. Non-fatal: a failure warns and retries next tick.
-        if let Err(e) = self
-            .backfill_synthetic_claim_calldata(&consumed, cursor)
-            .await
-        {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "synthesized-claim calldata backfill failed (non-fatal — retried next tick)"
-            );
-        }
+        // (Claim-calldata backfill already ran once this tick, before the at-tip early return.)
         // COMPLETENESS AUDITOR (detection only, every AUDIT_EVERY_N_TICKS ticks): diff the
         // store's consumed-B2AGG view against the synthetic log store for comfortably-sealed
         // blocks. Reuses this tick's already-fetched `consumed` feed — zero extra queries.
@@ -2609,6 +2642,92 @@ mod tests {
             logs[0].transaction_hash,
             derive_manual_claim_tx_hash(&note_commitment),
             "must NOT fall back to the derived hash when a link exists"
+        );
+    }
+
+    /// #67 gaps 2+3 — HEAL a historical real-hash failure. A note that is already
+    /// {processed + ClaimEvent under the REAL linked hash + MISSING transaction envelope} —
+    /// the pre-upgrade crash window (crash between recording the link and persisting the
+    /// envelope) — is UNREPAIRABLE by pre-#67 code: the projection path never re-runs (Dedup-1
+    /// skips the processed note) and the backfill only checked the DERIVED hash, marking the
+    /// note "resolved forever" while its real-hash ClaimEvent kept serving empty calldata.
+    /// POST-#67 the backfill checks the real linked hash and reconstructs the envelope under
+    /// it, so `eth_getTransactionByHash(real)` serves the full claimAsset calldata again.
+    #[tokio::test]
+    async fn backfill_heals_historical_real_hash_event_with_missing_envelope() {
+        use alloy::consensus::Transaction;
+        use alloy_core::sol_types::SolCall;
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+
+        let n_claim = claim_note(5, Some(0));
+        let note_commitment = hex::encode(n_claim.details_commitment().as_bytes());
+        let real_tx = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        // The surviving link — recorded by `publish_claim` before the crash.
+        store
+            .record_tx_note_link(real_tx, &note_commitment)
+            .await
+            .unwrap();
+        // The crash-window state: a ClaimEvent rides `real_tx`, the note is already processed,
+        // but the transaction envelope was never persisted (empty calldata).
+        let mut gi = [0u8; 32];
+        gi[31] = 0x5C;
+        store
+            .add_claim_event(
+                "0x00000000000000000000000000000000000000aa",
+                5,
+                [0u8; 32],
+                real_tx,
+                &gi,
+                0,
+                &[0xAB; 20],
+                &[0xCD; 20],
+                1_000,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_claim_note_processed(note_commitment.clone(), gi, 5)
+            .await
+            .unwrap();
+        let real_hash: alloy::primitives::TxHash = real_tx.parse().unwrap();
+        assert!(
+            store.txn_get(real_hash).await.unwrap().is_none(),
+            "precondition: the envelope is MISSING (crash before persisting it)"
+        );
+        assert!(
+            !store.get_logs_for_tx(real_tx).await.unwrap().is_empty(),
+            "precondition: the ClaimEvent rides the real linked hash"
+        );
+        assert!(
+            store
+                .get_logs_for_tx(&derive_manual_claim_tx_hash(&note_commitment))
+                .await
+                .unwrap()
+                .is_empty(),
+            "precondition: NOTHING under the derived hash (the derived-only backfill was blind)"
+        );
+
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        // cursor >= 5 (block projected) → pre-#67 the backfill marked this resolved-forever
+        // with empty calldata. POST-#67 it reconstructs under the real hash.
+        projector
+            .backfill_synthetic_claim_calldata(&[n_claim], 5)
+            .await
+            .unwrap();
+
+        let data =
+            store.txn_get(real_hash).await.unwrap().expect(
+                "backfill must reconstruct the missing envelope under the REAL linked hash",
+            );
+        assert!(
+            crate::claim::claimAssetCall::abi_decode(data.envelope.input()).is_ok(),
+            "the served input is the full claimAsset calldata, not the empty-calldata wedge"
+        );
+        assert!(
+            data.envelope.input().len() > 4 + 64 * 32,
+            "full calldata (both SMT proofs included), not a stub"
         );
     }
 

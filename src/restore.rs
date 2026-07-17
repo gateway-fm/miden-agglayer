@@ -1683,20 +1683,44 @@ pub(crate) async fn project_claim_note(
     // envelope), a reconstruct when it is ABSENT — either derived-hash synthesis (no real
     // eth-tx), OR the crash window where the note→hash link survived but the envelope did
     // NOT (which the derived-hash-only backfill would never repair, so the ClaimEvent would
-    // otherwise ride a hash with empty calldata forever). Best-effort: unrecoverable faucet
-    // metadata leaves the envelope absent (empty calldata; operator registers the faucet,
-    // backfill heals) — non-fatal, the ClaimEvent still commits below.
-    if let Err(e) =
-        insert_pending_claim_calldata(store, details.storage(), &note_id_str, &tx_hash).await
-    {
-        tracing::warn!(
-            target: "restore::claims",
-            note_id = %note_id_str,
-            tx_hash = %tx_hash,
-            error = %format!("{e:#}"),
-            "synthesised claim: calldata pre-insert failed (transient — the projector \
-             backfill retries next tick)"
-        );
+    // otherwise ride a hash with empty calldata forever).
+    //
+    // FAIL-CLOSED (MA#27 review follow-up): if the calldata cannot be ensured — either a
+    // transient error, or `Ok(false)` because the faucet metadata preimage is unrecoverable
+    // — DO NOT publish the ClaimEvent and DO NOT mark the note processed. Return an error so
+    // block projection RETRIES on a later tick (once the faucet is registered the
+    // reconstruction succeeds and the event emits with valid calldata). Publishing here
+    // would seal an IMMUTABLE ClaimEvent riding a hash with empty calldata: aggkit's
+    // full-claim parser wedges ("input too short: 0 bytes"), and because the note is marked
+    // processed nothing ever retries. A projector halt (surfaced via the metric + log below)
+    // is the correct fail-closed posture — the claim is already provably ours (the
+    // provenance gate ran above), so unrecoverable calldata is a real operator-actionable
+    // registry gap, not a note to skip.
+    match insert_pending_claim_calldata(store, details.storage(), &note_id_str, &tx_hash).await {
+        Ok(true) => {}
+        Ok(false) => {
+            ::metrics::counter!("synthetic_claim_calldata_fail_closed_total").increment(1);
+            tracing::error!(
+                target: "restore::claims",
+                note_id = %note_id_str,
+                tx_hash = %tx_hash,
+                global_index = %hex::encode(decoded.global_index),
+                "synthesised claim: full claimAsset calldata UNRECOVERABLE (faucet metadata \
+                 not in registry) — refusing to publish a ClaimEvent with empty calldata; \
+                 projection HALTS and retries (operator: register/repair the faucet)"
+            );
+            anyhow::bail!(
+                "claim {note_id_str}: full claimAsset calldata unrecoverable — fail-closed, \
+                 projection will retry (register/repair faucet metadata to unblock)"
+            );
+        }
+        Err(e) => {
+            ::metrics::counter!("synthetic_claim_calldata_fail_closed_total").increment(1);
+            return Err(e.context(format!(
+                "claim {note_id_str}: failed to ensure claimAsset calldata before publishing \
+                 ClaimEvent — fail-closed, projection will retry"
+            )));
+        }
     }
 
     store
@@ -3292,6 +3316,18 @@ mod tests {
     /// `consumer`, with a per-test `gi_byte` to keep global indexes distinct
     /// across tests (Dedup 2 keys on global_index).
     fn claim_input_note(consumer: Option<AccountId>, gi_byte: u8) -> InputNoteRecord {
+        // Default: empty metadata → truthful by hash → reconstructable with no registry entry.
+        claim_input_note_meta(consumer, gi_byte, &[])
+    }
+
+    /// Like [`claim_input_note`] but with a caller-chosen metadata preimage, so a test can
+    /// force a claim whose full calldata is UNRECOVERABLE (a non-empty metadata hash with no
+    /// registry preimage that hashes to it) — the fail-closed path.
+    fn claim_input_note_meta(
+        consumer: Option<AccountId>,
+        gi_byte: u8,
+        metadata: &[u8],
+    ) -> InputNoteRecord {
         use miden_base_agglayer::{
             ClaimNote, ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData,
             MetadataHash, ProofData, SmtNode,
@@ -3321,7 +3357,7 @@ mod tests {
                 destination_network: 1,
                 destination_address: EthAddress::new([0xCD; 20]),
                 amount: EthAmount::new(amount_bytes),
-                metadata_hash: MetadataHash::from_abi_encoded(&[]),
+                metadata_hash: MetadataHash::from_abi_encoded(metadata),
             },
             miden_claim_amount: Felt::ZERO,
         };
@@ -3928,6 +3964,55 @@ mod tests {
         assert!(
             data.envelope.input().len() > 4 + 64 * 32,
             "full calldata (proofs included), not a stub"
+        );
+    }
+
+    /// #67 gap 1 — FAIL-CLOSED reconstruction. A claim that is provably OURS (consumed by our
+    /// bridge) but whose full claimAsset calldata is UNRECOVERABLE (a non-empty metadata hash
+    /// with no registry preimage) must NOT publish a ClaimEvent and must NOT mark the note
+    /// processed: `project_claim_note` returns `Err` so block projection retries (once the
+    /// faucet is registered the reconstruction succeeds). PRE-#67 this fell through and sealed
+    /// an IMMUTABLE ClaimEvent riding a hash with empty calldata — aggkit's full-claim parser
+    /// wedges forever and, because the note was marked processed, nothing ever retries.
+    #[tokio::test]
+    async fn project_claim_note_fail_closed_when_calldata_unrecoverable() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        // Non-empty metadata hash with NO registry preimage → unrecoverable calldata. Consumed
+        // by OUR bridge so it passes the provenance gate and reaches the reconstruction step.
+        let note = claim_input_note_meta(
+            Some(id(TEST_TARGET_BRIDGE)),
+            0x93,
+            b"preimage the registry never saw",
+        );
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome = project_claim_note(
+            &store,
+            &note,
+            &std::collections::HashMap::new(),
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            8831,
+            [0xAA; 32],
+            get_bridge_address(),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "unrecoverable calldata must FAIL CLOSED (Err → projection retries), not emit"
+        );
+        // No ClaimEvent was sealed …
+        let mut gi = [0u8; 32];
+        gi[31] = 0x93;
+        assert!(
+            !store.has_claim_event_for_global_index(&gi).await.unwrap(),
+            "no ClaimEvent may exist for a claim whose calldata is unrecoverable"
+        );
+        // … and the note is NOT marked processed, so a later tick (post faucet-registration)
+        // re-runs the projection instead of a permanent fast-skip.
+        assert!(
+            !store.is_claim_note_processed(&note_id).await.unwrap(),
+            "the note must NOT be marked processed — projection must be able to retry"
         );
     }
 
