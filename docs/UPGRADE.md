@@ -89,6 +89,14 @@ WHERE t.status = 'pending'
 ORDER BY t.created_at;
 ```
 
+For upgrades that introduce the LET cardinality gate, keep
+`service_state.let_gate_baseline` at its default `0` unless an offline audit proves
+that pre-upgrade LET leaves are absent from `deposit_counter`. Follow
+[`operations/let-cardinality-gate.md`](operations/let-cardinality-gate.md) while the
+proxy is stopped; the runtime never infers or changes this offset.
+Do not run a full `--restore` with a nonzero baseline: full replay is zero-based and
+requires an offline history reconstruction first.
+
 Take a custom-format `pg_dump` of the proxy database. Also arrange a consistent
 snapshot of the entire Miden store directory. The safest filesystem snapshot is
 taken after write traffic is quiesced and the old process has stopped cleanly.
@@ -128,6 +136,12 @@ At startup, expect the process to:
 - start the single writer, L1 indexer (when both L1 settings exist), faucet
   reconciler, and HTTP service.
 
+The upgrade that introduces the durable B2AGG identity ledger intentionally resets
+`service_state.reconcile_cursor` to zero once. The reconciler makes one historical
+pass to populate nullifier-to-NoteId identities, and the full-tip visibility barrier
+holds synthetic projection until that pass reaches the current tip. This is an
+expected one-time availability cost; later starts resume the persisted cursor.
+
 Stop the rollout immediately if startup tries to initialize new accounts,
 reports a migration checksum mismatch, points at a different network, or fails
 the hardening/prover probe.
@@ -136,9 +150,10 @@ the hardening/prover probe.
 
 1. `GET /health` returns HTTP 200 with `{"status":"ok"}`.
 2. `eth_chainId`, `net_version`, and the account config match the baseline.
-3. `service_state.projector_cursor` and `reconcile_cursor` resume rather than
-   resetting to zero. A deliberate recovery flag is the only valid reason for
-   a full-history sweep.
+3. `service_state.projector_cursor` resumes. `reconcile_cursor` also resumes except
+   for the one-time identity-ledger backfill described above; after that sweep it
+   must persist and resume normally. A deliberate recovery flag is the only other
+   valid reason for a full-history sweep.
 4. Re-query the entire pre-upgrade block range and compare the canonical log
    fingerprint. Any difference is a release blocker.
 5. The synthetic tip advances while the Miden chain advances.

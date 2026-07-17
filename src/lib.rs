@@ -20,7 +20,6 @@ pub mod hex;
 pub mod init;
 pub mod l1_info_tree_indexer;
 pub mod l2_to_l1_claimer;
-pub mod let_divergence;
 pub mod log_synthesis;
 pub mod logging;
 pub mod metadata_recovery;

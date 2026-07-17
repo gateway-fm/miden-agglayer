@@ -103,32 +103,22 @@ pub fn init_metrics() {
          sweep cursor is behind the Miden tip (0 in steady state; >0 signals reconciler lag)"
     );
     describe_counter!(
-        "projector_unresolved_consumed_body_total",
-        "legacy unified-projector health readout, held at 0; the live fail-close signal is now \
-         synthetic_projector_b2agg_unresolved_total"
-    );
-    describe_counter!(
         "synthetic_projector_b2agg_authoritative_fetch_total",
-        "unified projector: bridge-consumed B2AGG bodies resolved by AUTHORITATIVE node fetch \
-         (get_notes_by_id) rather than the local cache — i.e. notes created+consumed under load \
-         before the reconciler imported them Committed (consumed unauthenticated, so the tx \
-         carries the note id). Nonzero under load is expected and healthy; it is the backstop \
-         that prevents the residual dropped-BridgeEvent."
+        "unified projector: bridge-consumed B2AGG bodies resolved by canonical get_notes_by_id. \
+         Increases once per successful resolution attempt; retries before cursor advance may \
+         exceed bridge-out volume."
     );
     describe_counter!(
-        "synthetic_projector_b2agg_authenticated_skip_total",
-        "unified projector: authenticated bridge consumptions skipped because they are not in the \
-         B2AGG-only body cache — normally a non-B2AGG note (CLAIM/GER/genesis) the store consumed \
-         feed already covers. NON-FATAL and expected-nonzero (esp. at genesis/setup); the tick \
-         never wedges on these. Only meaningful if it climbs alongside missing BridgeEvents."
+        "synthetic_projector_b2agg_headerless_skip_total",
+        "unified projector: headerless bridge inputs with no persisted B2AGG identity. These are \
+         normally CLAIM/GER/genesis notes covered by the store feed. A hidden B2AGG cannot seal \
+         because the LET cardinality gate fails closed."
     );
     describe_counter!(
         "synthetic_projector_b2agg_fetch_missing_total",
-        "unified projector LOUD-SKIP: an UNAUTHENTICATED bridge-consumed note the tx feed reported \
-         but get_notes_by_id STILL did not return after the bounded retry — the tick held for the \
-         retry window (sync_transactions ahead of the note DB) then advanced to keep the tip live \
-         rather than freezing. MUST stay 0 in a healthy stack; any increment means either a node \
-         note-DB fault or a genuine dropped exit to investigate."
+        "unified projector: a bridge-consumed note was absent from get_notes_by_id. The LET \
+         cardinality gate prevents sealing if it was a B2AGG leaf, \
+         and the next projector tick retries it. MUST stay 0 in a healthy stack."
     );
     describe_counter!(
         "synthetic_projector_completeness_missing_total",
@@ -142,6 +132,21 @@ pub fn init_metrics() {
         "in-proxy completeness auditor liveness beacon: the highest block audited so far \
          (projector cursor minus the settle margin). Flat while the chain advances = auditor \
          dead."
+    );
+    describe_counter!(
+        "bridge_let_assignment_gate_halted_total",
+        "projector ticks blocked before sealing because the bridge LET leaf count differs \
+         from durable reservations plus visible pending B2AGG leaves. kind=invisible_gap: \
+         the bridge is ahead; kind=local_ahead: local accounting is ahead. The next tick \
+         retries. MUST stay 0; see docs/operations/let-cardinality-gate.md."
+    );
+    describe_counter!(
+        "bridge_within_tx_order_unresolved_total",
+        "Cantina #7 FAIL-CLOSED: >=2 B2AGG notes consumed by the SAME bridge transaction \
+         whose within-tx order could not be established from the sync_transactions feed — \
+         the projection tick HALTS (nothing sealed, retried) because emitting in hash order \
+         could misnumber deposit_count/globalIndex, sealed forever by getLogs immutability. \
+         MUST stay 0; any increment means feed corruption to investigate."
     );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
@@ -165,12 +170,6 @@ pub fn init_metrics() {
         "bridge_out_self_targeted_total",
         "B2AGG bridge-outs whose destination_network equals our local network_id; \
          each one is a poison leaf that wedges the bridge (Cantina #13)"
-    );
-    describe_counter!(
-        "bridge_let_divergence_total",
-        "Local Exit Tree divergence events (Cantina #9). Labels: \
-         kind=on_chain_ahead (private B2AGG was consumed) or \
-         kind=aggkit_ahead (local state corruption)."
     );
     describe_counter!(
         "bridge_burn_serial_collision_total",

@@ -63,7 +63,7 @@ One local feed cannot reliably serve every note type:
 
 - B2AGG notes are made by external wallets and may be created and consumed
   between two proxy syncs. The projector reads bridge-account transactions for
-  `[cursor + 1, projection ceiling]` through `sync_transactions`, obtains their
+  `[cursor + 1, current Miden tip]` through `sync_transactions`, obtains their
   finalized input nullifiers and block/transaction order, and resolves each
   canonical B2AGG body.
 - CLAIM and GER notes are made by the proxy, with their output metadata and
@@ -72,12 +72,9 @@ One local feed cannot reliably serve every note type:
 
 The note reconciler walks `sync_notes` for public tag-0 notes. Its persisted
 cursor means “all note bodies through this Miden block were swept,” not “all
-consumptions were discovered.” Projection is capped at:
-
-`min(Miden sync tip, note-body reconcile cursor)`
-
-Holding the synthetic tip while the body sweep catches up is safe. Publishing a
-block and adding a missing event later is not.
+consumptions were discovered.” Projection runs only after that cursor reaches the
+current Miden sync tip. Holding the synthetic tip while the body sweep catches up
+is safe. Publishing a block and adding a missing event later is not.
 
 The exact source split and body-resolution path are documented in
 [`design/UNIFIED-PROJECTOR.md`](design/UNIFIED-PROJECTOR.md).
@@ -88,7 +85,9 @@ Within a projection bucket, notes are ordered by:
 
 1. consumed Miden block height;
 2. consuming transaction order;
-3. note details commitment.
+3. B2AGG input-note position within that transaction;
+4. note details commitment;
+5. unique NoteId.
 
 The first field is retained in the total ordering even though normal buckets
 contain one block. The same order is used by restore so deposit counts and the
@@ -96,15 +95,16 @@ GER hash chain match live projection.
 
 The store supplies the idempotency boundaries:
 
-- B2AGG: note identity, deposit-count allocation, and `BridgeEvent` are one
-  atomic commit.
+- B2AGG: the unique NoteId receives a durable execution-order deposit
+  reservation before any quarantine/deferral gate; emission atomically marks
+  that reservation emitted and inserts the `BridgeEvent`.
 - CLAIM: note identity, `ClaimEvent`, and any linked receipt finalization are
   one atomic commit.
 - GER: injection flag, GER hash-chain roll, event, handoff confirmation, and
   any linked receipt finalization are one atomic commit.
 
-Replaying the same input does not allocate another deposit count, roll the GER
-chain twice, or duplicate a log.
+Replaying the same input reuses its reservation and does not roll the GER chain
+twice or duplicate a log.
 
 ## Receipt linkage
 

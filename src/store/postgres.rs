@@ -18,6 +18,7 @@ use alloy::primitives::{Address, LogData, TxHash, U256};
 use deadpool_postgres::{Manager, Pool};
 use miden_protocol::Word;
 use miden_protocol::account::AccountId;
+use miden_protocol::note::{NoteId, Nullifier};
 use miden_protocol::transaction::TransactionId;
 use sha3::{Digest, Keccak256};
 use tokio_postgres::types::ToSql;
@@ -2221,15 +2222,197 @@ impl Store for PgStore {
 
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;
+        // emitted=false rows are RESERVATIONS (deferred/quarantined leaves) — not
+        // "processed": a later replay must still attempt emission with the same index.
         let rows = client
             .query(
-                "SELECT 1 FROM bridge_out_processed WHERE note_id = $1",
+                "SELECT 1 FROM bridge_out_processed WHERE note_id = $1 AND emitted",
                 &[&note_id],
             )
             .await?;
         Ok(!rows.is_empty())
     }
 
+    async fn first_unemitted_reservation(&self) -> anyhow::Result<Option<(u32, String)>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT deposit_count, note_id FROM bridge_out_processed \
+                 WHERE NOT emitted ORDER BY deposit_count ASC LIMIT 1",
+                &[],
+            )
+            .await?;
+        match row {
+            Some(r) => {
+                let idx: i32 = r.get(0);
+                let note: String = r.get(1);
+                Ok(Some((u32::try_from(idx)?, note)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT let_gate_baseline + deposit_counter FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(u64::try_from(row.get::<_, i64>(0))?)
+    }
+
+    async fn reserve_deposit_index(&self, note_key: &str) -> anyhow::Result<u32> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let idx: i32 = if let Some(row) = txn
+            .query_opt(
+                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                &[&note_key],
+            )
+            .await?
+        {
+            row.get(0)
+        } else {
+            // Absolute LET index = audited legacy baseline + raw reservation counter.
+            let row = txn
+                .query_one(
+                    "UPDATE service_state
+                     SET deposit_counter = deposit_counter + 1, updated_at = now()
+                     WHERE id = 1
+                     RETURNING (deposit_counter - 1) + let_gate_baseline",
+                    &[],
+                )
+                .await?;
+            let absolute: i64 = row.get(0);
+            let absolute_u32 = u32::try_from(absolute)
+                .map_err(|_| anyhow::anyhow!("invalid deposit index {absolute}"))?;
+            let absolute_i32 = i32::try_from(absolute_u32)
+                .map_err(|_| anyhow::anyhow!("deposit index {absolute} exceeds i32"))?;
+            txn.execute(
+                "INSERT INTO bridge_out_processed (note_id, deposit_count, emitted)
+                 VALUES ($1, $2, FALSE)",
+                &[&note_key, &absolute_i32],
+            )
+            .await?;
+            absolute_i32
+        };
+        txn.commit().await?;
+        u32::try_from(idx).map_err(anyhow::Error::from)
+    }
+
+    async fn migrate_legacy_deposit_key(
+        &self,
+        legacy_key: &str,
+        note_key: &str,
+        block_number: u64,
+        tx_hash: &str,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let block_number = i64::try_from(block_number)?;
+        client
+            .execute(
+                "UPDATE bridge_out_processed legacy
+                 SET note_id = $2
+                 WHERE legacy.note_id = $1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM bridge_out_processed existing WHERE existing.note_id = $2
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM synthetic_logs log
+                       WHERE lower(log.transaction_hash) = lower($3)
+                         AND log.block_number = $4
+                         AND log.topics[1] = $5
+                         -- depositCount is the last 4 bytes of the eighth ABI word.
+                         AND substring(log.data FROM 507 FOR 8) =
+                             lpad(to_hex(legacy.deposit_count), 8, '0')
+                   )",
+                &[
+                    &legacy_key,
+                    &note_key,
+                    &tx_hash,
+                    &block_number,
+                    &crate::log_synthesis::BRIDGE_EVENT_TOPIC,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn get_deposit_indices(
+        &self,
+        note_keys: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, u32>> {
+        if note_keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT note_id, deposit_count
+                 FROM bridge_out_processed
+                 WHERE note_id = ANY($1::text[])",
+                &[&note_keys],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let key: String = row.get(0);
+                let index = u32::try_from(row.get::<_, i32>(1))?;
+                Ok((key, index))
+            })
+            .collect()
+    }
+
+    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let nullifiers: Vec<String> = entries.iter().map(|(nf, _)| nf.to_hex()).collect();
+        let note_ids: Vec<String> = entries.iter().map(|(_, id)| id.to_hex()).collect();
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO bridge_b2agg_note_ids (nullifier, note_id)
+                 SELECT * FROM unnest($1::text[], $2::text[])
+                 ON CONFLICT (nullifier) DO NOTHING",
+                &[&nullifiers, &note_ids],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn get_b2agg_note_ids(
+        &self,
+        nullifiers: &[Nullifier],
+    ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>> {
+        if nullifiers.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let keys: Vec<String> = nullifiers.iter().map(Nullifier::to_hex).collect();
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT nullifier, note_id
+                 FROM bridge_b2agg_note_ids
+                 WHERE nullifier = ANY($1::text[])",
+                &[&keys],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let nullifier: String = row.get(0);
+                let note_id: String = row.get(1);
+                Ok((
+                    Nullifier::from_hex(&nullifier)?,
+                    NoteId::try_from_hex(&note_id)?,
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     async fn get_deposit_count(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let row = client
@@ -2241,33 +2424,12 @@ impl Store for PgStore {
         // service_state.deposit_counter is `INT NOT NULL` (postgres int4 / Rust i32),
         // not BIGINT. Reading as i64 panics with "error deserializing column 0".
         let val: i32 = row.get(0);
-        Ok(val as u64)
+        Ok(u64::try_from(val)?)
     }
 
     /// Atomic, idempotent B2AGG commit (audit H1/H3). Single postgres txn:
-    ///   1. reuse-or-allocate `deposit_count` (no counter bump on retry)
-    ///   2. allocate `log_index` + INSERT the synthetic BridgeEvent (skipped if
-    ///      a log with this deterministic tx_hash already exists)
-    /// A crash at any point rolls the whole txn back, so the note can never be
-    /// left marked-processed without a matching BridgeEvent.
-    ///
-    /// SINGLE-WRITER SERIAL INVARIANT — why the `SELECT 1 FROM synthetic_logs`
-    /// read-then-INSERT in step 2 (and the analogous read-then-INSERT in step 1)
-    /// is NOT a reachable TOCTOU race, and why no row lock / UNIQUE constraint /
-    /// `ON CONFLICT` is required:
-    ///
-    /// This method is called ONLY from the projector path, which is strictly
-    /// serial. The projector `tick()` borrows `&mut MidenClientLib` — one
-    /// non-reentrant client instance — and drives the commit loop one block at a
-    /// time, writing before advancing the cursor:
-    ///     while cursor < tip { project_block_notes(next).await?; set_projector_cursor(next).await? }
-    /// There is exactly one in-flight `commit_b2agg_event_atomic` at any moment
-    /// for a given store, so no concurrent writer can slip an insert between this
-    /// transaction's SELECT and its INSERT. The `RECONCILE_CONCURRENCY` fan-out
-    /// is FETCH-only (parallel `sync_note_ids`), never the commit — it never
-    /// touches `service_state`, `bridge_out_processed`, or `synthetic_logs`.
-    /// A Copilot reviewer flagged the read/insert gap as a TOCTOU; it reads as
-    /// intentional under this single-writer serial invariant.
+    /// Emit a previously reserved B2AGG leaf. Reservation state and the log commit in one
+    /// transaction, and the per-note `emitted` flag makes retries idempotent.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
         &self,
@@ -2287,48 +2449,22 @@ impl Store for PgStore {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
 
-        // 1. Reuse-or-allocate deposit_count. Idempotent: a retry after a
-        //    committed txn finds the existing row and reuses its count, so the
-        //    counter never advances twice for one note (no gap — H3).
-        let deposit_count: i32 = if let Some(row) = txn
+        let row = txn
             .query_opt(
-                "SELECT deposit_count FROM bridge_out_processed WHERE note_id = $1",
+                "SELECT deposit_count, emitted
+                 FROM bridge_out_processed WHERE note_id = $1 FOR UPDATE",
                 &[&note_id],
             )
             .await?
-        {
-            row.get(0)
-        } else {
-            let row = txn
-                .query_one(
-                    "UPDATE service_state
-                     SET deposit_counter = deposit_counter + 1, updated_at = now()
-                     WHERE id = 1
-                     RETURNING deposit_counter - 1",
-                    &[],
-                )
-                .await?;
-            let dc: i32 = row.get(0);
+            .ok_or_else(|| anyhow::anyhow!("missing deposit reservation for {note_id}"))?;
+        let deposit_count = u32::try_from(row.get::<_, i32>(0))?;
+        let already_emitted: bool = row.get(1);
+        if !already_emitted {
             txn.execute(
-                "INSERT INTO bridge_out_processed (note_id, deposit_count) VALUES ($1, $2)",
-                &[&note_id, &dc],
+                "UPDATE bridge_out_processed SET emitted = TRUE WHERE note_id = $1",
+                &[&note_id],
             )
             .await?;
-            dc
-        };
-
-        // 2. Idempotent log emission. tx_hash is derived deterministically from
-        //    note_id, so a retry produces the same tx_hash — skip the insert if
-        //    a row already exists for it (no duplicate BridgeEvent, no gap in
-        //    log_index).
-        let already_emitted = txn
-            .query_opt(
-                "SELECT 1 FROM synthetic_logs WHERE transaction_hash = $1 LIMIT 1",
-                &[&tx_hash],
-            )
-            .await?
-            .is_some();
-        if !already_emitted {
             let row = txn
                 .query_one(
                     "UPDATE service_state
@@ -2348,7 +2484,7 @@ impl Store for PgStore {
                 destination_address,
                 amount,
                 metadata,
-                deposit_count as u32,
+                deposit_count,
             );
             let topics_owned: [String; 1] = [crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()];
             let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();
@@ -2372,7 +2508,7 @@ impl Store for PgStore {
         }
 
         txn.commit().await?;
-        Ok(deposit_count as u32)
+        Ok(deposit_count)
     }
 
     // ── Claim watcher ────────────────────────────────────────────
