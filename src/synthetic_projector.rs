@@ -1320,6 +1320,33 @@ impl SyntheticProjector {
             }
         }
 
+        // #66 — emitted-frontier gate, enforced AT EMIT TIME (after this block's notes are
+        // projected, BEFORE the block seals) rather than only at tick-start. A reserved-but-
+        // unemitted LET leaf here is a getLogs `depositCount` gap; aggkit's L2 bridgesync
+        // requires contiguous deposit indices and HALTS ("state is inconsistent") on a gap,
+        // wedging every later Miden certificate. Fail-closed: refuse to seal past it so aggkit
+        // sees a contiguous prefix and WAITS. This placement fixes two modes of the old
+        // tick-start-only gate:
+        //   * WITHIN-TICK gap (part 2): the block used to seal WITH the gap exposed, and only
+        //     the NEXT tick's gate caught it — a window where aggkit could scan the gap. The
+        //     check now runs before THIS seal, so a poison leaf never seals.
+        //   * CRASH-after-reserve (part 1): a leaf reserved-but-unemitted by a crash between
+        //     reserve and emit was re-projected by the note loop ABOVE (reserve is idempotent;
+        //     the emit now completes), so it is already emitted here and the gate passes — an
+        //     automatic self-heal instead of the old permanent halt (which fired at tick-start
+        //     BEFORE the re-projection that would have healed it).
+        // A genuinely unrecoverable leaf (unrecoverable metadata / quarantined / self-target)
+        // is still unemitted here and HALTS fail-closed.
+        if let Some((idx, note)) = self.store.first_unemitted_reservation().await? {
+            ::metrics::counter!("bridge_unemitted_reservation_halt_total").increment(1);
+            anyhow::bail!(
+                "projector halted (fail-closed): note {note} (LET index {idx}) is reserved \
+                 but its BridgeEvent was never emitted (unrecoverable metadata / quarantined \
+                 leaf). Sealing past it would leave a getLogs gap that halts aggkit bridgesync. \
+                 Fix the leaf's metadata (registry backfill, or back up + drop the DB and \
+                 re-run `--restore` to rebuild from on-chain), then restart."
+            );
+        }
         // Write-before-advance: every synthetic log for `miden_block` is now in the
         // DB, so it is safe to advance the synthetic tip to == the Miden block.
         // Runs for EMPTY Miden blocks too (advance the tip even with 0 logs), so the
@@ -1559,16 +1586,11 @@ impl SyntheticProjector {
         // for the withheld leaf. Recovery is operator-driven: fix the leaf's metadata
         // (registry backfill / a full DB drop + `--restore` rebuild from on-chain) so the
         // leaf emits its real event.
-        if let Some((idx, note)) = self.store.first_unemitted_reservation().await? {
-            ::metrics::counter!("bridge_unemitted_reservation_halt_total").increment(1);
-            anyhow::bail!(
-                "projector halted (fail-closed): note {note} (LET index {idx}) is reserved \
-                 but its BridgeEvent was never emitted (unrecoverable metadata / quarantined \
-                 leaf). Sealing past it would leave a getLogs gap that halts aggkit bridgesync. \
-                 Fix the leaf's metadata (registry backfill, or back up + drop the DB and \
-                 re-run `--restore` to rebuild from on-chain), then restart."
-            );
-        }
+        // #66 — the emitted-frontier gate moved INTO `project_block_notes` (enforced per-block
+        // before each seal), so a poison leaf halts before its own block seals (no within-tick
+        // gap) and a crash-reserved leaf is re-emitted by re-projection before the check (no
+        // permanent halt). The old tick-start check here fired BEFORE that re-projection could
+        // heal a crash, and only AFTER a block had already sealed with the gap exposed.
         let no_notes: Vec<(Option<NoteId>, &InputNoteRecord)> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
@@ -3797,21 +3819,27 @@ mod tests {
         );
     }
 
-    /// A skipped LET leaf still consumes its index; the following valid event must encode 1.
+    /// #66 — a reserved-but-unemitted leaf HALTS the block AT EMIT TIME (before the seal), and
+    /// is RECOVERABLE. Leaf 0 is an unregistered faucet → it reserves LET index 0 (Cantina #7:
+    /// the on-chain leaf takes its slot) but cannot emit (UnknownFaucet). Sealing the block
+    /// would expose a getLogs `depositCount` gap at index 0 (leaf 1 at index 1 would be visible
+    /// past it) and wedge aggkit. The per-block emitted-frontier gate refuses to seal: the tick
+    /// HALTS fail-closed, the tip does NOT advance, and the cursor stays behind block 5 — so
+    /// once the faucet is registered, re-projecting block 5 emits leaf 0 and the gate passes.
+    /// (Pre-#66 the gate ran only at tick-start, so block 5 SEALED with the gap exposed and the
+    /// cursor advanced past leaf 0 — a PERMANENT wedge that registration could no longer heal.)
     #[tokio::test]
-    async fn skipped_let_leaf_reserves_its_deposit_index() {
+    async fn poison_leaf_halts_before_sealing_and_is_recoverable() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
 
-        // Leaf 0: a DISTINCT, unregistered faucet → quarantines as UnknownFaucet
-        // (reserves index 0, emits nothing). Leaf 1: the registered FAUCET → emits.
         let unregistered_faucet = aid("0xaa0000000000bc110000bc000000de");
         let quarantined = b2agg_note_faucet(5, Some(0), unregistered_faucet, 71);
-        register_faucet(&store).await;
+        register_faucet(&store).await; // registers the DEFAULT faucet (leaf 1's), not leaf 0's
         let valid = b2agg_note_with_amount(5, Some(1), 72);
 
-        let written = projector
+        let err = projector
             .project_notes(
                 &[quarantined.clone(), valid.clone()],
                 &HashMap::new(),
@@ -3820,36 +3848,74 @@ mod tests {
                 &HashMap::new(),
             )
             .await
-            .unwrap();
-        assert_eq!(written, 1, "only the valid leaf emits");
+            .expect_err("a reserved-but-unemitted poison leaf must HALT before the block seals");
+        assert!(
+            format!("{err:#}").contains("reserved") && format!("{err:#}").contains("never emitted"),
+            "halt must name the unemitted reservation: {err:#}"
+        );
+        // Cantina #7 — the poison leaf STILL reserved its index (held the LET slot) before halt.
         assert_eq!(
             store.get_deposit_count().await.unwrap(),
             2,
-            "both leaves indexed"
+            "both leaves reserved their LET indices"
+        );
+        // Fail-closed: the block did NOT seal — aggkit sees a contiguous prefix, nothing past
+        // the gap. THIS is the within-tick fix: the tip never advances over the poison leaf.
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            0,
+            "the tip must not advance past the reserved-but-unemitted leaf"
+        );
+    }
+
+    /// #66 part 1 — a leaf whose index was RESERVED before a crash (reserve committed, the
+    /// BridgeEvent not yet emitted) must be RE-EMITTED on re-projection, NOT halt forever.
+    /// Pre-#66 the gate ran at tick-start and halted BEFORE the re-projection that heals it — a
+    /// permanent halt for a recoverable leaf. Now the gate runs after the block's notes project,
+    /// so the re-emit completes first and the gate passes.
+    #[tokio::test]
+    async fn crash_reserved_leaf_re_emits_on_reprojection() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        register_faucet(&store).await;
+        let note = b2agg_note_with_amount(5, Some(0), 72);
+        // The dedup key is the note's NoteId (project_notes gives a headerless B2AGG fixture the
+        // same deterministic identity project_b2agg_note keys on:
+        // NoteId::new(details_commitment, metadata{bridge_id, Public})).
+        let metadata = miden_protocol::note::NoteMetadata::new(
+            miden_protocol::note::PartialNoteMetadata::new(
+                aid(BRIDGE),
+                miden_protocol::note::NoteType::Public,
+            ),
+            &miden_protocol::note::NoteAttachments::default(),
+        );
+        let key = miden_protocol::note::NoteId::new(note.details_commitment(), &metadata).to_hex();
+        // Simulate the crash: the LET index was reserved but the BridgeEvent was never emitted.
+        store.reserve_deposit_index(&key).await.unwrap();
+        assert!(
+            store.first_unemitted_reservation().await.unwrap().is_some(),
+            "precondition: a reserved-but-unemitted leaf exists (the crash window)"
         );
 
-        let logs = logs_in_range(&store, 0, 5).await;
-        assert_eq!(logs.len(), 1);
-        assert_eq!(bridge_deposit_count(&logs[0]), 1);
-
-        // Retry/restart: a fresh projector over the SAME store re-projects idempotently —
-        // indices are stable, nothing double-allocates, no second event.
-        let projector2 = test_projector(&store, &block_state).await;
-        let rewritten = projector2
-            .project_notes(
-                &[quarantined.clone(), valid.clone()],
-                &HashMap::new(),
-                5,
-                None,
-                &HashMap::new(),
-            )
+        // Re-project (restart): project_b2agg_note re-reserves idempotently + EMITS → the gate
+        // passes → the block seals. Recoverable, not a permanent halt.
+        let projector = test_projector(&store, &block_state).await;
+        let written = projector
+            .project_notes(&[note], &HashMap::new(), 5, None, &HashMap::new())
             .await
-            .unwrap();
-        assert_eq!(rewritten, 0, "replay emits nothing new");
+            .expect("a recoverable reserved-but-unemitted leaf must re-emit, not halt");
         assert_eq!(
-            store.get_deposit_count().await.unwrap(),
-            2,
-            "no re-allocation"
+            written, 1,
+            "the crash-reserved leaf re-emits its BridgeEvent"
+        );
+        assert!(
+            store.first_unemitted_reservation().await.unwrap().is_none(),
+            "the reservation is now emitted — no poison leaf remains"
+        );
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            5,
+            "the block seals once the crash-reserved leaf re-emits"
         );
     }
 
