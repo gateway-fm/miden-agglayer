@@ -2313,3 +2313,77 @@ async fn cantina7_pg_reservation_and_emitted_accounting() {
         .unwrap();
     assert_eq!(dc2, i1, "index stable across retry");
 }
+
+/// Review blocker 4 — the DERIVED hash must survive a real PG store→decode round-trip.
+/// A synthetic claim tx is stored under its derived hash (keccak(tag||note_id), NOT an RLP
+/// hash) while PG persists only EIP-2718/RLP bytes; txn_get decodes and the envelope's hash
+/// is RECOMPUTED as the RLP hash. `to_rpc_transaction` MUST re-assert the store key so a
+/// client that fetched by the derived hash gets back `.hash == derived hash`.
+#[tokio::test]
+async fn cantina136_derived_hash_survives_pg_round_trip() {
+    use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
+    use alloy::primitives::TxKind;
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let block_state = crate::block_state::BlockState::new();
+
+    // A synthetic claim tx keyed by a DERIVED hash unrelated to its RLP encoding.
+    let derived =
+        crate::claim_watcher::derive_manual_claim_tx_hash(&format!("rt-{:x}", rand_u64()));
+    let tx_hash: TxHash = derived.parse().unwrap();
+    let bridge_addr = Address::from([0xC8; 20]);
+    let tx = TxLegacy {
+        chain_id: None,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        to: TxKind::Call(bridge_addr),
+        value: U256::ZERO,
+        input: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+    };
+    let envelope = TxEnvelope::Legacy(Signed::new_unchecked(
+        tx,
+        Signature::new(U256::from(1), U256::from(1), false),
+        tx_hash,
+    ));
+    // Sanity: the envelope's RLP-recomputed hash is NOT the derived key (that is the trap).
+    assert_ne!(
+        format!("{:#x}", envelope.tx_hash()),
+        derived,
+        "fixture: the derived key must differ from the RLP hash"
+    );
+
+    store
+        .txn_begin(
+            tx_hash,
+            TxnEntry {
+                id: None,
+                envelope,
+                signer: bridge_addr,
+                expires_at: None,
+                logs: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .txn_commit(tx_hash, Ok(()), 8831, [0xAA; 32])
+        .await
+        .unwrap();
+
+    // Round-trip through PG: read back (decodes RLP → recomputes envelope hash) and render.
+    let data = store
+        .txn_get(tx_hash)
+        .await
+        .unwrap()
+        .expect("row persisted under the derived hash");
+    let json = data.to_rpc_transaction(tx_hash, &block_state);
+    assert_eq!(
+        json["hash"].as_str().unwrap().to_lowercase(),
+        derived.to_lowercase(),
+        "getTransactionByHash(derived).hash MUST equal the derived hash after a PG round-trip"
+    );
+    // The calldata is also intact (the e2e asserts .input; this pins .hash too).
+    assert_eq!(json["input"].as_str().unwrap().to_lowercase(), "0xdeadbeef");
+}

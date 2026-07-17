@@ -258,6 +258,14 @@ pub struct SyntheticProjector {
     audit_resolved: std::sync::Mutex<HashSet<([u8; 32], u64, u32)>>,
     /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
     audit_tick_counter: AtomicU64,
+    /// Synthesized-claim calldata backfill: details-commitments of consumed CLAIM notes
+    /// whose derived-hash tx record is RESOLVED (full claimAsset calldata persisted, or
+    /// proven to ride a real eth-tx hash instead). Unresolved notes are re-checked every
+    /// tick, so a claim synthesized by an OLDER build (event committed, calldata never
+    /// persisted — e.g. the live soak's block-8831 tx) heals within one tick of an
+    /// upgrade, and a metadata-unrecoverable claim keeps alarming until the registry is
+    /// repaired, then self-heals. In-memory on purpose: a restart re-checks from scratch.
+    claim_calldata_resolved: std::sync::Mutex<HashSet<[u8; 32]>>,
 }
 
 impl SyntheticProjector {
@@ -331,6 +339,7 @@ impl SyntheticProjector {
             pending_duplicate_cursor: std::sync::Mutex::new(None),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
+            claim_calldata_resolved: std::sync::Mutex::new(HashSet::new()),
         })
     }
 
@@ -892,6 +901,73 @@ impl SyntheticProjector {
             }
         }
         Ok(recs)
+    }
+
+    /// Synthesized-claim CALLDATA BACKFILL — retroactive self-heal for derived-hash
+    /// ClaimEvents whose full `claimAsset` calldata is not yet persisted (see
+    /// `restore::persist_synthetic_claim_tx`). Covers: claims synthesized by an OLDER
+    /// build (event committed, no calldata record — the live-soak block-8831 wedge), a
+    /// crash between the event commit and the calldata persist, and a transient persist
+    /// failure at synthesis time. Runs every tick over the already-fetched consumed feed;
+    /// the resolved-set keeps steady state O(new CLAIM notes).
+    ///
+    /// A note is RESOLVED (never re-checked) once its derived-hash tx record exists, or
+    /// once it is proven to ride a real eth-tx (its block is projected and the derived
+    /// hash bears no ClaimEvent). A metadata-unrecoverable note stays UNRESOLVED on
+    /// purpose: it re-alarms every tick (standing operator pressure) and self-heals the
+    /// tick after the faucet registry is repaired.
+    async fn backfill_synthetic_claim_calldata(
+        &self,
+        consumed: &[InputNoteRecord],
+        projector_cursor: u64,
+    ) -> anyhow::Result<()> {
+        let claim_root = miden_base_agglayer::ClaimNote::script().root();
+        for note in consumed {
+            if note.details().script().root() != claim_root {
+                continue;
+            }
+            let key: [u8; 32] = note.details_commitment().as_bytes();
+            {
+                let resolved = self
+                    .claim_calldata_resolved
+                    .lock()
+                    .expect("claim-calldata resolved set poisoned");
+                if resolved.contains(&key) {
+                    continue;
+                }
+            } // lock dropped before the awaits below
+            let note_id_str = hex::encode(key);
+            let derived = crate::claim_watcher::derive_manual_claim_tx_hash(&note_id_str);
+            let logs = self.store.get_logs_for_tx(&derived).await?;
+            let resolved = if let Some(log) = logs.first() {
+                // A derived-hash ClaimEvent exists → the full calldata must be servable.
+                crate::restore::persist_synthetic_claim_tx(
+                    &self.store,
+                    note.details().storage(),
+                    &note_id_str,
+                    &derived,
+                    log.block_number,
+                    log.block_hash,
+                )
+                .await?
+            } else {
+                // No derived-hash event. Once the note's consumption block is projected,
+                // its ClaimEvent (if any) rides a real eth-tx hash — nothing to backfill,
+                // resolved forever. Before that, re-check next tick (the synthesis path
+                // usually persists it first; this is only the crash backstop).
+                note.state()
+                    .consumed_block_height()
+                    .map(|h| h.as_u64())
+                    .is_some_and(|b| b <= projector_cursor)
+            };
+            if resolved {
+                self.claim_calldata_resolved
+                    .lock()
+                    .expect("claim-calldata resolved set poisoned")
+                    .insert(key);
+            }
+        }
+        Ok(())
     }
 
     /// COMPLETENESS AUDITOR — in-proxy early detection of missed BridgeEvents (the
@@ -1461,6 +1537,19 @@ impl SyntheticProjector {
             self.store.set_projector_cursor(next).await?;
             self.cursor.store(next, Ordering::Release);
             cursor = next;
+        }
+        // Synthesized-claim calldata backfill (every tick, O(new CLAIM notes) via the
+        // resolved-set): heals derived-hash ClaimEvents whose full claimAsset calldata is
+        // not yet persisted — older-build synthesis, or a crash between the event commit
+        // and the calldata persist. Non-fatal: a failure warns and retries next tick.
+        if let Err(e) = self
+            .backfill_synthetic_claim_calldata(&consumed, cursor)
+            .await
+        {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "synthesized-claim calldata backfill failed (non-fatal — retried next tick)"
+            );
         }
         // COMPLETENESS AUDITOR (detection only, every AUDIT_EVERY_N_TICKS ticks): diff the
         // store's consumed-B2AGG view against the synthetic log store for comfortably-sealed

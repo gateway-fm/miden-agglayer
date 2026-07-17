@@ -552,6 +552,19 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?
             {
+                // Observability + e2e gate (review blocker 2): log the EXACT hash served from
+                // the durable store. A persisted synthesized-claim tx is served here (the
+                // store-first branch), NOT via the `found synthetic tx` log-reconstruction
+                // fallback below — so this is the only positive, hash-exact proof that aggkit
+                // fetched THIS derived-hash claim's calldata.
+                let input_len = {
+                    use alloy::consensus::Transaction;
+                    data.envelope.input().len()
+                };
+                tracing::info!(
+                    "eth_getTransactionByHash: served stored tx {} (input_len={input_len})",
+                    format!("{txn_hash:#x}")
+                );
                 let txn = data.to_rpc_transaction(txn_hash, &service.block_state);
                 return Ok(JsonRpcResponse::success(answer_id, txn));
             }
@@ -589,6 +602,27 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .map_err(|e| store_error(answer_id.clone(), e))?;
             if let Some(log) = logs.first() {
                 tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
+                // A ClaimEvent-bearing tx should have been served by the stored-envelope
+                // path above (its full authoritative claimAsset calldata is persisted
+                // under the derived hash — `restore::persist_synthetic_claim_tx` + the
+                // projector backfill). Reaching this fallback means the calldata is
+                // UNRECOVERABLE (or the backfill hasn't caught up yet): alarm loudly —
+                // aggkit will fail to parse the empty input and stall on this claim —
+                // but do NOT fabricate fields it would persist as claim truth.
+                if log.topics.first().map(String::as_str)
+                    == Some(crate::log_synthesis::CLAIM_EVENT_TOPIC)
+                {
+                    ::metrics::counter!("synthetic_claim_tx_missing_calldata_total").increment(1);
+                    tracing::error!(
+                        tx_hash = %tx_hash_str,
+                        block = log.block_number,
+                        "eth_getTransactionByHash: ClaimEvent-bearing synthetic tx has NO \
+                         persisted claimAsset calldata — serving empty input (aggkit will \
+                         stall on this claim); check \
+                         synthetic_claim_calldata_unrecoverable_total / faucet registry \
+                         metadata"
+                    );
+                }
                 let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
                 return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
             }

@@ -49,7 +49,10 @@ pub(crate) async fn service_debug_trace_transaction(
         ));
     }
 
-    // Fallback for synthetic bridge-out txs
+    // Fallback for synthetic bridge-out txs. (A synthesized CLAIM tx does not reach this
+    // fallback: its full authoritative claimAsset calldata is persisted under the derived
+    // hash — `restore::persist_synthetic_claim_tx` — and served by the stored-envelope
+    // branch above.)
     let input_data = if let Ok(hash) = TxHash::from_str(&params.0) {
         let tx_key = format!("{hash:#x}");
         let logs = service
