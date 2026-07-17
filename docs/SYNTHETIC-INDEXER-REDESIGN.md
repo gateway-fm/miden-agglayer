@@ -1,208 +1,174 @@
-# Synthetic Indexer Redesign — the Miden chain as the single source of truth
+# Synthetic indexer contract
 
-**Status:** in progress · **Branch:** `feat/synthetic-indexer-redesign`
-**Fixes:** Finding #5 (non-atomic synthetic block allocation) · subsumes Finding #13 Layer 2 (recovery)
+Status: implemented on `main`.
 
-## Problem
+This document records the contract enforced by `SyntheticProjector`. It is not
+an implementation plan or a list of future migration phases.
 
-Today three writers — `bridge_out::on_post_sync`, `claim::publish_claim`, `ger::insert_ger` —
-generate the synthetic EVM chain (blocks + `BridgeEvent`/`ClaimEvent`/GER logs) as a **side
-effect** of submitting work to Miden, each reserving block numbers ad-hoc with
-`get_latest_block_number() + 1`. Consequences:
+## Purpose
 
-- **Finding #5:** block-number reservation is non-atomic and outside the store txn. Two writers
-  read the same tip, both pick `N+1`, and a late log lands in an already-observed block. The
-  synthetic block hash commits only to (number, parent), not the log set, so the late log is
-  invisible — a committed bridge-out is hidden from the destination claim flow.
-- **Duplication:** `restore_bridge_outs` / `restore_claims` / `restore_gers` already reconstruct
-  the *same* events by parsing the Miden chain. Live and recovery are two code paths for one
-  derivation.
-- **Recovery is a special case** (Finding #13 Layer 2 etc.) instead of the normal path.
+The proxy exposes EVM-shaped blocks and logs, but Miden is the execution layer.
+`SyntheticProjector` follows finalized Miden state and derives three event
+families:
 
-## Target: two single-threaded workers
+| Synthetic event | Miden source |
+| --- | --- |
+| `BridgeEvent` | canonical B2AGG note consumed by the configured bridge |
+| `ClaimEvent` | CLAIM note attributable to this deployment |
+| `UpdateHashChainValue` | `UpdateGerNote` attributable to the configured GER manager and bridge |
 
-1. **Submitter** (worker 1) — submits txs to Miden (CLAIM notes, GER injections). Bridge-outs are
-   user-initiated B2AGG notes. **Worker 1 emits no synthetic events and never touches the tip.**
-2. **Projector / Indexer** (worker 2) — the *sole* owner of the synthetic EVM chain. Follows the
-   Miden chain block-by-block on a persisted cursor. For each new Miden block `N`, it scans the
-   consumed notes attributed to `N` (`nullifier_block_height == N`), derives the synthetic events
-   in deterministic order, and emits exactly one synthetic block `N`. Numbering is **Miden-1:1**
-   (see "Numbering: Miden-1:1 (final)" below): synthetic block `N` == Miden block `N`, the tip
-   advances to `N` even for empty Miden blocks, so `eth_blockNumber` tracks the Miden tip.
+The projector is the only component allowed to emit these events or update the
+exposed synthetic tip during normal service operation. Offline `--restore`
+replays the same derivations before the normal service starts. Submission code
+creates Miden notes and records durable receipt links; it does not synthesize
+successful events.
 
-Single ordered projector ⇒ **no reservation, no race** (Finding #5 eliminated by construction).
-Catch-up (cursor → tip) **is** recovery **is** the normal loop.
+## Numbering and visibility
 
-## Contract (invariants the projector MUST hold)
+Synthetic block `N` is Miden block `N`. Empty Miden blocks are represented, so
+the exposed chain is monotonic and gap-free.
 
-- **Determinism.** Synthetic block `N` is a pure function of Miden block `N`'s consumed notes.
-  Re-running over the same chain yields byte-identical synthetic blocks (numbers, hashes, log
-  order, log indices). Intra-block events are ordered by `(consumed_tx_order, note_id)`.
-- **Cursor.** A persisted "last projected Miden block height". Re-processing a block is idempotent
-  (existing `is_*_processed` dedup keys are kept).
-- **Atomic visibility.** A synthetic block's logs are all written **before** the tip advances to it
-  (one unit of work in the projector). No reader can see tip ≥ N without the block-N logs.
-- **Block hash commits to logs** (upgrade): make `SyntheticBlock::build_header` mix in the logs
-  root so a changed log set changes the hash — permanently closes Finding #5's invisibility hole.
-- **Single-process only.** The projector is in-process; **multiple replicas are NOT supported.**
-  Documented loudly + asserted at startup.
-- **Mapping.** synthetic block `N` ⟷ Miden block `N`. An empty Miden block → an empty synthetic
-  block (monotonic, gap-free).
+```mermaid
+stateDiagram-v2
+    [*] --> ReconcileBodies
+    ReconcileBodies --> SourceConsumptions: body sweep reaches projection window
+    SourceConsumptions --> DeriveEvents: finalized block consumptions loaded
+    DeriveEvents --> CommitEvents: provenance and payload checks pass
+    CommitEvents --> AdvanceTip: all block events are stored
+    AdvanceTip --> PersistCursor
+    PersistCursor --> ReconcileBodies: next block or next sync tick
+```
 
-### STRONG invariants (getLogs correctness — do not weaken)
+For every block the ordering is:
 
-- **`getLogs` immutability.** `eth_getLogs([m, N])` MUST be immutable: once synthetic block `N` is
-  exposed, its log set never changes — no event is ever added, moved, or removed from an
-  already-exposed block. aggkit/agglayer re-query block ranges and must get byte-identical results
-  every time. Adding an event to a sealed block, or emitting it "late" into a later block, both
-  violate this and are forbidden.
-- **Reconcile-before-project, per block.** Block `N` is projected ONLY after it is *fully*
-  reconciled — every note consumed at `N` is known. Critically, "reconciled" means the block's
-  consumptions are **authoritatively confirmed from the node's finalized block**, not inferred from
-  the lagging local `sync_state` feed. Foundation: once `N ≤ miden_tip` the node holds `N`'s
-  complete, immutable consumption set (every nullifier spent in `N` is baked into the block); always
-  read consumptions from the finalized node block, never a partial local view. Formally
-  `projected ≤ reconciled`, where `reconciled` = the frontier whose consumptions the node has
-  confirmed — NOT the note-creation sweep frontier (that was the #30 bug: the cursor advanced on
-  `sync_notes` creation, silently excluding consumptions).
-- **Zero late notes (STRONG).** The late-consumption sweep MUST NEVER fire, for notes of **any**
-  kind. A non-empty `late` set means a block was sealed before it was fully reconciled — a
-  correctness violation even if that particular note emits no synthetic event, because it proves the
-  reconcile-before-project invariant did not hold and the B2AGG case is then only "accidentally"
-  safe. `projector_late_sweep_anomaly_total` MUST be 0 in steady state; a non-zero value is a bug to
-  fix at the barrier, not a routine recovery to paper over. The sweep is a fail-closed ALARM, not a
-  load-bearing recovery path.
+1. reconcile public tag-0 note bodies;
+2. source finalized consumptions;
+3. derive and transactionally store events and linked receipt updates;
+4. set `latest_block_number` to expose the block;
+5. persist the projector cursor.
 
-## Event derivations (all already exist)
+If the process stops after an event commit but before the tip advance, readers
+cannot see that block yet. If it stops after the tip advance but before the
+cursor write, the next run reprocesses the block through idempotent store
+operations.
 
-| Synthetic event | Source on Miden chain          | Existing code                          |
-|-----------------|--------------------------------|----------------------------------------|
-| `BridgeEvent`   | consumed B2AGG notes           | `restore_one_b2agg_note` (+ faucet metadata, Layer 1/2) |
-| `ClaimEvent`    | consumed CLAIM notes           | `restore_claims` + `parse_claim_event_from_storage`     |
-| GER hash-chain  | consumed `UpdateGerNote`s      | `restore_gers` (MA#28)                 |
+The store tip, not `BlockMonitor`, is authoritative for `eth_blockNumber` and
+range resolution. `BlockState` supplies deterministic RLP-compatible block
+headers and hashes. Header hashes are derived from fixed header fields and the
+parent hash; they do not commit to the log set.
 
-The projector unifies these three per-note derivations into one cursor-driven loop.
+## Consumption sources
 
-## Receipts — the submit ⟂ project handoff
+One local feed cannot reliably serve every note type:
 
-The proxy exposes an EVM-compatible RPC surface; aggkit and the bridge stack fetch
-**transaction receipts** (`eth_getTransactionReceipt`). Today the writer produces the synthetic
-block + logs synchronously at submit, so the receipt is ready immediately. Under the projector the
-receipt lifecycle **splits in two**, and that split is what keeps "sending" decoupled from
-"projecting":
+- B2AGG notes are made by external wallets and may be created and consumed
+  between two proxy syncs. The projector reads bridge-account transactions for
+  `[cursor + 1, current Miden tip]` through `sync_transactions`, obtains their
+  finalized input nullifiers and block/transaction order, and resolves each
+  canonical B2AGG body.
+- CLAIM and GER notes are made by the proxy, with their output metadata and
+  durable EVM-transaction links recorded before those specific notes are
+  submitted. Their consumed records come from the local miden-client store.
 
-- **Submit (worker 1).** Submits the CLAIM/GER note to Miden; cares only that Miden *accepts* it.
-  On acceptance it records a **pending receipt** keyed by the caller's EVM `tx_hash` (status known;
-  `blockNumber`/`blockHash`/`logs` still empty). On Miden *rejection* it returns an error — no
-  receipt. Worker 1 never touches the synthetic tip or produces logs.
-- **Projection (worker 2).** When the projector observes that note **consumed** in Miden block `N`,
-  it derives the synthetic log and **completes** the receipt: `blockNumber = N`, block hash, `logs`,
-  `transactionHash`, `logIndex`, `status = success`. A receipt is immutable once complete.
-- **`eth_getTransactionReceipt`** returns `null` until the projector reaches block `N`, then the
-  full receipt — i.e. **standard "wait for the tx to be mined."** aggkit already polls receipts, so
-  the ≈1-block lag is normal EVM async, and the receipt now reflects *finalized* Miden state instead
-  of an optimistic guess.
+The note reconciler walks `sync_notes` for public tag-0 notes. Its persisted
+cursor means “all note bodies through this Miden block were swept,” not “all
+consumptions were discovered.” Projection runs only after that cursor reaches the
+current Miden sync tip. Holding the synthetic tip while the body sweep catches up
+is safe. Publishing a block and adding a missing event later is not.
 
-### Linking a consumed note back to its receipt
+The exact source split and body-resolution path are documented in
+[`design/UNIFIED-PROJECTOR.md`](design/UNIFIED-PROJECTOR.md).
 
-The projector must complete the *right* receipt. Two cases:
+## Determinism and idempotency
 
-- **Bridge-outs** — no caller tx; the synthetic `tx_hash` is already a deterministic function of the
-  note (`derive_bridge_out_tx_hash(note_id)`). The projector re-derives it from the consumed note —
-  **no mapping needed.**
-- **Claims / GERs** — the caller signed a real `claimAsset` / `insertGlobalExitRoot` tx and holds
-  *its* hash. So worker 1, at submit, writes a small durable mapping **`evm_tx_hash → note
-  commitment`**; the projector looks it up when it consumes the note.
+Within a projection bucket, notes are ordered by:
 
-That map is the **only** state the two workers share, and it is a **first-write associative map,
-not a shared counter** — it carries none of Finding #5's race. The Miden chain remains the real
-handoff; the map only answers "which receipt does this note belong to."
+1. consumed Miden block height;
+2. consuming transaction order;
+3. B2AGG input-note position within that transaction;
+4. note details commitment;
+5. unique NoteId.
 
-### Edge cases (all clean)
+The first field is retained in the total ordering even though normal buckets
+contain one block. The same order is used by restore so deposit counts and the
+GER hash chain match live projection.
 
-- **Rejected at submit** → immediate error, no receipt.
-- **Accepted but never consumed** (stuck note) → receipt stays pending → expires, like a dropped EVM
-  tx. The existing receipt store already carries `expires_at` on its `TxnReceipt` LRU.
-- **Crash between submit and projection** → the mapping is durable and the note is on-chain, so the
-  projector completes the receipt during catch-up (recovery ≡ live again).
+The store supplies the idempotency boundaries:
 
-### Contract
+- B2AGG: the unique NoteId receives a durable execution-order deposit
+  reservation before any quarantine/deferral gate; emission atomically marks
+  that reservation emitted and inserts the `BridgeEvent`.
+- CLAIM: note identity, `ClaimEvent`, and any linked receipt finalization are
+  one atomic commit.
+- GER: injection flag, GER hash-chain roll, event, handoff confirmation, and
+  any linked receipt finalization are one atomic commit.
 
-A receipt is `pending` from submit until the projector reaches the note's Miden block, then
-`complete` and immutable. **The projector never produces a receipt for a note it has not observed
-consumed.** This is the explicit cutover target for Phases 2–3.
+Replaying the same input reuses its reservation and does not roll the GER chain
+twice or duplicate a log.
 
-## Phased migration — every phase gated by the FULL e2e regression matrix
+## Receipt linkage
 
-- **Phase 0 — foundation.** This doc + the cursor/ordering contract + a `SyntheticProjector`
-  skeleton (no behavior change). _(in progress)_
-- **Phase 1 — projector core, SHADOW mode.** Build the block-by-block projector (unify the three
-  `restore_*` derivations, keyed on `nullifier_block_height`, deterministic ordering). Run it in
-  **shadow**: it projects into a side store and we assert its output **equals** the live writers'
-  output. No production behavior change yet. Gate: full e2e green + shadow equality.
-- **Phase 2 — cut over claims.** Switch the live claim path to the projector (the claim watcher
-  already observes the chain), remove `publish_claim`'s synthetic-event side-effect + its tip
-  management. Gate: full e2e green.
-- **Phase 3 — cut over bridge-outs, then GERs.** Same for the other two writers; remove all ad-hoc
-  block-number reservation. Worker 1 becomes submit-only. Gate: full e2e green after each.
-- **Phase 4 — unify restore.** `restore_*` becomes the projector's catch-up (delete the duplicated
-  path). Land the block-hash-commits-to-logs upgrade. Gate: full e2e green incl. recovery suites.
+B2AGG has no originating EVM transaction, so its synthetic transaction hash is
+derived deterministically from the note identity. CLAIM and GER submissions do
+have real signed EVM hashes. Immediately before submitting that CLAIM or GER
+note, the writer persists an exact EVM-transaction-to-note handoff and a pending
+transaction row. Prerequisite faucet deployment/registration for a new token is
+a separate Miden side effect and can occur before the CLAIM handoff.
 
-## e2e acceptance — use them all
+```mermaid
+sequenceDiagram
+    participant W as Writer
+    participant S as Store
+    participant N as Miden node
+    participant P as Projector
+    participant C as RPC client
 
-At every phase boundary, run the **entire** regression matrix (all suites: `e2e-dynamic-erc20`,
-`e2e-l2-to-l1`, recovery/restore, GER, claim-watcher, rd-* dedup, …). The redesign is correct iff:
-1. the full matrix is green, **and**
-2. in shadow mode (Phase 1) the projected synthetic chain is byte-identical to the legacy output.
+    W->>S: persist exact tx-to-note handoff and pending row
+    W->>N: submit proven transaction
+    C->>S: eth_getTransactionReceipt
+    S-->>C: null while pending
+    N-->>P: note consumed in block N
+    P->>S: atomically emit event and finalize linked receipt at N
+    C->>S: eth_getTransactionReceipt
+    S-->>C: successful receipt at block N
+```
 
-No phase ships unless both hold.
+Historical notes without a durable link use deterministic synthetic hashes.
+Receipt lookup can synthesize a successful receipt from a stored synthetic log
+when no real transaction row exists.
 
-## Implementation outcome (landed)
+## Provenance and failure behavior
 
-The migration is complete: the `SyntheticProjector` is the **sole** synthetic-event producer and
-the **sole** advancer of `latest_block_number`. The feature flag, the per-writer
-`suppress_synthetic_emission` gates, the `ClaimWatcher`, the `StoreSyncListener` tip-advance, and
-the non-atomic `commit_*_event_atomic` reservation primitives have all been deleted — Finding #5 is
-eliminated by construction (no `get_latest()+1` reservation exists anymore).
+Event derivation is fail closed:
 
-### Numbering: Miden-1:1 (final)
+- a B2AGG must resolve to the canonical script, valid destination, known asset
+  origin, and bridge-account consumption;
+- a CLAIM must be attributable to this bridge or its configured service
+  account;
+- an `UpdateGerNote` must be attributable to the configured GER manager (or the
+  legacy service-account fallback) and target this bridge.
 
-Synthetic block `N` == Miden block `N`. Every synthetic log derived from the notes consumed at
-Miden block `N` is written at synthetic block `N`; the tip is advanced to `N` exactly once, **after**
-the block (write-before-advance), **including for empty Miden blocks**, so the synthetic chain
-mirrors the Miden chain block-for-block and `eth_blockNumber` tracks the Miden tip. (An earlier
-"one synthetic block per emitted log" variant was rejected because it raced the legacy
-height-tracking and produced tip/log inconsistencies.)
+Untranslatable bridge consumptions are quarantined or alarmed rather than
+turned into guessed events. A bounded completeness auditor compares settled
+local B2AGG observations with exact-block synthetic logs without mutating the
+chain.
 
-### Bugs found + fixed during the full-matrix validation (each unit-tested)
+## Persistence and recovery
 
-1. **GER limb byte-order.** `project_ger_note` decoded the `UpdateGerNote` storage felts big-endian;
-   the convention is little-endian (matching `ExitRoot::to_elements` / bridge_out / claim_note), so
-   every emitted GER was byte-swapped and never matched the GER aggkit injected — bridge-in deposits
-   hung on `ready_for_claim`. Fixed to `to_le_bytes`; round-trip test against `ExitRoot::to_elements`.
-2. **Synthetic-log receipt fallback.** Synthetic logs carry derived tx hashes with no real txn
-   record, so `eth_getTransactionReceipt` returned `null`; aggkit's L2BridgeSyncer fails to append a
-   logged tx with a null receipt (`input too short: 0 bytes`) and stalls. `service_get_txn_receipt`
-   now synthesises a success receipt from `logs_by_tx` when there is no txn record.
-3. **Claim tx-hash linkage.** aggkit decodes the claim tx's `claimAsset` calldata to resolve the
-   claim's GER boundary. The projector emitted the ClaimEvent under a derived hash whose synthetic tx
-   has empty calldata → no boundary → no certificate. `publish_claim` now records
-   `record_tx_note_link(real_claim_tx_hash ↔ note.details_commitment)`; `project_claim_note` emits
-   the ClaimEvent under the **real** claim tx (calldata + receipt present), falling back to the
-   derived hash only for unlinked notes.
-4. **Cantina #13 self-target gate (cutover-extraction gap).** Extracting the B2AGG derivation into
-   the shared `project_b2agg_note` had silently dropped the legacy scanner's self-target poison-leaf
-   gate — refuse to emit a BridgeEvent for a B2AGG whose `destination_network == local_network_id`.
-   The e2e cannot catch this (a malicious-input case). Restored on the projector path (threading
-   `local_network_id`) with a regression test, *before* deleting the legacy `process_consumed_note`,
-   so the cutover does not ship a security regression.
+Two cursors are stored independently:
 
-### Restore
+- projector cursor: last fully projected Miden block;
+- reconcile cursor: last completed tag-0 note-body sweep window.
 
-`restore_*` is the projector's catch-up over the same shared derivations. It reconstructs only the
-**Miden-derived** synthetic state (logs, GER hash-chain, bridge-out tracking, tip). The eth-side
-`transactions` / `transaction_logs` / `tx_note_links` (the proxy's record of `eth_sendRawTransaction`
-calldata + receipts) are **durable** — they never existed on Miden and a real restart preserves the
-Postgres volume — so the recovery suite preserves them rather than wiping them. (A true full-disk
-loss cannot recover the claim `claimAsset` calldata from Miden, since the CLAIM note storage keeps
-only the metadata *hash*; that is a documented recovery limitation, not something restore can close.)
+Normal restarts resume both. `--resweep-from-genesis` deliberately resets the
+body-sweep cursor. `--restore` replays B2AGG, CLAIM, and GER history through the
+same derivation functions, advances the projector cursor to the Miden tip, and
+resets the body-sweep cursor so the next normal boot performs the healing
+history sweep.
+
+## Deployment constraint
+
+The projector is a single in-process owner of its cursor, event order, deposit
+counter sequence, and synthetic tip. Multiple running replicas against one
+store are unsupported. Database fencing in the writer protects signed nonce
+admission but does not make projection multi-writer safe.

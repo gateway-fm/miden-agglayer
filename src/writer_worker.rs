@@ -52,6 +52,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument;
 use ulid::Ulid;
 
 /// Default writer-worker mpsc capacity. Spec §6 decision #5: at queue cap 64
@@ -82,8 +83,8 @@ const SWEEPER_INTERVAL: Duration = Duration::from_secs(30);
 /// next process boot to feed the `agglayer_writer_dropped_on_restart_total`
 /// counter. `/tmp` is appropriate for a k8s `emptyDir` (default behaviour on
 /// bali) — survives across container restarts within the same Pod, lost
-/// across Pod evictions, which matches the lossy semantics of the v1
-/// in-memory queue. SIGKILL leaves the tmpfile absent; combined with
+/// across Pod evictions, which remains useful as an observability signal even though the signed
+/// envelope is durably recoverable from the transaction store. SIGKILL leaves the tmpfile absent; combined with
 /// pre-kill `agglayer_writer_queue_depth` history this still pinpoints the
 /// loss window.
 pub const DROP_SNAPSHOT_PATH: &str = "/tmp/agglayer-writer-queue-snapshot";
@@ -114,11 +115,9 @@ pub fn write_drop_snapshot(count: u64) {
 // ─── DecodedWriteCall ───────────────────────────────────────────────────────
 
 /// Method-decoded `eth_sendRawTransaction` payload — the *output* of
-/// `service_send_raw_txn`'s request-thread decode step, the *input* to either
-/// the legacy sync dispatch or the writer-worker enqueue. Decoupling the
-/// dispatch shape from the wire shape lets the worker fork in
-/// `service_send_raw_txn` be a single `match` instead of duplicating selector
-/// detection.
+/// `service_send_raw_txn`'s request-thread decode step and the input to the
+/// mandatory writer-worker enqueue. Keeping this shape separate from the wire
+/// representation avoids duplicating selector detection in the worker.
 // `claimAssetCall` is much larger than the Ger payload (multiple FixedBytes<32>
 // arrays + U256 + addresses, ~1 KB worst case). Box it so the enum variant size
 // stays small — clippy::large_enum_variant gates this above 200 bytes and the
@@ -246,9 +245,8 @@ pub enum JobState {
     /// Worker successfully committed the receipt and emitted the synthetic
     /// log. `block_number` is the synthetic block the success was recorded at.
     Committed { block_number: u64 },
-    /// Worker exhausted its inline retries (or caught a panic via
-    /// `AssertUnwindSafe`). A failure receipt was best-effort written; the
-    /// caller's `eth_getTransactionReceipt` returns `status:0x0`.
+    /// Worker returned an error or its supervised dispatch task panicked. A failure
+    /// receipt was best-effort written; the caller's `eth_getTransactionReceipt` returns `status:0x0`.
     Failed,
 }
 
@@ -331,6 +329,27 @@ pub enum TryEnqueueError {
 #[error("writer queue saturated; retry")]
 pub struct WriterQueueSaturatedError;
 
+#[derive(Debug, thiserror::Error)]
+#[error("writer dispatch task panicked: {0}")]
+struct WriterDispatchPanic(String);
+
+/// Run one dispatch behind a Tokio task boundary so a panic becomes a normal
+/// job failure and cannot terminate the sole writer loop.
+async fn supervise_dispatch<F>(future: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    match tokio::spawn(future.in_current_span()).await {
+        Ok(result) => result,
+        Err(join_err) if join_err.is_panic() => {
+            Err(WriterDispatchPanic(join_err.to_string()).into())
+        }
+        Err(join_err) => Err(anyhow::anyhow!(
+            "writer dispatch task was cancelled: {join_err}"
+        )),
+    }
+}
+
 // ─── Public handle ───────────────────────────────────────────────────────────
 
 /// Producer-side handle to the writer worker. Cloneable via `Arc` so every
@@ -369,6 +388,17 @@ impl WriterWorkerHandle {
         self.inflight.contains_key(hash)
     }
 
+    /// Whether this process still has executable work for `(signer, nonce)`.
+    /// A durable unlinked row without this live counterpart is a restart orphan
+    /// and must block admission of later nonces until its exact hash resumes.
+    pub fn has_non_terminal_nonce(&self, signer: &Address, nonce: u64) -> bool {
+        self.inflight.iter().any(|entry| {
+            entry.signer == *signer
+                && !entry.state.is_terminal()
+                && crate::store::envelope_nonce(&entry.envelope) == nonce
+        })
+    }
+
     /// Number of slots currently available in the mpsc channel
     /// (`Sender::capacity()`). Re-published as the
     /// `agglayer_writer_queue_depth` gauge on each enqueue attempt.
@@ -386,14 +416,9 @@ impl WriterWorkerHandle {
             .count()
     }
 
-    /// RD-940 Decision 4 — count non-terminal in-flight jobs for `signer`.
-    ///
-    /// `eth_getTransactionCount(addr, "latest")` calls this to compute the
-    /// next-committed nonce as `next-accepted - non_terminal_count`. Without
-    /// the subtraction the RPC would leak queued/submitting txs into the
-    /// `latest` view, breaking claim-sponsor's `nonce_cache.go:35` LRU.
-    /// `pending` (geth default) keeps using `nonce_get` directly — that's
-    /// what the request thread bumped on accept.
+    /// Count process-local non-terminal jobs for diagnostics and drain tests.
+    /// Transaction-count RPCs use the store's durable pending frontier, which
+    /// survives process restart.
     pub fn count_non_terminal_for_signer(&self, signer: &Address) -> usize {
         self.inflight
             .iter()
@@ -518,7 +543,7 @@ impl WriterWorker {
         }
     }
 
-    /// Spawn the writer worker and TTL sweeper. Returns a producer handle
+    /// Spawn the writer worker and maintenance sweeper. Returns a producer handle
     /// (cloneable via Arc) and a oneshot shutdown channel — send `()` (or
     /// drop the sender) to request a graceful stop. The worker drains its
     /// `recv` loop and exits; the sweeper exits when the inflight map's
@@ -543,21 +568,17 @@ impl WriterWorker {
             worker.run(&mut shutdown_rx).await;
         });
 
-        // TTL sweeper — runs independently so a stuck inflight entry can be
-        // garbage-collected even if the main worker is busy. Mirrors the
-        // pattern in `L1InfoTreeIndexer::spawn` (a separate ticker loop on
-        // the same Arc handle).
+        // Maintenance sweeper. It deliberately NEVER terminal-fails queued or
+        // submitting work: the mpsc item / MidenClient closure is owned by a
+        // different task and can still execute after a concurrent map update.
+        // Publishing status:0x0 from here would therefore race a real Miden
+        // side effect. Only the consuming worker may fail a job, after it has
+        // either completed dispatch or determined (before dispatch) that the
+        // job spent its whole TTL in the queue.
         //
-        // RD-940 Decision 5: every accepted hash MUST reach a terminal
-        // state. Two responsibilities:
-        //   1. Non-terminal entries (Queued / Submitting) older than tx_ttl
-        //      since `created_at` are forcibly transitioned to `Failed` and
-        //      a failure receipt is written so `eth_getTransactionReceipt`
-        //      transitions `null → status:0x0`. Bounds the contract — no
-        //      more forever-pending traps like the IAIC postmortem
-        //      (`docs/POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md`).
-        //   2. Terminal entries older than tx_ttl since `terminal_at` are
-        //      evicted from the DashMap so it doesn't grow unbounded.
+        // This task has only two safe responsibilities:
+        //   1. renew nonce reservations while process-local work is live;
+        //   2. evict terminal entries older than tx_ttl since `terminal_at`.
         //
         // Iteration pattern: collect the hash+entry snapshots into a Vec
         // first (no `.await` while holding DashMap iter guards), then
@@ -568,7 +589,9 @@ impl WriterWorker {
         let sweeper_ttl = tx_ttl;
         let sweeper_service = service.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(SWEEPER_INTERVAL);
+            let reservation_lease = crate::service_send_raw_txn::reservation_lease();
+            let renewal_period = std::cmp::max(Duration::from_secs(1), reservation_lease / 3);
+            let mut ticker = tokio::time::interval(std::cmp::min(SWEEPER_INTERVAL, renewal_period));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate first tick.
             ticker.tick().await;
@@ -576,15 +599,16 @@ impl WriterWorker {
                 ticker.tick().await;
                 let now = Instant::now();
 
-                // Snapshot two cohorts in a single pass.
-                let mut to_expire: Vec<(TxHash, Address)> = Vec::new();
+                let mut to_renew: Vec<(TxHash, Address, u64)> = Vec::new();
                 let mut to_evict: Vec<TxHash> = Vec::new();
                 for entry in sweeper_inflight.iter() {
                     match entry.state {
                         JobState::Queued | JobState::Submitting => {
-                            if now.duration_since(entry.created_at) > sweeper_ttl {
-                                to_expire.push((*entry.key(), entry.signer));
-                            }
+                            to_renew.push((
+                                *entry.key(),
+                                entry.signer,
+                                crate::service_send_raw_txn::envelope_nonce(&entry.envelope),
+                            ));
                         }
                         JobState::Committed { .. } | JobState::Failed => {
                             if let Some(t) = entry.terminal_at
@@ -596,49 +620,17 @@ impl WriterWorker {
                     }
                 }
 
-                for (hash, _signer) in &to_expire {
-                    // Mark Failed + record terminal_at. Errors are logged
-                    // but don't block — the next sweeper tick re-tries.
-                    if let Some(mut entry) = sweeper_inflight.get_mut(hash) {
-                        entry.state = JobState::Failed;
-                        entry.terminal_at = Some(now);
-                    }
-                    let block_num = sweeper_service
+                for (hash, signer, nonce) in &to_renew {
+                    let signer = format!("{signer:#x}");
+                    if let Err(err) = sweeper_service
                         .store
-                        .get_latest_block_number()
-                        .await
-                        .unwrap_or(0);
-                    let block_hash = sweeper_service.block_state.get_block_hash(block_num);
-                    let reason = format!(
-                        "writer_worker: TTL expired (>{}s in non-terminal state)",
-                        sweeper_ttl.as_secs()
-                    );
-                    if let Err(e) = sweeper_service
-                        .store
-                        .txn_commit(*hash, Err(reason), block_num, block_hash)
+                        .renew_reservation(&signer, *nonce, *hash, reservation_lease)
                         .await
                     {
                         tracing::warn!(
-                            target: "writer_worker::ttl",
-                            %hash,
-                            err = format!("{e:#}"),
-                            "TTL expiry: store.txn_commit(Err) failed; \
-                             eth_getTransactionReceipt may still return null. \
-                             Next sweeper tick will retry."
+                            target: "writer_worker::lease", %hash, error = %err,
+                            "failed to renew durable writer reservation"
                         );
-                    } else {
-                        tracing::warn!(
-                            target: "writer_worker::ttl",
-                            %hash,
-                            "TTL expiry: wrote failure receipt (status:0x0). \
-                             Caller must re-submit with a fresh nonce."
-                        );
-                        ::metrics::counter!(
-                            "agglayer_writer_job_failures_total",
-                            "kind" => "unknown",
-                            "reason" => "ttl",
-                        )
-                        .increment(1);
                     }
                 }
 
@@ -706,11 +698,12 @@ impl WriterWorker {
         // commit_ms. `queue_wait_ms` is measured from the inflight entry's
         // `created_at` (set in `try_enqueue`); the remaining elapsed
         // measurements are recorded inline below.
-        let queue_wait_ms = self
+        let queue_wait = self
             .inflight
             .get(&hash)
-            .map(|e| e.created_at.elapsed().as_millis() as u64)
-            .unwrap_or(0);
+            .map(|e| e.created_at.elapsed())
+            .unwrap_or_default();
+        let queue_wait_ms = queue_wait.as_millis() as u64;
         let span = tracing::info_span!(
             target: "writer_worker::job",
             "writer_job",
@@ -722,20 +715,77 @@ impl WriterWorker {
         );
         let _entered = span.enter();
 
+        // The consuming worker is the only task allowed to expire queued
+        // work. At this point the item has been removed from mpsc and no
+        // dispatch future has been created, so a terminal failure cannot race
+        // a later Miden side effect from the same job.
+        if queue_wait >= self.tx_ttl {
+            let err = anyhow::anyhow!(
+                "writer_worker: TTL expired in queue before dispatch (>{}s)",
+                self.tx_ttl.as_secs()
+            );
+            if preserve_pending_after_handoff(&self.service.store, hash).await {
+                self.inflight.remove(&hash);
+                tracing::warn!(
+                    target: "writer_worker",
+                    %hash, kind = kind.as_str(), %job_id, signer = %signer,
+                    queue_wait_ms,
+                    "queued retry expired after an existing durable note handoff; \
+                     leaving receipt pending"
+                );
+                ::metrics::histogram!(
+                    "agglayer_writer_job_duration_seconds",
+                    "kind" => kind.as_str(),
+                    "outcome" => "pending",
+                )
+                .record(started.elapsed().as_secs_f64());
+                ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+                return;
+            }
+            if let Some(mut entry) = self.inflight.get_mut(&hash) {
+                entry.state = JobState::Failed;
+                entry.terminal_at = Some(Instant::now());
+            }
+            tracing::warn!(
+                target: "writer_worker",
+                %hash, kind = kind.as_str(), %job_id, signer = %signer,
+                queue_wait_ms,
+                "writer job expired in queue before dispatch; writing failure receipt"
+            );
+            if let Err(store_err) = write_failure_receipt(&self.service, hash, &err).await {
+                tracing::error!(
+                    target: "writer_worker",
+                    %hash,
+                    error = format!("{store_err:#}"),
+                    "writer_worker: failed to write queue-expiry receipt; \
+                     eth_getTransactionReceipt will return null"
+                );
+            }
+            ::metrics::counter!(
+                "agglayer_writer_job_failures_total",
+                "kind" => kind.as_str(),
+                "reason" => "ttl",
+            )
+            .increment(1);
+            ::metrics::histogram!(
+                "agglayer_writer_job_duration_seconds",
+                "kind" => kind.as_str(),
+                "outcome" => "failed",
+            )
+            .record(started.elapsed().as_secs_f64());
+            ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+            return;
+        }
+
         // Transition Queued → Submitting.
         if let Some(mut entry) = self.inflight.get_mut(&hash) {
             entry.state = JobState::Submitting;
         }
 
         let outcome_label;
-        let dispatch_result = std::panic::AssertUnwindSafe(dispatch_job(&self.service, job));
-        // FutureExt::catch_unwind would be cleaner but pulls in
-        // `futures-util`; we don't ship it as a dep. The bare AssertUnwindSafe
-        // here is enough because dispatch_job is itself an `async fn` — if it
-        // panics, the panic propagates through the .await and is caught by
-        // tokio::spawn's panic boundary. We log it via the worker
-        // supervision below.
-        let result: anyhow::Result<()> = dispatch_result.0.await;
+        let dispatch_service = self.service.clone();
+        let result =
+            supervise_dispatch(async move { dispatch_job(&dispatch_service, job).await }).await;
         match result {
             Ok(()) => {
                 // Best-effort: read the freshly-bumped tip to attribute the
@@ -770,45 +820,54 @@ impl WriterWorker {
                 );
             }
             Err(err) => {
-                if let Some(mut entry) = self.inflight.get_mut(&hash) {
-                    entry.state = JobState::Failed;
-                    entry.terminal_at = Some(Instant::now());
-                }
-                outcome_label = "failed";
-                tracing::error!(
-                    target: "writer_worker",
-                    %hash, kind = kind.as_str(), %job_id, signer = %signer,
-                    elapsed_secs = started.elapsed().as_secs_f64(),
-                    error = format!("{err:#}"),
-                    "writer_worker: job failed; writing failure receipt"
-                );
-                // Best-effort: write the failure receipt so
-                // `eth_getTransactionReceipt` transitions
-                // `null → status:0x0` and aggkit's ethtxmanager moves the
-                // tx to Failed instead of polling forever. Errors here are
-                // logged but cannot themselves fail the worker — if the
-                // store is sick the next sync will retry.
-                if let Err(store_err) = write_failure_receipt(&self.service, hash, &err).await {
+                if preserve_pending_after_handoff(&self.service.store, hash).await {
+                    self.inflight.remove(&hash);
+                    outcome_label = "pending";
+                    tracing::warn!(
+                        target: "writer_worker",
+                        %hash, kind = kind.as_str(), %job_id, signer = %signer,
+                        elapsed_secs = started.elapsed().as_secs_f64(),
+                        error = format!("{err:#}"),
+                        "writer job errored after durable note handoff; leaving receipt pending"
+                    );
+                } else {
+                    if let Some(mut entry) = self.inflight.get_mut(&hash) {
+                        entry.state = JobState::Failed;
+                        entry.terminal_at = Some(Instant::now());
+                    }
+                    outcome_label = "failed";
                     tracing::error!(
                         target: "writer_worker",
-                        %hash,
-                        error = format!("{store_err:#}"),
-                        "writer_worker: failed to write failure receipt; \
-                         eth_getTransactionReceipt will return null"
+                        %hash, kind = kind.as_str(), %job_id, signer = %signer,
+                        elapsed_secs = started.elapsed().as_secs_f64(),
+                        error = format!("{err:#}"),
+                        "writer_worker: job failed; writing failure receipt"
                     );
+                    // Best-effort: write the failure receipt so
+                    // `eth_getTransactionReceipt` transitions
+                    // `null → status:0x0` and aggkit's ethtxmanager moves the
+                    // tx to Failed instead of polling forever.
+                    if let Err(store_err) = write_failure_receipt(&self.service, hash, &err).await {
+                        tracing::error!(
+                            target: "writer_worker",
+                            %hash,
+                            error = format!("{store_err:#}"),
+                            "writer_worker: failed to write failure receipt; \
+                             eth_getTransactionReceipt will return null"
+                        );
+                    }
+                    let reason = if err.downcast_ref::<WriterDispatchPanic>().is_some() {
+                        "panic"
+                    } else {
+                        "miden"
+                    };
+                    ::metrics::counter!(
+                        "agglayer_writer_job_failures_total",
+                        "kind" => kind.as_str(),
+                        "reason" => reason,
+                    )
+                    .increment(1);
                 }
-                // Spec F: bucket failure reasons for the job_failures_total
-                // counter. Phase 1 doesn't distinguish miden errors from
-                // store errors at this layer — reason="miden" is the
-                // catch-all for now; the TTL sweeper increments
-                // reason="ttl" directly. Refine when miden_client emits
-                // typed errors.
-                ::metrics::counter!(
-                    "agglayer_writer_job_failures_total",
-                    "kind" => kind.as_str(),
-                    "reason" => "miden",
-                )
-                .increment(1);
             }
         }
 
@@ -824,9 +883,9 @@ impl WriterWorker {
 }
 
 /// Dispatch a `WriteJob` to the matching Phase-1 translator in
-/// `service_send_raw_txn`. Each variant calls the same publish/insert path the
-/// legacy sync handler does, minus the per-signer `nonce_increment` (the
-/// request thread already advanced the nonce at enqueue time — Spec §1 flow).
+/// `service_send_raw_txn`. Each variant calls the corresponding publish/insert
+/// handler without a per-signer `nonce_increment`: the request thread durably
+/// admitted the envelope and advanced the nonce before enqueue.
 async fn dispatch_job(service: &ServiceState, job: WriteJob) -> anyhow::Result<()> {
     match job {
         WriteJob::Claim {
@@ -875,6 +934,9 @@ async fn write_failure_receipt(
     hash: TxHash,
     err: &anyhow::Error,
 ) -> anyhow::Result<()> {
+    if preserve_pending_after_handoff(&service.store, hash).await {
+        return Ok(());
+    }
     let reason = format!("writer_worker: {err:#}");
 
     // Snapshot the current tip so the receipt is attributable to a block
@@ -889,11 +951,34 @@ async fn write_failure_receipt(
     // here (it's been moved into the dispatch), but the inflight cache does;
     // for Phase 1 we accept that "no prior begin" is best-effort recoverable
     // by the future txn_commit_pending sweep at sync time. Phase 4 lands the
-    // proper TTL→status:0x0 path that always writes both rows.
+    // queue-age expiry and completed dispatch failures use this same path.
     service
         .store
         .txn_commit(hash, Err(reason), block_num, block_hash)
         .await
+}
+
+/// Fail closed when the store cannot disprove an exact note handoff. Once a
+/// handoff exists, only commit/observation or expiration reconciliation may
+/// transition the receipt; worker errors must never publish status 0.
+async fn preserve_pending_after_handoff(
+    store: &std::sync::Arc<dyn crate::store::Store>,
+    hash: TxHash,
+) -> bool {
+    let tx_key = format!("{hash:#x}");
+    match store.get_note_handoff_for_tx(&tx_key).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                target: "writer_worker",
+                %hash,
+                error = %err,
+                "could not classify note handoff; conservatively keeping receipt pending"
+            );
+            true
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -942,6 +1027,94 @@ mod tests {
             eth_tx_hash: hash,
             job_id: Ulid::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_panic_is_contained_and_next_task_still_runs() {
+        let err = supervise_dispatch(async {
+            panic!("injected writer dispatch panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await
+        .expect_err("the panic must be converted into a job error");
+        assert!(err.downcast_ref::<WriterDispatchPanic>().is_some());
+
+        supervise_dispatch(async { Ok(()) })
+            .await
+            .expect("the supervisor must remain usable after a panic");
+    }
+
+    #[tokio::test]
+    async fn durable_note_handoff_preserves_pending_worker_outcome() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let hash = TxHash::from([0xabu8; 32]);
+        assert!(!preserve_pending_after_handoff(&store, hash).await);
+        store
+            .prepare_note_handoff(&format!("{hash:#x}"), "commitment", "note-id", 10)
+            .await
+            .unwrap();
+        assert!(preserve_pending_after_handoff(&store, hash).await);
+    }
+
+    /// Regression: expiry authority belongs to the worker that dequeued the
+    /// item. An over-age queued job is failed before `dispatch_job` is ever
+    /// constructed, so no Miden request can execute after status:0x0.
+    #[tokio::test]
+    async fn over_age_queued_job_expires_before_miden_dispatch() {
+        let service = crate::test_helpers::create_test_service();
+        let miden_client = service.miden_client.clone();
+        let nonce = service.store.nonce_get("queue-expiry-test").await.unwrap();
+        let mut job = fake_ger_job(nonce);
+        if let WriteJob::Ger { ger_bytes, .. } = &mut job {
+            *ger_bytes = [0x42; 32];
+        }
+        let hash = job.eth_tx_hash();
+
+        service
+            .store
+            .txn_begin(
+                hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope: job.envelope().clone(),
+                    signer: job.signer(),
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_sender, receiver) = mpsc::channel(1);
+        let inflight = Arc::new(DashMap::new());
+        let mut entry = InFlightEntry::from_job(&job);
+        entry.created_at = Instant::now() - Duration::from_secs(2);
+        inflight.insert(hash, entry);
+        let worker = WriterWorker {
+            receiver,
+            inflight: inflight.clone(),
+            service,
+            tx_ttl: Duration::from_secs(1),
+        };
+
+        worker.process(job).await;
+
+        assert_eq!(
+            miden_client.test_call_count(),
+            0,
+            "queue-age expiry must happen before dispatch reaches MidenClient::with"
+        );
+        assert_eq!(inflight.get(&hash).unwrap().state, JobState::Failed);
+        let receipt = worker
+            .service
+            .store
+            .txn_receipt(hash)
+            .await
+            .unwrap()
+            .expect("queue expiry writes a terminal receipt");
+        assert!(receipt.0.is_err());
     }
 
     /// Smoke test: parse_*_env returns defaults when env unset.

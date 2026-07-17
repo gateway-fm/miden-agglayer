@@ -29,6 +29,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 L2_RPC="${L2_RPC:-http://localhost:8546}"
 NODE_CONTAINER="${NODE_CONTAINER:-miden-agglayer-miden-node-1}"
 AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-miden-agglayer-miden-agglayer-1}"
+PG_HOST="${PG_HOST:-localhost}"; PG_PORT="${PG_PORT:-5434}"
+PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-agglayer_store}"
 ALLOW_LATE="${ALLOW_LATE:-0}"
 TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"
 
@@ -80,6 +82,19 @@ docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3 > "$TMP/node.sq
 docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3-wal > "$TMP/node.sqlite3-wal" 2>/dev/null \
     || rm -f "$TMP/node.sqlite3-wal"
 
+# An unresolvable destination is intentionally terminal without a Miden CLAIM
+# note: the proxy records the exception durably and emits one ClaimEvent so
+# AggKit stops retrying funds that require operator rescue. Keep these events
+# strict too: match the durable record to the exact receipt block, globalIndex,
+# and transaction hash instead of weakening the generic extra-log check.
+PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
+    -t -A -F '|' -c \
+    "SELECT u.global_index, COALESCE(t.block_number::text, ''), u.eth_tx_hash
+       FROM unclaimable_claims u
+       LEFT JOIN transactions t ON lower(t.tx_hash) = lower(u.eth_tx_hash)
+      ORDER BY u.global_index" > "$TMP/unclaimable-claims" \
+    || { echo "FAIL: cannot read durable unclaimable-claim records"; exit 1; }
+
 # 3b. Deliberately-DEFERRED bridge-outs are NOT missing. The proxy refuses to emit a
 #     BridgeEvent for a poisoned/unrecoverable faucet-registry row (MA#18; cantina13's
 #     unrecoverable-row scenario) — recovery is via --restore, so the note stays
@@ -122,7 +137,7 @@ done
 sleep "${SETTLE_MARGIN_SECS:-20}"
 
 # 4. Cross-check.
-python3 - "$TMP/node.sqlite3" "$L2_RPC" "$BRIDGE_ID" "$B2AGG_ROOT" "$CLAIM_ROOT" "$GER_ROOT" "$ALLOW_LATE" "$DEFERRED_FAUCETS" <<'PY'
+python3 - "$TMP/node.sqlite3" "$L2_RPC" "$BRIDGE_ID" "$B2AGG_ROOT" "$CLAIM_ROOT" "$GER_ROOT" "$ALLOW_LATE" "$DEFERRED_FAUCETS" "$TMP/unclaimable-claims" <<'PY'
 import json, sqlite3, sys, urllib.request
 from collections import Counter
 
@@ -130,6 +145,7 @@ db, rpc, bridge_id, b2agg_root, claim_root, ger_root, allow_late = sys.argv[1:8]
 # Faucets whose bridge-outs the proxy DELIBERATELY refused to emit (poisoned/
 # unrecoverable registry rows — see step 3b in the shell). Lower-case hex, no 0x.
 deferred_faucets = set((sys.argv[8] if len(sys.argv) > 8 else "").lower().split())
+unclaimable_file = sys.argv[9]
 bridge_hex = bridge_id[2:].upper()
 
 TOPICS = {
@@ -168,6 +184,14 @@ def get_logs(topic0):
         return logs
 
 n = sqlite3.connect(db); n.row_factory = sqlite3.Row
+unclaimable = []
+with open(unclaimable_file, encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        gi, block, tx_hash = line.split("|", 2)
+        unclaimable.append((int(gi, 0), int(block) if block else None, tx_hash.lower()))
 # Consistency cut: the node snapshot's own chain tip. Only notes consumed at or
 # before the cut are expected; only logs at or before the cut can be "extra"
 # (later logs may belong to consumptions that happened after the snapshot).
@@ -176,8 +200,8 @@ overall_fail = False
 total_notes = 0
 total_logs = 0
 print(f"consistency cut: node snapshot tip = block {cut}")
-print(f"{'TYPE':<22} {'notes':>6} {'logs':>6} {'exact':>6} {'late':>5} {'missing':>8} {'defer':>6} {'extra':>6}  verdict")
-print("-" * 85)
+print(f"{'TYPE':<22} {'notes':>6} {'logs':>6} {'exact':>6} {'late':>5} {'missing':>8} {'defer':>6} {'unclaim':>8} {'extra':>6}  verdict")
+print("-" * 96)
 for name, (topic, root) in TOPICS.items():
     rows = list(n.execute(
         "SELECT consumed_at FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
@@ -185,6 +209,33 @@ for name, (topic, root) in TOPICS.items():
         (bytes.fromhex(root[2:]), cut, bridge_hex)))
     note_blocks = Counter(r["consumed_at"] for r in rows)
     logs = get_logs(topic)
+    all_logs_count = sum(1 for l in logs if int(l["blockNumber"], 16) <= cut)
+
+    # ClaimEvents for durable unclaimable records have no corresponding Miden
+    # CLAIM note. Match and remove only their exact (block, GI, tx-hash) logs;
+    # every other surplus ClaimEvent remains an error.
+    unclaim_exact = 0
+    unclaim_missing = 0
+    if name == "CLAIM->ClaimEvent":
+        expected = Counter(
+            (block, gi, tx_hash)
+            for gi, block, tx_hash in unclaimable
+            if block is not None and block <= cut
+        )
+        unclaim_missing += sum(1 for _, block, _ in unclaimable if block is None)
+        kept = []
+        for log in logs:
+            block = int(log["blockNumber"], 16)
+            data = log.get("data", "")
+            gi = int((data[2:66] or "0"), 16)
+            key = (block, gi, log["transactionHash"].lower())
+            if expected[key] > 0:
+                expected[key] -= 1
+                unclaim_exact += 1
+            else:
+                kept.append(log)
+        unclaim_missing += sum(expected.values())
+        logs = kept
     all_log_blocks = [int(l["blockNumber"], 16) for l in logs]
     log_blocks = Counter(all_log_blocks)            # all logs (for exact/late matching)
     cut_log_blocks = Counter(b for b in all_log_blocks if b <= cut)  # extra-detection
@@ -223,12 +274,14 @@ for name, (topic, root) in TOPICS.items():
                     print(f"    MISSING candidate: note 0x{r['i'].lower()} consumed_at={r['b']}")
         missing -= deferred
     total_notes += n_notes
-    total_logs += n_logs_cut
-    ok = missing == 0 and extra == 0 and (late == 0 or allow_late == "1")
+    total_logs += all_logs_count
+    ok = (missing == 0 and extra == 0 and unclaim_missing == 0
+          and (late == 0 or allow_late == "1"))
     overall_fail |= not ok
-    print(f"{name:<22} {n_notes:>6} {n_logs_cut:>6} {exact:>6} {late:>5} {missing:>8} {deferred:>6} {extra:>6}  {'PASS' if ok else 'FAIL'}")
+    unclaim_col = f"{unclaim_exact}/{unclaim_exact + unclaim_missing}" if name == "CLAIM->ClaimEvent" else "-"
+    print(f"{name:<22} {n_notes:>6} {all_logs_count:>6} {exact:>6} {late:>5} {missing:>8} {deferred:>6} {unclaim_col:>8} {extra:>6}  {'PASS' if ok else 'FAIL'}")
 
-print("-" * 85)
+print("-" * 96)
 if total_notes == 0 and total_logs > 0:
     print("SANITY FAIL: node query matched ZERO consumed notes while logs exist —")
     print(f"almost certainly a wrong/bech32 BRIDGE_ID ({bridge_id}); pass the HEX id.")

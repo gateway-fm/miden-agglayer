@@ -101,6 +101,10 @@ want = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] != '' else None
 sys.exit(0 if bool(d.get('ready_for_claim')) and (want is None or str(d.get('dest_net')) == want) else 1)
 " "${4:-}"
 }
+_pred_deposit_indexed() {                                                        # <dest> <netid> <orig> [service-url]
+    local dep; dep=$(find_deposit "$1" "$2" "$3" "${4:-$BRIDGE_SERVICE_URL}")
+    [[ -n "$dep" ]]
+}
 
 # wait_for <desc> <timeout> <interval> <predicate-fn> [args...]
 # Polls the NAMED predicate function until it succeeds or <timeout>s elapse.

@@ -99,6 +99,18 @@ pub struct ServiceState {
     /// of `allowed_signers`. ONLY safe behind a loopback bind / network
     /// boundary. Refused by `--require-hardening`.
     pub allow_any_signer: bool,
+    /// Audit H6 — refuse to inject a GER whose `(mainnet, rollup)`
+    /// decomposition was NOT corroborated by the independent L1 InfoTree
+    /// indexer. Defends against a compromised aggoracle key injecting a forged
+    /// GER onto Miden. Default false (allow through, but flag via the
+    /// `ger_injection_unverified_total` metric) to tolerate indexer lag;
+    /// `--require-hardening` implies true.
+    pub reject_unverified_ger: bool,
+    /// Audit H6 — the single L1 frontier scanned for evidence: `latest`,
+    /// `safe`, or `finalized`. Roots are persisted only from this scan, so row
+    /// provenance and the scan cursor always share one setting. Hardened mode
+    /// accepts `safe` or `finalized`; the default is `latest`.
+    pub l1_evidence_tag: crate::ger::EvidenceTag,
     /// Per-signer async mutex registry (R4 follow-up) — serialises the
     /// nonce-check critical section so two concurrent same-nonce txs from one
     /// signer cannot both pass the equality check before either increments.
@@ -122,21 +134,10 @@ pub struct ServiceState {
     /// call. `None` when talking to the node directly; `Some(...)` when fronted by a
     /// gateway that rate-limits unauthenticated traffic. Redact if you ever log this.
     pub miden_api_key: Option<String>,
-    /// RD-940 async writer-worker dispatch toggle. When `false` (the default
-    /// until Phase 7 of the RD-940 rollout), `eth_sendRawTransaction` runs the
-    /// existing synchronous handler unchanged. When `true`, requests are
-    /// validated on the request thread and the actual Miden submission is
-    /// enqueued to the single writer-worker task. See
-    /// `docs/design/RD-940-async-writer.md` for the full design.
-    pub enable_writer_worker: bool,
-    /// RD-940 writer-worker producer handle. `None` when
-    /// `enable_writer_worker = false` *or* when the flag is set but the
-    /// worker failed to spawn at startup (logged-but-non-fatal — the sync
-    /// path remains usable as the fallback). `Some(handle)` is the live
-    /// `try_enqueue` surface plumbed into `service_send_raw_txn` and the
-    /// upcoming Phase 4 `eth_getTransactionByHash` in-flight reader. The
-    /// `Arc` shares the underlying channel + in-flight DashMap across every
-    /// `ServiceState::clone()` the dispatcher hands out.
+    /// Single writer-worker producer handle. Production startup always sets
+    /// this before serving RPC traffic. It remains optional only so lower-level
+    /// unit tests can construct a state without starting a background runtime.
+    /// The `Arc` shares the bounded channel and in-flight map across requests.
     pub writer_handle: Option<Arc<crate::writer_worker::WriterWorkerHandle>>,
 }
 
@@ -177,13 +178,14 @@ impl ServiceState {
             admin_api_key: None,
             allowed_signers: None,
             allow_any_signer: false,
+            reject_unverified_ger: false,
+            l1_evidence_tag: crate::ger::EvidenceTag::default(),
             per_signer_locks: PerSignerLocks::new(),
             rate_limit_per_second: crate::service::DEFAULT_RATE_LIMIT_PER_SECOND,
             rate_limit_burst: crate::service::DEFAULT_RATE_LIMIT_BURST,
             reject_zero_padding_addresses: false,
             expected_mints,
             miden_api_key: None,
-            enable_writer_worker: false,
             writer_handle: None,
         }
     }

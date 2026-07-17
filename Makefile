@@ -69,6 +69,12 @@ test: test-unit test-e2e ## Run everything: unit tests, then spin up stack and r
 test-unit: ## Run unit tests (no docker needed)
 	cargo test --workspace --profile=$(CARGO_PROFILE) --lib
 
+.PHONY: test-scripts
+test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker needed)
+	bash -n scripts/release-acceptance.sh
+	bash -n scripts/release-acceptance-guards.test.sh
+	bash scripts/release-acceptance-guards.test.sh
+
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
 	@echo "╔══════════════════════════════════════════════════════════════╗"
@@ -243,9 +249,11 @@ e2e-clean-data: ## Wipe .miden-agglayer-data/ + .b2agg-store/ + node_data volume
 		echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
 		ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; fi
 	mkdir -p .miden-agglayer-data/tmp
-	@out=$$(docker volume rm miden-agglayer_node_data 2>&1) || { \
+	@project="$${COMPOSE_PROJECT_NAME:-$(notdir $(CURDIR))}"; \
+	volume="$${project}_node_data"; \
+	out=$$(docker volume rm "$$volume" 2>&1) || { \
 		echo "$$out" | grep -qi "no such volume" || { \
-			echo "e2e-clean-data: cannot remove node_data volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
+			echo "e2e-clean-data: cannot remove $$volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)
@@ -371,13 +379,12 @@ e2e-cantina10: e2e-up ## Spin up stack + Cantina #10 concurrent first-claim fauc
 	$(COMPOSE_ENV) ./scripts/e2e-cantina10-concurrent-faucet.sh
 
 # --- RD-940 e2e -----------------------------------------------------------
-# All RD-940 e2e scripts require the writer worker active. The `e2e-rd940-up`
-# helper sets AGGLAYER_ENABLE_WRITER_WORKER=true before bringing up the stack.
+# The single writer is always active; this helper only applies worker-specific
+# queue/receipt settings used by the RD-940 scenarios.
 
 .PHONY: e2e-rd940-up
-e2e-rd940-up: e2e-clean-data ## Bring up the stack with the RD-940 writer worker enabled
-	AGGLAYER_ENABLE_WRITER_WORKER=true \
-	  AGGLAYER_WRITER_QUEUE_DEPTH=$${AGGLAYER_WRITER_QUEUE_DEPTH:-64} \
+e2e-rd940-up: e2e-clean-data ## Bring up the stack with RD-940 test settings
+	AGGLAYER_WRITER_QUEUE_DEPTH=$${AGGLAYER_WRITER_QUEUE_DEPTH:-64} \
 	  AGGLAYER_WRITER_TX_TTL=$${AGGLAYER_WRITER_TX_TTL:-300} \
 	  AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS=$${AGGLAYER_CLAIM_RECEIPT_EXPIRATION_BLOCKS:-120} \
 	  $(E2E_COMPOSE) up -d --build --wait

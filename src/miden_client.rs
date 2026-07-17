@@ -2,11 +2,14 @@ use anyhow::{Context, anyhow};
 use miden_client::RemoteTransactionProver;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
+use miden_client::rpc::domain::transaction::TransactionRecord;
 use miden_client::rpc::{Endpoint, GrpcClient, GrpcError, NodeRpcClient, RpcError};
 use miden_client::sync::SyncSummary;
 use miden_client::transaction::{LocalTransactionProver, TransactionProver};
 use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
+use miden_protocol::note::NoteId;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
@@ -110,6 +113,25 @@ type BoxFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 type BoxFutureFactory =
     Box<dyn for<'c> FnOnce(&'c mut MidenClientLib) -> BoxFuture<'c> + Send + 'static>;
 
+/// Require an exact aggregate `GetNotesById` response. The gRPC client handles request
+/// chunking; callers must still reject omissions before advancing any durable cursor.
+pub(crate) fn ensure_complete_note_response(
+    requested: &[NoteId],
+    returned: &[NoteId],
+) -> anyhow::Result<()> {
+    let expected: BTreeSet<_> = requested.iter().copied().collect();
+    let actual: BTreeSet<_> = returned.iter().copied().collect();
+    if returned.len() != requested.len() || actual != expected {
+        anyhow::bail!(
+            "get_notes_by_id returned an incomplete response: requested {}, received {} unique of {} rows",
+            requested.len(),
+            actual.len(),
+            returned.len()
+        );
+    }
+    Ok(())
+}
+
 struct Request {
     response_sender: oneshot::Sender<anyhow::Result<()>>,
     closure: BoxFutureFactory,
@@ -121,6 +143,15 @@ pub trait SyncListener: Send + Sync {
     async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+/// The RESOLVED node URL `MidenClient::new` will actually connect to for the given CLI
+/// option — `Endpoint::localhost()` when absent. Subsystems that build their OWN node RPC
+/// (the projector's reconciler, the LET cardinality gate, restore's recovery scans) MUST
+/// derive their URL from this instead of the raw `Option`; an absent CLI option means the
+/// localhost endpoint, not a disabled RPC.
+pub fn effective_node_url(node_url: Option<String>) -> String {
+    node_url.unwrap_or_else(|| Endpoint::localhost().to_string())
 }
 
 /// Shared node-URL resolver used by both the persistent `MidenClient` (background sync,
@@ -170,6 +201,74 @@ pub fn build_rpc_client(
         client = client.with_bearer_auth(key.to_string());
     }
     Arc::new(client)
+}
+
+/// Orders one account's transactions by their on-chain execution chain, not by the RPC
+/// response order. Multiple same-block updates are linked by
+/// `previous.final_state_commitment == next.initial_state_commitment`; an incomplete or
+/// ambiguous chain is unsafe for LET index assignment and therefore fails closed.
+pub(crate) fn ordered_account_transactions(
+    transactions: &[TransactionRecord],
+    account_id: miden_protocol::account::AccountId,
+) -> anyhow::Result<Vec<(u64, u32, &TransactionRecord)>> {
+    let mut by_block: BTreeMap<u64, Vec<&TransactionRecord>> = BTreeMap::new();
+    for transaction in transactions {
+        if transaction.transaction_header.account_id() == account_id {
+            by_block
+                .entry(transaction.block_num.as_u64())
+                .or_default()
+                .push(transaction);
+        }
+    }
+
+    let mut ordered = Vec::new();
+    for (block, transactions) in by_block {
+        if transactions.len() == 1 {
+            ordered.push((block, 0, transactions[0]));
+            continue;
+        }
+
+        let final_states: BTreeSet<_> = transactions
+            .iter()
+            .map(|tx| tx.transaction_header.final_state_commitment())
+            .collect();
+        let mut by_initial = BTreeMap::new();
+        for transaction in &transactions {
+            let initial = transaction.transaction_header.initial_state_commitment();
+            if by_initial.insert(initial, *transaction).is_some() {
+                anyhow::bail!(
+                    "transaction order: duplicate initial state for account {account_id} in block {block}"
+                );
+            }
+        }
+
+        let heads: Vec<_> = by_initial
+            .keys()
+            .filter(|initial| !final_states.contains(initial))
+            .copied()
+            .collect();
+        if heads.len() != 1 {
+            anyhow::bail!(
+                "transaction order: expected one execution-chain head for account {account_id} \
+                 in block {block}, found {}",
+                heads.len()
+            );
+        }
+
+        let mut next = heads[0];
+        for order in 0..transactions.len() {
+            let Some(transaction) = by_initial.remove(&next) else {
+                anyhow::bail!(
+                    "transaction order: disconnected execution chain for account {account_id} \
+                     in block {block}"
+                );
+            };
+            next = transaction.transaction_header.final_state_commitment();
+            ordered.push((block, order as u32, transaction));
+        }
+    }
+
+    Ok(ordered)
 }
 
 pub struct MidenClient {
@@ -417,6 +516,44 @@ impl MidenClient {
             listeners_paused: Arc::new(AtomicBool::new(false)),
             call_count,
         }
+    }
+
+    /// Test stub whose first serialized client request remains blocked until
+    /// the returned sender is signalled. Used to prove read-only RPC polling
+    /// never queues behind an in-progress Miden writer.
+    #[cfg(test)]
+    pub fn new_test_blocked() -> (Self, std::sync::mpsc::Sender<()>) {
+        let store_dir = tempfile::tempdir().unwrap().keep();
+        let keystore_path = store_dir.join("keystore");
+        std::fs::create_dir_all(&keystore_path).unwrap();
+        let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).unwrap());
+        let (sender, mut receiver) = mpsc::channel::<Request>(1);
+        let (done_sender, _done_receiver) = oneshot::channel::<()>();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        thread::spawn(move || {
+            if let Some(req) = receiver.blocking_recv() {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                let _ = release_receiver.recv();
+                let _ = req.response_sender.send(Ok(()));
+            }
+        });
+
+        (
+            Self {
+                keystore,
+                task: std::sync::Mutex::new(None),
+                sender,
+                done_sender: std::sync::Mutex::new(Some(done_sender)),
+                alive: Arc::new(AtomicBool::new(true)),
+                local_prover_fallback: None,
+                listeners_paused: Arc::new(AtomicBool::new(false)),
+                call_count,
+            },
+            release_sender,
+        )
     }
 
     /// Returns the number of times `.with()` was called on this test stub.
@@ -783,6 +920,21 @@ pub async fn wait_for_transaction_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default projector RPC must resolve to the same localhost endpoint as MidenClient.
+    #[test]
+    fn effective_node_url_defaults_to_localhost() {
+        let default = effective_node_url(None);
+        assert_eq!(
+            default,
+            Endpoint::localhost().to_string(),
+            "absent --miden-node must resolve to the same localhost the client uses"
+        );
+        assert!(!default.is_empty(), "the resolved URL is never empty/None");
+        // An explicit URL passes through unchanged.
+        let explicit = "http://node.example:57291".to_string();
+        assert_eq!(effective_node_url(Some(explicit.clone())), explicit);
+    }
 
     #[tokio::test]
     async fn test_miden_client_test_tracks_calls() {

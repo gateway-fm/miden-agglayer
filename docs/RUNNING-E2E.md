@@ -1,181 +1,224 @@
-# Running the e2e stack locally
+# Running the E2E stack locally
 
-The e2e stack is a full Miden↔AggLayer bridge: an Anvil L1 (replaying a Kurtosis
-CDK snapshot), the Miden node microservices (validator / node / ntx-builder /
-remote-prover), the `miden-agglayer` proxy (service under test), a patched
-zkevm-bridge-service, AggLayer, and AggKit. It is driven by
-`docker-compose.e2e.yml` + the `make e2e-*` targets.
+The local stack is defined by `docker-compose.e2e.yml` and driven by the
+`e2e-*` Make targets. It contains:
 
-Kurtosis is **only** used once to mint the L1 snapshot (fixtures); it is not part
-of running the stack — at runtime everything talks to Anvil.
+- Anvil with replayed CDK contract-deployment transactions;
+- Miden validator, sequencer (`miden-node`), network-transaction builder, and
+  remote transaction prover;
+- the `miden-agglayer` service under test and its Postgres store;
+- bridge-service and its Postgres store;
+- AggLayer, AggKit, and the standalone `bridge-autoclaim` process.
 
----
+Kurtosis is used only to generate the gitignored L1 fixtures. It is not part of
+the running Compose stack.
 
-## 1. Prerequisites
+## Important: startup is destructive
 
-Host tools: `docker` (Docker Desktop), `cast`/`anvil`/`forge` (foundry, on
-`~/.foundry/bin`), `kurtosis` (v1.16+), `jq`, `python3`, `node` (LTS), `cargo`.
+`make e2e-up`, `make test-e2e`, and most standalone `make e2e-*` targets call
+`e2e-clean-data`. That target deletes `.miden-agglayer-data/`,
+`.b2agg-store/`, and the `miden-agglayer_node_data` Docker volume before
+starting a new chain. Run scripts directly against an existing stack when its
+state must be retained.
 
-Sibling repos, cloned next to this checkout (`../`):
+## Prerequisites
 
-| dir | source | ref |
-|---|---|---|
-| `aggkit-proxy` | `github.com/mandrigin/aggkit-proxy` | `main` (provides `kurtosis/miden-cdk`) |
-| `kurtosis-cdk` | `github.com/0xPolygon/kurtosis-cdk` | default |
-| `miden-node-src` | `github.com/0xMiden/node` | **`v0.15.0`** |
-| `zkevm-bridge-service` | `github.com/revitteth/zkevm-bridge-service` | `fix/pending-bridges-rollup-disambiguation` |
+The normal host needs Docker with Compose, Foundry (`cast`), Bash, `jq`, Python
+3, Node.js, and Rust 1.93 or newer. Fixture generation also needs Kurtosis.
 
-`run-all.sh` clones these automatically on a bare Ubuntu box. On macOS, clone
-them by hand (its provisioning phase is Linux/apt-only).
+Compose expects four locally built Miden images and one patched bridge-service
+image:
 
-### Apple Silicon (arm64) — required lockfile pin
+| Image | Source used by repository scripts |
+|---|---|
+| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.15.0` |
+| `miden-node` | same checkout and ref |
+| `miden-ntx-builder` | same checkout and ref |
+| `miden-remote-prover` | same checkout and ref |
+| `zkevm-bridge-service:v0.6.4-RC2-pendingbridges` | `revitteth/zkevm-bridge-service`, branch `fix/pending-bridges-rollup-disambiguation` |
 
-The miden libraries must use **plonky3 `p3-* 0.5.3`**, not `0.5.2`. `p3-goldilocks
-0.5.2` computes wrong Goldilocks field values on ARM, so the proxy crash-loops at
-init with `value for key 0x… not present in the advice map` (the deploy commitment
-computed on arm64 doesn't match). `Cargo.lock` must have all `p3-*` at `0.5.3`
-(the node already pins them). x86_64 is unaffected. Verify:
+`run-all.sh` is the repository's supported bootstrap for a bare Ubuntu host. It
+installs/checks tools, clones companion repositories next to this checkout,
+patches the ntx-builder prover timeout used by this test environment, builds
+missing images, and generates missing fixtures:
 
 ```bash
-awk '/name = "p3-/{n=$3} /version/{if(n){print n,$3;n=""}}' Cargo.lock | grep 0.5.2  # must be empty
+./run-all.sh
 ```
 
----
+It also runs static checks and a bridge round trip. Use `SKIP_STATIC=1` when
+only provisioning and the E2E run are wanted, or `SKIP_PROVISION=1` when all
+images and fixtures already exist. Read the environment controls at the top of
+`run-all.sh` before using it on a managed host.
 
-## 2. Build the node + bridge images (not on any registry)
+### Manual image build
+
+If provisioning manually, clone the node as `../miden-node-src`, check out the
+ref printed by `make miden-node-image-coords`, and build the image names that
+Compose consumes:
 
 ```bash
 cd ../miden-node-src
-for p in "miden-validator 50101" "miden-node 57291" "miden-ntx-builder 50301" "miden-remote-prover 50051"; do
-  set -- $p; docker build --build-arg BIN=$1 --build-arg PORT=$2 -t $1 .; done
-cd ../zkevm-bridge-service && docker build -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges -f Dockerfile .
+for spec in \
+  "miden-validator 50101" \
+  "miden-node 57291" \
+  "miden-ntx-builder 50301" \
+  "miden-remote-prover 50051"
+do
+  set -- $spec
+  docker build --build-arg BIN="$1" --build-arg PORT="$2" -t "$1" .
+done
+
+cd ../zkevm-bridge-service
+docker build \
+  -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges \
+  -f Dockerfile .
 ```
 
-(`run-all.sh` also patches the ntx-builder remote-prover client timeout 10s→180s so
-the ~12.5s B2AGG proof on a slow host isn't cancelled.) The `miden-agglayer`
-service image is built by `make e2e-up`. First build is ~45 min total on arm64.
+The current `run-all.sh` also raises the ntx-builder's remote-prover timeout to
+180 seconds before building. Apply the same source change when reproducing its
+manual build; otherwise a slow B2AGG proof can exceed the upstream client
+timeout.
 
----
+## Generate fixtures
 
-## 3. Generate fixtures (one-time Kurtosis L1 snapshot)
-
-`scripts/setup-fixtures.sh` deploys a Kurtosis CDK enclave, extracts the L1
-state, and templates the service configs. It produces (all gitignored —
-regenerate, don't hand-edit):
-
-- `combined.json` — L1 contract addresses (RollupManager, bridge, GER, rollup, POL, sequencer)
-- `*.keystore` — aggoracle, aggregator, claimsponsor, **and sequencer** (the aggsender
-  signs certs with the sequencer key; missing it ⇒ `"expected proposer…"` cert failure)
-- `l1-raw-txs.txt` — ~32 raw L1 deploy txs; Anvil **replays** these at startup
-- `.env` — contract addrs + `ADMIN_API_KEY` (+ `SPONSOR_PRIVATE_KEY` after `ensure-sponsor-key.sh`)
-- `bridge/agglayer/aggkit/autoclaim-config.toml` — rendered service configs
-
-Prereqs that must hold or it aborts:
-- `kurtosis engine start` (uses Docker Desktop)
-- siblings present: `../aggkit-proxy/kurtosis/miden-cdk` **and** `../kurtosis-cdk`
-  (miden-cdk's `kurtosis.yml` `replace`s `0xPolygon/kurtosis-cdk` → `../../../kurtosis-cdk`)
-- `params.yaml` has `miden: { deploy_miden_services: false }` — **L1-snapshot only**.
-  Without it Kurtosis demands local miden/aggkit images that don't exist and aborts
-  during validation. This gate is on `aggkit-proxy` main.
+The generator defaults to
+`../aggkit-proxy/kurtosis/miden-cdk`. That package's `params.yaml` must select
+the L1-snapshot-only mode (`miden.deploy_miden_services: false`), and its local
+Kurtosis package replacement requires a sibling `../kurtosis-cdk` checkout.
 
 ```bash
 kurtosis engine start
-KURTOSIS_CDK_DIR=../aggkit-proxy/kurtosis/miden-cdk ./scripts/setup-fixtures.sh
-./scripts/ensure-e2e-secrets.sh && ./scripts/ensure-sponsor-key.sh
+KURTOSIS_CDK_DIR=../aggkit-proxy/kurtosis/miden-cdk \
+  ./scripts/setup-fixtures.sh
+./scripts/ensure-e2e-secrets.sh
+./scripts/ensure-sponsor-key.sh
 ```
 
-Deterministic: Kurtosis CDK uses a fixed mnemonic, so addresses/keys are identical
-every run; re-running is safe/idempotent. Already handled inside the script (don't
-re-discover): indexer scan-start blocks = 1 (Anvil replays from genesis),
-`rollupCreationBlockNumber` = deploy block, sequencer-keystore extraction.
+The scripts generate the gitignored files consumed by Compose, including:
 
----
+- `fixtures/combined.json`;
+- `fixtures/l1-raw-txs.txt` and `fixtures/l1-transactions.json`;
+- `fixtures/*.keystore`;
+- `fixtures/.env`.
 
-## 4. Bring up the stack (left running)
+The tracked TOML files in `fixtures/` are templates/current defaults; the
+fixture generator rewrites the deployment-specific values. Do not commit the
+generated keystores or `.env`.
+
+## Start and inspect the stack
 
 ```bash
-make e2e-up      # cleans data, builds the service image, starts ~12 services, --waits healthy
+make e2e-up
 docker compose -f docker-compose.e2e.yml --env-file fixtures/.env ps
 ```
 
-Endpoints: L1 `:8545`, L2 proxy `:8546`, bridge-service `:18080`, postgres `:5432`.
-Give the proxy ~45s after "healthy" to write `bridge_accounts.toml`.
+Host endpoints are loopback-only:
 
----
+| Service | Endpoint |
+|---|---|
+| Anvil L1 | `http://127.0.0.1:8545` |
+| miden-agglayer JSON-RPC | `http://127.0.0.1:8546` |
+| Miden sequencer gRPC | `http://127.0.0.1:57291` |
+| bridge-service HTTP | `http://127.0.0.1:18080` |
+| bridge-service gRPC | `127.0.0.1:19090` |
+| bridge-service Postgres | `127.0.0.1:5433` |
+| miden-agglayer Postgres | `127.0.0.1:5434` |
+| AggLayer gRPC/read RPC | `127.0.0.1:4443` / `127.0.0.1:4444` |
+| AggKit exposed port | `127.0.0.1:5576` |
 
-## 5. Manual deposit / withdraw
-
-The stack ships no pre-funded user wallet (the old `wallet_hardhat` account
-was removed): provision an INDEPENDENT wallet in an isolated store, fund it
-with a normal L1→L2 deposit to its address, then bridge out from it — the
-same flow the e2e drives via `scripts/lib-isolated-wallet.sh`. The easiest
-end-to-end path is simply:
-
-```bash
-./scripts/e2e-l2-to-l1.sh   # provisions + funds the isolated wallet, bridges out, autoclaims on L1
-```
-
-For a manual run:
+Use service names instead of generated container names:
 
 ```bash
-source fixtures/.env; export PATH="$HOME/.foundry/bin:$PATH"
-C=miden-agglayer-miden-agglayer-1
-ACCT=$(docker exec $C cat /var/lib/miden-agglayer-service/bridge_accounts.toml)
-BRIDGE=$(echo "$ACCT" | sed -n 's/.*bridge = "\(.*\)"/\1/p')
-FAUCET=$(echo "$ACCT" | sed -n 's/.*faucet_eth = "\(.*\)"/\1/p')
+docker compose -f docker-compose.e2e.yml --env-file fixtures/.env \
+  logs -f miden-agglayer
 
-# provision an independent wallet in an isolated store (prints wallet-id):
-docker exec $C bridge-out-tool --store-dir /tmp/manual-wallet \
-  --node-url http://miden-node:57291 --create-wallet
-WALLET=<wallet-id printed above>  # fund it first: L1→L2 deposit to its eth-address form (section below)
-
-# L2->L1 withdraw (bridge-autoclaim settles on L1):
-docker exec $C bridge-out-tool --store-dir /tmp/manual-wallet \
-  --node-url http://miden-node:57291 --wallet-id $WALLET --bridge-id $BRIDGE \
-  --faucet-id $FAUCET --amount 500 --dest-address 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --dest-network 0
-
-# check L2 balance (dry probe):
-docker exec $C bridge-out-tool --store-dir /tmp/manual-wallet \
-  --node-url http://miden-node:57291 --wallet-id $WALLET --bridge-id $BRIDGE \
-  --faucet-id $FAUCET --amount 999999999 --dest-address 0xdead --dest-network 0 2>&1 | grep 'wallet balance:'
+curl -fsS http://127.0.0.1:8546/health
+curl -fsS http://127.0.0.1:8546/metrics
 ```
 
-L1→L2 deposits land via `cast send $BRIDGE_ADDRESS 'bridgeAsset(...)'` and are
-auto-claimed by the service — see `scripts/e2e-l1-to-l2.sh` for the exact form.
+## Run tests
 
----
-
-## 6. Run the e2e suites
-
-Individual flows (each `make` target re-cleans + re-ups a fresh stack):
+The main targets are:
 
 ```bash
-make e2e-l1-to-l2        # L1->L2 deposit + CLAIM/MINT/P2ID
-make e2e-l2-to-l1        # L2->L1 bridge-out -> cert -> settle -> claimAsset
-make e2e-restore         # disaster recovery
-make e2e-rd940           # async writer worker (6 scripts)
-# ... see `make help`
+make test-e2e          # fresh base stack, full script suite, teardown
+make e2e-test          # full script suite against an already-running stack
+make e2e-l1-to-l2      # fresh stack, deposit/GER/CLAIM/MINT flow
+make e2e-l2-to-l1      # fresh stack, funds wallet, B2AGG/certificate/L1 claim flow
+make e2e-restore       # fresh stack, restore regression
+make e2e-rd940         # fresh writer-configured stack, six writer scenarios
+make e2e-security      # fresh stack, security scenarios
+make e2e-l2l2-up       # fresh base stack plus second-rollup overlay
+make e2e-l2l2          # L2-to-L2 group; overlay must already be running
+make help              # current complete target list
 ```
 
-Full regression matrix (10 suites, fresh stack each, ~1-3h):
+`scripts/e2e-test.sh` also accepts a named group, such as `l1-to-l2`,
+`l2-to-l1`, `tip-consistency`, `security`, or `l2l2`. Its `case` statement is
+the authoritative list.
+
+For an isolated regression matrix in which every suite gets a fresh stack:
 
 ```bash
-./run-regression.sh      # writes out/REGRESSION-SUMMARY.txt + out/regr-*.log
+./run-regression.sh
 ```
 
-To poke a running stack without re-cleaning, run the scripts directly
-(`./scripts/e2e-l1-to-l2.sh`) rather than the `make` target.
+Results are written under the gitignored `out/` directory.
 
----
+To run one script without resetting the chain:
 
-## 7. Troubleshooting
+```bash
+./scripts/e2e-rpc-tip-consistency.sh
+./scripts/e2e-l1-to-l2.sh
+./scripts/e2e-l2-to-l1.sh
+```
 
-- **`advice map` crash-loop on arm64** → plonky3 0.5.2 in `Cargo.lock`; pin `p3-*`
-  to `0.5.3` and rebuild the service (§1).
-- **`bridge-autoclaim` restarting** → `SPONSOR_PRIVATE_KEY` not set; run
-  `./scripts/ensure-sponsor-key.sh` and restart the service.
-- **Cert rejected `"expected proposer…"`** → missing `sequencer.keystore`; regenerate
-  fixtures.
-- **`DeadlineExceeded` pulling a base image** → Docker registry/auth hiccup; retry.
-- **macOS** is supported with the arm64 pin above; `/var`→`/private/var` symlink
-  handling in `sanitize_store_dir` is already in place.
+Scripts make assumptions about prior funding and test order; read the header of
+the selected script first.
+
+## Manual wallet work
+
+Never point `bridge-out-tool` at the proxy's live store. Create an isolated
+wallet store, fund that wallet through the normal L1-to-L2 path, and reuse the
+same isolated store for bridge-out:
+
+```bash
+docker compose -f docker-compose.e2e.yml --env-file fixtures/.env \
+  exec miden-agglayer bridge-out-tool \
+  --store-dir /tmp/manual-wallet \
+  --node-url http://miden-node:57291 \
+  --create-wallet
+```
+
+The tool prints the wallet ID. Read `bridge_accounts.toml` through
+`docker compose exec miden-agglayer` to obtain the bridge/faucet IDs, then use
+`bridge-out-tool --help` for the current bridge-out arguments. The automated
+and less error-prone reference is `scripts/lib-isolated-wallet.sh` plus
+`scripts/e2e-l2-to-l1.sh`.
+
+## Stop the stack
+
+```bash
+make e2e-down
+```
+
+This removes Compose volumes. Use a plain Compose `stop` only when retaining
+the local chain for later inspection.
+
+## Troubleshooting
+
+- If `e2e-clean-data` reports that `node_data` is in use, stop the old stack
+  before retrying. The target intentionally refuses to start a nominally fresh
+  chain on stale node state.
+- If `bridge-autoclaim` exits because the sponsor key is missing, run
+  `./scripts/ensure-sponsor-key.sh` and recreate that service.
+- If a certificate proposer is rejected, confirm that
+  `fixtures/sequencer.keystore` exists and that AggKit mounts it as configured
+  in `docker-compose.e2e.yml`.
+- If Miden and the proxy disagree on script roots or genesis, confirm every
+  local node image was built from the URL/ref printed by
+  `make miden-node-image-coords`, then recreate the fresh stack.
+- If the proxy fails with a cross-device sqlite rename error, retain the bind
+  mount and `TMPDIR=/var/lib/miden-agglayer-service/tmp` arrangement from the
+  checked-in Compose file.

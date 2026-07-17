@@ -25,11 +25,11 @@ use sha3::{Digest, Keccak256};
 // `miden-agglayer-0.14.5/src/claim_note.rs::{ProofData, LeafData}::to_elements`.
 //
 // ProofData (536 felts):
-//   [0..256)   smt_proof_local_exit_root   (32 nodes × 8 felts; unused here)
-//   [256..512) smt_proof_rollup_exit_root  (32 nodes × 8 felts; unused here)
+//   [0..256)   smt_proof_local_exit_root   (32 nodes × 8 felts; full decode only)
+//   [256..512) smt_proof_rollup_exit_root  (32 nodes × 8 felts; full decode only)
 //   [512..520) global_index                (8 felts, packed-u32-LE for 32 BE bytes)
-//   [520..528) mainnet_exit_root           (unused here)
-//   [528..536) rollup_exit_root            (unused here)
+//   [520..528) mainnet_exit_root           (full decode only)
+//   [528..536) rollup_exit_root            (full decode only)
 //
 // LeafData (32 felts, starting at offset 536):
 //   [536]      leaf_type                   (always Felt::ZERO)
@@ -38,16 +38,22 @@ use sha3::{Digest, Keccak256};
 //   [543]      destination_network         (1 felt, byte-swapped u32)
 //   [544..549) destination_address         (5 felts, packed-u32-LE for 20 BE bytes)
 //   [549..557) amount                      (8 felts, packed-u32-LE for 32 BE bytes — U256)
-//   [557..565) metadata_hash               (unused here)
+//   [557..565) metadata_hash               (full decode only)
 //   [565..568) padding                     (always Felt::ZERO ×3)
 //
 //   [568]      miden_claim_amount          (unused here; not part of ClaimEvent)
 
+const OFFSET_SMT_PROOF_LOCAL: usize = 0;
+const OFFSET_SMT_PROOF_ROLLUP: usize = 256;
 const OFFSET_GLOBAL_INDEX: usize = 512;
+const OFFSET_MAINNET_EXIT_ROOT: usize = 520;
+const OFFSET_ROLLUP_EXIT_ROOT: usize = 528;
 const OFFSET_ORIGIN_NETWORK: usize = 537;
 const OFFSET_ORIGIN_ADDRESS: usize = 538;
+const OFFSET_DESTINATION_NETWORK: usize = 543;
 const OFFSET_DESTINATION_ADDRESS: usize = 544;
 const OFFSET_AMOUNT: usize = 549;
+const OFFSET_METADATA_HASH: usize = 557;
 const MIN_FELT_COUNT: usize = 569;
 
 /// Fields extracted from a consumed CLAIM note's storage that are needed to
@@ -64,6 +70,40 @@ pub struct DecodedClaim {
     /// fits u64 (max ETH supply ≈ 2^57 wei) — we surface overflows as a metric
     /// and refuse to emit, rather than silently truncating.
     pub amount: u64,
+}
+
+/// The COMPLETE original `claimAsset` inputs recovered from a consumed CLAIM note's
+/// on-chain storage — every calldata field except the `metadata` byte-string, whose
+/// preimage is not in the note (only its keccak256, `metadata_hash`) and is resolved
+/// separately from the faucet registry.
+///
+/// The proxy BUILT the CLAIM note from exactly these fields
+/// (`claim::publish_claim` → `ClaimNoteStorage { ProofData, LeafData }`), and the
+/// on-chain bridge MASM verified the claim against them — so this decode is the
+/// authoritative claim truth, NOT a fabrication. aggkit v0.8.3's bridgesync
+/// full-claim parser persists all of it (both SMT proofs, both exit roots, networks,
+/// addresses, amount, metadata) and derives the claim's GER from the two exit roots,
+/// so a synthesized claim tx must serve these values verbatim.
+///
+/// Note the values are the CANONICALIZED forms the proxy verified on-chain
+/// (`claim::build_canonical_proof_data`): for a mainnet-flagged global index the
+/// rollup SMT proof is all-zero and the gi rollup-index bytes are zeroed — that is
+/// what was actually proven, hence what must be served.
+#[derive(Debug, Clone)]
+pub struct DecodedFullClaim {
+    pub smt_proof_local_exit_root: [[u8; 32]; 32],
+    pub smt_proof_rollup_exit_root: [[u8; 32]; 32],
+    pub global_index: [u8; 32],
+    pub mainnet_exit_root: [u8; 32],
+    pub rollup_exit_root: [u8; 32],
+    pub origin_network: u32,
+    pub origin_address: [u8; 20],
+    pub destination_network: u32,
+    pub destination_address: [u8; 20],
+    /// Full U256 big-endian amount — calldata is `uint256`, so no u64 clamp here
+    /// (unlike [`DecodedClaim::amount`], which feeds the u64-typed event store).
+    pub amount: [u8; 32],
+    pub metadata_hash: [u8; 32],
 }
 
 // PARSING
@@ -152,6 +192,56 @@ pub fn parse_claim_event_from_storage(storage: &NoteStorage) -> anyhow::Result<D
         origin_address,
         destination_address,
         amount,
+    })
+}
+
+/// Decode the COMPLETE `ClaimNoteStorage` — every original `claimAsset` field except the
+/// metadata preimage (see [`DecodedFullClaim`]). Same layout pin and error posture as
+/// [`parse_claim_event_from_storage`]; additionally recovers both 32-node SMT proofs, both
+/// exit roots, the destination network, the full U256 amount and the metadata hash.
+pub fn parse_full_claim_from_storage(storage: &NoteStorage) -> anyhow::Result<DecodedFullClaim> {
+    let items = storage.items();
+    if items.len() < MIN_FELT_COUNT {
+        anyhow::bail!(
+            "CLAIM storage too short: expected ≥{MIN_FELT_COUNT} felts, got {}",
+            items.len()
+        );
+    }
+
+    // Each SMT node is one Keccak256Output = 8 packed-u32 felts for 32 bytes
+    // (`Keccak256Output::to_elements` = `bytes_to_packed_u32_elements`) — the same
+    // encoding `unpack_u32_felts` inverts everywhere else in this decoder.
+    let mut smt_proof_local_exit_root = [[0u8; 32]; 32];
+    let mut smt_proof_rollup_exit_root = [[0u8; 32]; 32];
+    for i in 0..32 {
+        let local_at = OFFSET_SMT_PROOF_LOCAL + i * 8;
+        smt_proof_local_exit_root[i] = unpack_u32_felts::<32>(&items[local_at..local_at + 8])?;
+        let rollup_at = OFFSET_SMT_PROOF_ROLLUP + i * 8;
+        smt_proof_rollup_exit_root[i] = unpack_u32_felts::<32>(&items[rollup_at..rollup_at + 8])?;
+    }
+
+    Ok(DecodedFullClaim {
+        smt_proof_local_exit_root,
+        smt_proof_rollup_exit_root,
+        global_index: unpack_u32_felts::<32>(&items[OFFSET_GLOBAL_INDEX..OFFSET_GLOBAL_INDEX + 8])?,
+        mainnet_exit_root: unpack_u32_felts::<32>(
+            &items[OFFSET_MAINNET_EXIT_ROOT..OFFSET_MAINNET_EXIT_ROOT + 8],
+        )?,
+        rollup_exit_root: unpack_u32_felts::<32>(
+            &items[OFFSET_ROLLUP_EXIT_ROOT..OFFSET_ROLLUP_EXIT_ROOT + 8],
+        )?,
+        origin_network: decode_swapped_u32(items[OFFSET_ORIGIN_NETWORK])?,
+        origin_address: unpack_u32_felts::<20>(
+            &items[OFFSET_ORIGIN_ADDRESS..OFFSET_ORIGIN_ADDRESS + 5],
+        )?,
+        destination_network: decode_swapped_u32(items[OFFSET_DESTINATION_NETWORK])?,
+        destination_address: unpack_u32_felts::<20>(
+            &items[OFFSET_DESTINATION_ADDRESS..OFFSET_DESTINATION_ADDRESS + 5],
+        )?,
+        amount: unpack_u32_felts::<32>(&items[OFFSET_AMOUNT..OFFSET_AMOUNT + 8])?,
+        metadata_hash: unpack_u32_felts::<32>(
+            &items[OFFSET_METADATA_HASH..OFFSET_METADATA_HASH + 8],
+        )?,
     })
 }
 
@@ -320,7 +410,7 @@ mod tests {
 
     /// The store-side dedup contract the projector's claim derivation relies on:
     /// feeding the same global_index twice through the store paths must produce a
-    /// single ClaimEvent and a single cursor advance. Drives the store primitives
+    /// single ClaimEvent without sealing a partial synthetic block. Drives the store primitives
     /// directly to pin the dedup logic.
     #[tokio::test]
     async fn store_dedup_paths_are_idempotent() {
@@ -351,15 +441,11 @@ mod tests {
         // Both dedup predicates now return true.
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
-        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 0);
 
-        // A second commit with the same note_id must NOT advance the block
-        // or duplicate the log — note that the InMemoryStore default impl
-        // re-inserts (the HashMap upsert), but the cursor advance is to the
-        // same block_number, and downstream dedup catches re-emission.
-        // The PgStore variant uses `ON CONFLICT DO NOTHING` so it's a true
-        // no-op. The InMemoryStore observable invariant is "ClaimEvent
-        // lookup still returns true and cursor doesn't go BACKWARD".
+        // A second commit with the same note_id is a true no-op: it neither
+        // duplicates the log nor advances the block tip. The projector owns
+        // block sealing after every note in that block has been processed.
         store
             .commit_manual_claim_event_atomic(
                 note_id.clone(),
@@ -377,6 +463,6 @@ mod tests {
             .unwrap();
         assert!(store.is_claim_note_processed(&note_id).await.unwrap());
         assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
-        assert!(store.get_latest_block_number().await.unwrap() >= 1);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 0);
     }
 }

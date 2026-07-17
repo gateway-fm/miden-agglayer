@@ -1,61 +1,61 @@
-# miden-agglayer — operations
+# Operations
 
-Operational reference for running miden-agglayer in a production-like
-deployment (bali is the current reference cluster).
+These documents describe the service implemented by the current `main` branch.
+They are deployment-neutral: discover names, namespaces, secret sources, and
+database endpoints from the deployment you are operating instead of copying a
+historical cluster value.
 
-Audience: SRE on call for the bali Miden testnet, or anyone bringing up a
-similarly-shaped deployment elsewhere.
-
-## What's in this directory
-
-| Doc | Use it when… |
+| Document | Purpose |
 |---|---|
-| [`runbook.md`](./runbook.md) | You're deploying or recovering: the full startup surface (flags/env), the hard constraints (one replica, proxy-private store, loopback bind), the three recovery mechanisms (R1 automatic ladder / R2 `--restore` / R3 self-heal), and the step-by-step failure-mode catalogue (IAIC, AccountDataNotFound, GER backlog, stuck claim, ClaimSettler dry, indexer drift). |
-| [`monitoring.md`](./monitoring.md) | You want to know what to scrape, what to alert on, which log lines matter, and what "healthy" vs "stuck" looks like end to end (projector health line, reconciler chatter, LET convergence). |
-| [`diagnostics.md`](./diagnostics.md) | You don't yet know what's wrong — the read-only inspection playbook (Loki queries, SQL snapshots, single-deposit tracing, the event-integrity audit, node-DB vs proxy-store comparison). |
+| [Runbook](runbook.md) | Production constraints, startup, safe shutdown, recovery choices, and incident procedures |
+| [Monitoring](monitoring.md) | Health/metrics endpoints, high-signal metrics, alerts, and dashboards |
+| [Diagnostics](diagnostics.md) | Read-only collection and symptom-to-cause investigation |
+| [Quarantine](quarantine.md) | Handling B2AGG exits the projector deliberately cannot emit |
+| [Upgrade guide](../UPGRADE.md) | Version-neutral in-place upgrade and rollback procedure |
 
-## What's already documented elsewhere
-
-These existing docs cover architecture, specific incidents, and design
-notes — link out to them rather than re-stating their contents:
-
-- [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — component architecture,
-  the synthetic block engine (SyntheticProjector), the three main flows
-  (GER / claim / B2AGG), and the recovery-flow diagrams that
-  `runbook.md` Part 2 references. Read this first when new to the
-  system.
-- [`../POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md`](../POSTMORTEM_2026-05-11_IAIC_TO_ADNF.md) — the IAIC →
-  AccountDataNotFound chain that ran the bali bridge for ~20 days. Anyone
-  triaging "mempool conflict" or "account data wasn't found" symptoms
-  should read this first.
-- [`../REDEPLOY_RUNBOOK_BALI.md`](../REDEPLOY_RUNBOOK_BALI.md) — the v0.4.1 deploy + recovery
-  runbook for bali specifically. The redeploy procedure documented there
-  is the cure for the postmortem's failure mode on the existing bali
-  cluster.
-- [`../ger-decomposition.md`](../ger-decomposition.md) — design notes on the GER decomposition
-  problem and the `UseUpdateExitRoot` aggoracle mode that is the
-  permanent fix (RD-862).
-- [`../ger-note-screening-bypass.md`](../ger-note-screening-bypass.md) — design notes on the split
-  `execute → prove → submit` flow that GER injection uses to bypass the
-  miden-client NoteScreener.
-- [`../../README.md`](../../README.md) — service-level overview, CLI flags,
-  ClaimSettler env vars, recovery flags (`--reset-miden-store`,
-  `--unlock-miden-accounts`, `--restore`, `--init`).
-- The [`miden-bali-debug` skill](../../.claude/skills/miden-bali-debug/SKILL.md) (if checked
-  out) — read-only diagnostic agent that automates Phases 0-7 of
-  `diagnostics.md`.
+Architecture and data-flow context is in
+[the architecture guide](../ARCHITECTURE.md).
 
 ## Conventions
 
-- All command examples assume the bali cluster
-  (`dev-gateway-eks` / `outpost-testnet-miden-testnet` namespace,
-  pod `miden-agglayer-0`, image `gatewayfm/miden-agglayer:0.4.1` or
-  later). Adapt cluster context, namespace, and pod name for other
-  deployments.
-- Placeholders are written as `<placeholder>` and need operator input
-  before the command will run. Anything labelled `<TODO: ...>` is
-  unverified — confirm with the on-call before relying on it.
-- Destructive commands (`--reset-miden-store`, `--init`, SQL UPDATE) are
-  always called out with their blast radius and the rollback path.
-- The diagnostic skill is read-only by contract — it never executes
-  recovery actions, even when one is obvious.
+- Commands use variables such as `$NAMESPACE`, `$WORKLOAD`, `$POD`,
+  `$PROXY_RPC`, and `$DATABASE_URL`. Resolve them from the live deployment
+  first; the examples do not assume Kubernetes object names.
+- A command that needs deployment-specific authority states that prerequisite
+  in prose instead of presenting an incomplete command.
+- Start with read-only diagnostics. Database writes, account initialization,
+  store reset, restore, scaling, and image changes are recovery actions and
+  require an approved change/incident procedure.
+- Never expose port 8546 directly to the public internet. Bind privately or put
+  it behind an authenticated, rate-limited network boundary.
+- Never run two service processes against one Miden store. The projector and
+  sqlite client are single-owner components.
+- Never delete or replace `keystore/` or `bridge_accounts.toml` as part of a
+  routine recovery.
+
+## Discover a Kubernetes deployment
+
+The repository does not contain the production cluster manifest, so discover
+the live objects instead of relying on names from an old runbook:
+
+```bash
+kubectl config current-context
+kubectl get namespaces
+kubectl -n "$NAMESPACE" get deploy,statefulset,pod,service \
+  -o wide | grep -i miden
+kubectl -n "$NAMESPACE" get pod "$POD" \
+  -o jsonpath='{.spec.containers[*].name}{"\n"}'
+kubectl -n "$NAMESPACE" get pod "$POD" \
+  -o jsonpath='{.spec.containers[*].image}{"\n"}'
+```
+
+Resolve secret *names* and environment wiring from the workload manifest. Do
+not print secret values into terminals captured by support tooling:
+
+```bash
+kubectl -n "$NAMESPACE" get "$WORKLOAD" -o yaml
+```
+
+Use the workload kind that actually exists. If neither command identifies the
+service unambiguously, stop and obtain the deployment inventory from its owner
+before performing recovery actions.

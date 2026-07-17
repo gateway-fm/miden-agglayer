@@ -1,6 +1,7 @@
 use crate::COMPONENT;
 use crate::hex::hex_decode_u64;
 use crate::service_debug::service_debug_trace_transaction;
+use crate::service_estimate_gas::service_estimate_gas;
 use crate::service_eth_call::service_eth_call;
 use crate::service_get_logs::service_get_logs;
 use crate::service_get_txn_receipt::service_get_txn_receipt;
@@ -246,6 +247,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+pub(crate) fn select_transaction_count(
+    accepted_nonce: u64,
+    tag: &str,
+    frontier: crate::store::PendingNonceFrontier,
+) -> u64 {
+    if matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest") {
+        frontier
+            .lowest_pending
+            .map_or(accepted_nonce, |nonce| accepted_nonce.min(nonce))
+    } else {
+        accepted_nonce
+    }
+}
+
 async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> JrpcResult {
     let answer_id = request.get_answer_id();
     let method_name = request.method.clone();
@@ -390,35 +405,30 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .nonce_get(addr)
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?;
-            let mut returned_nonce = accepted_nonce;
 
             // RD-940 Decision 4 — honour the block tag.
             //
-            // `store.nonce_get` returns the **next-accepted** nonce because
-            // `eth_sendRawTransaction` advances it on accept (both legacy and
-            // worker paths). That value matches geth's `pending` semantics
-            // directly. For `latest` / `safe` / `finalized` / `earliest` the
-            // RPC must instead return the **next-committed** nonce, computed
-            // as `next-accepted - count(inflight non-terminal jobs from this
-            // signer)`.
+            // `store.nonce_get` is the next-accepted nonce (`pending`). For
+            // committed tags, use the oldest durable pending row as the
+            // boundary. This survives a writer restart; the old DashMap
+            // subtraction did not.
             //
             // claim-sponsor's `nonce_cache.go:35` LRU reads `latest`; without
             // this branch it sees queued/submitting txs leak into `latest`
-            // and races itself (Spec E). When the writer worker is disabled
-            // there are no inflight jobs so the two tags agree by
-            // construction.
+            // and races itself (Spec E).
             //
             // Empty / missing tag defaults to `latest` per the geth contract
             // (`eth_getTransactionCount` second-param convention).
             let treat_as_latest = matches!(tag, "" | "latest" | "safe" | "finalized" | "earliest");
-            let mut inflight_non_terminal = 0usize;
-            if treat_as_latest
-                && let Some(handle) = service.writer_handle.as_ref()
-                && let Ok(signer_addr) = addr.parse::<alloy::primitives::Address>()
-            {
-                inflight_non_terminal = handle.count_non_terminal_for_signer(&signer_addr);
-                returned_nonce = returned_nonce.saturating_sub(inflight_non_terminal as u64);
+            let mut pending_frontier = crate::store::PendingNonceFrontier::default();
+            if treat_as_latest {
+                pending_frontier = service
+                    .store
+                    .pending_nonce_frontier(addr)
+                    .await
+                    .map_err(|e| store_error(answer_id.clone(), e))?;
             }
+            let returned_nonce = select_transaction_count(accepted_nonce, tag, pending_frontier);
 
             tracing::info!(
                 target: "rpc::nonce_snoop",
@@ -429,9 +439,9 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                     "tag": tag,
                     "treat_as_latest": treat_as_latest,
                     "accepted_nonce": accepted_nonce,
-                    "inflight_non_terminal": inflight_non_terminal,
+                    "durable_lowest_pending": pending_frontier.lowest_pending,
+                    "durable_lowest_unlinked": pending_frontier.lowest_unlinked,
                     "returned_nonce": returned_nonce,
-                    "writer_enabled": service.enable_writer_worker,
                     "writer_handle_present": service.writer_handle.is_some(),
                 })
             );
@@ -460,7 +470,11 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
 
         "eth_gasPrice" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
         "eth_maxPriorityFeePerGas" => Ok(JsonRpcResponse::success(answer_id, "0x3b9aca00")),
-        "eth_estimateGas" => Ok(JsonRpcResponse::success(answer_id, "0x0")),
+        // Claim-aware (Cantina #21 / PR #127 review): mirrors the EVM
+        // bridge's fail-fast `GlobalExitRootInvalid()` revert while the
+        // claim's GER is unpublished, so the official ClaimTxManager never
+        // allocates a nonce for a claim the proxy would have to park.
+        "eth_estimateGas" => service_estimate_gas(service, request).await,
 
         "eth_chainId" => Ok(JsonRpcResponse::success(
             answer_id,
@@ -538,6 +552,19 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .await
                 .map_err(|e| store_error(answer_id.clone(), e))?
             {
+                // Observability + e2e gate (review blocker 2): log the EXACT hash served from
+                // the durable store. A persisted synthesized-claim tx is served here (the
+                // store-first branch), NOT via the `found synthetic tx` log-reconstruction
+                // fallback below — so this is the only positive, hash-exact proof that aggkit
+                // fetched THIS derived-hash claim's calldata.
+                let input_len = {
+                    use alloy::consensus::Transaction;
+                    data.envelope.input().len()
+                };
+                tracing::info!(
+                    "eth_getTransactionByHash: served stored tx {} (input_len={input_len})",
+                    format!("{txn_hash:#x}")
+                );
                 let txn = data.to_rpc_transaction(txn_hash, &service.block_state);
                 return Ok(JsonRpcResponse::success(answer_id, txn));
             }
@@ -575,6 +602,27 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 .map_err(|e| store_error(answer_id.clone(), e))?;
             if let Some(log) = logs.first() {
                 tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
+                // A ClaimEvent-bearing tx should have been served by the stored-envelope
+                // path above (its full authoritative claimAsset calldata is persisted
+                // under the derived hash — `restore::persist_synthetic_claim_tx` + the
+                // projector backfill). Reaching this fallback means the calldata is
+                // UNRECOVERABLE (or the backfill hasn't caught up yet): alarm loudly —
+                // aggkit will fail to parse the empty input and stall on this claim —
+                // but do NOT fabricate fields it would persist as claim truth.
+                if log.topics.first().map(String::as_str)
+                    == Some(crate::log_synthesis::CLAIM_EVENT_TOPIC)
+                {
+                    ::metrics::counter!("synthetic_claim_tx_missing_calldata_total").increment(1);
+                    tracing::error!(
+                        tx_hash = %tx_hash_str,
+                        block = log.block_number,
+                        "eth_getTransactionByHash: ClaimEvent-bearing synthetic tx has NO \
+                         persisted claimAsset calldata — serving empty input (aggkit will \
+                         stall on this claim); check \
+                         synthetic_claim_calldata_unrecoverable_total / faucet registry \
+                         metadata"
+                    );
+                }
                 let synthetic_tx = build_synthetic_tx_json(txn_hash, log, service.chain_id);
                 return Ok(JsonRpcResponse::success(answer_id, synthetic_tx));
             }

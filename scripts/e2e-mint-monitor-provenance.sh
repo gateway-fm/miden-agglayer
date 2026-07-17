@@ -93,15 +93,27 @@ PSQL=(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAX)
 # stderr dropped: locale-warning noise corrupts captures (see sibling scripts).
 pgq() { "${PSQL[@]}" -c "$1" 2>/dev/null; }
 
-# Prometheus counter from the proxy's /metrics (0 when absent).
-counter() {
-    local name="$1" value
-    value=$(curl -s "${L2_RPC}/metrics" | awk -v n="$name" '
-        $0 ~ ("^" n " ") { print $2; found=1; exit }
-        END { if (!found) print 0 }
-    ')
-    echo "${value%.*}"
+# Sum all series for a Prometheus counter, labelled or unlabelled (0 when absent).
+sum_counter_series() {
+    local name="$1"
+    awk -v n="$name" '
+        $1 == n || index($1, n "{") == 1 { total += $2; found=1 }
+        END { printf "%.0f\n", found ? total : 0 }
+    '
 }
+
+counter() {
+    local name="$1"
+    curl -s "${L2_RPC}/metrics" | sum_counter_series "$name"
+}
+
+# Guard the parser against silently dropping reason-labelled counter series.
+COUNTER_SUM_GUARD=$(printf '%s\n' \
+    'bridge_forged_mint_total 2' \
+    'bridge_forged_mint_total{reason="missing_claim"} 3' \
+    'bridge_forged_mint_total_other 99' \
+    | sum_counter_series bridge_forged_mint_total)
+[[ "$COUNTER_SUM_GUARD" == "5" ]] || fail "Prometheus counter parser self-check failed"
 
 l2_tip() {
     curl -sf -X POST "$L2_RPC" -H 'Content-Type: application/json' \

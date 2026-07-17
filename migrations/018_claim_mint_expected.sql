@@ -1,5 +1,5 @@
 -- ============================================================================
--- Cantina #4 — permanent claim → expected-MINT IDENTITY history
+-- Cantina #4 — permanent claim → expected-MINT identity history
 -- ============================================================================
 --
 -- The bridge MASM derives the MINT note's serial number from the CLAIM's

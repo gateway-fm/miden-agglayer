@@ -2,7 +2,7 @@
 description = "Miden AggLayer integration service"
 edition = "2024"
 exclude = [".github/"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 name = "miden-agglayer-service"
 readme = "README.md"
 rust-version = "1.93"
@@ -31,9 +31,18 @@ path = "src/bin/bridge_autoclaim.rs"
 
 [dev-dependencies]
 tempfile = "3.10"
+# test-util enables tokio's paused virtual clock (start_paused) — used by the
+# ger::poll_until_ready timing regression test to pin the exact sleep count
+# deterministically (no real waiting, no tolerance windows).
+tokio = { version = "1.48", features = ["test-util"] }
 # Used only by `r5_oversize_error_matches_aggsender_parser` to mirror aggkit's
 # `ParseMaxRangeFromError` regex verbatim and pin the error-format contract.
 regex = "1.10"
+# Mock RPC transport (Asserter) for the L1InfoTreeIndexer poll_once reorg /
+# retryable-batch regressions — drives the REAL poll loop with canned L1
+# responses, no live node. Version-matched to the alloy stack (resolves to the
+# same alloy-transport the provider uses), features off (mock is always built).
+alloy-transport = { version = "1.5", default-features = false }
 
 [profile.dev.package."*"]
 opt-level = 1

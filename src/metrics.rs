@@ -70,6 +70,32 @@ pub fn init_metrics() {
          and the sponsor's resubmission accepted. Nonzero after a crash in the submit window is \
          the recovery WORKING; a steady climb without restarts means claims are failing to land."
     );
+    describe_counter!(
+        "claim_landed_dedup_reverted_total",
+        "#55 accept-and-revert: a claimAsset targeting an ALREADY-LANDED globalIndex (a real \
+         ClaimEvent already exists) was ACCEPTED with a reverted (status 0x0) receipt instead of \
+         hard-rejected at the JSON-RPC layer — so the submitter's nonce is consumed, geth-faithful \
+         AlreadyClaimed. Nonzero means a sponsor/user cross-claimed the same gi and the sponsor's \
+         nonce sequence was kept in lockstep (autoclaim NOT wedged). A steady climb means heavy \
+         claim front-running, not a bug."
+    );
+    describe_counter!(
+        "rpc_nonce_repaired_after_commit_gap_total",
+        "#55 BLOCKER-2 crash-gap repair: on a same-hash rebroadcast, the signer's expected \
+         nonce was still equal to the known tx's nonce — meaning the tx's durable receipt was \
+         persisted but its nonce advance was lost to a crash BETWEEN the two on the sync accept \
+         path — so the nonce was advanced to complete the interrupted accept. Nonzero after a \
+         crash in the receipt→nonce window is the recovery WORKING (the signer is NOT wedged); a \
+         steady climb without restarts would signal a store that is losing nonce writes."
+    );
+    describe_counter!(
+        "rpc_nonce_reservation_lost_total",
+        "#55 BLOCKER 1 cross-replica guard: a submission LOST the atomic (signer, nonce) \
+         reservation to a DIFFERENT tx that already owned the slot, so it was rejected without \
+         executing (no enqueue/dispatch/receipt). Nonzero means two txs raced the same nonce \
+         slot (across replicas or a stale replacement) and the reservation kept exactly one; the \
+         winner advances the nonce and the loser is dropped, mirroring geth."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",
@@ -77,32 +103,22 @@ pub fn init_metrics() {
          sweep cursor is behind the Miden tip (0 in steady state; >0 signals reconciler lag)"
     );
     describe_counter!(
-        "projector_unresolved_consumed_body_total",
-        "legacy unified-projector health readout, held at 0; the live fail-close signal is now \
-         synthetic_projector_b2agg_unresolved_total"
-    );
-    describe_counter!(
         "synthetic_projector_b2agg_authoritative_fetch_total",
-        "unified projector: bridge-consumed B2AGG bodies resolved by AUTHORITATIVE node fetch \
-         (get_notes_by_id) rather than the local cache — i.e. notes created+consumed under load \
-         before the reconciler imported them Committed (consumed unauthenticated, so the tx \
-         carries the note id). Nonzero under load is expected and healthy; it is the backstop \
-         that prevents the residual dropped-BridgeEvent."
+        "unified projector: bridge-consumed B2AGG bodies resolved by canonical get_notes_by_id. \
+         Increases once per successful resolution attempt; retries before cursor advance may \
+         exceed bridge-out volume."
     );
     describe_counter!(
-        "synthetic_projector_b2agg_authenticated_skip_total",
-        "unified projector: authenticated bridge consumptions skipped because they are not in the \
-         B2AGG-only body cache — normally a non-B2AGG note (CLAIM/GER/genesis) the store consumed \
-         feed already covers. NON-FATAL and expected-nonzero (esp. at genesis/setup); the tick \
-         never wedges on these. Only meaningful if it climbs alongside missing BridgeEvents."
+        "synthetic_projector_b2agg_headerless_skip_total",
+        "unified projector: headerless bridge inputs with no persisted B2AGG identity. These are \
+         normally CLAIM/GER/genesis notes covered by the store feed. A hidden B2AGG cannot seal \
+         because the LET cardinality gate fails closed."
     );
     describe_counter!(
         "synthetic_projector_b2agg_fetch_missing_total",
-        "unified projector LOUD-SKIP: an UNAUTHENTICATED bridge-consumed note the tx feed reported \
-         but get_notes_by_id STILL did not return after the bounded retry — the tick held for the \
-         retry window (sync_transactions ahead of the note DB) then advanced to keep the tip live \
-         rather than freezing. MUST stay 0 in a healthy stack; any increment means either a node \
-         note-DB fault or a genuine dropped exit to investigate."
+        "unified projector: a bridge-consumed note was absent from get_notes_by_id. The LET \
+         cardinality gate prevents sealing if it was a B2AGG leaf, \
+         and the next projector tick retries it. MUST stay 0 in a healthy stack."
     );
     describe_counter!(
         "synthetic_projector_completeness_missing_total",
@@ -116,6 +132,21 @@ pub fn init_metrics() {
         "in-proxy completeness auditor liveness beacon: the highest block audited so far \
          (projector cursor minus the settle margin). Flat while the chain advances = auditor \
          dead."
+    );
+    describe_counter!(
+        "bridge_let_assignment_gate_halted_total",
+        "projector ticks blocked before sealing because the bridge LET leaf count differs \
+         from durable reservations plus visible pending B2AGG leaves. kind=invisible_gap: \
+         the bridge is ahead; kind=local_ahead: local accounting is ahead. The next tick \
+         retries. MUST stay 0; see docs/operations/let-cardinality-gate.md."
+    );
+    describe_counter!(
+        "bridge_within_tx_order_unresolved_total",
+        "Cantina #7 FAIL-CLOSED: >=2 B2AGG notes consumed by the SAME bridge transaction \
+         whose within-tx order could not be established from the sync_transactions feed — \
+         the projection tick HALTS (nothing sealed, retried) because emitting in hash order \
+         could misnumber deposit_count/globalIndex, sealed forever by getLogs immutability. \
+         MUST stay 0; any increment means feed corruption to investigate."
     );
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
@@ -139,12 +170,6 @@ pub fn init_metrics() {
         "bridge_out_self_targeted_total",
         "B2AGG bridge-outs whose destination_network equals our local network_id; \
          each one is a poison leaf that wedges the bridge (Cantina #13)"
-    );
-    describe_counter!(
-        "bridge_let_divergence_total",
-        "Local Exit Tree divergence events (Cantina #9). Labels: \
-         kind=on_chain_ahead (private B2AGG was consumed) or \
-         kind=aggkit_ahead (local state corruption)."
     );
     describe_counter!(
         "bridge_burn_serial_collision_total",
@@ -277,21 +302,67 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "rpc_claim_ger_not_seen_total",
-        "Claim submission rejected because the referenced GER was not \
-         yet in `has_seen_ger` (C6). Caller should retry after the GER \
-         is injected; the lock is NOT acquired so retries are cheap."
+        "Claim submission rejected at the C6 pre-admission gate because \
+         the referenced GER was not yet published (`is_ger_injected`). \
+         Caller should retry after the GER is injected; no nonce, lock, \
+         receipt, or queued job is consumed, so retries are cheap."
     );
     describe_counter!(
-        "rpc_claim_ger_wait_short_circuit_total",
-        "Claim submission's GER-propagation wait exited early because \
-         the GER was already recorded as injected by the proxy (G6). \
-         Saves up to 12s per claim in the common case."
+        "rpc_estimate_gas_ger_not_ready_total",
+        "eth_estimateGas(claimAsset) answered with `execution reverted: \
+         GlobalExitRootInvalid()` because the claim's combined GER is not \
+         yet published (Cantina #21). Mirrors the EVM bridge's fail-fast \
+         _verifyLeaf revert so the ClaimTxManager retries before ever \
+         allocating a nonce."
     );
     describe_counter!(
         "claim_watcher_synthesised_total",
         "ClaimWatcher synthesised a ClaimEvent from a consumed CLAIM note \
          that the normal eth_sendRawTransaction path had not recorded \
          (crash recovery or foreign-CLAIM observation)."
+    );
+    describe_counter!(
+        "restore_b2agg_same_details_multiplicity_quarantined_total",
+        "restore FAIL-CLOSED: B2AGG exits quarantined because the authoritative feed shows ≥2 \
+         distinct on-chain consumptions sharing a details_commitment that the commitment-keyed \
+         client store cannot disambiguate — quarantined rather than emit a wrong/collapsed \
+         BridgeEvent (review). MUST be rare; each is an operator-recoverable exit."
+    );
+    describe_counter!(
+        "synthetic_claim_calldata_finalized_pending_total",
+        "synthesized-claim calldata rows found PENDING (txn_begin ran, txn_commit did not — a \
+         crash between them) and finalized by a later persist pass, rather than being stranded \
+         pending forever (review blocker 3)."
+    );
+    describe_counter!(
+        "restore_b2agg_authoritative_attributed_total",
+        "restore Phase 2 (task #56): consumed B2AGG notes whose consumer the LOCAL store did \
+         not know (consumer_account=None — NTX-consumed, the normal bridge path, observed \
+         after a store rebuild) but that the bridge's on-chain sync_transactions feed \
+         authoritatively attributes to the bridge — rebuilt and re-projected instead of \
+         fail-closed skipped. Without this, restore ERASED already-settled BridgeEvents \
+         (getLogs-immutability break) and halted aggkit's L2BridgeSyncer."
+    );
+    describe_counter!(
+        "synthetic_claim_calldata_persisted_total",
+        "synthesized (derived-hash) claims whose FULL authoritative claimAsset calldata was \
+         recovered (CLAIM note storage: both SMT proofs, both exit roots, networks, addresses, \
+         amount; faucet registry: hash-verified metadata preimage) and persisted under the \
+         derived tx hash for eth_getTransactionByHash / aggkit's full-claim parser."
+    );
+    describe_counter!(
+        "synthetic_claim_calldata_unrecoverable_total",
+        "synthesized claims whose metadata preimage could NOT be recovered authoritatively \
+         (no registry entry hashing to the note's metadata_hash) — calldata deliberately NOT \
+         fabricated; the tx keeps an empty input and aggkit will stall on it. Operator action: \
+         register/repair the faucet metadata; the per-tick backfill then self-heals. MUST stay \
+         0 in a healthy stack."
+    );
+    describe_counter!(
+        "synthetic_claim_tx_missing_calldata_total",
+        "ClaimEvent-bearing synthetic txs served with EMPTY input by eth_getTransactionByHash \
+         (no persisted calldata record — unrecoverable, or the backfill has not caught up). \
+         Every increment stalls aggkit on that claim; must stay 0 in steady state."
     );
     describe_counter!(
         "claim_event_foreign_skipped_total",
@@ -341,9 +412,7 @@ pub fn init_metrics() {
          other call sites). Recorded on both success and error paths."
     );
 
-    // RD-940 — async writer worker observability (Spec F §4). Registered
-    // unconditionally so the metric series exist even when
-    // `enable_writer_worker = false`; the sync path simply never emits.
+    // RD-940 — single writer observability (Spec F §4).
     describe_gauge!(
         "agglayer_writer_queue_depth",
         "RD-940: current number of WriteJobs sitting in the writer-worker \
@@ -381,9 +450,9 @@ pub fn init_metrics() {
         "agglayer_writer_dropped_on_restart_total",
         "RD-940: queue-depth snapshot read on boot from the previous \
          process's graceful shutdown. A non-zero value means the previous \
-         restart dropped that many in-flight jobs whose hashes had already \
-         been returned to callers — those callers MUST re-submit. \
-         **Hard page on increase[1h]>0** — v1 tripwire (no on-disk queue). \
+         restart lost that many in-memory dispatches whose signed envelopes \
+         remain durable — those callers MUST re-submit the SAME hash. \
+         **Hard page on increase[1h]>0** — restart-pressure tripwire. \
          The metric is silent under SIGKILL because the tmpfile is only \
          written on graceful drain; combined with pre-kill queue-depth \
          history this still pinpoints the loss window."

@@ -87,8 +87,36 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/010_reconcile_cursor.sql"),
     ),
     (
-        "011_claim_mint_serials.sql",
-        include_str!("../../migrations/011_claim_mint_serials.sql"),
+        "011_nonce_reservations.sql",
+        include_str!("../../migrations/011_nonce_reservations.sql"),
+    ),
+    (
+        "012_submission_handoffs.sql",
+        include_str!("../../migrations/012_submission_handoffs.sql"),
+    ),
+    (
+        "013_l1_finalized_block.sql",
+        include_str!("../../migrations/013_l1_finalized_block.sql"),
+    ),
+    (
+        "014_finalized_verified.sql",
+        include_str!("../../migrations/014_finalized_verified.sql"),
+    ),
+    (
+        "015_l1_evidence_policy.sql",
+        include_str!("../../migrations/015_l1_evidence_policy.sql"),
+    ),
+    (
+        "016_deposit_reservations.sql",
+        include_str!("../../migrations/016_deposit_reservations.sql"),
+    ),
+    (
+        "017_b2agg_identity_backfill.sql",
+        include_str!("../../migrations/017_b2agg_identity_backfill.sql"),
+    ),
+    (
+        "018_claim_mint_expected.sql",
+        include_str!("../../migrations/018_claim_mint_expected.sql"),
     ),
 ];
 

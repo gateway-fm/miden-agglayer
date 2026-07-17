@@ -397,45 +397,128 @@ B_OUT_AMOUNT=$((B_BALANCE / 2))
 log "Bridging $B_OUT_AMOUNT $B_SYMBOL Miden units L2→L1 (must be GATED)..."
 bridge_out "$B_FAUCET_ID" "$B_OUT_AMOUNT" 0
 
-wait_for "fail-safe defer warn" \
-    "docker logs --since $B_PHASE_TS $AGGLAYER_CONTAINER 2>&1 | grep -q 'could not be recovered + validated'" \
+# DETECT: the live projector reserves the leaf's index then REFUSES to emit
+# (unrecoverable metadata) and HALTS fail-closed. A reserved-but-unemitted leaf would
+# gap getLogs and wedge aggkit bridgesync, so the emitted-frontier gate + the restore
+# bail refuse to seal past it. There is NO tombstone — a corrupted/half-recovered row is
+# more dangerous to patch than to rebuild from on-chain.
+wait_for "fail-closed halt on unrecoverable metadata" \
+    "docker logs --since $B_PHASE_TS $AGGLAYER_CONTAINER 2>&1 | grep -qiE 'unrecoverable ERC-20 metadata|reserved but its BridgeEvent was never emitted'" \
     120 5
-pass "Defer warn fired (empty metadata refused, bridge-out gated)"
+pass "Corruption DETECTED — projector HALTED fail-closed (loud, no silent getLogs gap)"
 
 UNRECOVERABLE_AFTER=$(proxy_metric bridge_out_metadata_unrecoverable_total)
 [[ "$UNRECOVERABLE_AFTER" -gt "$UNRECOVERABLE_BEFORE" ]] \
     || fail "bridge_out_metadata_unrecoverable_total did not increment ($UNRECOVERABLE_BEFORE → $UNRECOVERABLE_AFTER)"
 pass "bridge_out_metadata_unrecoverable_total: $UNRECOVERABLE_BEFORE → $UNRECOVERABLE_AFTER"
 
-# NO BridgeEvent may exist for this bridge-out — neither under the corrupted
-# origin (what an emit would carry) nor under the real token address.
+# NO BridgeEvent may exist for this bridge-out (neither corrupted nor real origin).
 [[ -z "$(find_bridge_event "$B_FROM_BLOCK" "0x$NON_CONTRACT_ADDR")" ]] \
     || fail "GATE BREACH: BridgeEvent emitted with the corrupted origin address"
 [[ -z "$(find_bridge_event "$B_FROM_BLOCK" "$B_TOKEN_ADDR")" ]] \
     || fail "GATE BREACH: BridgeEvent emitted for $B_SYMBOL despite unrecoverable metadata"
-# The deferred note re-surfaces every ~5s sync tick; give it two more ticks and
-# re-assert the gate held (a defer, not a delay-then-emit).
-sleep 12
-[[ -z "$(find_bridge_event "$B_FROM_BLOCK" "0x$NON_CONTRACT_ADDR")" ]] \
-    || fail "GATE BREACH: BridgeEvent appeared on a later sync tick"
-pass "No BridgeEvent emitted while unrecoverable (gate holds across sync ticks)"
+pass "No BridgeEvent emitted for the unrecoverable leaf (fail-closed holds)"
 
-# Remediation is operator-driven and DOCUMENTED, not live-automatic: the defer
-# WARN instructs "Backfill the faucet registry ... then re-run restore". By
-# design the live projector does NOT re-attempt a deferred note every tick
-# (the reconciler's swept-cache bounds RPC retries on genuinely-dead tokens),
-# so recovery-after-fix happens on the next `--restore`, which is covered
-# end-to-end by scripts/e2e-restore.sh. Here we backfill the registry so the
-# environment is left consistent, and re-assert the security invariant: fixing
-# the row does NOT retroactively conjure an event on the live path (the
-# finding is about NEVER emitting empty/unvalidated metadata).
-pg "UPDATE faucet_registry
-    SET origin_address = decode('$(lc "${B_TOKEN_ADDR#0x}")','hex')
-    WHERE faucet_id = '$B_FAUCET_ID'" >/dev/null
-sleep 15
-[[ -z "$(find_bridge_event "$B_FROM_BLOCK" "$B_TOKEN_ADDR")" ]] \
-    || fail "GATE BREACH: a BridgeEvent appeared on the live path after a mere registry fix (recovery must go through --restore)"
-pass "Registry backfilled; live path still emits no event for the deferred note (recovery is via --restore, see e2e-restore.sh)"
+# ── RECOVERY RUNBOOK: back up → DROP the whole proxy DB → re-recover from scratch ──────
+# There is NO safe in-place patch of a corrupted/half-recovered faucet row. Rebuild the
+# entire store from the authoritative on-chain state — and BACK UP FIRST.
+E2E_COMPOSE=(docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" -f "$PROJECT_DIR/docker-compose.l2l2.yml" --env-file "$FIXTURES_DIR/.env")
+BASE_ARGS=$(docker inspect -f '{{range .Args}}{{.}} {{end}}' "$AGGLAYER_CONTAINER")
+
+BACKUP="/tmp/agglayer_store.cantina13.$$.sql"
+docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/dev/null
+[[ -s "$BACKUP" ]] || fail "DB backup failed (empty dump) — refusing to drop without a backup"
+pass "DB backed up ($(wc -c < "$BACKUP") bytes → $BACKUP)"
+
+# Preserve the proxy's per-signer account-nonce state across the rebuild. DROP SCHEMA
+# wipes the `nonces` / `nonce_reservations` tables, but those hold LEGITIMATE EVM
+# account nonces for external claim submitters (aggkit claimsponsor / bridge-autoclaim).
+# They are proxy-internal (L2 claim txns are NOT on-chain, so `--restore` cannot rebuild
+# them) and are NOT corrupted. Without this, a submitter whose nonce advanced pre-drop
+# (e.g. the sponsor at nonce N) sends its next claim at nonce N to a reset proxy that now
+# expects 0 → future-nonce wedge → post-recovery deposit-claims stall forever (finding #65).
+NONCE_DUMP="/tmp/agglayer_nonces.cantina13.$$.sql"
+docker exec "$PG_CONTAINER" pg_dump -U agglayer -d agglayer_store --data-only \
+    -t public.nonces -t public.nonce_reservations > "$NONCE_DUMP" 2>/dev/null
+[[ -s "$NONCE_DUMP" ]] && pass "Preserved account-nonce state ($(wc -l < "$NONCE_DUMP") lines) for post-recovery submitter continuity" \
+    || warn "no account-nonce state to preserve (empty) — continuing"
+
+MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer >/dev/null 2>&1
+pg "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO agglayer;" >/dev/null
+pass "Proxy DB DROPPED (from scratch) — corrupted faucet row gone"
+
+RESTORE_LOG=$(mktemp)
+set +e
+MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" \
+    run --rm --no-deps miden-agglayer $BASE_ARGS --reset-miden-store --restore > "$RESTORE_LOG" 2>&1
+RESTORE_RC=$?
+set -e
+[[ "$RESTORE_RC" -eq 0 ]] || { tail -30 "$RESTORE_LOG" >&2; fail "restore-from-scratch one-shot exited $RESTORE_RC"; }
+grep -q 'RESTORE: complete' "$RESTORE_LOG" || fail "restore-from-scratch did not complete"
+pass "Store rebuilt from on-chain (faucet identity + metadata re-recovered)"
+
+# Restore the preserved account-nonce state into the freshly-migrated (empty) tables
+# BEFORE starting the live proxy, so external claim submitters resume at their real
+# nonce instead of wedging on a future-nonce against a reset-to-0 proxy (finding #65).
+if [[ -s "$NONCE_DUMP" ]]; then
+    docker exec -i "$PG_CONTAINER" psql -U agglayer -d agglayer_store < "$NONCE_DUMP" >/dev/null 2>&1 \
+        && pass "Account-nonce state restored — post-recovery deposit-claims will not wedge" \
+        || warn "account-nonce restore hit an error — continuing (verify Phase C liveness below)"
+fi
+
+MARK_B=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" start miden-agglayer >/dev/null 2>&1
+wait_for "proxy healthy after rebuild" \
+    "[[ \$(docker inspect -f '{{.State.Health.Status}}' $AGGLAYER_CONTAINER 2>/dev/null) == healthy ]]" \
+    180 3
+
+# After the rebuild the leaf's REAL metadata recovers (correct origin from on-chain →
+# L1 name()/symbol()/decimals()) → the REAL BridgeEvent emits at its reserved index →
+# frontier gate clears → projector resumes.
+wait_for "REAL BridgeEvent emitted for the recovered leaf" \
+    "[[ -n \"\$(find_bridge_event 1 \"$B_TOKEN_ADDR\")\" ]]" \
+    180 5
+pass "Recovery from scratch: REAL BridgeEvent emitted for $B_SYMBOL (metadata re-recovered from on-chain)"
+wait_for "projector resumed (frontier clear)" \
+    "docker logs --since $MARK_B $AGGLAYER_CONTAINER 2>&1 | grep -qE 'caught up to (the Miden tip|the projection ceiling)'" \
+    120 5
+pass "Projector RESUMED — getLogs contiguous, aggkit un-wedged"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase C — POST-RECOVERY LIVENESS (1 in + 1 out). The rebuilt-from-scratch proxy
+# must be fully operational in BOTH directions with FRESH traffic — not merely
+# able to re-emit the historical leaf. Bridge a brand-new token IN (L1→L2 deposit:
+# faucet auto-created + claimed against the rebuilt store), then bridge it back
+# OUT (L2→L1 exit → REAL BridgeEvent at a contiguous index; the emitted-frontier
+# gate must NOT false-halt now that the recovered leaf is emitted).
+# ══════════════════════════════════════════════════════════════════════════════
+log "───────────────────── Phase C: post-recovery liveness (1 in + 1 out) ─────────────────────"
+
+# 1 IN — a brand-new deposit after the DB rebuild. deploy_and_bridge_in asserts
+# the claim landed on L2 and the balance is exact, so a broken in-path fails here.
+C_NAME="Post Recovery Token"; C_SYMBOL="PRCT"
+deploy_and_bridge_in "$C_NAME" "$C_SYMBOL"
+C_TOKEN_ADDR="$TOKEN_ADDR"; C_FAUCET_ID="$FAUCET_ID"; C_BALANCE="$BALANCE"
+pass "Post-recovery DEPOSIT IN: $C_SYMBOL bridged L1→L2, faucet auto-created + claimed on the rebuilt store"
+
+# 1 OUT — bridge the freshly-deposited token back out. A REAL BridgeEvent must
+# emit with the correct (never-corrupted) metadata, proving the projector's
+# out-path + emitted-frontier gate are live and contiguous post-recovery.
+C_EXPECTED_METADATA=$(lc "$(cast abi-encode 'f(string,string,uint8)' "$C_NAME" "$C_SYMBOL" "$TOKEN_DECIMALS")")
+C_PHASE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+C_OUT_AMOUNT=$((C_BALANCE / 2))
+log "Bridging $C_OUT_AMOUNT $C_SYMBOL Miden units L2→L1 (post-recovery out-path)..."
+bridge_out "$C_FAUCET_ID" "$C_OUT_AMOUNT" 0
+wait_for "post-recovery BridgeEvent emitted for $C_SYMBOL" \
+    "[[ -n \"\$(find_bridge_event 1 \"$C_TOKEN_ADDR\")\" ]]" \
+    300 5
+C_GOT_METADATA=$(find_bridge_event 1 "$C_TOKEN_ADDR")
+[[ "$C_GOT_METADATA" == "0x" || -z "$C_GOT_METADATA" ]] && fail \
+    "Post-recovery out: BridgeEvent has EMPTY metadata for $C_SYMBOL"
+[[ "$(lc "$C_GOT_METADATA")" == "$C_EXPECTED_METADATA" ]] || fail \
+    "Post-recovery out: BridgeEvent metadata mismatch for $C_SYMBOL (got $C_GOT_METADATA)"
+pass "Post-recovery DEPOSIT OUT: $C_SYMBOL exited L2→L1, REAL BridgeEvent emitted with correct metadata"
+pass "Recovered proxy is LIVE in both directions (1 in + 1 out)"
 
 # ── Self-target gate (Cantina #13): covered by a UNIT test, not e2e ──────────
 # The projector's self-target poison-leaf gate (src/restore.rs — emits no
@@ -452,5 +535,6 @@ echo ""
 log "======================================================================"
 log "  CANTINA #13 LAYER-2 METADATA RECOVERY E2E DONE"
 log "  A: legacy row recovered from L1, keccak-validated, emitted, self-healed"
-log "  B: unrecoverable row gated (defer + metric); live path refuses post-fix"
+log "  B: corruption DETECTED → fail-closed HALT (no tombstone); recovered by backup + DROP DB + --restore from on-chain"
+log "  C: post-recovery liveness — fresh deposit IN + OUT (1+1) both flow on the rebuilt store"
 log "======================================================================"

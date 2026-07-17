@@ -1,295 +1,121 @@
-# L2→L2 e2e (Miden ↔ OP-Stack) — scaffold notes & design (task #25)
+# L2-to-L2 end-to-end test
 
-**Status: FULLY IMPLEMENTED with the REAL sovereign contracts** (branch `feat/l2-to-l2-e2e`). The hand-written `SovereignGER.sol` stub and the L1-bytecode-copy bridge are GONE — L2B now runs the real v12 `AgglayerBridgeL2` + `AgglayerGERL2` (impl+proxy) generated and initialized by the same agglayer-contracts tooling kurtosis-cdk uses, and rollup #2 is registered on L1 by the real `4_createRollup.ts` flow (new rollup type + `attachAggchainToAL`), not by piggybacking an existing rollup type. See UPDATE 6 for the mechanism. Absorbs task #15 (same-address/different-origin faucet isolation). UPDATE entries 1-5 below are historical (stub era) — kept for provenance.
+Status: implemented on `main`.
 
-## Goal
-Exercise the true cross-L2 bridge path through agglayer, which today's e2e (single Miden L2 ↔ L1) never covers: deploy an ERC-20 on a **second** L2 (OP-Stack), bridge it **OP-Stack → Miden** (foreign-origin → Miden provisions a wrapped-asset faucet), then bridge it **Miden → OP-Stack** back, asserting exact-block completeness and faucet isolation.
+The `l2l2` test group exercises a round trip between Miden and a second
+sovereign EVM rollup named L2B. L2B uses Anvil as its execution node for the
+test harness; it is not an OP Stack node. The AggLayer contracts and
+registration path are the real sovereign v12 flow.
 
-## Current single-rollup topology (`docker-compose.e2e.yml`)
-One rollup = **Miden L2 (network_id=1, chain_id=2)**, made of:
-- `anvil` — L1 (chain-id 271828), hosts the agglayer RollupManager + GER + bridge contracts.
-- `agglayer` (`agglayer:0.4.4`) + `fixtures/agglayer-config.toml` — the settlement layer; **this is where rollups are registered** (multi-rollup config lives here).
-- `aggkit:0.8.3-rc1` (`--components=aggoracle,aggsender`) — aggoracle injects L1→L2 GER, aggsender submits certs. One instance per rollup.
-- Miden node microservices: `node-bootstrap-{validator,sequencer,ntx}`, `validator`, `tx-prover`, `miden-node`, `ntx-builder`.
-- `miden-agglayer` (the proxy, :8546), `bridge-service`, `bridge-autoclaim`.
-- Postgres x2 (proxy store + agglayer store).
+## Topology
 
-Key IDs: `fixtures/.env` → `ROLLUP_ADDRESS`, `NETWORK_ID=1`, `CHAIN_ID=2`. Fixtures extracted via `make e2e-setup` → `scripts/setup-fixtures.sh` (from Kurtosis).
+```mermaid
+flowchart LR
+    subgraph L1["Shared L1 Anvil"]
+        RM["RollupManager"]
+        GER["Global exit root manager"]
+        B1["L1 bridge"]
+    end
 
-## What a second OP-Stack L2 requires
-1. **The OP-Stack chain itself** — the biggest lift. Options, cheapest→most-faithful:
-   - (a) A plain second `anvil`/reth EVM devnet acting as "L2 #2" — simplest, but not a real OP-Stack (no L2→L1 proof semantics). Good enough to exercise the *agglayer bridge* path if agglayer treats it as a registered rollup.
-   - (b) A real OP-Stack minimal devnet (`op-geth` + `op-node` + `op-batcher`/`op-proposer`) — faithful but heavy (several more services + L1 deposit contracts).
-   Recommend starting with (a) to unblock the *agglayer cross-rollup* logic, then upgrade to (b) if OP-specific behavior matters.
-2. **Register it as rollup #2 in the agglayer** — add it to `fixtures/agglayer-config.toml` (a `[rollup]`/network entry with its `network_id=2`/`3`, its L1 RollupID from RollupManager, its bridge contract address). Deploy the agglayer **bridge contracts** on the OP-Stack L2 (mirror how they're deployed for Miden — see setup-fixtures.sh / the L1 RollupManager registration).
-3. **Its own `aggkit` instance** (aggoracle+aggsender) pointed at the OP-Stack L2's RPC + its bridge/GER contracts, with its own keystore.
-4. **An ERC-20** deployed on the OP-Stack L2 (distinct symbol, e.g. `OPT0`).
-5. **GER propagation**: the shared L1 GER must carry both rollups' exit roots; the Miden proxy's L1-InfoTree indexer + the OP-Stack aggoracle both read/write it.
+    subgraph M["Rollup 1: Miden"]
+        MP["miden-agglayer RPC"]
+        MN["Miden node and bridge account"]
+        MA["AggKit instance"]
+        MS["Miden bridge-service and DB"]
+    end
 
-## Test flow — `scripts/e2e-l2-to-l2.sh` (skeleton on the branch)
-1. Deploy ERC-20 `OPT0` on OP-Stack L2 (origin_network = OP-Stack rollupID, NOT L1).
-2. **Forward (OP-Stack → Miden)**: `bridgeAsset(destNet=Miden, token=OPT0, amount)` on the OP-Stack bridge → wait for GER to include the new exit root → claim on Miden. Miden proxy sees a foreign-origin token → **provisions a faucet keyed by `hash(tokenAddress || origin_network)`** (the #108 (addr,network) keying) → mints the wrapped asset. Assert: faucet exists for `(OPT0, OP-Stack-net)`, wrapped balance correct, ClaimEvent at the exact consumption block (N-run exact-block check).
-3. **Faucet isolation (absorbs #15)**: deploy an ERC-20 at the **same 20-byte address** on L1 and bridge it in too; assert the two resolve to **distinct** Miden faucets (no collision) — proves `(addr, origin_network)` keying.
-4. **Back (Miden → OP-Stack)**: bridge-out from Miden (burn wrapped asset) → claim on OP-Stack → assert the round-trip returns `OPT0` to the original holder (balances net to zero on Miden, restored on OP-Stack).
-5. Exact-block asserts throughout (0 missing/extra/locks), + an N-run loadtest variant.
+    subgraph B["Rollup 2: L2B"]
+        BE["Anvil, chain ID 31338"]
+        BC["AgglayerBridgeL2 and AgglayerGERL2"]
+        L2B_AGGKIT["AggKit instance"]
+        BS["L2B bridge-service and DB"]
+    end
 
-## Hard parts / open questions (for the picker-upper)
-- **agglayer multi-rollup config format** — need the exact `agglayer-config.toml` schema for a 2nd rollup + how RollupManager assigns the 2nd RollupID on L1. Check the agglayer 0.4.4 docs / an existing multi-rollup Kurtosis config.
-- **OP-Stack bridge contract deployment** — reuse the agglayer bridge deploy scripts against the OP-Stack L2 RPC; wire its address into the aggkit + the test.
-- **Root-owned data dirs** — the 2nd L2 will create its own data dir; apply the same root-container-clean fix (see memory `aggkit-0.8.3-rc1-aggoracle-wedge`) to it before every bringup.
-- **Resource** — a 2nd full L2 roughly doubles container count; watch the node-RPC-under-load flakiness (same class as `e2e-claim-provenance`).
-
-## Where I landed (this session)
-- Branch `feat/l2-to-l2-e2e` created off `ec2e58f` with a **documented skeleton** `scripts/e2e-l2-to-l2.sh` (the 5-step flow as commented TODO stubs) + this notes file. No compose/chain wiring yet (that's the multi-day part).
-- **Next step**: decide chain option (a) vs (b), then wire the 2nd rollup into `agglayer-config.toml` + a `docker-compose.l2l2.yml` override adding the OP-Stack L2 + its aggkit, and flesh out step 1-2 of the script (deploy + forward-bridge).
-
----
-
-## UPDATE (2026-07-09): L1 registration PROVEN live + recipe captured
-
-Dry-ran against the real anvil snapshot (brought up the `anvil` service alone). **Rollup #2 registration works end-to-end** — see `scripts/setup-l2b.sh` (steps 1-2 verified, step 3 bytecode-extraction verified viable):
-
-1. **Decoded the snapshot's own creation txs** (`fixtures/l1-raw-txs.txt`, blocks 83-85):
-   - blk83 `addNewRollupType(0xabcb5198)`: consensusImpl `0xFB054898…` (AggchainECDSAMultisig), verifier 0, forkID 0, verifierType 2, genesis 0, "kurtosis-devnet", vkey 0 → **rollupTypeId 1 (reusable for rollup #2 — no new type needed)**.
-   - blk84 `attachAggchainToAL(0x97d289a3)`: `(typeId=1, chainID=2, abi.encode(aggchainAdmin))`.
-   - blk85 aggchain init (selector `0x697427f6`): `(admin, trustedSequencer, gasToken, sequencerURL, networkName, bytes32(0), signers[(addr,url)], threshold)`. **The original rollup #1 was an OP-reth sovereign chain** — its init literally contains `http://op-el-1-op-reth-op-node-001:8545` / `"op-sovereign"`. The Miden proxy replaced it. Our L2B mirrors the same consensus shape, so a plain anvil L2B is consensus-equivalent (mock-verifier + ECDSA-multisig certs).
-2. **Live dry-run results**: `attachAggchainToAL(1, 31338, abi.encode(0xE34a…))` from the admin key → rollupCount 2, aggchain at `0x5D1A491A…bd0E` (address is snapshot-deterministic but the script reads it from `rollupIDToRollupData(2)`); hand-built init calldata (layout above) → `trustedSequencer=0x5b06… ✓ networkName="l2b-sovereign" ✓ threshold=1 ✓`.
-3. **Keys**: admin `0xE34aaF64…9970` = kurtosis-cdk standard key (in setup-l2b.sh, TEST-ONLY); committee[0] reuses the existing `sequencer.keystore` (`0x5b06…`) so **aggkit-l2b's aggsender can reuse the same keystore** and agglayer `[proof-signers] 2` = same signer.
-4. **Bridge on L2B**: L1 bridge impl (PolygonZkEVMBridgeV2, 13150 bytes at EIP-1967 impl of `0xC8cb…`) extracts cleanly via `cast code` → `anvil_setCode` on L2B at the same proxy address + fresh `initialize(networkID=2, …)` (step 3 of setup-l2b.sh, written not yet exercised).
-
-### Remaining (next session)
-- **Sovereign L2-GER contract on L2B** — not on the L1 snapshot; vendor a minimal contract with the sovereign ABI (`insertGlobalExitRoot`, `updateExitRoot`, `globalExitRootMap`) at `0xa40D…` or compile the real `GlobalExitRootManagerL2SovereignChain`.
-- **Compose override** `docker-compose.l2l2.yml`: `anvil-l2b` (plain anvil, chain-id 31338, port 9545) + `aggkit-l2b` (copy of aggkit config with `L2URL=anvil-l2b`, RollupID/NetworkID 2, same keystores) + run `setup-l2b.sh` as a one-shot service after anvil healthy.
-- **agglayer config**: add `[full-node-rpcs] 2 = "http://anvil-l2b:8545"` + `[proof-signers] 2 = "0x5b06…"` (use a separate `agglayer-config-l2l2.toml` mounted by the override, so the base stack is untouched).
-- **bridge-service (ISOLATED per rollup)**: the base bridge-service stays Miden-only; L2B gets its OWN bridge-service + DB (`bridge-config-l2b.toml`, `postgres-l2b`, ports :28080/:29090) that indexes L1 + L2B only — canonical AggKit topology, not a single shared multi-network service.
-- Then flesh out `e2e-l2-to-l2.sh` steps 1-2 (ERC20 on L2B → bridgeAsset → cert → GER → claim on Miden).
-
----
-
-## UPDATE 2 (2026-07-09): full L2B wiring written — ready for live smoke
-
-- **`docker-compose.l2l2.yml`** — override adding `anvil-l2b` (chain-id 31338, :9545) + `aggkit-l2b` (aggoracle+aggsender, reuses aggoracle/sequencer keystores) + a network-2-aware agglayer config + an ISOLATED L2B bridge-service (`bridge-service-l2b`) with its own DB (`postgres-l2b`); the base bridge-service stays Miden-only.
-- **`scripts/gen-l2b-configs.sh`** — derives `agglayer-config-l2l2.toml` / `aggkit-l2b-config.toml` / `bridge-config-l2b.toml` from the base fixtures at setup time (gitignored; assert-guarded so base-config drift fails loudly).
-- **`fixtures/SovereignGER.sol`** — minimal sovereign-GER (insertGlobalExitRoot/updateExitRoot/globalExitRootMap + events), setCode-deployable (no constructor; `initialize(bridge, updater)`).
-- **`scripts/setup-l2b.sh`** extended: rollup-2 address guard, L2B account funding, GER-stub deploy at `0xa40D…` (updater = aggoracle addr derived from keystore at runtime), bridge proxy+impl setCode + `initialize(networkID=2,…)` — all idempotent.
-- **`scripts/e2e-l2-to-l2.sh` step 0** wired: gen-configs → compose-up L2B services → wait → setup-l2b.
-
-### Next session
-1. **Live smoke step 0**: base stack up (`make e2e-up` w/ root-clean), then `./scripts/e2e-l2-to-l2.sh` — expect: rollup #2 registered, L2B bridge `networkID()==2`, GER stub live, aggkit-l2b logs syncing (not crash-looping). Watch: agglayer accepting config with an unreachable-then-reachable network 2; aggkit-l2b's `L1ChainID=31338` assumption; bridge impl `initialize` ABI matching this contracts version (if it reverts, decode the L1 bridge's own init tx from l1-raw-txs for the exact signature — same technique as blk83-85).
-2. **Step 1**: `forge create fixtures/TestToken.sol:TestToken` against :9545 → OPT0; approve bridge; `bridgeAsset(destNet=1, …)` on L2B.
-3. **Step 2**: watch aggsender-l2b cert → agglayer settle → L1 GER → Miden aggoracle inject → claim on Miden via bridge-service proof (`/merkle-proof` for network 2) → assert foreign-origin faucet keyed (OPT0, net-2).
-
----
-
-## UPDATE 3 (2026-07-09): FORWARD PIPELINE PROVEN LIVE — L2B deposit settled to L1 + GER on Miden
-
-Full live run on the real stack (base + `docker-compose.l2l2.yml`):
-
-1. `setup-l2b.sh` end-to-end ✓ (idempotent): rollup #2 attached+initialized on L1; L2B funded; SovereignGER stub setCode'd+initialized; bridge impl+proxy setCode'd + **initialize gated by the ProxyAdmin-owner** (the fork reads the EIP-1967 admin slot and staticcalls `owner()` — solved by replicating the L1 ProxyAdmin at `0xd60F1B…` with our admin as owner); **getTokenMetadata helper** at `0xcC87d4…` (immutable in the impl) copied from L1 — without it every ERC-20 `bridgeAsset` bare-reverts.
-2. **aggkit-l2b healthy** (no crash-loop) — synced rollup 2, connected to agglayer.
-3. `OPT0` deployed on L2B; `bridgeAsset(destNet=1, 500 OPT0)` → `depositCount=1`, GER stub `lastRollupExitRoot=0xe3c6b488…`.
-4. **aggsender-l2b built a cert → agglayer SETTLED it** (`settled certificate from AggLayer: 0/0xbbcc2031…`; agglayer NetworkTask network_id=2).
-5. **L1**: rollup #2 `lastLocalExitRoot == 0xe3c6b488…` (exact match), rollupExitRoot updated, new GER `0x3e591e9e…`.
-6. **Miden**: `zkevm_getLatestGlobalExitRoot == 0x3e591e9e…` — the Miden aggoracle injected the cross-L2 GER.
-
-`e2e-l2-to-l2.sh` steps 1–2a now encode this proven flow (deploy + bridgeAsset + GER-propagation wait).
-
-### Debug lessons (this stack's bridge fork)
-- Bare `execution reverted, data: "0x"` from the bridge → `cast send --gas-limit 3M` + `cast run <hash>` traces the real cause ("call to non-contract address X").
-- Two hidden L1 dependencies must be replicated on any fresh EVM L2: the **ProxyAdmin** (initialize gate) and the **metadata helper** (bridgeAsset). Both are now in setup-l2b.sh.
-- Transparent-proxy note: with an empty admin slot, `cast call` (default `from=0x0`) hits the admin dispatch and reverts — set the admin slot (done) or pass `--from`.
-
-### Remaining for the full e2e
-- **Step 2b**: claim on Miden — bridge-service `/merkle-proof` for a network-2 deposit + `claimAsset` via the proxy → assert foreign-origin faucet keyed `(OPT0, net 2)` (#108) + wrapped balance + exact-block ClaimEvent. (bridge-service indexes network 2 via the generated config; verify its sync of anvil-l2b.)
-- **Step 3**: same-address/different-origin faucet isolation (absorbs #15).
-- **Step 4**: Miden → L2B back-bridge (bridge-out + claim on L2B against an injected GER — needs aggoracle-l2b GER injection into the stub, already wired).
-- **Step 5**: exact-block asserts + N-run variant; wire into `e2e-test.sh` as `l2-to-l2`.
-
----
-
-## UPDATE 4: BOTH-WAYS implementation plan (mechanics confirmed from existing e2e)
-
-Remaining legs reuse existing machinery — no manual merkle-proof/claimAsset:
-- **2b claim on Miden**: bridge-autoclaim (net 2 now indexed) auto-claims like e2e-l1-to-l2 → proxy provisions the foreign-origin faucet keyed (OPT0, net 2) + mints wrapped. ASSERT: faucet(OPT0,net2) exists; wrapped balance; ClaimEvent at exact block.
-- **3 faucet isolation (#15)**: same address on L1 AND L2B, bridge both in → ASSERT two DISTINCT faucets (hash(A‖net0) ≠ hash(A‖net2)), no cross-contamination.
-- **4 back Miden→OP-Stack**: B2AGG bridge-out with destNet=2 (e2e-l2-to-l1 path, destNet=2 not 0) → aggsender cert → agglayer settle → aggoracle-l2b injects GER into the SovereignGER stub (wired) → claim on L2B → ASSERT OPT0 restored, Miden wrapped back to 0.
-- **5**: exact-block asserts across round-trip + wire `l2-to-l2` into e2e-test.sh (BEFORE cantina13).
-Order: 2b → 4 → 3 → 5, each verified live on base+l2l2 stack.
-
----
-
-## UPDATE 5: legs 2b-5 IMPLEMENTED (script complete, pending live validation)
-
-`scripts/e2e-l2-to-l2.sh` now runs the full both-ways flow. **How to run**:
-
-```sh
-make e2e-up                        # base stack healthy first
-./scripts/e2e-l2-to-l2.sh          # or: ./scripts/e2e-test.sh l2-to-l2
+    RM --> M
+    RM --> B
+    MP <--> MN
+    MA <--> MP
+    MS <--> MP
+    L2B_AGGKIT <--> BE
+    BS <--> BE
+    BE <--> BC
+    MA --> L1
+    L2B_AGGKIT --> L1
+    L1 --> MA
+    L1 --> L2B_AGGKIT
 ```
 
-The script itself brings up the L2B overlay services (leg 0, idempotent) and
-restarts bridge-service with the network-2 config — so do NOT interleave it
-with the `all` suite (it is deliberately not in the `all` list).
+The two bridge-service instances and PostgreSQL databases are isolated by
+rollup. Cross-L2 claims are client submitted: the test obtains a proof from the
+source rollup's bridge-service and sends `claimAsset` to the destination.
 
-What each leg asserts (state-first: PG on :5434 + proxy RPC + bridge-service;
-docker-log greps only where the sibling suites proved them stable):
+`scripts/setup-l2b.sh` registers chain ID 31338 as rollup/network ID 2 through
+`deployment/v2/4_createRollup.ts` in the pinned
+`agglayer-contracts:v12.2.3` image. It generates the sovereign genesis and
+injects the real `AgglayerBridgeL2` and `AgglayerGERL2` code and storage into
+the live L2B Anvil instance. The setup is idempotent.
 
-- **Leg 2b** — forward deposit destination is now the ISOLATED WALLET's
-  zero-padded address (the old skeleton bridged to the bare admin EOA, which
-  is unclaimable on Miden). Waits ready_for_claim (bridge-service, network 2
-  source) → ClaimTxManager auto-claim → asserts: faucet keyed
-  `(OPT0, origin_network=2)` present in BOTH `admin_listFaucets` and the PG
-  `faucet_registry` (ids must agree); wrapped balance == amount/10^10 via the
-  isolated-wallet dry probe; a `ClaimEvent` synthetic_logs row for the
-  deposit's exact global index.
-- **Leg 3 (#15)** — TRUE same-address collision: a fresh keypair deploys
-  TestToken at nonce 0 on BOTH L1 and L2B → identical CREATE address. Both
-  get bridged in with distinct amounts. Asserts: exactly two
-  `faucet_registry` rows for that address keyed `(addr,0)` / `(addr,2)` with
-  DISTINCT faucet ids; per-faucet wrapped balances match their own amounts
-  (no cross-contamination); negative control — `(OPT0, net 0)` resolves to
-  NO faucet and OPT0's address has exactly one row.
-- **Leg 4** — `bridge-out-tool --dest-network 2` burns the wrapped OPT0;
-  asserts the synthesized BridgeEvent carries the `(OPT0, net 2)` origin
-  identity (PG), waits cert settle + ready_for_claim, claims on L2B
-  (bridge-service ClaimTxManager autoclaim preferred; fallback: manual
-  `claimAsset` from `/merkle-proof`, gated on the SovereignGER stub's
-  `globalExitRootMap` being populated by aggoracle-l2b). Asserts net-zero:
-  L2B holder balance back to its exact pre-forward value AND Miden wrapped
-  balance back to baseline.
-- **Leg 5** — 0 `database is locked` in the proxy logs for the run;
-  synthetic tip advancing; optional exact-block event completeness via
-  `verify-event-completeness.sh` (runs when `target/debug/bridge-out-tool`
-  is built; `STRICT_COMPLETENESS=1` makes it mandatory, `ALLOW_LATE=0`
-  tightens the late-log policy).
+Generated L2B configs are intentionally not committed. `make
+gen-l2b-configs` derives them from the base fixtures, and `make e2e-l2l2-up`
+runs that target automatically.
 
-Leg-0 additions since UPDATE 3: bridge-service HTTP readiness wait after the
-force-recreate, and the claim sponsor (claimsponsor.keystore /
-`SPONSOR_PRIVATE_KEY`) is funded on L2B — the ClaimTxManager needs gas there
-for the leg-4 autoclaim.
+## Run the group
 
-### Live-run punch list (assumptions to verify in the stack window)
-1. **bridge-service network-2 coverage**: `ready_for_claim` must flip for
-   BOTH directions — net-2-origin → net-1-dest (leg 2b) and net-1-origin →
-   net-2-dest (leg 4). The old "net-2 leaves never synchronize" observation
-   predates the network-2 config; re-verify with `bridge-config-l2b.toml`.
-2. **ClaimTxManager on L2B**: whether the upstream bridge-service actually
-   autoclaims on the second L2 (it is multi-network by design). If not, the
-   manual-claim fallback path runs — verify `/merkle-proof?net_id=1` returns
-   a proof whose GER lands in the SovereignGER stub (aggoracle-l2b inject).
-3. **Foreign-origin claim on Miden** (leg 2b): first live exercise of the
-   proxy claiming a rollup-tree (non-mainnet) global index — verify the
-   rollup_merkle_proof path in the MASM/proxy accepts it.
-4. **Faucet mint size**: forward amount was reduced from 500e18 to 1e15 wei
-   (100000 Miden units) to mirror e2e-dynamic-erc20's proven mint size.
-5. **Timeouts**: GER propagation 600s, L2B COL faucet pair 900s, cert settle
-   900s — tune after a cold-stack run.
+Prerequisites are the same host tools and locally built images described in
+[`RUNNING-E2E.md`](RUNNING-E2E.md).
 
----
+```sh
+make e2e-l2l2-up
+make e2e-l2l2
+make e2e-l2l2-down
+```
 
-## UPDATE 6 (2026-07-10): stub replaced by the REAL sovereign contracts (kurtosis flow)
+`e2e-l2l2-up` starts the base stack plus
+`docker-compose.l2l2.yml`, waits for L2B, registers rollup 2, deploys the
+sovereign contracts, and recreates the network-2 services after registration.
 
-The stub era (UPDATE entries 1-5: `fixtures/SovereignGER.sol` + L1-bridge-bytecode
-copy) is over. `scripts/setup-l2b.sh` now mirrors how kurtosis-cdk attaches an
-OP-Stack chain as a sovereign chain, using the SAME pinned tooling image
-(`agglayer-contracts:v12.2.3`, from kurtosis `src/package_io/constants.star`).
+`e2e-l2l2` runs these scripts in order:
 
-### Why the stub had to go
-The vendored zkevm-bridge-service decodes the smc v12 sovereign events
-(`etherman/etherman.go`): the L2 GER manager must emit
-`UpdateHashChainValue(bytes32,bytes32)` on `insertGlobalExitRoot`. The stub
-emitted `InsertGlobalExitRoot(bytes32)` — so the bridge-service never recorded
-L2B's trusted exit root, `GetLatestTrustedExitRoot(network=2)` stayed empty and
-the claimtxman L2→L2 readiness branch (`claimtxman.go:418`) never fired:
-L2B→Miden deposits never became `ready_for_claim`.
+1. `scripts/e2e-l2l2-forward.sh` deploys an 18-decimal token on L2B, bridges
+   it to Miden, waits for certificate settlement and GER propagation, submits
+   a proof-backed claim, and checks the origin-network-2 faucet, balance, and
+   `ClaimEvent`.
+2. `scripts/e2e-l2l2-clash.sh` deploys tokens at the same 20-byte address on
+   L1 and L2B, bridges both to Miden, and proves the `(origin address, origin
+   network)` keys produce distinct faucets and balances.
+3. `scripts/e2e-l2l2-back.sh` burns the wrapped L2B token on Miden, settles a
+   certificate, submits a proof-backed claim on L2B, and verifies the original
+   L2B balance is restored and the Miden wrapped balance returns to baseline.
 
-### L1 registration (kurtosis `contracts.sh create_sovereign_rollup_predeployed`)
-`setup-l2b.sh` step 1 runs `deployment/v2/4_createRollup.ts` (hardhat) inside
-the contracts image, joined to the L1 anvil's network namespace so the
-`localhost` hardhat network IS our L1. Inputs (mirrors of kurtosis
-`static_files/contracts/sovereign-rollup/create_new_rollup.json` and
-`deploy_parameters.json`, filled from `fixtures/combined.json`):
-- `fixtures/l2b/create_rollup_parameters.json` — AggchainECDSAMultisig,
-  chainID 31338, networkName `l2b-sovereign`, `isVanillaClient: true`,
-  sovereignParams (globalExitRootUpdater = aggoracle `0x0b6805…`),
-  aggchainParams (signers `[0x5b06…]`, threshold 1, selector `0x00000000`).
-- `fixtures/l2b/deploy_parameters.json` — reproduces the base L2 genesis.
+The forward leg writes scenario state under
+`.b2agg-store/e2e-l2l2`; the clash and back legs intentionally consume that
+same state. Run the full group when starting from a clean stack. Individual
+filters (`l2l2-forward`, `l2l2-clash`, and `l2l2-back`) are available through
+`scripts/e2e-test.sh` for focused debugging, subject to their documented state
+preconditions.
 
-The script deploys a fresh `AggchainECDSAMultisig` implementation, calls
-`RollupManager.addNewRollupType(impl, verifier=0, forkID=0,
-rollupVerifierType=2 (ALGateway), genesis=0, programVKey=0)` → rollupTypeID 2,
-then `attachAggchainToAL(2, 31338, …)` → rollupID 2 aggchain proxy at
-`0x5D1A491A…bd0E` (CREATE'd by the RollupManager — snapshot-deterministic,
-same address the configs pin), and initializes the aggchain
-(admin/trustedSequencer/signers/threshold). `addDefaultAggchainVKey` is
-commented out exactly like kurtosis does for `l2_network_id != 1` (the
-selector route exists from rollup #1 and would revert). Result is verified and
-recorded kurtosis-style: `rollupIDToRollupData(2)` →
-`fixtures/l2b/out/sovereign-rollup-out.json` (chainID 31338 + verifierType 2
-asserted), plus an L1 `eth_getLogs` check that a RollupManager event carries
-rollupID 2 (attach tx traceability).
+## GER propagation
 
-### L2B contracts (kurtosis "predeployed" model, real artifacts)
-With `isVanillaClient: true`, `4_createRollup.ts` also emits
-`genesis_sovereign.json` — the base L2 genesis (reproduced offline by
-`1_createGenesis.ts` from our deploy_parameters; bridge proxy
-`0xC8cbEBf9…f038`, GER proxy `0xa40D5f56…B8fA`, BridgeLib, TokenWrapped impl,
-ProxyAdmin `0xd60F1B…`, timelock) with the REAL `AgglayerBridgeL2` +
-`AgglayerGERL2` implementations swapped in and the proxy storage fully
-initialized (bridge `networkID=2`, GER wired, `globalExitRootUpdater` =
-aggoracle, bridgeManager/remover/pauser = admin). On an OP chain kurtosis
-bakes these allocs into the chain genesis; L2B is a live anvil, so step 2
-injects the same allocs via `anvil_setCode`/`anvil_setStorageAt`/
-`anvil_setBalance`/`anvil_setNonce` — same real code+storage, different
-delivery. The old hand-replicated pieces (ProxyAdmin owner gate, metadata
-helper `0xcC87d4…`) come along for free because they are IN the genesis.
+L2B exit roots reach Miden only after Aggsender submits and AggLayer settles a
+certificate, L1 updates the combined GER, and Miden's aggoracle injects it.
+When L2B is otherwise quiet, the harness creates a one-wei nudge deposit to
+force the next certificate cycle. Claim predicates fetch a fresh proof while
+waiting for the covering GER rather than reusing an old proof.
 
-Outputs live in `fixtures/l2b/out/` (`genesis-base.json`,
-`genesis-l2b-sovereign.json`, `create_rollup_output.json`,
-`sovereign-rollup-out.json`, hardhat logs). The dir is gitignored like every
-other snapshot-derived artifact (`combined.json` etc.) — setup-l2b.sh
-regenerates it whenever it registers rollup #2 on a fresh L1.
-`gen-l2b-configs.sh` reads `sovereign-rollup-out.json` for the rollup-2
-aggchain address when present. Everything is idempotent: registration is
-skipped when `chainIDToRollupID(31338) != 0`, injection when the GER proxy
-already answers `globalExitRootUpdater()`.
+Claims sent to the Miden proxy use a legacy transaction with an explicit gas
+price and gas limit because the synthetic RPC does not implement
+`eth_feeHistory` and `eth_estimateGas` is compatibility-oriented. Claims sent
+to L2B use its normal Anvil fee path.
 
-### Live evidence (fresh stack, 2026-07-10)
-- aggkit-l2b aggoracle: `inject GER transaction submitted … GER: 0x133e6a88…`
-  → mined+finalized to `0xa40D5f56…` (the real AgglayerGERL2);
-  `globalExitRootMap(0x133e6a88…)` returns the insertion timestamp.
-- bridge-service: `networkID: 2, adding L2 ger to the channel. GER:
-  0x133e6a88…` — the line the stub could never produce — and claimtxman
-  `RollupID: 2, … The destination network is another L2` both fire.
+## Evidence and assertions
 
-### Leg 2 L1-traceability asserts (now enforced by the e2e)
-`e2e-l2-to-l2.sh` leg 2 additionally asserts, with on-chain L1 reads:
-1. `rollupIDToRollupData(2).lastLocalExitRoot` moves off its pre-bridge value,
-2. the settlement tx exists (RollupManager event with rollupID-2 topic since
-   the leg-2 start block; receipt status 1; tx hash logged),
-3. the L1 GER contract's `lastRollupExitRoot()` moves (exit-root propagation).
+The group writes a per-run NDJSON audit trail under `.l2l2-evidence`. It records
+deployments, deposits, GER injections, claims, certificate settlements, rollup
+registration, and exit-root movement. Missing required evidence is a hard test
+failure.
 
-### L2→L2 claims are CLIENT-submitted (canonical per-rollup isolation, 2026-07-10)
-Canonical kurtosis-cdk runs ONE bridge-service per chain (L1 + only its own L2) and
-sets NO `AreClaimsBetweenL2sEnabled` anywhere — the ClaimTxManager does L1→L2
-autoclaims only. L2↔L2 claims are client-initiated. Our harness matches this:
-- **Config split** (`gen-l2b-configs.sh` → `bridge-config-l2b.toml`): a SEPARATE
-  isolated L2B bridge-service (`L2URLs=[anvil-l2b]`, own `postgres-l2b` DB). The base
-  Miden service stays Miden-only and does NOT index L2B. (An earlier shortcut used one
-  shared service indexing both L2s + `AreClaimsBetweenL2sEnabled`, which auto-claimed
-  the forward leg — non-canonical, now removed.)
-- **Forward L2B→Miden (leg 2b) and clash net-2 COL (leg 3)**: `_pred_submit_forward_claim`
-  fetches the deposit's proof from the L2B service (`:28080/merkle-proof`) and submits a
-  proof-backed `claimAsset` to the Miden proxy (`:8546`), which auto-creates the foreign
-  faucet + mints. Clash net-0 COL (L1→Miden) still AUTO-claims (canonical L1→L2). Back
-  Miden→L2B (leg 4) submits `claimAsset` to real anvil-l2b (already client-side).
-- **Nudge still needed, different reason**: a claim is accepted only once Miden has SEEN
-  the GER covering the deposit's L2B exit root (proxy `service_send_raw_txn.rs` C6
-  `has_seen_ger`). On a quiet L2B that root reaches L1 (then Miden) only on the next
-  cert; `nudge_cert` (1 wei NDG L2B→L1, dest L1 = no side effects) forces that cycle, and
-  the claim predicate re-fetches a fresh proof each round until it sticks.
-- **GOTCHA — proxy has no `eth_feeHistory`**: the Miden proxy synthetic RPC does not
-  implement `eth_feeHistory` (cast's default EIP-1559 fee path -32601s BEFORE submitting)
-  and `eth_estimateGas` returns 0. So `claimAsset` to the proxy MUST use
-  `cast send --legacy --gas-price <eth_gasPrice=1gwei> --gas-limit <fixed>`. The back leg
-  is unaffected (submits to real anvil-l2b, which has `eth_feeHistory`).
+Assertions use on-chain state, proxy PostgreSQL state, bridge-service APIs,
+and transaction receipts. Container-log matching is used only where there is
+no stronger state query. The optional Miden-origin scenarios are
+`DEST=l2b scripts/e2e-miden-origin.sh` and
+`DEST=l1 scripts/e2e-miden-origin.sh`.

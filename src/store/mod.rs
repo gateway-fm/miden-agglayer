@@ -20,6 +20,7 @@ use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
+use miden_protocol::note::{NoteId, Nullifier};
 use miden_protocol::transaction::TransactionId;
 use std::sync::Arc;
 
@@ -139,6 +140,50 @@ pub struct TxnEntry {
     pub logs: Vec<LogData>,
 }
 
+/// Outcome of [`Store::reserve_nonce`] — the atomic, FENCED `(signer, nonce)`
+/// admission-lease claim (#55 BLOCKER 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceReservation {
+    /// This call WON ownership of the admission lease — fresh, or a takeover of an
+    /// EXPIRED lease / a `released_failure` prior attempt by the same tx. This
+    /// replica (and ONLY this replica) may execute; the `fence` token must be
+    /// passed to [`Store::release_reservation`] so a delayed prior owner cannot
+    /// clobber this owner's release.
+    Won { fence: u64 },
+    /// The slot is currently owned+executing by the SAME tx under a VALID lease
+    /// (another replica is admitting it). Do NOT execute — dedup-return the hash;
+    /// the owner produces the receipt.
+    OwnedBySame,
+    /// A DIFFERENT tx owns/owned this slot. Hard reject — this submission must not
+    /// execute.
+    HeldByOther(TxHash),
+}
+
+/// Fenced ownership token for an in-progress claim submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimFence {
+    pub fence: u64,
+}
+
+/// Durable state of the exact Miden note associated with an Ethereum write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteHandoffState {
+    /// The exact note identity is durable, but inclusion has not been observed.
+    Prepared,
+    /// The transaction committed or the exact note was later observed.
+    Submitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteHandoff {
+    pub note_commitment: String,
+    pub note_id: Option<String>,
+    pub state: NoteHandoffState,
+    /// The executed Miden transaction's expiration block. Present for prepared
+    /// rows; a missing value is treated fail-closed and is never cleared.
+    pub expiration_block: Option<u64>,
+}
+
 /// Record of a claim we dropped because the destination could not be resolved to a
 /// Miden AccountId. See RD-860: storing these lets operators inspect the backlog and
 /// audit what happened to a user's funds when support asks about a specific deposit.
@@ -176,12 +221,10 @@ impl UnclaimableReason {
 ///
 /// The on-chain consumption already advanced the LET frontier — funds are
 /// effectively burned on L2 — but aggkit failed to parse or process the
-/// note. Without this quarantine row, the failure was only surfaced as a
-/// symptom by the LET-divergence monitor (Cantina #9); operators had no
-/// concrete handle for an individual stranded B2AGG.
+/// note. This row gives operators a concrete handle for the stranded B2AGG.
 ///
-/// `note_id` is the primary key because erased B2AGGs by definition never
-/// reached the deposit-counter stage that would assign a `global_index`.
+/// `note_id` is the primary key because distinct notes may share a details commitment.
+/// The projector reserves the LET index before any quarantine branch.
 /// `note_dump` captures everything we knew about the note at quarantine
 /// time so a future recovery RPC can re-attempt the BridgeEvent
 /// synthesis once the underlying cause is fixed (faucet registered, parse
@@ -201,8 +244,7 @@ pub struct UnbridgeableBridgeOut {
     /// operator to identify the depositor and decide on a recovery path.
     pub note_dump: String,
     /// The aggkit synthetic block number at which the consumption was
-    /// observed. Useful for cross-referencing with the LET-divergence
-    /// monitor that fires in the same on_post_sync tick.
+    /// observed. Useful for cross-referencing with the Miden transaction feed.
     pub observed_block: u64,
 }
 
@@ -243,6 +285,15 @@ pub enum UnbridgeableBridgeOutReason {
     /// silently skipped) so the note is recorded as a permanent skip and is not
     /// re-attempted every sync tick / restore run.
     MetadataTooLarge,
+    /// SAME-DETAILS MULTIPLICITY (review): the authoritative bridge-tx feed shows ≥2
+    /// DISTINCT on-chain B2AGG consumptions that share a `details_commitment` (same details,
+    /// different metadata → different NoteId/nullifier). The miden-client SQLite store keys
+    /// input notes by `details_commitment`, so it CANNOT represent them distinctly, and the
+    /// synthetic BridgeEvent's tx_hash is derived from the commitment (shared) — so restore
+    /// cannot emit a correct, distinct event per leaf without collapsing/misnumbering. Rather
+    /// than guess, quarantine ALL such exits fail-closed; recover via --restore/admin once the
+    /// authoritative per-note bodies can be sourced.
+    SameDetailsMultiplicity,
 }
 
 impl UnbridgeableBridgeOutReason {
@@ -254,6 +305,7 @@ impl UnbridgeableBridgeOutReason {
             Self::AmountOverflow => "amount_overflow",
             Self::AtomicCommitFailed => "atomic_commit_failed",
             Self::MetadataTooLarge => "metadata_too_large",
+            Self::SameDetailsMultiplicity => "same_details_multiplicity",
         }
     }
 }
@@ -270,18 +322,52 @@ pub struct TxnData {
     pub logs: Vec<LogData>,
 }
 
+/// Durable pending-nonce frontier for one recovered signer.
+///
+/// `lowest_pending` is the committed-nonce boundary used by
+/// `eth_getTransactionCount(..., "latest")`. `lowest_unlinked` is the oldest
+/// accepted transaction that has not crossed the Miden note-handoff boundary;
+/// later nonces must not be admitted ahead of it after a process restart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingNonceFrontier {
+    pub lowest_pending: Option<u64>,
+    pub lowest_unlinked: Option<u64>,
+}
+
+pub(crate) fn envelope_nonce(envelope: &TxEnvelope) -> u64 {
+    match envelope {
+        TxEnvelope::Eip1559(s) => s.tx().nonce,
+        TxEnvelope::Eip2930(s) => s.tx().nonce,
+        TxEnvelope::Eip4844(s) => s.tx().tx().nonce,
+        TxEnvelope::Eip7702(s) => s.tx().nonce,
+        TxEnvelope::Legacy(s) => s.tx().nonce,
+    }
+}
+
 impl TxnData {
-    /// Build an `alloy::rpc::types::Transaction` for JSON-RPC responses.
+    /// Build the `eth_getTransactionByHash` JSON for a stored tx. Returns a
+    /// `serde_json::Value` (not the raw `alloy::rpc::types::Transaction`) so the `hash`
+    /// field can be pinned to the STORE KEY.
+    ///
+    /// Why pin the hash (review blocker 4): a client that fetched by hash `H` MUST get back
+    /// `.hash == H`. For a real `eth_sendRawTransaction` tx the key equals the envelope's
+    /// RLP hash, so this is a no-op. But a SYNTHESIZED claim tx is stored under its DERIVED
+    /// hash (`keccak(tag || note_id)`, NOT an RLP hash) while PG persists only the
+    /// EIP-2718/RLP bytes — so after a round-trip `txn_get` decodes the envelope and its
+    /// hash is RECOMPUTED as the RLP hash, which differs from the derived key. Serializing
+    /// the envelope's hash would return an object whose `.hash` mismatches what aggkit
+    /// asked for. Re-asserting the key as `.hash` here makes the lookup identity hold
+    /// across the PG round-trip.
     pub fn to_rpc_transaction(
         &self,
-        _tx_hash: TxHash,
+        tx_hash: TxHash,
         block_state: &BlockState,
-    ) -> alloy::rpc::types::Transaction {
+    ) -> serde_json::Value {
         use alloy::consensus::transaction::Recovered;
         use alloy::primitives::B256;
 
         let is_confirmed = self.result.is_some();
-        alloy::rpc::types::Transaction {
+        let txn = alloy::rpc::types::Transaction {
             inner: Recovered::new_unchecked(self.envelope.clone(), self.signer),
             block_hash: if is_confirmed {
                 Some(B256::from(block_state.get_block_hash(self.block_num)))
@@ -295,7 +381,15 @@ impl TxnData {
             },
             transaction_index: if is_confirmed { Some(0) } else { None },
             effective_gas_price: Some(0),
+        };
+        let mut value = serde_json::to_value(&txn).unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "hash".to_string(),
+                serde_json::Value::String(format!("{tx_hash:#x}")),
+            );
         }
+        value
     }
 }
 
@@ -309,16 +403,27 @@ pub trait Store: Send + Sync + 'static {
     /// Increment block number by 1 and return the new value.
     async fn advance_block_number(&self) -> anyhow::Result<u64>;
 
-    // === L1 indexer cursor (RD-862 follow-up) ===
-    /// Last successfully-polled L1 block. Returns 0 if the indexer has
-    /// never persisted a cursor on this deployment.
-    async fn get_l1_indexer_cursor(&self) -> anyhow::Result<u64> {
+    // === Selected L1 evidence scan ===
+    /// Last block processed by the one configured scan. PostgreSQL uses the
+    /// legacy `finalized_scan_cursor` column for upgrade-safe provenance.
+    async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
     /// Persist the last-processed L1 block. Called after each successful
     /// batch so a restart resumes from here instead of jumping to L1 head.
-    async fn set_l1_indexer_cursor(&self, _block: u64) -> anyhow::Result<()> {
+    async fn set_l1_evidence_cursor(&self, _block: u64) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Bind the selected-scan marker and cursor to the configured evidence
+    /// policy. The first clean serving boot records `policy`; later boots must
+    /// present the exact same canonical value. Implementations must reject an
+    /// unbound store that already contains scan progress or verified evidence,
+    /// because the policy that produced it cannot be inferred safely. A
+    /// persistent implementation may bootstrap `latest` from its legacy latest
+    /// cursor; safe/finalized must never inherit that cursor.
+    async fn bind_l1_evidence_policy(&self, _policy: &str) -> anyhow::Result<()> {
+        anyhow::bail!("store does not support persistent L1 evidence-policy binding")
     }
 
     // === Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) ===
@@ -390,6 +495,47 @@ pub trait Store: Send + Sync + 'static {
     async fn get_tx_for_note(&self, _note_commitment: &str) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
+    /// Return the durable prepared/submitted state for an exact note handoff.
+    async fn get_note_handoff_for_tx(&self, tx_hash: &str) -> anyhow::Result<Option<NoteHandoff>>;
+    /// Return at most `limit` terminal-less transactions with an exact durable
+    /// note handoff whose hash sorts after `after`. The background projector
+    /// uses this bounded cursor query to reconcile confirmed duplicates fairly;
+    /// receipt polling never calls it.
+    async fn pending_note_handoff_txs(
+        &self,
+        after: Option<TxHash>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TxHash>>;
+    /// Persist an exact note identity immediately before the external submit.
+    async fn prepare_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
+    ) -> anyhow::Result<()>;
+    /// Confirm Miden acceptance (or later exact-note observation).
+    async fn confirm_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool>;
+    /// Confirm a prepared handoff from an observed note details commitment and
+    /// return its real Ethereum transaction hash.
+    async fn confirm_note_handoff_by_commitment(
+        &self,
+        note_commitment: &str,
+    ) -> anyhow::Result<Option<String>>;
+    /// Confirm prepared handoffs directly from a reconciler window's raw note
+    /// IDs, before body import/fetch and cursor advancement.
+    async fn confirm_prepared_note_handoffs(&self, note_ids: &[String]) -> anyhow::Result<u64>;
+    /// Clear only the same exact prepared handoff after an authoritative sync is
+    /// strictly past its Miden expiration block. Returns true when retry may proceed.
+    async fn clear_expired_prepared_note_handoff(
+        &self,
+        tx_hash: &str,
+        note_commitment: &str,
+    ) -> anyhow::Result<bool>;
 
     // === Synthetic logs ===
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;
@@ -406,14 +552,14 @@ pub trait Store: Send + Sync + 'static {
     async fn mark_ger_seen(&self, ger: &[u8; 32], entry: GerEntry) -> anyhow::Result<bool>;
     async fn get_latest_ger(&self) -> anyhow::Result<Option<[u8; 32]>>;
     async fn get_ger_entry(&self, ger: &[u8; 32]) -> anyhow::Result<Option<GerEntry>>;
-    /// Set the `(mainnet, rollup)` decomposition and L1 origin metadata for a
-    /// GER. Called by `L1InfoTreeIndexer` after observing the source
+    /// Atomically set the `(mainnet, rollup)` decomposition, L1 origin metadata,
+    /// and selected-scan provenance marker for a GER. Called by the one
+    /// configured `L1InfoTreeIndexer` scan after observing the source
     /// `UpdateL1InfoTree` / `UpdateGlobalExitRoot` event on L1, so the
     /// `l1_block_number` / `l1_timestamp` here are the L1 block where the
     /// event was emitted (the authoritative source for `zkevm_getExitRootsByGER`).
-    /// UPSERTs: on conflict, all four columns are overwritten — the indexer's
-    /// L1-sourced view supersedes any earlier hardcoded-0 row that may have
-    /// been left by an L2-side write path that didn't know the L1 origin yet.
+    /// UPSERTs roots and provenance together so pre-upgrade unqualified roots
+    /// cannot be trusted under a different policy.
     async fn set_ger_exit_roots(
         &self,
         ger: &[u8; 32],
@@ -456,6 +602,9 @@ pub trait Store: Send + Sync + 'static {
 
     // === Transactions ===
     async fn txn_begin(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<()>;
+    /// Durably admit a transaction before advancing its nonce. Idempotent for the
+    /// same tx hash; returns true when this call inserted the pending row.
+    async fn txn_begin_if_absent(&self, tx_hash: TxHash, entry: TxnEntry) -> anyhow::Result<bool>;
     async fn txn_commit(
         &self,
         tx_hash: TxHash,
@@ -463,11 +612,23 @@ pub trait Store: Send + Sync + 'static {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()>;
+    /// Finalize a note-linked pending transaction only after bridge state and its
+    /// exact NoteId prove another transaction applied the operation. This emits no
+    /// event and must not overwrite an existing terminal receipt.
+    async fn txn_commit_confirmed_duplicate(
+        &self,
+        tx_hash: TxHash,
+        result: Result<(), String>,
+        block_num: u64,
+    ) -> anyhow::Result<()>;
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,
     ) -> anyhow::Result<Option<(Result<(), String>, u64)>>;
     async fn txn_get(&self, tx_hash: TxHash) -> anyhow::Result<Option<TxnData>>;
+    /// Return the durable pending-nonce boundary for `addr`. Unlike the writer
+    /// DashMap, this survives restart and covers both sync and async admission.
+    async fn pending_nonce_frontier(&self, addr: &str) -> anyhow::Result<PendingNonceFrontier>;
     async fn txn_pending_by_miden_id(&self, id: TransactionId) -> anyhow::Result<Option<TxHash>>;
     async fn txn_commit_pending(
         &self,
@@ -482,7 +643,125 @@ pub trait Store: Send + Sync + 'static {
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;
 
+    /// #55 BLOCKER 1 — atomic `(signer, nonce)` reservation. Insert-if-absent keyed
+    /// on `(addr, nonce)`; the winner's `tx_hash` is durable. Returns
+    /// [`NonceReservation::Won`] iff this call owns the lease, otherwise
+    /// [`NonceReservation::OwnedBySame`] for the same hash or
+    /// [`NonceReservation::HeldByOther`] for a different winner.
+    ///
+    /// MUST be atomic at the store level (postgres: `SELECT … FOR UPDATE` +
+    /// conditional INSERT/UPDATE in ONE transaction; memory: one lock), so that two
+    /// replicas that each pass their process-local R4 for the same `(signer,
+    /// nonce)` are resolved deterministically:
+    ///   * a DIFFERENT tx → [`NonceReservation::HeldByOther`] (hard reject);
+    ///   * the SAME tx while the owner's lease is VALID and `executing` →
+    ///     [`NonceReservation::OwnedBySame`] (dedup, do NOT execute);
+    ///   * the SAME tx after lease expiry, `released_failure`, or
+    ///     `released_success` → takeover:
+    ///     [`NonceReservation::Won`] with a bumped fence (retry admission).
+    /// `lease` is how long the winner owns admission before another replica
+    /// presenting the SAME hash may take over on expiry (crash recovery). The
+    /// slot remains permanently bound to its first hash.
+    async fn reserve_nonce(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<NonceReservation>;
+
+    /// Extend the lease for the same durable transaction while it is queued or running.
+    async fn renew_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool>;
+
+    /// Fenced completion of a won admission. Either terminal state remains bound
+    /// to this hash and is immediately reclaimable by that exact durable retry.
+    async fn release_reservation(
+        &self,
+        addr: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        fence: u64,
+        success: bool,
+    ) -> anyhow::Result<()>;
+
+    /// #55 BLOCKER D — COMPARE-AND-SWAP nonce advance. Advance the stored nonce to
+    /// `expected + 1` **iff** the current stored value equals `expected` (a fresh
+    /// address is treated as nonce 0). Returns `true` iff it won the CAS (advanced).
+    ///
+    /// MUST be atomic at the store level (single conditional UPDATE / lock-guarded
+    /// CAS), so that under a shared PostgreSQL with rolling replicas two replicas
+    /// that both read expected nonce `N` cannot BOTH advance (`N → N+2`, skipping a
+    /// nonce → wedge). The process-local `per_signer_lock` only serialises within
+    /// one replica; this CAS is the cross-replica guarantee. Used on the accept
+    /// path (in place of the unconditional `nonce_increment`) and by the crash-gap
+    /// repair.
+    async fn nonce_advance_cas(&self, addr: &str, expected: u64) -> anyhow::Result<bool>;
+
+    /// #55 BLOCKER C — atomically persist a REVERTED receipt (status 0x0, EMPTY
+    /// logs, no ClaimEvent) for `tx_hash` **and** CAS-advance the signer's nonce, in
+    /// ONE store transaction, so a crash can never leave a half state — no
+    /// pending-forever receipt (the row is written already committed-`failed`, never
+    /// a separate `txn_begin`→`txn_commit`) and no stale nonce.
+    ///
+    /// The nonce CAS advances iff the current nonce == `expected_nonce` (the sync
+    /// accept path, where the nonce has not yet advanced). In async-writer mode the
+    /// enqueue already CAS-advanced it, so this CAS is a no-op and only the receipt
+    /// is written. Idempotent on `tx_hash` (a rebroadcast/re-entry re-affirms the
+    /// same committed-reverted row). Returns whether the nonce advanced here.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_reverted_receipt_and_advance_nonce(
+        &self,
+        tx_hash: TxHash,
+        entry: TxnEntry,
+        reason: String,
+        block_num: u64,
+        block_hash: [u8; 32],
+        addr: &str,
+        expected_nonce: u64,
+    ) -> anyhow::Result<bool>;
+
     // === Claims ===
+    /// Acquire a new claim lease. A conflict returns None.
+    async fn try_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>>;
+    /// Reclaim only an expired executing lease and bump its fence.
+    async fn try_reclaim_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<ClaimFence>>;
+    /// Atomically seal the current fence and persist an exact prepared note
+    /// identity before the first external submission side effect.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_claim_submission_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+        tx_hash: TxHash,
+        note_commitment: &str,
+        note_id: &str,
+        expiration_block: u64,
+    ) -> anyhow::Result<bool>;
+    /// Release only the current executing owner; stale owners cannot delete successors.
+    async fn unclaim_fenced(
+        &self,
+        global_index: &U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+    ) -> anyhow::Result<bool>;
+
     async fn try_claim(&self, global_index: U256) -> anyhow::Result<()>;
     async fn unclaim(&self, global_index: &U256) -> anyhow::Result<()>;
     async fn is_claimed(&self, global_index: &U256) -> anyhow::Result<bool>;
@@ -593,7 +872,7 @@ pub trait Store: Send + Sync + 'static {
     /// Record the FULL expected-MINT identity derived from a consumed CLAIM
     /// note's storage, keyed by the expected MINT serial (PROOF_DATA_KEY)
     /// (Cantina #4 reconciliation history — see
-    /// `migrations/011_claim_mint_serials.sql`). PERMANENT, unlike the
+    /// `migrations/018_claim_mint_expected.sql`). PERMANENT, unlike the
     /// Cantina #7 `expected_mint_*` staleness rows: the forged-MINT monitor
     /// reconciles every observed MINT against this set forever. First-write
     /// wins / idempotent (re-recording the same serial is a no-op — the
@@ -627,42 +906,55 @@ pub trait Store: Send + Sync + 'static {
 
     // === Bridge-out ===
     async fn is_note_processed(&self, note_id: &str) -> anyhow::Result<bool>;
-    /// Read the current deposit_counter (number of B2AGG-out notes aggkit has
-    /// processed since genesis). Used by the Cantina #9 LET-divergence monitor
-    /// to compare against the bridge account's `let_num_leaves` storage slot.
+
+    /// Reserve a stable LET index for a bridge-consumed B2AGG leaf without marking it
+    /// processed. This includes leaves that are quarantined or deferred and emit no event.
+    async fn reserve_deposit_index(&self, note_key: &str) -> anyhow::Result<u32>;
+
+    /// Atomically rename a pre-upgrade details-commitment key to its authoritative NoteId.
+    async fn migrate_legacy_deposit_key(
+        &self,
+        legacy_key: &str,
+        note_key: &str,
+        block_number: u64,
+        tx_hash: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Existing reservations for the requested keys.
+    async fn get_deposit_indices(
+        &self,
+        note_keys: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, u32>>;
+
+    /// Append to the durable identity ledger used to resolve headerless B2AGG
+    /// consumptions after restart. Existing nullifier mappings are immutable.
+    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()>;
+    async fn get_b2agg_note_ids(
+        &self,
+        nullifiers: &[Nullifier],
+    ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>>;
+
+    /// `deposit_counter` plus the operator-audited legacy LET offset, read atomically.
+    /// Lowest reserved-but-UNEMITTED LET leaf: a leaf that took a deposit index
+    /// (`reserve_deposit_index`) but whose synthetic `BridgeEvent` was never emitted
+    /// (quarantined / deferred / unrecoverable-metadata / self-target). Returns
+    /// `(deposit_count, note_id)`, or `None` when every reservation has been emitted.
+    ///
+    /// The LET cardinality gate enforces `accounted == on_chain let_num_leaves` (both
+    /// count the reservation) but NOT `emitted_events == accounted`. A reserved-but-
+    /// unemitted leaf therefore passes that gate yet leaves a permanent GAP in the
+    /// getLogs `depositCount` sequence — and aggkit's L2 bridgesync requires contiguous
+    /// indices, so it halts ("state is inconsistent") on the gap, wedging every later
+    /// certificate. The projector uses this to fail-closed (halt) instead of sealing
+    /// past such a leaf.
+    async fn first_unemitted_reservation(&self) -> anyhow::Result<Option<(u32, String)>>;
+
+    async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64>;
+    #[cfg(test)]
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;
 
-    /// Atomic, idempotent commit for a B2AGG bridge-out `BridgeEvent`. Folds:
-    ///   1. allocate (or reuse) the note's `deposit_count` and record the note
-    ///      as processed
-    ///   2. the BridgeEvent synthetic-log emission
-    /// into a single all-or-nothing operation. This is the SOLE write path for
-    /// the B2AGG processed-set that `is_note_processed` reads.
-    ///
-    /// Why this exists (audit H1): the legacy two-step mark-processed +
-    /// bridge-event emission sequence left a crash window — a process kill
-    /// between the two calls recorded the note as processed (and bumped
-    /// `deposit_counter`) with NO matching `BridgeEvent`. On restart the note
-    /// was silently skipped, stranding the exit: aggkit never certified it and
-    /// the L1 autoclaim never fired. The Claim path already had the atomic
-    /// pattern (`commit_manual_claim_event_atomic`); the B2AGG path did not.
-    ///
-    /// It is also idempotent on retry (audit H3): re-running for an
-    /// already-committed note reuses the original `deposit_count`, does NOT
-    /// bump the counter again, and does NOT emit a duplicate log. Allocating a
-    /// fresh `deposit_count` on retry would create a permanent gap in the
-    /// sequence, desynchronising leaf indices from the on-chain Local Exit
-    /// Tree (Cantina MA#15).
-    ///
-    /// REQUIRED — there is deliberately no default impl. A default that ran
-    /// the two steps sequentially would NOT be all-or-nothing (a failure
-    /// after the processed-marker write but before the event emission reopens
-    /// exactly the Cantina MA#15 crash window this method exists to close).
-    /// Each backend MUST provide a genuine single-transaction implementation:
-    /// `PgStore` uses one postgres txn; `InMemoryStore` folds the
-    /// reuse-or-allocate and the at-most-once emission under its in-process
-    /// locks.
-    /// Returns the `deposit_count` assigned to (or reused for) this note.
+    /// Atomically emit a previously reserved B2AGG leaf at most once. Retries reuse the
+    /// reservation and return its stable `deposit_count`.
     #[allow(clippy::too_many_arguments)]
     async fn commit_b2agg_event_atomic(
         &self,
@@ -739,17 +1031,14 @@ pub trait Store: Send + Sync + 'static {
         global_index: &[u8; 32],
     ) -> anyhow::Result<bool>;
 
-    /// Atomic commit for a watcher-synthesised ClaimEvent. Combines:
-    ///   1. `mark_claim_note_processed`
-    ///   2. `add_claim_event` (synthetic log emission)
-    ///   3. `set_latest_block_number` (cursor advance)
+    /// Atomic commit for a watcher-synthesised ClaimEvent. In one all-or-nothing
+    /// operation this marks the note processed, emits the synthetic log, and
+    /// finalises a linked pending transaction (when `tx_hash` names one).
     ///
-    /// PgStore overrides with a single SERIALIZABLE postgres txn; the default
-    /// impl below chains the three primitives sequentially, which is fine for
-    /// `InMemoryStore` where every primitive is an in-process lock. The
-    /// race-safe ordering (log THEN cursor) is the same invariant
-    /// `the projector B2AGG commit` and `the projector GER commit` enforce — see
-    /// the canonical comment at `src/bridge_out.rs::on_post_sync`.
+    /// The synthetic block tip is deliberately *not* advanced here. A block may
+    /// contain more notes; `SyntheticProjector` seals the block only after every
+    /// note has been projected. There is no default implementation so each store
+    /// must preserve the event/receipt atomicity contract.
     #[allow(clippy::too_many_arguments)]
     async fn commit_manual_claim_event_atomic(
         &self,
@@ -763,24 +1052,7 @@ pub trait Store: Send + Sync + 'static {
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
         amount: u64,
-    ) -> anyhow::Result<()> {
-        self.mark_claim_note_processed(note_id, global_index, block_number)
-            .await?;
-        self.add_claim_event(
-            bridge_address,
-            block_number,
-            block_hash,
-            tx_hash,
-            &global_index,
-            origin_network,
-            origin_address,
-            destination_address,
-            amount,
-        )
-        .await?;
-        self.set_latest_block_number(block_number).await?;
-        Ok(())
-    }
+    ) -> anyhow::Result<()>;
 
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).
