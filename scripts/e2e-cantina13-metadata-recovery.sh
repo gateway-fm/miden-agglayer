@@ -430,6 +430,19 @@ docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/de
 [[ -s "$BACKUP" ]] || fail "DB backup failed (empty dump) — refusing to drop without a backup"
 pass "DB backed up ($(wc -c < "$BACKUP") bytes → $BACKUP)"
 
+# Preserve the proxy's per-signer account-nonce state across the rebuild. DROP SCHEMA
+# wipes the `nonces` / `nonce_reservations` tables, but those hold LEGITIMATE EVM
+# account nonces for external claim submitters (aggkit claimsponsor / bridge-autoclaim).
+# They are proxy-internal (L2 claim txns are NOT on-chain, so `--restore` cannot rebuild
+# them) and are NOT corrupted. Without this, a submitter whose nonce advanced pre-drop
+# (e.g. the sponsor at nonce N) sends its next claim at nonce N to a reset proxy that now
+# expects 0 → future-nonce wedge → post-recovery deposit-claims stall forever (finding #65).
+NONCE_DUMP="/tmp/agglayer_nonces.cantina13.$$.sql"
+docker exec "$PG_CONTAINER" pg_dump -U agglayer -d agglayer_store --data-only \
+    -t public.nonces -t public.nonce_reservations > "$NONCE_DUMP" 2>/dev/null
+[[ -s "$NONCE_DUMP" ]] && pass "Preserved account-nonce state ($(wc -l < "$NONCE_DUMP") lines) for post-recovery submitter continuity" \
+    || warn "no account-nonce state to preserve (empty) — continuing"
+
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer >/dev/null 2>&1
 pg "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO agglayer;" >/dev/null
 pass "Proxy DB DROPPED (from scratch) — corrupted faucet row gone"
@@ -443,6 +456,15 @@ set -e
 [[ "$RESTORE_RC" -eq 0 ]] || { tail -30 "$RESTORE_LOG" >&2; fail "restore-from-scratch one-shot exited $RESTORE_RC"; }
 grep -q 'RESTORE: complete' "$RESTORE_LOG" || fail "restore-from-scratch did not complete"
 pass "Store rebuilt from on-chain (faucet identity + metadata re-recovered)"
+
+# Restore the preserved account-nonce state into the freshly-migrated (empty) tables
+# BEFORE starting the live proxy, so external claim submitters resume at their real
+# nonce instead of wedging on a future-nonce against a reset-to-0 proxy (finding #65).
+if [[ -s "$NONCE_DUMP" ]]; then
+    docker exec -i "$PG_CONTAINER" psql -U agglayer -d agglayer_store < "$NONCE_DUMP" >/dev/null 2>&1 \
+        && pass "Account-nonce state restored — post-recovery deposit-claims will not wedge" \
+        || warn "account-nonce restore hit an error — continuing (verify Phase C liveness below)"
+fi
 
 MARK_B=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" start miden-agglayer >/dev/null 2>&1
