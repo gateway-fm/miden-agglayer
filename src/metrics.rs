@@ -187,9 +187,13 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "bridge_mint_target_mismatch_total",
-        "MINT note consumed by a faucet other than its NetworkAccountTarget \
-         attachment (Cantina #2). The claimant is about to receive the \
-         wrong wrapped asset. Page critical."
+        "Cantina #2 mint-target alert: either the \
+         consuming faucet differs from the MINT's NetworkAccountTarget \
+         (cross-faucet exploit — the claimant receives the wrong wrapped \
+         asset), or the intended faucet is not in aggkit's registry \
+         (cross-faucet exploit against an unregistered faucet, or operator \
+         misregistration). Only fires for MINTs attributable to OUR \
+         deployment; positively foreign notes are excluded. Page critical."
     );
     describe_counter!(
         "bridge_faucet_ownership_drift_total",
@@ -200,9 +204,27 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "bridge_forged_mint_total",
-        "MINT note observed on-chain that does not correspond to any \
-         aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge \
-         note authorship. Page critical, freeze claim processing."
+        "MINT note observed consumed that does NOT reconcile to an \
+         aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge note \
+         authorship. Label reason=no_claim: the \
+         serial matches no recorded claim's PROOF_DATA_KEY (fires after a \
+         short grace window that absorbs cross-tick note-import ordering). \
+         Label reason=identity_undetermined: a claim exists but its expected \
+         identity remains unavailable after the grace window. \
+         Label reason=detail_mismatch: the serial IS recorded \
+         but the observed MINT's identity (recipient / amount / asset) differs \
+         from the claim's derived expected MINT — a copied-serial forgery — fires \
+         immediately, no grace. Page critical, freeze claim processing."
+    );
+    describe_counter!(
+        "bridge_monitor_registry_unavailable_total",
+        "Sync ticks on which the faucet registry (list_faucets) could not be \
+         read by the consumed-note monitors. The provenance gates fail \
+         CLOSED for the tick: NOTHING is skipped as foreign (no alert can be \
+         suppressed by a store outage) and the registry-membership Cantina \
+         #2 signal pauses. A sustained rate means the store is unhealthy — \
+         investigate; monitors are running in degraded (noisier, never \
+         blinder) mode."
     );
     describe_counter!(
         "bridge_expected_mint_stale_total",

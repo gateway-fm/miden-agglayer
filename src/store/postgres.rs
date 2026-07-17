@@ -2848,6 +2848,70 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
+    async fn claim_mint_expected_record(
+        &self,
+        serial: &[u8; 32],
+        identity: &crate::store::ExpectedMint,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let minted_amount = identity.minted_amount.to_be_bytes();
+        let origin_network = i64::from(identity.origin_network);
+        client
+            .execute(
+                "INSERT INTO monitor_claim_mint_serials \
+                 (serial, minted_amount, destination_address, origin_network, origin_address) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (serial) DO NOTHING",
+                &[
+                    &serial.as_slice(),
+                    &minted_amount.as_slice(),
+                    &identity.destination_address.as_slice(),
+                    &origin_network,
+                    &identity.origin_address.as_slice(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn claim_mint_expected_get(
+        &self,
+        serial: &[u8; 32],
+    ) -> anyhow::Result<Option<crate::store::ExpectedMint>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT minted_amount, destination_address, origin_network, origin_address \
+                 FROM monitor_claim_mint_serials WHERE serial = $1 LIMIT 1",
+                &[&serial.as_slice()],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let minted_amount_bytes: Vec<u8> = row.get(0);
+        let minted_amount = <[u8; 8]>::try_from(minted_amount_bytes.as_slice())
+            .map(u64::from_be_bytes)
+            .map_err(|_| anyhow::anyhow!("monitor_claim_mint_serials.minted_amount not 8 bytes"))?;
+        let destination_address = <[u8; 20]>::try_from(row.get::<_, Vec<u8>>(1).as_slice())
+            .map_err(|_| {
+                anyhow::anyhow!("monitor_claim_mint_serials.destination_address not 20 bytes")
+            })?;
+        let origin_network = u32::try_from(row.get::<_, i64>(2)).map_err(|_| {
+            anyhow::anyhow!("monitor_claim_mint_serials.origin_network out of u32 range")
+        })?;
+        let origin_address =
+            <[u8; 20]>::try_from(row.get::<_, Vec<u8>>(3).as_slice()).map_err(|_| {
+                anyhow::anyhow!("monitor_claim_mint_serials.origin_address not 20 bytes")
+            })?;
+        Ok(Some(crate::store::ExpectedMint {
+            minted_amount,
+            destination_address,
+            origin_network,
+            origin_address,
+        }))
+    }
+
     async fn expected_mint_record(
         &self,
         global_index: &[u8; 32],

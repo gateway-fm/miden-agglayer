@@ -19,5 +19,6 @@ jobs:
       - run: make install-tools
       - run: make lint
       - run: make build
+      - run: cargo check --workspace --features postgres --profile=release
       - run: make test-unit
       - run: make test-scripts

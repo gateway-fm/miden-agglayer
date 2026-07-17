@@ -141,6 +141,14 @@ admission because their GER is not yet injected.
 `GlobalExitRootInvalid()` simulation response. A sustained rate points to
 aggoracle or GER-indexing lag, not writer saturation.
 
+## Bridge security monitors
+
+| Metric | What it means | Cantina ref |
+|---|---|---|
+| `bridge_mint_target_mismatch_total` | MINT note **in our deployment's flow** whose intended faucet is unregistered or differs from the faucet that consumed it. This covers both misregistration and the Cantina #2 cross-faucet exploit. Positively foreign deployments' MINTs are excluded. | #2 |
+| `bridge_forged_mint_total{reason}` | MINT note **in our deployment's flow** that does not reconcile to an aggkit-recorded claim. `reason=no_claim`: its serial matches no recorded claim's PROOF_DATA_KEY (after a short grace window). `reason=identity_undetermined`: a claim exists but its expected identity remains unavailable after the grace window. `reason=detail_mismatch`: its canonical recipient, amount, asset, callback flag, or routing attachment differs from the claim-derived expectation and fires immediately. Native claims create no authorization. | #4 |
+| `bridge_monitor_registry_unavailable_total` | The faucet registry was unreadable. Provenance fails closed: no note is classified foreign and no claim writes legitimacy without positive local evidence. | #2/#4 |
+
 ## Bridge integrity: page on increase
 
 These counters represent fail-close integrity detections, not routine traffic:
