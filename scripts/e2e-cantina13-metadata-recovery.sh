@@ -430,18 +430,15 @@ docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/de
 [[ -s "$BACKUP" ]] || fail "DB backup failed (empty dump) — refusing to drop without a backup"
 pass "DB backed up ($(wc -c < "$BACKUP") bytes → $BACKUP)"
 
-# Preserve the proxy's per-signer account-nonce state across the rebuild. DROP SCHEMA
-# wipes the `nonces` / `nonce_reservations` tables, but those hold LEGITIMATE EVM
-# account nonces for external claim submitters (aggkit claimsponsor / bridge-autoclaim).
-# They are proxy-internal (L2 claim txns are NOT on-chain, so `--restore` cannot rebuild
-# them) and are NOT corrupted. Without this, a submitter whose nonce advanced pre-drop
-# (e.g. the sponsor at nonce N) sends its next claim at nonce N to a reset proxy that now
-# expects 0 → future-nonce wedge → post-recovery deposit-claims stall forever (finding #65).
-NONCE_DUMP="/tmp/agglayer_nonces.cantina13.$$.sql"
-docker exec "$PG_CONTAINER" pg_dump -U agglayer -d agglayer_store --data-only \
-    -t public.nonces -t public.nonce_reservations > "$NONCE_DUMP" 2>/dev/null
-[[ -s "$NONCE_DUMP" ]] && pass "Preserved account-nonce state ($(wc -l < "$NONCE_DUMP") lines) for post-recovery submitter continuity" \
-    || warn "no account-nonce state to preserve (empty) — continuing"
+# finding #65 — we deliberately do NOT preserve the proxy's per-signer nonce tables.
+# The proxy IS the synthetic L2, so DROP SCHEMA legitimately resets its `nonces` /
+# `nonce_reservations` to 0 on the from-scratch rebuild — that is correct, not a bug to
+# paper over. The external claim submitter (zkevm-bridge-service claimsponsor) caches its
+# nonce in ITS OWN store (bridge_db `sync.monitored_txs`); a proxy-only recovery would
+# leave that cache at a stale nonce N against a reset-to-0 proxy → future-nonce wedge.
+# The REALISTIC operational recovery resyncs the bridge-service alongside the proxy (see
+# the resync block after the proxy comes back healthy below): both return to nonce 0 and
+# re-driven claims dedup by global_index (finding #55).
 
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer >/dev/null 2>&1
 pg "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO agglayer;" >/dev/null
@@ -457,20 +454,32 @@ set -e
 grep -q 'RESTORE: complete' "$RESTORE_LOG" || fail "restore-from-scratch did not complete"
 pass "Store rebuilt from on-chain (faucet identity + metadata re-recovered)"
 
-# Restore the preserved account-nonce state into the freshly-migrated (empty) tables
-# BEFORE starting the live proxy, so external claim submitters resume at their real
-# nonce instead of wedging on a future-nonce against a reset-to-0 proxy (finding #65).
-if [[ -s "$NONCE_DUMP" ]]; then
-    docker exec -i "$PG_CONTAINER" psql -U agglayer -d agglayer_store < "$NONCE_DUMP" >/dev/null 2>&1 \
-        && pass "Account-nonce state restored — post-recovery deposit-claims will not wedge" \
-        || warn "account-nonce restore hit an error — continuing (verify Phase C liveness below)"
-fi
-
 MARK_B=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" start miden-agglayer >/dev/null 2>&1
 wait_for "proxy healthy after rebuild" \
     "[[ \$(docker inspect -f '{{.State.Health.Status}}' $AGGLAYER_CONTAINER 2>/dev/null) == healthy ]]" \
     180 3
+
+# ── REALISTIC RECOVERY: resync the bridge-service (finding #65) ───────────────────────
+# The proxy's per-signer nonces reset to 0 on the from-scratch rebuild. The external
+# claim submitter (zkevm-bridge-service claimsponsor) persists its cached nonce in
+# bridge_db (`sync.monitored_txs`) and would otherwise keep submitting at its stale
+# nonce → future-nonce wedge against the reset-to-0 proxy. A realistic operational
+# recovery resyncs it alongside the proxy: drop its storage and restart so it
+# re-migrates, re-syncs deposits from the recovered proxy, and re-fetches
+# eth_getTransactionCount (=0). Re-driven claims are idempotent (landed claims dedup by
+# global_index — finding #55). The bridge-service auto-migrates its schema on startup.
+BRIDGE_PG_CONTAINER="${BRIDGE_PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-postgres-1}"
+"${E2E_COMPOSE[@]}" stop bridge-service bridge-autoclaim >/dev/null 2>&1
+docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
+    -c "DROP SCHEMA IF EXISTS sync CASCADE; DROP SCHEMA IF EXISTS mt CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO bridge_user;" >/dev/null 2>&1 \
+    && pass "bridge-service storage dropped — cached sponsor nonce invalidated (realistic resync)" \
+    || fail "finding #65: failed to drop bridge_db for bridge-service resync"
+"${E2E_COMPOSE[@]}" up -d --no-deps bridge-service bridge-autoclaim >/dev/null 2>&1
+wait_for "bridge-service resynced + reachable after recovery" \
+    "[[ \$(curl -s -m3 -o /dev/null -w '%{http_code}' $BRIDGE_SERVICE_URL/ 2>/dev/null) =~ ^(200|404)$ ]]" \
+    180 5
+pass "bridge-service resynced — re-migrated, re-fetches sponsor nonce 0 from the recovered proxy"
 
 # After the rebuild the leaf's REAL metadata recovers (correct origin from on-chain →
 # L1 name()/symbol()/decimals()) → the REAL BridgeEvent emits at its reserved index →
