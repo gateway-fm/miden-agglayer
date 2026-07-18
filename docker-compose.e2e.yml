@@ -290,6 +290,12 @@ services:
       - "--miden-node=http://miden-node:57291"
       - "--miden-store-dir=/var/lib/miden-agglayer-service"
       - "--l1-rpc-url=http://anvil:8545"
+      # finding #62 — per-origin-network RPC for Cantina #13 metadata recovery. An
+      # L2B-origin (origin_network=2) token's ABI-metadata preimage must be fetched from
+      # the L2B chain, not L1, or restore leaves its metadata Unrecoverable. Harmless on
+      # the base stack (anvil-l2b absent → the entry is never looked up; recovery connects
+      # lazily only when a network-2 faucet is actually rebuilt). Live on the l2l2 overlay.
+      - "--network-rpc-url=2=http://anvil-l2b:8545"
       - "--ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
       # Index L1 from genesis (block 1), not from L1 head. The kurtosis L1
       # snapshot already has the bridge deployed and its initial

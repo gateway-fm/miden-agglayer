@@ -266,7 +266,7 @@ pub async fn restore(
     accounts: &AccountsConfig,
     local_network_id: u32,
     block_state: &Arc<BlockState>,
-    l1_rpc_url: Option<String>,
+    network_rpcs: crate::metadata_recovery::NetworkRpcMap,
     node_url: &str,
     api_key: Option<&str>,
 ) -> anyhow::Result<RestoreResult> {
@@ -401,7 +401,7 @@ pub async fn restore(
     // aborts restore.
     tracing::info!("Phase 1.7: rebuilding faucet identities from bridge state (Cantina #6)...");
     let faucet_identities_rebuilt =
-        restore_faucet_identities(store, miden_client, accounts, l1_rpc_url.clone()).await?;
+        restore_faucet_identities(store, miden_client, accounts, &network_rpcs).await?;
     tracing::info!(
         "Phase 1.7 complete: {faucet_identities_rebuilt} faucet identity row(s) rebuilt"
     );
@@ -414,7 +414,7 @@ pub async fn restore(
         accounts.bridge.0,
         local_network_id,
         block_state,
-        l1_rpc_url.clone(),
+        &network_rpcs,
         bridge_replay,
     )
     .await?;
@@ -697,11 +697,13 @@ async fn restore_faucet_identities(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
-    l1_rpc_url: Option<String>,
+    network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
 ) -> anyhow::Result<usize> {
     let store_clone = store.clone();
     let bridge_id = accounts.bridge.0;
-    let l1_url = l1_rpc_url;
+    // Owned clone moved into the `with(...)` closure; per-faucet RPC selection is
+    // keyed on the faucet's origin_network (finding #62 multi-network recovery).
+    let network_rpcs = network_rpcs.clone();
 
     let count = Arc::new(std::sync::Mutex::new(0usize));
     let count_inner = count.clone();
@@ -754,7 +756,9 @@ async fn restore_faucet_identities(
                         &bridge_account,
                         faucet_id,
                         &conversion,
-                        l1_url.as_deref(),
+                        network_rpcs
+                            .get(&conversion.origin_network)
+                            .map(String::as_str),
                     )
                     .await
                     {
@@ -824,11 +828,14 @@ async fn restore_bridge_outs(
     bridge_id: AccountId,
     local_network_id: u32,
     block_state: &Arc<BlockState>,
-    l1_rpc_url: Option<String>,
+    network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
     bridge_replay: Vec<ReplayBridgeOut>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
+    // Owned clone moved into the `with(...)` closure; per-bridge-out RPC selection
+    // is keyed on the resolved faucet origin_network (finding #62).
+    let network_rpcs = network_rpcs.clone();
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
 
@@ -864,7 +871,7 @@ async fn restore_bridge_outs(
                         block_hash,
                         bridge_address,
                         Some(&mut *client),
-                        l1_rpc_url.as_deref(),
+                        &network_rpcs,
                     )
                     .await?;
                     if outcome == B2AggRestoreOutcome::Emitted {
@@ -918,7 +925,7 @@ pub(crate) async fn project_b2agg_note(
     block_hash: [u8; 32],
     bridge_address: &str,
     client: Option<&mut MidenClientLib>,
-    l1_rpc_url: Option<&str>,
+    network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
 ) -> anyhow::Result<B2AggRestoreOutcome> {
     let details = note.details();
     if !is_b2agg_note(details) {
@@ -1124,7 +1131,9 @@ pub(crate) async fn project_b2agg_note(
             faucet_id,
             bridge_account.as_ref(),
             faucet_account.as_ref(),
-            l1_rpc_url,
+            // Finding #62: dial the token's ACTUAL origin-network RPC (L1 for
+            // network 0, L2B for network 2, …) so the keccak gate validates.
+            network_rpcs.get(&origin.origin_network).map(String::as_str),
         )
         .await
     };
@@ -2667,7 +2676,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2706,7 +2715,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2751,7 +2760,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2789,7 +2798,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2830,7 +2839,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2889,7 +2898,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2941,7 +2950,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2987,7 +2996,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -3072,7 +3081,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();

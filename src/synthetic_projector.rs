@@ -202,12 +202,14 @@ pub struct SyntheticProjector {
     /// deployment, foreign claims share our ClaimNote script root and must
     /// not be projected (see `restore::classify_claim_note`).
     expected_claim_sender: AccountId,
-    /// L1 JSON-RPC endpoint for the Cantina #13 Layer-2 ERC-20 metadata
-    /// recovery path (mirrors `BridgeOutScanner::l1_rpc_url`). Threaded into
-    /// `project_b2agg_note` so legacy/DB-loss faucet rows with empty ERC-20
-    /// metadata recover + validate instead of being skipped. `None` disables
-    /// the L1 fallback (recovery then relies solely on the all-Miden candidate).
-    l1_rpc_url: Option<String>,
+    /// Per-origin-network JSON-RPC endpoints for the Cantina #13 Layer-2 ERC-20
+    /// metadata recovery path. Threaded into `project_b2agg_note`, which selects
+    /// the RPC for each bridge-out's `origin_network` (L1 for network 0, L2B for
+    /// network 2, …) so a legacy/DB-loss faucet row with empty ERC-20 metadata
+    /// recovers + validates against the token's ACTUAL origin chain instead of
+    /// being skipped (finding #62). An empty map relies solely on the all-Miden
+    /// candidate — the pre-#62 behavior when no L1 RPC was configured.
+    network_rpcs: crate::metadata_recovery::NetworkRpcMap,
     /// Last projected Miden block height — an in-memory cache of the persisted
     /// `Store::get_projector_cursor`. The projector is the single owner of this
     /// cursor (SINGLE-PROCESS ONLY) and persists every advance in `tick`.
@@ -278,7 +280,7 @@ impl SyntheticProjector {
         block_state: Arc<BlockState>,
         accounts: &AccountsConfig,
         local_network_id: u32,
-        l1_rpc_url: Option<String>,
+        network_rpcs: crate::metadata_recovery::NetworkRpcMap,
         node_url: String,
         node_api_key: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -329,7 +331,7 @@ impl SyntheticProjector {
             local_network_id,
             expected_ger_sender,
             expected_claim_sender: accounts.service.0,
-            l1_rpc_url,
+            network_rpcs,
             cursor: AtomicU64::new(start_cursor),
             node_rpc,
             reconcile_cursor: AtomicU64::new(start_reconcile),
@@ -1273,9 +1275,10 @@ impl SyntheticProjector {
                     block_hash,
                     bridge_address,
                     // Cantina #13 recovery context: the live client + the projector's
-                    // L1 RPC, so legacy/empty-metadata ERC-20 bridge-outs recover.
+                    // per-network RPC map, so legacy/empty-metadata ERC-20 bridge-outs
+                    // recover against their actual origin chain (finding #62).
                     client.as_deref_mut(),
-                    self.l1_rpc_url.as_deref(),
+                    &self.network_rpcs,
                 )
                 .await?
                     == B2AggRestoreOutcome::Emitted
@@ -2007,7 +2010,7 @@ mod tests {
             block_state.clone(),
             &test_accounts(),
             7,
-            None,
+            crate::metadata_recovery::NetworkRpcMap::new(),
             crate::miden_client::effective_node_url(None),
             None,
         )
