@@ -71,18 +71,15 @@ case "$test_filter" in
         echo ""
         "$SCRIPT_DIR/e2e-reconciler-private-note.sh"
         echo ""
-        # ABSOLUTELY LAST on purpose: its final phase leaves a self-targeted
-        # poison leaf in the LET (by design of the Cantina #13 circuit-break
-        # repro), which wedges any certificate settlement that would happen
-        # after it — so no settlement-dependent test may follow.
-        "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
-        echo ""
-        # L2<->L2 + native Miden-originated tiers — canonical part of the full suite on
-        # this branch. They need the docker-compose.l2l2.yml overlay (postgres-l2b /
+        # ── L2<->L2 + native Miden-originated tiers — run BEFORE cantina13 so the
+        # recovery below is exercised against real multi-network state (finding #62: an
+        # L2B-origin (net 2) token's metadata must restore via its OWN chain's RPC, not
+        # L1). They need the docker-compose.l2l2.yml overlay (postgres-l2b /
         # bridge-service-l2b), so GUARD on the overlay being up: on the base stack they're
         # skipped with a warning; on the l2l2 stack they run. `e2e-test.sh l2l2` runs the
         # L2<->L2 group (forward/clash/back); the native round-trips exercise a
-        # Miden-originated token to BOTH destinations (->L2B and ->L1).
+        # Miden-originated token to BOTH destinations (->L2B and ->L1). Running them before
+        # cantina13's poison leaf also lets their certificate settlement complete un-wedged.
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'postgres-l2b'; then
             echo "== L2<->L2 group (L2B overlay present) =="
             "$SCRIPT_DIR/e2e-test.sh" l2l2
@@ -94,6 +91,14 @@ case "$test_filter" in
         else
             echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
         fi
+        echo ""
+        # cantina13 recovery — runs AFTER the L2<->L2 + native tiers so its from-scratch
+        # DROP + --restore rebuilds the whole multi-network faucet set (L1 net0, L2B net2,
+        # native net1) from on-chain — the finding #62 proof inside the full suite. Its
+        # final phase leaves a self-targeted poison leaf in the LET (Cantina #13
+        # circuit-break repro) that wedges any certificate settlement after it, so only the
+        # L1->L2-only manual-user-claim may follow.
+        "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
         echo ""
         # VERY LAST in the suite — defense in depth: the manual-user-claim
         # script deliberately front-runs the sponsor's autoclaimer, which
