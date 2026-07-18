@@ -21,7 +21,7 @@
 //! [`FaucetEntry`]: crate::store::FaucetEntry
 //! [`AggLayerBridge::faucet_metadata_map_slot_name`]: miden_base_agglayer::AggLayerBridge
 
-use miden_base_agglayer::{AggLayerBridge, AggLayerFaucet, MetadataHash};
+use miden_base_agglayer::{AggLayerBridge, MetadataHash};
 use miden_protocol::account::{Account, AccountId, AccountStorage, StorageSlotContent};
 use miden_protocol::{Felt, Word};
 
@@ -350,15 +350,24 @@ pub fn find_registered_faucet_for_origin(
 
 /// Build the all-Miden recovery candidate from the faucet account.
 ///
-/// NOTE: the AggLayer faucet sets its token name == symbol and stores a
-/// *sanitised* symbol, so this candidate only validates for tokens whose origin
-/// `name == symbol` and whose symbol survived sanitisation unchanged. It is tried
-/// first because it needs no RPC; the keccak gate makes trying it safe.
+/// Accepts BOTH supported faucet kinds via [`crate::faucet_ops::classify_faucet_account`]:
+/// an AggLayer-owned wrapped faucet (foreign-origin tokens) AND a native operator
+/// `FungibleFaucet` (Miden-originated tokens). This matters for a NATIVE token whose
+/// `origin_network` is this Miden deployment: there is no external chain to query for its
+/// ERC-20 metadata, so the Miden faucet is the ONLY authoritative source — and its
+/// registered preimage is `abi.encode(name, symbol, decimals)` with `name == symbol` (the
+/// admin register-native path defaults `name` to `symbol`). Previously this tried only
+/// `AggLayerFaucet::try_faucet_from_account`, so an externally-deployed native operator
+/// faucet yielded NO candidate and its metadata was unrecoverable on restore — a poison
+/// leaf that halts the entire restore. Behavior for AggLayer faucets is unchanged (classify
+/// tries that type first). Both kinds expose the same `token_name()`/`symbol()`. The token
+/// name still must equal the symbol for the candidate to validate; the keccak gate makes
+/// trying it safe.
 fn miden_faucet_candidate(
     faucet_account: &Account,
     origin_decimals: u8,
 ) -> Option<MetadataCandidate> {
-    let faucet = AggLayerFaucet::try_faucet_from_account(faucet_account).ok()?;
+    let (_kind, faucet) = crate::faucet_ops::classify_faucet_account(faucet_account).ok()?;
     Some(MetadataCandidate {
         name: faucet.token_name().as_str().to_string(),
         symbol: faucet.symbol().to_string(),
