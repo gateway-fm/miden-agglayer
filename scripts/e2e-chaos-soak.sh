@@ -40,6 +40,13 @@ L2L2_FWD="${L2L2_FWD:-2}"
 L2L2_BACK="${L2L2_BACK:-2}"
 FRESH="${FRESH:-0}"
 TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"   # repo-local default; override with $TOOL_BIN
+# #41: fail FAST if the debug tool is missing — a late WARN used to let the whole
+# storm run and then skip the completeness verdict entirely.
+if [[ ! -x "$TOOL_BIN" ]]; then
+    echo "FATAL: $TOOL_BIN not found/executable — the completeness verdict cannot run." >&2
+    echo "       Build it first:  cargo build --bin bridge-out-tool   (then re-run, or pass TOOL_BIN=...)" >&2
+    exit 4
+fi
 
 CHAOS_LOG="${CHAOS_LOG:-/tmp/chaos-events.log}"
 GARBO_LOG="${GARBO_LOG:-/tmp/chaos-garbo.log}"
@@ -112,6 +119,7 @@ say "chaos stopped: $FAULTS_DONE faults injected (log: $CHAOS_LOG)"
 # shellcheck disable=SC1090
 [[ -f "$GARBO_SUMMARY" ]] && source "$GARBO_SUMMARY" || true
 say "garbo fired: private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0} gis='${GARBO_FOREIGN_GIS:-}'"
+say "garbo attempts vs fired: private=${GARBO_PRIVATE_ATTEMPTS:-?}/${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_ATTEMPTS:-?}/${GARBO_FOREIGN_FIRED:-0} (#41: injections retry until landed)"
 
 # ── 4. post-chaos heal ───────────────────────────────────────────────────────
 say "=== post-chaos settle (${POST_CHAOS_SETTLE}s heal window) ==="
@@ -134,6 +142,41 @@ else
     say "WARN: $TOOL_BIN not found — completeness cannot run"
 fi
 LOCKS=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -c "database is locked" || true)
+
+# ── 5a'. STORE CORROBORATION (#41) — the authoritative completeness verdict ──
+# The verifier's node-DB denominator legitimately over-counts: observed (non-
+# injected) GERs emit no UpdateHashChain, L2<->L2/reclaim claims aren't proxy-
+# sponsored, and on a RECOVERED stack the whole-history GER denominator is
+# permanently ahead of the by-design-reset log view. The proxy STORE reconciling
+# against its own authoritative sources is the real integrity signal:
+#   UHC logs == injected GERs, CLAIM logs >= landed, BRIDGE logs == emitted,
+#   and no unemitted / unbridgeable / alerted-mint rows (unclaimable is reported
+#   but non-fatal — a user-front-run leaves a benign row).
+say "=== (a') store corroboration (authoritative) ==="
+SC_UHC=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%';")
+SC_CLAIM=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%';")
+SC_BRIDGE=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%';")
+SC_INJ=$(pgq "SELECT COUNT(*) FROM ger_entries WHERE is_injected;")
+SC_LANDED=$(pgq "SELECT COUNT(*) FROM claim_watcher_processed;")
+SC_EMIT=$(pgq "SELECT COUNT(*) FROM bridge_out_processed WHERE emitted;")
+SC_UNEMIT=$(pgq "SELECT COUNT(*) FROM bridge_out_processed WHERE emitted = false;")
+SC_UNBRIDGE=$(pgq "SELECT COUNT(*) FROM unbridgeable_bridge_outs;")
+SC_UNCLAIM=$(pgq "SELECT COUNT(*) FROM unclaimable_claims;")
+SC_ALERTED=$(pgq "SELECT COUNT(*) FILTER (WHERE alerted) FROM monitor_expected_mints;")
+say "  store: UHC=${SC_UHC:-?}/inj=${SC_INJ:-?} CLAIM=${SC_CLAIM:-?}/landed=${SC_LANDED:-?} BRIDGE=${SC_BRIDGE:-?}/emit=${SC_EMIT:-?} unemit=${SC_UNEMIT:-?} unbridge=${SC_UNBRIDGE:-?} unclaim=${SC_UNCLAIM:-?}(non-fatal) alerted=${SC_ALERTED:-?}"
+STORE_DROP=""
+[[ "${SC_UNEMIT:-1}" != "0" ]]   && STORE_DROP="$STORE_DROP unemitted=${SC_UNEMIT:-?}"
+[[ "${SC_UNBRIDGE:-1}" != "0" ]] && STORE_DROP="$STORE_DROP unbridgeable=${SC_UNBRIDGE:-?}"
+[[ "${SC_ALERTED:-1}" != "0" ]]  && STORE_DROP="$STORE_DROP alerted-mint=${SC_ALERTED:-?}"
+[[ -n "${SC_UHC:-}" && -n "${SC_INJ:-}" && "${SC_UHC}" -lt "${SC_INJ}" ]] 2>/dev/null && STORE_DROP="$STORE_DROP UHC<inj(${SC_UHC}<${SC_INJ})"
+[[ -n "${SC_CLAIM:-}" && -n "${SC_LANDED:-}" && "${SC_CLAIM}" -lt "${SC_LANDED}" ]] 2>/dev/null && STORE_DROP="$STORE_DROP CLAIM<landed(${SC_CLAIM}<${SC_LANDED})"
+[[ -n "${SC_BRIDGE:-}" && -n "${SC_EMIT:-}" && "${SC_BRIDGE}" -lt "${SC_EMIT}" ]] 2>/dev/null && STORE_DROP="$STORE_DROP BRIDGE<emit(${SC_BRIDGE}<${SC_EMIT})"
+if [[ -z "$STORE_DROP" ]]; then
+    STORE_OK=1; say "  store corroboration: CLEAN"
+    [[ "$VC_RC" != "0" ]] && say "  (verifier mismatch with a CLEAN store = denominator artifact, not a drop)"
+else
+    STORE_OK=0; say "  store corroboration: DROP —$STORE_DROP"
+fi
 
 # ── 5b. GARBO containment (the second verdict) ───────────────────────────────
 say "=== (b) garbo containment ==="
@@ -169,7 +212,12 @@ say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=
 # ONLY if its driver ABORTED (a fail() — e.g. a wedge or a harness bug). A
 # crashed driver means the full mixed load never ran, so it must NOT green even
 # if the (reduced) traffic verifies — else a dead driver false-passes.
-LEGIT_OK=0; [[ "$VC_RC" == "0" && "${LOCKS:-1}" == "0" && "$LT_RC" == "0" ]] && LEGIT_OK=1
+# #41: completeness = verifier PASS *or* store-corroboration CLEAN (the verifier
+# denominator over-counts by design in several benign cases); a store DROP always
+# fails regardless of the verifier.
+LEGIT_OK=0
+if [[ ( "$VC_RC" == "0" || "${STORE_OK:-0}" == "1" ) && "${LOCKS:-1}" == "0" && "$LT_RC" == "0" ]]; then LEGIT_OK=1; fi
+[[ "${STORE_OK:-0}" == "0" ]] && LEGIT_OK=0
 # (c) chaos ACTUALLY happened — a soak that injected no infra faults or fired no garbo
 # class would otherwise false-pass on an empty run. Require >=1 injected fault AND each
 # enabled garbo class fired (private always; foreign only when GARBO_FOREIGN=1).
@@ -177,7 +225,7 @@ CHAOS_OK=1
 [[ "${FAULTS_DONE:-0}" -ge 1 ]]              || CHAOS_OK=0
 [[ "${GARBO_PRIVATE_FIRED:-0}" -ge 1 ]]      || CHAOS_OK=0
 [[ "${GARBO_FOREIGN:-1}" != "1" || "${GARBO_FOREIGN_FIRED:-0}" -ge 1 ]] || CHAOS_OK=0
-say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC locks=$LOCKS loadtest_rc=$LT_RC)"
+say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC store=$([[ ${STORE_OK:-0} == 1 ]] && echo CLEAN || echo DROP) locks=$LOCKS loadtest_rc=$LT_RC)"
 say "    (b) GARBO containment:  $([[ $GARBO_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK)"
 say "    (c) CHAOS actually fired: $([[ $CHAOS_OK == 1 ]] && echo PASS || echo FAIL)  (faults=${FAULTS_DONE:-0} private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
 if [[ "$LEGIT_OK" == "1" && "$GARBO_OK" == "1" && "$CHAOS_OK" == "1" ]]; then

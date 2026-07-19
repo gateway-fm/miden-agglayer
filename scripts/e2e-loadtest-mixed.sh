@@ -65,6 +65,71 @@ for c in cast forge psql curl python3 docker; do command -v "$c" >/dev/null || f
 MIX_LOG="${MIX_LOG:-/tmp/mixed-l2l2.log}"; : > "$MIX_LOG"
 mix() { echo -e "${CYAN:-}[$(date +%H:%M:%S)] MIX:${NC:-} $*" | tee -a "$MIX_LOG"; }
 
+# ── #41: settle-aware nudge (chaos-tolerant) ─────────────────────────────────
+# nudge_until's hard NUDGE_TRIES cap false-fails whole phases under chaos: the
+# claim is often ACCEPTED on Miden (its ClaimEvent lands) while the cross-chain
+# settlement merely needs a few more cert cycles than the cap allows.
+# nudge_until_settled keeps the exact nudge cadence (nudge_cert + 75s poll per
+# round) and the tight NUDGE_TRIES fast path, but past the cap it extends up to
+# a DEADLINE (L2L2_SETTLE_TIMEOUT, default 900s) — and only while there is
+# OBSERVABLE PROGRESS (agglayer cert height advancing in aggkit logs, or new
+# ClaimEvents landing in synthetic_logs). Healthy stacks still resolve in the
+# first rounds, so the non-chaos suite is not slowed. The failure message
+# distinguishes "accepted but not settled" from "never accepted".
+L2L2_SETTLE_TIMEOUT="${L2L2_SETTLE_TIMEOUT:-900}"
+_settle_cert_height() {
+    ( set +o pipefail; docker logs --tail 400 "${COMPOSE_PROJECT_NAME}-aggkit-1" 2>&1 \
+        | grep -aoE 'Height: [0-9]+' | tail -1 | awk '{print $2}' ) 2>/dev/null
+}
+_settle_claim_count() {
+    pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%';" 2>/dev/null
+}
+nudge_until_settled() {
+    local desc="$1"; shift
+    local base_tries="${NUDGE_TRIES:-6}" t=0 waited start now elapsed
+    local h_prev c_prev c_init h_now c_now stall=0
+    start=$(date +%s)
+    h_prev=$(_settle_cert_height); h_prev="${h_prev:-0}"
+    c_init=$(_settle_claim_count); c_init="${c_init:-0}"; c_prev="$c_init"
+    while :; do
+        t=$((t + 1))
+        nudge_cert
+        waited=0
+        while [[ $waited -lt 75 ]]; do
+            if ( set +o pipefail; "$@" ) 2>/dev/null; then
+                log "  nudge round $t unblocked: $desc"; return 0
+            fi
+            sleep 5; waited=$((waited + 5)); echo -n "."
+        done
+        echo ""
+        now=$(date +%s); elapsed=$((now - start))
+        if [[ $t -lt $base_tries ]]; then
+            warn "nudge round $t/$base_tries did not unblock: $desc — re-nudging"
+            continue
+        fi
+        [[ $elapsed -ge $L2L2_SETTLE_TIMEOUT ]] && break
+        h_now=$(_settle_cert_height); h_now="${h_now:-0}"
+        c_now=$(_settle_claim_count); c_now="${c_now:-0}"
+        if [[ "$h_now" -gt "$h_prev" || "$c_now" -gt "$c_prev" ]] 2>/dev/null; then
+            stall=0
+            warn "nudge round $t: not settled but PROGRESS observed (cert height ${h_prev}→${h_now}, claims ${c_prev}→${c_now}) — extending (${elapsed}s/${L2L2_SETTLE_TIMEOUT}s): $desc"
+        else
+            stall=$((stall + 1))
+            warn "nudge round $t: no observable progress (cert height ${h_now}, claims ${c_now}; stall ${stall}/2) — $desc"
+            [[ $stall -ge 2 ]] && break
+        fi
+        h_prev="$h_now"; c_prev="$c_now"
+    done
+    now=$(date +%s); elapsed=$((now - start))
+    c_now=$(_settle_claim_count); c_now="${c_now:-0}"
+    if [[ "$c_now" -gt "$c_init" ]] 2>/dev/null; then
+        warn "SETTLE-TIMEOUT: accepted on Miden (ClaimEvents ${c_init}→${c_now}) but NOT settled within ${elapsed}s (L2L2_SETTLE_TIMEOUT=${L2L2_SETTLE_TIMEOUT}, rounds=$t): $desc"
+    else
+        warn "SETTLE-TIMEOUT: never accepted (no ClaimEvent landed in ${elapsed}s, rounds=$t): $desc"
+    fi
+    return 1
+}
+
 # ── mixed-specific predicate helpers (named callbacks for wait_for/nudge_until) ─
 _mixed_wallet_ge() { [[ "$(iso_wallet_balance "$1" "$2")" -ge "$3" ]]; }                 # <bridge_id> <faucet_id> <min_units>
 _mixed_l2b_balance_eq() {                                                                # <token> <holder> <want_wei>
@@ -163,7 +228,7 @@ SEED_DEP=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$MOP_LOWER" "$L2B_BRIDGE
 [[ -n "$SEED_DEP" ]] || fail "seed deposit not indexed on the L2B service"
 SEED_CNT=$(dep_field "$SEED_DEP" deposit_cnt); SEED_GI=$(dep_field "$SEED_DEP" global_index)
 SEED_META=$(echo "$SEED_DEP" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m != '0x' else '0x')")
-nudge_until "seed (MOP,net2) claim accepted on Miden (ClaimEvent gi $SEED_GI)" \
+nudge_until_settled "seed (MOP,net2) claim accepted on Miden (ClaimEvent gi $SEED_GI)" \
     _pred_submit_forward_claim "$SEED_CNT" "$SEED_GI" 2 "$MOP" "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$FWD_SEED_WEI" "$SEED_META" \
     || fail "seed (MOP,net2) claim never landed on Miden"
 
@@ -281,7 +346,7 @@ for dep in sorted(d.get('deposits',[]), key=lambda x:x.get('deposit_cnt',0)):
         print('%s|%s|%s' % (dep['deposit_cnt'], dep['global_index'], dep.get('metadata','0x') or '0x'))" 2>/dev/null)
     for entry in ${FWD_ROWS[@]+"${FWD_ROWS[@]}"}; do
         IFS='|' read -r cnt gi meta <<<"$entry"
-        if nudge_until "fwd ClaimEvent (gi $gi)" \
+        if nudge_until_settled "fwd ClaimEvent (gi $gi)" \
             _pred_submit_forward_claim "$cnt" "$gi" 2 "$MOP" "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$FWD_OP_WEI" "$meta"; then
             bump fwd_ok; mix "fwd CLAIMED (gi $gi)"
         else mix "fwd claim did NOT land (gi $gi)"; fi
@@ -295,11 +360,11 @@ if [[ "$(cat "$CNT_DIR/clash")" == "submitted" ]]; then
     if [[ -n "$cdep" ]]; then
         ccnt=$(dep_field "$cdep" deposit_cnt); cgi=$(dep_field "$cdep" global_index)
         cmeta=$(echo "$cdep" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m != '0x' else '0x')")
-        nudge_until "clash net-2 (COL) claim accepted on Miden (gi $cgi)" \
+        nudge_until_settled "clash net-2 (COL) claim accepted on Miden (gi $cgi)" \
             _pred_submit_forward_claim "$ccnt" "$cgi" 2 "$COL" "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$COL_L2B_WEI" "$cmeta" \
             || mix "clash net-2 claim did NOT land (gi $cgi)"
     else mix "clash net-2 COL deposit not indexed on the L2B service"; fi
-    if nudge_until "clash: TWO COL faucet rows" \
+    if nudge_until_settled "clash: TWO COL faucet rows" \
         _pred_pg_eq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}';" "2"; then
         f0=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}' AND origin_network=0;")
         f2=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}' AND origin_network=${L2B_NETWORK_ID};")
