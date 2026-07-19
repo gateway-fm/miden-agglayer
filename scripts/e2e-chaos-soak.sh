@@ -275,7 +275,11 @@ say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAI
 say "    (b) GARBO containment:  $([[ $GARBO_VERDICT_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK private_leak=$PRIVATE_LEAK)"
 say "    (c) CHAOS actually fired: $([[ $CHAOS_OK == 1 ]] && echo PASS || echo FAIL)  (faults=${FAULTS_DONE:-0} private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
 if [[ "$LEGIT_OK" == "1" && "$GARBO_VERDICT_OK" == "1" && "$CHAOS_OK" == "1" ]]; then
-    say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"
+    if [[ "$ALLOW_LATE" == "0" ]]; then
+        say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"
+    else
+        say "  >>> CHAOS SOAK PASS — every legit event survived (ALLOW_LATE=1: late events permitted, NOT exact-block certified); every garbo input contained <<<"
+    fi
     say "======================================================================"
     exit 0
 else

@@ -57,6 +57,17 @@ nok "verifier fail (MIX_VERIFY=1) fails"            mixed_ops_ok  2  2  2  2  di
 ok  "all ops complete + vc=skip passes"             mixed_ops_ok  2  2  2  2  distinct 0  0  skip 0
 ok  "all ops complete + vc=0 passes"                mixed_ops_ok  2  2  2  2  distinct 0  0  0    0
 
+
+# ── l1_ops_ok (PR#145 follow-up: the nested L1<->Miden child's STRICT_OPS
+#    verdict — the real operational failure the parent consumes as LT_RC) ─────
+#                                                            SUB1 PLN1 SUB2 PLN2 F1 F2 CLM SUB
+ok  "l1: all planned submitted, none failed, all claimed"  l1_ops_ok 15 15 15 15 0 0 30 30
+nok "l1: target shortfall L1->L2 (sub < plan) fails"       l1_ops_ok 14 15 15 15 0 0 29 29
+nok "l1: target shortfall L2->L1 (sub < plan) fails"       l1_ops_ok 15 15 12 15 0 0 27 27
+nok "l1: explicit submission failure fails"                l1_ops_ok 15 15 15 15 1 0 30 30
+nok "l1: submitted-but-unclaimed work fails"               l1_ops_ok 15 15 15 15 0 0 28 30
+nok "l1: empty/unset counters fail closed"                 l1_ops_ok "" "" "" "" "" "" "" ""
+
 echo "──────────────────────────────────────────────"
 if [[ "$FAILS" == "0" ]]; then
     echo "CHAOS-VERDICT TESTS: ALL PASS"

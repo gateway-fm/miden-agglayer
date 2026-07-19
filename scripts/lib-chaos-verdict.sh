@@ -55,6 +55,24 @@ chaos_verdict() {
     return 0
 }
 
+# l1_ops_ok SUB_L1 PLAN_L1 SUB_L2 PLAN_L2 FAIL_L1 FAIL_L2 G_CLM G_SUB
+#   The nested L1<->Miden bulk load's operational verdict (PR#145 follow-up:
+#   with VERIFY=0 the child's exit was `LOCK_COUNT>0 ? 1 : 0`, so failed or
+#   never-claimed L1 work exited 0 and the four-direction soak could PASS with
+#   missing L1 workload). 0 = OK iff every planned op was submitted
+#   (SUB==PLAN, both directions), zero submission failures, and every
+#   submitted op was claimed (G_CLM==G_SUB). Lives in the CHILD (STRICT_OPS=1)
+#   so the parent consumes a real exit code instead of parsing human logs.
+l1_ops_ok() {
+    local sub_l1="$1" plan_l1="$2" sub_l2="$3" plan_l2="$4" \
+          fail_l1="$5" fail_l2="$6" g_clm="$7" g_sub="$8"
+    [[ "${sub_l1:-0}" == "${plan_l1:--1}" ]] || return 1
+    [[ "${sub_l2:-0}" == "${plan_l2:--1}" ]] || return 1
+    [[ "${fail_l1:-1}" == "0" && "${fail_l2:-1}" == "0" ]] || return 1
+    [[ "${g_clm:-0}" == "${g_sub:--1}" ]] || return 1
+    return 0
+}
+
 # mixed_ops_ok FWD_OK FWD_SUB BACK_OK BACK_SUB CLASH LT_RC SKIP_L1 VC_RC LOCKS
 #   The mixed loadtest's operational verdict. VC_RC may be the literal string
 #   "skip" (MIX_VERIFY=0: the caller runs the ONE authoritative verifier

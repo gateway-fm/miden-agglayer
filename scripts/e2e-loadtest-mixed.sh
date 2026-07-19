@@ -256,8 +256,11 @@ COL_HEX=""; COL=""; BACK_DEST=""
 LT_OUT=/tmp/mixed-l1-loadtest.out; LT_PID=""
 if [[ "$SKIP_L1_LOAD" != "1" ]]; then
     step "Launching L1<->Miden bulk load ($N_L1_FWD L1->Miden + $N_L1_BACK Miden->L1) in background"
+    # PR#145: STRICT_OPS=1 — with VERIFY=0 the child's exit must still reflect
+    # its OPERATIONAL result (all planned ops submitted, zero failures, all
+    # submitted ops claimed), or LT_RC=0 is a false green with missing L1 work.
     COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" AGGLAYER_CONTAINER="$AGGLAYER_CONTAINER" \
-        PLAN_L1_TARGET="$N_L1_FWD" PLAN_L2_TARGET="$N_L1_BACK" VERIFY=0 ALLOW_LATE=1 \
+        PLAN_L1_TARGET="$N_L1_FWD" PLAN_L2_TARGET="$N_L1_BACK" VERIFY=0 STRICT_OPS=1 ALLOW_LATE=1 \
         "$SCRIPT_DIR/e2e-bridge-loadtest-isolated.sh" > "$LT_OUT" 2>&1 &
     LT_PID=$!
     log "  L1<->Miden loadtest PID $LT_PID (log: $LT_OUT)"
