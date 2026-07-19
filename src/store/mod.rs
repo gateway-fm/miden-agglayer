@@ -658,10 +658,17 @@ pub trait Store: Send + Sync + 'static {
     ///     [`NonceReservation::OwnedBySame`] (dedup, do NOT execute);
     ///   * the SAME tx after lease expiry, `released_failure`, or
     ///     `released_success` → takeover:
-    ///     [`NonceReservation::Won`] with a bumped fence (retry admission).
+    ///     [`NonceReservation::Won`] with a bumped fence (retry admission);
+    ///   * a DIFFERENT tx on an ABANDONED slot — `executing`, lease EXPIRED,
+    ///     and the bound hash never durably admitted (no `transactions` row ⇒
+    ///     the admission crashed before any external side effect) → takeover:
+    ///     [`NonceReservation::Won`] with a bumped fence (wedge #5: external
+    ///     submitters sign a fresh tx per retry, so a crashed slot must not
+    ///     poison its nonce forever).
     /// `lease` is how long the winner owns admission before another replica
-    /// presenting the SAME hash may take over on expiry (crash recovery). The
-    /// slot remains permanently bound to its first hash.
+    /// presenting the SAME hash may take over on expiry (crash recovery). A
+    /// released or durably-admitted slot remains permanently bound to its
+    /// first hash.
     async fn reserve_nonce(
         &self,
         addr: &str,

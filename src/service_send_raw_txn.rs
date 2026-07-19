@@ -4286,6 +4286,108 @@ mod tests {
         );
     }
 
+    /// Wedge #5 — ABANDONED-slot reclamation. An admission that crashes AFTER
+    /// `reserve_nonce` but BEFORE durable admission leaves the slot `executing`
+    /// with an expiring lease and NO `transactions` row. External submitters
+    /// (the zkevm-bridge-service claimtxman) sign a FRESH tx per retry — never
+    /// the bound hash — so without reclamation that nonce rejects every retry
+    /// forever (observed live: the sponsor wedged at nonce 78 until operator
+    /// surgery). Once the lease expires and the bound hash was never durably
+    /// admitted, a DIFFERENT tx must take the slot over with a bumped fence,
+    /// and the zombie owner must be fenced out.
+    #[tokio::test]
+    async fn wedge5_abandoned_expired_slot_reclaimable_by_different_tx() {
+        use crate::store::NonceReservation;
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let addr = "0x00000000000000000000000000000000000000a5";
+        let h1 = TxHash::from([0x51u8; 32]);
+        let h2 = TxHash::from([0x52u8; 32]);
+        let lease = std::time::Duration::from_secs(90);
+
+        // h1 wins the slot, then the admission "crashes" pre-durable-admission.
+        let NonceReservation::Won { fence } =
+            store.reserve_nonce(addr, 7, h1, lease).await.unwrap()
+        else {
+            panic!("fresh slot must be Won");
+        };
+        // While the lease is VALID, a different tx is still hard-rejected.
+        assert_eq!(
+            store.reserve_nonce(addr, 7, h2, lease).await.unwrap(),
+            NonceReservation::HeldByOther(h1),
+            "a valid executing lease must keep rejecting a different tx"
+        );
+        concrete.test_expire_reservation_lease(addr, 7);
+        // Expired + never durably admitted → the DIFFERENT tx reclaims the slot.
+        let NonceReservation::Won { fence: fence2 } =
+            store.reserve_nonce(addr, 7, h2, lease).await.unwrap()
+        else {
+            panic!("an abandoned (expired, unadmitted) slot must be reclaimable by a different tx");
+        };
+        assert!(fence2 > fence, "reclamation must bump the fence");
+        // The zombie owner is FENCED OUT: its stale release is ignored and the
+        // new owner still holds the slot.
+        store
+            .release_reservation(addr, 7, h1, fence, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.reserve_nonce(addr, 7, h2, lease).await.unwrap(),
+            NonceReservation::OwnedBySame,
+            "the zombie's fenced-out release must not evict the reclaiming owner"
+        );
+    }
+
+    /// Wedge #5 guard — an expired `executing` slot whose tx WAS durably
+    /// admitted (a `transactions` row exists) stays hash-bound: its external
+    /// outcome is tracked by the pending-tx machinery (crash-gap repair /
+    /// projector attribution), so a different tx must NOT take it over.
+    #[tokio::test]
+    async fn wedge5_expired_but_admitted_slot_stays_held() {
+        use crate::store::NonceReservation;
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let addr = "0x00000000000000000000000000000000000000a6";
+        let h1 = TxHash::from([0x61u8; 32]);
+        let h2 = TxHash::from([0x62u8; 32]);
+        let lease = std::time::Duration::from_secs(90);
+
+        assert!(matches!(
+            store.reserve_nonce(addr, 3, h1, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
+        // h1 IS durably admitted before the crash window closes.
+        let txn = TxLegacy {
+            input: vec![].into(),
+            chain_id: Some(1),
+            nonce: 3,
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(txn, Signature::test_signature(), TxHash::default());
+        let envelope = TxEnvelope::Legacy(signed);
+        let signer = envelope.recover_signer().expect("recover signer");
+        store
+            .txn_begin(
+                h1,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        concrete.test_expire_reservation_lease(addr, 3);
+        // Expired but ADMITTED → still held; a replacement would be ambiguous.
+        assert_eq!(
+            store.reserve_nonce(addr, 3, h2, lease).await.unwrap(),
+            NonceReservation::HeldByOther(h1),
+            "an expired slot with a durable transactions row must stay hash-bound"
+        );
+    }
+
     /// BLOCKER 1 — end-to-end: a submission whose (signer, nonce) slot was already
     /// reserved by a DIFFERENT tx (another replica won) is REJECTED and does NOT
     /// execute — no nonce advance, no receipt.
@@ -4320,9 +4422,14 @@ mod tests {
         assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
     }
 
-    /// Crash outcomes are ambiguous: a nonce slot is permanently bound to the
-    /// first signed transaction, even after failure or lease expiry. Only that
-    /// exact hash may recover the durable intent.
+    /// Crash outcomes on an AMBIGUOUS slot: once an attempt released (it may
+    /// have crossed an external side-effect boundary) or was durably admitted
+    /// (a `transactions` row exists), the slot stays bound to the first signed
+    /// transaction — even after lease expiry. Only that exact hash may recover
+    /// the durable intent. (The one exception — an expired `executing` slot
+    /// that was NEVER durably admitted, i.e. provably nothing external
+    /// happened — is the wedge-#5 reclamation, covered by
+    /// `wedge5_abandoned_expired_slot_reclaimable_by_different_tx`.)
     #[tokio::test]
     async fn blocker_a_different_tx_never_takes_over_ambiguous_slot() {
         use crate::store::NonceReservation;
@@ -4356,11 +4463,37 @@ mod tests {
             store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),
             NonceReservation::Won { .. }
         ));
+        // Durably admit `ha` — the slot's outcome is now genuinely ambiguous
+        // after a crash (the pending-tx machinery tracks it), so expiry must
+        // NOT grant a different tx the slot.
+        let txn = TxLegacy {
+            input: vec![].into(),
+            chain_id: Some(1),
+            nonce: 2,
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(txn, Signature::test_signature(), TxHash::default());
+        let envelope = TxEnvelope::Legacy(signed);
+        let signer = envelope.recover_signer().expect("recover signer");
+        store
+            .txn_begin(
+                ha,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
         concrete.test_expire_reservation_lease(addr, 2);
         assert_eq!(
             store.reserve_nonce(addr, 2, hb, lease).await.unwrap(),
             NonceReservation::HeldByOther(ha),
-            "expiry is crash recovery for the same hash, never replacement permission"
+            "expiry is crash recovery for the same hash, never replacement permission \
+             once the tx was durably admitted"
         );
         assert!(matches!(
             store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),

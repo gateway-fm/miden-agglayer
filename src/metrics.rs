@@ -96,6 +96,14 @@ pub fn init_metrics() {
          slot (across replicas or a stale replacement) and the reservation kept exactly one; the \
          winner advances the nonce and the loser is dropped, mirroring geth."
     );
+    describe_counter!(
+        "nonce_reservation_expired_reclaimed_total",
+        "Wedge #5 abandoned-slot reclamation: a (signer, nonce) reservation left 'executing' \
+         with an EXPIRED lease by an admission that crashed before durable admission (no \
+         transactions row = provably no external submit) was taken over by a DIFFERENT tx. \
+         Without this, an external submitter that signs a fresh tx per retry (the \
+         zkevm-bridge-service claimtxman) is rejected at that nonce forever."
+    );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
         "projector_visibility_barrier_held_blocks",
