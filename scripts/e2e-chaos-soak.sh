@@ -178,6 +178,18 @@ else
     STORE_OK=0; say "  store corroboration: DROP —$STORE_DROP"
 fi
 
+# ntx-builder liveness (task #68: it dies SILENTLY after idle-timeout actor
+# deactivation while the chain keeps moving — bridge note consumption halts with
+# it). WARN, not fail: an ops watchdog (docker restart) heals it, but a chaos run
+# where it died explains any missing CLAIM/GER growth.
+NTX_LAST=$(docker logs --timestamps --tail 1 "${PROJECT}-ntx-builder-1" 2>/dev/null | cut -c1-19)
+NTX_AGE=$(( $(date -u +%s) - $(date -u -d "${NTX_LAST:-1970-01-01T00:00:00}" +%s 2>/dev/null || echo 0) ))
+if [[ "${NTX_AGE:-0}" -gt 300 ]]; then
+    say "  ⚠ ntx-builder silent for ${NTX_AGE}s (task #68 silent-death) — restart it: docker restart ${PROJECT}-ntx-builder-1"
+else
+    say "  ntx-builder alive (last log ${NTX_AGE}s ago)"
+fi
+
 # ── 5b. GARBO containment (the second verdict) ───────────────────────────────
 say "=== (b) garbo containment ==="
 GARBO_OK=1
