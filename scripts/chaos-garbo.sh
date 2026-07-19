@@ -67,6 +67,7 @@ FOREIGN_FIRED=0
 FOREIGN_GIS=""
 PRIVATE_ATTEMPTS=0
 FOREIGN_ATTEMPTS=0
+PRIVATE_NOTE_IDS=""   # PR#145: exported so the soak can assert direct ID absence
 START=0   # set before the fire window opens; used by the retry helpers
 
 # ── #41: the injectors must actually FIRE under faults ───────────────────────
@@ -148,6 +149,9 @@ garbo_private_note() {
         glog "GARBO private-note: send FAILED (transient?) — $(echo "$out" | tail -1)"; return 1; }
     note_id=$(echo "$out" | grep '\[private-note\] note-id:' | awk '{print $NF}')
     PRIVATE_FIRED=$((PRIVATE_FIRED + 1))
+    # PR#145: record the id so the soak can assert its ABSENCE from the proxy
+    # store directly (a leak persists rows before it is ever served).
+    [[ -n "$note_id" ]] && PRIVATE_NOTE_IDS="$PRIVATE_NOTE_IDS ${note_id#0x}"
     glog "GARBO private-note #$PRIVATE_FIRED id=${note_id:-?} — EXPECT: reconciler skips (synthetic_reconciler_private_skipped_total++), NEVER projected as a BridgeEvent/ClaimEvent"
 }
 
@@ -208,6 +212,7 @@ write_summary() {
         echo "GARBO_FOREIGN_GIS=\"$(echo $FOREIGN_GIS | xargs)\""
         echo "GARBO_PRIVATE_ATTEMPTS=$PRIVATE_ATTEMPTS"
         echo "GARBO_FOREIGN_ATTEMPTS=$FOREIGN_ATTEMPTS"
+        echo "GARBO_PRIVATE_NOTE_IDS=\"$(echo $PRIVATE_NOTE_IDS | xargs)\""
     } > "$GARBO_SUMMARY"
     glog "summary -> $GARBO_SUMMARY (private=$PRIVATE_FIRED foreign=$FOREIGN_FIRED)"
 }

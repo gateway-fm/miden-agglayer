@@ -412,13 +412,18 @@ CLASH=$(cat "$CNT_DIR/clash")
 
 step "Verdict: settle margin, then event-completeness across net-0/1/2"
 sleep "${MIX_SETTLE:-60}"
+# PR#145: MIX_VERIFY=0 skips ONLY the duplicate completeness-verifier invocation
+# (the caller runs the ONE authoritative verify post-heal). It must NOT skip the
+# operational verdict below — previously an early `exit 0` here meant LT_RC=0
+# certified only that the driver reached this line, and an operation that was
+# never submitted/consumed is also absent from the caller's later node
+# denominator, so the miss could never be reconstructed.
 VC_RC=2
 if [[ "${MIX_VERIFY:-1}" != "1" ]]; then
     log "MIX_VERIFY=0 — skipping internal completeness (caller verifies post-heal)"
     log "  L1<->Miden rc=$LT_RC  fwd=$FWD_OK/$FWD_SUB  back=$BACK_OK/$BACK_SUB  clash=$CLASH"
-    exit 0
-fi
-if [[ -x "$TOOL_BIN" ]]; then
+    VC_RC="skip"
+elif [[ -x "$TOOL_BIN" ]]; then
     ALLOW_LATE="${ALLOW_LATE:-1}" TOOL_BIN="$TOOL_BIN" \
         NODE_CONTAINER="$NODE_CONTAINER" AGGLAYER_CONTAINER="$AGGLAYER_CONTAINER" \
         "$SCRIPT_DIR/verify-event-completeness.sh" > /tmp/mixed-verify.out 2>&1
@@ -431,22 +436,18 @@ fi
 # emitting a second "0" (an `|| echo 0` here would make LOCKS="0\n0" and fail the check).
 LOCKS=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -c "database is locked" || true)
 
+# shellcheck source=lib-chaos-verdict.sh
+source "$SCRIPT_DIR/lib-chaos-verdict.sh"
 log "======================================================================"
 log "  MIXED LOADTEST RESULT"
 log "    L1<->Miden loadtest rc      = $LT_RC ($N_L1_FWD L1->Miden + $N_L1_BACK Miden->L1)"
 log "    L2B->Miden forward ops      = $FWD_OK/$FWD_SUB claimed"
 log "    Miden->L2B back ops         = $BACK_OK/$BACK_SUB released"
 log "    address clash               = $CLASH (want: distinct)"
-log "    event-completeness rc       = $VC_RC (0 = PASS)"
+log "    event-completeness rc       = $VC_RC (0 = PASS; 'skip' = caller verifies)"
 log "    proxy store-locks           = $LOCKS"
-OK=1
-[[ "$FWD_OK" == "$FWD_SUB" && "$FWD_SUB" -gt 0 ]] || OK=0
-[[ "$BACK_OK" == "$BACK_SUB" && "$BACK_SUB" -gt 0 ]] || OK=0
-[[ "$CLASH" == "distinct" ]] || OK=0
-[[ "$VC_RC" == "0" ]] || OK=0
-[[ "${LOCKS:-1}" == "0" ]] || OK=0
-[[ "$LT_RC" == "0" || "$SKIP_L1_LOAD" == "1" ]] || OK=0
-if [[ "$OK" == "1" ]]; then
+if mixed_ops_ok "$FWD_OK" "$FWD_SUB" "$BACK_OK" "$BACK_SUB" "$CLASH" \
+        "$LT_RC" "${SKIP_L1_LOAD:-0}" "$VC_RC" "${LOCKS:-1}"; then
     log "  >>> MIXED LOADTEST PASS — all 4 directions landed + clash distinct <<<"
     log "======================================================================"
     exit 0

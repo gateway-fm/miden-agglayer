@@ -39,6 +39,10 @@ POST_CHAOS_SETTLE="${POST_CHAOS_SETTLE:-150}"
 L2L2_FWD="${L2L2_FWD:-2}"
 L2L2_BACK="${L2L2_BACK:-2}"
 FRESH="${FRESH:-0}"
+# PR#145: PASS certifies EXACT-BLOCK fidelity by default — late events fail.
+# A consciously-degraded run (e.g. a grown/recovered stack) may set ALLOW_LATE=1;
+# the verdict line prints the mode either way.
+ALLOW_LATE="${ALLOW_LATE:-0}"
 TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"   # repo-local default; override with $TOOL_BIN
 # #41: fail FAST if the debug tool is missing — a late WARN used to let the whole
 # storm run and then skip the completeness verdict entirely.
@@ -95,7 +99,7 @@ GARBO_PID=$!
 # split the soak's N evenly across L1->Miden / Miden->L1.
 say "=== mixed loadtest under storm (L1 ${N} split $((N / 2))/$((N - N / 2)), L2<->L2 $L2L2_FWD/$L2L2_BACK) ==="
 N_L1_FWD=$((N / 2)) N_L1_BACK=$((N - N / 2)) L2L2_FWD="$L2L2_FWD" L2L2_BACK="$L2L2_BACK" \
-    MIX_VERIFY=0 ALLOW_LATE=1 COMPOSE_PROJECT_NAME="$PROJECT" \
+    MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" COMPOSE_PROJECT_NAME="$PROJECT" \
     timeout 3600 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
 LT_RC=$?
 say "mixed loadtest exited rc=$LT_RC"
@@ -133,7 +137,7 @@ sleep "$POST_CHAOS_SETTLE"
 say "=== (a) verify-event-completeness (legit traffic) ==="
 VC_RC=2
 if [[ -x "$TOOL_BIN" ]]; then
-    ALLOW_LATE="${ALLOW_LATE:-1}" TOOL_BIN="$TOOL_BIN" \
+    ALLOW_LATE="$ALLOW_LATE" TOOL_BIN="$TOOL_BIN" \
         NODE_CONTAINER="${PROJECT}-miden-node-1" AGGLAYER_CONTAINER="$AGGLAYER_CONTAINER" \
         "$SCRIPT_DIR/verify-event-completeness.sh" > /tmp/chaos-verify.out 2>&1
     VC_RC=$?
@@ -143,16 +147,16 @@ else
 fi
 LOCKS=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -c "database is locked" || true)
 
-# ── 5a'. STORE CORROBORATION (#41) — the authoritative completeness verdict ──
-# The verifier's node-DB denominator legitimately over-counts: observed (non-
-# injected) GERs emit no UpdateHashChain, L2<->L2/reclaim claims aren't proxy-
-# sponsored, and on a RECOVERED stack the whole-history GER denominator is
-# permanently ahead of the by-design-reset log view. The proxy STORE reconciling
-# against its own authoritative sources is the real integrity signal:
-#   UHC logs == injected GERs, CLAIM logs >= landed, BRIDGE logs == emitted,
-#   and no unemitted / unbridgeable / alerted-mint rows (unclaimable is reported
-#   but non-fatal — a user-front-run leaves a benign row).
-say "=== (a') store corroboration (authoritative) ==="
+# ── 5a'. STORE CORROBORATION (#41) — ADDITIONAL failure signal, never a PASS ─
+# PR#145 review: both sides of this comparison are proxy-owned PostgreSQL
+# (synthetic_logs vs ger_entries / claim_watcher_processed /
+# bridge_out_processed) compared as aggregate counts — it cannot prove events
+# the proxy never observed, nor identity / exact-block fidelity. The
+# INDEPENDENT verifier above is the completeness authority; this section can
+# only VETO a verifier-pass (a store DROP always fails) and serves as a
+# diagnostic when the verifier's node denominator over-counts (observed GERs
+# emit no UpdateHashChain; non-sponsored claims; recovered-stack history).
+say "=== (a') store corroboration (additional failure signal) ==="
 SC_UHC=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%';")
 SC_CLAIM=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%';")
 SC_BRIDGE=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%';")
@@ -173,7 +177,8 @@ STORE_DROP=""
 [[ -n "${SC_BRIDGE:-}" && -n "${SC_EMIT:-}" && "${SC_BRIDGE}" -lt "${SC_EMIT}" ]] 2>/dev/null && STORE_DROP="$STORE_DROP BRIDGE<emit(${SC_BRIDGE}<${SC_EMIT})"
 if [[ -z "$STORE_DROP" ]]; then
     STORE_OK=1; say "  store corroboration: CLEAN"
-    [[ "$VC_RC" != "0" ]] && say "  (verifier mismatch with a CLEAN store = denominator artifact, not a drop)"
+    # Diagnostic label ONLY — a verifier fail still fails the verdict (PR#145).
+    [[ "$VC_RC" != "0" ]] && say "  (diagnostic: verifier mismatch with a CLEAN store is usually a denominator artifact — but the independent verifier remains authoritative)"
 else
     STORE_OK=0; say "  store corroboration: DROP —$STORE_DROP"
 fi
@@ -207,40 +212,69 @@ for gi_hex in ${GARBO_FOREIGN_GIS:-}; do
     fi
 done
 [[ "${GARBO_FOREIGN_FIRED:-0}" -gt 0 && -z "${GARBO_FOREIGN_GIS:-}" ]] && { say "  WARN: foreign fired but no gi recorded"; }
+# PR#145: DIRECT private/tag-0 containment — each fired private note's id must
+# be ABSENT from every proxy table a projected note would persist into
+# (bridge_out_processed, tx_note_links, unbridgeable_bridge_outs). A leak by
+# definition persists rows in the proxy's own store before getLogs can serve
+# it, so ID absence here is a positive containment proof independent of the
+# in-memory skip counters (which reset on a chaos proxy restart).
+PRIVATE_LEAK=0
+PRIV_IDS_CHECKED=0
+for pid_hex in ${GARBO_PRIVATE_NOTE_IDS:-}; do
+    pid_lc=$(echo "$pid_hex" | tr 'A-F' 'a-f'); pid_lc="${pid_lc#0x}"
+    [[ -z "$pid_lc" ]] && continue
+    PRIV_IDS_CHECKED=$((PRIV_IDS_CHECKED + 1))
+    rows=$(pgq "SELECT (SELECT COUNT(*) FROM bridge_out_processed WHERE lower(note_id) LIKE '%${pid_lc}%')
+              + (SELECT COUNT(*) FROM tx_note_links WHERE lower(coalesce(note_id,'')) LIKE '%${pid_lc}%' OR lower(coalesce(note_commitment,'')) LIKE '%${pid_lc}%')
+              + (SELECT COUNT(*) FROM unbridgeable_bridge_outs WHERE lower(note_id) LIKE '%${pid_lc}%');")
+    if [[ "${rows:-0}" != "0" ]]; then
+        say "  GARBO LEAK: private note 0x$pid_lc persisted $rows proxy row(s) — CONTAINMENT BREACH"
+        PRIVATE_LEAK=$((PRIVATE_LEAK + rows)); GARBO_OK=0
+    fi
+done
+if [[ "$PRIV_IDS_CHECKED" -gt 0 && "$PRIVATE_LEAK" == "0" ]]; then
+    say "  private notes: $PRIV_IDS_CHECKED id(s) checked, 0 persisted proxy rows (contained)"
+elif [[ "${GARBO_PRIVATE_FIRED:-0}" -gt 0 && "$PRIV_IDS_CHECKED" == "0" ]]; then
+    # Fired but ids not recorded (old summary / parse miss): fall back to the
+    # independent verifier (its extra==0), which the overall verdict already
+    # requires via VC_RC==0.
+    say "  WARN: private fired but no note ids recorded — relying on the independent verifier's extra==0"
+fi
 # Skip counters (best-effort — in-memory, may have reset on a chaos proxy restart).
 NOW_PRIV_SKIP=$(counter synthetic_reconciler_private_skipped_total)
 NOW_FOREIGN_SKIP=$(counter claim_event_foreign_skipped_total)
 say "  private_skipped_total: $BASE_PRIV_SKIP -> $NOW_PRIV_SKIP (garbo private fired=${GARBO_PRIVATE_FIRED:-0})"
 say "  foreign_skipped_total: $BASE_FOREIGN_SKIP -> $NOW_FOREIGN_SKIP (garbo foreign fired=${GARBO_FOREIGN_FIRED:-0})"
-# The verify's extra==0 (checked below via VC_RC) is the restart-robust proof
-# that NO private/tag-0/garbo note leaked as a real BridgeEvent/ClaimEvent.
+# The verify's extra==0 (required below via VC_RC==0) is the restart-robust
+# proof that NO private/tag-0/garbo note leaked as a real BridgeEvent/ClaimEvent.
 
 # ── 6. two-sided verdict ─────────────────────────────────────────────────────
+# PR#145: predicates live in lib-chaos-verdict.sh (unit-tested by
+# scripts/test-chaos-verdict.sh). The INDEPENDENT verifier is required
+# (VC_RC==0); store corroboration is an additional veto, never an override.
+# shellcheck source=lib-chaos-verdict.sh
+source "$SCRIPT_DIR/lib-chaos-verdict.sh"
 say "======================================================================"
 say "  UNIFIED CHAOS SOAK RESULT"
-say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
-say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=$FOREIGN_LEAK"
-# The mixed loadtest (MIX_VERIFY=0) exits 0 on a clean completion and non-zero
-# ONLY if its driver ABORTED (a fail() — e.g. a wedge or a harness bug). A
-# crashed driver means the full mixed load never ran, so it must NOT green even
-# if the (reduced) traffic verifies — else a dead driver false-passes.
-# #41: completeness = verifier PASS *or* store-corroboration CLEAN (the verifier
-# denominator over-counts by design in several benign cases); a store DROP always
-# fails regardless of the verifier.
+say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})  allow_late=$ALLOW_LATE"
+say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=$FOREIGN_LEAK  private_leak=$PRIVATE_LEAK"
+# The mixed loadtest (MIX_VERIFY=0) now enforces its FULL operational verdict
+# (all fwd/back landed, clash distinct, L1 rc) and skips only the duplicate
+# verifier run — a nonzero LT_RC means an operation never landed OR the driver
+# aborted; either must fail here.
 LEGIT_OK=0
-if [[ ( "$VC_RC" == "0" || "${STORE_OK:-0}" == "1" ) && "${LOCKS:-1}" == "0" && "$LT_RC" == "0" ]]; then LEGIT_OK=1; fi
-[[ "${STORE_OK:-0}" == "0" ]] && LEGIT_OK=0
+chaos_legit_ok "$VC_RC" "${STORE_OK:-0}" "${LOCKS:-1}" "$LT_RC" && LEGIT_OK=1
+GARBO_VERDICT_OK=0
+[[ "$GARBO_OK" == "1" ]] && chaos_garbo_ok "$FOREIGN_LEAK" "$PRIVATE_LEAK" && GARBO_VERDICT_OK=1
 # (c) chaos ACTUALLY happened — a soak that injected no infra faults or fired no garbo
 # class would otherwise false-pass on an empty run. Require >=1 injected fault AND each
 # enabled garbo class fired (private always; foreign only when GARBO_FOREIGN=1).
-CHAOS_OK=1
-[[ "${FAULTS_DONE:-0}" -ge 1 ]]              || CHAOS_OK=0
-[[ "${GARBO_PRIVATE_FIRED:-0}" -ge 1 ]]      || CHAOS_OK=0
-[[ "${GARBO_FOREIGN:-1}" != "1" || "${GARBO_FOREIGN_FIRED:-0}" -ge 1 ]] || CHAOS_OK=0
-say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC store=$([[ ${STORE_OK:-0} == 1 ]] && echo CLEAN || echo DROP) locks=$LOCKS loadtest_rc=$LT_RC)"
-say "    (b) GARBO containment:  $([[ $GARBO_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK)"
+CHAOS_OK=0
+chaos_fired_ok "${FAULTS_DONE:-0}" "${GARBO_PRIVATE_FIRED:-0}" "${GARBO_FOREIGN:-1}" "${GARBO_FOREIGN_FIRED:-0}" && CHAOS_OK=1
+say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC store=$([[ ${STORE_OK:-0} == 1 ]] && echo CLEAN || echo DROP) locks=$LOCKS loadtest_rc=$LT_RC allow_late=$ALLOW_LATE)"
+say "    (b) GARBO containment:  $([[ $GARBO_VERDICT_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK private_leak=$PRIVATE_LEAK)"
 say "    (c) CHAOS actually fired: $([[ $CHAOS_OK == 1 ]] && echo PASS || echo FAIL)  (faults=${FAULTS_DONE:-0} private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
-if [[ "$LEGIT_OK" == "1" && "$GARBO_OK" == "1" && "$CHAOS_OK" == "1" ]]; then
+if [[ "$LEGIT_OK" == "1" && "$GARBO_VERDICT_OK" == "1" && "$CHAOS_OK" == "1" ]]; then
     say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"
     say "======================================================================"
     exit 0
