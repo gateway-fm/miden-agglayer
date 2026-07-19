@@ -268,6 +268,13 @@ resolves identically — then verify sync (zero accept-header errors) and tip
 advancement before restoring traffic. The upgraded proxy resyncs cleanly
 through blocks mined during the swap window.
 
+> **Validated (2026-07-19, clean-rebuild rehearsal):** fresh v0.15.8 stack →
+> in-place upgrade to this release in the same deployment dir → **event history
+> preserved (no loss), tip continuous, post-upgrade L1↔Miden + L2↔L2 (all four
+> directions + same-address clash) GREEN, and the chaos completeness verifier
+> PASSED exact-block (ALLOW_LATE=0) with foreign/private garbo contained
+> (zero leaks).**
+
 ### Operational follow-ups shipped with this release
 
 The operations runbook gained incident procedures for the two known
