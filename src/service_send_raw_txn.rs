@@ -4422,14 +4422,14 @@ mod tests {
         assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
     }
 
-    /// Crash outcomes on an AMBIGUOUS slot: once an attempt released (it may
-    /// have crossed an external side-effect boundary) or was durably admitted
-    /// (a `transactions` row exists), the slot stays bound to the first signed
-    /// transaction — even after lease expiry. Only that exact hash may recover
-    /// the durable intent. (The one exception — an expired `executing` slot
-    /// that was NEVER durably admitted, i.e. provably nothing external
-    /// happened — is the wedge-#5 reclamation, covered by
-    /// `wedge5_abandoned_expired_slot_reclaimable_by_different_tx`.)
+    /// Crash outcomes on an AMBIGUOUS slot: once an attempt was durably
+    /// admitted (a `transactions` row exists — it may have crossed an external
+    /// side-effect boundary), the slot stays bound to the first signed
+    /// transaction — whether it later released failure or its lease expired.
+    /// Only that exact hash may recover the durable intent. (The exceptions —
+    /// an expired `executing` slot or a `released_failure` slot that was NEVER
+    /// durably admitted, i.e. provably nothing external happened — are the
+    /// wedge-#5 reclamations, covered by the `wedge5_*` tests.)
     #[tokio::test]
     async fn blocker_a_different_tx_never_takes_over_ambiguous_slot() {
         use crate::store::NonceReservation;
@@ -4445,31 +4445,15 @@ mod tests {
         else {
             panic!("fresh must win");
         };
-        store
-            .release_reservation(addr, 1, ha, fence, false)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.reserve_nonce(addr, 1, hb, lease).await.unwrap(),
-            NonceReservation::HeldByOther(ha),
-            "failure cannot authorize a replacement after an ambiguous external outcome"
-        );
-        assert!(matches!(
-            store.reserve_nonce(addr, 1, ha, lease).await.unwrap(),
-            NonceReservation::Won { .. }
-        ));
-
-        assert!(matches!(
-            store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),
-            NonceReservation::Won { .. }
-        ));
-        // Durably admit `ha` — the slot's outcome is now genuinely ambiguous
-        // after a crash (the pending-tx machinery tracks it), so expiry must
-        // NOT grant a different tx the slot.
+        // Durably admit `ha` BEFORE it releases failure — the outcome is now
+        // genuinely ambiguous (the pending-tx machinery tracks it), so neither
+        // a released failure nor lease expiry may grant a different tx the
+        // slot. (A released failure WITHOUT durable admission is NOT ambiguous
+        // — that is the wedge-#5 reclamation, tested separately.)
         let txn = TxLegacy {
             input: vec![].into(),
             chain_id: Some(1),
-            nonce: 2,
+            nonce: 1,
             ..Default::default()
         };
         let signed = Signed::new_unchecked(txn, Signature::test_signature(), TxHash::default());
@@ -4488,6 +4472,26 @@ mod tests {
             )
             .await
             .unwrap();
+        store
+            .release_reservation(addr, 1, ha, fence, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.reserve_nonce(addr, 1, hb, lease).await.unwrap(),
+            NonceReservation::HeldByOther(ha),
+            "failure cannot authorize a replacement after an ambiguous external outcome"
+        );
+        assert!(matches!(
+            store.reserve_nonce(addr, 1, ha, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
+
+        // Same tx (already durably admitted above) reserved at another nonce:
+        // lease expiry must not grant a different tx the slot either.
+        assert!(matches!(
+            store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),
+            NonceReservation::Won { .. }
+        ));
         concrete.test_expire_reservation_lease(addr, 2);
         assert_eq!(
             store.reserve_nonce(addr, 2, hb, lease).await.unwrap(),
@@ -4499,6 +4503,142 @@ mod tests {
             store.reserve_nonce(addr, 2, ha, lease).await.unwrap(),
             NonceReservation::Won { .. }
         ));
+    }
+
+    /// Wedge #5 (PR#145 blocker 1) — a slot released as FAILURE whose hash was
+    /// never durably admitted (the normal pre-admission error path: e.g. the
+    /// second writer-queue capacity check in `dispatch_after_reservation` fails
+    /// AFTER the reservation, and the outer path releases `success=false`
+    /// before any `txn_begin*`) is ABANDONED: a different tx reclaims it
+    /// immediately — no lease expiry required — with a bumped fence.
+    #[tokio::test]
+    async fn wedge5_released_failure_unadmitted_slot_reclaimable_by_different_tx() {
+        use crate::store::NonceReservation;
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let addr = "0x00000000000000000000000000000000000000a7";
+        let h1 = TxHash::from([0x71u8; 32]);
+        let h2 = TxHash::from([0x72u8; 32]);
+        let lease = std::time::Duration::from_secs(90);
+
+        let NonceReservation::Won { fence } =
+            store.reserve_nonce(addr, 4, h1, lease).await.unwrap()
+        else {
+            panic!("fresh slot must be Won");
+        };
+        // Pre-admission failure: released as failure, NO transactions row.
+        store
+            .release_reservation(addr, 4, h1, fence, false)
+            .await
+            .unwrap();
+        // A DIFFERENT tx reclaims immediately (no expiry) with a bumped fence.
+        let NonceReservation::Won { fence: fence2 } =
+            store.reserve_nonce(addr, 4, h2, lease).await.unwrap()
+        else {
+            panic!("released_failure without durable admission must be reclaimable");
+        };
+        assert!(fence2 > fence, "reclamation must bump the fence");
+    }
+
+    /// Wedge #5 guard — a `released_failure` slot whose tx WAS durably admitted
+    /// (a `transactions` row exists) stays hash-bound: the failure may have
+    /// crossed an external side-effect boundary, so a different tx must NOT
+    /// take it over.
+    #[tokio::test]
+    async fn wedge5_released_failure_admitted_slot_stays_held() {
+        use crate::store::NonceReservation;
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let addr = "0x00000000000000000000000000000000000000a8";
+        let h1 = TxHash::from([0x81u8; 32]);
+        let h2 = TxHash::from([0x82u8; 32]);
+        let lease = std::time::Duration::from_secs(90);
+
+        let NonceReservation::Won { fence } =
+            store.reserve_nonce(addr, 5, h1, lease).await.unwrap()
+        else {
+            panic!("fresh slot must be Won");
+        };
+        let txn = TxLegacy {
+            input: vec![].into(),
+            chain_id: Some(1),
+            nonce: 5,
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(txn, Signature::test_signature(), TxHash::default());
+        let envelope = TxEnvelope::Legacy(signed);
+        let signer = envelope.recover_signer().expect("recover signer");
+        store
+            .txn_begin(
+                h1,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .release_reservation(addr, 5, h1, fence, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.reserve_nonce(addr, 5, h2, lease).await.unwrap(),
+            NonceReservation::HeldByOther(h1),
+            "a released_failure slot with a durable transactions row must stay hash-bound"
+        );
+    }
+
+    /// Wedge #5 end-to-end (PR#145 blocker 1): after another attempt won the
+    /// `(signer, nonce)` slot and failed PRE-admission (the interleaving:
+    /// second writer-queue capacity check errors in
+    /// `dispatch_after_reservation` AFTER the reservation, outer path releases
+    /// `success=false`, no `transactions` row), an external submitter's
+    /// freshly-signed DIFFERENT tx at the SAME nonce must be ACCEPTED by the
+    /// service. (Deterministically forcing the second capacity check itself
+    /// would need a concurrent slot-consumer between the two checks — the
+    /// pre-reservation check at the top of `service_send_raw_txn` passes only
+    /// while capacity remains — so this test stages exactly the store
+    /// transition that path produces and proves the service-level outcome.)
+    #[tokio::test]
+    async fn wedge5_released_failure_unadmitted_allows_fresh_hash_service_retry() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xE7u8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx(calldata); // nonce 0
+        let signer_str = format!("{signer:#x}");
+
+        // Another attempt (different hash) won the slot, then failed
+        // pre-admission and released failure — no transactions row.
+        let other = TxHash::from([0xE8u8; 32]);
+        let crate::store::NonceReservation::Won { fence } = store
+            .reserve_nonce(&signer_str, 0, other, reservation_lease())
+            .await
+            .unwrap()
+        else {
+            panic!("fresh slot must be Won");
+        };
+        store
+            .release_reservation(&signer_str, 0, other, fence, false)
+            .await
+            .unwrap();
+
+        // The fresh-hash retry at the same nonce is ACCEPTED (pre-fix: rejected
+        // "reserved by a different tx" forever) and executes.
+        service_send_raw_txn(service, input_hex)
+            .await
+            .expect("a fresh-hash retry must reclaim the released_failure unadmitted slot");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            1,
+            "the reclaimed retry must execute and advance the nonce"
+        );
     }
 
     /// Writer admission persists the recoverable envelope before nonce CAS and enqueue.

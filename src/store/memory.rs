@@ -1305,22 +1305,34 @@ impl Store for InMemoryStore {
                     ) || r.lease_expires_at <= now);
                 // Wedge #5 — ABANDONED-slot reclamation for a DIFFERENT tx: the
                 // reservation precedes durable admission, so a crash in that
-                // window leaves `executing` + expired lease + no durable
+                // window leaves `executing` + expired lease, and a NORMAL
+                // pre-admission error (e.g. writer-queue saturation) releases
+                // `released_failure` — in both cases with no durable
                 // `transactions` row (provably nothing was submitted externally).
                 // External submitters sign a fresh tx per retry, so without this
-                // the crashed slot rejects every retry at its nonce forever.
+                // such a slot rejects every retry at its nonce forever.
                 // Mirrors the PgStore rule; LRU eviction could theoretically make
                 // an admitted hash look absent here, but this in-memory store is
                 // test/dev-only — PostgreSQL is authoritative in deployments.
+                let abandoned_state = (r.state == ReservationState::Executing
+                    && r.lease_expires_at <= now)
+                    || r.state == ReservationState::ReleasedFailure;
                 let abandoned = r.tx_hash != tx_hash
-                    && r.state == ReservationState::Executing
-                    && r.lease_expires_at <= now
+                    && abandoned_state
                     && !self.transactions.lock().contains(&r.tx_hash);
                 if takeover || abandoned {
                     let fence = r.fence + 1;
                     if abandoned {
-                        ::metrics::counter!("nonce_reservation_expired_reclaimed_total")
-                            .increment(1);
+                        let cause = if r.state == ReservationState::ReleasedFailure {
+                            "released_failure"
+                        } else {
+                            "expired_executing"
+                        };
+                        ::metrics::counter!(
+                            "nonce_reservation_abandoned_reclaimed_total",
+                            "cause" => cause
+                        )
+                        .increment(1);
                     }
                     reservations.insert(
                         key,

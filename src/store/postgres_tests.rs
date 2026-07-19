@@ -2173,6 +2173,59 @@ async fn test_pgstore_wedge5_abandoned_slot_reclamation() {
     );
 }
 
+/// Wedge #5 (PR#145 blocker 1) — the identical production transition on
+/// PostgreSQL: a slot released as FAILURE whose hash was never durably admitted
+/// (pre-admission error path, e.g. writer-queue saturation after the
+/// reservation) is reclaimable by a DIFFERENT tx immediately, fence bumped; a
+/// `released_failure` slot WITH a durable `transactions` row stays hash-bound.
+#[tokio::test]
+async fn test_pgstore_wedge5_released_failure_reclamation() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let base = rand_u64();
+    let addr = format!("0x{:040x}", (base ^ 0x5EDF) as u128);
+    let h1 = TxHash::from([(base % 197) as u8 + 7; 32]);
+    let h2 = TxHash::from([(base % 179) as u8 + 8; 32]);
+    let lease = std::time::Duration::from_secs(90);
+
+    // Released failure, NEVER durably admitted → reclaimable immediately.
+    let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 11, h1, lease).await.unwrap()
+    else {
+        panic!("fresh slot must be Won");
+    };
+    store
+        .release_reservation(&addr, 11, h1, fence, false)
+        .await
+        .unwrap();
+    let NonceReservation::Won { fence: fence2 } =
+        store.reserve_nonce(&addr, 11, h2, lease).await.unwrap()
+    else {
+        panic!("released_failure without durable admission must be reclaimable");
+    };
+    assert!(fence2 > fence, "reclamation must bump the fence");
+
+    // Released failure WITH a durable transactions row → stays hash-bound.
+    let h3 = TxHash::from([(base % 173) as u8 + 9; 32]);
+    let h4 = TxHash::from([(base % 167) as u8 + 10; 32]);
+    let NonceReservation::Won { fence: fence3 } =
+        store.reserve_nonce(&addr, 12, h3, lease).await.unwrap()
+    else {
+        panic!("fresh slot must be Won");
+    };
+    store.txn_begin(h3, dummy_txn_entry()).await.unwrap();
+    store
+        .release_reservation(&addr, 12, h3, fence3, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reserve_nonce(&addr, 12, h4, lease).await.unwrap(),
+        NonceReservation::HeldByOther(h3),
+        "a released_failure slot with a durable transactions row must stay hash-bound"
+    );
+}
+
 /// BLOCKER 1 — FULL two-replica shared-PostgreSQL races. Two PgStore handles over
 /// the SAME database (two "replicas") reserve the SAME (signer, nonce) slot.
 #[tokio::test]

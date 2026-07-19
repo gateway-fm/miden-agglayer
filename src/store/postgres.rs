@@ -1714,34 +1714,49 @@ impl Store for PgStore {
                     // Wedge #5 — ABANDONED-slot reclamation for a DIFFERENT tx.
                     // The reservation is taken BEFORE durable admission
                     // (`txn_begin*`), which itself precedes any external submit.
-                    // A crash in that window leaves the slot `executing` with an
-                    // expiring lease, its bound hash absent from `transactions`,
-                    // and the nonce unadvanced. External submitters (the
+                    // Two paths leave a provably-unadmitted slot behind:
+                    //   * a CRASH in that window → `executing` with an expiring
+                    //     lease (the owner is contractually dead — a live
+                    //     admission renews its lease);
+                    //   * a NORMAL pre-admission error (e.g.
+                    //     `WriterQueueSaturatedError` in
+                    //     `dispatch_after_reservation`, which fails after the
+                    //     reservation but before `txn_begin_if_absent`) → the
+                    //     outer path releases `released_failure`.
+                    // In both, the bound hash is absent from `transactions` and
+                    // the nonce is unadvanced. External submitters (the
                     // zkevm-bridge-service claimtxman) sign a FRESH tx per retry
-                    // — never the bound hash — so without this rule the crashed
-                    // slot rejects every retry at its nonce forever (observed
-                    // live: sponsor wedged at nonce 78 until operator surgery).
-                    // Reclaim iff: `executing` AND lease expired (the owner is
-                    // contractually dead — a live admission renews its lease)
-                    // AND the bound hash was never durably admitted (no
-                    // `transactions` row ⇒ provably nothing was submitted
-                    // externally ⇒ a replacement is unambiguous). Released slots
-                    // stay permanently hash-bound (receipt identity), and an
-                    // expired `executing` slot WITH a durable row stays held —
-                    // its outcome is tracked by the pending-tx machinery.
-                    let abandoned = if state == "executing" && expired {
-                        let admitted: bool = tx
-                            .query_one(
-                                "SELECT EXISTS(SELECT 1 FROM transactions WHERE tx_hash = $1)",
-                                &[&row_hash],
-                            )
-                            .await?
-                            .get(0);
-                        !admitted
+                    // — never the bound hash — so without this rule such a slot
+                    // rejects every retry at its nonce forever (observed live:
+                    // sponsor wedged at nonce 78 until operator surgery).
+                    // Reclaim iff: (`executing` AND lease expired) OR
+                    // `released_failure`, AND the bound hash was never durably
+                    // admitted (no `transactions` row ⇒ provably nothing was
+                    // submitted externally ⇒ a replacement is unambiguous).
+                    // `released_success` slots and any slot WITH a durable row
+                    // stay permanently hash-bound (receipt identity / pending-tx
+                    // machinery).
+                    let reclaim_cause = if state == "released_failure" {
+                        Some("released_failure")
+                    } else if state == "executing" && expired {
+                        Some("expired_executing")
                     } else {
-                        false
+                        None
                     };
-                    if abandoned {
+                    let abandoned_cause = match reclaim_cause {
+                        Some(cause) => {
+                            let admitted: bool = tx
+                                .query_one(
+                                    "SELECT EXISTS(SELECT 1 FROM transactions WHERE tx_hash = $1)",
+                                    &[&row_hash],
+                                )
+                                .await?
+                                .get(0);
+                            if admitted { None } else { Some(cause) }
+                        }
+                        None => None,
+                    };
+                    if let Some(cause) = abandoned_cause {
                         let new_fence = fence + 1;
                         tx.execute(
                             "UPDATE nonce_reservations SET tx_hash = $5, state = 'executing',
@@ -1757,16 +1772,19 @@ impl Store for PgStore {
                             ],
                         )
                         .await?;
-                        ::metrics::counter!("nonce_reservation_expired_reclaimed_total")
-                            .increment(1);
+                        ::metrics::counter!(
+                            "nonce_reservation_abandoned_reclaimed_total",
+                            "cause" => cause
+                        )
+                        .increment(1);
                         tracing::warn!(
                             signer = %key,
                             nonce,
+                            cause,
                             abandoned_tx = %row_hash,
                             new_tx = %hash_str,
                             "reserve_nonce: reclaimed an abandoned admission slot \
-                             (executing, lease expired, never durably admitted) for a \
-                             different tx (wedge #5)"
+                             (never durably admitted) for a different tx (wedge #5)"
                         );
                         NonceReservation::Won {
                             fence: new_fence as u64,
