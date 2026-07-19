@@ -318,6 +318,126 @@ Recovery:
    nonce to "unstick" it.
 5. Never delete admission/handoff rows manually.
 
+### Stuck GER injection (interrupted `ger_insert`) — aggoracle deadlock
+
+Known failure mode (tracked as finding #70; recurred repeatedly under fault
+testing). If the proxy is restarted/paused while a `ger_insert` writer job is
+in flight, the aggoracle's `insertGlobalExitRoot` transaction can be left
+`status='pending', block_number=0` permanently: nothing resumes the job after
+restart. Two deadlocks then stack:
+
+- the aggoracle's ethtxmanager polls that hash forever ("waiting signedTx to
+  be mined"); and
+- its monitored-transaction ID is deterministic (hash of from/to/calldata, no
+  nonce), so even a recreated aggkit re-derives the same ID, logs
+  `inject GER transaction already exists in monitoring DB`, and never sends a
+  new injection.
+
+Blast radius: GER injection stops → deposits never turn `ready_for_claim`,
+L2↔L2 settlement stalls, and the store's UpdateHashChain/ClaimEvent counts
+freeze while the chain keeps advancing. There is no error anywhere — only
+silence.
+
+**Diagnosis (in order):**
+
+1. Rule out the ntx-builder first (see the next procedure): if it is silent,
+   restart it and re-check before touching anything else — an unconsumed
+   UpdateGerNote resolves itself once consumption resumes.
+2. Stuck pending injection:
+
+   ```sql
+   SELECT tx_hash, status, block_number, created_at
+   FROM transactions
+   WHERE lower(signer) = '<aggoracle sender, lowercase>'
+     AND status = 'pending'
+     AND created_at < now() - interval '3 minutes';
+   ```
+
+   The aggoracle sender address is logged at aggkit startup
+   (`AggOracle sender address: 0x…`).
+3. Aggoracle deadlock confirmation: aggkit logs repeat
+   `inject GER transaction already exists in monitoring DB with ID 0x…` with
+   no interleaved `submitted`, and the proxy receives no
+   `eth_sendRawTransaction` from that sender.
+4. Corroborate the freeze: `ger_entries.is_injected` stops advancing;
+   `synthetic_logs` UpdateHashChain count is static while the Miden tip moves.
+
+**Recovery.** This is the one documented exception to "never delete
+admission rows / never replace a pending transaction". It is safe if and only
+if ALL of the following hold — verify each before proceeding:
+
+- the pending rows belong to the aggoracle sender only;
+- their GERs show `is_injected = false` in `ger_entries` (the injection never
+  landed — nothing external ever observed a receipt);
+- the only consumer of those hashes is the aggoracle itself, and it is reset
+  in the same procedure (fresh ethtxmanager state);
+- GER injection is content-idempotent: the same root is safely re-injected
+  under a new transaction.
+
+Procedure (order matters — client side must come back AFTER the proxy):
+
+```bash
+# 1. stop the aggoracle so it cannot re-send mid-surgery
+docker stop <aggkit-container>
+
+# 2. proxy store: remove the dead pending injection(s) + realign the nonce
+#    (psql into the proxy's PostgreSQL, agglayer_store)
+DELETE FROM tx_note_links WHERE tx_hash IN
+  (SELECT tx_hash FROM transactions
+   WHERE lower(signer)='<aggoracle>' AND status='pending');
+DELETE FROM transactions
+  WHERE lower(signer)='<aggoracle>' AND status='pending';
+-- MINED := count of that signer's success/reverted rows
+DELETE FROM nonce_reservations
+  WHERE lower(signer)='<aggoracle>' AND nonce >= MINED;
+UPDATE nonces SET nonce = MINED WHERE lower(address)='<aggoracle>';
+
+# 3. restart the proxy; wait for healthy
+docker restart <proxy-container>
+
+# 4. recreate aggkit WITH A FRESH CONTAINER (its ethtxmanager sqlite lives in
+#    the container /tmp — a plain restart resumes the deadlocked state)
+docker rm -f <aggkit-container>
+docker compose up -d --no-deps aggkit
+```
+
+**Verify:** within ~1 minute the aggoracle logs `inject GER transaction
+submitted`, the proxy mines it (`transactions.status='success'`,
+`ger_entries.is_injected` flips true, UpdateHashChain count increments), and
+new deposits turn `ready_for_claim`.
+
+**Prevention / monitoring:** alert when
+`count(pending aggoracle txs older than 3 min) > 0` or when
+`ger_entries.is_injected` is static for >5 min while the Miden tip advances.
+A supervised auto-heal implementing exactly the procedure above is acceptable.
+The product fix — resuming interrupted `ger_insert` jobs on startup via the
+durable note handoff — is tracked as finding #70; until it ships, treat this
+procedure as the standing remediation.
+
+### ntx-builder silent death (network-note consumption halts)
+
+Upstream Miden issue (finding #68). After all account actors log
+`Account actor deactivated due to idle timeout`, the ntx-builder can stop
+following the chain entirely — no further `apply_committed_block` lines, no
+error, process alive — while the tip advances. Because the bridge is a network
+account, ALL bridge note consumption (CLAIM, UpdateGerNote) halts with it:
+claims stop landing, GER injections stall (see the previous procedure — check
+this FIRST), and store event counts freeze silently.
+
+**Diagnosis:** compare the ntx-builder's last log timestamp against the Miden
+tip. Healthy operation logs `apply_committed_block` every few seconds; more
+than ~4 minutes of silence while the tip moves means it is dead. Recurrence is
+more likely when note traffic is bursty/sparse (every actor idles out) and
+intensifies under infrastructure faults.
+
+**Recovery:** `docker restart <ntx-builder-container>`. It re-applies from the
+committed tip and consumes the backlog within seconds; no state cleanup is
+needed anywhere else.
+
+**Prevention / monitoring:** alert on last-log age > 4 min while the tip
+advances; an unsupervised watchdog restart on that condition is safe and
+recommended until the upstream fix lands.
+
 ### Writer saturation
 
 Quiesce or rate-limit producers, confirm the remote prover/Miden node is not the
