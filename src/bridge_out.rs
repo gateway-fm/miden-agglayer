@@ -3571,7 +3571,7 @@ mod tests {
             block_state.get_block_hash(block),
             crate::bridge_address::get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap()
@@ -3626,7 +3626,7 @@ mod tests {
             block_state.get_block_hash(100),
             crate::bridge_address::get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await;
         assert!(

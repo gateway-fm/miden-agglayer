@@ -202,12 +202,14 @@ pub struct SyntheticProjector {
     /// deployment, foreign claims share our ClaimNote script root and must
     /// not be projected (see `restore::classify_claim_note`).
     expected_claim_sender: AccountId,
-    /// L1 JSON-RPC endpoint for the Cantina #13 Layer-2 ERC-20 metadata
-    /// recovery path (mirrors `BridgeOutScanner::l1_rpc_url`). Threaded into
-    /// `project_b2agg_note` so legacy/DB-loss faucet rows with empty ERC-20
-    /// metadata recover + validate instead of being skipped. `None` disables
-    /// the L1 fallback (recovery then relies solely on the all-Miden candidate).
-    l1_rpc_url: Option<String>,
+    /// Per-origin-network JSON-RPC endpoints for the Cantina #13 Layer-2 ERC-20
+    /// metadata recovery path. Threaded into `project_b2agg_note`, which selects
+    /// the RPC for each bridge-out's `origin_network` (L1 for network 0, L2B for
+    /// network 2, …) so a legacy/DB-loss faucet row with empty ERC-20 metadata
+    /// recovers + validates against the token's ACTUAL origin chain instead of
+    /// being skipped (finding #62). An empty map relies solely on the all-Miden
+    /// candidate — the pre-#62 behavior when no L1 RPC was configured.
+    network_rpcs: crate::metadata_recovery::NetworkRpcMap,
     /// Last projected Miden block height — an in-memory cache of the persisted
     /// `Store::get_projector_cursor`. The projector is the single owner of this
     /// cursor (SINGLE-PROCESS ONLY) and persists every advance in `tick`.
@@ -278,7 +280,7 @@ impl SyntheticProjector {
         block_state: Arc<BlockState>,
         accounts: &AccountsConfig,
         local_network_id: u32,
-        l1_rpc_url: Option<String>,
+        network_rpcs: crate::metadata_recovery::NetworkRpcMap,
         node_url: String,
         node_api_key: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -329,7 +331,7 @@ impl SyntheticProjector {
             local_network_id,
             expected_ger_sender,
             expected_claim_sender: accounts.service.0,
-            l1_rpc_url,
+            network_rpcs,
             cursor: AtomicU64::new(start_cursor),
             node_rpc,
             reconcile_cursor: AtomicU64::new(start_reconcile),
@@ -938,9 +940,19 @@ impl SyntheticProjector {
             } // lock dropped before the awaits below
             let note_id_str = hex::encode(key);
             let derived = crate::claim_watcher::derive_manual_claim_tx_hash(&note_id_str);
-            let logs = self.store.get_logs_for_tx(&derived).await?;
-            let resolved = if let Some(log) = logs.first() {
-                // A derived-hash ClaimEvent exists → the full calldata must be servable.
+            // The ClaimEvent may ride the DERIVED hash (derived-hash synthesis, no real
+            // eth-tx) OR the REAL linked eth-tx hash (`publish_claim`'s recorded link — the
+            // normal case). Repair under WHICHEVER hash actually carries the event. The old
+            // derived-only check silently marked a real-hash event "resolved forever" without
+            // verifying its envelope existed, so it never healed the {processed note +
+            // real-hash ClaimEvent + missing transaction envelope} crash window — a state
+            // that also survives an upgrade (the note is already processed, so the projection
+            // path never re-runs). `persist_synthetic_claim_tx` is idempotent: a no-op when
+            // the envelope is already present + committed, a reconstruct when it is absent,
+            // and returns `false` (stay unresolved, retry next tick) when the faucet metadata
+            // is still unrecoverable.
+            let derived_logs = self.store.get_logs_for_tx(&derived).await?;
+            let resolved = if let Some(log) = derived_logs.first() {
                 crate::restore::persist_synthetic_claim_tx(
                     &self.store,
                     note.details().storage(),
@@ -950,11 +962,29 @@ impl SyntheticProjector {
                     log.block_hash,
                 )
                 .await?
+            } else if let Some(real) = self.store.get_tx_for_note(&note_id_str).await? {
+                // A real link exists. If a ClaimEvent rides it, ensure its full calldata is
+                // servable under that hash (the crash-window heal). Only resolve once valid
+                // calldata is stored; if no event rides it yet the note is not projected —
+                // re-check next tick, do NOT resolve.
+                match self.store.get_logs_for_tx(&real).await?.first() {
+                    Some(log) => {
+                        crate::restore::persist_synthetic_claim_tx(
+                            &self.store,
+                            note.details().storage(),
+                            &note_id_str,
+                            &real,
+                            log.block_number,
+                            log.block_hash,
+                        )
+                        .await?
+                    }
+                    None => false,
+                }
             } else {
-                // No derived-hash event. Once the note's consumption block is projected,
-                // its ClaimEvent (if any) rides a real eth-tx hash — nothing to backfill,
-                // resolved forever. Before that, re-check next tick (the synthesis path
-                // usually persists it first; this is only the crash backstop).
+                // No derived-hash event AND no recorded real link. Once the consumption block
+                // is projected and no event exists anywhere, there is nothing to backfill (a
+                // skipped/foreign claim) — resolved forever. Before that, re-check next tick.
                 note.state()
                     .consumed_block_height()
                     .map(|h| h.as_u64())
@@ -1245,9 +1275,10 @@ impl SyntheticProjector {
                     block_hash,
                     bridge_address,
                     // Cantina #13 recovery context: the live client + the projector's
-                    // L1 RPC, so legacy/empty-metadata ERC-20 bridge-outs recover.
+                    // per-network RPC map, so legacy/empty-metadata ERC-20 bridge-outs
+                    // recover against their actual origin chain (finding #62).
                     client.as_deref_mut(),
-                    self.l1_rpc_url.as_deref(),
+                    &self.network_rpcs,
                 )
                 .await?
                     == B2AggRestoreOutcome::Emitted
@@ -1292,6 +1323,33 @@ impl SyntheticProjector {
             }
         }
 
+        // #66 — emitted-frontier gate, enforced AT EMIT TIME (after this block's notes are
+        // projected, BEFORE the block seals) rather than only at tick-start. A reserved-but-
+        // unemitted LET leaf here is a getLogs `depositCount` gap; aggkit's L2 bridgesync
+        // requires contiguous deposit indices and HALTS ("state is inconsistent") on a gap,
+        // wedging every later Miden certificate. Fail-closed: refuse to seal past it so aggkit
+        // sees a contiguous prefix and WAITS. This placement fixes two modes of the old
+        // tick-start-only gate:
+        //   * WITHIN-TICK gap (part 2): the block used to seal WITH the gap exposed, and only
+        //     the NEXT tick's gate caught it — a window where aggkit could scan the gap. The
+        //     check now runs before THIS seal, so a poison leaf never seals.
+        //   * CRASH-after-reserve (part 1): a leaf reserved-but-unemitted by a crash between
+        //     reserve and emit was re-projected by the note loop ABOVE (reserve is idempotent;
+        //     the emit now completes), so it is already emitted here and the gate passes — an
+        //     automatic self-heal instead of the old permanent halt (which fired at tick-start
+        //     BEFORE the re-projection that would have healed it).
+        // A genuinely unrecoverable leaf (unrecoverable metadata / quarantined / self-target)
+        // is still unemitted here and HALTS fail-closed.
+        if let Some((idx, note)) = self.store.first_unemitted_reservation().await? {
+            ::metrics::counter!("bridge_unemitted_reservation_halt_total").increment(1);
+            anyhow::bail!(
+                "projector halted (fail-closed): note {note} (LET index {idx}) is reserved \
+                 but its BridgeEvent was never emitted (unrecoverable metadata / quarantined \
+                 leaf). Sealing past it would leave a getLogs gap that halts aggkit bridgesync. \
+                 Fix the leaf's metadata (registry backfill, or back up + drop the DB and \
+                 re-run `--restore` to rebuild from on-chain), then restart."
+            );
+        }
         // Write-before-advance: every synthetic log for `miden_block` is now in the
         // DB, so it is safe to advance the synthetic tip to == the Miden block.
         // Runs for EMPTY Miden blocks too (advance the tip even with 0 logs), so the
@@ -1349,6 +1407,25 @@ impl SyntheticProjector {
                 "reconcile cursor is ahead of the Miden tip"
             );
         }
+        // Claim-calldata REPAIR runs EVERY tick — including at the tip — so a historical
+        // broken ClaimEvent (full calldata never stored: an older-build synthesis, or a crash
+        // between recording the note→hash link and persisting the envelope) heals on the very
+        // next tick, NOT only when new traffic advances the cursor past the tip. It therefore
+        // runs BEFORE the at-tip early return. The consumed feed it needs is also used by
+        // block projection and the completeness auditor below, so fetch it once here.
+        let consumed = client
+            .get_input_notes(NoteFilter::Consumed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?;
+        if let Err(e) = self
+            .backfill_synthetic_claim_calldata(&consumed, cursor)
+            .await
+        {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "synthesized-claim calldata backfill failed (non-fatal — retried next tick)"
+            );
+        }
         if cursor >= tip {
             return Ok(cursor);
         }
@@ -1374,10 +1451,8 @@ impl SyntheticProjector {
         // every bridge consumption through the B2AGG body path) is what keeps a GER/CLAIM
         // consumption — whose body the authoritative feed reports before the store's B2AGG
         // import frontier would have it — from wedging the tip.
-        let consumed = client
-            .get_input_notes(NoteFilter::Consumed)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?;
+        // `consumed` was fetched above (before the at-tip early return, for the calldata
+        // backfill) and is reused here for block projection.
         // CLAIM / GER from the store's consumed feed, at their finalized consumption block.
         // B2AGG is skipped here — sourced authoritatively below (keeping the two sources
         // disjoint keeps the reasoning clean; `is_note_processed` would dedup either way).
@@ -1514,16 +1589,11 @@ impl SyntheticProjector {
         // for the withheld leaf. Recovery is operator-driven: fix the leaf's metadata
         // (registry backfill / a full DB drop + `--restore` rebuild from on-chain) so the
         // leaf emits its real event.
-        if let Some((idx, note)) = self.store.first_unemitted_reservation().await? {
-            ::metrics::counter!("bridge_unemitted_reservation_halt_total").increment(1);
-            anyhow::bail!(
-                "projector halted (fail-closed): note {note} (LET index {idx}) is reserved \
-                 but its BridgeEvent was never emitted (unrecoverable metadata / quarantined \
-                 leaf). Sealing past it would leave a getLogs gap that halts aggkit bridgesync. \
-                 Fix the leaf's metadata (registry backfill, or back up + drop the DB and \
-                 re-run `--restore` to rebuild from on-chain), then restart."
-            );
-        }
+        // #66 — the emitted-frontier gate moved INTO `project_block_notes` (enforced per-block
+        // before each seal), so a poison leaf halts before its own block seals (no within-tick
+        // gap) and a crash-reserved leaf is re-emitted by re-projection before the check (no
+        // permanent halt). The old tick-start check here fired BEFORE that re-projection could
+        // heal a crash, and only AFTER a block had already sealed with the gap exposed.
         let no_notes: Vec<(Option<NoteId>, &InputNoteRecord)> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
@@ -1538,19 +1608,7 @@ impl SyntheticProjector {
             self.cursor.store(next, Ordering::Release);
             cursor = next;
         }
-        // Synthesized-claim calldata backfill (every tick, O(new CLAIM notes) via the
-        // resolved-set): heals derived-hash ClaimEvents whose full claimAsset calldata is
-        // not yet persisted — older-build synthesis, or a crash between the event commit
-        // and the calldata persist. Non-fatal: a failure warns and retries next tick.
-        if let Err(e) = self
-            .backfill_synthetic_claim_calldata(&consumed, cursor)
-            .await
-        {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "synthesized-claim calldata backfill failed (non-fatal — retried next tick)"
-            );
-        }
+        // (Claim-calldata backfill already ran once this tick, before the at-tip early return.)
         // COMPLETENESS AUDITOR (detection only, every AUDIT_EVERY_N_TICKS ticks): diff the
         // store's consumed-B2AGG view against the synthetic log store for comfortably-sealed
         // blocks. Reuses this tick's already-fetched `consumed` feed — zero extra queries.
@@ -1952,7 +2010,7 @@ mod tests {
             block_state.clone(),
             &test_accounts(),
             7,
-            None,
+            crate::metadata_recovery::NetworkRpcMap::new(),
             crate::miden_client::effective_node_url(None),
             None,
         )
@@ -2609,6 +2667,92 @@ mod tests {
             logs[0].transaction_hash,
             derive_manual_claim_tx_hash(&note_commitment),
             "must NOT fall back to the derived hash when a link exists"
+        );
+    }
+
+    /// #67 gaps 2+3 — HEAL a historical real-hash failure. A note that is already
+    /// {processed + ClaimEvent under the REAL linked hash + MISSING transaction envelope} —
+    /// the pre-upgrade crash window (crash between recording the link and persisting the
+    /// envelope) — is UNREPAIRABLE by pre-#67 code: the projection path never re-runs (Dedup-1
+    /// skips the processed note) and the backfill only checked the DERIVED hash, marking the
+    /// note "resolved forever" while its real-hash ClaimEvent kept serving empty calldata.
+    /// POST-#67 the backfill checks the real linked hash and reconstructs the envelope under
+    /// it, so `eth_getTransactionByHash(real)` serves the full claimAsset calldata again.
+    #[tokio::test]
+    async fn backfill_heals_historical_real_hash_event_with_missing_envelope() {
+        use alloy::consensus::Transaction;
+        use alloy_core::sol_types::SolCall;
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+
+        let n_claim = claim_note(5, Some(0));
+        let note_commitment = hex::encode(n_claim.details_commitment().as_bytes());
+        let real_tx = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        // The surviving link — recorded by `publish_claim` before the crash.
+        store
+            .record_tx_note_link(real_tx, &note_commitment)
+            .await
+            .unwrap();
+        // The crash-window state: a ClaimEvent rides `real_tx`, the note is already processed,
+        // but the transaction envelope was never persisted (empty calldata).
+        let mut gi = [0u8; 32];
+        gi[31] = 0x5C;
+        store
+            .add_claim_event(
+                "0x00000000000000000000000000000000000000aa",
+                5,
+                [0u8; 32],
+                real_tx,
+                &gi,
+                0,
+                &[0xAB; 20],
+                &[0xCD; 20],
+                1_000,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_claim_note_processed(note_commitment.clone(), gi, 5)
+            .await
+            .unwrap();
+        let real_hash: alloy::primitives::TxHash = real_tx.parse().unwrap();
+        assert!(
+            store.txn_get(real_hash).await.unwrap().is_none(),
+            "precondition: the envelope is MISSING (crash before persisting it)"
+        );
+        assert!(
+            !store.get_logs_for_tx(real_tx).await.unwrap().is_empty(),
+            "precondition: the ClaimEvent rides the real linked hash"
+        );
+        assert!(
+            store
+                .get_logs_for_tx(&derive_manual_claim_tx_hash(&note_commitment))
+                .await
+                .unwrap()
+                .is_empty(),
+            "precondition: NOTHING under the derived hash (the derived-only backfill was blind)"
+        );
+
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        // cursor >= 5 (block projected) → pre-#67 the backfill marked this resolved-forever
+        // with empty calldata. POST-#67 it reconstructs under the real hash.
+        projector
+            .backfill_synthetic_claim_calldata(&[n_claim], 5)
+            .await
+            .unwrap();
+
+        let data =
+            store.txn_get(real_hash).await.unwrap().expect(
+                "backfill must reconstruct the missing envelope under the REAL linked hash",
+            );
+        assert!(
+            crate::claim::claimAssetCall::abi_decode(data.envelope.input()).is_ok(),
+            "the served input is the full claimAsset calldata, not the empty-calldata wedge"
+        );
+        assert!(
+            data.envelope.input().len() > 4 + 64 * 32,
+            "full calldata (both SMT proofs included), not a stub"
         );
     }
 
@@ -3678,21 +3822,27 @@ mod tests {
         );
     }
 
-    /// A skipped LET leaf still consumes its index; the following valid event must encode 1.
+    /// #66 — a reserved-but-unemitted leaf HALTS the block AT EMIT TIME (before the seal), and
+    /// is RECOVERABLE. Leaf 0 is an unregistered faucet → it reserves LET index 0 (Cantina #7:
+    /// the on-chain leaf takes its slot) but cannot emit (UnknownFaucet). Sealing the block
+    /// would expose a getLogs `depositCount` gap at index 0 (leaf 1 at index 1 would be visible
+    /// past it) and wedge aggkit. The per-block emitted-frontier gate refuses to seal: the tick
+    /// HALTS fail-closed, the tip does NOT advance, and the cursor stays behind block 5 — so
+    /// once the faucet is registered, re-projecting block 5 emits leaf 0 and the gate passes.
+    /// (Pre-#66 the gate ran only at tick-start, so block 5 SEALED with the gap exposed and the
+    /// cursor advanced past leaf 0 — a PERMANENT wedge that registration could no longer heal.)
     #[tokio::test]
-    async fn skipped_let_leaf_reserves_its_deposit_index() {
+    async fn poison_leaf_halts_before_sealing_and_is_recoverable() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
 
-        // Leaf 0: a DISTINCT, unregistered faucet → quarantines as UnknownFaucet
-        // (reserves index 0, emits nothing). Leaf 1: the registered FAUCET → emits.
         let unregistered_faucet = aid("0xaa0000000000bc110000bc000000de");
         let quarantined = b2agg_note_faucet(5, Some(0), unregistered_faucet, 71);
-        register_faucet(&store).await;
+        register_faucet(&store).await; // registers the DEFAULT faucet (leaf 1's), not leaf 0's
         let valid = b2agg_note_with_amount(5, Some(1), 72);
 
-        let written = projector
+        let err = projector
             .project_notes(
                 &[quarantined.clone(), valid.clone()],
                 &HashMap::new(),
@@ -3701,36 +3851,74 @@ mod tests {
                 &HashMap::new(),
             )
             .await
-            .unwrap();
-        assert_eq!(written, 1, "only the valid leaf emits");
+            .expect_err("a reserved-but-unemitted poison leaf must HALT before the block seals");
+        assert!(
+            format!("{err:#}").contains("reserved") && format!("{err:#}").contains("never emitted"),
+            "halt must name the unemitted reservation: {err:#}"
+        );
+        // Cantina #7 — the poison leaf STILL reserved its index (held the LET slot) before halt.
         assert_eq!(
             store.get_deposit_count().await.unwrap(),
             2,
-            "both leaves indexed"
+            "both leaves reserved their LET indices"
+        );
+        // Fail-closed: the block did NOT seal — aggkit sees a contiguous prefix, nothing past
+        // the gap. THIS is the within-tick fix: the tip never advances over the poison leaf.
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            0,
+            "the tip must not advance past the reserved-but-unemitted leaf"
+        );
+    }
+
+    /// #66 part 1 — a leaf whose index was RESERVED before a crash (reserve committed, the
+    /// BridgeEvent not yet emitted) must be RE-EMITTED on re-projection, NOT halt forever.
+    /// Pre-#66 the gate ran at tick-start and halted BEFORE the re-projection that heals it — a
+    /// permanent halt for a recoverable leaf. Now the gate runs after the block's notes project,
+    /// so the re-emit completes first and the gate passes.
+    #[tokio::test]
+    async fn crash_reserved_leaf_re_emits_on_reprojection() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        register_faucet(&store).await;
+        let note = b2agg_note_with_amount(5, Some(0), 72);
+        // The dedup key is the note's NoteId (project_notes gives a headerless B2AGG fixture the
+        // same deterministic identity project_b2agg_note keys on:
+        // NoteId::new(details_commitment, metadata{bridge_id, Public})).
+        let metadata = miden_protocol::note::NoteMetadata::new(
+            miden_protocol::note::PartialNoteMetadata::new(
+                aid(BRIDGE),
+                miden_protocol::note::NoteType::Public,
+            ),
+            &miden_protocol::note::NoteAttachments::default(),
+        );
+        let key = miden_protocol::note::NoteId::new(note.details_commitment(), &metadata).to_hex();
+        // Simulate the crash: the LET index was reserved but the BridgeEvent was never emitted.
+        store.reserve_deposit_index(&key).await.unwrap();
+        assert!(
+            store.first_unemitted_reservation().await.unwrap().is_some(),
+            "precondition: a reserved-but-unemitted leaf exists (the crash window)"
         );
 
-        let logs = logs_in_range(&store, 0, 5).await;
-        assert_eq!(logs.len(), 1);
-        assert_eq!(bridge_deposit_count(&logs[0]), 1);
-
-        // Retry/restart: a fresh projector over the SAME store re-projects idempotently —
-        // indices are stable, nothing double-allocates, no second event.
-        let projector2 = test_projector(&store, &block_state).await;
-        let rewritten = projector2
-            .project_notes(
-                &[quarantined.clone(), valid.clone()],
-                &HashMap::new(),
-                5,
-                None,
-                &HashMap::new(),
-            )
+        // Re-project (restart): project_b2agg_note re-reserves idempotently + EMITS → the gate
+        // passes → the block seals. Recoverable, not a permanent halt.
+        let projector = test_projector(&store, &block_state).await;
+        let written = projector
+            .project_notes(&[note], &HashMap::new(), 5, None, &HashMap::new())
             .await
-            .unwrap();
-        assert_eq!(rewritten, 0, "replay emits nothing new");
+            .expect("a recoverable reserved-but-unemitted leaf must re-emit, not halt");
         assert_eq!(
-            store.get_deposit_count().await.unwrap(),
-            2,
-            "no re-allocation"
+            written, 1,
+            "the crash-reserved leaf re-emits its BridgeEvent"
+        );
+        assert!(
+            store.first_unemitted_reservation().await.unwrap().is_none(),
+            "the reservation is now emitted — no poison leaf remains"
+        );
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            5,
+            "the block seals once the crash-reserved leaf re-emits"
         );
     }
 

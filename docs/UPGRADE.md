@@ -210,3 +210,75 @@ re-upgrade against cloned state. `scripts/e2e-upgrade-test.sh` is a development
 fixture for the versions pinned inside that script; it is not a standing claim
 that arbitrary release pairs are rollback-compatible. Update its pinned image,
 override, endpoints, and assertions before using it as release evidence.
+
+
+## Release-specific notes: v0.15.8 → this release
+
+Validated by an in-place upgrade test on 2026-07-19 (fresh v0.15.8 stack →
+traffic → force-recreate onto this image → traffic; event history preserved,
+tip continuous, certification-grade chaos verdict on the upgraded stack).
+
+### Store migrations (auto-applied on startup)
+
+Eight new migrations land on first boot of the new image
+(`011_nonce_reservations` … `018_claim_mint_expected`): fenced nonce
+reservations, durable submission handoffs, L1 finality/evidence policy state,
+per-exit deposit reservations, B2AGG identity backfill, and expected-mint
+tracking. They are additive and idempotent; no manual DDL. First startup after
+the upgrade may take marginally longer while they apply — wait for `/health`
+before restoring write traffic, per the standard procedure above.
+
+### New flags (both additive; absent flags preserve old behavior)
+
+- `--network-rpc-url ID=URL` (repeatable; env `NETWORK_RPC_URLS`) — per-origin-
+  network RPC for ERC-20 metadata recovery. REQUIRED for deployments bridging
+  tokens whose origin is a second rollup (e.g. `2=http://<l2b-rpc>`): without
+  it, `--restore` and the live recovery path cannot validate an L2B-origin
+  token's metadata preimage and will defer those bridge-outs fail-closed.
+  Network 0 continues to come from `--l1-rpc-url`.
+- `--reject-unverified-ger-injection` — audit-H6 hardening; see the flag's
+  help text. Recommended in production together with a `safe`/`finalized`
+  `--l1-evidence-tag`.
+
+### Behavior changes to know about
+
+- **`--restore` now rebuilds historical claims** (Phase 2.6, node scan): after
+  a full store recovery, aggkit's aggsender can resolve pre-recovery bridge
+  exits and certificate settlement resumes. GER/hash-chain history still
+  restarts by design (the chain rebuilds through live operation).
+- **Duplicate landed claims are accepted-and-reverted** (geth-faithful,
+  status-0x0, no ClaimEvent) instead of rejected at admission, so an external
+  claim sponsor's transaction manager can never wedge on a user front-run.
+- **Abandoned nonce slots self-heal**: a reservation whose transaction
+  provably never reached durable admission (crashed mid-flight or released as
+  failure) is reclaimable by a fresh transaction at the same nonce. Metric:
+  `nonce_reservation_abandoned_reclaimed_total{cause}`.
+
+### Upgrade-procedure hazard validated by this test: run from the SAME deployment directory
+
+The e2e/compose deployment binds the Miden client store as a RELATIVE path
+(`./.miden-agglayer-data`). Recreating the service from a different checkout
+directory silently attaches a DIFFERENT store; if that store belongs to another
+chain, the client's sync is rejected by the node (`accept header validation
+failed`, genesis-commitment mismatch) and the synthetic tip freezes while the
+node keeps mining. This exact failure was reproduced during the v0.15.8→this
+release upgrade rehearsal. Rule: perform the image swap from the SAME compose
+working directory (or an absolute, unchanged store path) so every mount
+resolves identically — then verify sync (zero accept-header errors) and tip
+advancement before restoring traffic. The upgraded proxy resyncs cleanly
+through blocks mined during the swap window.
+
+> **Validated (2026-07-19, clean-rebuild rehearsal):** fresh v0.15.8 stack →
+> in-place upgrade to this release in the same deployment dir → **event history
+> preserved (no loss), tip continuous, post-upgrade L1↔Miden + L2↔L2 (all four
+> directions + same-address clash) GREEN, and the chaos completeness verifier
+> PASSED exact-block (ALLOW_LATE=0) with foreign/private garbo contained
+> (zero leaks).**
+
+### Operational follow-ups shipped with this release
+
+The operations runbook gained incident procedures for the two known
+silent-freeze modes — "Stuck GER injection (interrupted `ger_insert`)" and
+"ntx-builder silent death" (`docs/operations/runbook.md` §4) — including their
+monitoring signals and watchdog allowances. Review alerting against those
+sections when rolling this release out.

@@ -96,6 +96,19 @@ struct Command {
     #[arg(long, env = "L1_RPC_URL")]
     l1_rpc_url: Option<String>,
 
+    /// Additional per-origin-network RPC endpoints for Cantina #13 metadata
+    /// recovery, as `ID=URL` (e.g. `--network-rpc-url 2=http://anvil-l2b:8545`).
+    /// Network 0 is taken from `--l1-rpc-url`. Repeatable — one per network whose
+    /// tokens (L2B, …) may need ERC-20 metadata recovered from their own chain
+    /// during restore (finding #62). Without it, only network-0 (L1) tokens
+    /// recover — the pre-#62 behavior.
+    #[arg(
+        long = "network-rpc-url",
+        value_name = "ID=URL",
+        env = "NETWORK_RPC_URLS"
+    )]
+    network_rpc_urls: Vec<String>,
+
     /// L1 GER contract address for exit root resolution
     #[arg(long, env = "GER_L1_ADDRESS")]
     ger_l1_address: Option<String>,
@@ -856,6 +869,27 @@ async fn main() -> anyhow::Result<()> {
 
     let sync_listener = Arc::new(StoreSyncListener::new(store.clone(), block_state.clone()));
 
+    // Finding #62: per-origin-network RPC map for Cantina #13 metadata recovery.
+    // Network 0 = L1 (from --l1-rpc-url); extra networks (L2B=2, …) from
+    // --network-rpc-url ID=URL. Consumed by both the live projector and --restore
+    // so an L2B-origin ERC-20 recovers its metadata from its OWN chain.
+    let network_rpcs = {
+        let mut m = miden_agglayer_service::metadata_recovery::NetworkRpcMap::new();
+        if let Some(l1) = command.l1_rpc_url.clone() {
+            m.insert(0, l1);
+        }
+        for spec in &command.network_rpc_urls {
+            let (id, url) = spec
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--network-rpc-url must be ID=URL, got: {spec}"))?;
+            let id: u32 = id.parse().map_err(|e| {
+                anyhow::anyhow!("--network-rpc-url network id must be a u32, got '{id}': {e}")
+            })?;
+            m.insert(id, url.to_string());
+        }
+        m
+    };
+
     // Register the projector LAST so it observes the same consumed-note feed the
     // monitors saw this tick, then advances the synthetic tip itself (no race —
     // it is the only writer of `latest_block_number`, Finding #5).
@@ -865,7 +899,7 @@ async fn main() -> anyhow::Result<()> {
             block_state.clone(),
             &accounts.0,
             local_network_id_u32,
-            command.l1_rpc_url.clone(),
+            network_rpcs.clone(),
             // Use the same resolved node URL as MidenClient, including its localhost default.
             miden_agglayer_service::miden_client::effective_node_url(command.miden_node.clone()),
             command.miden_api_key.clone(),
@@ -916,7 +950,7 @@ async fn main() -> anyhow::Result<()> {
             &accounts.0,
             local_network_id_u32,
             &block_state,
-            command.l1_rpc_url.clone(),
+            network_rpcs.clone(),
             restore_node_url.as_str(),
             command.miden_api_key.as_deref(),
         )
@@ -1319,6 +1353,7 @@ mod hardening_tests {
             bridge_address: miden_agglayer_service::bridge_address::DEFAULT_BRIDGE_ADDRESS
                 .to_string(),
             l1_rpc_url: None,
+            network_rpc_urls: vec![],
             ger_l1_address: None,
             l1_indexer_from_block: None,
             l1_evidence_tag: "latest".to_string(),

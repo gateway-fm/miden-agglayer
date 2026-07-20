@@ -21,7 +21,7 @@
 //! [`FaucetEntry`]: crate::store::FaucetEntry
 //! [`AggLayerBridge::faucet_metadata_map_slot_name`]: miden_base_agglayer::AggLayerBridge
 
-use miden_base_agglayer::{AggLayerBridge, AggLayerFaucet, MetadataHash};
+use miden_base_agglayer::{AggLayerBridge, MetadataHash};
 use miden_protocol::account::{Account, AccountId, AccountStorage, StorageSlotContent};
 use miden_protocol::{Felt, Word};
 
@@ -31,6 +31,16 @@ use miden_protocol::{Felt, Word};
 /// registry (e.g. re-run `admin_registerFaucet` with the correct name) or supply
 /// a reachable L1 RPC for the token's origin network.
 pub const METADATA_UNRECOVERABLE_METRIC: &str = "bridge_out_metadata_unrecoverable_total";
+
+/// Maps an `origin_network` id → the RPC URL that serves that network's token
+/// contracts (network 0 = L1, network 2 = a second rollup / L2B, …). Cantina #13
+/// metadata recovery uses it to fetch ERC-20 `name()`/`symbol()`/`decimals()`
+/// from the token's ACTUAL origin chain instead of always dialing L1 — a token
+/// whose origin is L2B (origin_network=2) would otherwise be validated against
+/// the wrong chain and fail the keccak gate (finding #62). An empty map means "no
+/// RPC for any network" (recovery falls back to the all-Miden candidate only),
+/// which is exactly the pre-#62 behavior when no `l1_rpc_url` was configured.
+pub type NetworkRpcMap = std::collections::HashMap<u32, String>;
 
 /// Native-ETH sentinel: an all-zero origin token address. Native ETH legitimately
 /// carries empty metadata and must never be touched by recovery.
@@ -340,15 +350,24 @@ pub fn find_registered_faucet_for_origin(
 
 /// Build the all-Miden recovery candidate from the faucet account.
 ///
-/// NOTE: the AggLayer faucet sets its token name == symbol and stores a
-/// *sanitised* symbol, so this candidate only validates for tokens whose origin
-/// `name == symbol` and whose symbol survived sanitisation unchanged. It is tried
-/// first because it needs no RPC; the keccak gate makes trying it safe.
+/// Accepts BOTH supported faucet kinds via [`crate::faucet_ops::classify_faucet_account`]:
+/// an AggLayer-owned wrapped faucet (foreign-origin tokens) AND a native operator
+/// `FungibleFaucet` (Miden-originated tokens). This matters for a NATIVE token whose
+/// `origin_network` is this Miden deployment: there is no external chain to query for its
+/// ERC-20 metadata, so the Miden faucet is the ONLY authoritative source — and its
+/// registered preimage is `abi.encode(name, symbol, decimals)` with `name == symbol` (the
+/// admin register-native path defaults `name` to `symbol`). Previously this tried only
+/// `AggLayerFaucet::try_faucet_from_account`, so an externally-deployed native operator
+/// faucet yielded NO candidate and its metadata was unrecoverable on restore — a poison
+/// leaf that halts the entire restore. Behavior for AggLayer faucets is unchanged (classify
+/// tries that type first). Both kinds expose the same `token_name()`/`symbol()`. The token
+/// name still must equal the symbol for the candidate to validate; the keccak gate makes
+/// trying it safe.
 fn miden_faucet_candidate(
     faucet_account: &Account,
     origin_decimals: u8,
 ) -> Option<MetadataCandidate> {
-    let faucet = AggLayerFaucet::try_faucet_from_account(faucet_account).ok()?;
+    let (_kind, faucet) = crate::faucet_ops::classify_faucet_account(faucet_account).ok()?;
     Some(MetadataCandidate {
         name: faucet.token_name().as_str().to_string(),
         symbol: faucet.symbol().to_string(),
@@ -641,6 +660,73 @@ mod tests {
             assert_eq!(origin.origin_address, USDC);
             assert_eq!(origin.origin_network, 6);
             assert_eq!(origin.scale, 10);
+        }
+
+        // ── Finding #62 — multi-network restore-metadata ─────────────────────
+
+        /// The per-network RPC selection (the exact `network_rpcs.get(&n)` used at
+        /// the two restore recovery sites) routes an L2B-origin (network 2) token
+        /// to the L2B RPC and an L1 (network 0) token to the L1 RPC — and yields
+        /// None for an unmapped network (recovery then relies on the all-Miden
+        /// candidate only, the pre-#62 behavior). This is what stops an L2B token
+        /// being validated against the wrong (L1) chain and failing the keccak gate.
+        #[test]
+        fn finding_62_network_rpc_map_selects_rpc_by_origin_network() {
+            let mut rpcs = NetworkRpcMap::new();
+            rpcs.insert(0, "http://l1:8545".to_string());
+            rpcs.insert(2, "http://anvil-l2b:8545".to_string());
+
+            assert_eq!(rpcs.get(&0).map(String::as_str), Some("http://l1:8545"));
+            assert_eq!(
+                rpcs.get(&2).map(String::as_str),
+                Some("http://anvil-l2b:8545")
+            );
+            // An unmapped network (e.g. a third rollup we weren't configured for)
+            // selects no RPC — recovery falls back to the all-Miden candidate.
+            assert_eq!(rpcs.get(&3).map(String::as_str), None);
+            // Empty map == pre-#62 "no L1 RPC configured": every lookup is None.
+            assert_eq!(NetworkRpcMap::new().get(&0).map(String::as_str), None);
+        }
+
+        /// A restore rebuild for an L2B-origin faucet (origin_network=2) must carry
+        /// the correct `symbol` and `origin_network` into the rebuilt row. The
+        /// symbol comes from the Miden faucet account (network-independent), so it
+        /// survives restore regardless of which chain the metadata PREIMAGE is
+        /// recovered from — proving the registry row itself is network-agnostic
+        /// and only the metadata-preimage RPC (tested above) was single-network.
+        #[tokio::test]
+        async fn finding_62_restore_rebuilds_l2b_origin_row_with_symbol() {
+            let faucet = faucet_id();
+            // origin_network = 2 (L2B), a token that would previously be validated
+            // against L1 and lose its metadata.
+            let bridge_storage = fabricate_bridge_storage(faucet, USDC, 2, 4);
+            let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+
+            let conv = read_faucet_conversion_metadata(&bridge_storage, faucet).unwrap();
+            assert_eq!(conv.origin_network, 2, "L2B network must decode faithfully");
+            let miden_decimals = 6u8;
+            store
+                .register_faucet(FaucetEntry {
+                    faucet_id: faucet,
+                    origin_address: conv.origin_address,
+                    origin_network: conv.origin_network,
+                    symbol: "MOP".into(),
+                    origin_decimals: miden_decimals + conv.scale,
+                    miden_decimals,
+                    scale: conv.scale,
+                    metadata: vec![],
+                })
+                .await
+                .unwrap();
+
+            let origin = resolve_faucet_origin(faucet, &*store)
+                .await
+                .expect("rebuilt L2B row must resolve");
+            assert_eq!(origin.origin_network, 2);
+            assert_eq!(origin.origin_address, USDC);
+            let row = store.get_faucet_by_id(faucet).await.unwrap().unwrap();
+            assert_eq!(row.symbol, "MOP", "L2B token symbol must survive restore");
+            assert_eq!(row.origin_network, 2);
         }
     }
 

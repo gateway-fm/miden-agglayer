@@ -2087,6 +2087,145 @@ async fn test_pgstore_reserve_nonce() {
     ));
 }
 
+/// Wedge #5 — abandoned-slot reclamation. An admission that crashes AFTER
+/// `reserve_nonce` but BEFORE durable admission leaves the slot `executing`
+/// with an expired lease and NO `transactions` row; a DIFFERENT tx must then
+/// take it over (fence bumps, zombie fenced out). Guard: the same expired slot
+/// WITH a durable `transactions` row stays hash-bound (HeldByOther).
+#[tokio::test]
+async fn test_pgstore_wedge5_abandoned_slot_reclamation() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let base = rand_u64();
+    let addr = format!("0x{:040x}", (base ^ 0x5ED5) as u128);
+    let h1 = TxHash::from([(base % 199) as u8 + 3; 32]);
+    let h2 = TxHash::from([(base % 193) as u8 + 4; 32]);
+    let lease = std::time::Duration::from_secs(90);
+
+    let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 9, h1, lease).await.unwrap()
+    else {
+        panic!("fresh slot must be Won");
+    };
+    // A VALID executing lease still hard-rejects a different tx.
+    assert_eq!(
+        store.reserve_nonce(&addr, 9, h2, lease).await.unwrap(),
+        NonceReservation::HeldByOther(h1)
+    );
+
+    // Backdate the lease via raw SQL — the crashed-admission signature
+    // (executing, expired, never durably admitted).
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let (client, conn) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    client
+        .execute(
+            "UPDATE nonce_reservations SET lease_expires_at = now() - interval '1 second'
+             WHERE signer = $1 AND nonce = 9",
+            &[&addr.to_lowercase()],
+        )
+        .await
+        .expect("backdate lease");
+
+    // Expired + unadmitted → the DIFFERENT tx reclaims with a bumped fence.
+    let NonceReservation::Won { fence: fence2 } =
+        store.reserve_nonce(&addr, 9, h2, lease).await.unwrap()
+    else {
+        panic!("an abandoned (expired, unadmitted) slot must be reclaimable by a different tx");
+    };
+    assert!(fence2 > fence, "reclamation must bump the fence");
+    // The zombie owner is fenced out; the reclaiming owner keeps the slot.
+    store
+        .release_reservation(&addr, 9, h1, fence, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reserve_nonce(&addr, 9, h2, lease).await.unwrap(),
+        NonceReservation::OwnedBySame,
+        "the zombie's fenced-out release must not evict the reclaiming owner"
+    );
+
+    // Guard: expired but durably ADMITTED (transactions row exists) stays held.
+    let h3 = TxHash::from([(base % 191) as u8 + 5; 32]);
+    let h4 = TxHash::from([(base % 181) as u8 + 6; 32]);
+    assert!(matches!(
+        store.reserve_nonce(&addr, 10, h3, lease).await.unwrap(),
+        NonceReservation::Won { .. }
+    ));
+    store.txn_begin(h3, dummy_txn_entry()).await.unwrap();
+    client
+        .execute(
+            "UPDATE nonce_reservations SET lease_expires_at = now() - interval '1 second'
+             WHERE signer = $1 AND nonce = 10",
+            &[&addr.to_lowercase()],
+        )
+        .await
+        .expect("backdate lease");
+    assert_eq!(
+        store.reserve_nonce(&addr, 10, h4, lease).await.unwrap(),
+        NonceReservation::HeldByOther(h3),
+        "an expired slot with a durable transactions row must stay hash-bound"
+    );
+}
+
+/// Wedge #5 (PR#145 blocker 1) — the identical production transition on
+/// PostgreSQL: a slot released as FAILURE whose hash was never durably admitted
+/// (pre-admission error path, e.g. writer-queue saturation after the
+/// reservation) is reclaimable by a DIFFERENT tx immediately, fence bumped; a
+/// `released_failure` slot WITH a durable `transactions` row stays hash-bound.
+#[tokio::test]
+async fn test_pgstore_wedge5_released_failure_reclamation() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use crate::store::NonceReservation;
+    let base = rand_u64();
+    let addr = format!("0x{:040x}", (base ^ 0x5EDF) as u128);
+    let h1 = TxHash::from([(base % 197) as u8 + 7; 32]);
+    let h2 = TxHash::from([(base % 179) as u8 + 8; 32]);
+    let lease = std::time::Duration::from_secs(90);
+
+    // Released failure, NEVER durably admitted → reclaimable immediately.
+    let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 11, h1, lease).await.unwrap()
+    else {
+        panic!("fresh slot must be Won");
+    };
+    store
+        .release_reservation(&addr, 11, h1, fence, false)
+        .await
+        .unwrap();
+    let NonceReservation::Won { fence: fence2 } =
+        store.reserve_nonce(&addr, 11, h2, lease).await.unwrap()
+    else {
+        panic!("released_failure without durable admission must be reclaimable");
+    };
+    assert!(fence2 > fence, "reclamation must bump the fence");
+
+    // Released failure WITH a durable transactions row → stays hash-bound.
+    let h3 = TxHash::from([(base % 173) as u8 + 9; 32]);
+    let h4 = TxHash::from([(base % 167) as u8 + 10; 32]);
+    let NonceReservation::Won { fence: fence3 } =
+        store.reserve_nonce(&addr, 12, h3, lease).await.unwrap()
+    else {
+        panic!("fresh slot must be Won");
+    };
+    store.txn_begin(h3, dummy_txn_entry()).await.unwrap();
+    store
+        .release_reservation(&addr, 12, h3, fence3, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reserve_nonce(&addr, 12, h4, lease).await.unwrap(),
+        NonceReservation::HeldByOther(h3),
+        "a released_failure slot with a durable transactions row must stay hash-bound"
+    );
+}
+
 /// BLOCKER 1 — FULL two-replica shared-PostgreSQL races. Two PgStore handles over
 /// the SAME database (two "replicas") reserve the SAME (signer, nonce) slot.
 #[tokio::test]

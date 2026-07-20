@@ -242,14 +242,42 @@ struct RecoveredBridgeBody {
     attachments: NoteAttachments,
 }
 
+/// Finding #69 — a public CLAIM body recovered straight from the node scan.
+/// Unlike the client-store path, the node's public note record retains the
+/// full `NoteMetadata` (sender), which is the provenance the mint-proof half of
+/// [`classify_claim_note`] needs after `--reset-miden-store` wiped the local
+/// output-note records.
+struct RecoveredClaimBody {
+    details: NoteDetails,
+    metadata: NoteMetadata,
+    attachments: NoteAttachments,
+}
+
+#[derive(Default)]
 struct RecoveredBridgeOuts {
     id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
     by_id: std::collections::HashMap<NoteId, RecoveredBridgeBody>,
+    /// Finding #69 — CLAIM bodies collected by the same block walk.
+    claim_id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
+    claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody>,
 }
 
 struct ReplayBridgeOut {
     id: NoteId,
     body: RecoveredBridgeBody,
+    block: u64,
+    tx_order: u32,
+}
+
+/// Finding #69 — a bridge-consumed CLAIM joined to its consuming bridge
+/// transaction: the node-scan analogue of the client-store records Phase 2.5
+/// replays. `block`/`tx_order` come from the bridge's authoritative
+/// `sync_transactions` execution order, so the synthetic ClaimEvent lands at
+/// the claim's ORIGINAL consumption block (Miden-1:1), which is exactly what
+/// aggkit's aggsender needs to resolve a pre-recovery bridge exit to a block.
+struct ReplayClaim {
+    id: NoteId,
+    body: RecoveredClaimBody,
     block: u64,
     tx_order: u32,
 }
@@ -266,7 +294,7 @@ pub async fn restore(
     accounts: &AccountsConfig,
     local_network_id: u32,
     block_state: &Arc<BlockState>,
-    l1_rpc_url: Option<String>,
+    network_rpcs: crate::metadata_recovery::NetworkRpcMap,
     node_url: &str,
     api_key: Option<&str>,
 ) -> anyhow::Result<RestoreResult> {
@@ -329,9 +357,10 @@ pub async fn restore(
         "Phase 1.5 complete: found {} B2AGG note(s)",
         recovered.by_id.len()
     );
-    let bridge_replay = restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
-        .await
-        .map_err(|e| anyhow::anyhow!("restore bridge-out ordering scan failed: {e:#}"))?;
+    let (bridge_replay, claim_replay) =
+        restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
+            .await
+            .map_err(|e| anyhow::anyhow!("restore bridge-out ordering scan failed: {e:#}"))?;
     if bridge_replay.len() as u64 != let_leaves {
         anyhow::bail!(
             "restore bridge-out cardinality mismatch at Miden block {miden_tip}: \
@@ -401,7 +430,7 @@ pub async fn restore(
     // aborts restore.
     tracing::info!("Phase 1.7: rebuilding faucet identities from bridge state (Cantina #6)...");
     let faucet_identities_rebuilt =
-        restore_faucet_identities(store, miden_client, accounts, l1_rpc_url.clone()).await?;
+        restore_faucet_identities(store, miden_client, accounts, &network_rpcs).await?;
     tracing::info!(
         "Phase 1.7 complete: {faucet_identities_rebuilt} faucet identity row(s) rebuilt"
     );
@@ -414,7 +443,7 @@ pub async fn restore(
         accounts.bridge.0,
         local_network_id,
         block_state,
-        l1_rpc_url.clone(),
+        &network_rpcs,
         bridge_replay,
     )
     .await?;
@@ -439,6 +468,31 @@ pub async fn restore(
         restore_claims(store, miden_client, accounts, block_state, miden_tip).await?;
     total_logs += claim_logs;
     tracing::info!("Phase 2.5 complete: {claims} claims, {claim_logs} logs");
+
+    // Phase 2.6: Replay node-scanned bridge-consumed CLAIM notes — finding #69
+    //
+    // Phase 2.5's source is the local miden-client store, which
+    // `--reset-miden-store` wipes — so a from-scratch recovery restored ZERO
+    // historical claims, and aggkit's aggsender could never resolve its last
+    // settled certificate's "last imported bridge exit" to a block ("no claim
+    // found for bridge exit hash …") → Miden-side certificate settlement dead
+    // after a full recovery. This phase replays the SAME claims from the node
+    // scan (Phase 1.5) joined to the bridge's consuming transactions, at their
+    // original consumption blocks. The shared `project_claim_parts` dedups make
+    // 2.5 + 2.6 idempotent in either order. Deliberately CLAIMS ONLY — the
+    // historical GER/UpdateHashChain view still resets by design.
+    tracing::info!("Phase 2.6: replaying node-scanned CLAIM notes (finding #69)...");
+    let node_claims = restore_claims_from_node(
+        store,
+        block_state,
+        claim_replay,
+        accounts.service.0,
+        accounts.bridge.0,
+    )
+    .await?;
+    total_logs += node_claims;
+    tracing::info!("Phase 2.6 complete: {node_claims} claims from node scan");
+    let claims = claims + node_claims;
 
     // Phase 3: Scan consumed UpdateGerNote notes on Miden
     tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
@@ -545,8 +599,12 @@ async fn scan_bridge_out_bodies(
 ) -> anyhow::Result<RecoveredBridgeOuts> {
     use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
+    let claim_root = miden_base_agglayer::ClaimNote::script().root();
     let mut by_id = std::collections::HashMap::new();
     let mut id_by_nullifier = std::collections::HashMap::new();
+    let mut claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody> =
+        std::collections::HashMap::new();
+    let mut claim_id_by_nullifier = std::collections::HashMap::new();
     let mut scanned = 0usize;
     for b in 0..=to_block {
         let block = rpc
@@ -567,6 +625,10 @@ async fn scan_bridge_out_bodies(
                     let id = note.id();
                     let nullifier = note.nullifier();
                     let attachments = note.attachments().clone();
+                    // Finding #69: capture the public note's metadata BEFORE the
+                    // details conversion drops it — it carries the sender the
+                    // mint-proof provenance path needs post `--reset-miden-store`.
+                    let metadata = *note.metadata();
                     let details: NoteDetails = note.into();
                     if is_b2agg_note(&details) {
                         if by_id
@@ -584,6 +646,26 @@ async fn scan_bridge_out_bodies(
                         if id_by_nullifier.insert(nullifier, id).is_some() {
                             anyhow::bail!("recovery: duplicate B2AGG nullifier {nullifier}");
                         }
+                    } else if details.script().root() == claim_root {
+                        // Finding #69: retain public CLAIM bodies so restore can
+                        // replay historical ClaimEvents even when the client
+                        // store (Phase 2.5's source) was reset.
+                        if claims_by_id
+                            .insert(
+                                id,
+                                RecoveredClaimBody {
+                                    details,
+                                    metadata,
+                                    attachments,
+                                },
+                            )
+                            .is_some()
+                        {
+                            anyhow::bail!("recovery: duplicate CLAIM NoteId {id}");
+                        }
+                        if claim_id_by_nullifier.insert(nullifier, id).is_some() {
+                            anyhow::bail!("recovery: duplicate CLAIM nullifier {nullifier}");
+                        }
                     }
                 }
             }
@@ -596,6 +678,7 @@ async fn scan_bridge_out_bodies(
                 to_block,
                 scanned,
                 b2agg = by_id.len(),
+                claims = claims_by_id.len(),
                 "recovery scan: progress"
             );
         }
@@ -607,24 +690,28 @@ async fn scan_bridge_out_bodies(
         to_block,
         blocks_scanned = scanned,
         b2agg = by_id.len(),
-        "recovery scan complete: B2AGG bridge-out notes found on the node"
+        claims = claims_by_id.len(),
+        "recovery scan complete: B2AGG bridge-out + CLAIM notes found on the node"
     );
 
     Ok(RecoveredBridgeOuts {
         id_by_nullifier,
         by_id,
+        claim_id_by_nullifier,
+        claims_by_id,
     })
 }
 
 /// Joins the recovered bodies to bridge-consumed inputs. The execution-chain helper and
 /// input iteration already produce exact `(block, tx, input)` order, so no second sort or
-/// commitment-based identity recovery is needed.
+/// commitment-based identity recovery is needed. One `sync_transactions` fetch feeds both
+/// the B2AGG replay and (finding #69) the CLAIM replay.
 async fn restore_bridge_replay(
     rpc: &dyn miden_client::rpc::NodeRpcClient,
     bridge_id: AccountId,
-    recovered: RecoveredBridgeOuts,
+    mut recovered: RecoveredBridgeOuts,
     to_block: u32,
-) -> anyhow::Result<Vec<ReplayBridgeOut>> {
+) -> anyhow::Result<(Vec<ReplayBridgeOut>, Vec<ReplayClaim>)> {
     use miden_protocol::block::BlockNumber;
 
     let txs = rpc
@@ -636,7 +723,11 @@ async fn restore_bridge_replay(
         .await
         .map_err(|e| anyhow::anyhow!("restore: sync bridge transactions 0..{to_block}: {e}"))?;
 
-    build_bridge_replay(&txs, bridge_id, recovered)
+    let claims_by_id = std::mem::take(&mut recovered.claims_by_id);
+    let claim_id_by_nullifier = std::mem::take(&mut recovered.claim_id_by_nullifier);
+    let bridge_replay = build_bridge_replay(&txs, bridge_id, recovered)?;
+    let claim_replay = build_claim_replay(&txs, bridge_id, claims_by_id, claim_id_by_nullifier)?;
+    Ok((bridge_replay, claim_replay))
 }
 
 fn build_bridge_replay(
@@ -647,6 +738,7 @@ fn build_bridge_replay(
     let RecoveredBridgeOuts {
         id_by_nullifier,
         mut by_id,
+        ..
     } = recovered;
     let mut replay = Vec::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
@@ -680,6 +772,49 @@ fn build_bridge_replay(
     Ok(replay)
 }
 
+/// Finding #69 — join node-scanned CLAIM bodies to the bridge's consuming
+/// transactions, exactly like [`build_bridge_replay`] does for B2AGG (input
+/// note header id, or nullifier fallback). A CLAIM that joins here was
+/// provably consumed by OUR bridge — the MA#3 consumer trust root — which is
+/// the provenance [`classify_claim_note`] accepts regardless of minter.
+fn build_claim_replay(
+    txs: &[miden_client::rpc::domain::transaction::TransactionRecord],
+    bridge_id: AccountId,
+    mut claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody>,
+    claim_id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
+) -> anyhow::Result<Vec<ReplayClaim>> {
+    let mut replay = Vec::new();
+    for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
+        for input in tx.transaction_header.input_notes().iter() {
+            let id = input
+                .header()
+                .map(|header| header.id())
+                .or_else(|| claim_id_by_nullifier.get(&input.nullifier()).copied());
+            let Some(id) = id else { continue };
+            let Some(body) = claims_by_id.remove(&id) else {
+                continue;
+            };
+            if let Some(header) = input.header()
+                && header.details_commitment() != body.details.commitment()
+            {
+                anyhow::bail!("restore: CLAIM NoteId {id} body/transaction commitment mismatch");
+            }
+            replay.push(ReplayClaim {
+                id,
+                body,
+                block,
+                tx_order: order,
+            });
+        }
+    }
+    tracing::info!(
+        bridge = %bridge_id,
+        claims = replay.len(),
+        "restore: bridge-consumed CLAIM replay built from transaction execution order (finding #69)"
+    );
+    Ok(replay)
+}
+
 /// Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet `faucet_registry` rows
 /// from the bridge's authoritative `faucet_metadata_map`.
 ///
@@ -697,11 +832,13 @@ async fn restore_faucet_identities(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
     accounts: &AccountsConfig,
-    l1_rpc_url: Option<String>,
+    network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
 ) -> anyhow::Result<usize> {
     let store_clone = store.clone();
     let bridge_id = accounts.bridge.0;
-    let l1_url = l1_rpc_url;
+    // Owned clone moved into the `with(...)` closure; per-faucet RPC selection is
+    // keyed on the faucet's origin_network (finding #62 multi-network recovery).
+    let network_rpcs = network_rpcs.clone();
 
     let count = Arc::new(std::sync::Mutex::new(0usize));
     let count_inner = count.clone();
@@ -754,7 +891,9 @@ async fn restore_faucet_identities(
                         &bridge_account,
                         faucet_id,
                         &conversion,
-                        l1_url.as_deref(),
+                        network_rpcs
+                            .get(&conversion.origin_network)
+                            .map(String::as_str),
                     )
                     .await
                     {
@@ -824,11 +963,14 @@ async fn restore_bridge_outs(
     bridge_id: AccountId,
     local_network_id: u32,
     block_state: &Arc<BlockState>,
-    l1_rpc_url: Option<String>,
+    network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
     bridge_replay: Vec<ReplayBridgeOut>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
+    // Owned clone moved into the `with(...)` closure; per-bridge-out RPC selection
+    // is keyed on the resolved faucet origin_network (finding #62).
+    let network_rpcs = network_rpcs.clone();
     let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     let result_inner = result.clone();
 
@@ -864,7 +1006,7 @@ async fn restore_bridge_outs(
                         block_hash,
                         bridge_address,
                         Some(&mut *client),
-                        l1_rpc_url.as_deref(),
+                        &network_rpcs,
                     )
                     .await?;
                     if outcome == B2AggRestoreOutcome::Emitted {
@@ -918,7 +1060,7 @@ pub(crate) async fn project_b2agg_note(
     block_hash: [u8; 32],
     bridge_address: &str,
     client: Option<&mut MidenClientLib>,
-    l1_rpc_url: Option<&str>,
+    network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
 ) -> anyhow::Result<B2AggRestoreOutcome> {
     let details = note.details();
     if !is_b2agg_note(details) {
@@ -1124,7 +1266,9 @@ pub(crate) async fn project_b2agg_note(
             faucet_id,
             bridge_account.as_ref(),
             faucet_account.as_ref(),
-            l1_rpc_url,
+            // Finding #62: dial the token's ACTUAL origin-network RPC (L1 for
+            // network 0, L2B for network 2, …) so the keccak gate validates.
+            network_rpcs.get(&origin.origin_network).map(String::as_str),
         )
         .await
     };
@@ -1565,25 +1709,61 @@ pub(crate) async fn project_claim_note(
     block_hash: [u8; 32],
     bridge_address: &str,
 ) -> anyhow::Result<ClaimProjectOutcome> {
+    let note_id_str = hex::encode(note.details_commitment().as_bytes());
+    let effective_metadata = note
+        .metadata()
+        .or_else(|| output_metadata.get(&note.details_commitment().as_bytes()));
+    project_claim_parts(
+        store,
+        note_id_str,
+        note.details(),
+        effective_metadata,
+        note.consumer_account(),
+        note.attachments(),
+        expected_sender,
+        bridge_id,
+        block_number,
+        block_hash,
+        bridge_address,
+    )
+    .await
+}
+
+/// Core of the CLAIM derivation over PLAIN note parts, so it serves both note
+/// sources: client-store [`InputNoteRecord`]s (the live projector + Phase 2.5,
+/// via the [`project_claim_note`] adapter) and node-scanned public bodies
+/// (Phase 2.6, finding #69 — where the client store was reset and the metadata
+/// comes from the node's public record, with consumer attribution proven by
+/// the bridge's `sync_transactions` join). Behavior is byte-identical to the
+/// pre-refactor `project_claim_note`: same gates, same dedups, same atomic
+/// commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn project_claim_parts(
+    store: &Arc<dyn Store>,
+    note_id_str: String,
+    details: &NoteDetails,
+    effective_metadata: Option<&NoteMetadata>,
+    consumer_account: Option<AccountId>,
+    attachments: &NoteAttachments,
+    expected_sender: AccountId,
+    bridge_id: AccountId,
+    block_number: u64,
+    block_hash: [u8; 32],
+    bridge_address: &str,
+) -> anyhow::Result<ClaimProjectOutcome> {
     let claim_root = miden_base_agglayer::ClaimNote::script().root();
-    let details = note.details();
     if details.script().root() != claim_root {
         return Ok(ClaimProjectOutcome::Skipped);
     }
-
-    let note_id_str = hex::encode(note.details_commitment().as_bytes());
 
     // Provenance gate — BEFORE any storage read, dedup mark, or emission
     // (the MA#28 posture). On a chain shared with a foreign miden-agglayer
     // deployment, foreign claims share our ClaimNote script root; projecting
     // them poisons synthetic_logs with ClaimEvents our L1 never saw.
-    let effective_metadata = note
-        .metadata()
-        .or_else(|| output_metadata.get(&note.details_commitment().as_bytes()));
     if classify_claim_note(
-        note.consumer_account(),
+        consumer_account,
         effective_metadata,
-        note.attachments(),
+        attachments,
         expected_sender,
         bridge_id,
     ) == ClaimNoteVerdict::Foreign
@@ -1592,7 +1772,7 @@ pub(crate) async fn project_claim_note(
         tracing::warn!(
             target: "restore::claims",
             note_id = %note_id_str,
-            consumer = ?note.consumer_account(),
+            consumer = ?consumer_account,
             sender = ?effective_metadata.map(|m| m.sender()),
             expected_sender = %expected_sender,
             bridge = %bridge_id,
@@ -1683,20 +1863,44 @@ pub(crate) async fn project_claim_note(
     // envelope), a reconstruct when it is ABSENT — either derived-hash synthesis (no real
     // eth-tx), OR the crash window where the note→hash link survived but the envelope did
     // NOT (which the derived-hash-only backfill would never repair, so the ClaimEvent would
-    // otherwise ride a hash with empty calldata forever). Best-effort: unrecoverable faucet
-    // metadata leaves the envelope absent (empty calldata; operator registers the faucet,
-    // backfill heals) — non-fatal, the ClaimEvent still commits below.
-    if let Err(e) =
-        insert_pending_claim_calldata(store, details.storage(), &note_id_str, &tx_hash).await
-    {
-        tracing::warn!(
-            target: "restore::claims",
-            note_id = %note_id_str,
-            tx_hash = %tx_hash,
-            error = %format!("{e:#}"),
-            "synthesised claim: calldata pre-insert failed (transient — the projector \
-             backfill retries next tick)"
-        );
+    // otherwise ride a hash with empty calldata forever).
+    //
+    // FAIL-CLOSED (MA#27 review follow-up): if the calldata cannot be ensured — either a
+    // transient error, or `Ok(false)` because the faucet metadata preimage is unrecoverable
+    // — DO NOT publish the ClaimEvent and DO NOT mark the note processed. Return an error so
+    // block projection RETRIES on a later tick (once the faucet is registered the
+    // reconstruction succeeds and the event emits with valid calldata). Publishing here
+    // would seal an IMMUTABLE ClaimEvent riding a hash with empty calldata: aggkit's
+    // full-claim parser wedges ("input too short: 0 bytes"), and because the note is marked
+    // processed nothing ever retries. A projector halt (surfaced via the metric + log below)
+    // is the correct fail-closed posture — the claim is already provably ours (the
+    // provenance gate ran above), so unrecoverable calldata is a real operator-actionable
+    // registry gap, not a note to skip.
+    match insert_pending_claim_calldata(store, details.storage(), &note_id_str, &tx_hash).await {
+        Ok(true) => {}
+        Ok(false) => {
+            ::metrics::counter!("synthetic_claim_calldata_fail_closed_total").increment(1);
+            tracing::error!(
+                target: "restore::claims",
+                note_id = %note_id_str,
+                tx_hash = %tx_hash,
+                global_index = %hex::encode(decoded.global_index),
+                "synthesised claim: full claimAsset calldata UNRECOVERABLE (faucet metadata \
+                 not in registry) — refusing to publish a ClaimEvent with empty calldata; \
+                 projection HALTS and retries (operator: register/repair the faucet)"
+            );
+            anyhow::bail!(
+                "claim {note_id_str}: full claimAsset calldata unrecoverable — fail-closed, \
+                 projection will retry (register/repair faucet metadata to unblock)"
+            );
+        }
+        Err(e) => {
+            ::metrics::counter!("synthetic_claim_calldata_fail_closed_total").increment(1);
+            return Err(e.context(format!(
+                "claim {note_id_str}: failed to ensure claimAsset calldata before publishing \
+                 ClaimEvent — fail-closed, projection will retry"
+            )));
+        }
     }
 
     store
@@ -1837,6 +2041,57 @@ async fn restore_claims(
 
     let (count, logs) = *result.lock().unwrap();
     Ok((count, logs))
+}
+
+/// Phase 2.6 (finding #69): replay bridge-consumed CLAIM notes recovered by the
+/// NODE scan — the source that survives `--reset-miden-store`, unlike Phase
+/// 2.5's client-store records. Each claim is projected at its original
+/// consumption block via [`project_claim_parts`]; `consumer_account` is our
+/// bridge by construction (the `sync_transactions` join proved the bridge
+/// consumed it — the MA#3 trust root), and the node's public metadata provides
+/// the MA#28 mint-proof fallback. Returns the number of ClaimEvents emitted
+/// (each is also one synthetic log).
+async fn restore_claims_from_node(
+    store: &Arc<dyn Store>,
+    block_state: &Arc<BlockState>,
+    mut claim_replay: Vec<ReplayClaim>,
+    expected_sender: AccountId,
+    bridge_id: AccountId,
+) -> anyhow::Result<usize> {
+    // The join already yields execution order; keep it deterministic even if a
+    // future refactor changes the producer.
+    claim_replay.sort_by_key(|item| (item.block, item.tx_order));
+    let bridge_address = get_bridge_address();
+    let mut emitted = 0usize;
+    for replay in claim_replay {
+        let note_id_str = hex::encode(replay.body.details.commitment().as_bytes());
+        let block_hash = block_state.get_block_hash(replay.block);
+        tracing::debug!(
+            target: "restore::claims",
+            note = %replay.id,
+            block = replay.block,
+            "restore: replaying node-scanned CLAIM (finding #69)"
+        );
+        if project_claim_parts(
+            store,
+            note_id_str,
+            &replay.body.details,
+            Some(&replay.body.metadata),
+            Some(bridge_id),
+            &replay.body.attachments,
+            expected_sender,
+            bridge_id,
+            replay.block,
+            block_hash,
+            bridge_address,
+        )
+        .await?
+            == ClaimProjectOutcome::Emitted
+        {
+            emitted += 1;
+        }
+    }
+    Ok(emitted)
 }
 
 /// Outcome of projecting one consumed note through the GER derivation.
@@ -2592,6 +2847,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         };
         let replay = build_bridge_replay(&[tx], bridge_id, recovered).unwrap();
         assert_eq!(replay.iter().map(|item| item.id).collect::<Vec<_>>(), ids);
@@ -2643,7 +2899,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2682,7 +2938,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2727,7 +2983,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2765,7 +3021,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2806,7 +3062,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2865,7 +3121,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2917,7 +3173,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -2963,7 +3219,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -3048,7 +3304,7 @@ mod tests {
             [7u8; 32],
             get_bridge_address(),
             None,
-            None,
+            &crate::metadata_recovery::NetworkRpcMap::new(),
         )
         .await
         .unwrap();
@@ -3292,6 +3548,18 @@ mod tests {
     /// `consumer`, with a per-test `gi_byte` to keep global indexes distinct
     /// across tests (Dedup 2 keys on global_index).
     fn claim_input_note(consumer: Option<AccountId>, gi_byte: u8) -> InputNoteRecord {
+        // Default: empty metadata → truthful by hash → reconstructable with no registry entry.
+        claim_input_note_meta(consumer, gi_byte, &[])
+    }
+
+    /// Like [`claim_input_note`] but with a caller-chosen metadata preimage, so a test can
+    /// force a claim whose full calldata is UNRECOVERABLE (a non-empty metadata hash with no
+    /// registry preimage that hashes to it) — the fail-closed path.
+    fn claim_input_note_meta(
+        consumer: Option<AccountId>,
+        gi_byte: u8,
+        metadata: &[u8],
+    ) -> InputNoteRecord {
         use miden_base_agglayer::{
             ClaimNote, ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData,
             MetadataHash, ProofData, SmtNode,
@@ -3321,7 +3589,7 @@ mod tests {
                 destination_network: 1,
                 destination_address: EthAddress::new([0xCD; 20]),
                 amount: EthAmount::new(amount_bytes),
-                metadata_hash: MetadataHash::from_abi_encoded(&[]),
+                metadata_hash: MetadataHash::from_abi_encoded(metadata),
             },
             miden_claim_amount: Felt::ZERO,
         };
@@ -3335,6 +3603,174 @@ mod tests {
             consumed_tx_order: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
+    // ── Finding #69 — node-scan CLAIM replay (Phase 2.6) ─────────────────────
+
+    /// Finding #69 (a): `build_claim_replay` joins a node-scanned CLAIM body to
+    /// the bridge transaction that consumed it via the NULLIFIER fallback (the
+    /// input-note commitment carries no header), yielding the claim at the
+    /// bridge tx's authoritative `(block, tx_order)`.
+    #[test]
+    fn finding69_build_claim_replay_joins_by_nullifier_fallback() {
+        use miden_client::rpc::domain::transaction::TransactionRecord;
+        use miden_protocol::asset::FungibleAsset;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::Nullifier;
+        use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
+
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        let details = claim_input_note(Some(bridge_id), 0x69).details().clone();
+        let (metadata, attachments) = make_metadata(id(TEST_SENDER_MANAGER), Some(bridge_id));
+        let note_id = miden_protocol::note::NoteId::new(details.commitment(), &metadata);
+
+        let nullifier = Nullifier::from_raw(Word::new([Felt::new(9).unwrap(); 4]));
+        // No header on the input commitment → the join MUST fall back to the
+        // nullifier map (the shape `ConsumedExternal` history produces).
+        let inputs = InputNotes::new(vec![InputNoteCommitment::from_parts_unchecked(
+            nullifier, None,
+        )])
+        .unwrap();
+        let tx = TransactionRecord {
+            block_num: BlockNumber::from(11u32),
+            transaction_header: TransactionHeader::new(
+                bridge_id,
+                Word::default(),
+                Word::new([Felt::new(1).unwrap(); 4]),
+                inputs,
+                vec![],
+                FungibleAsset::new(faucet_id, 0).unwrap(),
+            ),
+            output_notes: vec![],
+            erased_output_notes: vec![],
+        };
+
+        let claims_by_id = std::collections::HashMap::from([(
+            note_id,
+            RecoveredClaimBody {
+                details,
+                metadata,
+                attachments,
+            },
+        )]);
+        let claim_id_by_nullifier = std::collections::HashMap::from([(nullifier, note_id)]);
+
+        let replay =
+            build_claim_replay(&[tx], bridge_id, claims_by_id, claim_id_by_nullifier).unwrap();
+        assert_eq!(replay.len(), 1, "the consumed claim must join exactly once");
+        assert_eq!(replay[0].id, note_id);
+        assert_eq!(
+            (replay[0].block, replay[0].tx_order),
+            (11, 0),
+            "claim must carry the consuming bridge tx's (block, tx_order)"
+        );
+    }
+
+    /// Finding #69 (b): `project_claim_parts` over node-scanned parts
+    /// (consumer = our bridge, metadata sender = our service) emits a
+    /// ClaimEvent, marks the note processed, does NOT seal the block, and is
+    /// idempotent — the second call short-circuits on Dedup 1.
+    #[tokio::test]
+    async fn finding69_project_claim_parts_emits_and_dedups() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let bridge_id = id(TEST_TARGET_BRIDGE);
+        let service = id(TEST_SENDER_MANAGER);
+        let details = claim_input_note(Some(bridge_id), 0x77).details().clone();
+        let (metadata, attachments) = make_metadata(service, Some(bridge_id));
+        let note_id_str = hex::encode(details.commitment().as_bytes());
+
+        let outcome = project_claim_parts(
+            &store,
+            note_id_str.clone(),
+            &details,
+            Some(&metadata),
+            Some(bridge_id),
+            &attachments,
+            service,
+            bridge_id,
+            9,
+            [9u8; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ClaimProjectOutcome::Emitted);
+        assert!(store.is_claim_note_processed(&note_id_str).await.unwrap());
+        let mut gi = [0u8; 32];
+        gi[31] = 0x77;
+        assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+        assert_eq!(
+            store.get_latest_block_number().await.unwrap(),
+            0,
+            "a node-scan claim replay must not seal its block"
+        );
+
+        let again = project_claim_parts(
+            &store,
+            note_id_str.clone(),
+            &details,
+            Some(&metadata),
+            Some(bridge_id),
+            &attachments,
+            service,
+            bridge_id,
+            9,
+            [9u8; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again,
+            ClaimProjectOutcome::Skipped,
+            "second replay of the same claim must dedup"
+        );
+    }
+
+    /// Finding #69 (c): a FOREIGN claim (consumed by a foreign bridge, minted
+    /// by a foreign sender) fed through `project_claim_parts` is a fail-closed
+    /// skip — no ClaimEvent, no processed mark.
+    #[tokio::test]
+    async fn finding69_project_claim_parts_foreign_is_fail_closed_skip() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let bridge_id = id(TEST_TARGET_BRIDGE);
+        let service = id(TEST_SENDER_MANAGER);
+        let foreign_sender = id(TEST_SENDER_ATTACKER);
+        let foreign_bridge = id(TEST_TARGET_OTHER);
+        let details = claim_input_note(Some(foreign_bridge), 0x78)
+            .details()
+            .clone();
+        // Foreign deployment: minted by the foreign service, targeting the
+        // foreign bridge — neither our consumer proof nor our mint proof holds.
+        let (metadata, attachments) = make_metadata(foreign_sender, Some(foreign_bridge));
+        let note_id_str = hex::encode(details.commitment().as_bytes());
+
+        let outcome = project_claim_parts(
+            &store,
+            note_id_str.clone(),
+            &details,
+            Some(&metadata),
+            Some(foreign_bridge),
+            &attachments,
+            service,
+            bridge_id,
+            9,
+            [9u8; 32],
+            get_bridge_address(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ClaimProjectOutcome::Skipped);
+        assert!(
+            !store.is_claim_note_processed(&note_id_str).await.unwrap(),
+            "foreign claim must not be marked processed"
+        );
+        let mut gi = [0u8; 32];
+        gi[31] = 0x78;
+        assert!(
+            !store.has_claim_event_for_global_index(&gi).await.unwrap(),
+            "foreign claim must not emit a ClaimEvent"
+        );
     }
 
     /// RED→GREEN PoC for the live finding: a consumed claim-shaped note whose
@@ -3928,6 +4364,55 @@ mod tests {
         assert!(
             data.envelope.input().len() > 4 + 64 * 32,
             "full calldata (proofs included), not a stub"
+        );
+    }
+
+    /// #67 gap 1 — FAIL-CLOSED reconstruction. A claim that is provably OURS (consumed by our
+    /// bridge) but whose full claimAsset calldata is UNRECOVERABLE (a non-empty metadata hash
+    /// with no registry preimage) must NOT publish a ClaimEvent and must NOT mark the note
+    /// processed: `project_claim_note` returns `Err` so block projection retries (once the
+    /// faucet is registered the reconstruction succeeds). PRE-#67 this fell through and sealed
+    /// an IMMUTABLE ClaimEvent riding a hash with empty calldata — aggkit's full-claim parser
+    /// wedges forever and, because the note was marked processed, nothing ever retries.
+    #[tokio::test]
+    async fn project_claim_note_fail_closed_when_calldata_unrecoverable() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        // Non-empty metadata hash with NO registry preimage → unrecoverable calldata. Consumed
+        // by OUR bridge so it passes the provenance gate and reaches the reconstruction step.
+        let note = claim_input_note_meta(
+            Some(id(TEST_TARGET_BRIDGE)),
+            0x93,
+            b"preimage the registry never saw",
+        );
+        let note_id = hex::encode(note.details_commitment().as_bytes());
+
+        let outcome = project_claim_note(
+            &store,
+            &note,
+            &std::collections::HashMap::new(),
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            8831,
+            [0xAA; 32],
+            get_bridge_address(),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "unrecoverable calldata must FAIL CLOSED (Err → projection retries), not emit"
+        );
+        // No ClaimEvent was sealed …
+        let mut gi = [0u8; 32];
+        gi[31] = 0x93;
+        assert!(
+            !store.has_claim_event_for_global_index(&gi).await.unwrap(),
+            "no ClaimEvent may exist for a claim whose calldata is unrecoverable"
+        );
+        // … and the note is NOT marked processed, so a later tick (post faucet-registration)
+        // re-runs the projection instead of a permanent fast-skip.
+        assert!(
+            !store.is_claim_note_processed(&note_id).await.unwrap(),
+            "the note must NOT be marked processed — projection must be able to retry"
         );
     }
 

@@ -1681,9 +1681,11 @@ impl Store for PgStore {
                 let state: String = row.get(1);
                 let expired: bool = row.get(2);
                 let fence: i64 = row.get(3);
-                // A nonce slot is permanently bound to its first transaction hash.
-                // Expiry only permits recovery by that exact signed transaction; a
-                // replacement is unsafe because the prior external outcome may be ambiguous.
+                // A nonce slot is bound to its first transaction hash. Expiry
+                // permits recovery by that exact signed transaction; a DIFFERENT
+                // replacement is unsafe while the prior external outcome may be
+                // ambiguous — it may only take over an ABANDONED slot (executing,
+                // lease expired, never durably admitted; wedge-#5 rule below).
                 let same_tx = row_hash.eq_ignore_ascii_case(&hash_str);
                 let takeover = same_tx
                     && (state == "released_failure" || state == "released_success" || expired);
@@ -1709,16 +1711,96 @@ impl Store for PgStore {
                 } else if row_hash.eq_ignore_ascii_case(&hash_str) {
                     NonceReservation::OwnedBySame
                 } else {
-                    // NIT — propagate a parse error WITH context instead of
-                    // substituting the zero hash.
-                    let other =
-                        <TxHash as std::str::FromStr>::from_str(&row_hash).map_err(|e| {
-                            anyhow::anyhow!(
-                                "nonce_reservations row for signer {key} nonce {nonce} has an \
+                    // Wedge #5 — ABANDONED-slot reclamation for a DIFFERENT tx.
+                    // The reservation is taken BEFORE durable admission
+                    // (`txn_begin*`), which itself precedes any external submit.
+                    // Two paths leave a provably-unadmitted slot behind:
+                    //   * a CRASH in that window → `executing` with an expiring
+                    //     lease (the owner is contractually dead — a live
+                    //     admission renews its lease);
+                    //   * a NORMAL pre-admission error (e.g.
+                    //     `WriterQueueSaturatedError` in
+                    //     `dispatch_after_reservation`, which fails after the
+                    //     reservation but before `txn_begin_if_absent`) → the
+                    //     outer path releases `released_failure`.
+                    // In both, the bound hash is absent from `transactions` and
+                    // the nonce is unadvanced. External submitters (the
+                    // zkevm-bridge-service claimtxman) sign a FRESH tx per retry
+                    // — never the bound hash — so without this rule such a slot
+                    // rejects every retry at its nonce forever (observed live:
+                    // sponsor wedged at nonce 78 until operator surgery).
+                    // Reclaim iff: (`executing` AND lease expired) OR
+                    // `released_failure`, AND the bound hash was never durably
+                    // admitted (no `transactions` row ⇒ provably nothing was
+                    // submitted externally ⇒ a replacement is unambiguous).
+                    // `released_success` slots and any slot WITH a durable row
+                    // stay permanently hash-bound (receipt identity / pending-tx
+                    // machinery).
+                    let reclaim_cause = if state == "released_failure" {
+                        Some("released_failure")
+                    } else if state == "executing" && expired {
+                        Some("expired_executing")
+                    } else {
+                        None
+                    };
+                    let abandoned_cause = match reclaim_cause {
+                        Some(cause) => {
+                            let admitted: bool = tx
+                                .query_one(
+                                    "SELECT EXISTS(SELECT 1 FROM transactions WHERE tx_hash = $1)",
+                                    &[&row_hash],
+                                )
+                                .await?
+                                .get(0);
+                            if admitted { None } else { Some(cause) }
+                        }
+                        None => None,
+                    };
+                    if let Some(cause) = abandoned_cause {
+                        let new_fence = fence + 1;
+                        tx.execute(
+                            "UPDATE nonce_reservations SET tx_hash = $5, state = 'executing',
+                             lease_expires_at = now() + ($3 || ' seconds')::interval,
+                             fence_token = $4
+                             WHERE signer = $1 AND nonce = $2",
+                            &[
+                                &key,
+                                &(nonce as i64),
+                                &lease_secs.to_string(),
+                                &new_fence,
+                                &hash_str,
+                            ],
+                        )
+                        .await?;
+                        ::metrics::counter!(
+                            "nonce_reservation_abandoned_reclaimed_total",
+                            "cause" => cause
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            signer = %key,
+                            nonce,
+                            cause,
+                            abandoned_tx = %row_hash,
+                            new_tx = %hash_str,
+                            "reserve_nonce: reclaimed an abandoned admission slot \
+                             (never durably admitted) for a different tx (wedge #5)"
+                        );
+                        NonceReservation::Won {
+                            fence: new_fence as u64,
+                        }
+                    } else {
+                        // NIT — propagate a parse error WITH context instead of
+                        // substituting the zero hash.
+                        let other =
+                            <TxHash as std::str::FromStr>::from_str(&row_hash).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "nonce_reservations row for signer {key} nonce {nonce} has an \
                              unparsable tx_hash {row_hash:?}: {e}"
-                            )
-                        })?;
-                    NonceReservation::HeldByOther(other)
+                                )
+                            })?;
+                        NonceReservation::HeldByOther(other)
+                    }
                 }
             }
         };

@@ -1294,16 +1294,46 @@ impl Store for InMemoryStore {
                 Ok(NonceReservation::Won { fence: 1 })
             }
             Some(r) => {
-                // A nonce slot is permanently bound to its first tx hash. Even a
-                // failed or expired attempt may have crossed an external side-effect
-                // boundary, so a different replacement can never take it over.
+                // A nonce slot is bound to its first tx hash: a failed or expired
+                // attempt may have crossed an external side-effect boundary, so a
+                // different replacement may only take over an ABANDONED slot (see
+                // the wedge-#5 rule below), never a released or admitted one.
                 let takeover = r.tx_hash == tx_hash
                     && (matches!(
                         r.state,
                         ReservationState::ReleasedFailure | ReservationState::ReleasedSuccess
                     ) || r.lease_expires_at <= now);
-                if takeover {
+                // Wedge #5 — ABANDONED-slot reclamation for a DIFFERENT tx: the
+                // reservation precedes durable admission, so a crash in that
+                // window leaves `executing` + expired lease, and a NORMAL
+                // pre-admission error (e.g. writer-queue saturation) releases
+                // `released_failure` — in both cases with no durable
+                // `transactions` row (provably nothing was submitted externally).
+                // External submitters sign a fresh tx per retry, so without this
+                // such a slot rejects every retry at its nonce forever.
+                // Mirrors the PgStore rule; LRU eviction could theoretically make
+                // an admitted hash look absent here, but this in-memory store is
+                // test/dev-only — PostgreSQL is authoritative in deployments.
+                let abandoned_state = (r.state == ReservationState::Executing
+                    && r.lease_expires_at <= now)
+                    || r.state == ReservationState::ReleasedFailure;
+                let abandoned = r.tx_hash != tx_hash
+                    && abandoned_state
+                    && !self.transactions.lock().contains(&r.tx_hash);
+                if takeover || abandoned {
                     let fence = r.fence + 1;
+                    if abandoned {
+                        let cause = if r.state == ReservationState::ReleasedFailure {
+                            "released_failure"
+                        } else {
+                            "expired_executing"
+                        };
+                        ::metrics::counter!(
+                            "nonce_reservation_abandoned_reclaimed_total",
+                            "cause" => cause
+                        )
+                        .increment(1);
+                    }
                     reservations.insert(
                         key,
                         Reservation {

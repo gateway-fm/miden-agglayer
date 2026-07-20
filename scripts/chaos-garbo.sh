@@ -65,6 +65,47 @@ counter() {
 PRIVATE_FIRED=0
 FOREIGN_FIRED=0
 FOREIGN_GIS=""
+PRIVATE_ATTEMPTS=0
+FOREIGN_ATTEMPTS=0
+PRIVATE_NOTE_IDS=""   # PR#145: exported so the soak can assert direct ID absence
+START=0   # set before the fire window opens; used by the retry helpers
+
+# ── #41: the injectors must actually FIRE under faults ───────────────────────
+# Under chaos (proxy restarts, pg pauses) a one-shot injection attempt fails and
+# a whole run used to end with private=0 foreign=0, so the soak's containment
+# check (c) could never assert. Every injection now (a) waits for the proxy to
+# be reachable, (b) retries the SAME op every ~10s until it lands or the
+# GARBO_DURATION window runs out. Attempts vs fired are both reported.
+window_remaining() {
+    local now; now=$(date +%s)
+    echo $(( GARBO_DURATION - (now - START) ))
+}
+
+proxy_ready() {
+    curl -sf -m 3 "${L2_RPC}/metrics" >/dev/null 2>&1
+}
+
+wait_proxy_ready() {
+    while [ "$(window_remaining)" -gt 0 ]; do
+        proxy_ready && return 0
+        sleep 5
+    done
+    return 1
+}
+
+# retry_until_landed <fn> — re-run <fn> (a garbo class that returns 0 iff the
+# injection landed) every ~10s, gated on proxy reachability, until it lands or
+# the window closes.
+retry_until_landed() {
+    local fn="$1"
+    while [ "$(window_remaining)" -gt 0 ]; do
+        wait_proxy_ready || return 1
+        if "$fn"; then return 0; fi
+        glog "GARBO retry: $fn did not land — retrying in 10s ($(window_remaining)s left)"
+        sleep 10
+    done
+    return 1
+}
 
 # ── setup: provision + fund a garbo wallet (for private-note sends) ──────────
 setup_garbo() {
@@ -103,24 +144,29 @@ setup_garbo() {
 garbo_private_note() {
     B2AGG_STORE_DIR="$GARBO_WALLET_STORE"
     local out note_id
+    PRIVATE_ATTEMPTS=$((PRIVATE_ATTEMPTS + 1))
     out=$(iso_tool --send-private-note --wallet-id "$WALLET_ID" 2>&1) || {
-        glog "GARBO private-note: send FAILED (transient?) — $(echo "$out" | tail -1)"; return; }
+        glog "GARBO private-note: send FAILED (transient?) — $(echo "$out" | tail -1)"; return 1; }
     note_id=$(echo "$out" | grep '\[private-note\] note-id:' | awk '{print $NF}')
     PRIVATE_FIRED=$((PRIVATE_FIRED + 1))
+    # PR#145: record the id so the soak can assert its ABSENCE from the proxy
+    # store directly (a leak persists rows before it is ever served).
+    [[ -n "$note_id" ]] && PRIVATE_NOTE_IDS="$PRIVATE_NOTE_IDS ${note_id#0x}"
     glog "GARBO private-note #$PRIVATE_FIRED id=${note_id:-?} — EXPECT: reconciler skips (synthetic_reconciler_private_skipped_total++), NEVER projected as a BridgeEvent/ClaimEvent"
 }
 
 # ── class: foreign-deployment claim (provenance gate) ────────────────────────
 garbo_foreign_claim() {
     B2AGG_STORE_DIR="$FOREIGN_STORE"
+    FOREIGN_ATTEMPTS=$((FOREIGN_ATTEMPTS + 1))
     _iso_wipe_store; mkdir -p "$B2AGG_STORE_DIR/tmp"
     local fb_out fs fg fbid ffaucet
     fb_out=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" 2>&1) || {
-        glog "GARBO foreign-claim: --create-foreign-bridge FAILED — $(echo "$fb_out" | tail -2)"; return; }
+        glog "GARBO foreign-claim: --create-foreign-bridge FAILED — $(echo "$fb_out" | tail -2)"; return 1; }
     fs=$(echo "$fb_out" | grep "service-id:" | awk '{print $NF}')
     fg=$(echo "$fb_out" | grep "ger-manager-id:" | awk '{print $NF}')
     fbid=$(echo "$fb_out" | grep -w "bridge-id:" | awk '{print $NF}')
-    [[ -n "$fs" && -n "$fg" && -n "$fbid" ]] || { glog "GARBO foreign-claim: could not parse foreign ids"; return; }
+    [[ -n "$fs" && -n "$fg" && -n "$fbid" ]] || { glog "GARBO foreign-claim: could not parse foreign ids"; return 1; }
     local fs_inner="${fs#0x}"
     local fdest="0x00000000${fs_inner:0:16}${fs_inner:16:14}00"
 
@@ -131,7 +177,7 @@ garbo_foreign_claim() {
     empty_meta=$(cast keccak 0x)
     amt_hex=$(printf '%064x' "$DEPOSIT_AMOUNT")
     leaf_packed="0x00$(printf '%08x' 0)$(printf '0%.0s' {1..40})$(printf '%08x' "$FOREIGN_NETWORK_ID")${fdest#0x}${amt_hex}${empty_meta#0x}"
-    [[ ${#leaf_packed} -eq 228 ]] || { glog "GARBO foreign-claim: bad packed leaf len"; return; }
+    [[ ${#leaf_packed} -eq 228 ]] || { glog "GARBO foreign-claim: bad packed leaf len"; return 1; }
     leaf=$(cast keccak "$leaf_packed")
     node="${leaf#0x}"; idx="$dcnt"
     for _ in $(seq 1 32); do
@@ -149,9 +195,9 @@ garbo_foreign_claim() {
     fc_out=$(iso_tool --submit-foreign-claim \
         --claim-calldata-file /store/foreign-claim-calldata.hex \
         --foreign-bridge-id "$fbid" --foreign-service-id "$fs" --foreign-ger-manager-id "$fg" \
-        --scale-exp 10 2>&1) || { glog "GARBO foreign-claim: --submit-foreign-claim FAILED — $(echo "$fc_out" | tail -3)"; return; }
+        --scale-exp 10 2>&1) || { glog "GARBO foreign-claim: --submit-foreign-claim FAILED — $(echo "$fc_out" | tail -3)"; return 1; }
     fgi=$(echo "$fc_out" | grep "global-index:" | awk '{print $NF}')
-    [[ -n "$fgi" ]] || { glog "GARBO foreign-claim: could not parse foreign global index"; return; }
+    [[ -n "$fgi" ]] || { glog "GARBO foreign-claim: could not parse foreign global index"; return 1; }
     FOREIGN_FIRED=$((FOREIGN_FIRED + 1))
     FOREIGN_GIS="$FOREIGN_GIS ${fgi#0x}"
     glog "GARBO foreign-claim #$FOREIGN_FIRED bridge=$fbid net=$FOREIGN_NETWORK_ID gi=$fgi — EXPECT: our proxy skips it (claim_event_foreign_skipped_total++), ZERO synthetic_logs ClaimEvent rows for gi ${fgi#0x}"
@@ -164,6 +210,9 @@ write_summary() {
         echo "GARBO_PRIVATE_FIRED=$PRIVATE_FIRED"
         echo "GARBO_FOREIGN_FIRED=$FOREIGN_FIRED"
         echo "GARBO_FOREIGN_GIS=\"$(echo $FOREIGN_GIS | xargs)\""
+        echo "GARBO_PRIVATE_ATTEMPTS=$PRIVATE_ATTEMPTS"
+        echo "GARBO_FOREIGN_ATTEMPTS=$FOREIGN_ATTEMPTS"
+        echo "GARBO_PRIVATE_NOTE_IDS=\"$(echo $PRIVATE_NOTE_IDS | xargs)\""
     } > "$GARBO_SUMMARY"
     glog "summary -> $GARBO_SUMMARY (private=$PRIVATE_FIRED foreign=$FOREIGN_FIRED)"
 }
@@ -172,18 +221,30 @@ trap write_summary EXIT
 : > "$GARBO_LOG"
 glog "=== chaos-garbo start (dur=${GARBO_DURATION}s seed=$SEED foreign=$GARBO_FOREIGN net=$FOREIGN_NETWORK_ID) ==="
 if ! setup_garbo; then
-    glog "setup incomplete — running with whatever classes are available"
+    glog "setup incomplete — will retry setup inside the fire window (#41)"
 fi
 
 START=$(date +%s)
 # Fire the heavy foreign-claim class ONCE early (it needs several minutes).
-if [[ "$GARBO_FOREIGN" == "1" ]]; then garbo_foreign_claim; fi
+# #41: retried until it actually lands (or the window closes) — a one-shot
+# attempt during a proxy restart used to end the run with foreign=0.
+if [[ "$GARBO_FOREIGN" == "1" ]]; then
+    retry_until_landed garbo_foreign_claim \
+        || glog "GARBO foreign-claim: window closed before it landed (attempts=$FOREIGN_ATTEMPTS)"
+fi
 # Then spam private / tag-0 notes at random intervals for the rest of the window.
+# #41: each slot retries the SAME note until it lands; a run that got wallet
+# setup interrupted retries setup here instead of firing nothing forever.
 while [ $(( $(date +%s) - START )) -lt "$GARBO_DURATION" ]; do
     gap=$(( GARBO_MIN_GAP + RANDOM % (GARBO_MAX_GAP - GARBO_MIN_GAP + 1) ))
     sleep "$gap"
     [ $(( $(date +%s) - START )) -ge "$GARBO_DURATION" ] && break
-    [[ -n "${WALLET_ID:-}" ]] && garbo_private_note
+    if [[ -z "${WALLET_ID:-}" ]]; then
+        wait_proxy_ready && setup_garbo || glog "GARBO setup retry failed — will retry next slot"
+        continue
+    fi
+    retry_until_landed garbo_private_note || break
 done
 glog "=== chaos-garbo done: private=$PRIVATE_FIRED foreign=$FOREIGN_FIRED ==="
+glog "garbo attempts vs fired: private=$PRIVATE_ATTEMPTS/$PRIVATE_FIRED foreign=$FOREIGN_ATTEMPTS/$FOREIGN_FIRED"
 # EXIT trap writes the summary.

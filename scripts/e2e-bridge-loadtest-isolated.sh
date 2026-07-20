@@ -677,7 +677,25 @@ if [[ "${VERIFY:-1}" == "1" ]]; then
     VERIFY_RC=${PIPESTATUS[0]}
     r "verification exit: $VERIFY_RC"
 fi
-exit $(( LOCK_COUNT > 0 ? 1 : VERIFY_RC ))
+# PR#145: STRICT_OPS=1 (set by the mixed runner, which runs with VERIFY=0)
+# makes the OPERATIONAL result part of the exit — previously VERIFY=0 exited 0
+# even when submissions failed or submitted ops were never claimed, so the
+# parent's LT_RC could be a false green with missing L1 workload. The predicate
+# lives in lib-chaos-verdict.sh so the same rule is unit-tested and the parent
+# consumes a real exit code instead of parsing human-readable logs.
+OPS_RC=0
+if [[ "${STRICT_OPS:-0}" == "1" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/lib-chaos-verdict.sh"
+    if l1_ops_ok "$TOT_SUB_L1" "$PLAN_L1" "$TOT_SUB_L2" "$PLAN_L2" \
+                 "$TOT_FAIL_L1" "$TOT_FAIL_L2" "$G_CLM" "$G_SUB"; then
+        r "strict-ops verdict: OK (sub $TOT_SUB_L1/$PLAN_L1 + $TOT_SUB_L2/$PLAN_L2, fail 0, claimed $G_CLM/$G_SUB)"
+    else
+        OPS_RC=1
+        r "strict-ops verdict: FAIL — sub L1=$TOT_SUB_L1/$PLAN_L1 L2=$TOT_SUB_L2/$PLAN_L2 fail=$TOT_FAIL_L1/$TOT_FAIL_L2 claimed=$G_CLM/$G_SUB (incomplete L1 workload)"
+    fi
+fi
+exit $(( LOCK_COUNT > 0 ? 1 : (VERIFY_RC != 0 ? VERIFY_RC : OPS_RC) ))
 # Forensics: archive proxy logs (reconciler warnings, import errors, sweep
 # lines) so rung teardown can't destroy the evidence for a failed run.
 docker logs "$AGGLAYER_CONTAINER" > "$OUT_DIR/proxy-$STAMP.log" 2>&1 || true
