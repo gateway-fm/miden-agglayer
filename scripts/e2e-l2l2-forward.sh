@@ -268,10 +268,21 @@ if [[ "${RUN_L2B_NATIVE_ETH:-0}" == "1" ]]; then
     [[ "$ONCHAIN_GAS" != "0x0000000000000000000000000000000000000000" ]] \
         || fail "#147/leg3: L2B bridge gasTokenAddress is 0x0 — the custom-gas-token setup (finding #77) is not applied; native bridging reverts (0x14603c01). Fix setup-l2b.sh / create_rollup_parameters.json."
     ETH_MIDEN_UNITS=$(( ETH_WEI / 10000000000 ))
-    # #77: seed LBT(0, gasTokenAddress) BEFORE the out-bridge (else LocalBalanceTreeUnderflow
-    # / 0x14603c01). Seed 4x the out amount so the single out-bridge has ample margin.
-    step "#147/leg3: seeding L2B Local Balance Tree for the gas token (bridge L1->L2B + claim on L2B)"
-    seed_l2b_gastoken_lbt "$(( ETH_WEI * 4 ))"
+    # #77: the out-bridge needs LBT(0, gasTokenAddress) >= amount, else it reverts
+    # LocalBalanceTreeUnderflow (0x14603c01). The LBT is ON-CHAIN state that PERSISTS on the
+    # stack, so seeding is a ONE-TIME concern — NOT per forward run. Seed LAZILY: simulate the
+    # out-bridge (read-only cast call); only if it would underflow do we run the L1->L2B seed
+    # (bridge + claim), and then a LARGE amount so later runs on the same stack reuse it. This
+    # avoids re-running the seed CLAIM every round — that claim depends on aggoracle-l2b's slow,
+    # uneven L1->L2B GER-injection cadence and timed out intermittently (gate round 2, ~1/3).
+    if cast call "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
+         "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$ETH_WEI" "$ZERO_ADDR" true 0x \
+         --value "$ETH_WEI" --from "$ADMIN" --rpc-url "$L2B_RPC" >/dev/null 2>&1; then
+        log "#147/leg3: L2B LBT already funded for the gas token (out-bridge simulation succeeds) — skipping seed"
+    else
+        step "#147/leg3: LBT underfunded — seeding L2B Local Balance Tree (bridge L1->L2B + claim on L2B; large, reused by later runs)"
+        seed_l2b_gastoken_lbt "$(( ETH_WEI * 1000 ))"
+    fi
     # Bridge the L2B native gas token OUT to Miden (address(0), msg.value == amount).
     # Robust capture: check status==0x1 AND a non-empty tx hash; surface the on-chain
     # revert reason on failure (never a cryptic message, never a false PASS on empty).
