@@ -446,8 +446,14 @@ _s149_row() { pg "SELECT faucet_id||'|'||origin_network||'|'||encode(origin_addr
 # Constrain the native custom-name capture to the NATIVE route (origin_network ==
 # the proxy's own net id): symbol='WMDN' alone could select a foreign-origin WMDN
 # row on a warm/shared stack and prove survival of the WRONG route (PR #150).
-S149_NATIVE_ROW=$(_s149_row "symbol='WMDN' AND origin_network=${LOCAL_NETWORK_ID}")
-S149_NET2_ROW=$(_s149_row "origin_network=2")
+# REQUIRE non-empty metadata (octet_length > 0): a row whose preimage is empty
+# would still yield a non-empty _s149_row tuple, and the POST equality would accept
+# empty->empty — a false-green that never exercises recovery of the preimage (for
+# net-2, recovery from its OWN network RPC, finding #62). An empty-metadata row is
+# treated as ABSENT here, so the absent-row policy below (fail if REQUIRE, else skip)
+# applies (PR #150 re-review).
+S149_NATIVE_ROW=$(_s149_row "symbol='WMDN' AND origin_network=${LOCAL_NETWORK_ID} AND octet_length(metadata) > 0")
+S149_NET2_ROW=$(_s149_row "origin_network=2 AND octet_length(metadata) > 0")
 if [[ -n "$S149_NATIVE_ROW" && -n "$S149_NET2_ROW" ]]; then
     S149_CHECK=1
     S149_NATIVE_FID="${S149_NATIVE_ROW%%|*}"; S149_NET2_FID="${S149_NET2_ROW%%|*}"
@@ -455,7 +461,7 @@ if [[ -n "$S149_NATIVE_ROW" && -n "$S149_NET2_ROW" ]]; then
 elif [[ "${REQUIRE_S149_RESTORE:-0}" == "1" ]]; then
     # In the full overlay suite the prior L2L2/native phases MUST have created both
     # rows; a regression there must FAIL the release gate, not silently skip (PR #150).
-    fail "#149 restore-survival: REQUIRE_S149_RESTORE=1 but a prerequisite row is absent (native WMDN net=$LOCAL_NETWORK_ID: ${S149_NATIVE_ROW:-<none>} | net-2: ${S149_NET2_ROW:-<none>}) — a prior phase regressed"
+    fail "#149 restore-survival: REQUIRE_S149_RESTORE=1 but a prerequisite row is absent or has empty metadata (native WMDN net=$LOCAL_NETWORK_ID: ${S149_NATIVE_ROW:-<none>} | net-2: ${S149_NET2_ROW:-<none>}) — a prior phase regressed"
 else
     S149_CHECK=0
     log "#149 restore-survival: SKIP — no WMDN native and/or net-2 row present (standalone cantina13, REQUIRE_S149_RESTORE unset)"

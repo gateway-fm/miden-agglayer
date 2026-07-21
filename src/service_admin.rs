@@ -472,15 +472,46 @@ pub async fn admin_register_native_faucet(
         )
     })?;
 
-    // #149 — validate the caller-supplied values against authoritative chain state
-    // (symbol, decimals, and name each independently) and RESOLVE the metadata to
-    // persist/emit from the faucet account. Any mismatch bails here, before the
-    // bridge ConfigAggBridgeNote or the registry row — no partial state change.
+    // #149 — validate + register from AUTHORITATIVE state. Split out so the
+    // "successful read → mismatch → NO bridge ConfigAggBridgeNote" path is
+    // executable in a unit test (PR #150): the test calls `register_native_validated`
+    // with a materialized authoritative triple and asserts the bridge-register
+    // `with()` is never reached on a mismatch (test_call_count()==0 vs 1 on a match).
+    register_native_validated(
+        &state,
+        faucet_id,
+        origin_address,
+        origin_network,
+        scale,
+        &params,
+        &authoritative,
+    )
+    .await
+}
+
+/// #149 — the validate-then-register tail of `admin_register_native_faucet`, split
+/// out so it is unit-testable with a caller-supplied authoritative triple (the
+/// production caller reads that triple from the deployed faucet account first).
+///
+/// Validates the requested metadata against `authoritative` and, only if it passes,
+/// emits the bridge `ConfigAggBridgeNote` (via `register_faucet_in_bridge`) and
+/// persists the registry row — both built from the RESOLVED (authoritative) values.
+/// A mismatch returns `Err` BEFORE the `register_faucet_in_bridge` `with()` call, so
+/// no bridge note and no registry row are produced (no partial state).
+async fn register_native_validated(
+    state: &ServiceState,
+    faucet_id: AccountId,
+    origin_address: [u8; 20],
+    origin_network: u32,
+    scale: u8,
+    params: &RegisterNativeFaucetParams,
+    authoritative: &AuthoritativeFaucetMetadata,
+) -> anyhow::Result<String> {
     let resolved = resolve_native_faucet_metadata(
         params.name.as_deref(),
         &params.symbol,
         params.decimals,
-        &authoritative,
+        authoritative,
     )?;
 
     // abi.encode(name, symbol, decimals) — same preimage the bridge/L2 wrapped-token
@@ -720,6 +751,101 @@ mod tests {
             service.miden_client.test_call_count(),
             1,
             "bridge ConfigAggBridgeNote must not be emitted on a failed registration"
+        );
+    }
+
+    /// #149 (PR #150) — EXECUTABLE proof that a SUCCESSFUL authoritative read
+    /// FOLLOWED BY a metadata mismatch never reaches the bridge-register `with()`
+    /// (never emits a `ConfigAggBridgeNote`). `register_native_validated` takes a
+    /// materialized authoritative triple, so — unlike the endpoint test, whose mock
+    /// never runs the read closure — this drives the mismatch path directly.
+    /// `test_call_count() == 0` after a mismatch vs `== 1` after a match proves the
+    /// register `with()` is conditional on validation passing (not vacuously zero).
+    #[tokio::test]
+    async fn native_registration_mismatch_skips_bridge_registration() {
+        let service = create_test_service();
+        // A SUCCESSFUL authoritative read: the deployed faucet has symbol=MDN, decimals=8.
+        let auth = authoritative("MDN", "MDN", 8);
+        let faucet_id = AccountId::from_hex(&native_params(None).faucet_id).unwrap();
+        let origin = parse_eth_address(&native_params(None).origin_token_address).unwrap();
+        let net = service.network_id;
+
+        // symbol mismatch → Err, and the bridge-register with() is NEVER called.
+        let mut p = native_params(None);
+        p.symbol = "WRONG".into();
+        let err = register_native_validated(&service, faucet_id, origin, net, 0, &p, &auth)
+            .await
+            .expect_err("symbol mismatch must be rejected");
+        assert!(
+            err.to_string().contains("symbol mismatch"),
+            "unexpected: {err}"
+        );
+        assert_eq!(
+            service.miden_client.test_call_count(),
+            0,
+            "no bridge ConfigAggBridgeNote may be emitted on a symbol mismatch"
+        );
+        assert!(
+            service
+                .store
+                .get_faucet_by_origin(&origin, net)
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected registration must leave no registry row"
+        );
+
+        // decimals mismatch → Err, still no bridge call.
+        let mut pd = native_params(None);
+        pd.decimals = 6;
+        let err = register_native_validated(&service, faucet_id, origin, net, 0, &pd, &auth)
+            .await
+            .expect_err("decimals mismatch must be rejected");
+        assert!(
+            err.to_string().contains("decimals mismatch"),
+            "unexpected: {err}"
+        );
+        assert_eq!(service.miden_client.test_call_count(), 0);
+
+        // name mismatch (explicit custom name != authoritative) → Err, still no bridge call.
+        let err = register_native_validated(
+            &service,
+            faucet_id,
+            origin,
+            net,
+            0,
+            &native_params(Some("Not The Real Name")),
+            &auth,
+        )
+        .await
+        .expect_err("name mismatch must be rejected");
+        assert!(
+            err.to_string().contains("name mismatch"),
+            "unexpected: {err}"
+        );
+        assert_eq!(
+            service.miden_client.test_call_count(),
+            0,
+            "no bridge note emitted across the symbol/decimals/name mismatches"
+        );
+
+        // POSITIVE CONTROL: a MATCHING authoritative DOES reach the bridge-register
+        // with() (count 0 -> 1), proving the count==0 assertions above are meaningful.
+        register_native_validated(
+            &service,
+            faucet_id,
+            origin,
+            net,
+            0,
+            &native_params(None),
+            &auth,
+        )
+        .await
+        .expect("matching metadata registers");
+        assert_eq!(
+            service.miden_client.test_call_count(),
+            1,
+            "the register path DOES call the bridge with() when validation passes"
         );
     }
 

@@ -173,16 +173,17 @@ echo "$RESP" | grep -qi 'name mismatch' \
   || fail "#149: wrong-name registration should error 'name mismatch', got: $RESP"
 _no_registry_row "$BAD_NAME_ORIGIN" || fail "#149: wrong-name registration must leave NO registry row"
 # The no-row checks above are the store-side evidence. That the bridge
-# ConfigAggBridgeNote is NOT emitted on a mismatch is guaranteed STRUCTURALLY,
-# not by an on-chain probe here: admin_register_native_faucet calls the sole
-# validation gate `resolve_native_faucet_metadata(...)?` BEFORE the
-# register_faucet_in_bridge `.with()` call, so a mismatch (Err) returns before
-# any bridge note or store write. That per-field gate is unit-tested directly
-# (native_metadata_{symbol,decimals,name}_mismatch_rejected). (No reconciler
-# inference: FaucetRegistryReconciler is a tripwire keyed on faucet_id, not
-# origin, and these mismatches reuse the already-registered NATIVE_FAUCET_ID —
-# it cannot evidence a bad-origin note. PR #150 re-review.)
-pass "#149: mismatched symbol/decimals/name each rejected before any state change — NO registry row for any (bridge note skipped: validation Err precedes the register call; unit-tested gate)"
+# ConfigAggBridgeNote is NOT emitted on a mismatch is proven by an EXECUTABLE unit
+# regression: `native_registration_mismatch_skips_bridge_registration` drives a
+# SUCCESSFUL authoritative read followed by a mismatch through
+# `register_native_validated` and asserts the register_faucet_in_bridge `.with()`
+# is NEVER called (miden_client.test_call_count()==0), versus ==1 on a matching
+# control — so a mismatch provably reaches no bridge note (the register `.with()`
+# is conditional on validation passing). Per-field rejection is additionally
+# unit-tested on the pure gate (native_metadata_{symbol,decimals,name}_mismatch_
+# rejected). (No reconciler inference here: FaucetRegistryReconciler is a tripwire
+# keyed on faucet_id, and these mismatches reuse NATIVE_FAUCET_ID. PR #150.)
+pass "#149: mismatched symbol/decimals/name each rejected before any state change — NO registry row for any (bridge note skipped: proven by native_registration_mismatch_skips_bridge_registration, count==0 vs 1)"
 
 # ── 1d. #149 — a custom-name (name != symbol) faucet is preserved exactly ──────
 # Deploy a SECOND native faucet whose on-chain token NAME differs from its symbol
