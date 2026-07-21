@@ -182,6 +182,13 @@ struct Args {
     #[arg(long, default_value = "MDN")]
     native_symbol: String,
 
+    /// Custom token NAME for --create-native-faucet (Miden TokenName). Defaults to the
+    /// symbol when omitted. Use a distinct value to deploy a `name != symbol` faucet —
+    /// exercises issue #149 (registration must adopt/validate the on-chain token name,
+    /// and recovery must preserve a custom name's exact metadata preimage).
+    #[arg(long)]
+    native_name: Option<String>,
+
     /// Custom decimals for --create-native-faucet.
     #[arg(long, default_value_t = 8)]
     native_decimals: u8,
@@ -556,8 +563,14 @@ async fn main() -> anyhow::Result<()> {
         // 1. Deploy the operator-owned fungible faucet (custom symbol/decimals).
         let symbol = TokenSymbol::new(&args.native_symbol)
             .map_err(|e| anyhow!("invalid TokenSymbol {:?}: {e:?}", args.native_symbol))?;
-        let name =
-            TokenName::new(&symbol.to_string()).map_err(|e| anyhow!("invalid TokenName: {e:?}"))?;
+        // #149: name defaults to the symbol, but --native-name lets an external party
+        // deploy a custom-name (name != symbol) faucet. The proxy's registration reads
+        // this on-chain token name authoritatively; recovery must preserve it exactly.
+        let name_str = args
+            .native_name
+            .clone()
+            .unwrap_or_else(|| symbol.to_string());
+        let name = TokenName::new(&name_str).map_err(|e| anyhow!("invalid TokenName: {e:?}"))?;
         let faucet_component = FungibleFaucet::builder()
             .name(name)
             .symbol(symbol)

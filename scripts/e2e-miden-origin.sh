@@ -126,6 +126,84 @@ done
   || fail "native faucet origin_network='$NATIVE_NET', expected $MIDEN_NETWORK_ID (proxy must record the CONFIGURED net id)"
 pass "proxy allowlisted native faucet on the bridge (origin_network=$MIDEN_NETWORK_ID)"
 
+# ── 1c. #149 — registration validates against the deployed faucet account ─────
+# The deployed MDN faucet is authoritative (symbol=MDN, decimals=8). A registration
+# whose metadata DIFFERS from the faucet account must be REJECTED before any state
+# change, so recovery never has to reconstruct an unreconstructable preimage. Use a
+# FRESH origin address each time (idempotency keys on (origin_address, net) — a repeat
+# on the SAME origin would short-circuit and return the existing route without
+# validating). Assert: JSON-RPC error with the specific reason AND no registry row.
+step "1c. #149: mismatched native-faucet metadata is rejected before any state change"
+_reg_mismatch() { # $1=symbol $2=decimals $3=origin_addr  -> echoes the JSON response
+  curl -s "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+    \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+    \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$3\",
+      \"symbol\":\"$1\",\"decimals\":$2}]}" 2>/dev/null
+}
+BAD_SYM_ORIGIN="0x0bad51$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+BAD_DEC_ORIGIN="0x0badde$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+BAD_NAME_ORIGIN="0x0bad1a$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+# wrong symbol
+RESP=$(_reg_mismatch "WRONG" 8 "$BAD_SYM_ORIGIN")
+echo "$RESP" | grep -qi 'symbol mismatch' \
+  || fail "#149: wrong-symbol registration should error 'symbol mismatch', got: $RESP"
+[[ -z "$(pgq "SELECT 1 FROM faucet_registry WHERE lower(origin_address)=lower('${BAD_SYM_ORIGIN#0x}') OR lower(origin_address)=lower('$BAD_SYM_ORIGIN');")" ]] \
+  || fail "#149: wrong-symbol registration must leave NO registry row"
+# wrong decimals
+RESP=$(_reg_mismatch "MDN" 6 "$BAD_DEC_ORIGIN")
+echo "$RESP" | grep -qi 'decimals mismatch' \
+  || fail "#149: wrong-decimals registration should error 'decimals mismatch', got: $RESP"
+# wrong (non-matching) explicit name
+RESP=$(curl -s "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+  \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$BAD_NAME_ORIGIN\",
+    \"symbol\":\"MDN\",\"decimals\":8,\"name\":\"Not The Real Name\"}]}" 2>/dev/null)
+echo "$RESP" | grep -qi 'name mismatch' \
+  || fail "#149: wrong-name registration should error 'name mismatch', got: $RESP"
+pass "#149: mismatched symbol/decimals/name each rejected before any state change (no registry rows)"
+
+# ── 1d. #149 — a custom-name (name != symbol) faucet is preserved exactly ──────
+# Deploy a SECOND native faucet whose on-chain token NAME differs from its symbol
+# (--native-name), register it with `name` OMITTED so the proxy ADOPTS the authoritative
+# on-chain name, and assert the persisted metadata preimage carries the custom name
+# (never normalized to the symbol) — so its keccak hash is reconstructable on restore.
+step "1d. #149: custom-name (name != symbol) native faucet — name adopted + preserved"
+CUSTOM_NAME="Wrapped Midnight"
+CUSTOM_SYMBOL="WMDN"
+_cn_log="$(mktemp)"
+iso_tool --create-native-faucet --native-name "$CUSTOM_NAME" --native-symbol "$CUSTOM_SYMBOL" \
+    --native-decimals 8 --mint-units 0 --wallet-id "$WALLET_ID" > "$_cn_log" 2>&1 || true
+CUSTOM_FAUCET_ID=$(awk '/faucet-id:/{print $NF}' "$_cn_log")
+[[ -n "$CUSTOM_FAUCET_ID" ]] || { cat "$_cn_log"; rm -f "$_cn_log"; fail "#149: custom-name faucet deploy failed"; }
+rm -f "$_cn_log"
+CUSTOM_ORIGIN="0x0c0574$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+# Register with name OMITTED — the proxy must adopt the on-chain name "Wrapped Midnight".
+RESP=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+  \"params\":[{\"faucet_id\":\"$CUSTOM_FAUCET_ID\",\"origin_token_address\":\"$CUSTOM_ORIGIN\",
+    \"symbol\":\"$CUSTOM_SYMBOL\",\"decimals\":8}]}" 2>/dev/null) \
+  || fail "#149: custom-name registration (name omitted) should SUCCEED, got: $RESP"
+echo "$RESP" | python3 -c "import json,sys; sys.exit(0 if 'result' in json.load(sys.stdin) else 1)" \
+  || fail "#149: custom-name registration returned no result: $RESP"
+# Poll for the persisted metadata preimage, then assert it carries the custom NAME
+# (never collapsed to the symbol). The preimage is abi.encode(name, symbol, decimals),
+# so the UTF-8 bytes of both strings appear in it; name_hex must be present AND differ
+# from symbol_hex (proving name != symbol was preserved, not normalized).
+NAME_HEX=$(python3 -c "print('$CUSTOM_NAME'.encode().hex())")
+SYMBOL_HEX=$(python3 -c "print('$CUSTOM_SYMBOL'.encode().hex())")
+META_HEX=""
+for _i in $(seq 1 40); do
+    META_HEX=$(pgq "SELECT encode(metadata,'hex') FROM faucet_registry WHERE lower(faucet_id)=lower('$CUSTOM_FAUCET_ID');")
+    [[ -n "$META_HEX" && "$META_HEX" == *"$NAME_HEX"* ]] && break
+    sleep 3
+done
+[[ -n "$META_HEX" ]] || fail "#149: custom-name faucet_registry.metadata never persisted"
+[[ "$META_HEX" == *"$NAME_HEX"* ]] \
+  || fail "#149: persisted preimage must contain the custom name '$CUSTOM_NAME' (name_hex=$NAME_HEX); got metadata=$META_HEX"
+[[ "$NAME_HEX" != "$SYMBOL_HEX" ]] \
+  || fail "#149: test setup error — custom name must differ from symbol"
+pass "#149: custom name '$CUSTOM_NAME' (!= symbol '$CUSTOM_SYMBOL') adopted + preserved in the metadata preimage"
+
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> $DEST_LABEL (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
 # Bridge OUT to a FRESH funded account whose key we KEEP, so step 4 can approve + bridge
@@ -230,6 +308,92 @@ WRAPPED_SUPPLY=$(cast call "$WRAPPED_L2B" "totalSupply()(uint256)" --rpc-url "$D
 [[ "${WRAPPED_SUPPLY:-0}" -eq 0 ]] \
     || fail "wrapped native-Miden supply on L2B = $WRAPPED_SUPPLY, expected 0 (not fully burned)"
 pass "NET-ZERO: native holder = $NATIVE_BAL units; wrapped $DEST_LABEL supply = 0"
+
+# ── 1e. #149 — --restore preserves the native custom-name row AND a network-2 row ─
+# The restore side of #149: a custom-name (name != symbol) native faucet's metadata
+# preimage must be reconstructable from authoritative chain state after DB loss (it is,
+# because #149 persists the authoritative name), and multi-network recovery must rebuild
+# a network-2 (L2B-origin) row too. Register a net-2 token, drop + rebuild the proxy
+# store from on-chain (same runbook as e2e-cantina13-metadata-recovery.sh), and assert
+# BOTH rows survive with byte-identical metadata preimages. l2b-only (net-2 needs L2B).
+if [[ "$DEST" == "l2b" && "${RUN_1E_RESTORE:-0}" == "1" ]]; then
+    # 1e does a destructive drop + --reset-miden-store --restore. That must NOT run
+    # inside a looped/regression gate (it resets the shared stack mid-suite and any
+    # test after it on the same stack starts degraded). Gated behind RUN_1E_RESTORE=1
+    # so the gate runs it EXACTLY ONCE, as the final step, on an otherwise-quiet stack.
+    # Its assertions read faucet_registry via psql, which survives regardless.
+    step "1e. #149: drop + --restore preserves the native custom-name row AND a network-2 row"
+
+    # Add a network-2 (L2B-origin) wrapped-token row so a net-2 identity exists to recover.
+    NET2_ORIGIN="0x0e2b02$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+    RESP=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+      \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerFaucet\",
+      \"params\":[{\"symbol\":\"L2BT\",\"origin_token_address\":\"$NET2_ORIGIN\",
+        \"origin_network\":2,\"origin_decimals\":6}]}" 2>/dev/null) \
+      || fail "#149/1e: admin_registerFaucet (net-2) unreachable: $RESP"
+    NET2_FAUCET_ID=""
+    for _i in $(seq 1 40); do
+        NET2_FAUCET_ID=$(pgq "SELECT faucet_id FROM faucet_registry WHERE origin_network=2 AND (lower(origin_address)=lower('${NET2_ORIGIN#0x}') OR lower(origin_address)=lower('$NET2_ORIGIN'));")
+        [[ -n "$NET2_FAUCET_ID" ]] && break
+        sleep 3
+    done
+    [[ -n "$NET2_FAUCET_ID" ]] || fail "#149/1e: network-2 registry row never created (net-2 registration failed: $RESP)"
+    pass "1e PRE: network-2 (L2B-origin) token registered: faucet=$NET2_FAUCET_ID"
+
+    # Capture PRE metadata preimages for BOTH rows (WMDN native custom-name from 1d + net-2).
+    PRE_NATIVE_META=$(pgq "SELECT encode(metadata,'hex') FROM faucet_registry WHERE lower(faucet_id)=lower('$CUSTOM_FAUCET_ID');")
+    PRE_NET2_META=$(pgq "SELECT encode(metadata,'hex') FROM faucet_registry WHERE lower(faucet_id)=lower('$NET2_FAUCET_ID');")
+    [[ -n "$PRE_NATIVE_META" && -n "$PRE_NET2_META" ]] \
+      || fail "#149/1e: PRE metadata missing (native=$PRE_NATIVE_META net2=$PRE_NET2_META)"
+    WMDN_NAME_HEX=$(python3 -c "print('$CUSTOM_NAME'.encode().hex())")
+
+    # Drop + rebuild the proxy store from on-chain — identical runbook to cantina13.
+    E2E_COMPOSE=(docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" -f "$PROJECT_DIR/docker-compose.l2l2.yml" --env-file "$FIXTURES_DIR/.env")
+    PG_CONTAINER="${PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-agglayer-postgres-1}"
+    BASE_ARGS=$(docker inspect -f '{{range .Args}}{{.}} {{end}}' "$AGGLAYER_CONTAINER")
+    echo "$BASE_ARGS" | grep -q 'network-rpc-url=2=' \
+      || fail "#149/1e: proxy BASE_ARGS missing --network-rpc-url=2 (net-2 metadata recovery needs it)"
+
+    BACKUP="/tmp/agglayer_store.miden-origin-1e.$$.sql"
+    docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/dev/null
+    [[ -s "$BACKUP" ]] || fail "#149/1e: DB backup failed (empty) — refusing to drop without a backup"
+
+    MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer >/dev/null 2>&1
+    pgq "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO agglayer;" >/dev/null
+    pass "1e: proxy store DROPPED (from scratch)"
+
+    RESTORE_LOG=$(mktemp); set +e
+    MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" \
+        run --rm --no-deps miden-agglayer $BASE_ARGS --reset-miden-store --restore > "$RESTORE_LOG" 2>&1
+    RESTORE_RC=$?; set -e
+    [[ "$RESTORE_RC" -eq 0 ]] || { tail -30 "$RESTORE_LOG" >&2; fail "#149/1e: restore-from-scratch exited $RESTORE_RC"; }
+    grep -q 'RESTORE: complete' "$RESTORE_LOG" || { tail -30 "$RESTORE_LOG" >&2; fail "#149/1e: restore did not complete"; }
+    MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" start miden-agglayer >/dev/null 2>&1
+    wait_for "proxy healthy after 1e rebuild" \
+        "[[ \$(docker inspect -f '{{.State.Health.Status}}' $AGGLAYER_CONTAINER 2>/dev/null) == healthy ]]" 180 3
+    pass "1e: store rebuilt from on-chain"
+
+    # POST: BOTH rows survive with byte-identical metadata preimages (name != symbol
+    # preserved on the native row). Restore rebuilds faucet identities + metadata eagerly
+    # (rebuild_faucet_entry_from_chain), so poll for the rows then compare.
+    POST_NATIVE_META=""; POST_NET2_META=""
+    for _i in $(seq 1 60); do
+        POST_NATIVE_META=$(pgq "SELECT encode(metadata,'hex') FROM faucet_registry WHERE lower(faucet_id)=lower('$CUSTOM_FAUCET_ID');")
+        POST_NET2_META=$(pgq "SELECT encode(metadata,'hex') FROM faucet_registry WHERE lower(faucet_id)=lower('$NET2_FAUCET_ID') AND origin_network=2;")
+        [[ -n "$POST_NATIVE_META" && -n "$POST_NET2_META" ]] && break
+        sleep 3
+    done
+    [[ -n "$POST_NATIVE_META" ]] || fail "#149/1e: native custom-name row ($CUSTOM_FAUCET_ID) did NOT survive restore"
+    [[ "$POST_NATIVE_META" == "$PRE_NATIVE_META" ]] \
+      || fail "#149/1e: native custom-name preimage CHANGED across restore (pre=$PRE_NATIVE_META post=$POST_NATIVE_META)"
+    [[ "$POST_NATIVE_META" == *"$WMDN_NAME_HEX"* ]] \
+      || fail "#149/1e: recovered native preimage lost the custom name '$CUSTOM_NAME' (name_hex=$WMDN_NAME_HEX)"
+    [[ -n "$POST_NET2_META" ]] || fail "#149/1e: network-2 row ($NET2_FAUCET_ID) did NOT survive restore"
+    [[ "$POST_NET2_META" == "$PRE_NET2_META" ]] \
+      || fail "#149/1e: network-2 preimage CHANGED across restore (pre=$PRE_NET2_META post=$POST_NET2_META)"
+    rm -f "$BACKUP" "$RESTORE_LOG"
+    pass "1e: --restore preserved BOTH the native custom-name row (name != symbol) AND the network-2 row with byte-identical metadata preimages"
+fi
 
 log "======================================================================"
 log "  MIDEN-ORIGINATED ROUND-TRIP PASS — native lock/unlock, exact-block, net-zero"

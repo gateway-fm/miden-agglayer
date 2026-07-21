@@ -280,6 +280,46 @@ sweep.
 Never substitute `--init` for recovery: it creates new account identities and
 can strand control/balances associated with the old ones.
 
+### Detecting + remediating a mismatched native-faucet registry row
+
+`admin_registerNativeFaucet` now validates caller-supplied metadata against the
+deployed Miden faucet account before writing anything (issue #149): the persisted
++ emitted metadata-hash preimage `abi.encode(name, symbol, decimals)` is taken
+from the faucet account, never from caller-supplied params. This guarantees the
+preimage is reconstructable from authoritative chain state during `--restore`
+(recovery derives its only native-token candidate from the faucet account). A
+mismatched symbol, decimals, or name is rejected up-front with a specific error
+and leaves no registry row.
+
+A row registered by an **older build** may still carry a preimage that does not
+match its deployed faucet account. Recovery does **not** silently guess a
+preimage — an unrecoverable native row halts `--restore` fail-closed (its poison
+leaf). To detect and remediate before that happens:
+
+1. Detect. For each native row (`origin_network` == the proxy's configured
+   `network_id`), compare the stored preimage against the deployed faucet
+   account's authoritative `token_name` / `symbol` / `decimals`:
+
+   ```sql
+   -- stored preimage (hex) per native faucet
+   SELECT faucet_id, symbol, origin_decimals, encode(metadata,'hex')
+   FROM faucet_registry
+   WHERE origin_network = <configured network_id>;
+   ```
+
+   Read the faucet account's authoritative metadata from Miden (the same
+   `token_name()` / `symbol()` / `decimals()` the proxy reads at registration),
+   ABI-encode `(name, symbol, decimals)`, and confirm its `keccak256` equals the
+   faucet's on-chain `MetadataHash`. A row whose stored preimage keccak differs
+   from the deployed faucet's hash is mismatched.
+
+2. Remediate. Re-register the faucet against its deployed account so the row and
+   the emitted bridge metadata are rewritten from authoritative state. Because a
+   custom `name != symbol` is valid, supply the faucet's actual name (or omit
+   `name` to adopt it) — never normalize it to the symbol. Recovery must not
+   reconstruct history by guessing; the only safe source is the deployed faucet
+   account.
+
 ## 4. Incident procedures
 
 ### Node outage or `/health` 503
