@@ -287,7 +287,7 @@ print('['+','.join(p[:32])+']')" 2>/dev/null || true)
 # -> retry until the covering GER is injected on L2B. Returns 0 only on a status==0x1 tx.
 _submit_seed_claim() {
     local cnt="$1" gi="$2" gas="$3" amt="$4" meta="$5"
-    local tries="${SEED_CLAIM_TRIES:-30}" interval="${SEED_CLAIM_INTERVAL:-10}"
+    local tries="${SEED_CLAIM_TRIES:-45}" interval="${SEED_CLAIM_INTERVAL:-10}"
     local attempt pj mer rer smtL smtR out st
     for attempt in $(seq 1 "$tries"); do
         pj=$(curl -sf "$L2B_BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=0" 2>/dev/null || true)
@@ -311,6 +311,15 @@ print('['+','.join(p[:32])+']')" 2>/dev/null || true)
                 st=$(echo "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); print('1' if str(d.get('status','')) in ('0x1','1','true') else '')" 2>/dev/null || true)
                 [[ -n "$st" ]] && return 0
             fi
+        fi
+        # The L1->L2B claim needs L2B to have INJECTED the covering (combined) L1 GER.
+        # aggoracle-l2b injects infrequently on a quiet stack (~1 per several min), so a
+        # passive retry can time out (observed intermittently, e.g. gate round 2). A nudge
+        # settles an L2B cert -> updates the L1 rollup exit root -> fresh combined L1 GER
+        # -> aggoracle injects it (covering this deposit). Best-effort every 3rd attempt
+        # (subshell contains nudge_cert's fail-exit; never aborts the seed on a nudge hiccup).
+        if [[ -n "${NDG:-}" && $(( attempt % 3 )) -eq 0 ]]; then
+            ( nudge_cert ) >/dev/null 2>&1 || true
         fi
         sleep "$interval"
     done
