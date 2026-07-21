@@ -126,6 +126,111 @@ done
   || fail "native faucet origin_network='$NATIVE_NET', expected $MIDEN_NETWORK_ID (proxy must record the CONFIGURED net id)"
 pass "proxy allowlisted native faucet on the bridge (origin_network=$MIDEN_NETWORK_ID)"
 
+# ── 1c. #149 — registration validates against the deployed faucet account ─────
+# The deployed MDN faucet is authoritative (symbol=MDN, decimals=8). A registration
+# whose metadata DIFFERS from the faucet account must be REJECTED before any state
+# change, so recovery never has to reconstruct an unreconstructable preimage. Use a
+# FRESH origin address each time (idempotency keys on (origin_address, net) — a repeat
+# on the SAME origin would short-circuit and return the existing route without
+# validating). Assert: JSON-RPC error with the specific reason AND no registry row.
+step "1c. #149: mismatched native-faucet metadata is rejected before any state change"
+_reg_mismatch() { # $1=symbol $2=decimals $3=origin_addr  -> echoes the JSON response
+  curl -s "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+    \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+    \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$3\",
+      \"symbol\":\"$1\",\"decimals\":$2}]}" 2>/dev/null
+}
+BAD_SYM_ORIGIN="0x0bad51$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+BAD_DEC_ORIGIN="0x0badde$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+BAD_NAME_ORIGIN="0x0bad1a$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+# origin_address is BYTEA: `lower(origin_address)` is an invalid Postgres call that
+# pgq suppresses → empty output → a FALSE-GREEN "no row" even if one exists (PR #150
+# review). Compare `encode(origin_address,'hex')` against the hex origin instead.
+# A rejected registration must leave EXACTLY zero rows. Use COUNT(*) and require it
+# to equal "0": a pgq/connection/query error (stderr suppressed) yields a nonzero
+# exit or empty output — both must FAIL, not silently pass a `-z` check (PR #150).
+_no_registry_row() {
+  local n
+  n=$(pgq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex')=lower('${1#0x}');") || return 1
+  [[ "$n" == "0" ]]
+}
+# wrong symbol → 'symbol mismatch', and NO registry row
+RESP=$(_reg_mismatch "WRONG" 8 "$BAD_SYM_ORIGIN")
+echo "$RESP" | grep -qi 'symbol mismatch' \
+  || fail "#149: wrong-symbol registration should error 'symbol mismatch', got: $RESP"
+_no_registry_row "$BAD_SYM_ORIGIN" || fail "#149: wrong-symbol registration must leave NO registry row"
+# wrong decimals → 'decimals mismatch', and NO registry row
+RESP=$(_reg_mismatch "MDN" 6 "$BAD_DEC_ORIGIN")
+echo "$RESP" | grep -qi 'decimals mismatch' \
+  || fail "#149: wrong-decimals registration should error 'decimals mismatch', got: $RESP"
+_no_registry_row "$BAD_DEC_ORIGIN" || fail "#149: wrong-decimals registration must leave NO registry row"
+# wrong (non-matching) explicit name → 'name mismatch', and NO registry row
+RESP=$(curl -s "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+  \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$BAD_NAME_ORIGIN\",
+    \"symbol\":\"MDN\",\"decimals\":8,\"name\":\"Not The Real Name\"}]}" 2>/dev/null)
+echo "$RESP" | grep -qi 'name mismatch' \
+  || fail "#149: wrong-name registration should error 'name mismatch', got: $RESP"
+_no_registry_row "$BAD_NAME_ORIGIN" || fail "#149: wrong-name registration must leave NO registry row"
+# The no-row checks above are the store-side evidence. That the bridge
+# ConfigAggBridgeNote is NOT emitted on a mismatch is proven by an EXECUTABLE unit
+# regression: `native_registration_mismatch_skips_bridge_registration` drives a
+# SUCCESSFUL authoritative read followed by a mismatch through
+# `register_native_validated` and asserts the register_faucet_in_bridge `.with()`
+# is NEVER called (miden_client.test_call_count()==0), versus ==1 on a matching
+# control — so a mismatch provably reaches no bridge note (the register `.with()`
+# is conditional on validation passing). Per-field rejection is additionally
+# unit-tested on the pure gate (native_metadata_{symbol,decimals,name}_mismatch_
+# rejected). (No reconciler inference here: FaucetRegistryReconciler is a tripwire
+# keyed on faucet_id, and these mismatches reuse NATIVE_FAUCET_ID. PR #150.)
+pass "#149: mismatched symbol/decimals/name each rejected before any state change — NO registry row for any (bridge note skipped: proven by native_registration_mismatch_skips_bridge_registration, count==0 vs 1)"
+
+# ── 1d. #149 — a custom-name (name != symbol) faucet is preserved exactly ──────
+# Deploy a SECOND native faucet whose on-chain token NAME differs from its symbol
+# (--native-name), register it with `name` OMITTED so the proxy ADOPTS the authoritative
+# on-chain name, and assert the persisted metadata preimage carries the custom name
+# (never normalized to the symbol) — so its keccak hash is reconstructable on restore.
+step "1d. #149: custom-name (name != symbol) native faucet — name adopted + preserved"
+CUSTOM_NAME="Wrapped Midnight"
+CUSTOM_SYMBOL="WMDN"
+_cn_log="$(mktemp)"
+iso_tool --create-native-faucet --native-name "$CUSTOM_NAME" --native-symbol "$CUSTOM_SYMBOL" \
+    --native-decimals 8 --mint-units 0 --wallet-id "$WALLET_ID" > "$_cn_log" 2>&1 || true
+CUSTOM_FAUCET_ID=$(awk '/faucet-id:/{print $NF}' "$_cn_log")
+[[ -n "$CUSTOM_FAUCET_ID" ]] || { cat "$_cn_log"; rm -f "$_cn_log"; fail "#149: custom-name faucet deploy failed"; }
+rm -f "$_cn_log"
+CUSTOM_ORIGIN="0x0c0574$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+# Register with name OMITTED — the proxy must adopt the on-chain name "Wrapped Midnight".
+RESP=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+  \"params\":[{\"faucet_id\":\"$CUSTOM_FAUCET_ID\",\"origin_token_address\":\"$CUSTOM_ORIGIN\",
+    \"symbol\":\"$CUSTOM_SYMBOL\",\"decimals\":8}]}" 2>/dev/null) \
+  || fail "#149: custom-name registration (name omitted) should SUCCEED, got: $RESP"
+echo "$RESP" | python3 -c "import json,sys; sys.exit(0 if 'result' in json.load(sys.stdin) else 1)" \
+  || fail "#149: custom-name registration returned no result: $RESP"
+# Poll for the persisted metadata preimage, then assert it carries the custom NAME
+# (never collapsed to the symbol). The preimage is abi.encode(name, symbol, decimals),
+# so the UTF-8 bytes of both strings appear in it; name_hex must be present AND differ
+# from symbol_hex (proving name != symbol was preserved, not normalized).
+NAME_HEX=$(python3 -c "print('$CUSTOM_NAME'.encode().hex())")
+SYMBOL_HEX=$(python3 -c "print('$CUSTOM_SYMBOL'.encode().hex())")
+META_HEX=""
+for _i in $(seq 1 40); do
+    META_HEX=$(pgq "SELECT encode(metadata,'hex') FROM faucet_registry WHERE lower(faucet_id)=lower('$CUSTOM_FAUCET_ID');")
+    [[ -n "$META_HEX" && "$META_HEX" == *"$NAME_HEX"* ]] && break
+    sleep 3
+done
+[[ -n "$META_HEX" ]] || fail "#149: custom-name faucet_registry.metadata never persisted"
+[[ "$META_HEX" == *"$NAME_HEX"* ]] \
+  || fail "#149: persisted preimage must contain the custom name '$CUSTOM_NAME' (name_hex=$NAME_HEX); got metadata=$META_HEX"
+[[ "$NAME_HEX" != "$SYMBOL_HEX" ]] \
+  || fail "#149: test setup error — custom name must differ from symbol"
+pass "#149: custom name '$CUSTOM_NAME' (!= symbol '$CUSTOM_SYMBOL') adopted + preserved in the metadata preimage"
+# The custom-name (WMDN, name != symbol) native row created here is what the
+# restore-survival assertion in e2e-cantina13-metadata-recovery.sh reuses (its
+# coordinated proxy + bridge-service drop+restore proves the row survives). The
+# destructive in-script restore leg was removed per the PR #150 re-review.
+
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> $DEST_LABEL (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
 # Bridge OUT to a FRESH funded account whose key we KEEP, so step 4 can approve + bridge

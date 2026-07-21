@@ -88,6 +88,12 @@ case "$test_filter" in
             DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
             echo ""
             DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
+            # #149 restore acceptance (native custom-name row + net-2 row survive
+            # --restore with byte-identical preimages + full identity) is asserted by
+            # cantina13 below, which reuses the WMDN name!=symbol native row created by
+            # the DEST=l2b run above and a net-2 row from the l2l2 tier, and does its own
+            # COORDINATED proxy + bridge-service drop+restore (PR #150 re-review — no
+            # separate destructive proxy-only reset that would wedge cantina13).
         else
             echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
         fi
@@ -98,7 +104,11 @@ case "$test_filter" in
         # final phase leaves a self-targeted poison leaf in the LET (Cantina #13
         # circuit-break repro) that wedges any certificate settlement after it, so only the
         # L1->L2-only manual-user-claim may follow.
-        "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
+        # #149: when the L2B overlay is up (so the native+net-2 prerequisite rows were
+        # created by the tiers above), REQUIRE the restore-survival assertion — a missing
+        # row then FAILS the gate instead of silently skipping (PR #150 re-review).
+        REQUIRE_S149_RESTORE="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'postgres-l2b' && echo 1 || echo 0)" \
+            "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
         echo ""
         # VERY LAST in the suite — defense in depth: the manual-user-claim
         # script deliberately front-runs the sponsor's autoclaimer, which

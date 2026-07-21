@@ -280,6 +280,57 @@ sweep.
 Never substitute `--init` for recovery: it creates new account identities and
 can strand control/balances associated with the old ones.
 
+### Detecting + remediating a mismatched native-faucet registry row
+
+`admin_registerNativeFaucet` now validates caller-supplied metadata against the
+deployed Miden faucet account before writing anything (issue #149): the persisted
++ emitted metadata-hash preimage `abi.encode(name, symbol, decimals)` is taken
+from the faucet account, never from caller-supplied params. This guarantees the
+preimage is reconstructable from authoritative chain state during `--restore`
+(recovery derives its only native-token candidate from the faucet account). A
+mismatched symbol, decimals, or name is rejected up-front with a specific error
+and leaves no registry row.
+
+**Legacy state is not migrated.** The supported rollout is clean-slate: the new
+deployment starts fresh with this validation active, so no legacy mismatched row
+carries into it, and no in-place repair path is provided. The detection below is
+for diagnosing an unexpected mismatched row on a stack that must be kept — not a
+supported migration.
+
+A row registered by an **older build** may still carry a preimage that does not
+match its deployed faucet account. Recovery does **not** silently guess a
+preimage — an unrecoverable native row halts `--restore` fail-closed (its poison
+leaf). To detect it:
+
+1. Detect. For each native row (`origin_network` == the proxy's configured
+   `network_id`), compare the stored preimage against the deployed faucet
+   account's authoritative `token_name` / `symbol` / `decimals`:
+
+   ```sql
+   -- stored preimage (hex) per native faucet
+   SELECT faucet_id, symbol, origin_decimals, encode(metadata,'hex')
+   FROM faucet_registry
+   WHERE origin_network = <configured network_id>;
+   ```
+
+   Read the faucet account's authoritative metadata from Miden (the same
+   `token_name()` / `symbol()` / `decimals()` the proxy reads at registration),
+   ABI-encode `(name, symbol, decimals)`, and confirm its `keccak256` equals the
+   faucet's on-chain `MetadataHash`. A row whose stored preimage keccak differs
+   from the deployed faucet's hash is mismatched.
+
+2. Do not attempt an in-place repair. `admin_registerNativeFaucet` is
+   register-if-absent (idempotent) — it never rewrites an existing row — so
+   re-registration cannot fix a mismatched row. Surgical row deletion +
+   re-registration is also **not** a repair: it discards the only locally
+   retained legacy preimage and overwrites the bridge's current metadata hash,
+   yet it cannot repair historical B2AGG leaves/events already committed with
+   the old hash. The supported rollout is clean-slate, so legacy state is not
+   migrated and this situation does not arise on it. If a mismatched row is
+   ever observed on a stack that must be kept: preserve and back up the current
+   state, quarantine the affected faucet, and escalate — or rebuild from a
+   clean deployment. Do not perform surgical row edits.
+
 ## 4. Incident procedures
 
 ### Node outage or `/health` 503
