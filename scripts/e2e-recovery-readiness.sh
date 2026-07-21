@@ -111,8 +111,17 @@ pass "Consumers gated OFF (aggkit, bridge-service, bridge-autoclaim stopped) for
 # RETAIN Postgres; only remove the claim's calldata envelope (transaction_logs
 # cascade-drops via FK; the ClaimEvent in synthetic_logs is UNTOUCHED), and reset
 # the reconcile cursor to 0 so the genesis re-sweep re-observes + backfills it.
-DELETED="$(pgi "WITH d AS (DELETE FROM transactions WHERE lower(tx_hash) = '$CLAIM_TX' RETURNING 1) SELECT COUNT(*) FROM d")"
-[[ "$DELETED" == "1" ]] || fail "#148: expected to blank exactly 1 claim tx envelope, deleted '$DELETED'"
+# Blank the envelopes for ALL landed claims (not just CLAIM_TX). PR #151 blocker: with
+# a SINGLE missing claim, the projector's initial sync tick — the same one that flips
+# is_alive true — can repair it, so /health jumps degraded(alive=false)→200 and NEVER
+# passes through the `recovering` state (alive=true, backlog>0) that step 1 asserts. A
+# larger backlog is not fully drained in the alive-transition tick, so `recovering` is
+# genuinely observable. CLAIM_TX's calldata is still checked byte-for-byte in step 2
+# (its ORIG_CALLDATA is saved); the rest only need to drain the backlog.
+DELETED="$(pgi "WITH d AS (DELETE FROM transactions WHERE lower(tx_hash) IN (SELECT DISTINCT lower(transaction_hash) FROM synthetic_logs WHERE lower(topics[1]) = lower('$CLAIM_EVENT_TOPIC')) RETURNING 1) SELECT COUNT(*) FROM d")"
+[[ "$DELETED" =~ ^[0-9]+$ && "$DELETED" -ge 1 ]] || fail "#148: expected to blank >=1 claim tx envelope, deleted '$DELETED'"
+[[ "$(pgi "SELECT COUNT(*) FROM transactions WHERE lower(tx_hash) = '$CLAIM_TX'")" == "0" ]] || fail "#148: CLAIM_TX envelope not among the blanked set"
+log "  #148: blanked $DELETED claim envelope(s) to build an observable repair backlog"
 pgq "UPDATE service_state SET reconcile_cursor = 0 WHERE id = 1" >/dev/null \
     || fail "#148: failed to reset reconcile_cursor (the genesis re-sweep would not run)"
 # Reset the Miden client store — the issue's recovery shape MUST be genuinely
@@ -154,18 +163,22 @@ done
 # ── 1. Readiness is WITHHELD while the claim calldata is missing ──────────────
 # Poll: we MUST observe a 503 "recovering" with claims_awaiting_calldata >= 1 at
 # least once (the gate holding), then a transition to 200 (repair complete).
+# Single-curl capture (code+body together, no race between two requests) polled TIGHTLY
+# so a short-lived `recovering` window is not stepped over. Deadline-bounded so the wait
+# for the eventual 200 stays generous even at a fast interval.
 SAW_RECOVERING=0; READY=0
-for _i in $(seq 1 200); do
-    CODE="$(proxy_health_code)"
+RECOV_DEADLINE=$(( $(date +%s) + 600 ))
+while [[ $(date +%s) -lt $RECOV_DEADLINE ]]; do
+    RESP="$(curl -s -m5 -w $'\n%{http_code}' "$L2_RPC/health" 2>/dev/null || printf '{}\n000')"
+    CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
     if [[ "$CODE" == "503" ]]; then
-        BODY="$(proxy_health_body)"
         if echo "$BODY" | grep -q 'recovering' && echo "$BODY" | python3 -c "import json,sys;sys.exit(0 if (json.load(sys.stdin).get('claims_awaiting_calldata',0) or 0) >= 1 else 1)" 2>/dev/null; then
             SAW_RECOVERING=1
         fi
     elif [[ "$CODE" == "200" ]]; then
         READY=1; break
     fi
-    sleep 3
+    sleep 0.3
 done
 [[ "$SAW_RECOVERING" == "1" ]] \
     || fail "#148: never observed /health=503 'recovering' with claims_awaiting_calldata>=1 — the readiness gate did NOT hold while calldata was missing"
@@ -194,13 +207,16 @@ pass "3. No foreign/spurious ClaimEvent across recovery (count stable at $CLAIM_
 # the release the readiness probe authorises. Realistic operational resync
 # (finding #65): the reset proxy nonces are 0, so drop bridge_db and let the
 # bridge-service re-fetch from nonce 0 (else a future-nonce wedge). aggkit is
-# restarted alongside — it is the bridgesync consumer that would have STALLED on
-# the empty-input claim, so its clean catch-up is the real proof #148 works.
+# --force-recreate'd (NOT plain up -d): aggkit's BridgeL2Sync cursor lives in the
+# container's PathRWData=/tmp, which a plain `up -d` PRESERVES — so aggkit would
+# RESUME from its old cursor and never re-fetch/re-parse the historical claim (PR
+# #151 blocker). A fresh container re-scans the proxy L2 from block 0, genuinely
+# re-exercising the empty-input-stall consumer. Step 4b asserts aggkit's OWN recovery.
 docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
     -c "DROP SCHEMA IF EXISTS sync CASCADE; DROP SCHEMA IF EXISTS mt CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO bridge_user;" >/dev/null 2>&1 \
     || fail "#148: failed to drop bridge_db for the realistic resync (finding #65)"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
-    "${E2E_COMPOSE[@]}" up -d --no-deps aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
+    "${E2E_COMPOSE[@]}" up -d --no-deps --force-recreate aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
 wait_for "bridge-service reachable after recovery" \
     "[[ \$(curl -s -m3 -o /dev/null -w '%{http_code}' $BRIDGE_SERVICE_URL/ 2>/dev/null) =~ ^(200|404)\$ ]]" 180 5
 # SETTLEMENT (not merely "reachable"): the Miden bridge-service (network 1) must
@@ -227,6 +243,35 @@ done
 [[ "$(tx_input "$CLAIM_TX")" == "$ORIG_CALLDATA" ]] \
     || fail "#148: recovered calldata regressed after the consumer release"
 pass "4. Released consumers SETTLED: bridge-service sync.status network 1 synced=$SYNCED remaining_blocks=$REMAIN; recovered claim's calldata intact + parsed (no empty-input stall)"
+
+# ── 4b. AGGKIT's OWN BridgeL2Sync re-processed the recovered claim ────────────
+# The step-4 sync.status belongs to BRIDGE-SERVICE. The consumer #148 is really about
+# is aggkit's L2BridgeSyncer (it fetches each ClaimEvent tx's claimAsset calldata to
+# parse it; empty input STALLS it). Because we --force-recreate'd aggkit, its cursor is
+# fresh and it re-scans the proxy L2 from block 0. If the claim STILL served empty input
+# its parser would stall AT the claim's block and never log it processed. aggkit's
+# L2BridgeSyncer logs `block N processed with M events` (bridgesync/processor.go), and
+# it only reaches an event-bearing block once it has fetched+parsed that block's claim.
+# Assert it processes to >= the recovered claim's block. (Fresh container ⇒ docker logs
+# holds only the post-recreate re-scan, so no timestamp correlation is needed.)
+AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
+CLAIM_BLOCK="$(pgq "SELECT block_number FROM synthetic_logs WHERE lower(transaction_hash) = lower('$CLAIM_TX') ORDER BY block_number DESC LIMIT 1" || true)"
+[[ "$CLAIM_BLOCK" =~ ^[0-9]+$ ]] \
+    || fail "#148: could not resolve the recovered claim's L2 block (CLAIM_TX=$CLAIM_TX) for the aggkit re-process assertion"
+AGGKIT_DEADLINE=$(( $(date +%s) + 240 ))
+AGGKIT_MAXBLK=0
+while :; do
+    AGGKIT_MAXBLK="$(docker logs "$AGGKIT_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -aE 'bridgesync/processor\.go.*block [0-9]+ processed' \
+        | grep -aoE 'block [0-9]+ processed' | grep -aoE '[0-9]+' | sort -n | tail -1)"
+    AGGKIT_MAXBLK="${AGGKIT_MAXBLK:-0}"
+    [[ "$AGGKIT_MAXBLK" -ge "$CLAIM_BLOCK" ]] && break
+    [[ $(date +%s) -ge $AGGKIT_DEADLINE ]] && break
+    sleep 5
+done
+[[ "$AGGKIT_MAXBLK" -ge "$CLAIM_BLOCK" ]] \
+    || fail "#148: aggkit's OWN L2BridgeSyncer did NOT re-process past the recovered claim after force-recreate (reached block $AGGKIT_MAXBLK < claim block $CLAIM_BLOCK within 240s) — its bridgesync stalled on the claim, so the empty-input recovery is NOT proven for the consumer that actually stalls"
+pass "4b. aggkit's OWN L2BridgeSyncer re-processed the recovered claim from a FRESH cursor (reached block $AGGKIT_MAXBLK >= claim block $CLAIM_BLOCK) — the stalling consumer genuinely recovered, not just bridge-service"
 
 rm -f "$BACKUP"
 log "======================================================================"
