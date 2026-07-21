@@ -213,18 +213,32 @@ evidence_exit_root "leg2b" forward post-forward-claim
 # a fresh wallet AND is a DISTINCT faucet from the L1 native-ETH faucet: (0,0x0) and
 # ($L2B_NETWORK_ID,0x0) are different origins even though both display ETH.
 #
-# ENV-GATED (RUN_L2B_NATIVE_ETH=1, default off): this leg is implemented but not yet
-# validated on a live stack, and it depends on the proxy resolving an L2B-origin
-# native-ETH claim ((net=$L2B_NETWORK_ID, address=0x0), empty metadata) to an ETH/8
-# faucet. Enable it in the gate to validate; a failure here surfaces whether the
-# proxy special-cases L2B native ETH (a #147 product question), not a harness bug.
+# ENV-GATED (RUN_L2B_NATIVE_ETH=1, default OFF) — BLOCKED BY A SOVEREIGN-BRIDGE
+# LIMITATION, not a harness bug (finding #77): the L2B sovereign bridge
+# (networkID=2, gasTokenAddress=0x0, WETHToken unset) DETERMINISTICALLY reverts
+# `bridgeAsset(destNet, address(0), amount, --value=amount)` with custom error
+# 0x14603c01 — confirmed via cast estimate (the pre-submit path), well-formed
+# call, ADMIN funded with ~9999 ETH on anvil-l2b. Bridging the sovereign chain's
+# native gas token OUT is not supported in this setup; the ERC-20 path (leg 2 /
+# OPT0) works fine. So this leg (and its "two native-ETH faucets distinct by
+# origin (0,0x0) vs (L2B_NET,0x0)" distinctness check) cannot be exercised until
+# sovereign native-ETH bridging (or a WETH-mapped path) is enabled. #147's core
+# wallet-resolvable-metadata coverage is proven by rows 1/3/4 (L1 native ETH, L1
+# ERC-20, L2B OPT0). When re-enabled, a bridgeAsset revert must fail LOUD with
+# this context, not a cryptic "bridgeAsset failed".
 if [[ "${RUN_L2B_NATIVE_ETH:-0}" == "1" ]]; then
     step "#147 Leg 3: bridge native ETH L2B -> Miden + assert ETH/8, distinct from L1 ETH faucet"
     ZERO_ADDR="0x0000000000000000000000000000000000000000"
     ETH_WEI="${L2B_ETH_WEI:-1000000000000000}"   # 0.001 ETH
     ETH_MIDEN_UNITS=$(( ETH_WEI / 10000000000 )) # 10^10 scale (18 -> 8 decimals)
-    ETH_DEST=$(cast wallet address --private-key "$ADMIN_KEY" 2>/dev/null || echo "$ADMIN")
-    ETH_DEST_PADDED="0x000000000000000000000000${ETH_DEST#0x}"
+    # Pre-check the sovereign bridge accepts native-ETH bridging at all — surface
+    # the sovereign-bridge revert (finding #77: 0x14603c01) explicitly instead of
+    # an opaque empty-cast-output failure downstream.
+    if ! cast estimate "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
+        "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$ETH_WEI" "$ZERO_ADDR" true 0x \
+        --value "$ETH_WEI" --from "$ADMIN" --rpc-url "$L2B_RPC" >/dev/null 2>&1; then
+        fail "#147/leg3: L2B sovereign bridge rejects native-ETH bridgeAsset (finding #77, likely custom error 0x14603c01) — this leg is unexercisable until sovereign native-ETH bridging is enabled; #147 core coverage is rows 1/3/4"
+    fi
     NETH_TX=$(cast send "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
         "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$ETH_WEI" "$ZERO_ADDR" true 0x \
         --value "$ETH_WEI" --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" --json 2>/dev/null \
