@@ -462,6 +462,22 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// #148 — readiness backlog: how many ClaimEvent-bearing synthetic
+    /// transactions still have NO persisted `claimAsset` calldata envelope in
+    /// the `transactions` table. In steady state this is 0 — a claim's envelope
+    /// is admitted (via `eth_sendRawTransaction`) BEFORE its ClaimEvent is
+    /// emitted, so a ClaimEvent always has its calldata. It is > 0 only in the
+    /// retained-PostgreSQL + reset-Miden-store recovery, where the ClaimEvent
+    /// rows are retained but their tx envelopes were lost, until the genesis
+    /// reconciler re-observes each historical CLAIM note and backfills its
+    /// calldata (`restore::persist_synthetic_claim_tx`). Readiness gates on this
+    /// reaching 0 so consumers are never released while `eth_getTransactionByHash`
+    /// would serve an empty-input claim (aggkit's bridgesync parser stalls on it).
+    /// Default 0 — stores that do not track claim calldata report themselves ready.
+    async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
     // === Receipts map (synthetic-indexer redesign, Phase 2b substrate) ===
     //
     // See the "Receipts — the submit ⟂ project handoff" section of

@@ -763,20 +763,82 @@ async fn shutdown_signal() {
     }
 }
 
+/// #148 — the service's operational readiness for consumer release.
+/// Consumers (bridge-service / aggkit's bridgesync) gate on `/health` == 200, so
+/// this must stay NOT-ready during a retained-PostgreSQL + reset-Miden-store
+/// recovery until every historical ClaimEvent's `claimAsset` calldata has been
+/// re-persisted — otherwise `eth_getTransactionByHash` serves an empty-input
+/// claim and aggkit's full-claim parser stalls on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Readiness {
+    Ready,
+    /// The Miden node connection is lost — the client is not alive.
+    Degraded,
+    /// Recovering: this many historical claims still have no persisted calldata;
+    /// readiness is withheld until it reaches 0.
+    RecoveringCalldata {
+        claims_awaiting_calldata: u64,
+    },
+}
+
+/// Pure readiness decision (unit-testable in isolation): node liveness first,
+/// then the historical-claim calldata-repair backlog.
+pub(crate) fn readiness_from(node_alive: bool, claims_awaiting_calldata: u64) -> Readiness {
+    if !node_alive {
+        Readiness::Degraded
+    } else if claims_awaiting_calldata > 0 {
+        Readiness::RecoveringCalldata {
+            claims_awaiting_calldata,
+        }
+    } else {
+        Readiness::Ready
+    }
+}
+
 async fn health_check(State(service): State<ServiceState>) -> impl IntoResponse {
-    if service.miden_client.is_alive() {
-        (
+    let node_alive = service.miden_client.is_alive();
+    // #148: withhold readiness while any historical ClaimEvent still lacks its
+    // persisted claimAsset calldata (retained-PG + reset-Miden-store recovery),
+    // so consumers are never released onto an empty-input claim. In steady state
+    // this backlog is 0 (a claim's envelope is admitted before its ClaimEvent),
+    // so /health reports ready as normal. (Perf: the COUNT is an indexed scan run
+    // per poll; a once-cleared cache is a possible follow-up — the backlog cannot
+    // re-grow in steady state.)
+    let backlog = match service.store.count_claim_events_awaiting_calldata().await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "health_check: claim-calldata backlog query failed");
+            ::metrics::counter!("health_calldata_backlog_query_errors_total").increment(1);
+            // Fail-safe: on an unreadable store, do NOT report ready — surface a
+            // nonzero backlog so readiness is withheld (unless the node is also
+            // down, in which case Degraded already withholds it).
+            1
+        }
+    };
+    ::metrics::gauge!("claim_calldata_repair_backlog").set(backlog as f64);
+    match readiness_from(node_alive, backlog) {
+        Readiness::Ready => (
             http::StatusCode::OK,
             axum::Json(serde_json::json!({ "status": "ok" })),
-        )
-    } else {
-        (
+        ),
+        Readiness::Degraded => (
             http::StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
                 "status": "degraded",
                 "reason": "node connection lost"
             })),
-        )
+        ),
+        Readiness::RecoveringCalldata {
+            claims_awaiting_calldata,
+        } => (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "recovering",
+                "reason": "historical claim calldata repair in progress \
+                           (retained-PostgreSQL + reset-Miden-store recovery)",
+                "claims_awaiting_calldata": claims_awaiting_calldata,
+            })),
+        ),
     }
 }
 
@@ -1039,6 +1101,33 @@ mod tests {
         // Empty / odd inputs handled.
         assert_eq!(bucket_method_label(""), "other");
         assert_eq!(bucket_method_label(&"a".repeat(10_000)), "other");
+    }
+
+    /// #148 — the readiness predicate: node liveness first, then the historical
+    /// claim-calldata backlog. Non-vacuous positive + negative controls.
+    #[test]
+    fn readiness_gates_on_calldata_backlog() {
+        use super::{Readiness, readiness_from};
+        // Node down → Degraded regardless of the backlog.
+        assert_eq!(readiness_from(false, 0), Readiness::Degraded);
+        assert_eq!(readiness_from(false, 5), Readiness::Degraded);
+        // Node up but claims still awaiting calldata → NOT ready (the #148 gate:
+        // consumers are withheld so aggkit is never released onto empty input).
+        assert_eq!(
+            readiness_from(true, 3),
+            Readiness::RecoveringCalldata {
+                claims_awaiting_calldata: 3
+            }
+        );
+        assert_eq!(
+            readiness_from(true, 1),
+            Readiness::RecoveringCalldata {
+                claims_awaiting_calldata: 1
+            }
+        );
+        // Positive control — node up + backlog cleared → Ready (steady state /
+        // repair complete). Proves the not-ready assertions above are non-vacuous.
+        assert_eq!(readiness_from(true, 0), Readiness::Ready);
     }
 
     /// Self-review R1 — repro+regression. Pre-fix, every `admin_*` JSON-RPC method

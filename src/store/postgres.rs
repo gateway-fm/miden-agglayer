@@ -238,6 +238,28 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        // Distinct ClaimEvent tx-hashes (topic0 == CLAIM_EVENT_TOPIC) that have NO
+        // row in `transactions` — i.e. their `claimAsset` calldata envelope was
+        // never persisted or was lost. LEFT JOIN + IS NULL is indexable
+        // (idx_logs_tx_hash / transactions PK) and beats a NOT IN subquery.
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM (
+                     SELECT DISTINCT lower(transaction_hash) AS h
+                     FROM synthetic_logs
+                     WHERE lower(topics[1]) = lower($1)
+                 ) c
+                 LEFT JOIN transactions t ON lower(t.tx_hash) = c.h
+                 WHERE t.tx_hash IS NULL",
+                &[&crate::log_synthesis::CLAIM_EVENT_TOPIC],
+            )
+            .await?;
+        let n: i64 = row.get(0);
+        Ok(n.max(0) as u64)
+    }
+
     // ── Receipts map (Phase 2b substrate; unused in 2a) ──────────
     //
     // First-write-wins evm_tx_hash -> note_commitment (migration 009). The

@@ -445,6 +445,35 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
+        // Mirror of the postgres query: distinct ClaimEvent tx-hashes with no
+        // persisted `transactions` entry. (LruCache eviction can undercount on a
+        // hot store, but the production/authoritative store is Postgres; this
+        // in-memory path backs unit tests + non-durable dev only.)
+        let claim_topic = crate::log_synthesis::CLAIM_EVENT_TOPIC.to_lowercase();
+        let logs_by_tx = self.logs_by_tx.read();
+        let txns = self.transactions.lock();
+        let mut awaiting = 0u64;
+        for (tx_hash, logs) in logs_by_tx.iter() {
+            let is_claim = logs.iter().any(|l| {
+                l.topics
+                    .first()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(&claim_topic))
+            });
+            if !is_claim {
+                continue;
+            }
+            let has_calldata = tx_hash
+                .parse::<TxHash>()
+                .ok()
+                .is_some_and(|h| txns.contains(&h));
+            if !has_calldata {
+                awaiting += 1;
+            }
+        }
+        Ok(awaiting)
+    }
+
     // ── Selected L1 evidence scan ────────────────────────────────
 
     async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
@@ -2976,6 +3005,91 @@ mod tests {
         let (res, block_num) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
         assert!(res.is_ok());
         assert_eq!(block_num, 42);
+    }
+
+    /// #148 — the readiness backlog counts ClaimEvents whose calldata envelope is
+    /// missing (the retained-PG + reset-Miden-store recovery shape), ignores
+    /// non-claim logs, and clears once the calldata is persisted.
+    #[tokio::test]
+    async fn count_claim_events_awaiting_calldata_gates_recovery() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let store = InMemoryStore::new();
+        // Empty store → nothing awaiting.
+        assert_eq!(
+            store.count_claim_events_awaiting_calldata().await.unwrap(),
+            0
+        );
+
+        // A ClaimEvent whose calldata envelope is MISSING → counted as awaiting.
+        let tx_hash = TxHash::from([7u8; 32]);
+        let tx_hash_str = format!("{tx_hash:#x}");
+        store
+            .add_claim_event(
+                "0xbridge",
+                10,
+                [0u8; 32],
+                &tx_hash_str,
+                &[0u8; 32],
+                1,
+                &[0u8; 20],
+                &[0u8; 20],
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_claim_events_awaiting_calldata().await.unwrap(),
+            1,
+            "a ClaimEvent with no persisted calldata must be in the backlog"
+        );
+
+        // A non-claim log (BridgeEvent) with no tx must NOT be counted.
+        let other = TxHash::from([9u8; 32]);
+        store
+            .add_log(SyntheticLog {
+                address: "0xbridge".to_string(),
+                topics: vec![crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string()],
+                data: String::new(),
+                block_number: 11,
+                block_hash: [0u8; 32],
+                transaction_hash: format!("{other:#x}"),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_claim_events_awaiting_calldata().await.unwrap(),
+            1,
+            "only ClaimEvents count toward the calldata backlog"
+        );
+
+        // Persisting the claim's calldata envelope clears the backlog → ready.
+        let envelope = alloy::consensus::TxEnvelope::Legacy(Signed::new_unchecked(
+            TxLegacy::default(),
+            Signature::test_signature(),
+            tx_hash,
+        ));
+        store
+            .txn_begin(
+                tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: Address::ZERO,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_claim_events_awaiting_calldata().await.unwrap(),
+            0,
+            "once the calldata envelope is persisted the claim clears the backlog"
+        );
     }
 
     /// PR #127 follow-up — the memory/postgres `txn_commit` contract:

@@ -88,6 +88,16 @@ case "$test_filter" in
             DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
             echo ""
             DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
+            echo ""
+            # #148 recovery-readiness — retained-PostgreSQL + reset-Miden-store: readiness
+            # (/health) is WITHHELD until the historical claim calldata is repaired. Runs
+            # here — after the claim-producing tiers (a landed claim with real calldata
+            # exists to reuse) but BEFORE cantina13's poison leaf (which would fail-closed
+            # halt the reconcile re-sweep this test depends on). It coordinates its own
+            # proxy restart + bridge-service resync. MANDATORY under the overlay: a landed
+            # claim MUST exist, so a missing one FAILS the gate (does not silently skip).
+            echo "== #148 recovery readiness (retained-PG + reset-Miden-store) =="
+            REQUIRE_RECOVERY_READINESS=1 "$SCRIPT_DIR/e2e-recovery-readiness.sh"
             # #149 restore acceptance (native custom-name row + net-2 row survive
             # --restore with byte-identical preimages + full identity) is asserted by
             # cantina13 below, which reuses the WMDN name!=symbol native row created by
