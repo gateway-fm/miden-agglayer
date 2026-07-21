@@ -97,12 +97,13 @@ iso_inspect_faucet() {
     local fid="$1" fresh rc out
     fresh="$B2AGG_STORE_DIR/inspect-$$-${RANDOM}"
     mkdir -p "$fresh/tmp"
-    out=$(docker run --rm --network "$ISO_NETWORK" \
+    # Capture the container's exit code WITHOUT tripping the caller's set -e: a bare
+    # `out=$(docker ...); rc=$?` aborts under errexit before rc is read on nonzero.
+    if out=$(docker run --rm --network "$ISO_NETWORK" \
         -v "$fresh:/store" -e "TMPDIR=/store/tmp" \
         --entrypoint bridge-out-tool "$ISO_IMAGE" \
         --store-dir /store --node-url "$ISO_NODE_URL" \
-        --inspect-faucet "$fid" 2>&1)
-    rc=$?
+        --inspect-faucet "$fid" 2>&1); then rc=0; else rc=$?; fi
     # container-created files are root-owned; wipe via busybox if plain rm fails.
     rm -rf "$fresh" 2>/dev/null || docker run --rm -v "$B2AGG_STORE_DIR:/w" busybox rm -rf "/w/$(basename "$fresh")" >/dev/null 2>&1 || true
     echo "$out"
@@ -122,6 +123,29 @@ assert_faucet_symbol() {
     [[ "$INSPECT_SYMBOL" == "$want_sym" && "$INSPECT_DECIMALS" == "$want_dec" ]] \
         || fail "#147: $label faucet must resolve $want_sym/$want_dec but a fresh client got symbol='$INSPECT_SYMBOL' decimals='$INSPECT_DECIMALS' (faucet=$fid; full: $insp)"
     pass "#147: $label faucet $fid resolves $INSPECT_SYMBOL/$INSPECT_DECIMALS from public account state (cold-wallet safe)"
+}
+
+# assert_received_faucet <bridge_id> <faucet_id> <expected_symbol> <expected_dec> <min_amount> <origin-label>
+# #147/PR#152 received-asset linkage: prove the symbol assertion is about the asset the
+# RECEIVING wallet actually got, not just a registry row. iso_wallet_balance syncs the
+# isolated wallet and CONSUMES its pending P2ID note(s), so a nonzero balance for
+# <faucet_id> exists ONLY because the wallet consumed a P2ID note carrying that faucet's
+# fungible asset — that is the on-chain link between the received note and the faucet.
+# Then assert_faucet_symbol proves that SAME faucet resolves the expected symbol/decimals
+# on a cold wallet. Fails LOUD (prints wallet id, faucet, balance, expected) if the wallet
+# did not receive >= <min_amount> of <faucet_id>. Uses the ambient WALLET_ID.
+# (A stronger form — enumerating the consumed note's faucet id directly instead of probing
+# a known id — needs a bridge-out-tool `--list-wallet-faucets` mode; tracked as follow-up.)
+assert_received_faucet() {
+    local bridge_id="$1" fid="$2" want_sym="$3" want_dec="$4" min_amt="$5" label="$6" bal
+    bal=$(iso_wallet_balance "$bridge_id" "$fid")
+    [[ -n "$bal" && "$bal" =~ ^[0-9]+$ ]] \
+        || fail "#147/link: could not read received balance for $label (wallet=$WALLET_ID faucet=$fid) — got '$bal'; the wallet never consumed a P2ID note of this faucet"
+    [[ "$bal" -ge "$min_amt" ]] \
+        || fail "#147/link: $label wallet received $bal < expected >= $min_amt of faucet $fid (wallet=$WALLET_ID) — received asset does not match"
+    log "#147/link: $label — wallet $WALLET_ID holds $bal units of faucet $fid (consumed its P2ID note); verifying that faucet's symbol"
+    assert_faucet_symbol "$fid" "$want_sym" "$want_dec" "$label"
+    pass "#147/link: $label received asset LINKED — wallet consumed a P2ID note of faucet $fid ($bal units) that resolves $want_sym/$want_dec"
 }
 
 # provision_isolated_wallet [<probe_bridge_id> <probe_faucet_id>]

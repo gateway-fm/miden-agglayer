@@ -320,7 +320,10 @@ except Exception:
     # A-Z only, so digits/punctuation are dropped) + min(decimals,8) — NOT 'Unknown'.
     # assert_faucet_symbol prints faucet_id + fetched symbol/decimals on pass AND fail.
     log "#147/leg3: gas-token symbol propagation — origin (net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX), faucet=$GAS_FID, origin symbol='$GAS_ORIGIN_SYMBOL' -> Miden display symbol='$GAS_MIDEN_SYMBOL' decimals=$GAS_EXPECT_DECIMALS (origin $GAS_ORIGIN_DECIMALS capped)"
-    assert_faucet_symbol "$GAS_FID" "$GAS_MIDEN_SYMBOL" "$GAS_EXPECT_DECIMALS" "L2B gas token (origin net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX)"
+    # Received-asset linkage (PR #152): the wallet must actually hold the bridged units of
+    # this gas-token faucet (consumed its P2ID note) AND that faucet resolves the sanitised
+    # symbol — not just a registry row. Mirrors leg 2b's balance+symbol check for OPT0.
+    assert_received_faucet "$BRIDGE_ID" "$GAS_FID" "$GAS_MIDEN_SYMBOL" "$GAS_EXPECT_DECIMALS" "$ETH_MIDEN_UNITS" "L2B gas token (origin net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX)"
     # Cross-check the store row: symbol column = SANITISED display symbol, origin_decimals
     # = origin (18), miden_decimals = cap (8). Constrained to origin_network=$GAS_ORIGIN_NET.
     GAS_ROW=$(pgq "SELECT symbol||'|'||origin_decimals||'|'||miden_decimals FROM faucet_registry WHERE encode(origin_address,'hex')='$GAS_ADDR_HEX' AND origin_network=${GAS_ORIGIN_NET};")
