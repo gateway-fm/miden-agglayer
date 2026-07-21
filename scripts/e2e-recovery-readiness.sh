@@ -40,8 +40,18 @@ PG_CONTAINER="${PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-agglayer-postgres-1}"
 BRIDGE_PG_CONTAINER="${BRIDGE_PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-postgres-1}"
 
 # `pgi` — a COUNT/scalar query that FAILS on a psql error (no false-green from a
-# suppressed error; PR-review-rigor #1). `pg` (from lib-l2l2) is used for text.
-pgi() { local out; out=$(pg "$1") || return 1; printf '%s' "$out"; }
+# suppressed error; PR-review-rigor #1). Wraps `pgq` (the canonical query helper
+# from lib-l2l2 — a bare `pg` was UNDEFINED here, so every DB read was a
+# `command not found`); `|| return 1` propagates a psql failure to the caller.
+pgi() { local out; out=$(pgq "$1") || return 1; printf '%s' "$out"; }
+# `pgi_bridge` — query the SEPARATE bridge-service database (bridge_db in
+# $BRIDGE_PG_CONTAINER), error-propagating. `pgq`/`pgi` target the proxy's
+# agglayer_store; the consumer sync.status lives in bridge_db.
+pgi_bridge() {
+    local out
+    out=$(docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db -tAX -c "$1") || return 1
+    printf '%s' "$out"
+}
 proxy_health_code() { curl -s -m5 -o /dev/null -w '%{http_code}' "$L2_RPC/health" 2>/dev/null || echo 000; }
 proxy_health_body() { curl -s -m5 "$L2_RPC/health" 2>/dev/null || echo '{}'; }
 # eth_getTransactionByHash → the `input` field (calldata), lowercased.
@@ -63,7 +73,7 @@ if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
 # A ClaimEvent whose tx has non-empty stored calldata (a normally-processed
 # claim from the prior tiers). REQUIRE non-empty input so the later byte-for-byte
 # equality can't pass as empty->empty (PR-review-rigor #3).
-CLAIM_TX="$(pg "SELECT lower(transaction_hash) FROM synthetic_logs WHERE lower(topics[1]) = lower('$CLAIM_EVENT_TOPIC') ORDER BY block_number DESC LIMIT 1" || true)"
+CLAIM_TX="$(pgq "SELECT lower(transaction_hash) FROM synthetic_logs WHERE lower(topics[1]) = lower('$CLAIM_EVENT_TOPIC') ORDER BY block_number DESC LIMIT 1" || true)"
 if [[ -z "$CLAIM_TX" ]]; then
     if [[ "${REQUIRE_RECOVERY_READINESS:-0}" == "1" ]]; then
         fail "#148: REQUIRE_RECOVERY_READINESS=1 but no landed ClaimEvent is present — a prior claim-producing phase regressed"
@@ -84,17 +94,48 @@ BACKUP="/tmp/agglayer_store.recovery-readiness.$$.sql"
 docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/dev/null
 [[ -s "$BACKUP" ]] || fail "#148: DB backup failed (empty) — refusing to mutate without a backup"
 
-MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer >/dev/null 2>&1
+# Stop the proxy AND its Miden-side consumers together. #148 protects consumers
+# from being released onto an empty-input claim; the readiness probe (503) is
+# what an orchestrator (k8s readiness → no Service endpoints) uses to keep
+# bridgesync traffic OFF the proxy until repair completes. The prior version left
+# aggkit + bridge-service RUNNING throughout, so the gate's actual PURPOSE — that
+# consumers are held off during the repair and only resume once ready — was never
+# exercised (review blocker 6). Take them down for the whole repair window; they
+# are brought back and asserted-settled only after /health flips to 200.
+MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
+for c in aggkit bridge-service bridge-autoclaim; do
+    [[ "$(docker inspect -f '{{.State.Running}}' "${COMPOSE_PROJECT_NAME}-${c}-1" 2>/dev/null)" == "false" ]] \
+        || fail "#148: consumer '$c' is still running — it must be gated OFF during the calldata repair"
+done
+pass "Consumers gated OFF (aggkit, bridge-service, bridge-autoclaim stopped) for the repair window"
 # RETAIN Postgres; only remove the claim's calldata envelope (transaction_logs
 # cascade-drops via FK; the ClaimEvent in synthetic_logs is UNTOUCHED), and reset
 # the reconcile cursor to 0 so the genesis re-sweep re-observes + backfills it.
 DELETED="$(pgi "WITH d AS (DELETE FROM transactions WHERE lower(tx_hash) = '$CLAIM_TX' RETURNING 1) SELECT COUNT(*) FROM d")"
 [[ "$DELETED" == "1" ]] || fail "#148: expected to blank exactly 1 claim tx envelope, deleted '$DELETED'"
-pg "UPDATE service_state SET reconcile_cursor = 0 WHERE id = 1" >/dev/null
-# Reset the Miden client store (the issue's recovery shape) — best-effort delete
-# of the sqlite from the bind mount; the reconcile_cursor=0 above independently
-# forces the re-sweep, so the repair runs whether or not the rm matched.
-rm -f "$PROJECT_DIR/.miden-agglayer-data/store.sqlite3"* 2>/dev/null || true
+pgq "UPDATE service_state SET reconcile_cursor = 0 WHERE id = 1" >/dev/null \
+    || fail "#148: failed to reset reconcile_cursor (the genesis re-sweep would not run)"
+# Reset the Miden client store — the issue's recovery shape MUST be genuinely
+# reproduced, not best-effort. A host `rm` fails EPERM here: the proxy runs as
+# root (no `user:`), so the bind-mounted sqlite is root-owned. The previous
+# `rm -f … || true` therefore silently NO-OP'd and the test only passed because
+# reconcile_cursor=0 independently forced the re-sweep — the reset-Miden-store
+# path was never actually exercised (review blocker 5). Remove the sqlite set
+# (exactly `recovery::reset_miden_store`'s SQLITE_FILES) as ROOT via a one-shot
+# container sharing the same bind mount, and ASSERT it happened: a file existed
+# and none remains.
+MIDEN_RESET_OUT="$(MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
+    "${E2E_COMPOSE[@]}" run --rm --no-deps --entrypoint sh miden-agglayer -c \
+    'cd /var/lib/miden-agglayer-service 2>/dev/null || exit 3
+     n=$(ls store.sqlite3 store.sqlite3-wal store.sqlite3-shm 2>/dev/null | wc -l)
+     rm -f store.sqlite3 store.sqlite3-wal store.sqlite3-shm
+     if ls store.sqlite3 store.sqlite3-wal store.sqlite3-shm >/dev/null 2>&1; then echo "REMAIN removed=$n"; else echo "GONE removed=$n"; fi' \
+    2>/dev/null | tr -d '\r')"
+[[ "$MIDEN_RESET_OUT" == GONE\ * ]] \
+    || fail "#148: Miden store reset did not complete (out='$MIDEN_RESET_OUT') — the reset-Miden-store recovery shape was not reproduced"
+[[ "$MIDEN_RESET_OUT" =~ removed=([0-9]+) && "${BASH_REMATCH[1]}" -ge 1 ]] \
+    || fail "#148: Miden store had NO sqlite to reset (out='$MIDEN_RESET_OUT') — the proxy never wrote a store, so this run cannot exercise the recovery"
+pass "Miden store reset (as root, via shared mount): removed ${BASH_REMATCH[1]} sqlite file(s), none remain"
 # Sanity: the ClaimEvent is retained, its calldata is gone.
 [[ "$(pgi "SELECT COUNT(*) FROM synthetic_logs WHERE lower(transaction_hash) = '$CLAIM_TX' AND lower(topics[1]) = lower('$CLAIM_EVENT_TOPIC')")" == "1" ]] \
     || fail "#148: the ClaimEvent must be RETAINED (only the calldata is lost)"
@@ -148,25 +189,48 @@ CLAIM_COUNT_POST="$(pgi "SELECT COUNT(*) FROM synthetic_logs WHERE lower(topics[
     || fail "#148: ClaimEvent count changed across recovery ($CLAIM_COUNT_PRE -> $CLAIM_COUNT_POST) — a foreign/spurious claim leaked or a legit one was dropped"
 pass "3. No foreign/spurious ClaimEvent across recovery (count stable at $CLAIM_COUNT_POST)"
 
-# ── 4. bridge-service resyncs; the recovered claim stays settleable ──────────
-# Realistic operational resync (finding #65): the reset proxy nonces are 0, so
-# resync the bridge-service alongside so it re-fetches nonce 0 (else future-nonce
-# wedge). Then assert it comes back reachable + synced against the recovered proxy.
-"${E2E_COMPOSE[@]}" stop bridge-service bridge-autoclaim >/dev/null 2>&1
+# ── 4. Release the gated consumers; assert the recovered claim SETTLES ────────
+# Only NOW (readiness=200) do we release the consumers the gate held off. This is
+# the release the readiness probe authorises. Realistic operational resync
+# (finding #65): the reset proxy nonces are 0, so drop bridge_db and let the
+# bridge-service re-fetch from nonce 0 (else a future-nonce wedge). aggkit is
+# restarted alongside — it is the bridgesync consumer that would have STALLED on
+# the empty-input claim, so its clean catch-up is the real proof #148 works.
 docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
     -c "DROP SCHEMA IF EXISTS sync CASCADE; DROP SCHEMA IF EXISTS mt CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO bridge_user;" >/dev/null 2>&1 \
     || fail "#148: failed to drop bridge_db for the realistic resync (finding #65)"
-"${E2E_COMPOSE[@]}" up -d --no-deps bridge-service bridge-autoclaim >/dev/null 2>&1
-wait_for "bridge-service resynced + reachable after recovery" \
+MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
+    "${E2E_COMPOSE[@]}" up -d --no-deps aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
+wait_for "bridge-service reachable after recovery" \
     "[[ \$(curl -s -m3 -o /dev/null -w '%{http_code}' $BRIDGE_SERVICE_URL/ 2>/dev/null) =~ ^(200|404)\$ ]]" 180 5
-# The recovered claim's calldata is now complete, so aggkit's bridgesync can parse
-# it (the empty-input stall is gone) — assert it is STILL served intact post-resync.
+# SETTLEMENT (not merely "reachable"): the Miden bridge-service (network 1) must
+# reach synced=true with a small remaining_blocks lag. If the recovered claim
+# still served empty input, aggkit's bridgesync parser would STALL and this row
+# would sit synced=false / remaining climbing — so a genuine synced row is the
+# end-to-end proof the empty-input stall is gone and the claim is settleable.
+# Error-propagating (PR-review-rigor #1): a missing/empty row is a FAIL, not a
+# silent pass.
+SETTLE_DEADLINE=$(( $(date +%s) + 240 ))
+SYNCED=""; REMAIN=""
+while :; do
+    ROW="$(pgi_bridge "SELECT synced||'|'||remaining_blocks FROM sync.status WHERE network_id=1" 2>/dev/null | tr -d '[:space:]')" || ROW=""
+    SYNCED="${ROW%%|*}"; REMAIN="${ROW##*|}"
+    [[ "$SYNCED" == "t" || "$SYNCED" == "true" ]] && [[ "${REMAIN:-999999}" -le 50 ]] && break
+    [[ $(date +%s) -ge $SETTLE_DEADLINE ]] && break
+    sleep 5
+done
+[[ -n "$ROW" ]] \
+    || fail "#148: no sync.status row for network 1 in bridge_db after release — the bridgesync consumer never started (settlement not observed)"
+{ [[ "$SYNCED" == "t" || "$SYNCED" == "true" ]] && [[ "${REMAIN:-999999}" -le 50 ]]; } \
+    || fail "#148: released consumer did NOT settle — sync.status network 1 synced=$SYNCED remaining_blocks=$REMAIN after 240s; the recovered claim likely still stalls bridgesync"
+# And the calldata the consumer parsed is still the complete original.
 [[ "$(tx_input "$CLAIM_TX")" == "$ORIG_CALLDATA" ]] \
-    || fail "#148: recovered calldata regressed after the bridge-service resync"
-pass "4. bridge-service resynced against the recovered proxy; the recovered claim's calldata is intact + parseable (settleable)"
+    || fail "#148: recovered calldata regressed after the consumer release"
+pass "4. Released consumers SETTLED: bridge-service sync.status network 1 synced=$SYNCED remaining_blocks=$REMAIN; recovered claim's calldata intact + parsed (no empty-input stall)"
 
 rm -f "$BACKUP"
 log "======================================================================"
-log "  #148 RECOVERY READINESS PASS — readiness gated on calldata repair;"
-log "  original calldata recovered byte-for-byte; no foreign claim; resynced"
+log "  #148 RECOVERY READINESS PASS — consumers gated OFF during repair,"
+log "  readiness gated on calldata repair; original calldata recovered"
+log "  byte-for-byte; no foreign claim; released consumers settled"
 log "======================================================================"

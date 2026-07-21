@@ -474,7 +474,32 @@ pub trait Store: Send + Sync + 'static {
     /// reaching 0 so consumers are never released while `eth_getTransactionByHash`
     /// would serve an empty-input claim (aggkit's bridgesync parser stalls on it).
     /// Default 0 — stores that do not track claim calldata report themselves ready.
+    ///
+    /// Implemented as an O(1) `SELECT COUNT(*)` over the durable
+    /// `claim_calldata_repair_pending` set (migration 019), NOT a per-poll scan
+    /// of the historical claim-log join (review blocker 2). The set is seeded
+    /// once at startup by [`Self::seed_claim_calldata_repair_backlog`] and
+    /// drained inside a successful `txn_commit`.
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Rebuild the durable claim-calldata repair backlog from ground truth and
+    /// return its resulting size. Called ONCE at startup (after migrations, before
+    /// the readiness endpoint serves) so the expensive historical-log scan runs
+    /// exactly once per process rather than on every `/health` poll.
+    ///
+    /// Self-healing reconcile (review blockers 1 + 2):
+    ///   * INSERT every distinct ClaimEvent tx-hash whose calldata `transactions`
+    ///     row is ABSENT **or** non-`'success'` (a `txn_begin` that never reached a
+    ///     successful commit is still awaiting repair — blocker 1).
+    ///   * DELETE any pending row that now has a successful calldata row (heals a
+    ///     set that drifted from ground truth, e.g. rows repaired by a prior
+    ///     process before this feature existed).
+    ///
+    /// Default no-op returning 0 — a store that does not track claim calldata has
+    /// no backlog to seed.
+    async fn seed_claim_calldata_repair_backlog(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
 

@@ -194,6 +194,15 @@ pub struct InMemoryStore {
     // mirrored alongside it. UNUSED in Phase 2a. See Store::record_tx_note_link.
     tx_note_links: RwLock<HashMap<String, NoteHandoffRecord>>,
     note_tx_links: RwLock<HashMap<String, String>>,
+
+    // #148 durable claim-calldata repair backlog — the in-memory mirror of the
+    // PgStore `claim_calldata_repair_pending` set (migration 019). Seeded once by
+    // `seed_claim_calldata_repair_backlog`, drained on a successful `txn_commit`.
+    // Deliberately NOT derived from `logs_by_tx`/`transactions` at read time: the
+    // `transactions` LruCache evicts under load, and a scan-based count would then
+    // treat an evicted (repaired) claim as "still awaiting" and pin readiness at a
+    // permanent 503 (review blocker 3). A standalone set is immune to eviction.
+    claim_calldata_pending: RwLock<HashSet<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -227,6 +236,7 @@ impl InMemoryStore {
             latest_ger: RwLock::new(None),
             hash_chain_value: RwLock::new([0u8; 32]),
             injected_gers: RwLock::new(HashSet::new()),
+            claim_calldata_pending: RwLock::new(HashSet::new()),
             #[cfg(test)]
             test_fail_next_ger_evidence_write: std::sync::atomic::AtomicBool::new(false),
             transactions: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
@@ -446,14 +456,27 @@ impl Store for InMemoryStore {
     }
 
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
-        // Mirror of the postgres query: distinct ClaimEvent tx-hashes with no
-        // persisted `transactions` entry. (LruCache eviction can undercount on a
-        // hot store, but the production/authoritative store is Postgres; this
-        // in-memory path backs unit tests + non-durable dev only.)
+        // O(1) read of the durable repair-backlog set — NOT a scan of
+        // `logs_by_tx`/`transactions` (review blocker 3). The `transactions`
+        // LruCache evicts, and a scan-based count would treat an evicted-but-
+        // repaired claim as still-awaiting and wedge readiness at a permanent 503.
+        // The set is seeded once at startup and drained on successful commit, so it
+        // is empty except during an active recovery. See the field doc.
+        Ok(self.claim_calldata_pending.read().len() as u64)
+    }
+
+    async fn seed_claim_calldata_repair_backlog(&self) -> anyhow::Result<u64> {
+        // Rebuild the backlog from ground truth (mirrors the PgStore seed). A claim
+        // is awaiting calldata while its `transactions` entry is ABSENT or not a
+        // recorded success (blocker 1). Runs once at startup, before serving; the
+        // resulting set — not a per-poll scan — is what readiness reads. For a
+        // fresh/non-durable in-memory store this typically finds nothing, which is
+        // the correct "no recovery backlog → ready" answer.
         let claim_topic = crate::log_synthesis::CLAIM_EVENT_TOPIC.to_lowercase();
         let logs_by_tx = self.logs_by_tx.read();
         let txns = self.transactions.lock();
-        let mut awaiting = 0u64;
+        let mut pending = self.claim_calldata_pending.write();
+        pending.clear();
         for (tx_hash, logs) in logs_by_tx.iter() {
             let is_claim = logs.iter().any(|l| {
                 l.topics
@@ -463,15 +486,17 @@ impl Store for InMemoryStore {
             if !is_claim {
                 continue;
             }
-            let has_calldata = tx_hash
-                .parse::<TxHash>()
-                .ok()
-                .is_some_and(|h| txns.contains(&h));
-            if !has_calldata {
-                awaiting += 1;
+            // ABSENT or non-'success' → still awaiting. The LruCache only stores a
+            // receipt once txn_begin ran; a successful commit sets result=Some(Ok).
+            let repaired = tx_hash.parse::<TxHash>().ok().is_some_and(|h| {
+                txns.peek(&h)
+                    .is_some_and(|r| matches!(&r.result, Some(Ok(_))))
+            });
+            if !repaired {
+                pending.insert(tx_hash.clone());
             }
         }
-        Ok(awaiting)
+        Ok(pending.len() as u64)
     }
 
     // ── Selected L1 evidence scan ────────────────────────────────
@@ -1116,6 +1141,13 @@ impl Store for InMemoryStore {
         }; // Mutex dropped before any .await
 
         if let Some(logs) = logs_to_add {
+            // #148 drain — a successful commit repairs this claim's calldata, so
+            // remove it from the durable repair backlog (mirrors the PgStore drain).
+            // No-op for a tx_hash never in the backlog (ordinary live claim).
+            self.claim_calldata_pending
+                .write()
+                .remove(&format!("{tx_hash:#x}"));
+
             let bridge_address = crate::bridge_address::get_bridge_address().to_string();
             for log_data in logs {
                 let log = SyntheticLog {
@@ -3007,21 +3039,36 @@ mod tests {
         assert_eq!(block_num, 42);
     }
 
-    /// #148 — the readiness backlog counts ClaimEvents whose calldata envelope is
-    /// missing (the retained-PG + reset-Miden-store recovery shape), ignores
-    /// non-claim logs, and clears once the calldata is persisted.
+    /// #148 — the readiness backlog is a DURABLE set seeded once at startup and
+    /// drained only on a SUCCESSFUL calldata commit. This exercises the three
+    /// review-blocker regressions:
+    ///   * B1 — a `txn_begin` that never reaches a successful `txn_commit`
+    ///     (crash / failed repair) stays counted; only a `txn_commit(Ok)` drains.
+    ///   * B2 — the count is read from the seeded set, not a live per-poll scan.
+    ///   * B3 — because the count never reads the evictable `transactions` cache,
+    ///     it cannot over-count after eviction (proven here by the seed-driven,
+    ///     not live-scan, behaviour + a real eviction that leaves the count at 0).
     #[tokio::test]
     async fn count_claim_events_awaiting_calldata_gates_recovery() {
         use alloy::consensus::{Signed, TxLegacy};
         use alloy::primitives::Signature;
+
+        let mk_envelope = |h: TxHash| {
+            alloy::consensus::TxEnvelope::Legacy(Signed::new_unchecked(
+                TxLegacy::default(),
+                Signature::test_signature(),
+                h,
+            ))
+        };
         let store = InMemoryStore::new();
-        // Empty store → nothing awaiting.
+
+        // Empty store, no seed → nothing awaiting.
         assert_eq!(
             store.count_claim_events_awaiting_calldata().await.unwrap(),
             0
         );
 
-        // A ClaimEvent whose calldata envelope is MISSING → counted as awaiting.
+        // A ClaimEvent whose calldata envelope is MISSING (recovery shape).
         let tx_hash = TxHash::from([7u8; 32]);
         let tx_hash_str = format!("{tx_hash:#x}");
         store
@@ -3038,13 +3085,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            store.count_claim_events_awaiting_calldata().await.unwrap(),
-            1,
-            "a ClaimEvent with no persisted calldata must be in the backlog"
-        );
 
-        // A non-claim log (BridgeEvent) with no tx must NOT be counted.
+        // A non-claim log (BridgeEvent) with no tx must NEVER count.
         let other = TxHash::from([9u8; 32]);
         store
             .add_log(SyntheticLog {
@@ -3060,24 +3102,34 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // B2 — the backlog is empty until it is SEEDED; the count is not a live
+        // scan of `logs_by_tx`. Seeding classifies the one claim as awaiting.
         assert_eq!(
             store.count_claim_events_awaiting_calldata().await.unwrap(),
+            0,
+            "count reads the seeded set, not a live log scan (blocker 2)"
+        );
+        assert_eq!(
+            store.seed_claim_calldata_repair_backlog().await.unwrap(),
             1,
-            "only ClaimEvents count toward the calldata backlog"
+            "seed classifies the missing-calldata claim as awaiting; ignores the BridgeEvent"
+        );
+        assert_eq!(
+            store.count_claim_events_awaiting_calldata().await.unwrap(),
+            1
         );
 
-        // Persisting the claim's calldata envelope clears the backlog → ready.
-        let envelope = alloy::consensus::TxEnvelope::Legacy(Signed::new_unchecked(
-            TxLegacy::default(),
-            Signature::test_signature(),
-            tx_hash,
-        ));
+        // B1 — a bare `txn_begin` (calldata durably stored but NOT yet a
+        // successful commit) must NOT drain the backlog. The old scan cleared on
+        // ANY transactions row and would flip readiness to 200 with the repair
+        // unfinished; a re-seed here (idempotent) still counts it.
         store
             .txn_begin(
                 tx_hash,
                 TxnEntry {
                     id: None,
-                    envelope,
+                    envelope: mk_envelope(tx_hash),
                     signer: Address::ZERO,
                     expires_at: None,
                     logs: vec![],
@@ -3087,8 +3139,57 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.count_claim_events_awaiting_calldata().await.unwrap(),
+            1,
+            "txn_begin alone does not repair the claim — stays counted (blocker 1)"
+        );
+        assert_eq!(
+            store.seed_claim_calldata_repair_backlog().await.unwrap(),
+            1,
+            "re-seed still classifies a begun-but-uncommitted claim as awaiting (blocker 1)"
+        );
+
+        // A SUCCESSFUL commit is the only thing that drains the backlog.
+        store
+            .txn_commit(tx_hash, Ok(()), 12, [0u8; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_claim_events_awaiting_calldata().await.unwrap(),
             0,
-            "once the calldata envelope is persisted the claim clears the backlog"
+            "a successful calldata commit clears the claim from the backlog"
+        );
+
+        // B3 — evicting the committed claim's receipt from the 10k-entry LRU must
+        // NOT resurrect the backlog. The old scan-based count read the evictable
+        // `transactions` cache and would recount the (repaired) claim as awaiting,
+        // pinning readiness at a permanent 503. The durable set is untouched by
+        // eviction, so the count stays 0.
+        for i in 0..10_010u32 {
+            let mut h = [0u8; 32];
+            h[28..].copy_from_slice(&i.to_be_bytes());
+            let filler = TxHash::from(h);
+            store
+                .txn_begin(
+                    filler,
+                    TxnEntry {
+                        id: None,
+                        envelope: mk_envelope(filler),
+                        signer: Address::ZERO,
+                        expires_at: None,
+                        logs: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            !store.transactions.lock().contains(&tx_hash),
+            "precondition: the committed claim's receipt was evicted from the LRU"
+        );
+        assert_eq!(
+            store.count_claim_events_awaiting_calldata().await.unwrap(),
+            0,
+            "eviction of a repaired claim must not resurrect the backlog (blocker 3)"
         );
     }
 

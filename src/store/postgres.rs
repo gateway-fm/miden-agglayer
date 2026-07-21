@@ -240,23 +240,64 @@ impl Store for PgStore {
 
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
-        // Distinct ClaimEvent tx-hashes (topic0 == CLAIM_EVENT_TOPIC) that have NO
-        // row in `transactions` — i.e. their `claimAsset` calldata envelope was
-        // never persisted or was lost. LEFT JOIN + IS NULL is indexable
-        // (idx_logs_tx_hash / transactions PK) and beats a NOT IN subquery.
+        // O(1) read of the durable repair-backlog set (migration 019), seeded once
+        // at startup by `seed_claim_calldata_repair_backlog` and drained inside a
+        // successful `txn_commit`. This replaces the previous per-poll
+        // `synthetic_logs LEFT JOIN transactions` scan (review blocker 2): the
+        // table is empty except during an active recovery, so readiness polling is
+        // a bounded index count rather than a historical-log deduplication.
         let row = client
-            .query_one(
-                "SELECT COUNT(*) FROM (
-                     SELECT DISTINCT lower(transaction_hash) AS h
-                     FROM synthetic_logs
-                     WHERE lower(topics[1]) = lower($1)
-                 ) c
-                 LEFT JOIN transactions t ON lower(t.tx_hash) = c.h
-                 WHERE t.tx_hash IS NULL",
-                &[&crate::log_synthesis::CLAIM_EVENT_TOPIC],
-            )
+            .query_one("SELECT COUNT(*) FROM claim_calldata_repair_pending", &[])
             .await?;
         let n: i64 = row.get(0);
+        Ok(n.max(0) as u64)
+    }
+
+    async fn seed_claim_calldata_repair_backlog(&self) -> anyhow::Result<u64> {
+        let mut client = self.pool.get().await?;
+        // Rebuild the backlog set from ground truth inside ONE transaction so a
+        // concurrent readiness poll never observes a half-reconciled set.
+        let tx = client.transaction().await?;
+
+        // Blocker 1 — a claim is "awaiting calldata" while its `transactions` row
+        // is ABSENT *or* not yet 'success'. A `txn_begin` that never reached a
+        // successful commit (crash / failed repair) must stay counted, so the seed
+        // predicate is `t.tx_hash IS NULL OR t.status <> 'success'`, and the drain
+        // (in `txn_commit`) only removes on success. `transaction_hash` is already
+        // canonical lowercase `0x…` (written by `txn_commit`); `topics[1]` is the
+        // event's topic0. Keeping `lower()` on both sides is defensive against any
+        // legacy non-canonical rows.
+        tx.execute(
+            "INSERT INTO claim_calldata_repair_pending (tx_hash)
+             SELECT c.h FROM (
+                 SELECT DISTINCT lower(transaction_hash) AS h
+                 FROM synthetic_logs
+                 WHERE lower(topics[1]) = lower($1)
+             ) c
+             LEFT JOIN transactions t ON lower(t.tx_hash) = c.h
+             WHERE t.tx_hash IS NULL OR t.status <> 'success'
+             ON CONFLICT (tx_hash) DO NOTHING",
+            &[&crate::log_synthesis::CLAIM_EVENT_TOPIC],
+        )
+        .await?;
+
+        // Self-heal: drop any pending row that now has a successful calldata row
+        // (e.g. repaired by a prior process, or a drain that a crash interrupted).
+        tx.execute(
+            "DELETE FROM claim_calldata_repair_pending p
+             WHERE EXISTS (
+                 SELECT 1 FROM transactions t
+                 WHERE lower(t.tx_hash) = p.tx_hash AND t.status = 'success'
+             )",
+            &[],
+        )
+        .await?;
+
+        let row = tx
+            .query_one("SELECT COUNT(*) FROM claim_calldata_repair_pending", &[])
+            .await?;
+        let n: i64 = row.get(0);
+        tx.commit().await?;
         Ok(n.max(0) as u64)
     }
 
@@ -1329,6 +1370,18 @@ impl Store for PgStore {
                 )
                 .await?;
             }
+
+            // #148 drain — a successful calldata commit repairs this claim's
+            // envelope, so remove it from the durable repair backlog IN THE SAME
+            // transaction as the status→'success' update. Atomic with the commit:
+            // the row leaves the backlog iff the calldata is durably 'success'
+            // (blocker 1). No-op for a tx_hash that was never in the backlog
+            // (ordinary live claim, or a non-claim tx).
+            tx.execute(
+                "DELETE FROM claim_calldata_repair_pending WHERE tx_hash = $1",
+                &[&hash_str],
+            )
+            .await?;
         }
 
         tx.commit().await?;
