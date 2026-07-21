@@ -188,6 +188,13 @@ done
     || fail "wrapped balance mismatch: got $BALANCE, expected $FWD_MIDEN_UNITS"
 pass "wrapped OPT0 credited: $BALANCE Miden units"
 
+# (b') #147 — the wrapped OPT0 faucet must expose wallet-resolvable metadata. A fresh
+# client resolves the display symbol/decimals from the public faucet ACCOUNT. The proxy
+# creates the faucet symbol via faucet_ops::sanitise_token_symbol (Miden TokenSymbol
+# keeps only A-Z), so the on-chain OPT0 symbol resolves to "OPT" (the digit is stripped)
+# with decimals min(18,8)=8; identity is exact (origin_network=$L2B_NETWORK_ID, OPT0).
+assert_faucet_symbol "$OPT0_FAUCET_ID" "OPT" "8" "L2B OPT0 ERC-20 (origin net=$L2B_NETWORK_ID, addr=$OPT0)"
+
 # (c) ClaimEvent row exists for this deposit's global index.
 CLAIM_ROWS=$(claim_event_rows "$FWD_GI")
 [[ "${CLAIM_ROWS:-0}" -ge 1 ]] || fail "no ClaimEvent synthetic_logs row for globalIndex $FWD_GI"
@@ -199,6 +206,52 @@ pass "ClaimEvent at synthetic block ${FWD_CLAIM_BLOCK:-?} (rows=$CLAIM_ROWS)"
 evidence_record "leg2b" forward Miden claim "" "${FWD_CLAIM_BLOCK:-}" "$BRIDGE_ID" \
     "ClaimEvent-present rows=$CLAIM_ROWS" "globalIndex=$FWD_GI faucet=$OPT0_FAUCET_ID units=$FWD_MIDEN_UNITS"
 evidence_exit_root "leg2b" forward post-forward-claim
+
+# ── #147 Leg 3 (NEW): L2B NATIVE ETH → Miden — the missing native-L2B leg ─────
+# Bridge NATIVE ETH (address(0), metadata 0x, msg.value) L2B → Miden, claim on the
+# proxy, and assert the received faucet resolves ETH/8 from public account state on
+# a fresh wallet AND is a DISTINCT faucet from the L1 native-ETH faucet: (0,0x0) and
+# ($L2B_NETWORK_ID,0x0) are different origins even though both display ETH.
+#
+# ENV-GATED (RUN_L2B_NATIVE_ETH=1, default off): this leg is implemented but not yet
+# validated on a live stack, and it depends on the proxy resolving an L2B-origin
+# native-ETH claim ((net=$L2B_NETWORK_ID, address=0x0), empty metadata) to an ETH/8
+# faucet. Enable it in the gate to validate; a failure here surfaces whether the
+# proxy special-cases L2B native ETH (a #147 product question), not a harness bug.
+if [[ "${RUN_L2B_NATIVE_ETH:-0}" == "1" ]]; then
+    step "#147 Leg 3: bridge native ETH L2B -> Miden + assert ETH/8, distinct from L1 ETH faucet"
+    ZERO_ADDR="0x0000000000000000000000000000000000000000"
+    ETH_WEI="${L2B_ETH_WEI:-1000000000000000}"   # 0.001 ETH
+    ETH_MIDEN_UNITS=$(( ETH_WEI / 10000000000 )) # 10^10 scale (18 -> 8 decimals)
+    ETH_DEST=$(cast wallet address --private-key "$ADMIN_KEY" 2>/dev/null || echo "$ADMIN")
+    ETH_DEST_PADDED="0x000000000000000000000000${ETH_DEST#0x}"
+    NETH_TX=$(cast send "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
+        "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$ETH_WEI" "$ZERO_ADDR" true 0x \
+        --value "$ETH_WEI" --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" --json 2>/dev/null \
+        | python3 -c "import json,sys;print(json.load(sys.stdin).get('transactionHash',''))") \
+        || fail "#147/leg3: native-ETH bridgeAsset on L2B failed"
+    pass "#147/leg3: native ETH locked on L2B (tx $NETH_TX, $ETH_WEI wei)"
+    # Wait for the L2B->Miden native-ETH deposit, then claim it on the proxy (same
+    # nudge-driven proof-backed flow as OPT0, but origin address 0x0 + empty metadata).
+    wait_for "L2B->Miden native-ETH deposit indexed" 180 5 \
+        _pred_deposit_indexed "$DEST_ADDR" "$L2B_NETWORK_ID" "${ZERO_ADDR#0x}" "$L2B_BRIDGE_SERVICE_URL"
+    NETH_DEP=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "${ZERO_ADDR#0x}" "$L2B_BRIDGE_SERVICE_URL")
+    [[ -n "$NETH_DEP" ]] || fail "#147/leg3: native-ETH deposit not indexed"
+    NETH_GI=$(dep_field "$NETH_DEP" global_index); NETH_CNT=$(dep_field "$NETH_DEP" deposit_cnt)
+    NETH_DNET=$(dep_field "$NETH_DEP" dest_net); NETH_DADDR=$(dep_field "$NETH_DEP" dest_addr)
+    NETH_AMT=$(dep_field "$NETH_DEP" amount)
+    nudge_until "native-ETH claimAsset accepted on Miden (ClaimEvent gi $NETH_GI)" \
+        _pred_submit_forward_claim "$NETH_CNT" "$NETH_GI" "$L2B_NETWORK_ID" "$ZERO_ADDR" "$NETH_DNET" "$NETH_DADDR" "$NETH_AMT" "0x" \
+        || fail "#147/leg3: native-ETH claim never accepted on the proxy (gi $NETH_GI)"
+    # Resolve the (net=$L2B_NETWORK_ID, 0x0) native-ETH faucet + assert distinctness.
+    L2B_ETH_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '0000000000000000000000000000000000000000' AND origin_network = ${L2B_NETWORK_ID};")
+    [[ -n "$L2B_ETH_FID" ]] || fail "#147/leg3: no faucet_registry row for L2B native ETH (net $L2B_NETWORK_ID, 0x0)"
+    L1_ETH_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '0000000000000000000000000000000000000000' AND origin_network = 0;")
+    [[ -n "$L1_ETH_FID" && "$L2B_ETH_FID" != "$L1_ETH_FID" ]] \
+        || fail "#147/leg3: L2B native-ETH faucet ($L2B_ETH_FID) must be DISTINCT from L1 native-ETH faucet ($L1_ETH_FID) — (0,0x0) vs ($L2B_NETWORK_ID,0x0) collapsed"
+    pass "#147/leg3: L2B native-ETH faucet $L2B_ETH_FID distinct from L1 ETH faucet $L1_ETH_FID"
+    assert_faucet_symbol "$L2B_ETH_FID" "ETH" "8" "L2B native ETH (origin net=$L2B_NETWORK_ID, addr=0x0)"
+fi
 
 # ── Persist state for the clash + back scenarios (atomic + fingerprinted) ────
 # Write to a temp file and atomically rename so a consumer never sees a partial

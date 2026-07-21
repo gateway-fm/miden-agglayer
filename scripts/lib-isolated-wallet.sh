@@ -86,6 +86,44 @@ iso_wallet_balance() {
     echo "$out" | grep "wallet balance:" | head -1 | awk '{print $NF}' || true
 }
 
+# iso_inspect_faucet <faucet_id> → resolve a faucet's WALLET-RESOLVABLE display
+# metadata (symbol/decimals) on a FRESH client store with NO preloaded token map —
+# exactly what a cold receiving wallet does to render an incoming fungible P2ID
+# asset (#147). Echoes the tool's `inspect-faucet: faucet_id=.. symbol=.. decimals=..`
+# line on success (rc 0); returns NON-ZERO (echoing the ERROR line) when the metadata
+# is unresolvable (the wallet's `Unknown`) or the RPC fails — never a silent empty.
+# A throwaway store dir on the same bind-mount device is created + wiped each call.
+iso_inspect_faucet() {
+    local fid="$1" fresh rc out
+    fresh="$B2AGG_STORE_DIR/inspect-$$-${RANDOM}"
+    mkdir -p "$fresh/tmp"
+    out=$(docker run --rm --network "$ISO_NETWORK" \
+        -v "$fresh:/store" -e "TMPDIR=/store/tmp" \
+        --entrypoint bridge-out-tool "$ISO_IMAGE" \
+        --store-dir /store --node-url "$ISO_NODE_URL" \
+        --inspect-faucet "$fid" 2>&1)
+    rc=$?
+    # container-created files are root-owned; wipe via busybox if plain rm fails.
+    rm -rf "$fresh" 2>/dev/null || docker run --rm -v "$B2AGG_STORE_DIR:/w" busybox rm -rf "/w/$(basename "$fresh")" >/dev/null 2>&1 || true
+    echo "$out"
+    return "$rc"
+}
+
+# assert_faucet_symbol <faucet_id> <expected_symbol> <expected_decimals> <origin-label>
+# → inspect the faucet on a fresh client and fail (with full diagnostics) unless it
+# resolves to exactly <expected_symbol>/<expected_decimals>. #147: a fresh wallet must
+# NOT render this asset as `Unknown`. Exports INSPECT_SYMBOL/INSPECT_DECIMALS.
+assert_faucet_symbol() {
+    local fid="$1" want_sym="$2" want_dec="$3" label="$4" insp
+    insp=$(iso_inspect_faucet "$fid") \
+        || fail "#147: faucet metadata UNRESOLVABLE (a cold wallet would show 'Unknown') for $label faucet=$fid — $insp"
+    INSPECT_SYMBOL=$(printf '%s\n' "$insp" | grep -oE 'symbol=[^ ]+' | head -1 | cut -d= -f2)
+    INSPECT_DECIMALS=$(printf '%s\n' "$insp" | grep -oE 'decimals=[0-9]+' | head -1 | cut -d= -f2)
+    [[ "$INSPECT_SYMBOL" == "$want_sym" && "$INSPECT_DECIMALS" == "$want_dec" ]] \
+        || fail "#147: $label faucet must resolve $want_sym/$want_dec but a fresh client got symbol='$INSPECT_SYMBOL' decimals='$INSPECT_DECIMALS' (faucet=$fid; full: $insp)"
+    pass "#147: $label faucet $fid resolves $INSPECT_SYMBOL/$INSPECT_DECIMALS from public account state (cold-wallet safe)"
+}
+
 # provision_isolated_wallet [<probe_bridge_id> <probe_faucet_id>]
 #
 # Ensures $B2AGG_STORE_DIR holds a provisioned, usable wallet and exports:

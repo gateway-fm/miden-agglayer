@@ -204,6 +204,14 @@ else
     pass "L1→L2 COMPLETE! Wallet balance: $BAL_BEFORE → $BALANCE (+$BAL_DELTA, expected +$EXPECTED_L2_BALANCE)"
 fi
 
+# ── #147: the received ETH faucet must expose wallet-resolvable ETH/8 ──────────
+# The P2ID asset just credited carries only (faucet_id, amount) — a fresh wallet
+# resolves its display symbol/decimals from the public faucet ACCOUNT (not a
+# preloaded map / admin_listFaucets). This is the canonical seeded L1 ETH faucet,
+# keyed (origin_network=0, origin_address=0x0). A None/RPC-fail/Unknown fails.
+log "Step 6/6 (#147): a fresh client resolves the received ETH faucet's symbol/decimals"
+assert_faucet_symbol "$FAUCET_ID" "ETH" "8" "L1 native ETH (origin net=0, addr=0x0)"
+
 echo ""
 log "======================================================================"
 log "  L1→L2 TEST DONE"

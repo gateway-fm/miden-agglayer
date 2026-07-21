@@ -206,6 +206,21 @@ struct Args {
     /// is less than the amount to remove" (it would address the empty enabled slot).
     #[arg(long)]
     asset_callbacks_disabled: bool,
+
+    /// Faucet-inspection mode (#147): resolve a public faucet's WALLET-RESOLVABLE
+    /// display metadata (symbol + decimals) purely from on-chain account state via
+    /// `Client::fetch_remote_token_metadata` — exactly what a receiving wallet does
+    /// to render an incoming fungible P2ID asset (which carries only faucet_id +
+    /// amount, no symbol). Uses a FRESH client (pass a temp --store-dir with no
+    /// preloaded token map) + the same node the wallet syncs against, so a green
+    /// result proves a cold wallet resolves the symbol rather than showing `Unknown`.
+    /// Prints a stable machine-readable line: `inspect-faucet: faucet_id=<hex>
+    /// symbol=<S> decimals=<D>`. Metadata that does not resolve (private / not on
+    /// chain / storage slot not a token config = the wallet's `Unknown`) or an RPC
+    /// failure is a NON-ZERO exit with `inspect-faucet: ERROR <reason>` — never a
+    /// silent empty symbol. Requires only --store-dir + --node-url.
+    #[arg(long)]
+    inspect_faucet: Option<String>,
 }
 
 impl std::fmt::Debug for Args {
@@ -335,8 +350,13 @@ async fn main() -> anyhow::Result<()> {
     let store_path = args.store_dir.join("store.sqlite3");
     let keystore_path = args.store_dir.join("keystore");
 
-    if args.create_wallet || args.create_foreign_bridge || args.create_native_faucet {
-        // Provision modes: the store/keystore may not exist yet — create them.
+    if args.create_wallet
+        || args.create_foreign_bridge
+        || args.create_native_faucet
+        || args.inspect_faucet.is_some()
+    {
+        // Provision / read-only modes: the store/keystore may not exist yet (a fresh
+        // temp dir for --inspect-faucet) — create them.
         std::fs::create_dir_all(&keystore_path)
             .with_context(|| format!("creating keystore dir {}", keystore_path.display()))?;
     } else {
@@ -401,6 +421,46 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await
         .map_err(|e| anyhow!("failed to build miden client: {e:?}"))?;
+
+    // ── Faucet-inspection mode (#147) ─────────────────────────────────────────
+    // Resolve a public faucet's display metadata (symbol + decimals) exactly the
+    // way a receiving wallet does — purely from on-chain account state, on a fresh
+    // client with no preloaded token map. Machine-readable output; a NON-resolving
+    // faucet (the wallet's `Unknown`) or an RPC failure is a non-zero exit.
+    if let Some(fid_hex) = args.inspect_faucet.as_deref() {
+        let faucet_id = parse_account_id(fid_hex)
+            .with_context(|| format!("inspect-faucet: bad faucet id {fid_hex}"))?;
+        match client.fetch_remote_token_metadata(faucet_id).await {
+            Ok(Some(meta)) => {
+                // Stable, parseable line — the e2e greps `symbol=` / `decimals=`.
+                println!(
+                    "inspect-faucet: faucet_id={} symbol={} decimals={}",
+                    faucet_id.to_hex(),
+                    meta.symbol,
+                    meta.decimals,
+                );
+                return Ok(());
+            }
+            Ok(None) => {
+                // This is the exact condition under which a fresh wallet renders the
+                // received asset as `Unknown`: fail LOUD so an e2e cannot stay green.
+                eprintln!(
+                    "inspect-faucet: ERROR unresolvable metadata for faucet {} \
+                     (account is private / not on chain / storage slot is not a token \
+                     config) — a fresh wallet would render this asset as `Unknown`",
+                    faucet_id.to_hex(),
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!(
+                    "inspect-faucet: ERROR rpc fetch failed for faucet {}: {e:?}",
+                    faucet_id.to_hex(),
+                );
+                std::process::exit(3);
+            }
+        }
+    }
 
     // ── Provision mode ────────────────────────────────────────────────────────
     // Create a fully independent bridge-out wallet in THIS store (separate from
