@@ -161,28 +161,33 @@ for _i in $(seq 1 90); do
 done
 
 # ── 1. Readiness is WITHHELD while the claim calldata is missing ──────────────
-# Poll: we MUST observe a 503 "recovering" with claims_awaiting_calldata >= 1 at
-# least once (the gate holding), then a transition to 200 (repair complete).
-# Single-curl capture (code+body together, no race between two requests) polled TIGHTLY
-# so a short-lived `recovering` window is not stepped over. Deadline-bounded so the wait
-# for the eventual 200 stays generous even at a fast interval.
-SAW_RECOVERING=0; READY=0
+# The gating PROPERTY: while any historical ClaimEvent still lacks its calldata, /health is
+# 503 with claims_awaiting_calldata >= 1; it flips to 200 only once repair completes. We
+# assert THAT, not the specific sub-status label: a correct fast client can transition
+# `degraded` (node not yet alive, backlog>0) straight to 200 without ever exposing the
+# `recovering` (alive=true, backlog>0) sub-state (the same initial tick that flips alive
+# true also drains a small backlog) — so requiring the `recovering` label is unsatisfiable
+# for a healthy impl (PR #151 blocker). BOTH 503 sub-states now report the backlog, so
+# "503 AND claims_awaiting_calldata>=1" is the reliable, observable withhold signal (the
+# node-reconnect window is not sub-second). Single-curl capture (code+body atomically),
+# polled tightly, deadline-bounded for the eventual 200.
+SAW_WITHHELD=0; READY=0
 RECOV_DEADLINE=$(( $(date +%s) + 600 ))
 while [[ $(date +%s) -lt $RECOV_DEADLINE ]]; do
     RESP="$(curl -s -m5 -w $'\n%{http_code}' "$L2_RPC/health" 2>/dev/null || printf '{}\n000')"
     CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
     if [[ "$CODE" == "503" ]]; then
-        if echo "$BODY" | grep -q 'recovering' && echo "$BODY" | python3 -c "import json,sys;sys.exit(0 if (json.load(sys.stdin).get('claims_awaiting_calldata',0) or 0) >= 1 else 1)" 2>/dev/null; then
-            SAW_RECOVERING=1
+        if echo "$BODY" | python3 -c "import json,sys;sys.exit(0 if (json.load(sys.stdin).get('claims_awaiting_calldata',0) or 0) >= 1 else 1)" 2>/dev/null; then
+            SAW_WITHHELD=1
         fi
     elif [[ "$CODE" == "200" ]]; then
         READY=1; break
     fi
     sleep 0.3
 done
-[[ "$SAW_RECOVERING" == "1" ]] \
-    || fail "#148: never observed /health=503 'recovering' with claims_awaiting_calldata>=1 — the readiness gate did NOT hold while calldata was missing"
-pass "1. Readiness WITHHELD: /health=503 'recovering' (claims_awaiting_calldata>=1) while the claim calldata was missing"
+[[ "$SAW_WITHHELD" == "1" ]] \
+    || fail "#148: never observed /health=503 with claims_awaiting_calldata>=1 — the readiness gate did NOT hold while calldata was missing"
+pass "1. Readiness WITHHELD: /health=503 (claims_awaiting_calldata>=1) while the claim calldata was missing"
 [[ "$READY" == "1" ]] || fail "#148: /health never returned to 200 after the calldata repair (repair stalled?)"
 pass "1b. Readiness flipped to 200 once the calldata repair completed"
 

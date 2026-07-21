@@ -825,7 +825,14 @@ async fn health_check(State(service): State<ServiceState>) -> impl IntoResponse 
             http::StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
                 "status": "degraded",
-                "reason": "node connection lost"
+                "reason": "node connection lost",
+                // Report the calldata-repair backlog even while the node is down: during a
+                // reset-Miden-store recovery the node is not-yet-alive WHILE the backlog is
+                // still >0, and readiness is withheld for BOTH reasons. Surfacing it here
+                // makes "readiness held because calldata is still missing" observable in the
+                // node-reconnect window (the `recovering`/alive=true window can be skipped
+                // when the same initial tick that flips alive true also drains the backlog).
+                "claims_awaiting_calldata": backlog,
             })),
         ),
         Readiness::RecoveringCalldata {
