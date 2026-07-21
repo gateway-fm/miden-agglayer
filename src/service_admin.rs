@@ -442,8 +442,19 @@ pub async fn admin_register_native_faucet(
                              found after import"
                         )
                     })?;
-                // Both supported kinds expose the standard FungibleFaucet metadata.
-                let (_kind, faucet) = faucet_ops::classify_faucet_account(&faucet_account)?;
+                // Both supported kinds expose the standard FungibleFaucet metadata, but
+                // admin_registerNativeFaucet is for operator-owned NATIVE faucets only.
+                // Guard against an operator accidentally reclassifying an already-deployed
+                // AggLayer-owned (bridge mint/burn) faucet as native (PR #150 review).
+                let (kind, faucet) = faucet_ops::classify_faucet_account(&faucet_account)?;
+                if kind != faucet_ops::FaucetKind::NativeFungible {
+                    anyhow::bail!(
+                        "admin_registerNativeFaucet: faucet account {faucet_id} is an \
+                         AggLayer-owned (bridge mint/burn) faucet, not an operator-owned \
+                         native FungibleFaucet — refusing to register it as native; no \
+                         registry row written"
+                    );
+                }
                 *authoritative_read.lock().unwrap() = Some(AuthoritativeFaucetMetadata {
                     name: faucet.token_name().as_str().to_string(),
                     symbol: faucet.symbol().to_string(),

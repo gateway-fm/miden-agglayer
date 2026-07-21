@@ -291,10 +291,16 @@ preimage is reconstructable from authoritative chain state during `--restore`
 mismatched symbol, decimals, or name is rejected up-front with a specific error
 and leaves no registry row.
 
+**Legacy state is not migrated.** The supported rollout is clean-slate: the new
+deployment starts fresh with this validation active, so no legacy mismatched row
+carries into it, and no in-place repair path is provided. The detection below is
+for diagnosing an unexpected mismatched row on a stack that must be kept — not a
+supported migration.
+
 A row registered by an **older build** may still carry a preimage that does not
 match its deployed faucet account. Recovery does **not** silently guess a
 preimage — an unrecoverable native row halts `--restore` fail-closed (its poison
-leaf). To detect and remediate before that happens:
+leaf). To detect it:
 
 1. Detect. For each native row (`origin_network` == the proxy's configured
    `network_id`), compare the stored preimage against the deployed faucet
@@ -313,12 +319,17 @@ leaf). To detect and remediate before that happens:
    faucet's on-chain `MetadataHash`. A row whose stored preimage keccak differs
    from the deployed faucet's hash is mismatched.
 
-2. Remediate. Re-register the faucet against its deployed account so the row and
-   the emitted bridge metadata are rewritten from authoritative state. Because a
-   custom `name != symbol` is valid, supply the faucet's actual name (or omit
-   `name` to adopt it) — never normalize it to the symbol. Recovery must not
-   reconstruct history by guessing; the only safe source is the deployed faucet
-   account.
+2. Remediate. Re-registration does **not** repair a mismatched row:
+   `admin_registerNativeFaucet` is register-if-absent (idempotent) — for an
+   origin that already has a route it returns the existing row unchanged and
+   never rewrites its metadata. A kept stack with a mismatched legacy row must
+   therefore be remediated by removing that row (operator-authorized DB action)
+   and re-registering the faucet against its deployed account — the fresh
+   registration then validates + persists authoritative metadata (supplying the
+   faucet's actual name, or omitting `name` to adopt it; a custom `name != symbol`
+   is preserved, never normalized). Recovery must not reconstruct history by
+   guessing; the only safe source is the deployed faucet account. On the
+   supported clean-slate rollout this situation does not arise.
 
 ## 4. Incident procedures
 

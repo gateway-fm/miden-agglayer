@@ -143,24 +143,32 @@ _reg_mismatch() { # $1=symbol $2=decimals $3=origin_addr  -> echoes the JSON res
 BAD_SYM_ORIGIN="0x0bad51$(python3 -c "import secrets;print(secrets.token_hex(17))")"
 BAD_DEC_ORIGIN="0x0badde$(python3 -c "import secrets;print(secrets.token_hex(17))")"
 BAD_NAME_ORIGIN="0x0bad1a$(python3 -c "import secrets;print(secrets.token_hex(17))")"
-# wrong symbol
+# origin_address is BYTEA: `lower(origin_address)` is an invalid Postgres call that
+# pgq suppresses → empty output → a FALSE-GREEN "no row" even if one exists (PR #150
+# review). Compare `encode(origin_address,'hex')` against the hex origin instead.
+_no_registry_row() { [[ -z "$(pgq "SELECT 1 FROM faucet_registry WHERE encode(origin_address,'hex')=lower('${1#0x}');")" ]]; }
+# wrong symbol → 'symbol mismatch', and NO registry row
 RESP=$(_reg_mismatch "WRONG" 8 "$BAD_SYM_ORIGIN")
 echo "$RESP" | grep -qi 'symbol mismatch' \
   || fail "#149: wrong-symbol registration should error 'symbol mismatch', got: $RESP"
-[[ -z "$(pgq "SELECT 1 FROM faucet_registry WHERE lower(origin_address)=lower('${BAD_SYM_ORIGIN#0x}') OR lower(origin_address)=lower('$BAD_SYM_ORIGIN');")" ]] \
-  || fail "#149: wrong-symbol registration must leave NO registry row"
-# wrong decimals
+_no_registry_row "$BAD_SYM_ORIGIN" || fail "#149: wrong-symbol registration must leave NO registry row"
+# wrong decimals → 'decimals mismatch', and NO registry row
 RESP=$(_reg_mismatch "MDN" 6 "$BAD_DEC_ORIGIN")
 echo "$RESP" | grep -qi 'decimals mismatch' \
   || fail "#149: wrong-decimals registration should error 'decimals mismatch', got: $RESP"
-# wrong (non-matching) explicit name
+_no_registry_row "$BAD_DEC_ORIGIN" || fail "#149: wrong-decimals registration must leave NO registry row"
+# wrong (non-matching) explicit name → 'name mismatch', and NO registry row
 RESP=$(curl -s "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
   \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
   \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$BAD_NAME_ORIGIN\",
     \"symbol\":\"MDN\",\"decimals\":8,\"name\":\"Not The Real Name\"}]}" 2>/dev/null)
 echo "$RESP" | grep -qi 'name mismatch' \
   || fail "#149: wrong-name registration should error 'name mismatch', got: $RESP"
-pass "#149: mismatched symbol/decimals/name each rejected before any state change (no registry rows)"
+_no_registry_row "$BAD_NAME_ORIGIN" || fail "#149: wrong-name registration must leave NO registry row"
+# No-bridge-metadata side: register_faucet_in_bridge runs only AFTER validation passes,
+# so a rejected registration also emits NO ConfigAggBridgeNote — unit-proven by
+# native_registration_fails_closed_when_metadata_unreadable (test_call_count()==1).
+pass "#149: mismatched symbol/decimals/name each rejected before any state change — NO registry row for any (+ no bridge metadata, unit-proven)"
 
 # ── 1d. #149 — a custom-name (name != symbol) faucet is preserved exactly ──────
 # Deploy a SECOND native faucet whose on-chain token NAME differs from its symbol
@@ -203,6 +211,30 @@ done
 [[ "$NAME_HEX" != "$SYMBOL_HEX" ]] \
   || fail "#149: test setup error — custom name must differ from symbol"
 pass "#149: custom name '$CUSTOM_NAME' (!= symbol '$CUSTOM_SYMBOL') adopted + preserved in the metadata preimage"
+
+# ── 1e-PRE: register the network-2 row EARLY (while the miden client is FRESH) ──
+# The restore-survival assertion (step 1e, gated by RUN_1E_RESTORE) needs a net-2
+# (L2B-origin) registry row to prove multi-network recovery. Register it HERE,
+# before the native round-trip — NOT mid-1e — because admin_registerFaucet(net-2)
+# after the round-trip trips a miden-client-worker death (finding #76, unrelated
+# to #149's admin_registerNativeFaucet path). On a fresh client it registers
+# cleanly (as e2e-l2l2-forward.sh does).
+if [[ "$DEST" == "l2b" && "${RUN_1E_RESTORE:-0}" == "1" ]]; then
+    NET2_ORIGIN="0x0e2b02$(python3 -c "import secrets;print(secrets.token_hex(17))")"
+    RESP=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+      \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerFaucet\",
+      \"params\":[{\"symbol\":\"L2BT\",\"origin_token_address\":\"$NET2_ORIGIN\",
+        \"origin_network\":2,\"origin_decimals\":6}]}" 2>/dev/null) \
+      || fail "#149/1e-PRE: admin_registerFaucet (net-2) unreachable: $RESP"
+    NET2_FAUCET_ID=""
+    for _i in $(seq 1 40); do
+        NET2_FAUCET_ID=$(pgq "SELECT faucet_id FROM faucet_registry WHERE origin_network=2 AND encode(origin_address,'hex')=lower('${NET2_ORIGIN#0x}');")
+        [[ -n "$NET2_FAUCET_ID" ]] && break
+        sleep 3
+    done
+    [[ -n "$NET2_FAUCET_ID" ]] || fail "#149/1e-PRE: network-2 registry row never created (net-2 registration failed: $RESP)"
+    pass "1e-PRE: network-2 (L2B-origin) token registered early (fresh client): faucet=$NET2_FAUCET_ID"
+fi
 
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> $DEST_LABEL (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
@@ -324,21 +356,8 @@ if [[ "$DEST" == "l2b" && "${RUN_1E_RESTORE:-0}" == "1" ]]; then
     # Its assertions read faucet_registry via psql, which survives regardless.
     step "1e. #149: drop + --restore preserves the native custom-name row AND a network-2 row"
 
-    # Add a network-2 (L2B-origin) wrapped-token row so a net-2 identity exists to recover.
-    NET2_ORIGIN="0x0e2b02$(python3 -c "import secrets;print(secrets.token_hex(17))")"
-    RESP=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
-      \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerFaucet\",
-      \"params\":[{\"symbol\":\"L2BT\",\"origin_token_address\":\"$NET2_ORIGIN\",
-        \"origin_network\":2,\"origin_decimals\":6}]}" 2>/dev/null) \
-      || fail "#149/1e: admin_registerFaucet (net-2) unreachable: $RESP"
-    NET2_FAUCET_ID=""
-    for _i in $(seq 1 40); do
-        NET2_FAUCET_ID=$(pgq "SELECT faucet_id FROM faucet_registry WHERE origin_network=2 AND (lower(origin_address)=lower('${NET2_ORIGIN#0x}') OR lower(origin_address)=lower('$NET2_ORIGIN'));")
-        [[ -n "$NET2_FAUCET_ID" ]] && break
-        sleep 3
-    done
-    [[ -n "$NET2_FAUCET_ID" ]] || fail "#149/1e: network-2 registry row never created (net-2 registration failed: $RESP)"
-    pass "1e PRE: network-2 (L2B-origin) token registered: faucet=$NET2_FAUCET_ID"
+    # NET2_FAUCET_ID was registered EARLY (1e-PRE, fresh client) to avoid finding #76.
+    [[ -n "${NET2_FAUCET_ID:-}" ]] || fail "#149/1e: NET2_FAUCET_ID not set (1e-PRE early registration must have run)"
 
     # Capture PRE metadata preimages for BOTH rows (WMDN native custom-name from 1d + net-2).
     PRE_NATIVE_META=$(pgq "SELECT encode(metadata,'hex') FROM faucet_registry WHERE lower(faucet_id)=lower('$CUSTOM_FAUCET_ID');")
