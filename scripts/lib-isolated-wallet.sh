@@ -137,12 +137,20 @@ assert_faucet_symbol() {
 # (A stronger form — enumerating the consumed note's faucet id directly instead of probing
 # a known id — needs a bridge-out-tool `--list-wallet-faucets` mode; tracked as follow-up.)
 assert_received_faucet() {
-    local bridge_id="$1" fid="$2" want_sym="$3" want_dec="$4" min_amt="$5" label="$6" bal
-    bal=$(iso_wallet_balance "$bridge_id" "$fid")
+    local bridge_id="$1" fid="$2" want_sym="$3" want_dec="$4" min_amt="$5" label="$6" bal="" attempt
+    # POLL: the just-claimed P2ID note is not consumed/visible instantly — each
+    # iso_wallet_balance call syncs + consumes pending notes, so retry until the balance
+    # reaches min_amt (mirrors leg 2b's wrapped-balance poll). On a FRESH stack (no
+    # accumulated balance) a single read races the note and reads 0; polling closes that.
+    for attempt in $(seq 1 "${RECV_POLL_TRIES:-15}"); do
+        bal=$(iso_wallet_balance "$bridge_id" "$fid")
+        [[ -n "$bal" && "$bal" =~ ^[0-9]+$ && "$bal" -ge "$min_amt" ]] && break
+        sleep "${RECV_POLL_INTERVAL:-10}"
+    done
     [[ -n "$bal" && "$bal" =~ ^[0-9]+$ ]] \
-        || fail "#147/link: could not read received balance for $label (wallet=$WALLET_ID faucet=$fid) — got '$bal'; the wallet never consumed a P2ID note of this faucet"
+        || fail "#147/link: could not read received balance for $label (wallet=$WALLET_ID faucet=$fid) after ${RECV_POLL_TRIES:-15} polls — got '$bal'; the wallet never consumed a P2ID note of this faucet"
     [[ "$bal" -ge "$min_amt" ]] \
-        || fail "#147/link: $label wallet received $bal < expected >= $min_amt of faucet $fid (wallet=$WALLET_ID) — received asset does not match"
+        || fail "#147/link: $label wallet received $bal < expected >= $min_amt of faucet $fid (wallet=$WALLET_ID) after ${RECV_POLL_TRIES:-15} polls — received asset does not match"
     log "#147/link: $label — wallet $WALLET_ID holds $bal units of faucet $fid (consumed its P2ID note); verifying that faucet's symbol"
     assert_faucet_symbol "$fid" "$want_sym" "$want_dec" "$label"
     pass "#147/link: $label received asset LINKED — wallet consumed a P2ID note of faucet $fid ($bal units) that resolves $want_sym/$want_dec"
