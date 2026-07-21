@@ -319,17 +319,17 @@ leaf). To detect it:
    faucet's on-chain `MetadataHash`. A row whose stored preimage keccak differs
    from the deployed faucet's hash is mismatched.
 
-2. Remediate. Re-registration does **not** repair a mismatched row:
-   `admin_registerNativeFaucet` is register-if-absent (idempotent) — for an
-   origin that already has a route it returns the existing row unchanged and
-   never rewrites its metadata. A kept stack with a mismatched legacy row must
-   therefore be remediated by removing that row (operator-authorized DB action)
-   and re-registering the faucet against its deployed account — the fresh
-   registration then validates + persists authoritative metadata (supplying the
-   faucet's actual name, or omitting `name` to adopt it; a custom `name != symbol`
-   is preserved, never normalized). Recovery must not reconstruct history by
-   guessing; the only safe source is the deployed faucet account. On the
-   supported clean-slate rollout this situation does not arise.
+2. Do not attempt an in-place repair. `admin_registerNativeFaucet` is
+   register-if-absent (idempotent) — it never rewrites an existing row — so
+   re-registration cannot fix a mismatched row. Surgical row deletion +
+   re-registration is also **not** a repair: it discards the only locally
+   retained legacy preimage and overwrites the bridge's current metadata hash,
+   yet it cannot repair historical B2AGG leaves/events already committed with
+   the old hash. The supported rollout is clean-slate, so legacy state is not
+   migrated and this situation does not arise on it. If a mismatched row is
+   ever observed on a stack that must be kept: preserve and back up the current
+   state, quarantine the affected faucet, and escalate — or rebuild from a
+   clean deployment. Do not perform surgical row edits.
 
 ## 4. Incident procedures
 

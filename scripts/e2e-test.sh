@@ -88,16 +88,12 @@ case "$test_filter" in
             DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
             echo ""
             DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
-            echo ""
-            # #149 restore acceptance: a dedicated one-shot proving a native CUSTOM-NAME
-            # faucet (name != symbol) AND a network-2 row survive a from-scratch drop +
-            # --restore with byte-identical metadata preimages (RUN_1E_RESTORE=1). It is
-            # DESTRUCTIVE (rebuilds the store from chain) so it runs as its own phase,
-            # immediately before cantina13 (which does its own from-scratch restore next,
-            # so back-to-back restores are safe). Without this wiring the restore leg is
-            # dead code — PR #150 review.
-            echo "== #149 native-faucet metadata restore-survival (drop + --restore) =="
-            RUN_1E_RESTORE=1 DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
+            # #149 restore acceptance (native custom-name row + net-2 row survive
+            # --restore with byte-identical preimages + full identity) is asserted by
+            # cantina13 below, which reuses the WMDN name!=symbol native row created by
+            # the DEST=l2b run above and a net-2 row from the l2l2 tier, and does its own
+            # COORDINATED proxy + bridge-service drop+restore (PR #150 re-review — no
+            # separate destructive proxy-only reset that would wedge cantina13).
         else
             echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
         fi

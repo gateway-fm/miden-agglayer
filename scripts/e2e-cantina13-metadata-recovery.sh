@@ -430,6 +430,27 @@ docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/de
 [[ -s "$BACKUP" ]] || fail "DB backup failed (empty dump) — refusing to drop without a backup"
 pass "DB backed up ($(wc -c < "$BACKUP") bytes → $BACKUP)"
 
+# ── #149 restore-survival PRE-capture (reuses existing full-suite rows) ────────────────
+# Before the from-scratch DROP + --restore, snapshot a native CUSTOM-NAME row and a
+# network-2 row so we can prove they SURVIVE recovery with FULL identity
+# (faucet_id | origin_network | origin_address | symbol | origin_decimals | preimage).
+# The native custom-name (WMDN, name != symbol) row comes from e2e-miden-origin.sh's
+# custom-name faucet (step 1d); a net-2 (L2B-origin) row comes from the l2l2 tier. This
+# reuses rows that already exist in the full suite — no extra registration, no separate
+# proxy-only reset (PR #150 re-review). If either row is absent (cantina13 run outside
+# the full suite), SKIP — the assertion is only meaningful with the prior tiers present.
+_s149_row() { pg "SELECT faucet_id||'|'||origin_network||'|'||encode(origin_address,'hex')||'|'||symbol||'|'||origin_decimals||'|'||encode(metadata,'hex') FROM faucet_registry WHERE $1 ORDER BY faucet_id LIMIT 1"; }
+S149_NATIVE_ROW=$(_s149_row "symbol='WMDN'")
+S149_NET2_ROW=$(_s149_row "origin_network=2")
+if [[ -n "$S149_NATIVE_ROW" && -n "$S149_NET2_ROW" ]]; then
+    S149_CHECK=1
+    S149_NATIVE_FID="${S149_NATIVE_ROW%%|*}"; S149_NET2_FID="${S149_NET2_ROW%%|*}"
+    pass "#149 restore-survival PRE: captured native custom-name row (WMDN $S149_NATIVE_FID) + net-2 row ($S149_NET2_FID)"
+else
+    S149_CHECK=0
+    log "#149 restore-survival: SKIP — no WMDN native and/or net-2 row present (cantina13 run outside the full suite)"
+fi
+
 # finding #65 — we deliberately do NOT preserve the proxy's per-signer nonce tables.
 # The proxy IS the synthetic L2, so DROP SCHEMA legitimately resets its `nonces` /
 # `nonce_reservations` to 0 on the from-scratch rebuild — that is correct, not a bug to
@@ -480,6 +501,38 @@ wait_for "bridge-service resynced + reachable after recovery" \
     "[[ \$(curl -s -m3 -o /dev/null -w '%{http_code}' $BRIDGE_SERVICE_URL/ 2>/dev/null) =~ ^(200|404)$ ]]" \
     180 5
 pass "bridge-service resynced — re-migrated, re-fetches sponsor nonce 0 from the recovered proxy"
+
+# ── #149 restore-survival POST: both rows survived recovery with full identity ────────
+# The from-scratch --restore rebuilds every faucet_registry row from authoritative
+# on-chain state. Assert the captured native custom-name row AND net-2 row survive with
+# a BYTE-IDENTICAL identity string (same faucet_id / origin_network / origin_address /
+# symbol / origin_decimals / metadata preimage) — this is the explicit native + net-2
+# registry-row acceptance criterion (PR #150 re-review, blocker 1: prove native ROUTE
+# identity, not just that some row exists). name != symbol preservation is checked too.
+if [[ "${S149_CHECK:-0}" == "1" ]]; then
+    S149_POST_NATIVE=""; S149_POST_NET2=""
+    for _i in $(seq 1 60); do
+        S149_POST_NATIVE=$(_s149_row "faucet_id='$S149_NATIVE_FID'")
+        S149_POST_NET2=$(_s149_row "faucet_id='$S149_NET2_FID'")
+        [[ -n "$S149_POST_NATIVE" && -n "$S149_POST_NET2" ]] && break
+        sleep 3
+    done
+    [[ -n "$S149_POST_NATIVE" ]] || fail "#149 restore-survival: native custom-name row ($S149_NATIVE_FID) did NOT survive --restore"
+    [[ "$S149_POST_NATIVE" == "$S149_NATIVE_ROW" ]] \
+        || fail "#149 restore-survival: native row identity/preimage CHANGED across restore — pre=[$S149_NATIVE_ROW] post=[$S149_POST_NATIVE]"
+    [[ -n "$S149_POST_NET2" ]] || fail "#149 restore-survival: network-2 row ($S149_NET2_FID) did NOT survive --restore"
+    [[ "$S149_POST_NET2" == "$S149_NET2_ROW" ]] \
+        || fail "#149 restore-survival: net-2 row identity/preimage CHANGED across restore — pre=[$S149_NET2_ROW] post=[$S149_POST_NET2]"
+    # name != symbol preserved: the WMDN preimage is abi.encode("Wrapped Midnight","WMDN",8)
+    # (e2e-miden-origin.sh CUSTOM_NAME/CUSTOM_SYMBOL); its name-hex must be present in the
+    # recovered preimage AND differ from the symbol-hex (proving it was not normalized).
+    S149_NAME_HEX=$(python3 -c "print('Wrapped Midnight'.encode().hex())")
+    S149_SYM_HEX=$(python3 -c "print('WMDN'.encode().hex())")
+    S149_POST_META="${S149_POST_NATIVE##*|}"
+    [[ "$S149_POST_META" == *"$S149_NAME_HEX"* && "$S149_NAME_HEX" != "$S149_SYM_HEX" ]] \
+        || fail "#149 restore-survival: recovered native preimage lost the custom name 'Wrapped Midnight' (name != symbol not preserved)"
+    pass "#149 restore-survival: native custom-name row (name != symbol) AND net-2 row survived --restore with identical origin_network / origin_address / symbol / decimals + byte-identical preimage"
+fi
 
 # After the rebuild the leaf's REAL metadata recovers (correct origin from on-chain →
 # L1 name()/symbol()/decimals()) → the REAL BridgeEvent emits at its reserved index →
