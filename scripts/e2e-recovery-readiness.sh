@@ -222,8 +222,14 @@ docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
     || fail "#148: failed to drop bridge_db for the realistic resync (finding #65)"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
     "${E2E_COMPOSE[@]}" up -d --no-deps --force-recreate aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
-wait_for "bridge-service reachable after recovery" \
-    "[[ \$(curl -s -m3 -o /dev/null -w '%{http_code}' $BRIDGE_SERVICE_URL/ 2>/dev/null) =~ ^(200|404)\$ ]]" 180 5
+# wait_for runs its predicate as a COMMAND (`"$@"` after `shift 3`), not an eval'd string,
+# and its arg order is <desc> <timeout> <interval> <predicate-fn>. The prior call passed a
+# `[[ … ]]` STRING in the timeout slot, so it errored every iteration and never terminated.
+_bridge_svc_reachable() {
+    local c; c="$(curl -s -m3 -o /dev/null -w '%{http_code}' "$BRIDGE_SERVICE_URL/" 2>/dev/null)"
+    [[ "$c" =~ ^(200|404)$ ]]
+}
+wait_for "bridge-service reachable after recovery" 180 5 _bridge_svc_reachable
 # SETTLEMENT (not merely "reachable"): the Miden bridge-service (network 1) must
 # reach synced=true with a small remaining_blocks lag. If the recovered claim
 # still served empty input, aggkit's bridgesync parser would STALL and this row
