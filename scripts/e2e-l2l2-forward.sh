@@ -213,58 +213,128 @@ evidence_exit_root "leg2b" forward post-forward-claim
 # a fresh wallet AND is a DISTINCT faucet from the L1 native-ETH faucet: (0,0x0) and
 # ($L2B_NETWORK_ID,0x0) are different origins even though both display ETH.
 #
-# ENV-GATED (RUN_L2B_NATIVE_ETH=1, default OFF) — BLOCKED BY A SOVEREIGN-BRIDGE
-# LIMITATION, not a harness bug (finding #77): the L2B sovereign bridge
-# (networkID=2, gasTokenAddress=0x0, WETHToken unset) DETERMINISTICALLY reverts
-# `bridgeAsset(destNet, address(0), amount, --value=amount)` with custom error
-# 0x14603c01 — confirmed via cast estimate (the pre-submit path), well-formed
-# call, ADMIN funded with ~9999 ETH on anvil-l2b. Bridging the sovereign chain's
-# native gas token OUT is not supported in this setup; the ERC-20 path (leg 2 /
-# OPT0) works fine. So this leg (and its "two native-ETH faucets distinct by
-# origin (0,0x0) vs (L2B_NET,0x0)" distinctness check) cannot be exercised until
-# sovereign native-ETH bridging (or a WETH-mapped path) is enabled. #147's core
-# wallet-resolvable-metadata coverage is proven by rows 1/3/4 (L1 native ETH, L1
-# ERC-20, L2B OPT0). When re-enabled, a bridgeAsset revert must fail LOUD with
-# this context, not a cryptic "bridgeAsset failed".
+# ENV-GATED (RUN_L2B_NATIVE_ETH=1, default OFF). #77 root cause (was mis-attributed
+# to gasTokenAddress=0x0): with a CUSTOM gas token configured (setup-l2b.sh deploys
+# L2BGAS on L1 + sets it as the L2B bridge gasTokenAddress, WETH auto-deployed),
+# `bridgeAsset(destNet, address(0), amount, --value=amount)` STILL reverts — with
+# custom error 0x14603c01 = LocalBalanceTreeUnderflow(originNet, gasTokenAddress,
+# amount, currentBalance). Cause: the L2B sovereign bridge tracks a Local Balance
+# Tree and only lets an origin token be bridged OUT up to what was bridged IN. The
+# chain's genesis-minted native gas balance is NOT LBT-backed (currentBalance=0), so
+# the FIRST out-bridge underflows. Fix: seed LBT(0, gasTokenAddress) by bridging the
+# gas token L1->L2B + claiming it on L2B (seed_l2b_gastoken_lbt) BEFORE bridging out.
+#
+# HEADLINE (#147/#77) observable: the gas token's on-chain gasTokenMetadata
+# (name/symbol/decimals) propagates L2B deposit -> Miden faucet, but Miden's
+# TokenSymbol is A-Z ONLY, so `sanitise_token_symbol` DROPS digits/punctuation:
+# "L2BGAS" -> Miden display symbol "LBGAS" (decimals 18 -> cap 8). This leg asserts
+# the SANITISED symbol (deterministic, matches src/faucet_ops.rs) — proving the
+# metadata propagates AND documenting the digit-stripping. A bridgeAsset revert must
+# fail LOUD with this context, never a cryptic "bridgeAsset failed" or a false PASS.
 if [[ "${RUN_L2B_NATIVE_ETH:-0}" == "1" ]]; then
     step "#147 Leg 3: bridge native ETH L2B -> Miden + assert ETH/8, distinct from L1 ETH faucet"
     ZERO_ADDR="0x0000000000000000000000000000000000000000"
     ETH_WEI="${L2B_ETH_WEI:-1000000000000000}"   # 0.001 ETH
-    ETH_MIDEN_UNITS=$(( ETH_WEI / 10000000000 )) # 10^10 scale (18 -> 8 decimals)
-    # Pre-check the sovereign bridge accepts native-ETH bridging at all — surface
-    # the sovereign-bridge revert (finding #77: 0x14603c01) explicitly instead of
-    # an opaque empty-cast-output failure downstream.
-    if ! cast estimate "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
-        "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$ETH_WEI" "$ZERO_ADDR" true 0x \
-        --value "$ETH_WEI" --from "$ADMIN" --rpc-url "$L2B_RPC" >/dev/null 2>&1; then
-        fail "#147/leg3: L2B sovereign bridge rejects native-ETH bridgeAsset (finding #77, likely custom error 0x14603c01) — this leg is unexercisable until sovereign native-ETH bridging is enabled; #147 core coverage is rows 1/3/4"
+    # ── #77 model: L2B is a CUSTOM-GAS-TOKEN sovereign chain. Bridging its NATIVE
+    # currency (address(0) locally) does NOT emit an ETH/(net2,0x0) deposit — the
+    # bridge stamps the deposit with the GAS TOKEN's origin + its on-chain
+    # `gasTokenMetadata = abi.encode(name, symbol, decimals)` (set at chain init).
+    # So the Miden faucet is keyed by the gas token's ORIGIN tuple
+    # (gasTokenNetwork, gasTokenAddress) and carries the gas token's SYMBOL — this
+    # is the headline #147/#77 observable: a NON-ERC-20-symbol()-resolvable token
+    # whose display metadata must still propagate L2B → deposit metadata → the
+    # Miden wrapped faucet, and resolve on a fresh wallet (never "Unknown").
+    #
+    # The setup (setup-l2b.sh / create_rollup_parameters.json) deploys the gas
+    # token on L1 and sets these; the e2e reads them (defaults match the setup):
+    GAS_ORIGIN_NET="${L2B_GAS_ORIGIN_NET:-0}"                      # gasTokenNetwork (L1-origin)
+    GAS_TOKEN_ADDR="${L2B_GAS_TOKEN_ADDR:?set L2B_GAS_TOKEN_ADDR to the L1 gas-token ERC-20 (== bridge gasTokenAddress)}"
+    GAS_ORIGIN_SYMBOL="${L2B_GAS_SYMBOL:-L2BGAS}"                  # symbol in gasTokenMetadata (origin)
+    # Miden's TokenSymbol is A-Z ONLY: sanitise_token_symbol (src/faucet_ops.rs) keeps
+    # only uppercased ASCII letters, DROPPING digits/punctuation. Mirror it here so the
+    # assertion expects the ACTUAL Miden display symbol (e.g. "L2BGAS" -> "LBGAS"). If
+    # sanitisation empties the symbol the proxy falls back to T+addr; assert that too.
+    GAS_MIDEN_SYMBOL="$(echo "$GAS_ORIGIN_SYMBOL" | tr 'a-z' 'A-Z' | tr -cd 'A-Z' | cut -c1-6)"
+    if [[ -z "$GAS_MIDEN_SYMBOL" ]]; then
+        GAS_MIDEN_SYMBOL="T$(echo "${GAS_TOKEN_ADDR#0x}" | tr 'A-F' 'a-f' | cut -c1-4 | tr 'a-z' 'A-Z')"
     fi
-    NETH_TX=$(cast send "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
+    GAS_ORIGIN_DECIMALS="${L2B_GAS_DECIMALS:-18}"                   # gas-token decimals (18 exercises the min(,8) cap)
+    GAS_EXPECT_DECIMALS=$(( GAS_ORIGIN_DECIMALS < 8 ? GAS_ORIGIN_DECIMALS : 8 ))
+    GAS_ADDR_HEX="$(echo "${GAS_TOKEN_ADDR#0x}" | tr 'A-F' 'a-f')"       # no 0x — for pg encode(origin_address,'hex')
+    GAS_ADDR_LOWER="$(echo "$GAS_TOKEN_ADDR" | tr 'A-F' 'a-f')"          # WITH 0x — find_deposit exact-compares orig_addr
+    # Sanity: the bridge must actually be a custom-gas-token chain (finding #77 fix
+    # applied). If gasTokenAddress is still 0x0, the sovereign chain is misconfigured.
+    ONCHAIN_GAS=$(cast call "$BRIDGE" 'gasTokenAddress()(address)' --rpc-url "$L2B_RPC" 2>/dev/null | tr 'A-F' 'a-f')
+    [[ "$ONCHAIN_GAS" != "0x0000000000000000000000000000000000000000" ]] \
+        || fail "#147/leg3: L2B bridge gasTokenAddress is 0x0 — the custom-gas-token setup (finding #77) is not applied; native bridging reverts (0x14603c01). Fix setup-l2b.sh / create_rollup_parameters.json."
+    ETH_MIDEN_UNITS=$(( ETH_WEI / 10000000000 ))
+    # #77: seed LBT(0, gasTokenAddress) BEFORE the out-bridge (else LocalBalanceTreeUnderflow
+    # / 0x14603c01). Seed 4x the out amount so the single out-bridge has ample margin.
+    step "#147/leg3: seeding L2B Local Balance Tree for the gas token (bridge L1->L2B + claim on L2B)"
+    seed_l2b_gastoken_lbt "$(( ETH_WEI * 4 ))"
+    # Bridge the L2B native gas token OUT to Miden (address(0), msg.value == amount).
+    # Robust capture: check status==0x1 AND a non-empty tx hash; surface the on-chain
+    # revert reason on failure (never a cryptic message, never a false PASS on empty).
+    NETH_OUT=$(cast send "$BRIDGE" "bridgeAsset(uint32,address,uint256,address,bool,bytes)" \
         "$MIDEN_NETWORK_ID" "$DEST_ADDR" "$ETH_WEI" "$ZERO_ADDR" true 0x \
-        --value "$ETH_WEI" --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" --json 2>/dev/null \
-        | python3 -c "import json,sys;print(json.load(sys.stdin).get('transactionHash',''))") \
-        || fail "#147/leg3: native-ETH bridgeAsset on L2B failed"
-    pass "#147/leg3: native ETH locked on L2B (tx $NETH_TX, $ETH_WEI wei)"
-    # Wait for the L2B->Miden native-ETH deposit, then claim it on the proxy (same
-    # nudge-driven proof-backed flow as OPT0, but origin address 0x0 + empty metadata).
-    wait_for "L2B->Miden native-ETH deposit indexed" 180 5 \
-        _pred_deposit_indexed "$DEST_ADDR" "$L2B_NETWORK_ID" "${ZERO_ADDR#0x}" "$L2B_BRIDGE_SERVICE_URL"
-    NETH_DEP=$(find_deposit "$DEST_ADDR" $L2B_NETWORK_ID "${ZERO_ADDR#0x}" "$L2B_BRIDGE_SERVICE_URL")
-    [[ -n "$NETH_DEP" ]] || fail "#147/leg3: native-ETH deposit not indexed"
-    NETH_GI=$(dep_field "$NETH_DEP" global_index); NETH_CNT=$(dep_field "$NETH_DEP" deposit_cnt)
-    NETH_DNET=$(dep_field "$NETH_DEP" dest_net); NETH_DADDR=$(dep_field "$NETH_DEP" dest_addr)
-    NETH_AMT=$(dep_field "$NETH_DEP" amount)
-    nudge_until "native-ETH claimAsset accepted on Miden (ClaimEvent gi $NETH_GI)" \
-        _pred_submit_forward_claim "$NETH_CNT" "$NETH_GI" "$L2B_NETWORK_ID" "$ZERO_ADDR" "$NETH_DNET" "$NETH_DADDR" "$NETH_AMT" "0x" \
-        || fail "#147/leg3: native-ETH claim never accepted on the proxy (gi $NETH_GI)"
-    # Resolve the (net=$L2B_NETWORK_ID, 0x0) native-ETH faucet + assert distinctness.
-    L2B_ETH_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '0000000000000000000000000000000000000000' AND origin_network = ${L2B_NETWORK_ID};")
-    [[ -n "$L2B_ETH_FID" ]] || fail "#147/leg3: no faucet_registry row for L2B native ETH (net $L2B_NETWORK_ID, 0x0)"
+        --value "$ETH_WEI" --private-key "$ADMIN_KEY" --rpc-url "$L2B_RPC" --json 2>&1) || true
+    NETH_TX=$(echo "$NETH_OUT" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('transactionHash','') if str(d.get('status','')) in ('0x1','1','true') else '')
+except Exception:
+    print('')" 2>/dev/null)
+    [[ -n "$NETH_TX" ]] \
+        || fail "#147/leg3: L2B native gas-token bridgeAsset OUT failed/reverted after LBT seeding — $(echo "$NETH_OUT" | tr '\n' ' ' | tail -c 240)"
+    pass "#147/leg3: L2B native gas token locked (tx $NETH_TX, $ETH_WEI wei)"
+    # The deposit was MADE on L2B (network_id=$L2B_NETWORK_ID) and its TOKEN origin is
+    # (orig_net=$GAS_ORIGIN_NET, orig_addr=$GAS_ADDR_LOWER). find_deposit filters on
+    # network_id (the SOURCE chain, = L2B) and exact-compares orig_addr (WITH 0x).
+    wait_for "L2B->Miden gas-token deposit indexed (src net=$L2B_NETWORK_ID token=$GAS_ADDR_LOWER)" 180 5 \
+        _pred_deposit_indexed "$DEST_ADDR" "$L2B_NETWORK_ID" "$GAS_ADDR_LOWER" "$L2B_BRIDGE_SERVICE_URL"
+    GAS_DEP=$(find_deposit "$DEST_ADDR" "$L2B_NETWORK_ID" "$GAS_ADDR_LOWER" "$L2B_BRIDGE_SERVICE_URL")
+    [[ -n "$GAS_DEP" ]] || fail "#147/leg3: L2B gas-token deposit not indexed (src net=$L2B_NETWORK_ID token=$GAS_ADDR_LOWER)"
+    GAS_GI=$(dep_field "$GAS_DEP" global_index); GAS_CNT=$(dep_field "$GAS_DEP" deposit_cnt)
+    GAS_DNET=$(dep_field "$GAS_DEP" dest_net); GAS_DADDR=$(dep_field "$GAS_DEP" dest_addr)
+    GAS_AMT=$(dep_field "$GAS_DEP" amount)
+    GAS_META=$(echo "$GAS_DEP" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m!='0x' else '0x')")
+    log "#147/leg3: deposit metadata (gasTokenMetadata carried in the leaf) = $GAS_META"
+    # HEADLINE edge (#147 raison d'être): a gas token that ships EMPTY on-chain
+    # metadata is exactly the wallet-'Unknown' failure mode — fail LOUD, don't skip.
+    [[ "$GAS_META" != "0x" ]] \
+        || fail "#147/leg3: L2B gas token has EMPTY on-chain gasTokenMetadata — a fresh wallet resolves it as 'Unknown'. Set gasTokenMetadata (name/symbol/decimals) at chain init so the symbol propagates."
+    nudge_until "L2B gas-token claimAsset accepted on Miden (ClaimEvent gi $GAS_GI)" \
+        _pred_submit_forward_claim "$GAS_CNT" "$GAS_GI" "$GAS_ORIGIN_NET" "0x$GAS_ADDR_HEX" "$GAS_DNET" "$GAS_DADDR" "$GAS_AMT" "$GAS_META" \
+        || fail "#147/leg3: L2B gas-token claim never accepted on the proxy (gi $GAS_GI)"
+    # Resolve the Miden faucet for the gas token's origin tuple + assert it is a
+    # DISTINCT faucet from the L1-ETH one (different origin address).
+    GAS_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '$GAS_ADDR_HEX' AND origin_network = ${GAS_ORIGIN_NET};")
+    [[ -n "$GAS_FID" ]] || fail "#147/leg3: no faucet_registry row for the L2B gas token (net $GAS_ORIGIN_NET, addr 0x$GAS_ADDR_HEX)"
     L1_ETH_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '0000000000000000000000000000000000000000' AND origin_network = 0;")
-    [[ -n "$L1_ETH_FID" && "$L2B_ETH_FID" != "$L1_ETH_FID" ]] \
-        || fail "#147/leg3: L2B native-ETH faucet ($L2B_ETH_FID) must be DISTINCT from L1 native-ETH faucet ($L1_ETH_FID) — (0,0x0) vs ($L2B_NETWORK_ID,0x0) collapsed"
-    pass "#147/leg3: L2B native-ETH faucet $L2B_ETH_FID distinct from L1 ETH faucet $L1_ETH_FID"
-    assert_faucet_symbol "$L2B_ETH_FID" "ETH" "8" "L2B native ETH (origin net=$L2B_NETWORK_ID, addr=0x0)"
+    [[ -n "$L1_ETH_FID" && "$GAS_FID" != "$L1_ETH_FID" ]] \
+        || fail "#147/leg3: L2B gas-token faucet ($GAS_FID) must be DISTINCT from the L1-ETH faucet ($L1_ETH_FID)"
+    # THE HEADLINE ASSERTION: a FRESH client (no preloaded symbol map) fetches the
+    # Miden faucet's public metadata and must resolve the gas token's SANITISED symbol
+    # (origin "$GAS_ORIGIN_SYMBOL" -> Miden "$GAS_MIDEN_SYMBOL": Miden TokenSymbol is
+    # A-Z only, so digits/punctuation are dropped) + min(decimals,8) — NOT 'Unknown'.
+    # assert_faucet_symbol prints faucet_id + fetched symbol/decimals on pass AND fail.
+    log "#147/leg3: gas-token symbol propagation — origin (net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX), faucet=$GAS_FID, origin symbol='$GAS_ORIGIN_SYMBOL' -> Miden display symbol='$GAS_MIDEN_SYMBOL' decimals=$GAS_EXPECT_DECIMALS (origin $GAS_ORIGIN_DECIMALS capped)"
+    assert_faucet_symbol "$GAS_FID" "$GAS_MIDEN_SYMBOL" "$GAS_EXPECT_DECIMALS" "L2B gas token (origin net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX)"
+    # Cross-check the store row: symbol column = SANITISED display symbol, origin_decimals
+    # = origin (18), miden_decimals = cap (8). Constrained to origin_network=$GAS_ORIGIN_NET.
+    GAS_ROW=$(pgq "SELECT symbol||'|'||origin_decimals||'|'||miden_decimals FROM faucet_registry WHERE encode(origin_address,'hex')='$GAS_ADDR_HEX' AND origin_network=${GAS_ORIGIN_NET};")
+    [[ "$GAS_ROW" == "${GAS_MIDEN_SYMBOL}|${GAS_ORIGIN_DECIMALS}|${GAS_EXPECT_DECIMALS}" ]] \
+        || fail "#147/leg3: gas-token registry row mismatch — got '$GAS_ROW' want '${GAS_MIDEN_SYMBOL}|${GAS_ORIGIN_DECIMALS}|${GAS_EXPECT_DECIMALS}'"
+    # 3rd defect fix: assert the claim actually LANDED for THIS deposit's global index
+    # (>=1 ClaimEvent row for $GAS_GI) — not just that nudge_until returned. (The exact
+    # received-amount vs ETH_MIDEN_UNITS is asserted by the received-asset linkage check
+    # that derives the faucet from the consumed P2ID note — PR #152 follow-up.)
+    GAS_CLAIM_ROWS=$(claim_event_rows "$GAS_GI")
+    [[ "${GAS_CLAIM_ROWS:-0}" -ge 1 ]] \
+        || fail "#147/leg3: no ClaimEvent row for the gas-token deposit (gi=$GAS_GI) — claim did not land"
+    log "#147/leg3: gas-token ClaimEvent rows for gi=$GAS_GI = $GAS_CLAIM_ROWS (expected credit ETH_MIDEN_UNITS=$ETH_MIDEN_UNITS)"
+    pass "#147/leg3: L2B gas-token symbol '$GAS_ORIGIN_SYMBOL'->'$GAS_MIDEN_SYMBOL'/$GAS_EXPECT_DECIMALS propagated L2B→Miden (digit-stripped by Miden TokenSymbol) + distinct from L1 ETH ($GAS_FID != $L1_ETH_FID)"
 fi
 
 # ── Persist state for the clash + back scenarios (atomic + fingerprinted) ────

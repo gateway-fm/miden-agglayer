@@ -75,6 +75,38 @@ docker inspect "$L1_CONTAINER" >/dev/null 2>&1 || fail "L1 anvil container '$L1_
 
 mkdir -p "$OUT_DIR"
 
+# ── #77: deploy L2B's OWN gas token on L1 (BEFORE rollup registration) ────────
+# A realistic sovereign chain has its OWN gas token (not gasTokenAddress=0/ETH — that
+# config makes the sovereign bridge revert native-ETH bridging, finding #77). The gas
+# token is an L1-origin ERC-20; `1_createGenesis.ts` reads its name/symbol/decimals off
+# L1 to stamp the bridge's `gasTokenMetadata`, so a later native/gas-token bridge-out
+# carries the REAL (name,symbol,decimals) to Miden. gasTokenAddress in
+# create_rollup_parameters.json pins the deterministic (fixed key @ nonce 0) address
+# below; this deploy must produce exactly that address.
+GAS_TOKEN_DEPLOYER_KEY="${GAS_TOKEN_DEPLOYER_KEY:-0x7777777777777777777777777777777777777777777777777777777777777777}"
+GAS_TOKEN_DEPLOYER=$(cast wallet address --private-key "$GAS_TOKEN_DEPLOYER_KEY")
+GAS_TOKEN_ADDR=$(cast compute-address "$GAS_TOKEN_DEPLOYER" --nonce 0 | awk '{print $NF}')
+L2B_GAS_SYMBOL="${L2B_GAS_SYMBOL:-L2BGAS}"
+L2B_GAS_DECIMALS="${L2B_GAS_DECIMALS:-18}"
+if [ "$(cast code "$GAS_TOKEN_ADDR" --rpc-url "$L1_RPC" 2>/dev/null || echo 0x)" = "0x" ]; then
+  cast rpc anvil_setBalance "$GAS_TOKEN_DEPLOYER" 0x21e19e0c9bab2400000 --rpc-url "$L1_RPC" >/dev/null 2>&1 || true
+  _GT_OUT=$(forge create "$FIXTURES_DIR/TestToken.sol:TestToken" --rpc-url "$L1_RPC" \
+      --private-key "$GAS_TOKEN_DEPLOYER_KEY" --broadcast \
+      --constructor-args "L2B Gas" "$L2B_GAS_SYMBOL" "$L2B_GAS_DECIMALS" 1000000000000000000000000 2>&1) || true
+  _GT_DEPLOYED=$(echo "$_GT_OUT" | awk '/Deployed to:/{print $NF}')
+  [ "$(echo "$_GT_DEPLOYED" | tr 'A-F' 'a-f')" = "$(echo "$GAS_TOKEN_ADDR" | tr 'A-F' 'a-f')" ] \
+    || fail "#77: gas token deployed to '${_GT_DEPLOYED:-<none>}', expected deterministic $GAS_TOKEN_ADDR (deployer nonce not 0?): $(echo "$_GT_OUT" | tail -2)"
+  log "#77: L2B gas token deployed on L1: $GAS_TOKEN_ADDR ($L2B_GAS_SYMBOL, $L2B_GAS_DECIMALS decimals)"
+else
+  log "#77: L2B gas token already on L1 at $GAS_TOKEN_ADDR"
+fi
+# Sanity: create_rollup_parameters.json must pin this exact address.
+_CRP_GAS=$(python3 -c "import json;print(json.load(open('$L2B_DIR/create_rollup_parameters.json'))['gasTokenAddress'])")
+[ "$(echo "$_CRP_GAS" | tr 'A-F' 'a-f')" = "$(echo "$GAS_TOKEN_ADDR" | tr 'A-F' 'a-f')" ] \
+  || fail "#77: create_rollup_parameters.json gasTokenAddress=$_CRP_GAS != deployed $GAS_TOKEN_ADDR"
+# Export for the l2l2 lib / e2e legs (the gas-token symbol/decimals the Miden faucet must resolve).
+{ echo "L2B_GAS_TOKEN_ADDR=$GAS_TOKEN_ADDR"; echo "L2B_GAS_SYMBOL=$L2B_GAS_SYMBOL"; echo "L2B_GAS_DECIMALS=$L2B_GAS_DECIMALS"; echo "GAS_TOKEN_DEPLOYER_KEY=$GAS_TOKEN_DEPLOYER_KEY"; } > "$L2B_DIR/gas_token.env"
+
 # ── Step 1: L1 registration via the real kurtosis tooling ────────────────────
 EXISTING_ID=$(cast call $ROLLUP_MANAGER 'chainIDToRollupID(uint64)(uint32)' "$L2B_CHAIN_ID" --rpc-url "$L1_RPC")
 if [ "$EXISTING_ID" != "0" ]; then
