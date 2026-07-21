@@ -104,7 +104,11 @@ case "$test_filter" in
         # final phase leaves a self-targeted poison leaf in the LET (Cantina #13
         # circuit-break repro) that wedges any certificate settlement after it, so only the
         # L1->L2-only manual-user-claim may follow.
-        "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
+        # #149: when the L2B overlay is up (so the native+net-2 prerequisite rows were
+        # created by the tiers above), REQUIRE the restore-survival assertion — a missing
+        # row then FAILS the gate instead of silently skipping (PR #150 re-review).
+        REQUIRE_S149_RESTORE="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'postgres-l2b' && echo 1 || echo 0)" \
+            "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
         echo ""
         # VERY LAST in the suite — defense in depth: the manual-user-claim
         # script deliberately front-runs the sponsor's autoclaimer, which

@@ -172,23 +172,17 @@ RESP=$(curl -s "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" 
 echo "$RESP" | grep -qi 'name mismatch' \
   || fail "#149: wrong-name registration should error 'name mismatch', got: $RESP"
 _no_registry_row "$BAD_NAME_ORIGIN" || fail "#149: wrong-name registration must leave NO registry row"
-# No-bridge-note EVIDENCE (PR #150 re-review): register_faucet_in_bridge (the
-# ConfigAggBridgeNote) runs only AFTER validation passes. To prove the ON-CHAIN
-# config/token map has no entry for these origins (not merely that the direct
-# store-write was skipped), wait one full faucet-reconciler cycle (default 30s
-# poll) and re-assert NO row: the reconciler reads the bridge's on-chain config
-# and materializes a store row for ANY note it finds, so a row appearing here
-# would mean a config note WAS emitted for a rejected origin.
-sleep 35
-_no_registry_row "$BAD_SYM_ORIGIN"  || fail "#149: wrong-symbol registration emitted an on-chain bridge config note (row appeared after a reconciler poll)"
-_no_registry_row "$BAD_DEC_ORIGIN"  || fail "#149: wrong-decimals registration emitted an on-chain bridge config note (row appeared after a reconciler poll)"
-_no_registry_row "$BAD_NAME_ORIGIN" || fail "#149: wrong-name registration emitted an on-chain bridge config note (row appeared after a reconciler poll)"
-# So the no-row assertions above (COUNT(*) == 0, error-safe, post-reconciler-poll)
-# evidence that no bridge configuration was emitted for these origins. The
-# per-field mismatch REJECTION is unit-tested directly (native_metadata_*_mismatch_*
-# on resolve_native_faucet_metadata, the sole validation gate the endpoint calls via
-# `?` before any bridge/store write).
-pass "#149: mismatched symbol/decimals/name each rejected before any state change — NO registry row for any (⇒ no bridge config emitted)"
+# The no-row checks above are the store-side evidence. That the bridge
+# ConfigAggBridgeNote is NOT emitted on a mismatch is guaranteed STRUCTURALLY,
+# not by an on-chain probe here: admin_register_native_faucet calls the sole
+# validation gate `resolve_native_faucet_metadata(...)?` BEFORE the
+# register_faucet_in_bridge `.with()` call, so a mismatch (Err) returns before
+# any bridge note or store write. That per-field gate is unit-tested directly
+# (native_metadata_{symbol,decimals,name}_mismatch_rejected). (No reconciler
+# inference: FaucetRegistryReconciler is a tripwire keyed on faucet_id, not
+# origin, and these mismatches reuse the already-registered NATIVE_FAUCET_ID —
+# it cannot evidence a bad-origin note. PR #150 re-review.)
+pass "#149: mismatched symbol/decimals/name each rejected before any state change — NO registry row for any (bridge note skipped: validation Err precedes the register call; unit-tested gate)"
 
 # ── 1d. #149 — a custom-name (name != symbol) faucet is preserved exactly ──────
 # Deploy a SECOND native faucet whose on-chain token NAME differs from its symbol

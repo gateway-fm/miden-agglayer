@@ -439,16 +439,26 @@ pass "DB backed up ($(wc -c < "$BACKUP") bytes → $BACKUP)"
 # reuses rows that already exist in the full suite — no extra registration, no separate
 # proxy-only reset (PR #150 re-review). If either row is absent (cantina13 run outside
 # the full suite), SKIP — the assertion is only meaningful with the prior tiers present.
-_s149_row() { pg "SELECT faucet_id||'|'||origin_network||'|'||encode(origin_address,'hex')||'|'||symbol||'|'||origin_decimals||'|'||encode(metadata,'hex') FROM faucet_registry WHERE $1 ORDER BY faucet_id LIMIT 1"; }
-S149_NATIVE_ROW=$(_s149_row "symbol='WMDN'")
+# FULL identity: faucet_id | origin_network | origin_address | symbol |
+# origin_decimals | miden_decimals | scale | metadata-preimage — miden_decimals
+# and scale included so a restore with wrong CONVERSION params can't pass (PR #150).
+_s149_row() { pg "SELECT faucet_id||'|'||origin_network||'|'||encode(origin_address,'hex')||'|'||symbol||'|'||origin_decimals||'|'||miden_decimals||'|'||scale||'|'||encode(metadata,'hex') FROM faucet_registry WHERE $1 ORDER BY faucet_id LIMIT 1"; }
+# Constrain the native custom-name capture to the NATIVE route (origin_network ==
+# the proxy's own net id): symbol='WMDN' alone could select a foreign-origin WMDN
+# row on a warm/shared stack and prove survival of the WRONG route (PR #150).
+S149_NATIVE_ROW=$(_s149_row "symbol='WMDN' AND origin_network=${LOCAL_NETWORK_ID}")
 S149_NET2_ROW=$(_s149_row "origin_network=2")
 if [[ -n "$S149_NATIVE_ROW" && -n "$S149_NET2_ROW" ]]; then
     S149_CHECK=1
     S149_NATIVE_FID="${S149_NATIVE_ROW%%|*}"; S149_NET2_FID="${S149_NET2_ROW%%|*}"
     pass "#149 restore-survival PRE: captured native custom-name row (WMDN $S149_NATIVE_FID) + net-2 row ($S149_NET2_FID)"
+elif [[ "${REQUIRE_S149_RESTORE:-0}" == "1" ]]; then
+    # In the full overlay suite the prior L2L2/native phases MUST have created both
+    # rows; a regression there must FAIL the release gate, not silently skip (PR #150).
+    fail "#149 restore-survival: REQUIRE_S149_RESTORE=1 but a prerequisite row is absent (native WMDN net=$LOCAL_NETWORK_ID: ${S149_NATIVE_ROW:-<none>} | net-2: ${S149_NET2_ROW:-<none>}) — a prior phase regressed"
 else
     S149_CHECK=0
-    log "#149 restore-survival: SKIP — no WMDN native and/or net-2 row present (cantina13 run outside the full suite)"
+    log "#149 restore-survival: SKIP — no WMDN native and/or net-2 row present (standalone cantina13, REQUIRE_S149_RESTORE unset)"
 fi
 
 # finding #65 — we deliberately do NOT preserve the proxy's per-signer nonce tables.
