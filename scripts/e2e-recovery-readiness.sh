@@ -386,14 +386,20 @@ while :; do
     # highest with Height > pre-recovery max, a non-empty exit root, and a well-formed tx hash.
     CERT_LINE="$(docker logs --tail "${AGGKIT_LOG_TAIL:-40000}" "$AGGKIT_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
         | grep -aE 'changed status.*to \[Settled\]' \
-        | awk -v pre="$PRE_CERT_HEIGHT" -v empty="$EMPTY_LER" '
+        | awk -v pre="$PRE_CERT_HEIGHT" -v empty="$EMPTY_LER" \
+              -v zero="0x0000000000000000000000000000000000000000000000000000000000000000" '
             { h=""; st=""; nler="";
               for (i=1;i<=NF;i++) {
                   if ($i=="Height:")            { h=$(i+1);    gsub(/[,.]/,"",h) }
                   if ($i=="SettlementTxnHash:") { st=$(i+1);   gsub(/[,.]/,"",st) }
                   if ($i=="NewLocalExitRoot:")  { nler=$(i+1); gsub(/[,.]/,"",nler) }
               }
-              if ((h+0)>(pre+0) && nler!=empty && st ~ /^0x[0-9a-fA-F]{64}$/) print h, st
+              # NewLocalExitRoot must be a well-formed 32-byte root that is NOT the empty-tree
+              # root, NOT all-zero, and NOT missing (a missing field leaves nler="" which the
+              # regex rejects) — otherwise the settlement proof could false-pass on a cert that
+              # carries no real bridge-out leaf.
+              if ((h+0)>(pre+0) && nler ~ /^0x[0-9a-fA-F]{64}$/ && nler!=empty && nler!=zero \
+                 && st ~ /^0x[0-9a-fA-F]{64}$/) print h, st
             }' | sort -n | tail -1 || true)"
     if [[ -n "$CERT_LINE" ]]; then NEW_CERT_HEIGHT="${CERT_LINE%% *}"; NEW_SETTLEMENT_TX="${CERT_LINE##* }"; break; fi
     [[ $(date +%s) -ge $CERT_DEADLINE ]] && break
