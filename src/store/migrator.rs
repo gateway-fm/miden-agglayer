@@ -122,9 +122,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "019_claim_calldata_repair_pending.sql",
         include_str!("../../migrations/019_claim_calldata_repair_pending.sql"),
     ),
-    // 020 is reserved for #146's `queued_txns`; #156 takes 021 so the two land
-    // without a migration-number collision. Migrations apply in this array's
-    // order, so a gap is harmless.
+    // 020 is #146's `queued_txns` (main reserved this slot for it); #156 takes
+    // 021. Migrations apply in this array's order.
+    (
+        "020_queued_txns.sql",
+        include_str!("../../migrations/020_queued_txns.sql"),
+    ),
     (
         "021_orphan_recovery_backoff.sql",
         include_str!("../../migrations/021_orphan_recovery_backoff.sql"),

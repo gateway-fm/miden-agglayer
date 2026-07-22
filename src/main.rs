@@ -1548,6 +1548,64 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // #146 mempool resume — promote any future-nonce txns that were durably
+    // parked before a restart and whose gap is now filled, so an acknowledged
+    // future tx is never silently dropped across a process restart.
+    //
+    // PR#155 blocker #2: the original awaited this BEFORE the HTTP bind, so a
+    // slow/unavailable Miden node (the drain can wait on GER observation) would
+    // stall the bind and health/readiness could never answer. Mirror the #156
+    // startup-recovery shape instead: bounded, backgrounded, best-effort — the
+    // periodic drain sweep continues the promotion regardless.
+    {
+        let queued_state = state.clone();
+        tokio::spawn(async move {
+            let bound = std::time::Duration::from_secs(
+                miden_agglayer_service::orphan_recovery::RECOVERY_SWEEP_INTERVAL_SECS,
+            );
+            match tokio::time::timeout(
+                bound,
+                miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&queued_state),
+            )
+            .await
+            {
+                Err(_) => tracing::warn!(
+                    "startup mempool resume timed out (Miden slow/unavailable?); the periodic drain sweep will continue"
+                ),
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "startup mempool resume_queued_drain failed (periodic sweep will retry)")
+                }
+                Ok(Ok(())) => {}
+            }
+        });
+    }
+
+    // #146 — PERIODIC drain sweep. Promotion is otherwise only attempted when a
+    // gap-filling tx is admitted, so a transiently failed drain (writer
+    // saturated, Miden briefly unavailable, a crash between admit and delete)
+    // leaves an ACKNOWLEDGED parked tx sitting until the next admission for that
+    // signer — which may never come, since the sender believes it was accepted.
+    // The startup resume alone does not cover a long-lived process. Sweep on the
+    // same bounded interval as orphan recovery so parked work always self-heals.
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                miden_agglayer_service::orphan_recovery::RECOVERY_SWEEP_INTERVAL_SECS,
+            ));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                if let Err(e) =
+                    miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&sweep_state)
+                        .await
+                {
+                    tracing::warn!(error = %e, "periodic mempool drain sweep failed (will retry next tick)");
+                }
+            }
+        });
+    }
+
     let url = build_service_url(&command.bind, command.port)?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
