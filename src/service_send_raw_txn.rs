@@ -1633,37 +1633,61 @@ const QUEUE_MAX_PER_SIGNER: usize = 256;
 /// Global bound across all signers, so the queue cannot grow without limit.
 const QUEUE_MAX_GLOBAL: usize = 4_096;
 
-/// Acquire this signer's lock, recover any stale crash-window rows, then promote
-/// the contiguous parked run. This is the STANDALONE entry point (startup resume
-/// and the periodic sweep): it takes the per-signer lock itself, so its inner
-/// `from_drain` replays run under a lock nobody else holds. The gap-fill admission
-/// path does NOT call this — it already holds the lock and calls
+/// Acquire this signer's lock, re-drive/promote its parked run, then expire any
+/// gap-blocked rows past their TTL. This is the STANDALONE entry point (startup
+/// resume and the periodic sweep): it takes the per-signer lock itself, so its
+/// inner `from_drain` replays run under a lock nobody else holds. The gap-fill
+/// admission path does NOT call this — it already holds the lock and calls
 /// `drain_queued_locked` directly to keep a continuous hold (first-wins, #146
 /// finding 1).
+///
+/// Expiry runs UNDER THE LOCK and AFTER the drain (#146 finding 4 / re-review
+/// blocker 2d): the drain first promotes everything promotable, so every row that
+/// remains is genuinely gap-blocked and safe to evict. Doing expiry here — never
+/// from the lock-free block sweep — means it can never race a concurrent promotion
+/// and can never evict a tx that is about to be (or is being) promoted.
 async fn drain_queued(service: &ServiceState, signer_str: &str) {
     let Ok(signer) = signer_str.parse::<Address>() else {
         tracing::error!(target: "rpc::mempool", signer = %signer_str, "drain: un-parseable signer");
         return;
     };
     let _guard = service.per_signer_locks.lock(signer).await;
-    cleanup_stale_promoted_rows(service, signer_str).await;
     drain_queued_locked(service, signer_str).await;
+    expire_gap_blocked_locked(service, signer_str).await;
 }
 
-/// Recover the admit-before-delete crash window (#146 finding 3). If a promotion
-/// advanced the tracked nonce (durable pending row written + nonce CAS) but the
-/// process crashed before `delete_queued_txn`, a stale queued row survives at a
-/// nonce BELOW the signer's now-expected nonce. That row would otherwise wedge the
-/// contiguous-run resume forever (`peek_min != expected`), stranding every later
-/// parked row. Clean such a row ONLY after proving its exact hash is already
-/// durable (admitted) — never delete an un-admitted below-expected row — then
-/// continue at `expected`. Caller must hold this signer's lock.
-async fn cleanup_stale_promoted_rows(service: &ServiceState, signer_str: &str) {
+/// Re-drive and promote this signer's parked future-nonce txns, in nonce order,
+/// starting at the SMALLEST parked nonce. Each row is replayed through the normal
+/// admission path (`service_send_raw_txn_inner(.., from_drain = true)`) and only
+/// deleted AFTER that replay durably admits it, so an acknowledged tx is never
+/// lost between promotion and durable admission.
+///
+/// Rows are processed relative to the signer's next-expected nonce:
+///   * `min == expected` — the gap is filled; a normal promotion advances the
+///     nonce and enqueues the writer job.
+///   * `min < expected` — a below-expected row is a PROMOTED-BUT-NOT-DELETED tx:
+///     the crash window (nonce advanced, `delete_queued_txn` lost) OR the
+///     `available_capacity() → try_enqueue()` race (durable pending row written +
+///     nonce advanced, but the enqueue rejected). Its hash is durable, so the
+///     replay takes the idempotent durable-resume path — dedup-returning a
+///     terminal/handed-off tx, or RE-ENQUEUEING a still-pending unlinked orphan
+///     (re-review blocker 1). Crucially it is NEVER bare-deleted: deleting the row
+///     of a pending-unlinked orphan would destroy the only recoverable envelope
+///     and strand acknowledged work behind a client rebroadcast.
+///   * `min > expected` — a real gap; stop (recovered on the next gap-fill,
+///     re-broadcast, or sweep once the gap fills / capacity returns).
+///
+/// CALLER MUST HOLD this signer's per-signer lock: the inner `from_drain` replays
+/// deliberately skip re-acquiring it (that continuous hold is the first-wins
+/// guarantee, #146 finding 1). Best-effort: a failure is logged, never propagated.
+async fn drain_queued_locked(service: &ServiceState, signer_str: &str) {
+    // Bounded by QUEUE_MAX_PER_SIGNER live parked entries; the +1 guards against
+    // a pathological same-nonce re-park loop.
     for _ in 0..=QUEUE_MAX_PER_SIGNER {
         let expected = match service.store.nonce_get(signer_str).await {
             Ok(n) => n,
             Err(e) => {
-                tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "cleanup: nonce_get failed");
+                tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "drain: nonce_get failed");
                 return;
             }
         };
@@ -1671,81 +1695,18 @@ async fn cleanup_stale_promoted_rows(service: &ServiceState, signer_str: &str) {
             Ok(Some(n)) => n,
             Ok(None) => return, // queue empty for this signer
             Err(e) => {
-                tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "cleanup: peek_queued_min_nonce failed");
+                tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "drain: peek_queued_min_nonce failed");
                 return;
             }
         };
-        if min >= expected {
-            return; // nothing stale; the contiguous drain handles min == expected
+        if min > expected {
+            return; // real gap — nothing promotable until it fills
         }
-        let stale = match service.store.get_queued_txn(signer_str, min).await {
+        let row = match service.store.get_queued_txn(signer_str, min).await {
             Ok(Some(q)) => q,
             Ok(None) => return,
             Err(e) => {
-                tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = min, error = %e, "cleanup: get_queued_txn failed");
-                return;
-            }
-        };
-        // Proof of durability: a below-expected row can only be legitimate if its
-        // exact hash was actually admitted (which is WHY the nonce advanced past
-        // it). If it is NOT durable, this is not the crash-window signature — leave
-        // it untouched and stop rather than risk dropping un-admitted acked work.
-        match service.store.txn_get(stale.tx_hash).await {
-            Ok(Some(_)) => {
-                if let Err(e) = service
-                    .store
-                    .delete_queued_txn(signer_str, stale.nonce, stale.tx_hash)
-                    .await
-                {
-                    tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = stale.nonce, error = %e, "cleanup: delete of durable stale row failed");
-                    return;
-                }
-                ::metrics::counter!("rpc_future_nonce_stale_cleaned_total").increment(1);
-                tracing::info!(target: "rpc::mempool", signer = %signer_str, nonce = stale.nonce, tx_hash = %stale.tx_hash, expected, "cleanup: removed stale promoted queued row (crash window); continuing at expected nonce");
-            }
-            Ok(None) => {
-                tracing::warn!(target: "rpc::mempool", signer = %signer_str, nonce = stale.nonce, tx_hash = %stale.tx_hash, expected, "cleanup: below-expected queued row is NOT durable; leaving it and stopping (not the crash-window signature)");
-                return;
-            }
-            Err(e) => {
-                tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = stale.nonce, error = %e, "cleanup: txn_get failed");
-                return;
-            }
-        }
-    }
-}
-
-/// Promote the contiguous run of parked future-nonce txns for `signer`, starting
-/// at the signer's current next-expected nonce, into the writer queue in nonce
-/// order. Each parked tx is replayed through the normal admission path
-/// (`service_send_raw_txn_inner(.., from_drain = true)`): re-validated, durably
-/// admitted (nonce CAS + pending row), enqueued — and only THEN deleted from the
-/// queue, so an acknowledged future tx is never lost between promotion and
-/// durable admission (crash-safe: the startup resume re-drives it). Stops at the
-/// first missing nonce or a promotion error (recovered on the next gap-fill,
-/// re-broadcast, or periodic sweep). Best-effort: a failure is logged, never
-/// propagated to the caller whose own tx already succeeded.
-///
-/// CALLER MUST HOLD this signer's per-signer lock: the inner `from_drain` replays
-/// deliberately skip re-acquiring it (that continuous hold is the first-wins
-/// guarantee, #146 finding 1). The standalone `drain_queued` wrapper takes the
-/// lock; the gap-fill path passes its already-held lock through.
-async fn drain_queued_locked(service: &ServiceState, signer_str: &str) {
-    // Bounded by QUEUE_MAX_PER_SIGNER live parked entries; the +1 guards against
-    // a pathological same-nonce re-park loop.
-    for _ in 0..=QUEUE_MAX_PER_SIGNER {
-        let next = match service.store.nonce_get(signer_str).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "drain: nonce_get failed");
-                return;
-            }
-        };
-        let parked = match service.store.get_queued_txn(signer_str, next).await {
-            Ok(Some(q)) => q,
-            Ok(None) => return, // gap again (or queue empty) — nothing contiguous
-            Err(e) => {
-                tracing::error!(target: "rpc::mempool", signer = %signer_str, next, error = %e, "drain: get_queued_txn failed");
+                tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = min, error = %e, "drain: get_queued_txn failed");
                 return;
             }
         };
@@ -1753,9 +1714,12 @@ async fn drain_queued_locked(service: &ServiceState, signer_str: &str) {
         {
             use alloy::eips::Encodable2718;
             let mut bytes = Vec::new();
-            parked.envelope.encode_2718(&mut bytes);
+            row.envelope.encode_2718(&mut bytes);
             envelope_hex.push_str(&alloy::hex::encode(bytes));
         }
+        // Re-drive the row. For `min == expected` this promotes; for `min <
+        // expected` the durable-resume path either dedup-returns (terminal /
+        // handed off) or re-enqueues a pending-unlinked orphan — both idempotent.
         match Box::pin(service_send_raw_txn_inner(
             service.clone(),
             envelope_hex,
@@ -1764,22 +1728,30 @@ async fn drain_queued_locked(service: &ServiceState, signer_str: &str) {
         .await
         {
             Ok(_) => {
-                // Durably admitted — now safe to remove from the queue. A crash
-                // between admit and delete leaves the row; the startup resume
-                // re-replays it and admission is idempotent (dedup-returns).
+                // Durably admitted / re-enqueued / dedup-confirmed — now safe to
+                // remove from the queue. A crash between admit and delete leaves
+                // the row; the resume re-replays it and admission is idempotent.
                 if let Err(e) = service
                     .store
-                    .delete_queued_txn(signer_str, parked.nonce, parked.tx_hash)
+                    .delete_queued_txn(signer_str, row.nonce, row.tx_hash)
                     .await
                 {
-                    tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, error = %e, "drain: delete_queued_txn failed after admit; will retry via resume");
+                    tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = row.nonce, error = %e, "drain: delete_queued_txn failed after admit; will retry via resume");
                     return;
                 }
-                ::metrics::counter!("rpc_future_nonce_promoted_total").increment(1);
-                tracing::info!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, tx_hash = %parked.tx_hash, "promoted parked future-nonce tx after gap filled");
+                if row.nonce < expected {
+                    ::metrics::counter!("rpc_future_nonce_stale_cleaned_total").increment(1);
+                    tracing::info!(target: "rpc::mempool", signer = %signer_str, nonce = row.nonce, tx_hash = %row.tx_hash, expected, "drain: recovered a below-expected promoted/orphan row (re-driven, not stranded)");
+                } else {
+                    ::metrics::counter!("rpc_future_nonce_promoted_total").increment(1);
+                    tracing::info!(target: "rpc::mempool", signer = %signer_str, nonce = row.nonce, tx_hash = %row.tx_hash, "promoted parked future-nonce tx after gap filled");
+                }
             }
             Err(e) => {
-                tracing::warn!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, error = %e, "drain: promoting parked tx failed; stopping (recovered on re-broadcast or resume)");
+                // e.g. writer saturated. Leave the row in place (NOT deleted) so
+                // the next sweep re-drives it once capacity returns — no client
+                // rebroadcast required.
+                tracing::warn!(target: "rpc::mempool", signer = %signer_str, nonce = row.nonce, error = %e, "drain: re-driving row failed; stopping (recovered on next sweep / gap-fill)");
                 return;
             }
         }
@@ -1787,15 +1759,52 @@ async fn drain_queued_locked(service: &ServiceState, signer_str: &str) {
     tracing::warn!(target: "rpc::mempool", signer = %signer_str, "drain: hit the per-signer promotion bound; will continue on the next gap-fill");
 }
 
-/// Recover and promote persisted future-nonce txns for every signer with parked
-/// work. For each signer, `drain_queued` takes the per-signer lock, cleans any
-/// stale admit-before-delete crash-window row (#146 finding 3), then promotes the
-/// contiguous run whose smallest parked nonce equals the next-expected nonce.
+/// Evict this signer's parked rows whose block-denominated TTL has passed
+/// (#146 finding 4). MUST be called under this signer's lock AND after
+/// `drain_queued_locked`, so every remaining row is genuinely gap-blocked (a
+/// promotable row was already promoted, never evicted).
+///
+/// Eviction is a plain delete: `eth_getTransactionByHash` /
+/// `eth_getTransactionReceipt` then return `null`, exactly as Geth drops a stale
+/// queued transaction that never got mined (re-review blocker 2a). It deliberately
+/// leaves NO durable `transactions` row — a synthetic failed receipt would be
+/// non-Ethereum and, worse, would make a later re-broadcast of the same hash
+/// invoke nonce repair and advance the nonce without executing (blocker 2b). A
+/// re-broadcast after eviction is simply a fresh submission.
+async fn expire_gap_blocked_locked(service: &ServiceState, signer_str: &str) {
+    let latest_block = match service.store.get_latest_block_number().await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "expire: get_latest_block_number failed");
+            return;
+        }
+    };
+    match service
+        .store
+        .expire_queued_txns_for_signer(signer_str, latest_block)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => {
+            ::metrics::counter!("rpc_future_nonce_expired_total").increment(n as u64);
+            tracing::info!(target: "rpc::mempool", signer = %signer_str, evicted = n, block = latest_block, "evicted gap-blocked parked txns past TTL (returns null, Geth-style)");
+        }
+        Err(e) => {
+            tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "expire: expire_queued_txns_for_signer failed");
+        }
+    }
+}
+
+/// Recover, promote, and expire persisted future-nonce txns for every signer with
+/// parked work. For each signer, `drain_queued` takes the per-signer lock,
+/// re-drives its parked run (promoting gap-fills and re-enqueueing below-expected
+/// orphans — never stranding acknowledged work), then evicts any gap-blocked rows
+/// past TTL.
 ///
 /// This is BOTH the startup resume (an acknowledged future tx is never silently
 /// dropped across a restart) AND the periodic auto-resume sweep (#146 finding 2):
-/// a parked run that stopped on transient writer saturation resumes here once
-/// capacity returns, with no client rebroadcast. Best-effort per signer.
+/// a run that stopped on transient writer saturation resumes here once capacity
+/// returns, with no client rebroadcast. Best-effort per signer.
 pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
     let signers = service.store.queued_signers().await?;
     for signer in signers {
@@ -5830,6 +5839,89 @@ mod tests {
         );
     }
 
+    /// #146 re-review blocker 1 — a PENDING-UNLINKED orphan must be RE-ENQUEUED,
+    /// never bare-deleted. The `available_capacity() → try_enqueue()` race (or a
+    /// crash after the nonce advanced) leaves a durable *pending* row + advanced
+    /// nonce but NO writer job and NO note handoff. The old cleanup deleted the
+    /// queue row (its hash was `Some`), destroying the only recoverable envelope and
+    /// stranding acknowledged work. The drain must instead re-drive it back into the
+    /// writer.
+    #[tokio::test]
+    async fn mempool_pending_unlinked_orphan_is_reenqueued_not_stranded() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Park nonce 1.
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0x61);
+        {
+            let mut s1 = crate::test_helpers::create_test_service_with_store(store.clone());
+            let (h, _sd) = crate::writer_worker::WriterWorker::spawn(
+                s1.clone(),
+                64,
+                std::time::Duration::from_secs(60),
+            );
+            s1.writer_handle = Some(std::sync::Arc::new(h));
+            service_send_raw_txn(s1, raw1).await.unwrap();
+        }
+
+        // Model the enqueue-race orphan: nonce 0 executed, then nonce 1 was durably
+        // admitted (pending row written + nonce advanced to 2) but the enqueue was
+        // REJECTED — so hash1 is a durable PENDING, UNLINKED row (no receipt, no
+        // note link) with NO writer job, and its queue row survives at nonce 1.
+        assert!(store.nonce_advance_cas(&signer_str, 0).await.unwrap());
+        assert!(store.nonce_advance_cas(&signer_str, 1).await.unwrap());
+        let q1 = store.queued_txn_by_hash(hash1).await.unwrap().unwrap();
+        store
+            .txn_begin_if_absent(
+                hash1,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope: q1.envelope,
+                    signer: key.address(),
+                    expires_at: None,
+                    logs: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.txn_receipt(hash1).await.unwrap().is_none(),
+            "the orphan is pending (no receipt), not terminal"
+        );
+
+        // Fresh service (writer empty — the orphan is NOT in-flight anywhere) runs
+        // the resume sweep. The below-expected orphan must be re-enqueued.
+        let mut s2 = crate::test_helpers::create_test_service_with_store(store.clone());
+        let (h2, _sd2) = crate::writer_worker::WriterWorker::spawn(
+            s2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        let handle = std::sync::Arc::new(h2);
+        s2.writer_handle = Some(handle.clone());
+        resume_queued_drain(&s2).await.unwrap();
+
+        // The queue row is consumed (re-driven, not left) AND the orphan is now
+        // known to the writer (re-enqueued) or already finalised — NOT stranded.
+        assert!(
+            store.queued_txn_by_hash(hash1).await.unwrap().is_none(),
+            "the orphan's queue row must be consumed by a successful re-drive"
+        );
+        let recovered =
+            handle.is_inflight(&hash1) || store.txn_receipt(hash1).await.unwrap().is_some();
+        assert!(
+            recovered,
+            "the orphan must be re-enqueued into the writer (or finalised), not stranded as a bare pending row"
+        );
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "re-driving an already-advanced orphan must NOT double-advance the nonce"
+        );
+    }
+
     /// #146 finding 2A — parking is INDEPENDENT of writer capacity. With the writer
     /// saturated, a valid future-nonce tx must still PARK (durable, acknowledged),
     /// while a dispatchable tx at the expected nonce is correctly backpressured.
@@ -5929,48 +6021,56 @@ mod tests {
         }
     }
 
-    /// #146 finding 4 — TTL expiry must leave an OBSERVABLE terminal tombstone, not
-    /// silently forget an acknowledged hash. After expiry, the receipt is a terminal
-    /// failure (not null), so an RPC client sees a definite outcome.
+    /// #146 finding 4 (re-review blocker 2) — TTL expiry EVICTS a gap-blocked
+    /// parked tx: `getTransactionByHash`/receipt return null, exactly as Geth drops
+    /// a stale queued tx that never got mined. It must NOT leave a durable receipt
+    /// (a synthetic failed receipt is non-Ethereum and would make a re-broadcast
+    /// invoke nonce repair), and must never advance the nonce.
     #[tokio::test]
-    async fn mempool_ttl_expiry_writes_observable_terminal_tombstone() {
+    async fn mempool_ttl_expiry_evicts_gap_blocked_tx_returning_null() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
         let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
 
-        // Park a future-nonce tx (its gap never fills).
+        // Park a future-nonce tx whose gap never fills (expires_at = 0 + TTL).
         let (raw1, hash1) = ger_tx_at(&key, 1, 0x91);
         service_send_raw_txn(service.clone(), raw1).await.unwrap();
         assert!(
+            store.queued_txn_by_hash(hash1).await.unwrap().is_some(),
+            "the tx is parked"
+        );
+        assert!(
             store.txn_receipt(hash1).await.unwrap().is_none(),
-            "a freshly parked tx has no receipt yet"
+            "a parked tx has no receipt (it never executed)"
         );
 
-        // Run the block-denominated expiry sweep well past the parked TTL.
-        let expired = crate::store::tombstone_expired_queued_txns(
-            store.as_ref(),
-            QUEUE_TTL_BLOCKS + 1_000,
-            [0x11u8; 32],
-        )
-        .await
-        .unwrap();
-        assert_eq!(expired, 1, "the stale parked tx must be reaped");
+        // Advance the chain well past the parked TTL, then run the drain sweep,
+        // which evicts gap-blocked rows under the per-signer lock (after draining).
+        store
+            .set_latest_block_number(QUEUE_TTL_BLOCKS + 1_000)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
 
-        // The queue row is gone, but the hash is NOT forgotten: the receipt is a
-        // terminal FAILURE — an observable tombstone.
+        // Evicted: the queue row is gone AND there is NO receipt / no durable txn
+        // row — lookups return null (Geth-style), not a synthetic failed receipt.
         assert!(
             store.queued_txn_by_hash(hash1).await.unwrap().is_none(),
-            "the expired row is removed from the queue"
+            "the expired row must be evicted from the queue"
         );
-        let (result, _block) = store
-            .txn_receipt(hash1)
-            .await
-            .unwrap()
-            .expect("an expired parked tx must leave an observable terminal receipt, not null");
-        let err = result.expect_err("the tombstone receipt must be a terminal failure");
         assert!(
-            err.contains("expired"),
-            "the terminal outcome must record expiry: {err}"
+            store.txn_receipt(hash1).await.unwrap().is_none(),
+            "an evicted parked tx must return null, not a durable failed receipt"
+        );
+        assert!(
+            store.txn_get(hash1).await.unwrap().is_none(),
+            "eviction must leave NO durable transactions row (else re-broadcast repairs the nonce)"
+        );
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "eviction must never advance the nonce"
         );
     }
 }

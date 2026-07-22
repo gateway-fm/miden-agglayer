@@ -2687,16 +2687,26 @@ async fn test_pgstore_queued_txns_bounds_serialization_and_expiry() {
     let store = std::sync::Arc::new(store);
 
     // `expires_at` is persisted as i64, so `u64::MAX` would wrap to -1. Use
-    // i64-safe sentinels: CLEAR_ALL sweeps every row (all expires_at <= i64::MAX);
+    // i64-safe sentinels: CLEAR_ALL evicts every row (all expires_at <= i64::MAX);
     // NEVER_EXPIRES is far above any block a test reaches.
     const CLEAR_ALL: u64 = i64::MAX as u64;
     const NEVER_EXPIRES: u64 = 1_000_000_000;
+
+    // Expiry is now per-signer; clear the whole table by sweeping each signer.
+    async fn clear_all_queued(store: &super::postgres::PgStore) {
+        for s in store.queued_signers().await.unwrap() {
+            store
+                .expire_queued_txns_for_signer(&s, i64::MAX as u64)
+                .await
+                .unwrap();
+        }
+    }
 
     // ── Finding 5: the global capacity check + INSERT must be serialised so
     // concurrent parks for DIFFERENT signers cannot both pass a COUNT under the
     // global cap and exceed it. Under READ COMMITTED without the advisory lock
     // this over-admits; with it, exactly `global` rows land under any concurrency.
-    store.take_expired_queued_txns(CLEAR_ALL).await.unwrap(); // start empty
+    clear_all_queued(store.as_ref()).await; // start empty
 
     const GLOBAL: usize = 5;
     const CONTENDERS: usize = 24;
@@ -2711,7 +2721,14 @@ async fn test_pgstore_queued_txns_bounds_serialization_and_expiry() {
             let signer = format!("0x{:040x}", i + 1);
             let tx_hash = TxHash::from([(i + 1) as u8; 32]);
             store
-                .queue_txn(&signer, 1, tx_hash, &queued_envelope(), NEVER_EXPIRES, bounds)
+                .queue_txn(
+                    &signer,
+                    1,
+                    tx_hash,
+                    &queued_envelope(),
+                    NEVER_EXPIRES,
+                    bounds,
+                )
                 .await
                 .unwrap()
         }));
@@ -2744,10 +2761,9 @@ async fn test_pgstore_queued_txns_bounds_serialization_and_expiry() {
     }
     assert_eq!(landed, GLOBAL, "no over-admission past the global cap");
 
-    // ── Finding 4: TTL expiry must ATOMICALLY remove AND RETURN the expiring
-    // rows so the sweep can write an observable terminal tombstone for each. A
-    // bare delete (no return) is what silently forgot an acknowledged hash.
-    store.take_expired_queued_txns(CLEAR_ALL).await.unwrap(); // clear finding-5 rows
+    // ── Finding 4: TTL expiry EVICTS a signer's gap-blocked rows past their block —
+    // a plain per-signer delete (lookups then return null, Geth-style).
+    clear_all_queued(store.as_ref()).await; // clear finding-5 rows
 
     let signer = "0x00000000000000000000000000000000dead0001";
     let bounds = super::QueueBounds {
@@ -2766,24 +2782,24 @@ async fn test_pgstore_queued_txns_bounds_serialization_and_expiry() {
         .await
         .unwrap();
 
-    // Sweep at block 50: only the nonce-1 row is expired; returned AND removed.
-    let expired = store.take_expired_queued_txns(50).await.unwrap();
-    assert_eq!(
-        expired.len(),
-        1,
-        "only the block-10 row is expired at block 50"
+    // Evict at block 50: only the nonce-1 row (expires 10) is removed; nonce 2
+    // (expires 100) remains.
+    let evicted = store
+        .expire_queued_txns_for_signer(signer, 50)
+        .await
+        .unwrap();
+    assert_eq!(evicted, 1, "only the block-10 row is evicted at block 50");
+    assert!(
+        store.queued_txn_by_hash(h_early).await.unwrap().is_none(),
+        "the evicted row is gone (lookups return null)"
     );
-    assert_eq!(expired[0].tx_hash, h_early);
-    assert_eq!(expired[0].nonce, 1);
     assert_eq!(
         store.peek_queued_min_nonce(signer).await.unwrap(),
         Some(2),
         "the un-expired later row remains parked"
     );
-    // The returned row carries enough to tombstone (signer + envelope round-trip).
-    assert!(expired[0].signer.eq_ignore_ascii_case(signer));
 
     // Clean up.
-    store.take_expired_queued_txns(CLEAR_ALL).await.unwrap();
+    clear_all_queued(store.as_ref()).await;
     assert!(store.peek_queued_min_nonce(signer).await.unwrap().is_none());
 }

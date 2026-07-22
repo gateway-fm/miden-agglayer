@@ -1395,23 +1395,25 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
-    async fn take_expired_queued_txns(&self, now: u64) -> anyhow::Result<Vec<QueuedTxn>> {
+    async fn expire_queued_txns_for_signer(&self, signer: &str, now: u64) -> anyhow::Result<usize> {
+        let key = signer.to_lowercase();
         let mut map = self.queued_txns.write();
-        let mut expired = Vec::new();
-        for inner in map.values_mut() {
-            let stale: Vec<u64> = inner
-                .iter()
-                .filter(|(_, q)| q.expires_at <= now)
-                .map(|(n, _)| *n)
-                .collect();
-            for n in stale {
-                if let Some(q) = inner.remove(&n) {
-                    expired.push(q);
-                }
-            }
+        let Some(inner) = map.get_mut(&key) else {
+            return Ok(0);
+        };
+        let stale: Vec<u64> = inner
+            .iter()
+            .filter(|(_, q)| q.expires_at <= now)
+            .map(|(n, _)| *n)
+            .collect();
+        let n = stale.len();
+        for nonce in stale {
+            inner.remove(&nonce);
         }
-        map.retain(|_, inner| !inner.is_empty());
-        Ok(expired)
+        if inner.is_empty() {
+            map.remove(&key);
+        }
+        Ok(n)
     }
 
     // ── Nonces ───────────────────────────────────────────────────
@@ -4187,12 +4189,10 @@ mod tests {
         assert!(store.delete_queued_txn(a, 5, h5).await.unwrap());
         assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), Some(6));
 
-        // Expiry removes AND returns every row whose expires_at <= now (nonce 6,
-        // expires_at 100) so the caller can tombstone it (#146 finding 4).
-        let expired = store.take_expired_queued_txns(100).await.unwrap();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].nonce, 6);
-        assert_eq!(expired[0].tx_hash, h6);
+        // Expiry evicts every row for the signer whose expires_at <= now (nonce 6,
+        // expires_at 100) — a plain delete; lookups then return null (#146 finding 4).
+        let evicted = store.expire_queued_txns_for_signer(a, 100).await.unwrap();
+        assert_eq!(evicted, 1);
         assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), None);
         assert!(store.queued_signers().await.unwrap().is_empty());
     }

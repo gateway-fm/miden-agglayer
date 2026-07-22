@@ -1835,31 +1835,18 @@ impl Store for PgStore {
         }))
     }
 
-    async fn take_expired_queued_txns(&self, now: u64) -> anyhow::Result<Vec<QueuedTxn>> {
+    async fn expire_queued_txns_for_signer(&self, signer: &str, now: u64) -> anyhow::Result<usize> {
         let client = self.pool.get().await?;
-        // Atomic delete-and-return so an expiring tx is tombstoned exactly once even
-        // if two sweeps race: the row is gone from `queued_txns` the instant it is
-        // returned here (#146 finding 4).
-        let rows = client
-            .query(
-                "DELETE FROM queued_txns WHERE expires_at <= $1
-                 RETURNING signer, nonce, tx_hash, envelope, expires_at",
-                &[&(now as i64)],
+        // Plain atomic delete — the evicted rows simply vanish and lookups return
+        // null (Geth-style), leaving NO durable receipt (#146 finding 4). Scoped to
+        // one signer because the caller holds that signer's lock.
+        let n = client
+            .execute(
+                "DELETE FROM queued_txns WHERE signer = $1 AND expires_at <= $2",
+                &[&signer.to_lowercase(), &(now as i64)],
             )
             .await?;
-        let mut expired = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let signer: String = row.get(0);
-            let nonce: i64 = row.get(1);
-            expired.push(QueuedTxn {
-                signer,
-                nonce: nonce as u64,
-                tx_hash: parse_queued_hash(row.get(2))?,
-                envelope: decode_queued_envelope(row.get(3))?,
-                expires_at: row.get::<_, i64>(4) as u64,
-            });
-        }
-        Ok(expired)
+        Ok(n as usize)
     }
 
     // ── Nonces ───────────────────────────────────────────────────
