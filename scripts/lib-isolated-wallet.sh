@@ -150,6 +150,39 @@ _faucet_amt() {
     awk -v f="$f" '$1==f{print $2; found=1} END{if(!found)print 0}' <<<"$1"
 }
 
+# _norm_account_id <id> — canonicalize a Miden account/faucet id to the lowercase
+# 0x-hex of the 15-byte account id, so ids in different textual forms compare equal.
+# Accepts hex (0x…, with or without a leading type byte) OR bech32/bech32m (as
+# `bridge_accounts.toml` now stores them, e.g. `mcst1…` — commit d071c47). The
+# config stores bech32 while `--list-wallet-faucets` emits hex; without this both
+# forms of the SAME faucet would false-mismatch (#147 linkage).
+_norm_account_id() {
+    python3 - "$1" <<'PY'
+import sys
+s = sys.argv[1].strip()
+def out(b):
+    print("0x" + b[-15:].hex())  # trailing 15 bytes are the account id
+sl = s.lower()
+if sl.startswith("0x"):
+    try:
+        out(bytes.fromhex(sl[2:])); sys.exit(0)
+    except Exception:
+        pass
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+try:
+    data = s[s.rfind('1') + 1:]
+    vals = [CHARSET.index(c.lower()) for c in data][:-6]  # strip 6-symbol checksum
+    acc = bits = 0; o = bytearray()
+    for v in vals:
+        acc = (acc << 5) | v; bits += 5
+        while bits >= 8:
+            bits -= 8; o.append((acc >> bits) & 0xff)
+    out(bytes(o)); sys.exit(0)
+except Exception as e:
+    print("NORM_ERR", e); sys.exit(1)
+PY
+}
+
 # assert_received_faucet <before_snapshot> <expected_faucet_id> <expected_symbol> \
 #                        <expected_decimals> <expected_amount> <origin-label>
 # #147/PR#152 received-asset linkage — DERIVE the received faucet from the receiving wallet's
@@ -162,8 +195,11 @@ _faucet_amt() {
 # LOUD with before/after snapshots + derived/expected/origin diagnostics. Uses ambient WALLET_ID.
 assert_received_faucet() {
     local before="$1" want_fid="$2" want_sym="$3" want_dec="$4" want_amt="$5" label="$6"
-    local want_fid_lc; want_fid_lc="0x$(echo "${want_fid#0x}" | tr 'A-F' 'a-f')"
-    local after="" derived="" attempt fid aamt bamt delta
+    # Canonicalize the expected id up front so a bech32 config id and the hex ids
+    # emitted by --list-wallet-faucets compare on identity, not textual form.
+    local want_norm; want_norm="$(_norm_account_id "$want_fid")" \
+        || fail "#147/link: $label — expected origin faucet id is unparseable: $want_fid"
+    local after="" derived="" derived_norm="" attempt fid aamt bamt delta
     # POLL: the just-claimed P2ID note is not consumed/visible instantly. Each snapshot
     # re-syncs + consumes, so retry until a faucet's delta reaches the received amount.
     for attempt in $(seq 1 "${RECV_POLL_TRIES:-15}"); do
@@ -179,9 +215,11 @@ assert_received_faucet() {
         sleep "${RECV_POLL_INTERVAL:-10}"
     done
     [[ -n "$derived" ]] \
-        || fail "#147/link: $label — NO wallet faucet's vault balance rose by >= $want_amt after the claim (wallet=$WALLET_ID). BEFORE=[$(printf '%s' "$before" | tr '\n' ';')] AFTER=[$(printf '%s' "$after" | tr '\n' ';')] expected-origin-faucet=$want_fid_lc symbol=$want_sym/$want_dec — the received asset was linked to no faucet"
-    [[ "$derived" == "$want_fid_lc" ]] \
-        || fail "#147/link: $label — the RECEIVED asset's faucet (DERIVED $derived, balance rose >= $want_amt) != the expected origin faucet ($want_fid_lc). The wallet received a DIFFERENT asset than the config/RPC/PG id claims. AFTER=[$(printf '%s' "$after" | tr '\n' ';')]"
+        || fail "#147/link: $label — NO wallet faucet's vault balance rose by >= $want_amt after the claim (wallet=$WALLET_ID). BEFORE=[$(printf '%s' "$before" | tr '\n' ';')] AFTER=[$(printf '%s' "$after" | tr '\n' ';')] expected-origin-faucet=$want_norm symbol=$want_sym/$want_dec — the received asset was linked to no faucet"
+    derived_norm="$(_norm_account_id "$derived")" \
+        || fail "#147/link: $label — derived received faucet id is unparseable: $derived"
+    [[ "$derived_norm" == "$want_norm" ]] \
+        || fail "#147/link: $label — the RECEIVED asset's faucet (DERIVED $derived → $derived_norm, balance rose >= $want_amt) != the expected origin faucet ($want_fid → $want_norm). The wallet received a DIFFERENT asset than the config/RPC/PG id claims. AFTER=[$(printf '%s' "$after" | tr '\n' ';')]"
     log "#147/link: $label — DERIVED received faucet $derived from the wallet's vault delta (>= $want_amt units); verifying its cold-wallet metadata"
     assert_faucet_symbol "$derived" "$want_sym" "$want_dec" "$label (derived from received asset)"
     pass "#147/link: $label received-asset LINKED — vault delta identifies faucet $derived (== origin), resolves $want_sym/$want_dec on a cold wallet"
