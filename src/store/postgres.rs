@@ -4,9 +4,9 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, Store, TxnData,
-    TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim,
-    UnclaimableReason,
+    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
+    RecoverablePendingTxn, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
+    UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
@@ -409,6 +409,103 @@ impl Store for PgStore {
                 })
             })
             .collect()
+    }
+
+    async fn recoverable_pending_txns(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RecoverablePendingTxn>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await?;
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Oldest-first so a LIMIT keeps the most urgent orphans; nonce is not a
+        // stored column, so we regroup and order by (signer, nonce) in Rust.
+        let rows = client
+            .query(
+                "SELECT t.tx_hash, t.signer, t.envelope_bytes, t.miden_tx_id,
+                        l.note_id, l.handoff_state,
+                        t.recovery_attempts, t.next_recovery_at,
+                        CAST(EXTRACT(EPOCH FROM (now() - t.created_at)) AS BIGINT) AS age_secs
+                 FROM transactions t
+                 LEFT JOIN tx_note_links l ON l.tx_hash = t.tx_hash
+                 WHERE t.status = 'pending'
+                 ORDER BY t.created_at ASC
+                 LIMIT $1",
+                &[&limit_i],
+            )
+            .await?;
+        use alloy::eips::Decodable2718;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let hash_str: String = row.get(0);
+            let tx_hash = hash_str.parse::<TxHash>().map_err(|error| {
+                anyhow::anyhow!("invalid recoverable pending tx hash {hash_str}: {error}")
+            })?;
+            let envelope_bytes: &[u8] = row.get(2);
+            let envelope = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).map_err(|e| {
+                ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
+                anyhow::anyhow!("stored TxEnvelope for {hash_str} cannot be decoded ({e})")
+            })?;
+            let note_id: Option<String> = row.get(4);
+            let handoff = note_id.as_ref().map(|_| {
+                match row.get::<_, Option<String>>(5).as_deref() {
+                    Some("prepared") => NoteHandoffState::Prepared,
+                    // Legacy rows default handoff_state to 'submitted' (mig 012).
+                    _ => NoteHandoffState::Submitted,
+                }
+            });
+            out.push(RecoverablePendingTxn {
+                tx_hash,
+                signer: row.get::<_, String>(1).to_lowercase(),
+                nonce: super::envelope_nonce(&envelope),
+                envelope,
+                miden_tx_id: row.get::<_, Option<String>>(3),
+                handoff,
+                recovery_attempts: row.get::<_, i32>(6).max(0) as u32,
+                next_recovery_at: row.get::<_, Option<i64>>(7).map(|v| v.max(0) as u64),
+                age_secs: row.get::<_, Option<i64>>(8).unwrap_or(0).max(0) as u64,
+            });
+        }
+        out.sort_by(|a, b| a.signer.cmp(&b.signer).then(a.nonce.cmp(&b.nonce)));
+        Ok(out)
+    }
+
+    async fn record_recovery_attempt(
+        &self,
+        tx_hash: TxHash,
+        next_recovery_at: u64,
+    ) -> anyhow::Result<u32> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "UPDATE transactions
+                    SET recovery_attempts = recovery_attempts + 1,
+                        next_recovery_at = $2,
+                        updated_at = now()
+                  WHERE tx_hash = $1
+                  RETURNING recovery_attempts",
+                &[
+                    &format!("{tx_hash:#x}"),
+                    &i64::try_from(next_recovery_at).unwrap_or(i64::MAX),
+                ],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, i32>(0).max(0) as u32).unwrap_or(0))
+    }
+
+    async fn clear_recovery_backoff(&self, tx_hash: TxHash) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE transactions
+                    SET recovery_attempts = 0, next_recovery_at = NULL
+                  WHERE tx_hash = $1",
+                &[&format!("{tx_hash:#x}")],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn prepare_note_handoff(

@@ -105,6 +105,14 @@ async fn handle_ger_result(
             let _ = ger_bytes; // kept for backward-compat; unused here.
             tracing::info!("inserted GER with eth txn: {txn_hash}");
             if is_new {
+                // Stamp GER-injection freshness for the staleness alert (#156 obs):
+                // a climbing `time() - last_ger_injection_timestamp_seconds` means
+                // GER injection has stalled.
+                if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                {
+                    ::metrics::gauge!("last_ger_injection_timestamp_seconds")
+                        .set(now.as_secs() as f64);
+                }
                 // New GER: insert_ger's serialized-client closure
                 // (`ger::record_ger_submission_handoff`) records BOTH the
                 // eth-tx ↔ UpdateGerNote link AND the pending receipt
