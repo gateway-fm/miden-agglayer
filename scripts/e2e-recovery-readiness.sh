@@ -111,17 +111,15 @@ pass "Consumers gated OFF (aggkit, bridge-service, bridge-autoclaim stopped) for
 # RETAIN Postgres; only remove the claim's calldata envelope (transaction_logs
 # cascade-drops via FK; the ClaimEvent in synthetic_logs is UNTOUCHED), and reset
 # the reconcile cursor to 0 so the genesis re-sweep re-observes + backfills it.
-# Blank the envelopes for ALL landed claims (not just CLAIM_TX). PR #151 blocker: with
-# a SINGLE missing claim, the projector's initial sync tick — the same one that flips
-# is_alive true — can repair it, so /health jumps degraded(alive=false)→200 and NEVER
-# passes through the `recovering` state (alive=true, backlog>0) that step 1 asserts. A
-# larger backlog is not fully drained in the alive-transition tick, so `recovering` is
-# genuinely observable. CLAIM_TX's calldata is still checked byte-for-byte in step 2
-# (its ORIG_CALLDATA is saved); the rest only need to drain the backlog.
-DELETED="$(pgi "WITH d AS (DELETE FROM transactions WHERE lower(tx_hash) IN (SELECT DISTINCT lower(transaction_hash) FROM synthetic_logs WHERE lower(topics[1]) = lower('$CLAIM_EVENT_TOPIC')) RETURNING 1) SELECT COUNT(*) FROM d")"
-[[ "$DELETED" =~ ^[0-9]+$ && "$DELETED" -ge 1 ]] || fail "#148: expected to blank >=1 claim tx envelope, deleted '$DELETED'"
-[[ "$(pgi "SELECT COUNT(*) FROM transactions WHERE lower(tx_hash) = '$CLAIM_TX'")" == "0" ]] || fail "#148: CLAIM_TX envelope not among the blanked set"
-log "  #148: blanked $DELETED claim envelope(s) to build an observable repair backlog"
+# Blank only CLAIM_TX's calldata envelope — the LATEST landed claim, which is freshly
+# produced and reliably reconstructable. (An earlier attempt blanked ALL claims to widen
+# the recovering window, but that swept in older/foreign claims the backfill cannot
+# re-consume/reconstruct, stalling /health at backlog>0 forever. It is also unnecessary:
+# the withhold is observable via the DEGRADED node-reconnect window now that that /health
+# body reports claims_awaiting_calldata — step 1 asserts the PROPERTY, 503+backlog>=1,
+# not the transient `recovering` label.)
+DELETED="$(pgi "WITH d AS (DELETE FROM transactions WHERE lower(tx_hash) = '$CLAIM_TX' RETURNING 1) SELECT COUNT(*) FROM d")"
+[[ "$DELETED" == "1" ]] || fail "#148: expected to blank exactly 1 claim tx envelope, deleted '$DELETED'"
 pgq "UPDATE service_state SET reconcile_cursor = 0 WHERE id = 1" >/dev/null \
     || fail "#148: failed to reset reconcile_cursor (the genesis re-sweep would not run)"
 # Reset the Miden client store — the issue's recovery shape MUST be genuinely
