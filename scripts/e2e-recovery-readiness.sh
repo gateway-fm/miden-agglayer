@@ -230,6 +230,30 @@ CLAIM_COUNT_POST="$(pgi "SELECT COUNT(*) FROM synthetic_logs WHERE lower(topics[
     || fail "#148: ClaimEvent count changed across recovery ($CLAIM_COUNT_PRE -> $CLAIM_COUNT_POST) — a foreign/spurious claim leaked or a legit one was dropped"
 pass "3. No foreign/spurious ClaimEvent across recovery (count stable at $CLAIM_COUNT_POST)"
 
+# ── Pre-recovery snapshots for the consumer-attribution proofs (PR #151 round 3) ─────
+# Captured BEFORE the consumers are force-recreated so the post-recovery deltas below can
+# only be attributed to the recreated consumers, never to this script's own reads.
+PROXY_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
+AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
+CLAIM_TX_LC="$(echo "$CLAIM_TX" | tr 'A-F' 'a-f')"
+# serve_count: how many times the (un-reset) proxy has served eth_getTransactionByHash for
+# THIS exact hash (src/service.rs logs "served stored tx <hash>"). It INCLUDES this script's
+# own reads (step 2) — step 4c requires a STRICT increase, so only a genuinely new (aggkit-
+# driven) fetch can pass, never the test re-reading.
+serve_count() {
+    docker logs --tail "${PROXY_LOG_TAIL:-20000}" "$PROXY_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | grep -icF "$CLAIM_TX_LC" || true
+}
+# cert_height: the MAX agglayer certificate Height aggkit has logged. Step 4e requires a cert
+# STRICTLY newer than this pre-recovery max — never an old cert re-logged after the restart.
+cert_height() {
+    docker logs --tail "${AGGKIT_LOG_TAIL:-40000}" "$AGGKIT_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aoE 'Height: [0-9]+' | grep -aoE '[0-9]+' | sort -n | tail -1
+}
+SERVES_BEFORE="$(serve_count)"; SERVES_BEFORE="${SERVES_BEFORE:-0}"
+PRE_CERT_HEIGHT="$(cert_height)"; PRE_CERT_HEIGHT="${PRE_CERT_HEIGHT:-0}"
+log "  pre-recovery snapshots: proxy served $CLAIM_TX_LC ${SERVES_BEFORE}x (incl. this script's reads); max agglayer cert height ${PRE_CERT_HEIGHT}"
+
 # ── 4. Release the gated consumers; assert the recovered claim SETTLES ────────
 # Only NOW (readiness=200) do we release the consumers the gate held off. This is
 # the release the readiness probe authorises. Realistic operational resync
@@ -239,10 +263,9 @@ pass "3. No foreign/spurious ClaimEvent across recovery (count stable at $CLAIM_
 # container's PathRWData=/tmp, which a plain `up -d` PRESERVES — so aggkit would
 # RESUME from its old cursor and never re-fetch/re-parse the historical claim (PR
 # #151 blocker). A fresh container re-scans the proxy L2 from block 0, genuinely
-# re-exercising the empty-input-stall consumer. Step 4b asserts aggkit's OWN recovery.
-# Timestamp the release so step 4c only counts a certificate that settles AFTER it (a
-# genuinely FRESH cert, not one that settled before the recovery).
-RECOVERY_RELEASE_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# re-exercising the empty-input-stall consumer. Step 4b asserts aggkit's OWN recovery;
+# steps 4c/4e attribute the post-recovery serve + a strictly-newer settled cert to the
+# recreated consumers via the SERVES_BEFORE / PRE_CERT_HEIGHT snapshots captured above.
 docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
     -c "DROP SCHEMA IF EXISTS sync CASCADE; DROP SCHEMA IF EXISTS mt CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO bridge_user;" >/dev/null 2>&1 \
     || fail "#148: failed to drop bridge_db for the realistic resync (finding #65)"
@@ -276,10 +299,10 @@ done
     || fail "#148: no sync.status row for network 1 in bridge_db after release — the bridgesync consumer never started (settlement not observed)"
 { [[ "$SYNCED" == "t" || "$SYNCED" == "true" ]] && [[ "${REMAIN:-999999}" -le 50 ]]; } \
     || fail "#148: released consumer did NOT settle — sync.status network 1 synced=$SYNCED remaining_blocks=$REMAIN after 240s; the recovered claim likely still stalls bridgesync"
-# And the calldata the consumer parsed is still the complete original.
-[[ "$(tx_input "$CLAIM_TX")" == "$ORIG_CALLDATA" ]] \
-    || fail "#148: recovered calldata regressed after the consumer release"
-pass "4. Released consumers SETTLED: bridge-service sync.status network 1 synced=$SYNCED remaining_blocks=$REMAIN; recovered claim's calldata intact + parsed (no empty-input stall)"
+# NOTE: the calldata was verified byte-for-byte in step 2 (pre-release). We do NOT re-read
+# eth_getTransactionByHash here — that would be the TEST serving the hash and would pollute
+# the step-4c serve-count delta (which must attribute the next serve to aggkit alone).
+pass "4. Released consumers SETTLED: bridge-service sync.status network 1 synced=$SYNCED remaining_blocks=$REMAIN (no empty-input stall)"
 
 # ── 4b. AGGKIT's OWN BridgeL2Sync re-processed the recovered claim ────────────
 # The step-4 sync.status belongs to BRIDGE-SERVICE. The consumer #148 is really about
@@ -310,41 +333,78 @@ done
     || fail "#148: aggkit's OWN L2BridgeSyncer did NOT re-process past the recovered claim after force-recreate (reached block $AGGKIT_MAXBLK < claim block $CLAIM_BLOCK within 240s) — its bridgesync stalled on the claim, so the empty-input recovery is NOT proven for the consumer that actually stalls"
 pass "4b. aggkit's OWN L2BridgeSyncer re-processed the recovered claim from a FRESH cursor (reached block $AGGKIT_MAXBLK >= claim block $CLAIM_BLOCK) — the stalling consumer genuinely recovered, not just bridge-service"
 
-# ── 4c. Exact recovered claim served afresh + exact global index + a FRESH cert Settled ─
-# (a) A GENUINELY NEW serve (after the consumers were force-recreated, not the pre-release
-#     read) of the EXACT recovered tx hash returns the full ORIGINAL calldata, and that
-#     calldata carries THE exact global index — binds the recovery to (hash, global index),
-#     not just "a block advanced".
-FRESH_SERVE="$(tx_input "$CLAIM_TX")"
-[[ "$FRESH_SERVE" == "$ORIG_CALLDATA" ]] \
-    || fail "#148: post-recovery re-serve of the EXACT claim hash $CLAIM_TX differs from the original calldata (orig ${#ORIG_CALLDATA} chars, got ${#FRESH_SERVE}) — the reset proxy is not re-serving this exact hash"
-FRESH_GI="$(gi_from_calldata "$FRESH_SERVE")"
-[[ "$FRESH_GI" == "$GI_HEX" ]] \
-    || fail "#148: post-recovery re-served calldata for $CLAIM_TX carries globalIndex '$FRESH_GI' != recovered global index '$GI_HEX' ($GLOBAL_INDEX) — exact-global-index binding broken"
-pass "4c. Fresh post-recovery serve of the EXACT recovered claim: hash=$CLAIM_TX, global index=$GLOBAL_INDEX bound byte-for-byte in the re-served claimAsset calldata"
-
-# (b) A FRESH certificate must reach Settled AFTER recovery — proves the settlement pipeline
-#     (aggsender → agglayer) resumed end-to-end, not merely that bridgesync scanned. Same
-#     ground-truth signal e2e-l2-to-l1-autoclaim uses: aggkit logs `changed status … Settled`
-#     with a non-genesis NewLocalExitRoot. `--since $RECOVERY_RELEASE_TS` restricts to certs
-#     that settled AFTER the release (the force-recreated aggkit container is fresh anyway).
-CERT_DEADLINE=$(( $(date +%s) + 300 ))
-CERT_SETTLED=0
+# ── 4c. EXACT-HASH FETCH by aggkit — serve-count DELTA (PR #151 round 3, gap 1) ──────
+# Step 2 proved the repaired BYTES. This proves the FORCE-RECREATED aggkit itself re-fetched
+# THIS exact hash: the proxy logs every stored tx it serves by exact hash; we snapshotted
+# SERVES_BEFORE (incl. this script's own step-2 read) BEFORE the recreate, and now require a
+# STRICT increase — a serve that can ONLY be aggkit's post-reset re-fetch, never the test.
+# Correlated with 4b (aggkit demonstrably re-processed the claim's block), the new serve is its.
+SERVE_DEADLINE=$(( $(date +%s) + 240 )); SERVES_AFTER="$SERVES_BEFORE"
 while :; do
-    # Same exclusion as e2e-l2l2-to-l1-autoclaim: ignore the all-zero root and the
-    # known empty-tree root, so a cert that settles with NO new local exit root (no
-    # real activity) does not count as a fresh settlement.
-    if docker logs --since "$RECOVERY_RELEASE_TS" "$AGGKIT_CONTAINER" 2>&1 \
-        | sed -E 's/\x1b\[[0-9;]*m//g' \
-        | grep -aE 'changed status.*Settled' \
-        | grep -avE 'NewLocalExitRoot: (0x0+[,} ]|0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757)' \
-        | grep -aq 'NewLocalExitRoot'; then CERT_SETTLED=1; break; fi
+    SERVES_AFTER="$(serve_count)"; SERVES_AFTER="${SERVES_AFTER:-0}"
+    [[ "$SERVES_AFTER" -gt "$SERVES_BEFORE" ]] && break
+    [[ $(date +%s) -ge $SERVE_DEADLINE ]] && break
+    sleep 5
+done
+[[ "$SERVES_AFTER" -gt "$SERVES_BEFORE" ]] \
+    || fail "#148: the proxy did NOT serve the exact recovered hash $CLAIM_TX_LC to aggkit after force-recreate (serve count stuck at $SERVES_BEFORE within 240s) — aggkit did not re-fetch THIS claim's calldata (only a block number advanced)"
+pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate (serve count $SERVES_BEFORE -> $SERVES_AFTER) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
+
+# ── 4d. CONSUMER-SIDE exact global index (PR #151 round 3, gap 2) ────────────────────
+# The exact GI was bound INSIDE the proxy (ClaimEvent<->calldata, at PRE). Now require the
+# SAME exact GI to be durably DELIVERED in the CONSUMER index: bridge_db (re-populated from
+# the drop+resync) must hold a sync.claim row for this exact global_index — proving the
+# consumer actually INGESTED THIS claim, not merely advanced a block. global_index in
+# sync.claim is stored as the decimal value == GLOBAL_INDEX. Error-propagating (pgi_bridge).
+GI_IN_CONSUMER="$(pgi_bridge "SELECT COUNT(*) FROM sync.claim WHERE global_index = $GLOBAL_INDEX")"
+[[ "$GI_IN_CONSUMER" =~ ^[0-9]+$ && "$GI_IN_CONSUMER" -ge 1 ]] \
+    || fail "#148: the recovered claim's EXACT global index $GLOBAL_INDEX is NOT delivered in the consumer index (bridge_db sync.claim count='$GI_IN_CONSUMER') — the consumer did not ingest THIS claim"
+pass "4d. Consumer (bridge_db sync.claim) durably delivered the recovered claim's EXACT global index $GLOBAL_INDEX — exact-gi tie on the consumer side, not just a block advance"
+
+# ── 4e. Post-recovery OUTBOUND + a STRICTLY-NEWER cert settled ON-CHAIN (gap 3) ──────
+# An imported ClaimEvent is NOT a Local-Exit-Tree leaf, so it cannot by itself drive a fresh
+# certificate. Submit ONE Miden->L1 bridge-out (a real LET leaf), then require a certificate
+# with Height STRICTLY GREATER than the pre-recovery max (never an old cert re-logged after
+# the restart), and receipt-check its SettlementTxnHash on L1 (status 0x1, to == RollupManager)
+# — the on-chain proof that the aggsender -> agglayer -> L1 settlement pipeline resumed.
+step "4e: post-recovery Miden->L1 bridge-out (fresh LET leaf), then require a strictly-newer settled cert proven on-chain"
+if ! "$SCRIPT_DIR/e2e-l2-to-l1.sh" > "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>&1; then
+    sed -E 's/\x1b\[[0-9;]*m//g' "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null | tail -6 | sed 's/^/  [l2-to-l1] /'
+    rm -f "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null || true
+    fail "#148: post-recovery Miden->L1 bridge-out (e2e-l2-to-l1.sh) failed — the recovered stack cannot produce a fresh outbound exit for a new certificate"
+fi
+rm -f "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null || true
+EMPTY_LER="0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"
+CERT_DEADLINE=$(( $(date +%s) + 300 )); NEW_CERT_HEIGHT=""; NEW_SETTLEMENT_TX=""
+while :; do
+    # Parse each settled-cert line for Height / SettlementTxnHash / NewLocalExitRoot; keep the
+    # highest with Height > pre-recovery max, a non-empty exit root, and a well-formed tx hash.
+    CERT_LINE="$(docker logs --tail "${AGGKIT_LOG_TAIL:-40000}" "$AGGKIT_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -aE 'changed status.*to \[Settled\]' \
+        | awk -v pre="$PRE_CERT_HEIGHT" -v empty="$EMPTY_LER" '
+            { h=""; st=""; nler="";
+              for (i=1;i<=NF;i++) {
+                  if ($i=="Height:")            { h=$(i+1);    gsub(/[,.]/,"",h) }
+                  if ($i=="SettlementTxnHash:") { st=$(i+1);   gsub(/[,.]/,"",st) }
+                  if ($i=="NewLocalExitRoot:")  { nler=$(i+1); gsub(/[,.]/,"",nler) }
+              }
+              if ((h+0)>(pre+0) && nler!=empty && st ~ /^0x[0-9a-fA-F]{64}$/) print h, st
+            }' | sort -n | tail -1)"
+    if [[ -n "$CERT_LINE" ]]; then NEW_CERT_HEIGHT="${CERT_LINE%% *}"; NEW_SETTLEMENT_TX="${CERT_LINE##* }"; break; fi
     [[ $(date +%s) -ge $CERT_DEADLINE ]] && break
     sleep 10
 done
-[[ "$CERT_SETTLED" == 1 ]] \
-    || fail "#148: NO fresh certificate reached Settled within 300s after recovery — the aggsender→agglayer settlement pipeline did not resume end-to-end (only bridgesync scanning was proven). Recent aggkit status lines: $(docker logs --since "$RECOVERY_RELEASE_TS" "$AGGKIT_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aE 'changed status' | tail -3 | tr '\n' '|')"
-pass "4c(b). A FRESH certificate reached Settled after recovery — settlement pipeline resumed end-to-end (aggsender → agglayer), not just bridgesync"
+[[ -n "$NEW_SETTLEMENT_TX" ]] \
+    || fail "#148: NO certificate with Height > $PRE_CERT_HEIGHT (a genuinely NEW, non-empty-root cert) settled within 300s after the post-recovery bridge-out — the aggsender->agglayer settlement pipeline did not resume. Recent settled certs: $(docker logs --tail "${AGGKIT_LOG_TAIL:-40000}" "$AGGKIT_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aoE 'Height: [0-9]+, CertificateID' | tail -3 | tr '\n' '|')"
+# On-chain settlement proof: the cert's SettlementTxnHash must be a confirmed L1 tx to the RollupManager.
+RCPT_JSON="$(cast receipt "$NEW_SETTLEMENT_TX" --rpc-url "$L1_RPC" --json 2>/dev/null || true)"
+RCPT_STATUS="$(echo "$RCPT_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || true)"
+RCPT_TO="$(echo "$RCPT_JSON" | python3 -c "import json,sys; print((json.load(sys.stdin).get('to') or '').lower())" 2>/dev/null || true)"
+[[ "$RCPT_STATUS" == "0x1" ]] \
+    || fail "#148: the fresh cert's SettlementTxnHash $NEW_SETTLEMENT_TX is NOT a confirmed L1 tx (receipt status='$RCPT_STATUS') — settlement not proven on-chain"
+[[ "$RCPT_TO" == "$(echo "$ROLLUP_MANAGER" | tr 'A-F' 'a-f')" ]] \
+    || fail "#148: the settlement tx $NEW_SETTLEMENT_TX target ('$RCPT_TO') is not the RollupManager ($ROLLUP_MANAGER) — not a genuine rollup settlement"
+pass "4e. Post-recovery STRICTLY-NEWER certificate settled (Height $PRE_CERT_HEIGHT -> $NEW_CERT_HEIGHT) and its SettlementTxnHash $NEW_SETTLEMENT_TX is confirmed ON L1 (status 0x1, to=RollupManager) — aggsender -> agglayer -> L1 settlement resumed end-to-end"
 
 rm -f "$BACKUP"
 log "======================================================================"
