@@ -290,6 +290,25 @@ impl InFlightEntry {
             terminal_at: None,
         }
     }
+
+    /// #146 — a synthetic "accepted, not yet mined" entry for a future-nonce tx
+    /// PARKED in the mempool queue (not actually in the writer queue). Used only
+    /// by `eth_getTransactionByHash` to render the geth pending-tx shape via
+    /// [`crate::service_helpers::build_inflight_pending_tx_json`], which reads
+    /// only `envelope`, `eth_tx_hash`, and `signer` — the remaining fields are
+    /// inert placeholders (never serialised for a parked tx).
+    pub fn pending_for(envelope: TxEnvelope, eth_tx_hash: TxHash, signer: Address) -> Self {
+        Self {
+            state: JobState::Queued,
+            eth_tx_hash,
+            signer,
+            kind: WriteJobKind::Claim,
+            job_id: Ulid::new(),
+            envelope,
+            created_at: Instant::now(),
+            terminal_at: None,
+        }
+    }
 }
 
 impl WriteJob {

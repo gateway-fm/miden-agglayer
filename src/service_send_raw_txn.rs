@@ -1129,7 +1129,23 @@ pub fn is_signer_allowed(allowed: Option<&[Address]>, signer: &Address) -> bool 
     }
 }
 
+/// `eth_sendRawTransaction`. A transaction whose nonce is AHEAD of the signer's
+/// next expected nonce (a bursty / out-of-order submission) is PARKED in the
+/// per-signer future-nonce queue and its hash returned immediately, instead of
+/// blocking then rejecting (#146). When the gap fills, the contiguous run of
+/// parked successors is drained into the writer queue in nonce order.
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
+    service_send_raw_txn_inner(service, input, false).await
+}
+
+/// `from_drain` is set only when the drain loop replays a previously-parked
+/// envelope: it suppresses the post-admit re-drain (the loop already iterates)
+/// so promotion is a bounded loop, not unbounded re-entrant recursion.
+async fn service_send_raw_txn_inner(
+    service: ServiceState,
+    input: String,
+    from_drain: bool,
+) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
@@ -1328,17 +1344,12 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // same-nonce txs both pass the equality check before either calls
     // `nonce_increment`.
     //
-    // The mandatory writer also tolerates bounded future-nonce
-    // reordering from concurrent HTTP delivery: if nonce N+1 reaches us before
-    // nonce N, release the lock, wait briefly for N to be accepted, then
-    // re-check. This is a small in-process txpool behavior; stale/replay nonces
-    // still fail immediately, and missing gaps still fail after the bound.
-    let future_nonce_wait_max = std::time::Duration::from_secs(30);
-    let future_nonce_poll = std::time::Duration::from_millis(50);
-    let future_nonce_wait_started = tokio::time::Instant::now();
-    let mut logged_future_nonce_wait = false;
-
-    let _lock = loop {
+    // #146 — the mandatory writer behaves like a node's mempool for future-nonce
+    // txs: a valid tx whose nonce is AHEAD of the next expected nonce is PARKED in
+    // the persistent per-signer queue and its hash returned immediately (not
+    // blocked-then-rejected). The gap-fill (a tx at exactly the expected nonce)
+    // drains the contiguous parked run. Stale/replay nonces still fail immediately.
+    let signer_lock = {
         let lock = service.per_signer_locks.lock(signer).await;
 
         // Close the race between the optimistic dedup read above and this lock.
@@ -1382,13 +1393,12 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         }
         let durable_resume_nonce =
             known_durable_intent && expected_nonce == tx_nonce.saturating_add(1);
-        let can_wait_for_future_nonce = service.writer_handle.is_some()
-            && tx_nonce > expected_nonce
-            && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
+        let is_future_nonce =
+            service.writer_handle.is_some() && !durable_resume_nonce && tx_nonce > expected_nonce;
         let nonce_action = if tx_nonce == expected_nonce || durable_resume_nonce {
             "accept"
-        } else if can_wait_for_future_nonce {
-            "wait_future"
+        } else if is_future_nonce {
+            "park_future"
         } else {
             "reject"
         };
@@ -1405,29 +1415,68 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 "nonce_matches": tx_nonce == expected_nonce,
                 "durable_resume": durable_resume_nonce,
                 "action": nonce_action,
-                "future_nonce_wait_ms": future_nonce_wait_started.elapsed().as_millis(),
                 "writer_handle_present": service.writer_handle.is_some(),
             })
         );
 
         if tx_nonce == expected_nonce || durable_resume_nonce {
-            break lock;
-        }
-
-        if can_wait_for_future_nonce {
-            if !logged_future_nonce_wait {
-                ::metrics::counter!("rpc_future_nonce_wait_total").increment(1);
-                logged_future_nonce_wait = true;
-            }
+            lock
+        } else if is_future_nonce {
+            // Park the validated future-nonce tx and accept immediately. The raw
+            // envelope is replayed verbatim by the drain once the gap fills. TTL is
+            // block-denominated so the shared pending-receipt expiry sweep reaps a
+            // gap that never fills. Idempotent same-hash re-broadcast accepts;
+            // conflicting same-nonce hash and bound breaches are refused.
+            let latest_block = service.store.get_latest_block_number().await?;
+            let expires_at = latest_block.saturating_add(QUEUE_TTL_BLOCKS);
+            let outcome = service
+                .store
+                .queue_txn(
+                    &signer_str,
+                    tx_nonce,
+                    txn_hash,
+                    &txn_envelope,
+                    expires_at,
+                    crate::store::QueueBounds {
+                        per_signer: QUEUE_MAX_PER_SIGNER,
+                        global: QUEUE_MAX_GLOBAL,
+                    },
+                )
+                .await?;
             drop(lock);
-            tokio::time::sleep(future_nonce_poll).await;
-            continue;
+            match outcome {
+                crate::store::QueueOutcome::Parked | crate::store::QueueOutcome::AlreadyParked => {
+                    ::metrics::counter!("rpc_future_nonce_parked_total").increment(1);
+                    tracing::info!(
+                        target: "rpc::mempool",
+                        signer = %signer_str, nonce = tx_nonce, %txn_hash,
+                        expected = expected_nonce, outcome = ?outcome,
+                        "parked future-nonce tx (mempool); will be promoted when the gap fills"
+                    );
+                    return Ok(txn_hash);
+                }
+                crate::store::QueueOutcome::ConflictDifferentHash => {
+                    ::metrics::counter!("rpc_future_nonce_conflict_total").increment(1);
+                    anyhow::bail!(
+                        "a different transaction is already queued for {signer_str} at nonce {tx_nonce}; \
+                         keeping the first (no replacement) — resubmit that exact transaction"
+                    );
+                }
+                crate::store::QueueOutcome::PerSignerBoundExceeded
+                | crate::store::QueueOutcome::GlobalBoundExceeded => {
+                    ::metrics::counter!("rpc_future_nonce_bound_exceeded_total").increment(1);
+                    anyhow::bail!(
+                        "future-nonce queue is full ({outcome:?}) for {signer_str} at nonce {tx_nonce}; \
+                         retry after the gap fills"
+                    );
+                }
+            }
+        } else {
+            ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+            anyhow::bail!(
+                "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; this guards against replay and out-of-order submission (R4)"
+            );
         }
-
-        ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
-        anyhow::bail!(
-            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; this guards against replay and out-of-order submission (R4)"
-        );
     };
 
     // ── #55 BLOCKER 1 — atomic (signer, nonce) reservation ──────────────
@@ -1534,7 +1583,110 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             "failed to release the nonce reservation lease; it will expire and be taken over"
         );
     }
+    // #146 — the in-order tx was admitted and advanced the nonce, so any parked
+    // successor at the new expected nonce is now promotable. RELEASE the per-signer
+    // lock FIRST: the drain re-enters this fn and re-acquires the same lock, so
+    // draining while still holding it would self-deadlock. Skipped when THIS call is
+    // itself a drain replay (`from_drain`), so promotion is a bounded loop rather
+    // than unbounded re-entrant recursion.
+    drop(signer_lock);
+    if admission.is_ok() && !from_drain {
+        drain_queued(&service, &signer_str).await;
+    }
     admission
+}
+
+/// Block-denominated TTL for a parked future-nonce tx. Generous — a real gap
+/// fills within a few blocks; this only reaps a gap that never fills, via the
+/// same sweep that expires pending receipts. ~1h at ~1 block/s.
+const QUEUE_TTL_BLOCKS: u64 = 3_600;
+/// Bound on parked future-nonce txs per signer (a bursty sender's reorder depth
+/// is small; this caps a misbehaving/adversarial signer).
+const QUEUE_MAX_PER_SIGNER: usize = 256;
+/// Global bound across all signers, so the queue cannot grow without limit.
+const QUEUE_MAX_GLOBAL: usize = 4_096;
+
+/// Promote the contiguous run of parked future-nonce txns for `signer`, starting
+/// at the signer's current next-expected nonce, into the writer queue in nonce
+/// order. Each parked tx is replayed through the normal admission path
+/// (`service_send_raw_txn_inner(.., from_drain = true)`): re-validated, durably
+/// admitted (nonce CAS + pending row), enqueued — and only THEN deleted from the
+/// queue, so an acknowledged future tx is never lost between promotion and
+/// durable admission (crash-safe: the startup resume re-drives it). Stops at the
+/// first missing nonce or a promotion error (recovered on the next gap-fill or
+/// re-broadcast). Best-effort: a failure is logged, never propagated to the
+/// caller whose own tx already succeeded.
+async fn drain_queued(service: &ServiceState, signer_str: &str) {
+    // Bounded by QUEUE_MAX_PER_SIGNER live parked entries; the +1 guards against
+    // a pathological same-nonce re-park loop.
+    for _ in 0..=QUEUE_MAX_PER_SIGNER {
+        let next = match service.store.nonce_get(signer_str).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "drain: nonce_get failed");
+                return;
+            }
+        };
+        let parked = match service.store.get_queued_txn(signer_str, next).await {
+            Ok(Some(q)) => q,
+            Ok(None) => return, // gap again (or queue empty) — nothing contiguous
+            Err(e) => {
+                tracing::error!(target: "rpc::mempool", signer = %signer_str, next, error = %e, "drain: get_queued_txn failed");
+                return;
+            }
+        };
+        let mut envelope_hex = String::from("0x");
+        {
+            use alloy::eips::Encodable2718;
+            let mut bytes = Vec::new();
+            parked.envelope.encode_2718(&mut bytes);
+            envelope_hex.push_str(&alloy::hex::encode(bytes));
+        }
+        match Box::pin(service_send_raw_txn_inner(
+            service.clone(),
+            envelope_hex,
+            true,
+        ))
+        .await
+        {
+            Ok(_) => {
+                // Durably admitted — now safe to remove from the queue. A crash
+                // between admit and delete leaves the row; the startup resume
+                // re-replays it and admission is idempotent (dedup-returns).
+                if let Err(e) = service
+                    .store
+                    .delete_queued_txn(signer_str, parked.nonce, parked.tx_hash)
+                    .await
+                {
+                    tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, error = %e, "drain: delete_queued_txn failed after admit; will retry via resume");
+                    return;
+                }
+                ::metrics::counter!("rpc_future_nonce_promoted_total").increment(1);
+                tracing::info!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, tx_hash = %parked.tx_hash, "promoted parked future-nonce tx after gap filled");
+            }
+            Err(e) => {
+                tracing::warn!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, error = %e, "drain: promoting parked tx failed; stopping (recovered on re-broadcast or resume)");
+                return;
+            }
+        }
+    }
+    tracing::warn!(target: "rpc::mempool", signer = %signer_str, "drain: hit the per-signer promotion bound; will continue on the next gap-fill");
+}
+
+/// Startup resume: for every signer with parked future-nonce txns whose smallest
+/// parked nonce already equals the signer's next-expected nonce, drain the
+/// contiguous run. Recovers acknowledged future txs across a process restart so
+/// an ack'd tx never silently disappears. Best-effort per signer.
+pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
+    let signers = service.store.queued_signers().await?;
+    for signer in signers {
+        let next = service.store.nonce_get(&signer).await?;
+        if service.store.peek_queued_min_nonce(&signer).await? == Some(next) {
+            tracing::info!(target: "rpc::mempool", signer = %signer, next, "resuming drain of persisted future-nonce txns after restart");
+            drain_queued(service, &signer).await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2638,51 +2790,43 @@ mod tests {
         );
     }
 
+    /// #146 (supersedes the old rd940 30s-wait behavior): a future-nonce tx is
+    /// PARKED and its hash returned PROMPTLY — it does not block the request — and
+    /// is promoted when the missing nonce fills. The old test asserted the request
+    /// blocked (`!is_finished`) for up to 30s; that liveness trap is exactly what
+    /// #146 removes.
     #[tokio::test]
-    async fn rd940_future_nonce_waits_for_missing_nonce_acceptance() {
-        let mut service = create_test_service();
+    async fn rd940_future_nonce_parks_promptly_then_promotes_on_gap_fill() {
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
-        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
-            service.clone(),
-            64,
-            std::time::Duration::from_secs(60),
-        );
-        service.writer_handle = Some(std::sync::Arc::new(handle));
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
 
-        let calldata = insertGlobalExitRootCall {
-            root: FixedBytes::from([0xBBu8; 32]),
-        }
-        .abi_encode();
-        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 1);
-
-        let svc = service.clone();
-        let pending = tokio::spawn(async move { service_send_raw_txn(svc, input_hex).await });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(
-            !pending.is_finished(),
-            "future nonce should wait for the missing nonce instead of failing immediately"
-        );
-
-        store
-            .nonce_increment(&format!("{signer:#x}"))
-            .await
-            .expect("simulate nonce 0 acceptance");
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
-            .await
-            .expect("future nonce waiter should complete")
-            .expect("task should not panic");
-        assert!(
-            result.is_ok(),
-            "future nonce should be accepted: {result:?}"
-        );
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xBB);
+        // Parking must return promptly (well under the old 30s block), NOT hang.
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service_send_raw_txn(service.clone(), raw1),
+        )
+        .await
+        .expect("a future-nonce tx must be PARKED and return promptly, not block")
+        .expect("the future-nonce tx must be accepted (parked)");
+        assert_eq!(parked, hash1);
         assert_eq!(
-            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
-            2,
-            "accepting nonce 1 should advance the next accepted nonce to 2"
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "a parked future-nonce tx must NOT advance the nonce"
         );
+        assert!(store.queued_txn_by_hash(hash1).await.unwrap().is_some());
 
-        let _ = shutdown.send(());
+        // Filling the gap promotes the parked successor.
+        let (raw0, _) = ger_tx_at(&key, 0, 0xBA);
+        service_send_raw_txn(service.clone(), raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "filling the gap promotes the parked tx; the nonce reaches 2"
+        );
     }
 
     /// Self-review R2 + audit C2 — repro+regression. Pre-fix, every recovered
@@ -3689,39 +3833,48 @@ mod tests {
         );
     }
 
-    /// Test 4b — a landed-gi claim whose nonce is in the FUTURE (writer-worker
-    /// mode) must take the normal R4 retryable future-nonce WAIT, not
-    /// accept-and-revert immediately. Proves accept-and-revert only fires for a
-    /// tx the R4 gate would otherwise admit (nonce == expected).
+    /// Test 4b (#146) — a landed-gi claim whose nonce is in the FUTURE must be
+    /// PARKED, not short-circuited to accept-and-revert. The invariant this
+    /// protects is unchanged: accept-and-revert only fires for a tx the R4 gate
+    /// would admit (nonce == expected); a future-nonce landed claim must NOT
+    /// execute out of order. Under #146 it parks (accepted promptly, no receipt,
+    /// no nonce advance) rather than blocking on the old 30s R4 wait.
     #[tokio::test]
-    async fn landed_gi_future_nonce_waits_not_reverted() {
-        let mut service = create_test_service();
+    async fn landed_gi_future_nonce_parks_not_reverted() {
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
-        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
-            service.clone(),
-            64,
-            std::time::Duration::from_secs(60),
-        );
-        service.writer_handle = Some(std::sync::Arc::new(handle));
         seed_zero_ger(&store).await;
 
         let gi = U256::from(0x5506u64);
         land_claim_for(&store, gi).await;
 
-        // Submit at nonce 1 while expected is 0 → future nonce → must WAIT.
+        // Submit at nonce 1 while expected is 0 → future nonce → must PARK.
         let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key_b.address());
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
-        let (input_b, _tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 1);
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 1);
 
-        let svc = service.clone();
-        let pending = tokio::spawn(async move { service_send_raw_txn(svc, input_b).await });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service_send_raw_txn(service.clone(), input_b),
+        )
+        .await
+        .expect("a future-nonce landed claim must park promptly, not block")
+        .expect("the future-nonce landed claim must be accepted (parked)");
+        assert_eq!(parked, tx_b);
         assert!(
-            !pending.is_finished(),
-            "a future-nonce landed claim must WAIT on R4, not short-circuit to accept-and-revert"
+            store.txn_receipt(tx_b).await.unwrap().is_none(),
+            "a parked future-nonce landed claim must NOT accept-and-revert (no receipt)"
         );
-        pending.abort();
-        let _ = shutdown.send(());
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "it must NOT advance the nonce out of order"
+        );
+        assert!(
+            store.queued_txn_by_hash(tx_b).await.unwrap().is_some(),
+            "it must be parked, not executed"
+        );
     }
 
     /// Test 5 — async-writer-mode variant of Test 1: a landed-gi claim from a
@@ -5194,5 +5347,284 @@ mod tests {
             acquire_claim_lock(&store, gi, owner, ttl).await.unwrap(),
             ClaimLockOutcome::Acquired { .. }
         ));
+    }
+
+    // ── #146 future-nonce queue ("mempool") ──────────────────────────────────
+
+    /// Spawn a service with a live writer (parking requires a writer handle) and
+    /// keep the shutdown sender alive for the test's lifetime.
+    fn mempool_service() -> (ServiceState, tokio::sync::oneshot::Sender<()>) {
+        let mut service = create_test_service();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+        (service, shutdown)
+    }
+
+    fn ger_tx_at(
+        key: &alloy::signers::local::PrivateKeySigner,
+        nonce: u64,
+        marker: u8,
+    ) -> (String, TxHash) {
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([marker; 32]),
+        }
+        .abi_encode();
+        encode_tx_signed_with_nonce(key, calldata, nonce)
+    }
+
+    /// Acceptance: submit N+1 before N — it parks (returns its hash promptly, does
+    /// NOT advance the nonce, its receipt stays null). Then N fills the gap and
+    /// both are promoted/executed in order.
+    #[tokio::test]
+    async fn mempool_future_nonce_parks_then_gap_fill_drains_in_order() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xA1);
+        let h1 = service_send_raw_txn(service.clone(), raw1).await.unwrap();
+        assert_eq!(h1, hash1, "parked tx returns its own hash");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "a future-nonce tx must NOT advance the executable/pending nonce"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1),
+            "the future-nonce tx must be parked"
+        );
+        assert!(
+            store.queued_txn_by_hash(hash1).await.unwrap().is_some(),
+            "the parked tx must be findable by hash (getTransactionByHash pending shape)"
+        );
+        assert!(
+            store.txn_receipt(hash1).await.unwrap().is_none(),
+            "the parked tx's receipt must remain null until the gap fills"
+        );
+
+        let (raw0, _) = ger_tx_at(&key, 0, 0xA0);
+        service_send_raw_txn(service.clone(), raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "the in-order tx must process AND drain (promote) the queued successor"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none(),
+            "the queue must be empty after the contiguous drain"
+        );
+    }
+
+    /// Acceptance: a shuffled multi-nonce burst executes in EXACT nonce order —
+    /// every gapped tx parks, and the single in-order tx drains the whole run.
+    #[tokio::test]
+    async fn mempool_shuffled_burst_executes_in_exact_nonce_order() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Shuffled: 2, 4, 1, 3 all park (nonce stays 0, nothing contiguous yet).
+        for nonce in [2u64, 4, 1, 3] {
+            let (raw, _) = ger_tx_at(&key, nonce, 0xB0 + nonce as u8);
+            service_send_raw_txn(service.clone(), raw).await.unwrap();
+        }
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "all gapped txs park; the nonce does not move"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1)
+        );
+
+        // 0 fills the gap → 1,2,3,4 promote in order → nonce reaches 5.
+        let (raw0, _) = ger_tx_at(&key, 0, 0xB0);
+        service_send_raw_txn(service.clone(), raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            5,
+            "the full contiguous 0..=4 run must execute in nonce order"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Same-hash re-broadcast of a parked tx is idempotent (accepts, one row).
+    #[tokio::test]
+    async fn mempool_same_hash_rebroadcast_is_idempotent() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xC1);
+        assert_eq!(
+            service_send_raw_txn(service.clone(), raw1.clone())
+                .await
+                .unwrap(),
+            hash1
+        );
+        // Re-broadcast the exact same envelope — must accept the same hash again.
+        assert_eq!(
+            service_send_raw_txn(service.clone(), raw1).await.unwrap(),
+            hash1
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1),
+            "still exactly one parked tx at nonce 1"
+        );
+    }
+
+    /// A DIFFERENT tx at an already-parked (signer, nonce) is refused — the first
+    /// wins, no silent replacement.
+    #[tokio::test]
+    async fn mempool_conflicting_same_nonce_hash_is_rejected() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+
+        let (raw_a, hash_a) = ger_tx_at(&key, 1, 0xD1);
+        service_send_raw_txn(service.clone(), raw_a).await.unwrap();
+        let (raw_b, hash_b) = ger_tx_at(&key, 1, 0xD2);
+        assert_ne!(hash_a, hash_b);
+        let err = service_send_raw_txn(service.clone(), raw_b)
+            .await
+            .expect_err("a different tx at an already-parked nonce must be rejected");
+        assert!(
+            err.to_string().contains("already queued"),
+            "rejection must name the conflict: {err}"
+        );
+        assert_eq!(
+            store
+                .queued_txn_by_hash(hash_a)
+                .await
+                .unwrap()
+                .unwrap()
+                .nonce,
+            1,
+            "the first-parked tx is kept"
+        );
+        assert!(
+            store.queued_txn_by_hash(hash_b).await.unwrap().is_none(),
+            "the conflicting tx is not parked"
+        );
+    }
+
+    /// Restart recovery: a tx parked before a restart is promoted once the gap
+    /// fills on a FRESH service over the same (persistent) store — an
+    /// acknowledged future tx is never lost across a process restart.
+    #[tokio::test]
+    async fn mempool_parked_tx_survives_restart_and_promotes() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Boot 1: park nonce 1, then "crash".
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xE1);
+        {
+            let mut s1 = crate::test_helpers::create_test_service_with_store(store.clone());
+            let (h, _sd) = crate::writer_worker::WriterWorker::spawn(
+                s1.clone(),
+                64,
+                std::time::Duration::from_secs(60),
+            );
+            s1.writer_handle = Some(std::sync::Arc::new(h));
+            service_send_raw_txn(s1, raw1).await.unwrap();
+        }
+        assert!(
+            store.queued_txn_by_hash(hash1).await.unwrap().is_some(),
+            "the parked tx is durable across the restart"
+        );
+
+        // Boot 2: a fresh service over the SAME store fills the gap; the parked
+        // successor promotes.
+        let mut s2 = crate::test_helpers::create_test_service_with_store(store.clone());
+        let (h2, _sd2) = crate::writer_worker::WriterWorker::spawn(
+            s2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        s2.writer_handle = Some(std::sync::Arc::new(h2));
+        let (raw0, _) = ger_tx_at(&key, 0, 0xE0);
+        service_send_raw_txn(s2, raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "after restart, filling the gap promotes the persisted parked tx"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Restart recovery via the explicit startup resume: if the gap is ALREADY
+    /// filled at boot (nonce advanced before the crash), `resume_queued_drain`
+    /// promotes the contiguous parked run without a fresh submission.
+    #[tokio::test]
+    async fn mempool_resume_queued_drain_promotes_at_startup() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Park nonce 1 …
+        let (raw1, _) = ger_tx_at(&key, 1, 0xF1);
+        {
+            let mut s1 = crate::test_helpers::create_test_service_with_store(store.clone());
+            let (h, _sd) = crate::writer_worker::WriterWorker::spawn(
+                s1.clone(),
+                64,
+                std::time::Duration::from_secs(60),
+            );
+            s1.writer_handle = Some(std::sync::Arc::new(h));
+            service_send_raw_txn(s1, raw1).await.unwrap();
+        }
+        // … and model that nonce 0 was executed just before the crash (the gap is
+        // already filled), so only the resume pass is needed to promote nonce 1.
+        assert!(store.nonce_advance_cas(&signer_str, 0).await.unwrap());
+
+        let mut s2 = crate::test_helpers::create_test_service_with_store(store.clone());
+        let (h2, _sd2) = crate::writer_worker::WriterWorker::spawn(
+            s2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        s2.writer_handle = Some(std::sync::Arc::new(h2));
+        resume_queued_drain(&s2).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "startup resume must promote the now-contiguous parked tx"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
