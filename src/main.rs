@@ -1278,6 +1278,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // #146 mempool resume — before serving, promote any future-nonce txns that
+    // were durably parked before a restart and whose gap is now filled, so an
+    // acknowledged future tx is never silently dropped across a process restart.
+    // Best-effort: a failure here must not prevent the service from starting.
+    if let Err(e) = miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&state).await
+    {
+        tracing::error!(error = %e, "mempool resume_queued_drain failed at startup (continuing)");
+    }
+
     let url = build_service_url(&command.bind, command.port)?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
