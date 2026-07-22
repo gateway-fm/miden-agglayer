@@ -21,12 +21,14 @@
 //!   local receipt without re-submitting).
 //! - **Handoff recorded but effect not yet observed** — the intent crossed the
 //!   external submission boundary; poll it with backoff, never blindly re-submit.
-//! - **No handoff, no effect** — an orphaned durable intent; re-drive the exact
-//!   stored envelope through the same-hash durable-resume path with persistent
-//!   exponential backoff.
+//! - **No handoff, no effect** — an orphaned durable intent; re-enqueue its writer
+//!   job (rebuilt from the stored envelope) directly, with persistent exponential
+//!   backoff. The pending row and nonce CAS are already durable, so this is the
+//!   exact post-admission work — it advances no nonce and recovers several orphans
+//!   for one signer in nonce order.
 //!
 //! Delivery is at-least-once with state reconciliation: every re-drive checks
-//! authoritative Miden state first, the durable-resume path reuses the writer's
+//! authoritative Miden state first, the re-enqueued job reuses the writer's
 //! handoff fencing, and Miden duplicate-protection is the final safety boundary,
 //! so recovery cannot double-advance a nonce or duplicate a GER/claim. Multi-
 //! replica coordination is out of scope (#142).
