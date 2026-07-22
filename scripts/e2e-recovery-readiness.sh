@@ -247,8 +247,11 @@ serve_count() {
 # cert_height: the MAX agglayer certificate Height aggkit has logged. Step 4e requires a cert
 # STRICTLY newer than this pre-recovery max — never an old cert re-logged after the restart.
 cert_height() {
+    # `|| true`: no `Height:` line yet (fresh stack, no cert logged) makes grep exit 1, which
+    # under `set -o pipefail` would abort the caller's `PRE_CERT_HEIGHT="$(cert_height)"`; a
+    # missing height must read as empty (→ 0 via the `:-0` default), not kill the script.
     docker logs --tail "${AGGKIT_LOG_TAIL:-40000}" "$AGGKIT_CONTAINER" 2>&1 \
-        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aoE 'Height: [0-9]+' | grep -aoE '[0-9]+' | sort -n | tail -1
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aoE 'Height: [0-9]+' | grep -aoE '[0-9]+' | sort -n | tail -1 || true
 }
 SERVES_BEFORE="$(serve_count)"; SERVES_BEFORE="${SERVES_BEFORE:-0}"
 PRE_CERT_HEIGHT="$(cert_height)"; PRE_CERT_HEIGHT="${PRE_CERT_HEIGHT:-0}"
@@ -354,9 +357,11 @@ pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate (
 # The exact GI was bound INSIDE the proxy (ClaimEvent<->calldata, at PRE). Now require the
 # SAME exact GI to be durably DELIVERED in the CONSUMER index: bridge_db (re-populated from
 # the drop+resync) must hold a sync.claim row for this exact global_index — proving the
-# consumer actually INGESTED THIS claim, not merely advanced a block. global_index in
-# sync.claim is stored as the decimal value == GLOBAL_INDEX. Error-propagating (pgi_bridge).
-GI_IN_CONSUMER="$(pgi_bridge "SELECT COUNT(*) FROM sync.claim WHERE global_index = $GLOBAL_INDEX")"
+# consumer actually INGESTED THIS claim, not merely advanced a block. sync.claim.global_index
+# is a `character varying` (a decimal STRING, e.g. '18446744073709551617'), so it MUST be
+# compared as a QUOTED literal — an unquoted numeric fails with `text = bigint`. GLOBAL_INDEX
+# is that same decimal value. Error-propagating (pgi_bridge).
+GI_IN_CONSUMER="$(pgi_bridge "SELECT COUNT(*) FROM sync.claim WHERE global_index = '$GLOBAL_INDEX'")"
 [[ "$GI_IN_CONSUMER" =~ ^[0-9]+$ && "$GI_IN_CONSUMER" -ge 1 ]] \
     || fail "#148: the recovered claim's EXACT global index $GLOBAL_INDEX is NOT delivered in the consumer index (bridge_db sync.claim count='$GI_IN_CONSUMER') — the consumer did not ingest THIS claim"
 pass "4d. Consumer (bridge_db sync.claim) durably delivered the recovered claim's EXACT global index $GLOBAL_INDEX — exact-gi tie on the consumer side, not just a block advance"
@@ -389,7 +394,7 @@ while :; do
                   if ($i=="NewLocalExitRoot:")  { nler=$(i+1); gsub(/[,.]/,"",nler) }
               }
               if ((h+0)>(pre+0) && nler!=empty && st ~ /^0x[0-9a-fA-F]{64}$/) print h, st
-            }' | sort -n | tail -1)"
+            }' | sort -n | tail -1 || true)"
     if [[ -n "$CERT_LINE" ]]; then NEW_CERT_HEIGHT="${CERT_LINE%% *}"; NEW_SETTLEMENT_TX="${CERT_LINE##* }"; break; fi
     [[ $(date +%s) -ge $CERT_DEADLINE ]] && break
     sleep 10
