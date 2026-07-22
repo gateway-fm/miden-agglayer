@@ -1287,6 +1287,29 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = %e, "mempool resume_queued_drain failed at startup (continuing)");
     }
 
+    // #146 finding 2 — periodic auto-resume sweep. A parked contiguous run that
+    // stopped mid-promotion on transient writer saturation (or a crash-window stale
+    // row) must resume WITHOUT a client rebroadcast or a restart. This sweep re-runs
+    // the same lock-guarded clean-then-drain per signer on a fixed cadence, so once
+    // writer capacity returns the queue drains on its own. Idempotent and best-effort.
+    {
+        const DRAIN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DRAIN_SWEEP_INTERVAL);
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                if let Err(e) =
+                    miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&sweep_state)
+                        .await
+                {
+                    tracing::warn!(target: "rpc::mempool", error = %e, "periodic future-nonce drain sweep failed (will retry next tick)");
+                }
+            }
+        });
+    }
+
     let url = build_service_url(&command.bind, command.port)?;
     service::serve(url, state.clone(), metrics_handle).await?;
 

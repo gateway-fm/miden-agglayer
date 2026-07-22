@@ -2661,3 +2661,136 @@ async fn test_pgstore_claim_calldata_repair_backlog() {
         "a successful calldata commit clears the claim from the backlog"
     );
 }
+
+// ── Future-nonce queue ("mempool") — #146 ────────────────────────────
+
+/// A distinct dummy envelope reused for parked rows (queue_txn stores the
+/// caller-supplied tx_hash independently of the envelope, so the envelope bytes
+/// need only round-trip, not match the hash).
+fn queued_envelope() -> TxEnvelope {
+    dummy_txn_entry().envelope
+}
+
+/// #146 finding 5 — the global capacity check + INSERT must be serialised so
+/// concurrent parks for DIFFERENT signers cannot both pass a COUNT under the
+/// global cap and exceed it. Under READ COMMITTED without the advisory lock this
+/// over-admits; with it, exactly `global` rows land no matter the concurrency.
+#[tokio::test]
+async fn test_pgstore_queue_txn_global_bound_serialized_under_concurrency() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    // Start from an empty queue (delete every parked row).
+    store.take_expired_queued_txns(u64::MAX).await.unwrap();
+
+    const GLOBAL: usize = 5;
+    const CONTENDERS: usize = 24;
+    let store = std::sync::Arc::new(store);
+    let bounds = super::QueueBounds {
+        per_signer: 1_000,
+        global: GLOBAL,
+    };
+
+    // Launch many concurrent parks, each a DIFFERENT signer at nonce 1 with a
+    // distinct hash, so only the global cap can gate them.
+    let mut handles = Vec::new();
+    for i in 0..CONTENDERS {
+        let store = store.clone();
+        handles.push(tokio::spawn(async move {
+            let signer = format!("0x{:040x}", i + 1);
+            let tx_hash = TxHash::from([(i + 1) as u8; 32]);
+            store
+                .queue_txn(
+                    &signer,
+                    1,
+                    tx_hash,
+                    &queued_envelope(),
+                    u64::MAX, // never expires during the test
+                    bounds,
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    let mut parked = 0usize;
+    let mut rejected = 0usize;
+    for h in handles {
+        match h.await.unwrap() {
+            super::QueueOutcome::Parked => parked += 1,
+            super::QueueOutcome::GlobalBoundExceeded => rejected += 1,
+            other => panic!("unexpected outcome under contention: {other:?}"),
+        }
+    }
+    assert_eq!(
+        parked, GLOBAL,
+        "exactly the global cap must be admitted, never more (finding 5)"
+    );
+    assert_eq!(rejected, CONTENDERS - GLOBAL, "the rest must be refused");
+
+    // Ground truth in the table: the serialised bound held.
+    let mut landed = 0usize;
+    for i in 0..CONTENDERS {
+        let signer = format!("0x{:040x}", i + 1);
+        if store
+            .peek_queued_min_nonce(&signer)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            landed += 1;
+        }
+    }
+    assert_eq!(landed, GLOBAL, "no over-admission past the global cap");
+
+    // Clean up so a re-run starts empty.
+    store.take_expired_queued_txns(u64::MAX).await.unwrap();
+}
+
+/// #146 finding 4 — TTL expiry must ATOMICALLY remove AND RETURN the expiring
+/// rows so the sweep can write an observable terminal tombstone for each. A bare
+/// delete (no return) is what silently forgot an acknowledged hash.
+#[tokio::test]
+async fn test_pgstore_take_expired_queued_txns_returns_removed_rows() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    store.take_expired_queued_txns(u64::MAX).await.unwrap();
+
+    let signer = "0x00000000000000000000000000000000dead0001";
+    let bounds = super::QueueBounds {
+        per_signer: 100,
+        global: 100,
+    };
+    let h_early = TxHash::from([0xE1u8; 32]);
+    let h_late = TxHash::from([0xE2u8; 32]);
+    // nonce 1 expires at block 10; nonce 2 expires at block 100.
+    store
+        .queue_txn(signer, 1, h_early, &queued_envelope(), 10, bounds)
+        .await
+        .unwrap();
+    store
+        .queue_txn(signer, 2, h_late, &queued_envelope(), 100, bounds)
+        .await
+        .unwrap();
+
+    // Sweep at block 50: only the nonce-1 row is expired; it is returned AND gone.
+    let expired = store.take_expired_queued_txns(50).await.unwrap();
+    assert_eq!(
+        expired.len(),
+        1,
+        "only the block-10 row is expired at block 50"
+    );
+    assert_eq!(expired[0].tx_hash, h_early);
+    assert_eq!(expired[0].nonce, 1);
+    assert_eq!(
+        store.peek_queued_min_nonce(signer).await.unwrap(),
+        Some(2),
+        "the un-expired later row remains parked"
+    );
+    // The returned row carries enough to tombstone (signer + envelope round-trip).
+    assert!(expired[0].signer.eq_ignore_ascii_case(signer));
+
+    // Clean up.
+    store.take_expired_queued_txns(u64::MAX).await.unwrap();
+    assert!(store.peek_queued_min_nonce(signer).await.unwrap().is_none());
+}

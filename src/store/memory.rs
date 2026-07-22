@@ -1395,9 +1395,9 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
-    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
+    async fn take_expired_queued_txns(&self, now: u64) -> anyhow::Result<Vec<QueuedTxn>> {
         let mut map = self.queued_txns.write();
-        let mut dropped = 0;
+        let mut expired = Vec::new();
         for inner in map.values_mut() {
             let stale: Vec<u64> = inner
                 .iter()
@@ -1405,12 +1405,13 @@ impl Store for InMemoryStore {
                 .map(|(n, _)| *n)
                 .collect();
             for n in stale {
-                inner.remove(&n);
-                dropped += 1;
+                if let Some(q) = inner.remove(&n) {
+                    expired.push(q);
+                }
             }
         }
         map.retain(|_, inner| !inner.is_empty());
-        Ok(dropped)
+        Ok(expired)
     }
 
     // ── Nonces ───────────────────────────────────────────────────
@@ -4186,8 +4187,12 @@ mod tests {
         assert!(store.delete_queued_txn(a, 5, h5).await.unwrap());
         assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), Some(6));
 
-        // Expiry drops every row whose expires_at <= now (nonce 6, expires_at 100).
-        assert_eq!(store.expire_queued_txns(100).await.unwrap(), 1);
+        // Expiry removes AND returns every row whose expires_at <= now (nonce 6,
+        // expires_at 100) so the caller can tombstone it (#146 finding 4).
+        let expired = store.take_expired_queued_txns(100).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].nonce, 6);
+        assert_eq!(expired[0].tx_hash, h6);
         assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), None);
         assert!(store.queued_signers().await.unwrap().is_empty());
     }

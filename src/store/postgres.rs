@@ -27,6 +27,12 @@ pub struct PgStore {
     pool: Pool,
 }
 
+/// Stable, arbitrary key for the global advisory lock that serialises
+/// future-nonce park capacity checks (#146 finding 5). Any fixed value works; it
+/// only needs to be distinct from other advisory locks this process takes. The
+/// startup migration advisory lock uses a different, unrelated key.
+const QUEUE_BOUNDS_ADVISORY_LOCK_KEY: i64 = 0x6d69_6465_6e5f_3134_u64 as i64; // "miden_14"
+
 /// Convert a byte slice to a fixed 32-byte array, zero-padded if too short.
 fn bytes_to_array_32(bytes: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
@@ -1683,6 +1689,18 @@ impl Store for PgStore {
         // One transaction so the count checks and the insert are atomic against a
         // concurrent park for the same signer / global pool.
         let tx = client.transaction().await?;
+        // #146 finding 5 — the per-signer + global capacity counts and the INSERT
+        // must be atomic against a concurrent park for a DIFFERENT signer (which the
+        // (signer, nonce) row lock alone does not serialise). Under READ COMMITTED,
+        // two concurrent parks could each read `global == cap - 1` and both insert,
+        // exceeding the global bound. A single global advisory xact lock serialises
+        // all parks; it auto-releases at COMMIT/ROLLBACK. Parking is not a hot path
+        // (future-nonce only), so global serialisation of the bound check is cheap.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&QUEUE_BOUNDS_ADVISORY_LOCK_KEY],
+        )
+        .await?;
         // Idempotency / conflict at (signer, nonce) FIRST — an already-parked
         // same-hash re-broadcast must accept even when a bound is met.
         if let Some(row) = tx
@@ -1817,15 +1835,31 @@ impl Store for PgStore {
         }))
     }
 
-    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
+    async fn take_expired_queued_txns(&self, now: u64) -> anyhow::Result<Vec<QueuedTxn>> {
         let client = self.pool.get().await?;
-        let n = client
-            .execute(
-                "DELETE FROM queued_txns WHERE expires_at <= $1",
+        // Atomic delete-and-return so an expiring tx is tombstoned exactly once even
+        // if two sweeps race: the row is gone from `queued_txns` the instant it is
+        // returned here (#146 finding 4).
+        let rows = client
+            .query(
+                "DELETE FROM queued_txns WHERE expires_at <= $1
+                 RETURNING signer, nonce, tx_hash, envelope, expires_at",
                 &[&(now as i64)],
             )
             .await?;
-        Ok(n as usize)
+        let mut expired = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let signer: String = row.get(0);
+            let nonce: i64 = row.get(1);
+            expired.push(QueuedTxn {
+                signer,
+                nonce: nonce as u64,
+                tx_hash: parse_queued_hash(row.get(2))?,
+                envelope: decode_queued_envelope(row.get(3))?,
+                expires_at: row.get::<_, i64>(4) as u64,
+            });
+        }
+        Ok(expired)
     }
 
     // ── Nonces ───────────────────────────────────────────────────

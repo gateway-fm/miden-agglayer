@@ -768,9 +768,12 @@ pub trait Store: Send + Sync + 'static {
     /// Look up a parked tx by its hash (for `eth_getTransactionByHash`).
     async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>>;
 
-    /// Drop every parked tx whose `expires_at` block is `<= now`. Returns how
-    /// many rows were dropped.
-    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize>;
+    /// Atomically remove and RETURN every parked tx whose `expires_at` block is
+    /// `<= now`. The caller records an observable terminal (expired) receipt for
+    /// each returned tx so an acknowledged future-nonce hash is never silently
+    /// forgotten on TTL expiry (#146 finding 4 — explicit-expiry tombstone). The
+    /// delete-and-return must be atomic so a tx is tombstoned exactly once.
+    async fn take_expired_queued_txns(&self, now: u64) -> anyhow::Result<Vec<QueuedTxn>>;
 
     // === Nonces ===
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
@@ -1298,18 +1301,70 @@ impl SyncListener for StoreSyncListener {
                 .txn_expire_pending(data.block_num, block_hash)
                 .await?;
             // #146 — reap parked future-nonce txns whose gap never filled, on the
-            // same block-denominated sweep that expires pending receipts.
-            let dropped = self.store.expire_queued_txns(data.block_num).await?;
-            if dropped > 0 {
-                ::metrics::counter!("rpc_future_nonce_expired_total").increment(dropped as u64);
-                tracing::info!(
-                    target: "rpc::mempool",
-                    dropped,
-                    block = data.block_num,
-                    "expired stale parked future-nonce txns (gap never filled)"
-                );
-            }
+            // same block-denominated sweep that expires pending receipts, leaving an
+            // observable terminal tombstone for each (finding 4).
+            tombstone_expired_queued_txns(self.store.as_ref(), data.block_num, block_hash).await?;
         }
         Ok(())
     }
+}
+
+/// Expire parked future-nonce txns whose TTL block has passed AND leave an
+/// observable TERMINAL (expired) receipt — a tombstone — for each (#146 finding 4).
+///
+/// A parked hash was ACKNOWLEDGED to the client, so on expiry it must not silently
+/// become `null` for both `eth_getTransactionByHash` and
+/// `eth_getTransactionReceipt`. `take_expired_queued_txns` atomically removes and
+/// returns the expiring rows; for each we materialise a durable transaction row
+/// (the parked tx lived only in `queued_txns`) via `txn_begin_if_absent`, then
+/// `txn_commit(Err)` marks it terminally expired. Returns the number expired.
+/// Per-tx tombstone failures are logged, not propagated, so one bad row cannot
+/// abort the whole sweep. Runs on the block-denominated sync sweep and is unit
+/// tested directly.
+pub async fn tombstone_expired_queued_txns(
+    store: &dyn Store,
+    block_num: u64,
+    block_hash: [u8; 32],
+) -> anyhow::Result<usize> {
+    let expired = store.take_expired_queued_txns(block_num).await?;
+    if expired.is_empty() {
+        return Ok(0);
+    }
+    ::metrics::counter!("rpc_future_nonce_expired_total").increment(expired.len() as u64);
+    for q in &expired {
+        if let Err(e) = store
+            .txn_begin_if_absent(
+                q.tx_hash,
+                TxnEntry {
+                    id: None,
+                    envelope: q.envelope.clone(),
+                    signer: q.signer.parse::<Address>().unwrap_or_default(),
+                    expires_at: None,
+                    logs: Vec::new(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(target: "rpc::mempool", tx_hash = %q.tx_hash, error = %e, "expiry tombstone: txn_begin_if_absent failed");
+            continue;
+        }
+        if let Err(e) = store
+            .txn_commit(
+                q.tx_hash,
+                Err("expired: future-nonce gap never filled".to_string()),
+                block_num,
+                block_hash,
+            )
+            .await
+        {
+            tracing::warn!(target: "rpc::mempool", tx_hash = %q.tx_hash, error = %e, "expiry tombstone: txn_commit(expired) failed");
+        }
+    }
+    tracing::info!(
+        target: "rpc::mempool",
+        dropped = expired.len(),
+        block = block_num,
+        "expired stale parked future-nonce txns (gap never filled); wrote terminal tombstones"
+    );
+    Ok(expired.len())
 }
