@@ -16,6 +16,15 @@ use crate::log_synthesis::{
 use alloy::consensus::{TxEip1559, TxEnvelope};
 use alloy::primitives::{Address, Signature, TxHash, U256};
 
+// #156 orphan-recovery PG integration test imports.
+use crate::ger::insertGlobalExitRootCall;
+use alloy::consensus::{SignableTransaction, TxLegacy};
+use alloy::primitives::FixedBytes;
+use alloy::signers::SignerSync;
+use alloy::signers::local::PrivateKeySigner;
+use alloy_core::sol_types::SolCall;
+use std::sync::Arc;
+
 /// Helper: create a PgStore from DATABASE_URL or skip the test.
 async fn pg_store() -> Option<PgStore> {
     let url = match std::env::var("DATABASE_URL") {
@@ -2660,4 +2669,123 @@ async fn test_pgstore_claim_calldata_repair_backlog() {
         base,
         "a successful calldata commit clears the claim from the backlog"
     );
+}
+
+// ── #156 orphan recovery — PG integration ──────────────────────────────
+
+/// A GER-injection transaction really signed by `key` at `nonce`.
+fn signed_ger_tx_pg(
+    key: &PrivateKeySigner,
+    nonce: u64,
+    marker: u8,
+) -> (TxEnvelope, TxHash, Address) {
+    let input = insertGlobalExitRootCall {
+        root: FixedBytes::from([marker; 32]),
+    }
+    .abi_encode();
+    let txn = TxLegacy {
+        nonce,
+        input: input.into(),
+        chain_id: Some(1),
+        gas_price: 1,
+        ..Default::default()
+    };
+    let sig = key.sign_hash_sync(&txn.signature_hash()).unwrap();
+    let signed = txn.into_signed(sig);
+    let hash = *signed.hash();
+    (signed.into(), hash, key.address())
+}
+
+/// #156 test 6 — reproduce the exact durable signature (pending row + advanced
+/// nonce, no miden_tx_id, no submitted handoff) in PostgreSQL, then run the
+/// recovery loop over a fresh service state and prove the transaction self-heals
+/// (re-enqueued into the writer) WITHOUT any client activity, its nonce never
+/// advancing twice. Also verifies the store enumeration + durable backoff SQL.
+#[tokio::test]
+async fn test_pgstore_orphan_recovery_self_heals() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store: Arc<dyn Store> = Arc::new(store);
+    let key = PrivateKeySigner::random(); // unique keys keep this row isolated
+    let (env, hash, signer) = signed_ger_tx_pg(&key, 0, 0x5C);
+    let addr = format!("{signer:#x}");
+
+    // Durable admission with the writer job then lost: pending row + nonce CAS,
+    // no handoff, no miden_tx_id.
+    store
+        .txn_begin_if_absent(
+            hash,
+            TxnEntry {
+                id: None,
+                envelope: env,
+                signer,
+                expires_at: None,
+                logs: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(store.nonce_advance_cas(&addr, 0).await.unwrap());
+    assert_eq!(store.nonce_get(&addr).await.unwrap(), 1);
+
+    // Store enumeration reports it as a recoverable orphan (no handoff, attempts 0).
+    let mine = store
+        .recoverable_pending_txns(10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.tx_hash == hash)
+        .expect("orphan must be enumerated as recoverable");
+    assert_eq!(mine.nonce, 0);
+    assert!(mine.handoff.is_none() && mine.miden_tx_id.is_none());
+    assert_eq!(mine.recovery_attempts, 0);
+    assert!(mine.next_recovery_at.is_none());
+
+    // Durable backoff SQL round-trips and clears.
+    let n = store
+        .record_recovery_attempt(hash, 1_777_777_777)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    let after = store
+        .recoverable_pending_txns(10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.tx_hash == hash)
+        .unwrap();
+    assert_eq!(after.recovery_attempts, 1);
+    assert_eq!(after.next_recovery_at, Some(1_777_777_777));
+    store.clear_recovery_backoff(hash).await.unwrap();
+
+    // Fresh service state (writer empty — the orphan is in-flight nowhere) runs
+    // the recovery loop; the orphan must self-heal by re-enqueueing into the
+    // writer, with no client activity and no second nonce advance.
+    let mut service = crate::test_helpers::create_test_service_with_store(store.clone());
+    let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+        service.clone(),
+        64,
+        std::time::Duration::from_secs(60),
+    );
+    std::mem::forget(shutdown);
+    let handle = Arc::new(handle);
+    service.writer_handle = Some(handle.clone());
+
+    crate::orphan_recovery::recover_orphaned_pending_txns(&service)
+        .await
+        .unwrap();
+
+    assert!(
+        handle.is_inflight(&hash),
+        "the orphan must self-heal by re-enqueueing into the writer"
+    );
+    assert_eq!(
+        store.nonce_get(&addr).await.unwrap(),
+        1,
+        "recovery must not advance the nonce a second time"
+    );
+
+    // Clean up this row so a re-run starts fresh (shared DB).
+    let _ = store.txn_commit(hash, Ok(()), 1, [0u8; 32]).await;
 }

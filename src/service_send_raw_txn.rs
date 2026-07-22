@@ -614,6 +614,21 @@ async fn durably_admit_and_advance_nonce(
             );
         }
     }
+
+    // #156 fault-injection barrier (tests only). When AGGLAYER_FAULT_EXIT_AFTER_ADMIT
+    // is set, the process aborts HERE — after the pending row is durable and the
+    // nonce is advanced, but before the writer job is enqueued. That is exactly the
+    // acknowledged-but-orphaned state a crash produces, so the recovery e2e can
+    // reproduce it deterministically and prove self-healing on restart. Never set
+    // in production (the runbook/README document it as a test knob only).
+    if std::env::var("AGGLAYER_FAULT_EXIT_AFTER_ADMIT").is_ok_and(|v| v == "1") {
+        tracing::error!(
+            target: "fault_injection",
+            tx_hash = %txn_hash, nonce = tx_nonce, signer = %signer_str,
+            "AGGLAYER_FAULT_EXIT_AFTER_ADMIT: aborting after durable admission, before writer enqueue (test fault barrier)"
+        );
+        std::process::exit(70);
+    }
     Ok(())
 }
 
