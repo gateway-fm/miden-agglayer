@@ -6,7 +6,7 @@ listener configured by `--bind`/`--port` (default `0.0.0.0:8546`):
 | Route | Meaning |
 |---|---|
 | `POST /` | JSON-RPC |
-| `GET /health` | HTTP 200 while the background Miden client is alive; HTTP 503 after node connection loss |
+| `GET /health` | Readiness gate. HTTP 200 only when the Miden client is alive **and** no historical claim awaits calldata repair. HTTP 503 on node connection loss (`degraded`) **or** while `claims_awaiting_calldata > 0` (`recovering`, retained-PostgreSQL + reset-Miden-store recovery). Both 503 bodies include `claims_awaiting_calldata`; the `claim_calldata_repair_backlog` gauge tracks it. |
 | `GET /metrics` | Prometheus exposition from the process-wide recorder |
 
 All three routes share the per-IP rate limit. Scrape over the private service

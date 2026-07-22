@@ -148,7 +148,7 @@ to that topology while keeping port `8546` private.
 The same listener serves:
 
 - `POST /` — JSON-RPC
-- `GET /health` — background Miden-client liveness (`503` after node connection loss)
+- `GET /health` — readiness gate (`200` only when the Miden client is alive **and** no historical claim still awaits calldata repair). `503` on node connection loss (`status: degraded`) **or** while the claim-calldata repair backlog is non-zero (`status: recovering`, retained-PostgreSQL + reset-Miden-store recovery); both surface `claims_awaiting_calldata`. See `docs/operations/runbook.md`.
 - `GET /metrics` — Prometheus exposition
 
 All routes share the configured per-IP rate limit and 256 KiB request-body
