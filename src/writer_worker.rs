@@ -371,6 +371,15 @@ where
 
 // ─── Public handle ───────────────────────────────────────────────────────────
 
+/// Keep-alive for a [`WriterWorkerHandle::saturated_for_test`] handle. Holds the
+/// un-drained receiver (so the channel stays open) and the owned permit (so the
+/// sole slot stays reserved and `available_capacity()` stays 0).
+#[cfg(test)]
+pub struct SaturatedWriterGuard {
+    _rx: mpsc::Receiver<WriteJob>,
+    _permit: mpsc::OwnedPermit<WriteJob>,
+}
+
 /// Producer-side handle to the writer worker. Cloneable via `Arc` so every
 /// `ServiceState` clone shares the same channel + in-flight cache.
 pub struct WriterWorkerHandle {
@@ -423,6 +432,33 @@ impl WriterWorkerHandle {
     /// `agglayer_writer_queue_depth` gauge on each enqueue attempt.
     pub fn available_capacity(&self) -> usize {
         self.sender.capacity()
+    }
+
+    /// Build a handle whose write channel reports `available_capacity() == 0`
+    /// DETERMINISTICALLY, with no draining worker — the single buffer slot is held
+    /// by an owned permit. Used to test that future-nonce parking is independent of
+    /// writer saturation while a dispatchable tx is still backpressured (#146
+    /// finding 2). The returned guard MUST be held for the test's duration: it pins
+    /// the reservation (capacity stays 0) and keeps the channel open.
+    #[cfg(test)]
+    pub fn saturated_for_test() -> (Self, SaturatedWriterGuard) {
+        let (sender, rx) = mpsc::channel::<WriteJob>(1);
+        let permit = sender
+            .clone()
+            .try_reserve_owned()
+            .expect("the sole channel slot must be reservable");
+        let handle = Self {
+            sender,
+            inflight: Arc::new(DashMap::new()),
+            queue_depth: 1,
+        };
+        (
+            handle,
+            SaturatedWriterGuard {
+                _rx: rx,
+                _permit: permit,
+            },
+        )
     }
 
     /// RD-940 Phase 5 — total non-terminal in-flight count (Queued +
