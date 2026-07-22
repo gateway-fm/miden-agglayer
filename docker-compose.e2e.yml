@@ -338,17 +338,22 @@ services:
       agglayer-postgres:
         condition: service_healthy
     healthcheck:
+      # #148: gate on the READINESS endpoint, not a bare eth_chainId. /health returns 200
+      # only when the node is alive AND the historical claim-calldata repair backlog is 0;
+      # it returns 503 while degraded/recovering, and `curl -sf` fails on that 503. So
+      # `depends_on: service_healthy` now reflects the actual #148 readiness gate rather
+      # than mere RPC liveness. In steady state the backlog is 0, so /health is 200 as soon
+      # as the node finishes its initial sync.
       test: >-
-        curl -sf -X POST http://localhost:8546
-        -H "Content-Type: application/json"
-        -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+        curl -sf http://localhost:8546/health
       interval: 3s
       timeout: 2s
       retries: 30
-      # 180s (was 60s): on a busy host the proxy's --init account redeploy +
-      # external-prover handshake can push the first healthy check past 60s,
-      # which makes `docker compose up --wait` abort dependents prematurely.
-      start_period: 180s
+      # 240s: readiness (node-alive after initial sync + backlog drained) can take a touch
+      # longer than a bare RPC bind; with the --init account redeploy + external-prover
+      # handshake, give the first healthy check headroom so `up --wait` does not abort
+      # dependents prematurely.
+      start_period: 240s
 
   # ── Bridge Service ─────────────────────────────────────────────────────────
   bridge-service:

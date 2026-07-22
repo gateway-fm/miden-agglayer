@@ -1,0 +1,43 @@
+-- ============================================================================
+-- #148 — durable claim-calldata repair backlog (recovery readiness gate)
+-- ============================================================================
+--
+-- Readiness (`/health`) must return 503 until every HISTORICAL ClaimEvent
+-- whose `claimAsset` calldata envelope was lost (retained-Postgres +
+-- reset-Miden-store recovery) has been repaired by the genesis reconciler
+-- (`restore::persist_synthetic_claim_tx`). See `Store::
+-- count_claim_events_awaiting_calldata`.
+--
+-- WHY A DURABLE SET, NOT A PER-POLL SCAN (review blockers 1 + 2):
+--
+--   * Blocker 2 — the previous design ran, on EVERY readiness poll, a
+--     `SELECT DISTINCT ... FROM synthetic_logs LEFT JOIN transactions` that
+--     scans + deduplicates the entire historical claim-log set. This table
+--     turns `/health` into an O(1) `SELECT COUNT(*)` over a tiny set that is
+--     non-empty ONLY during an active recovery. The expensive scan runs ONCE,
+--     at startup, to seed the set (`seed_claim_calldata_repair_backlog`).
+--
+--   * Blocker 1 — the old scan counted a claim as repaired the instant ANY
+--     `transactions` row existed, so a `txn_begin` that never reached a
+--     successful `txn_commit` (crash / failed repair) was silently treated as
+--     done and readiness flipped to 200 with the calldata still empty. The set
+--     is DRAINED only inside a SUCCESSFUL `txn_commit` (same transaction as the
+--     status→'success' update), so an absent OR non-'success' calldata row
+--     keeps the claim counted.
+--
+-- SELF-HEALING: the startup seed both inserts still-unrepaired claim hashes
+-- and removes any row that now has a successful calldata `transactions` row.
+-- So even if a drain were ever missed (e.g. a crash between the status commit
+-- and… — it can't, the drain is in the same txn, but belt-and-braces), the
+-- next startup reconciles the set against ground truth. The set is a
+-- performance cache with an authoritative rebuild, never a source of divergence.
+--
+-- `tx_hash` is the ClaimEvent transaction hash in canonical lowercase `0x…`
+-- form (identical to `synthetic_logs.transaction_hash` and the `hash_str`
+-- used by `txn_commit`), so seed-INSERT and commit-DRAIN key on the same value.
+--
+-- Idempotent (`IF NOT EXISTS`); reversible by DROP TABLE (fully re-derivable
+-- from `synthetic_logs` + `transactions` on the next startup seed).
+CREATE TABLE IF NOT EXISTS claim_calldata_repair_pending (
+    tx_hash TEXT PRIMARY KEY
+);

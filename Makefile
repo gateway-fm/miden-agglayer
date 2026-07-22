@@ -295,6 +295,17 @@ e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay
 e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
 	$(COMPOSE_ENV) ./scripts/e2e-test.sh l2l2
 
+.PHONY: e2e-recovery-readiness
+e2e-recovery-readiness: e2e-l2l2-up ## #148: fresh stack -> land a claim -> run the DESTRUCTIVE recovery-readiness test 3x (retained-PG + reset-Miden-store). DEDICATED gate, NOT in e2e-test.sh all: it drops bridge_db + force-recreates aggkit, which would degrade later suite tiers.
+	# Land a real ClaimEvent (with calldata) for the recovery test to blank + repair.
+	$(COMPOSE_ENV) ./scripts/e2e-l1-to-l2.sh
+	# 3x proves the recovery is re-runnable (each run recovers the stack, no DB restore).
+	@for r in 1 2 3; do \
+		echo ">> #148 recovery-readiness round $$r/3"; \
+		$(COMPOSE_ENV) REQUIRE_RECOVERY_READINESS=1 ./scripts/e2e-recovery-readiness.sh || exit 1; \
+	done
+	@echo ">> #148 recovery-readiness 3x GREEN"
+
 .PHONY: e2e-l1-to-l2
 e2e-l1-to-l2: e2e-up ## Spin up stack + run L1→L2 deposit + claim test
 	$(COMPOSE_ENV) ./scripts/e2e-l1-to-l2.sh

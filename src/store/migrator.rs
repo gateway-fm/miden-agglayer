@@ -118,6 +118,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "018_claim_mint_expected.sql",
         include_str!("../../migrations/018_claim_mint_expected.sql"),
     ),
+    (
+        "019_claim_calldata_repair_pending.sql",
+        include_str!("../../migrations/019_claim_calldata_repair_pending.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

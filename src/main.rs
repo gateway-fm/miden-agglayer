@@ -777,6 +777,26 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("binding persisted L1 evidence to the configured policy")?;
 
+    // #148 — seed the durable claim-calldata repair backlog ONCE, here, before
+    // the readiness endpoint can serve. This is the only place the expensive
+    // historical claim-log scan runs; afterwards `/health` reads the resulting
+    // set with an O(1) COUNT (review blocker 2). It is > 0 only in the
+    // retained-Postgres + reset-Miden-store recovery, where ClaimEvent rows were
+    // kept but their calldata envelopes were lost; the genesis reconciler drains
+    // the set as it re-observes each historical CLAIM note and backfills calldata.
+    let repair_backlog = store
+        .seed_claim_calldata_repair_backlog()
+        .await
+        .context("seeding claim-calldata repair backlog for recovery readiness")?;
+    if repair_backlog > 0 {
+        tracing::warn!(
+            claims_awaiting_calldata = repair_backlog,
+            "recovery readiness gated: /health will report 503 until historical claim calldata is repaired"
+        );
+    } else {
+        tracing::info!("claim-calldata repair backlog empty — recovery readiness open");
+    }
+
     // Reset the persisted note-reconciler sweep cursor BEFORE the
     // SyntheticProjector is constructed (it loads the cursor in `new()`):
     //   * `--reset-miden-store` wiped the miden-client sqlite above — the

@@ -1480,25 +1480,44 @@ pub(crate) async fn persist_synthetic_claim_tx(
         .map_err(|e| anyhow::anyhow!("derived claim tx hash {tx_hash_str}: {e}"))?;
     // Idempotent AND crash-safe (review blocker 3): synthesis re-runs (restore replay,
     // projector re-observation) and the live backfill all funnel here.
-    //   * A fully-COMMITTED row (result present) → done, first writer won.
-    //   * A PENDING row (txn_begin ran, txn_commit did not — a crash BETWEEN them) must be
-    //     FINALIZED, not treated as complete: the old `is_some()` short-circuit stranded it
-    //     pending forever (no block/receipt), so every later backfill saw the row and
-    //     skipped. The envelope (with calldata) is already persisted, so we only need the
-    //     commit. txn_commit is idempotent on a re-run.
+    //   * A SUCCESSFULLY-committed row (`Some(Ok(_))`) → done, first writer won.
+    //   * A PENDING row (`None` result: txn_begin ran, txn_commit did not — a crash BETWEEN
+    //     them) OR a terminally-FAILED row (`Some(Err(_))`) must both be FINALIZED to
+    //     success, not treated as complete. (PR #151 blocker 1) The old guard was
+    //     `data.result.is_some()`, which matched `Some(Err(_))` too — so a failed repair
+    //     returned `Ok(true)` (marked resolved forever) while the durable-backlog drain
+    //     (in `txn_commit`) only fires on success, pinning `/health` at 503 FOREVER and
+    //     never retrying. This function is only reached for a note whose ClaimEvent EXISTS
+    //     (that is what the backfill repairs), and a ClaimEvent is emitted only when the
+    //     claim SUCCEEDED — so a `failed` status is stale ground-truth. The envelope (with
+    //     the reconstructed calldata) is already persisted, so re-commit with `Ok(())`:
+    //     idempotent, it finalizes the row to success AND atomically drains the backlog.
     match store.txn_get(tx_hash).await? {
-        Some(data) if data.result.is_some() => return Ok(true),
-        Some(_) => {
+        Some(data) if matches!(data.result, Some(Ok(_))) => return Ok(true),
+        Some(data) => {
+            let was_failed = matches!(data.result, Some(Err(_)));
             store
                 .txn_commit(tx_hash, Ok(()), block_number, block_hash)
                 .await?;
-            ::metrics::counter!("synthetic_claim_calldata_finalized_pending_total").increment(1);
-            tracing::info!(
-                note_id = %note_id_str,
-                tx_hash = %tx_hash_str,
-                "synthesized claim: finalized a PENDING calldata row (crash between begin and \
-                 commit) rather than stranding it"
-            );
+            if was_failed {
+                ::metrics::counter!("synthetic_claim_calldata_healed_failed_total").increment(1);
+                tracing::info!(
+                    note_id = %note_id_str,
+                    tx_hash = %tx_hash_str,
+                    "synthesized claim: HEALED a terminally-failed calldata row (its ClaimEvent \
+                     exists, so the claim succeeded) — re-committed to success + drained the \
+                     repair backlog rather than pinning /health at 503 forever"
+                );
+            } else {
+                ::metrics::counter!("synthetic_claim_calldata_finalized_pending_total")
+                    .increment(1);
+                tracing::info!(
+                    note_id = %note_id_str,
+                    tx_hash = %tx_hash_str,
+                    "synthesized claim: finalized a PENDING calldata row (crash between begin and \
+                     commit) rather than stranding it"
+                );
+            }
             return Ok(true);
         }
         None => {}
@@ -4182,6 +4201,73 @@ mod tests {
         use alloy::consensus::Transaction;
         let decoded = crate::claim::claimAssetCall::abi_decode(data.envelope.input()).unwrap();
         assert!(decoded.metadata.is_empty());
+    }
+
+    /// PR #151 blocker 1: a terminally-FAILED calldata row (`Some(Err(_))`) whose ClaimEvent
+    /// exists (so the claim succeeded — the failed status is stale) must be HEALED to success,
+    /// not treated as complete-but-stuck. The old `data.result.is_some()` guard returned
+    /// `Ok(true)` for `Some(Err(_))` and left the row failed, so the durable repair backlog
+    /// (drained only on a successful `txn_commit`) pinned `/health` at 503 forever.
+    #[tokio::test]
+    async fn persist_synthetic_claim_tx_heals_terminally_failed_row() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let storage = full_claim_fixture(&[]);
+        let derived = derive_manual_claim_tx_hash("failed-claim");
+        let tx_hash: alloy::primitives::TxHash = derived.parse().unwrap();
+        // Build a terminally-FAILED row: reconstruct the real envelope, then commit it with
+        // Err (a prior failed repair / failed on-chain result).
+        let (envelope, bridge_addr, _) =
+            build_synthetic_claim_envelope(&store, &storage, "failed-claim", tx_hash)
+                .await
+                .unwrap()
+                .unwrap();
+        store
+            .txn_begin(
+                tx_hash,
+                crate::store::TxnEntry {
+                    id: None,
+                    envelope,
+                    signer: bridge_addr,
+                    expires_at: None,
+                    logs: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .txn_commit(
+                tx_hash,
+                Err("prior repair failed".to_string()),
+                5,
+                [0u8; 32],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                store.txn_get(tx_hash).await.unwrap().unwrap().result,
+                Some(Err(_))
+            ),
+            "precondition: the row is terminally failed"
+        );
+        // Heal — the ClaimEvent exists, so the failed status is stale ground-truth.
+        let healed =
+            persist_synthetic_claim_tx(&store, &storage, "failed-claim", &derived, 5, [0u8; 32])
+                .await
+                .unwrap();
+        assert!(
+            healed,
+            "a failed row whose event exists must heal to resolved"
+        );
+        // Postcondition: the row is now SUCCESS, so the /health repair backlog drains rather
+        // than pinning at 503 forever.
+        assert!(
+            matches!(
+                store.txn_get(tx_hash).await.unwrap().unwrap().result,
+                Some(Ok(_))
+            ),
+            "healed row must be committed to success so the repair backlog drains"
+        );
     }
 
     /// Unrecoverable metadata (non-empty hash, no registry preimage hashing to it): the

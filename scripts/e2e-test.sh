@@ -88,6 +88,17 @@ case "$test_filter" in
             DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
             echo ""
             DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
+            echo ""
+            # #148 recovery-readiness is DELIBERATELY NOT run inside `all`. It is genuinely
+            # DESTRUCTIVE — it stops the proxy, resets the Miden store, drops bridge_db, and
+            # --force-recreates aggkit (fresh BridgeL2Sync cursor), leaving bridge-service +
+            # aggkit re-syncing. Its own assertions pass, but the follow-on cantina13 tier
+            # then cannot get a fresh deposit to ready_for_claim on the still-resyncing
+            # consumers. And it CANNOT be reordered after cantina13 either — cantina13's
+            # poison leaf fail-closed halts the reconcile re-sweep recovery depends on. So it
+            # must run ISOLATED: the dedicated #148 gate runs e2e-recovery-readiness.sh 3x on
+            # its own fresh stack (REQUIRE_RECOVERY_READINESS=1). (It used to run here only
+            # because it failed fast at step 1 and never reached its destructive step 4.)
             # #149 restore acceptance (native custom-name row + net-2 row survive
             # --restore with byte-identical preimages + full identity) is asserted by
             # cantina13 below, which reuses the WMDN name!=symbol native row created by

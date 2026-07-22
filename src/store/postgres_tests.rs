@@ -2582,3 +2582,82 @@ async fn cantina136_derived_hash_survives_pg_round_trip() {
     // The calldata is also intact (the e2e asserts .input; this pins .hash too).
     assert_eq!(json["input"].as_str().unwrap().to_lowercase(), "0xdeadbeef");
 }
+
+/// #148 — the PgStore durable claim-calldata repair backlog (migration 019).
+/// Twin of the memory `count_claim_events_awaiting_calldata_gates_recovery`:
+///   * seed classifies a ClaimEvent with no successful calldata as awaiting,
+///   * a bare `txn_begin` (crash before a successful commit) stays counted (B1),
+///   * only a successful `txn_commit` drains it,
+///   * `count` reads the tiny set, not the historical-log join (B2).
+/// Delta-based (the DB is shared across pgstore tests) with a unique tx_hash.
+#[tokio::test]
+async fn test_pgstore_claim_calldata_repair_backlog() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    reset_state(&store).await;
+
+    // Unique claim tx_hash so this test is isolated from other pgstore tests'
+    // rows on the shared database.
+    let tx_hash = TxHash::from([0x48u8; 32]);
+    let tx_hash_str = format!("{tx_hash:#x}");
+
+    let base = store.seed_claim_calldata_repair_backlog().await.unwrap();
+
+    // A ClaimEvent whose calldata envelope is MISSING → +1 after seed.
+    store
+        .add_claim_event(
+            "0xbridge",
+            10,
+            [0u8; 32],
+            &tx_hash_str,
+            &[0u8; 32],
+            1,
+            &[0u8; 20],
+            &[0u8; 20],
+            100,
+        )
+        .await
+        .unwrap();
+    let after_add = store.seed_claim_calldata_repair_backlog().await.unwrap();
+    assert_eq!(
+        after_add,
+        base + 1,
+        "seed classifies the missing-calldata claim as awaiting"
+    );
+
+    // B1 — a bare `txn_begin` (no successful commit) must NOT drain the backlog.
+    let entry = TxnEntry {
+        id: None,
+        envelope: TxEnvelope::Eip1559(alloy::consensus::Signed::new_unchecked(
+            TxEip1559::default(),
+            Signature::test_signature(),
+            tx_hash,
+        )),
+        signer: Address::ZERO,
+        expires_at: None,
+        logs: vec![],
+    };
+    store.txn_begin(tx_hash, entry).await.unwrap();
+    assert_eq!(
+        store.count_claim_events_awaiting_calldata().await.unwrap(),
+        after_add,
+        "txn_begin alone does not repair the claim — stays counted (blocker 1)"
+    );
+    assert_eq!(
+        store.seed_claim_calldata_repair_backlog().await.unwrap(),
+        after_add,
+        "re-seed still classifies a begun-but-uncommitted claim as awaiting (blocker 1)"
+    );
+
+    // A SUCCESSFUL commit drains exactly this claim (delta back to base).
+    store
+        .txn_commit(tx_hash, Ok(()), 11, [0u8; 32])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_claim_events_awaiting_calldata().await.unwrap(),
+        base,
+        "a successful calldata commit clears the claim from the backlog"
+    );
+}

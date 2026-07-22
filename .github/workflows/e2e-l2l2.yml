@@ -111,6 +111,17 @@ jobs:
       - name: Run L2<->L2 group (both directions) + evidence
         run: make e2e-l2l2
 
+      # #148 recovery-readiness (retained-PG + reset-Miden-store). DESTRUCTIVE — it
+      # drops bridge_db + force-recreates aggkit, so it runs LAST, on the same stack,
+      # reusing a ClaimEvent the L2<->L2 group just landed. NOT part of `e2e-test.sh all`
+      # for that reason; this is the dedicated invocation (also `make e2e-recovery-readiness`).
+      - name: Run #148 recovery-readiness (retained-PG + reset-Miden-store) 3x
+        run: |
+          for r in 1 2 3; do
+            echo ">> #148 recovery-readiness round $r/3"
+            REQUIRE_RECOVERY_READINESS=1 ./scripts/e2e-recovery-readiness.sh || exit 1
+          done
+
       # Always upload the audit trail — even on failure, for forensics.
       - name: Upload evidence NDJSON
         if: ${{ always() }}

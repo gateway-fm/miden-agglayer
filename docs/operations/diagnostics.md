@@ -61,9 +61,14 @@ curl -fsS -X POST "$PROXY_RPC" \
 curl -fsS "$PROXY_RPC/metrics" > /tmp/miden-agglayer.metrics
 ```
 
-`/health` is not a deep bridge check. HTTP 200 means the background Miden
-client is alive; HTTP 503 reports `node connection lost`. A healthy endpoint
-does not prove projector completeness, GER indexing, or end-to-end settlement.
+`/health` is a readiness gate, not a deep bridge check. HTTP 200 means the
+background Miden client is alive **and** no historical claim still awaits
+calldata repair. HTTP 503 is returned on node connection loss
+(`status: degraded`, `reason: node connection lost`) **or** while the
+claim-calldata repair backlog is non-zero (`status: recovering`, retained-
+PostgreSQL + reset-Miden-store recovery — see `runbook.md`); both 503 bodies
+carry `claims_awaiting_calldata`. A 200 does not prove projector completeness,
+GER indexing, or end-to-end settlement.
 
 Repeat `eth_blockNumber` after Miden has produced blocks. A flat tip while the
 authoritative Miden chain advances is an incident even if `/health` is 200.

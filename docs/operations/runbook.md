@@ -280,6 +280,38 @@ sweep.
 Never substitute `--init` for recovery: it creates new account identities and
 can strand control/balances associated with the old ones.
 
+### Retained PostgreSQL + reset Miden store — a SUPPORTED mode, readiness-gated
+
+Resetting the Miden store while **retaining** the synthetic Postgres is a
+supported recovery mode (issue #148). In it, a processed claim and its synthetic
+`ClaimEvent` survive in Postgres, but the claim's stored `claimAsset` calldata
+envelope may be absent; the reset forces the genesis reconciler to re-observe
+each historical CLAIM note and **backfill** its calldata
+(`persist_synthetic_claim_tx`). Until that repair completes,
+`eth_getTransactionByHash` would serve the claim with **empty input**, and
+aggkit's bridgesync full-claim parser stalls on it.
+
+**The service gates readiness on the repair.** While any ClaimEvent still lacks
+its persisted calldata, `GET /health` returns **503** with
+`{"status":"recovering","claims_awaiting_calldata":N}`; it flips to **200** only
+once `N` reaches zero (every historical claim's calldata is re-persisted) and the
+node connection is alive. The `claim_calldata_repair_backlog` gauge tracks `N`.
+In steady-state operation this backlog is always zero (a claim's envelope is
+admitted before its ClaimEvent is emitted), so `/health` is unaffected outside
+recovery.
+
+**Operator expectation:** do NOT release consumers — bridge-service / aggkit
+bridgesync — until `/health` reports ready (200). Keep bridge-service stopped (or
+un-pointed) through the recovering window; releasing it early exposes it to the
+empty-input claim and stalls its sync. Once ready, resync the bridge-service
+alongside the reset proxy (its cached sponsor nonce must be re-fetched against the
+reset-to-0 proxy — see finding #65) and the recovered claim settles normally. A
+persistently nonzero `claims_awaiting_calldata` means a claim's calldata is
+genuinely unrecoverable (its metadata preimage is lost — see
+`synthetic_claim_calldata_unrecoverable_total` and the mismatched-registry-row
+procedure below); resolve that before releasing consumers rather than forcing
+readiness.
+
 ### Detecting + remediating a mismatched native-faucet registry row
 
 `admin_registerNativeFaucet` now validates caller-supplied metadata against the
