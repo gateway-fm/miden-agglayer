@@ -53,6 +53,16 @@ L2B_NETWORK_ID=2
 MIDEN_NETWORK_ID=1
 BRIDGE_ADDRESS="${BRIDGE_ADDRESS:-$BRIDGE}"             # L1 bridge (== BRIDGE proxy addr)
 
+# #77: L2B's OWN gas token (deployed on L1 by setup-l2b.sh; its gasTokenMetadata is
+# stamped into the bridge at genesis). e2e-l2l2-forward's native leg (RUN_L2B_NATIVE_ETH=1)
+# bridges this gas token to Miden and asserts its symbol/decimals resolve on a fresh wallet.
+_L2B_GAS_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/fixtures/l2b/gas_token.env"
+# shellcheck disable=SC1090
+[ -f "$_L2B_GAS_ENV" ] && . "$_L2B_GAS_ENV"
+L2B_GAS_TOKEN_ADDR="${L2B_GAS_TOKEN_ADDR:-0x28D24f2e8CF975a4c385e8f10305061Fb73df388}"
+L2B_GAS_SYMBOL="${L2B_GAS_SYMBOL:-L2BGAS}"
+L2B_GAS_DECIMALS="${L2B_GAS_DECIMALS:-18}"
+
 # TEST-ONLY keys (kurtosis-cdk standard)
 ADMIN=0xE34aaF64b29273B7D567FCFc40544c014EEe9970
 ADMIN_KEY=0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625
@@ -266,6 +276,99 @@ print('['+','.join(p[:32])+']')" 2>/dev/null || true)
         sleep "$interval"
     done
     return 1
+}
+
+# _submit_seed_claim <cnt> <gi> <gas_token> <amount_wei> <metadata>
+# Client-submit the L1->L2B gas-token claim ON L2B: fetch the deposit's proof (net_id=0,
+# L1 source) from the L2B bridge-service and submit claimAsset to the REAL anvil-l2b
+# bridge (a real EVM chain -> EIP-1559 fine, no --legacy). The served proof + its L2B-GER
+# injection LAG the deposit turning ready, so each attempt RE-FETCHES a fresh proof; cast
+# send gas-estimates first, so a not-yet-settleable claim reverts fast without submitting
+# -> retry until the covering GER is injected on L2B. Returns 0 only on a status==0x1 tx.
+_submit_seed_claim() {
+    local cnt="$1" gi="$2" gas="$3" amt="$4" meta="$5"
+    local tries="${SEED_CLAIM_TRIES:-45}" interval="${SEED_CLAIM_INTERVAL:-10}"
+    local attempt pj mer rer smtL smtR out st
+    for attempt in $(seq 1 "$tries"); do
+        pj=$(curl -sf "$L2B_BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=0" 2>/dev/null || true)
+        if [[ -n "$pj" ]]; then
+            mer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])" 2>/dev/null || true)
+            rer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])" 2>/dev/null || true)
+            smtL=$(echo "$pj" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+            smtR=$(echo "$pj" | python3 -c "
+import json,sys
+p=json.load(sys.stdin)['proof']['rollup_merkle_proof']
+while len(p)<32:p.append('0x'+'00'*32)
+print('['+','.join(p[:32])+']')" 2>/dev/null || true)
+            if [[ -n "$mer" && -n "$smtL" && -n "$smtR" ]]; then
+                out=$(cast send --rpc-url "$L2B_RPC" --private-key "$ADMIN_KEY" --json "$BRIDGE" \
+                    'claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)' \
+                    "$smtL" "$smtR" "$gi" "$mer" "$rer" 0 "$gas" "$L2B_NETWORK_ID" "$ADMIN" "$amt" "$meta" 2>/dev/null || true)
+                st=$(echo "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); print('1' if str(d.get('status','')) in ('0x1','1','true') else '')" 2>/dev/null || true)
+                [[ -n "$st" ]] && return 0
+            fi
+        fi
+        # The L1->L2B claim needs L2B to have INJECTED the covering (combined) L1 GER.
+        # aggoracle-l2b injects infrequently on a quiet stack (~1 per several min), so a
+        # passive retry can time out (observed intermittently, e.g. gate round 2). A nudge
+        # settles an L2B cert -> updates the L1 rollup exit root -> fresh combined L1 GER
+        # -> aggoracle injects it (covering this deposit). Best-effort every 3rd attempt
+        # (subshell contains nudge_cert's fail-exit; never aborts the seed on a nudge hiccup).
+        if [[ -n "${NDG:-}" && $(( attempt % 3 )) -eq 0 ]]; then
+            ( nudge_cert ) >/dev/null 2>&1 || true
+        fi
+        sleep "$interval"
+    done
+    return 1
+}
+
+# seed_l2b_gastoken_lbt <amount_wei>
+# #77 / LocalBalanceTreeUnderflow (custom error 0x14603c01): the L2B sovereign bridge
+# only lets an origin token be bridged OUT up to what was bridged IN (its Local Balance
+# Tree balance). The chain's GENESIS-minted native gas balance is NOT LBT-backed, so
+# bridging the native gas token OUT reverts with LocalBalanceTreeUnderflow(originNet,
+# gasTokenAddress, amount, currentBalance=0). This seeds LBT(0, gasTokenAddress): bridge
+# the gas token L1->L2B (from its deployer, who holds the whole L1 supply) and claim it
+# on L2B — the sovereign bridge pays the recipient native gas token from its ~2^128
+# reserve AND credits the LBT, so a later bridge-OUT of <= <amount> succeeds. Fails LOUD
+# at every step; the seed is PROVEN by ADMIN's L2B native balance rising by ~amount.
+seed_l2b_gastoken_lbt() {
+    local amount="$1"
+    local gas="${L2B_GAS_TOKEN_ADDR:?seed_l2b_gastoken_lbt: L2B_GAS_TOKEN_ADDR unset (setup-l2b.sh must deploy the L1 gas token)}"
+    local dkey="${GAS_TOKEN_DEPLOYER_KEY:-0x7777777777777777777777777777777777777777777777777777777777777777}"
+    local gas_hex; gas_hex="$(echo "${gas#0x}" | tr 'A-F' 'a-f')"      # no 0x (for messages)
+    local gas_lower; gas_lower="$(echo "$gas" | tr 'A-F' 'a-f')"        # WITH 0x — find_deposit exact-compares orig_addr
+    local before after dep cnt gi meta
+    before=$(cast balance "$ADMIN" --rpc-url "$L2B_RPC" 2>/dev/null || echo 0)
+    # 1) L1: approve + bridgeAsset the gas token L1->L2B (destNet=2, dest=ADMIN).
+    cast send "$gas" 'approve(address,uint256)' "$BRIDGE" "$amount" \
+        --private-key "$dkey" --rpc-url "$L1_RPC" >/dev/null 2>&1 \
+        || fail "#77 seed LBT: L1 approve of gas token ($gas) failed"
+    cast send "$BRIDGE" 'bridgeAsset(uint32,address,uint256,address,bool,bytes)' \
+        "$L2B_NETWORK_ID" "$ADMIN" "$amount" "$gas" true 0x \
+        --private-key "$dkey" --rpc-url "$L1_RPC" >/dev/null 2>&1 \
+        || fail "#77 seed LBT: L1->L2B gas-token bridgeAsset failed (deployer=$dkey amount=$amount)"
+    # 2) wait for the L2B service to index the L1-origin (network_id=0) deposit. The
+    #    deposit's orig_addr is the gas token WITH 0x — pass gas_lower, not gas_hex.
+    wait_for "#77 seed LBT: L1->L2B gas-token deposit indexed on L2B service" 180 5 \
+        _pred_deposit_indexed "$ADMIN" 0 "$gas_lower" "$L2B_BRIDGE_SERVICE_URL"
+    dep=$(find_deposit "$ADMIN" 0 "$gas_lower" "$L2B_BRIDGE_SERVICE_URL")
+    [[ -n "$dep" ]] || fail "#77 seed LBT: L1->L2B gas-token deposit never indexed (dest=$ADMIN net=0 addr=$gas_lower)"
+    cnt=$(dep_field "$dep" deposit_cnt); gi=$(dep_field "$dep" global_index)
+    meta=$(echo "$dep" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata') or '0x'; print(m if m else '0x')")
+    # 3) claim on L2B (proof net_id=0) -> credits LBT(0,gas) + mints native to ADMIN.
+    _submit_seed_claim "$cnt" "$gi" "$gas" "$amount" "$meta" \
+        || fail "#77 seed LBT: L2B claim of the L1->L2B gas-token deposit never settled (cnt=$cnt gi=$gi)"
+    # 4) prove the seed took: ADMIN's L2B native balance rose by >= amount/2 (allowing the
+    #    tiny claim gas cost). NEVER a bare 'nonempty' pass — the delta must cover the seed.
+    after=$(cast balance "$ADMIN" --rpc-url "$L2B_RPC" 2>/dev/null || echo 0)
+    python3 -c "import sys; sys.exit(0 if (int('$after')-int('$before')) >= int('$amount')//2 else 1)" \
+        || fail "#77 seed LBT: ADMIN L2B native balance did not rise (before=$before after=$after amount=$amount) — the L2B claim did not seed LBT(0,$gas_hex)"
+    log "  #77 LBT seeded (net=0, $gas): bridged+claimed $amount L1->L2B (ADMIN native $before -> $after)"
 }
 
 # wait_wrapped_mint <orig_net> <orig_addr> <holder> <want_amt> <rpc> [timeout_s]

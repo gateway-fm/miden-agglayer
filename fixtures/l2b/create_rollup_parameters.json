@@ -13,7 +13,7 @@
     "trustedSequencer": "0x5b06837A43bdC3dD9F114558DAf4B26ed49842Ed",
     "chainID": 31338,
     "rollupAdminAddress": "0xE34aaF64b29273B7D567FCFc40544c014EEe9970",
-    "gasTokenAddress": "0x0000000000000000000000000000000000000000",
+    "gasTokenAddress": "0x28D24f2e8CF975a4c385e8f10305061Fb73df388",
     "deployerPvtKey": "0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625",
     "aggchainManagerPvtKey": "0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625",
     "maxFeePerGas": "",
@@ -56,7 +56,12 @@
         "initAggchainVKeySelector": "0x00000000",
         "vKeyManager": "0xE34aaF64b29273B7D567FCFc40544c014EEe9970",
         "useDefaultSigners": false,
-        "signers": [["0x5b06837A43bdC3dD9F114558DAf4B26ed49842Ed", " "]],
+        "signers": [
+            [
+                "0x5b06837A43bdC3dD9F114558DAf4B26ed49842Ed",
+                " "
+            ]
+        ],
         "threshold": 1
     }
 }
