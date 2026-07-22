@@ -71,6 +71,11 @@ evidence_tx "leg1" forward L2B deploy "$L2B_RPC" "$OPT0_DEPLOY_TX" "$OPT0" \
 l2l2_deploy_nudge_token
 evidence_tx "leg1" forward L2B deploy "$L2B_RPC" "$NDG_DEPLOY_TX" "$NDG" "token=NDG role=cert-nudge"
 
+# #147/PR#152: snapshot the wallet's held faucets BEFORE the forward claim delivers OPT0,
+# so leg 2b can DERIVE the received faucet from the vault delta (OPT0 is deterministic
+# across rounds, so the wallet accumulates it — a delta, not an absolute, is required).
+RECV_BEFORE="$(iso_wallet_faucets)"
+
 # ── Leg 2: forward bridgeAsset(destNet=1) + GER propagation ──────────────────
 step "Leg 2: bridgeAsset(destNet=$MIDEN_NETWORK_ID, $FWD_AMOUNT_WEI OPT0 wei) on L2B"
 L2B_BAL_BEFORE_FORWARD=$(cast call "$OPT0" 'balanceOf(address)(uint256)' "$ADMIN" --rpc-url "$L2B_RPC" | awk '{print $1}')
@@ -193,7 +198,9 @@ pass "wrapped OPT0 credited: $BALANCE Miden units"
 # creates the faucet symbol via faucet_ops::sanitise_token_symbol (Miden TokenSymbol
 # keeps only A-Z), so the on-chain OPT0 symbol resolves to "OPT" (the digit is stripped)
 # with decimals min(18,8)=8; identity is exact (origin_network=$L2B_NETWORK_ID, OPT0).
-assert_faucet_symbol "$OPT0_FAUCET_ID" "OPT" "8" "L2B OPT0 ERC-20 (origin net=$L2B_NETWORK_ID, addr=$OPT0)"
+# PR#152: DERIVE the received faucet from the wallet's vault delta, assert it == OPT0's
+# discovered faucet id and resolves OPT/8 on a cold wallet (retained OPT0 can't false-pass).
+assert_received_faucet "$RECV_BEFORE" "$OPT0_FAUCET_ID" "OPT" "8" "$FWD_MIDEN_UNITS" "L2B OPT0 ERC-20 (origin net=$L2B_NETWORK_ID, addr=$OPT0)"
 
 # (c) ClaimEvent row exists for this deposit's global index.
 CLAIM_ROWS=$(claim_event_rows "$FWD_GI")
@@ -213,7 +220,7 @@ evidence_exit_root "leg2b" forward post-forward-claim
 # a fresh wallet AND is a DISTINCT faucet from the L1 native-ETH faucet: (0,0x0) and
 # ($L2B_NETWORK_ID,0x0) are different origins even though both display ETH.
 #
-# ENV-GATED (RUN_L2B_NATIVE_ETH=1, default OFF). #77 root cause (was mis-attributed
+# ENV-GATED (RUN_L2B_NATIVE_ETH=1, default OFF). #77 root cause (was misattributed
 # to gasTokenAddress=0x0): with a CUSTOM gas token configured (setup-l2b.sh deploys
 # L2BGAS on L1 + sets it as the L2B bridge gasTokenAddress, WETH auto-deployed),
 # `bridgeAsset(destNet, address(0), amount, --value=amount)` STILL reverts — with
@@ -233,6 +240,9 @@ evidence_exit_root "leg2b" forward post-forward-claim
 # fail LOUD with this context, never a cryptic "bridgeAsset failed" or a false PASS.
 if [[ "${RUN_L2B_NATIVE_ETH:-0}" == "1" ]]; then
     step "#147 Leg 3: bridge native ETH L2B -> Miden + assert ETH/8, distinct from L1 ETH faucet"
+    # #147/PR#152: snapshot held faucets BEFORE the gas-token claim, to DERIVE the received
+    # gas-token faucet from the wallet's vault delta.
+    RECV_BEFORE_GAS="$(iso_wallet_faucets)"
     ZERO_ADDR="0x0000000000000000000000000000000000000000"
     ETH_WEI="${L2B_ETH_WEI:-1000000000000000}"   # 0.001 ETH
     # ── #77 model: L2B is a CUSTOM-GAS-TOKEN sovereign chain. Bridging its NATIVE
@@ -311,7 +321,7 @@ except Exception:
     GAS_AMT=$(dep_field "$GAS_DEP" amount)
     GAS_META=$(echo "$GAS_DEP" | python3 -c "import json,sys; m=json.load(sys.stdin).get('metadata','0x'); print(m if m and m!='0x' else '0x')")
     log "#147/leg3: deposit metadata (gasTokenMetadata carried in the leaf) = $GAS_META"
-    # HEADLINE edge (#147 raison d'être): a gas token that ships EMPTY on-chain
+    # HEADLINE edge (#147 core purpose): a gas token that ships EMPTY on-chain
     # metadata is exactly the wallet-'Unknown' failure mode — fail LOUD, don't skip.
     [[ "$GAS_META" != "0x" ]] \
         || fail "#147/leg3: L2B gas token has EMPTY on-chain gasTokenMetadata — a fresh wallet resolves it as 'Unknown'. Set gasTokenMetadata (name/symbol/decimals) at chain init so the symbol propagates."
@@ -331,10 +341,10 @@ except Exception:
     # A-Z only, so digits/punctuation are dropped) + min(decimals,8) — NOT 'Unknown'.
     # assert_faucet_symbol prints faucet_id + fetched symbol/decimals on pass AND fail.
     log "#147/leg3: gas-token symbol propagation — origin (net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX), faucet=$GAS_FID, origin symbol='$GAS_ORIGIN_SYMBOL' -> Miden display symbol='$GAS_MIDEN_SYMBOL' decimals=$GAS_EXPECT_DECIMALS (origin $GAS_ORIGIN_DECIMALS capped)"
-    # Received-asset linkage (PR #152): the wallet must actually hold the bridged units of
-    # this gas-token faucet (consumed its P2ID note) AND that faucet resolves the sanitised
-    # symbol — not just a registry row. Mirrors leg 2b's balance+symbol check for OPT0.
-    assert_received_faucet "$BRIDGE_ID" "$GAS_FID" "$GAS_MIDEN_SYMBOL" "$GAS_EXPECT_DECIMALS" "$ETH_MIDEN_UNITS" "L2B gas token (origin net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX)"
+    # Received-asset linkage (PR #152): DERIVE the received gas-token faucet from the wallet's
+    # vault delta (not GAS_FID from Postgres), assert it == GAS_FID and resolves the sanitised
+    # symbol on a cold wallet. Mirrors the three enabled rows' derived-id linkage.
+    assert_received_faucet "$RECV_BEFORE_GAS" "$GAS_FID" "$GAS_MIDEN_SYMBOL" "$GAS_EXPECT_DECIMALS" "$ETH_MIDEN_UNITS" "L2B gas token (origin net=$GAS_ORIGIN_NET, addr=0x$GAS_ADDR_HEX)"
     # Cross-check the store row: symbol column = SANITISED display symbol, origin_decimals
     # = origin (18), miden_decimals = cap (8). Constrained to origin_network=$GAS_ORIGIN_NET.
     GAS_ROW=$(pgq "SELECT symbol||'|'||origin_decimals||'|'||miden_decimals FROM faucet_registry WHERE encode(origin_address,'hex')='$GAS_ADDR_HEX' AND origin_network=${GAS_ORIGIN_NET};")

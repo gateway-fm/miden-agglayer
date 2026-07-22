@@ -136,6 +136,9 @@ log "Amount:  $DEPOSIT_AMOUNT wei (expect $EXPECTED_L2_BALANCE Miden units)"
 BAL_BEFORE=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
 BAL_BEFORE="${BAL_BEFORE:-0}"
 log "L2 balance before deposit: $BAL_BEFORE"
+# #147/PR#152: snapshot the wallet's held faucets BEFORE the deposit so the received
+# asset can later be DERIVED from the vault delta (not a config-sourced id).
+RECV_BEFORE="$(iso_wallet_faucets)"
 
 # ── Step 1: Deposit on L1 ────────────────────────────────────────────────────
 log "Step 1/5: Depositing on L1..."
@@ -209,8 +212,11 @@ fi
 # resolves its display symbol/decimals from the public faucet ACCOUNT (not a
 # preloaded map / admin_listFaucets). This is the canonical seeded L1 ETH faucet,
 # keyed (origin_network=0, origin_address=0x0). A None/RPC-fail/Unknown fails.
-log "Step 6/6 (#147): a fresh client resolves the received ETH faucet's symbol/decimals"
-assert_faucet_symbol "$FAUCET_ID" "ETH" "8" "L1 native ETH (origin net=0, addr=0x0)"
+log "Step 6/6 (#147): DERIVE the received faucet from the wallet's vault delta, then resolve its symbol"
+# PR#152: the symbol assertion runs on the faucet DERIVED from the asset the wallet actually
+# received (vault before/after delta), not the config-sourced FAUCET_ID — and it must equal
+# that expected origin faucet. A retained balance cannot false-pass (delta, not absolute).
+assert_received_faucet "$RECV_BEFORE" "$FAUCET_ID" "ETH" "8" "$EXPECTED_L2_BALANCE" "L1 native ETH (origin net=0, addr=0x0)"
 
 echo ""
 log "======================================================================"

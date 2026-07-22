@@ -221,6 +221,16 @@ struct Args {
     /// silent empty symbol. Requires only --store-dir + --node-url.
     #[arg(long)]
     inspect_faucet: Option<String>,
+
+    /// Received-asset linkage mode (#147 / PR#152). Enumerate the fungible faucets the
+    /// RECEIVING wallet (--wallet-id) actually holds, derived from its ON-CHAIN vault
+    /// after syncing + consuming any pending P2ID notes — so the e2e can identify the
+    /// faucet of the asset it TRULY received via a before/after vault delta, instead of
+    /// trusting a caller-supplied known id. Prints one parseable line per held faucet:
+    /// `wallet-faucet: faucet_id=<hex> amount=<n>`, then `wallet-faucet: done`. Requires
+    /// an existing --store-dir + --node-url + --wallet-id.
+    #[arg(long)]
+    list_wallet_faucets: bool,
 }
 
 impl std::fmt::Debug for Args {
@@ -323,6 +333,84 @@ async fn sync_with_retry(
              ({stalled}/{MAX_STALLED} without progress), retrying in {RETRY_DELAY_SECS}s: {err:?}"
         );
         tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+    }
+}
+
+/// Sync-then-consume any consumable P2ID notes for `wallet_id`, so the wallet's vault
+/// reflects everything it has RECEIVED. Best-effort + non-fatal (a note that fails to
+/// convert/consume is logged, not fatal — mirrors the bridge-out balance path). Shared
+/// by the bridge-out flow and the `--list-wallet-faucets` received-asset-linkage mode.
+async fn consume_pending_notes(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    wallet_id: AccountId,
+) {
+    use miden_client::store::NoteFilter;
+    let expected = client
+        .get_input_notes(NoteFilter::Expected)
+        .await
+        .unwrap_or_default();
+    let committed = client
+        .get_input_notes(NoteFilter::Committed)
+        .await
+        .unwrap_or_default();
+    println!(
+        "[consume] notes: {} expected, {} committed",
+        expected.len(),
+        committed.len()
+    );
+    let consumable = client
+        .get_consumable_notes(Some(wallet_id))
+        .await
+        .unwrap_or_default();
+    if consumable.is_empty() {
+        return;
+    }
+    println!("[consume] consuming {} notes...", consumable.len());
+    let notes: Vec<miden_protocol::note::Note> = consumable
+        .into_iter()
+        .filter_map(|(rec, _)| match rec.try_into() {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!(
+                    "[consume] SKIPPING unconvertible note record (was silently dropped pre-#128): {e:?}"
+                );
+                None
+            }
+        })
+        .collect();
+    if notes.is_empty() {
+        return;
+    }
+    match TransactionRequestBuilder::new().build_consume_notes(notes) {
+        Ok(req) => {
+            match miden_agglayer_service::metrics::meter_proof(
+                miden_agglayer_service::metrics::ProofKind::BridgeOut,
+                client.submit_new_transaction(wallet_id, req),
+            )
+            .await
+            {
+                Ok(tx) => {
+                    println!("[consume] consumed notes: {tx}");
+                    for _ in 0..10 {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        if let Err(e) = client.sync_state().await {
+                            eprintln!("[consume] settle sync failed (non-fatal, retried): {e:?}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[consume] consume failed: {e:?}");
+                }
+            }
+        }
+        Err(e) => {
+            // Pre-prove build failure — record the distinct `build_failed` outcome.
+            miden_agglayer_service::metrics::record_proof_outcome(
+                miden_agglayer_service::metrics::ProofKind::BridgeOut,
+                miden_agglayer_service::metrics::ProofOutcome::BuildFailed,
+            );
+            println!("[consume] build consume req failed: {e:?}");
+        }
     }
 }
 
@@ -460,6 +548,41 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(3);
             }
         }
+    }
+
+    // ── Received-asset linkage mode (#147 / PR#152) ───────────────────────────
+    // Enumerate the fungible faucets the RECEIVING wallet actually holds, derived from
+    // its ON-CHAIN vault after syncing + consuming its pending P2ID notes. The e2e diffs
+    // a before/after snapshot to identify the faucet of the asset it TRULY received (an
+    // unambiguous vault delta), so the cold-metadata + balance assertions run against a
+    // DERIVED id rather than a caller-supplied known id — a retained/accumulated balance
+    // can no longer false-pass. One parseable line per held faucet, then a `done` marker.
+    if args.list_wallet_faucets {
+        let wallet_id = parse_account_id(
+            args.wallet_id
+                .as_deref()
+                .context("--list-wallet-faucets requires --wallet-id")?,
+        )
+        .with_context(|| format!("list-wallet-faucets: bad wallet id {:?}", args.wallet_id))?;
+        sync_with_retry(&mut client, "list-wallet-faucets").await?;
+        consume_pending_notes(&mut client, wallet_id).await;
+        let vault = client
+            .get_account_vault(wallet_id)
+            .await
+            .map_err(|e| anyhow!("list-wallet-faucets: get_account_vault failed: {e:?}"))?;
+        for asset in vault.assets() {
+            if let miden_client::asset::Asset::Fungible(fa) = asset {
+                println!(
+                    "wallet-faucet: faucet_id={} amount={}",
+                    fa.faucet_id().to_hex(),
+                    fa.amount()
+                );
+            }
+        }
+        // Stable terminator so the caller can distinguish "synced, zero faucets held"
+        // (valid — nothing received yet) from a truncated/failed run.
+        println!("wallet-faucet: done");
+        return Ok(());
     }
 
     // ── Provision mode ────────────────────────────────────────────────────────
@@ -995,80 +1118,8 @@ async fn main() -> anyhow::Result<()> {
     sync_with_retry(&mut client, "bridge-out").await?;
     println!("[bridge-out] sync complete");
 
-    // Try to consume any Expected/Committed notes for the wallet
-    {
-        use miden_client::store::NoteFilter;
-        let expected = client
-            .get_input_notes(NoteFilter::Expected)
-            .await
-            .unwrap_or_default();
-        let committed = client
-            .get_input_notes(NoteFilter::Committed)
-            .await
-            .unwrap_or_default();
-        println!(
-            "[bridge-out] notes: {} expected, {} committed",
-            expected.len(),
-            committed.len()
-        );
-
-        let consumable = client
-            .get_consumable_notes(Some(wallet_id))
-            .await
-            .unwrap_or_default();
-        if !consumable.is_empty() {
-            println!("[bridge-out] consuming {} notes...", consumable.len());
-            let notes: Vec<miden_protocol::note::Note> = consumable
-                .into_iter()
-                .filter_map(|(rec, _)| match rec.try_into() {
-                    Ok(n) => Some(n),
-                    Err(e) => {
-                        eprintln!("[bridge-out] SKIPPING unconvertible note record (was silently dropped pre-#128): {e:?}");
-                        None
-                    }
-                })
-                .collect();
-            if !notes.is_empty() {
-                match TransactionRequestBuilder::new().build_consume_notes(notes) {
-                    Ok(req) => {
-                        match miden_agglayer_service::metrics::meter_proof(
-                            miden_agglayer_service::metrics::ProofKind::BridgeOut,
-                            client.submit_new_transaction(wallet_id, req),
-                        )
-                        .await
-                        {
-                            Ok(tx) => {
-                                println!("[bridge-out] consumed notes: {tx}");
-                                for _ in 0..10 {
-                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                    if let Err(e) = client.sync_state().await {
-                                        eprintln!(
-                                            "[settle] sync failed (non-fatal, retried next tick): {e:?}"
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("[bridge-out] consume failed: {e:?}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Pre-prove build failure — no histogram (duration is
-                        // meaningless before any proving started). Record the
-                        // distinct `build_failed` outcome so dashboards can
-                        // split prover failures from request-construction
-                        // failures.
-                        miden_agglayer_service::metrics::record_proof_outcome(
-                            miden_agglayer_service::metrics::ProofKind::BridgeOut,
-                            miden_agglayer_service::metrics::ProofOutcome::BuildFailed,
-                        );
-                        println!("[bridge-out] build consume req failed: {e:?}");
-                    }
-                }
-            }
-        }
-    }
+    // Sync + consume any received P2ID notes so the balance below reflects them.
+    consume_pending_notes(&mut client, wallet_id).await;
 
     // Check wallet balance
     let balance = client

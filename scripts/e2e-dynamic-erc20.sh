@@ -106,6 +106,9 @@ log "======================================================================"
 log "Wallet:  $WALLET_ID (isolated store: $B2AGG_STORE_DIR)"
 log "Dest:    $DEST_ADDR (zero-padded, network $DEST_NETWORK)"
 log "Amount:  $BRIDGE_AMOUNT base units (expect $EXPECTED_L2_BALANCE Miden units)"
+# #147/PR#152: snapshot held faucets BEFORE bridging so the received asset is DERIVED
+# from the wallet's vault delta (not the admin-RPC-discovered NEW_FAUCET_ID).
+RECV_BEFORE="$(iso_wallet_faucets)"
 
 # ── Step 1: Deploy TestToken ERC-20 on Anvil ──────────────────────────────────
 log "Step 1/7: Deploying TestToken ERC-20 on Anvil..."
@@ -236,7 +239,9 @@ EXP_SYM=$(printf '%s' "$TOKEN_SYMBOL" | tr -d '"' | tr 'a-z' 'A-Z' | tr -cd 'A-Z
 [[ -n "$EXP_SYM" ]] || EXP_SYM="T$(printf '%s' "${TOKEN_ADDR#0x}" | cut -c1-4 | tr 'a-f' 'A-F')"
 EXP_DEC=$(( TOKEN_DEC < 8 ? TOKEN_DEC : 8 ))
 log "Step 5b/7 (#147): a fresh client resolves the dynamic ERC-20 faucet's symbol/decimals (expect $EXP_SYM/$EXP_DEC)"
-assert_faucet_symbol "$NEW_FAUCET_ID" "$EXP_SYM" "$EXP_DEC" "L1 dynamic ERC-20 (origin net=0, addr=$TOKEN_ADDR)"
+# PR#152: DERIVE the received faucet from the vault delta; assert it == NEW_FAUCET_ID and
+# resolves the sanitised symbol on a cold wallet. (Retained balance cannot false-pass.)
+assert_received_faucet "$RECV_BEFORE" "$NEW_FAUCET_ID" "$EXP_SYM" "$EXP_DEC" "$EXPECTED_L2_BALANCE" "L1 dynamic ERC-20 (origin net=0, addr=$TOKEN_ADDR)"
 
 # ── Step 6: Bridge L2→L1 ─────────────────────────────────────────────────────
 L1_DEST="$FUNDED_ADDR"
