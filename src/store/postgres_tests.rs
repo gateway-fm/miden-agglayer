@@ -2661,3 +2661,145 @@ async fn test_pgstore_claim_calldata_repair_backlog() {
         "a successful calldata commit clears the claim from the backlog"
     );
 }
+
+// ── Future-nonce queue ("mempool") — #146 ────────────────────────────
+
+/// A distinct dummy envelope reused for parked rows (queue_txn stores the
+/// caller-supplied tx_hash independently of the envelope, so the envelope bytes
+/// need only round-trip, not match the hash).
+fn queued_envelope() -> TxEnvelope {
+    dummy_txn_entry().envelope
+}
+
+/// #146 findings 5 + 4 for the PgStore, in ONE test so the two scenarios run
+/// sequentially. `queued_txns` is the ONLY table this test touches and no other
+/// pgstore test touches it, so a global clear at each scenario boundary keeps this
+/// test isolated even though the shared DB runs test functions in parallel.
+/// (Splitting these into two `#[tokio::test]`s would let cargo run them
+/// concurrently, and each mutates the whole `queued_txns` table — the global
+/// bound count and the global expiry sweep are not per-signer, so they would
+/// clobber each other.)
+#[tokio::test]
+async fn test_pgstore_queued_txns_bounds_serialization_and_expiry() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store = std::sync::Arc::new(store);
+
+    // `expires_at` is persisted as i64, so `u64::MAX` would wrap to -1. Use
+    // i64-safe sentinels: CLEAR_ALL evicts every row (all expires_at <= i64::MAX);
+    // NEVER_EXPIRES is far above any block a test reaches.
+    const CLEAR_ALL: u64 = i64::MAX as u64;
+    const NEVER_EXPIRES: u64 = 1_000_000_000;
+
+    // Expiry is now per-signer; clear the whole table by sweeping each signer.
+    async fn clear_all_queued(store: &super::postgres::PgStore) {
+        for s in store.queued_signers().await.unwrap() {
+            store
+                .expire_queued_txns_for_signer(&s, i64::MAX as u64)
+                .await
+                .unwrap();
+        }
+    }
+
+    // ── Finding 5: the global capacity check + INSERT must be serialised so
+    // concurrent parks for DIFFERENT signers cannot both pass a COUNT under the
+    // global cap and exceed it. Under READ COMMITTED without the advisory lock
+    // this over-admits; with it, exactly `global` rows land under any concurrency.
+    clear_all_queued(store.as_ref()).await; // start empty
+
+    const GLOBAL: usize = 5;
+    const CONTENDERS: usize = 24;
+    let bounds = super::QueueBounds {
+        per_signer: 1_000,
+        global: GLOBAL,
+    };
+    let mut handles = Vec::new();
+    for i in 0..CONTENDERS {
+        let store = store.clone();
+        handles.push(tokio::spawn(async move {
+            let signer = format!("0x{:040x}", i + 1);
+            let tx_hash = TxHash::from([(i + 1) as u8; 32]);
+            store
+                .queue_txn(
+                    &signer,
+                    1,
+                    tx_hash,
+                    &queued_envelope(),
+                    NEVER_EXPIRES,
+                    bounds,
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    let mut parked = 0usize;
+    let mut rejected = 0usize;
+    for h in handles {
+        match h.await.unwrap() {
+            super::QueueOutcome::Parked => parked += 1,
+            super::QueueOutcome::GlobalBoundExceeded => rejected += 1,
+            other => panic!("unexpected outcome under contention: {other:?}"),
+        }
+    }
+    assert_eq!(
+        parked, GLOBAL,
+        "exactly the global cap must be admitted, never more (finding 5)"
+    );
+    assert_eq!(rejected, CONTENDERS - GLOBAL, "the rest must be refused");
+    let mut landed = 0usize;
+    for i in 0..CONTENDERS {
+        let signer = format!("0x{:040x}", i + 1);
+        if store
+            .peek_queued_min_nonce(&signer)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            landed += 1;
+        }
+    }
+    assert_eq!(landed, GLOBAL, "no over-admission past the global cap");
+
+    // ── Finding 4: TTL expiry EVICTS a signer's gap-blocked rows past their block —
+    // a plain per-signer delete (lookups then return null, Geth-style).
+    clear_all_queued(store.as_ref()).await; // clear finding-5 rows
+
+    let signer = "0x00000000000000000000000000000000dead0001";
+    let bounds = super::QueueBounds {
+        per_signer: 100,
+        global: 100,
+    };
+    let h_early = TxHash::from([0xE1u8; 32]);
+    let h_late = TxHash::from([0xE2u8; 32]);
+    // nonce 1 expires at block 10; nonce 2 expires at block 100.
+    store
+        .queue_txn(signer, 1, h_early, &queued_envelope(), 10, bounds)
+        .await
+        .unwrap();
+    store
+        .queue_txn(signer, 2, h_late, &queued_envelope(), 100, bounds)
+        .await
+        .unwrap();
+
+    // Evict at block 50: only the nonce-1 row (expires 10) is removed; nonce 2
+    // (expires 100) remains.
+    let evicted = store
+        .expire_queued_txns_for_signer(signer, 50)
+        .await
+        .unwrap();
+    assert_eq!(evicted, 1, "only the block-10 row is evicted at block 50");
+    assert!(
+        store.queued_txn_by_hash(h_early).await.unwrap().is_none(),
+        "the evicted row is gone (lookups return null)"
+    );
+    assert_eq!(
+        store.peek_queued_min_nonce(signer).await.unwrap(),
+        Some(2),
+        "the un-expired later row remains parked"
+    );
+
+    // Clean up.
+    clear_all_queued(store.as_ref()).await;
+    assert!(store.peek_queued_min_nonce(signer).await.unwrap().is_none());
+}
