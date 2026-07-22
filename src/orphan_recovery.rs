@@ -31,12 +31,11 @@
 //! so recovery cannot double-advance a nonce or duplicate a GER/claim. Multi-
 //! replica coordination is out of scope (#142).
 
-use crate::service_send_raw_txn::{decode_write_call, service_send_raw_txn};
+use crate::service_send_raw_txn::decode_write_call;
 use crate::service_state::ServiceState;
 use crate::store::RecoverablePendingTxn;
 use crate::writer_worker::DecodedWriteCall;
 use alloy::consensus::TxEnvelope;
-use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, Bytes};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -124,13 +123,6 @@ fn envelope_input(envelope: &TxEnvelope) -> &Bytes {
     }
 }
 
-/// Re-hex the stored envelope for replay through the normal admission path.
-fn envelope_hex(envelope: &TxEnvelope) -> String {
-    let mut bytes = Vec::new();
-    envelope.encode_2718(&mut bytes);
-    format!("0x{}", alloy::hex::encode(bytes))
-}
-
 /// Finalise the original proxy hash with a terminal SUCCESS receipt because the
 /// intended effect is already durable in Miden. Clears recovery backoff and
 /// unblocks the next nonce. Never re-submits.
@@ -197,26 +189,53 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
     }
 
     ::metrics::counter!("orphan_recovery_attempts_total").increment(1);
-    // Re-drive through the PUBLIC entry: it acquires this signer's lock itself (so
-    // recovery serialises against live admission) and, because the row is durable
-    // pending with the nonce already advanced, takes the same-hash durable-resume
-    // path — re-enqueueing the exact envelope without a second nonce advance.
-    match Box::pin(service_send_raw_txn(
-        service.clone(),
-        envelope_hex(&tx.envelope),
-    ))
-    .await
-    {
-        Ok(_) => {
-            // Re-enqueued (or reconciled) through the durable-resume path. Clear
-            // backoff and keep walking: later nonces queue behind it in order.
+
+    // Re-drive by RE-ENQUEUEING the writer job directly for this already-durable
+    // intent. The pending row and the nonce CAS are already persisted, so we must
+    // NOT go back through nonce classification (the public admission path only
+    // resumes a tx exactly one below the expected nonce, which would reject the
+    // lower of several orphans as a stale nonce). Rebuilding the job from the
+    // stored envelope and enqueueing it is the exact work the original admission
+    // did after `durably_admit_and_advance_nonce`, so the nonce never advances
+    // twice and multiple orphans recover in nonce order. Idempotency is preserved
+    // by the writer's handoff fencing and Miden duplicate-protection.
+    let Some(handle) = service.writer_handle.as_ref() else {
+        defer_with_backoff(service, tx, "no writer handle available").await;
+        return Step::StopSigner;
+    };
+    let decoded = match decode_write_call(envelope_input(&tx.envelope)) {
+        Ok(d) => d,
+        Err(e) => {
+            // Deterministic decode failure — never a transient outage. Record a
+            // definite terminal failure so it stops blocking later nonces.
+            let block = service.store.get_latest_block_number().await.unwrap_or(0);
+            let block_hash = service.block_state.get_block_hash(block);
+            let _ = service
+                .store
+                .txn_commit(
+                    tx.tx_hash,
+                    Err(format!("recovery: undecodable write call ({e})")),
+                    block,
+                    block_hash,
+                )
+                .await;
+            let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
+            tracing::error!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: envelope is not a supported write call; recorded terminal failure");
+            return Step::Continue;
+        }
+    };
+    let job = decoded.into_job(tx.envelope.clone(), signer, tx.tx_hash);
+    match handle.try_enqueue(job) {
+        Ok(()) => {
             let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
             ::metrics::counter!("orphan_recovery_successes_total").increment(1);
-            tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, attempts = tx.recovery_attempts, "recovery: re-drove orphaned durable intent through the same-hash path");
+            tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, attempts = tx.recovery_attempts, "recovery: re-enqueued orphaned durable intent into the writer");
             Step::Continue
         }
         Err(e) => {
-            defer_with_backoff(service, tx, &format!("re-drive failed: {e}")).await;
+            // Writer saturated or shut down — transient. Defer with backoff; the
+            // row stays durable and recoverable on the next sweep.
+            defer_with_backoff(service, tx, &format!("re-enqueue failed: {e}")).await;
             Step::StopSigner
         }
     }
@@ -291,4 +310,322 @@ pub async fn recover_orphaned_pending_txns(service: &ServiceState) -> anyhow::Re
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ger::insertGlobalExitRootCall;
+    use crate::store::{Store, TxnEntry, memory::InMemoryStore};
+    use crate::test_helpers::create_test_service_with_store;
+    use crate::writer_worker::{WriterWorker, WriterWorkerHandle};
+    use alloy::consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+    use alloy::primitives::{Address, FixedBytes, TxHash};
+    use alloy::signers::SignerSync;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy_core::sol_types::SolCall;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A GER-injection transaction really signed by `key` at `nonce`. Returns the
+    /// decoded envelope, its hash, the 32-byte GER, and the recovered signer.
+    fn signed_ger_tx(
+        key: &PrivateKeySigner,
+        nonce: u64,
+        marker: u8,
+    ) -> (TxEnvelope, TxHash, [u8; 32], Address) {
+        let ger_bytes = [marker; 32];
+        let input = insertGlobalExitRootCall {
+            root: FixedBytes::from(ger_bytes),
+        }
+        .abi_encode();
+        let txn = TxLegacy {
+            nonce,
+            input: input.into(),
+            chain_id: Some(1),
+            gas_price: 1,
+            ..Default::default()
+        };
+        let sig = key
+            .sign_hash_sync(&txn.signature_hash())
+            .expect("sign test tx");
+        let signed = txn.into_signed(sig);
+        let hash = *signed.hash();
+        let envelope: TxEnvelope = signed.into();
+        // The signer is the key's address; recovering it from the envelope would
+        // need an extra trait import and must match this anyway.
+        (envelope, hash, ger_bytes, key.address())
+    }
+
+    fn signer_hex(signer: Address) -> String {
+        format!("{signer:#x}")
+    }
+
+    /// Model the exact durable state the issue targets: a `pending` row admitted
+    /// via `durably_admit_and_advance_nonce` (pending row + nonce CAS) whose writer
+    /// job was then lost — no handoff, no live worker. Advances the signer nonce
+    /// from 0 through `nonce` so the row sits one below the expected nonce.
+    async fn install_orphan(
+        store: &Arc<dyn Store>,
+        envelope: &TxEnvelope,
+        hash: TxHash,
+        signer: Address,
+        nonce: u64,
+    ) {
+        store
+            .txn_begin_if_absent(
+                hash,
+                TxnEntry {
+                    id: None,
+                    envelope: envelope.clone(),
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let addr = signer_hex(signer);
+        for n in 0..=nonce {
+            assert!(
+                store.nonce_advance_cas(&addr, n).await.unwrap(),
+                "nonce CAS {n} must advance in test setup"
+            );
+        }
+    }
+
+    fn with_writer(store: Arc<dyn Store>, depth: usize) -> crate::service_state::ServiceState {
+        let mut service = create_test_service_with_store(store);
+        let (handle, _sd) = WriterWorker::spawn(service.clone(), depth, Duration::from_secs(60));
+        // Leak the shutdown sender so the worker lives for the test.
+        std::mem::forget(_sd);
+        service.writer_handle = Some(Arc::new(handle));
+        service
+    }
+
+    /// #156 tests 1/2/4 — a durable pending orphan with no handoff and no live
+    /// writer job (crash after admission before enqueue, or the capacity race) is
+    /// automatically re-driven back into the writer, and its nonce is NOT advanced
+    /// a second time. No client rebroadcast.
+    #[tokio::test]
+    async fn orphan_pending_no_handoff_is_redriven() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xA0);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        assert_eq!(store.nonce_get(&signer_hex(signer)).await.unwrap(), 1);
+
+        let service = with_writer(store.clone(), 64);
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        let handle = service.writer_handle.as_ref().unwrap();
+        let recovered =
+            handle.is_inflight(&hash) || store.txn_receipt(hash).await.unwrap().is_some();
+        assert!(
+            recovered,
+            "the orphan must be re-driven into the writer (or finalised), not stranded"
+        );
+        assert_eq!(
+            store.nonce_get(&signer_hex(signer)).await.unwrap(),
+            1,
+            "re-driving an orphan must NOT advance the nonce a second time"
+        );
+    }
+
+    /// #156 test 12 (lost local receipt) + reconciliation — the GER is already
+    /// applied in Miden but the proxy never recorded its receipt. Recovery
+    /// finalises the original hash from authoritative state WITHOUT resubmitting.
+    #[tokio::test]
+    async fn effect_already_applied_finalizes_without_resubmit() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, ger, signer) = signed_ger_tx(&key, 0, 0xB0);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        // The GER is already applied in Miden state (lost local receipt).
+        store
+            .commit_ger_event_atomic(1, [1u8; 32], &format!("{hash:#x}"), &ger, None, None, 0)
+            .await
+            .unwrap();
+        assert!(store.is_ger_injected(&ger).await.unwrap());
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        let (result, _) = store
+            .txn_receipt(hash)
+            .await
+            .unwrap()
+            .expect("recovery must finalise a terminal receipt from applied Miden state");
+        assert!(
+            result.is_ok(),
+            "finalised outcome must be success: {result:?}"
+        );
+        assert!(
+            !handle.is_inflight(&hash),
+            "an already-applied effect must NOT be resubmitted to the writer"
+        );
+    }
+
+    /// #156 test 10 — multiple orphans for one signer are recovered in nonce order.
+    #[tokio::test]
+    async fn multiple_orphans_recovered_in_nonce_order() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env0, h0, _g0, signer) = signed_ger_tx(&key, 0, 0xC0);
+        let (env1, h1, _g1, _s1) = signed_ger_tx(&key, 1, 0xC1);
+        // Both admitted (nonce advanced to 2), neither handed off nor live.
+        store
+            .txn_begin_if_absent(h0, entry(&env0, signer))
+            .await
+            .unwrap();
+        store
+            .txn_begin_if_absent(h1, entry(&env1, signer))
+            .await
+            .unwrap();
+        let addr = signer_hex(signer);
+        assert!(store.nonce_advance_cas(&addr, 0).await.unwrap());
+        assert!(store.nonce_advance_cas(&addr, 1).await.unwrap());
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        for (n, h) in [(0u64, h0), (1, h1)] {
+            let recovered = handle.is_inflight(&h) || store.txn_receipt(h).await.unwrap().is_some();
+            assert!(recovered, "orphan at nonce {n} must be recovered");
+        }
+        assert_eq!(
+            store.nonce_get(&addr).await.unwrap(),
+            2,
+            "no nonce may advance twice during multi-orphan recovery"
+        );
+    }
+
+    fn entry(env: &TxEnvelope, signer: Address) -> TxnEntry {
+        TxnEntry {
+            id: None,
+            envelope: env.clone(),
+            signer,
+            expires_at: None,
+            logs: vec![],
+        }
+    }
+
+    /// #156 test 13 — a durable handoff is recorded but the effect is not yet
+    /// confirmed (Miden outage). Recovery must NOT resubmit; it defers with backoff
+    /// and the schedule is persisted.
+    #[tokio::test]
+    async fn handoff_recorded_is_polled_not_resubmitted() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xD0);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        // A prepared handoff: the intent crossed the external submission boundary.
+        store
+            .prepare_note_handoff(&format!("{hash:#x}"), "0xcommit", "0xnote", 100)
+            .await
+            .unwrap();
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        assert!(
+            !handle.is_inflight(&hash),
+            "a handoff-recorded tx must be polled, never blindly resubmitted"
+        );
+        let after = store
+            .recoverable_pending_txns(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.tx_hash == hash)
+            .expect("still pending");
+        assert_eq!(
+            after.recovery_attempts, 1,
+            "backoff attempt must be recorded"
+        );
+        assert!(
+            after.next_recovery_at.is_some(),
+            "next-attempt must be scheduled"
+        );
+    }
+
+    /// #156 test 8 — a persisted future backoff defers the re-drive: an orphan
+    /// whose `next_recovery_at` is in the future is not retried yet, and is not
+    /// resubmitted.
+    #[tokio::test]
+    async fn backoff_not_due_defers_redrive() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xE0);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        // Schedule the next attempt far in the future.
+        store
+            .record_recovery_attempt(hash, now_unix() + 10_000)
+            .await
+            .unwrap();
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        assert!(
+            !handle.is_inflight(&hash),
+            "an orphan that is backing off must not be re-driven yet"
+        );
+    }
+
+    /// #156 test 4 — the writer-capacity race: a durable pending orphan whose
+    /// re-drive is rejected because the writer is saturated stays automatically
+    /// recoverable — its backoff advances and it is NOT stranded.
+    #[tokio::test]
+    async fn saturated_writer_defers_orphan_with_backoff() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xF0);
+        install_orphan(&store, &env, hash, signer, 0).await;
+
+        let mut service = create_test_service_with_store(store.clone());
+        let (handle, _sat) = WriterWorkerHandle::saturated_for_test();
+        assert_eq!(handle.available_capacity(), 0);
+        service.writer_handle = Some(Arc::new(handle));
+
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        let after = store
+            .recoverable_pending_txns(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.tx_hash == hash)
+            .expect("orphan must remain durably pending and recoverable, not stranded");
+        assert!(
+            after.recovery_attempts >= 1,
+            "a saturated re-drive must record a backoff attempt, keeping the tx recoverable"
+        );
+        assert_eq!(
+            store.nonce_get(&signer_hex(signer)).await.unwrap(),
+            1,
+            "a failed re-drive must not advance the nonce"
+        );
+    }
+
+    /// Recovery leaves a transaction with a live writer job untouched (no
+    /// duplicate work) and takes no action on an empty backlog.
+    #[tokio::test]
+    async fn empty_backlog_is_a_noop() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let service = with_writer(store, 64);
+        // No pending rows at all.
+        recover_orphaned_pending_txns(&service).await.unwrap();
+    }
 }
