@@ -84,9 +84,34 @@ fi
 ORIG_CALLDATA="$(tx_input "$CLAIM_TX")"
 [[ "$ORIG_CALLDATA" == 0x* && ${#ORIG_CALLDATA} -gt 10 ]] \
     || fail "#148: chosen claim $CLAIM_TX has no real calldata to lose (input='$ORIG_CALLDATA') — cannot exercise repair"
+
+# The recovered claim's EXACT global index. The synthesised ClaimEvent encodes globalIndex
+# as data word 0 (cf. lib-l2l2.sh::claim_event_rows `data LIKE 0x<gi>%`), so it is the first
+# 32-byte word of the event data. We bind the recovery to THIS exact (hash, global index) —
+# not merely "a block advanced" (PR #151 blocker).
+GI_HEX="$(pgi "SELECT substring(lower(data) from 3 for 64) FROM synthetic_logs WHERE lower(transaction_hash) = lower('$CLAIM_TX') AND lower(topics[1]) = lower('$CLAIM_EVENT_TOPIC') ORDER BY block_number DESC LIMIT 1")"
+[[ "$GI_HEX" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "#148: could not extract the claim's global index from its ClaimEvent data (got '$GI_HEX')"
+GLOBAL_INDEX="$(python3 -c "print(int('$GI_HEX',16))")"
+# claimAsset(bytes32[32],bytes32[32],uint256 globalIndex,...): globalIndex is arg 3, at
+# byte offset selector(4) + 2*bytes32[32](2*1024) = 2052 → hex-char offset 2*(2052)=4104
+# after the 0x. Extract it from the calldata to bind the SERVED calldata to the exact GI
+# (schema-free: proves the recovered calldata is THIS claim, not a same-shape placeholder).
+gi_from_calldata() {
+    python3 -c "
+import sys
+h=sys.argv[1]; h=h[2:] if h.startswith('0x') else h
+off=2*(4+1024+1024)
+print(h[off:off+64].lower() if len(h)>=off+64 else '')
+" "$1"
+}
+GI_FROM_CD="$(gi_from_calldata "$ORIG_CALLDATA")"
+[[ "$GI_FROM_CD" == "$GI_HEX" ]] \
+    || fail "#148: the claim's ORIGINAL calldata globalIndex ('$GI_FROM_CD') != its ClaimEvent global index ('$GI_HEX') — calldata↔event binding broken (bad offset or wrong claim)"
+
 CLAIM_COUNT_PRE="$(pgi "SELECT COUNT(*) FROM synthetic_logs WHERE lower(topics[1]) = lower('$CLAIM_EVENT_TOPIC')")"
 [[ "$(proxy_health_code)" == "200" ]] || fail "#148: proxy not READY (200) before the recovery — precondition"
-pass "PRE: claim $CLAIM_TX has ${#ORIG_CALLDATA}-char calldata; $CLAIM_COUNT_PRE ClaimEvent(s); /health=200"
+pass "PRE: claim $CLAIM_TX (global index $GLOBAL_INDEX, bound in its calldata) has ${#ORIG_CALLDATA}-char calldata; $CLAIM_COUNT_PRE ClaimEvent(s); /health=200"
 
 # ── Induce the recovery shape: retained PG, blanked claim envelope, reset store ─
 BASE_ARGS=$(docker inspect -f '{{range .Args}}{{.}} {{end}}' "$AGGLAYER_CONTAINER")
@@ -215,6 +240,9 @@ pass "3. No foreign/spurious ClaimEvent across recovery (count stable at $CLAIM_
 # RESUME from its old cursor and never re-fetch/re-parse the historical claim (PR
 # #151 blocker). A fresh container re-scans the proxy L2 from block 0, genuinely
 # re-exercising the empty-input-stall consumer. Step 4b asserts aggkit's OWN recovery.
+# Timestamp the release so step 4c only counts a certificate that settles AFTER it (a
+# genuinely FRESH cert, not one that settled before the recovery).
+RECOVERY_RELEASE_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
     -c "DROP SCHEMA IF EXISTS sync CASCADE; DROP SCHEMA IF EXISTS mt CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO bridge_user;" >/dev/null 2>&1 \
     || fail "#148: failed to drop bridge_db for the realistic resync (finding #65)"
@@ -281,6 +309,42 @@ done
 [[ "$AGGKIT_MAXBLK" -ge "$CLAIM_BLOCK" ]] \
     || fail "#148: aggkit's OWN L2BridgeSyncer did NOT re-process past the recovered claim after force-recreate (reached block $AGGKIT_MAXBLK < claim block $CLAIM_BLOCK within 240s) — its bridgesync stalled on the claim, so the empty-input recovery is NOT proven for the consumer that actually stalls"
 pass "4b. aggkit's OWN L2BridgeSyncer re-processed the recovered claim from a FRESH cursor (reached block $AGGKIT_MAXBLK >= claim block $CLAIM_BLOCK) — the stalling consumer genuinely recovered, not just bridge-service"
+
+# ── 4c. Exact recovered claim served afresh + exact global index + a FRESH cert Settled ─
+# (a) A GENUINELY NEW serve (after the consumers were force-recreated, not the pre-release
+#     read) of the EXACT recovered tx hash returns the full ORIGINAL calldata, and that
+#     calldata carries THE exact global index — binds the recovery to (hash, global index),
+#     not just "a block advanced".
+FRESH_SERVE="$(tx_input "$CLAIM_TX")"
+[[ "$FRESH_SERVE" == "$ORIG_CALLDATA" ]] \
+    || fail "#148: post-recovery re-serve of the EXACT claim hash $CLAIM_TX differs from the original calldata (orig ${#ORIG_CALLDATA} chars, got ${#FRESH_SERVE}) — the reset proxy is not re-serving this exact hash"
+FRESH_GI="$(gi_from_calldata "$FRESH_SERVE")"
+[[ "$FRESH_GI" == "$GI_HEX" ]] \
+    || fail "#148: post-recovery re-served calldata for $CLAIM_TX carries globalIndex '$FRESH_GI' != recovered global index '$GI_HEX' ($GLOBAL_INDEX) — exact-global-index binding broken"
+pass "4c. Fresh post-recovery serve of the EXACT recovered claim: hash=$CLAIM_TX, global index=$GLOBAL_INDEX bound byte-for-byte in the re-served claimAsset calldata"
+
+# (b) A FRESH certificate must reach Settled AFTER recovery — proves the settlement pipeline
+#     (aggsender → agglayer) resumed end-to-end, not merely that bridgesync scanned. Same
+#     ground-truth signal e2e-l2-to-l1-autoclaim uses: aggkit logs `changed status … Settled`
+#     with a non-genesis NewLocalExitRoot. `--since $RECOVERY_RELEASE_TS` restricts to certs
+#     that settled AFTER the release (the force-recreated aggkit container is fresh anyway).
+CERT_DEADLINE=$(( $(date +%s) + 300 ))
+CERT_SETTLED=0
+while :; do
+    # Same exclusion as e2e-l2l2-to-l1-autoclaim: ignore the all-zero root and the
+    # known empty-tree root, so a cert that settles with NO new local exit root (no
+    # real activity) does not count as a fresh settlement.
+    if docker logs --since "$RECOVERY_RELEASE_TS" "$AGGKIT_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -aE 'changed status.*Settled' \
+        | grep -avE 'NewLocalExitRoot: (0x0+[,} ]|0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757)' \
+        | grep -aq 'NewLocalExitRoot'; then CERT_SETTLED=1; break; fi
+    [[ $(date +%s) -ge $CERT_DEADLINE ]] && break
+    sleep 10
+done
+[[ "$CERT_SETTLED" == 1 ]] \
+    || fail "#148: NO fresh certificate reached Settled within 300s after recovery — the aggsender→agglayer settlement pipeline did not resume end-to-end (only bridgesync scanning was proven). Recent aggkit status lines: $(docker logs --since "$RECOVERY_RELEASE_TS" "$AGGKIT_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aE 'changed status' | tail -3 | tr '\n' '|')"
+pass "4c(b). A FRESH certificate reached Settled after recovery — settlement pipeline resumed end-to-end (aggsender → agglayer), not just bridgesync"
 
 rm -f "$BACKUP"
 log "======================================================================"
