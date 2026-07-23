@@ -151,7 +151,7 @@ scenario_ger() {
         "$BRIDGE" 'insertGlobalExitRoot(bytes32)' "$ger" 2>/dev/null)"
     [[ "$hash" == 0x* ]] || fail "controlled GER submit not admitted (hash=$hash; REJECT_UNVERIFIED_GER=true?)"
     log "  admitted $hash (signer=$GER_ADDR nonce=$nonce_before ger=$ger); waiting for PROOF boundary"
-    wait_for_marker "$GER_PROVE_MARKER" "$since" 180 || fail "GER never reached the proof boundary"
+    wait_for_marker "$GER_PROVE_MARKER, ger: ${ger#0x}" "$since" 180 || fail "GER never reached the proof boundary (ger ${ger#0x})"
     assert_pending_no_handoff "$hash"
 
     case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
