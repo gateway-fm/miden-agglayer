@@ -289,6 +289,157 @@ pub(crate) async fn reconcile_claim_handoff_with_client(
     ))
 }
 
+/// Recovery-oriented, FRESH GER effect classification (reviewer #5). Syncs the
+/// Miden view before reading so a stale local view can never report "absent" and
+/// trigger a spurious re-drive. GER injection is idempotent and ownership-
+/// independent, so the exact-note distinction is irrelevant here: any applied
+/// result is a success for the caller; only a truly-absent GER re-drives.
+#[cfg(not(test))]
+pub(crate) async fn reconcile_ger_recovery(
+    service: &ServiceState,
+    ger: [u8; 32],
+) -> anyhow::Result<ExactNoteOutcome> {
+    if service.store.is_ger_injected(&ger).await? {
+        return Ok(ExactNoteOutcome::AppliedByExactNote);
+    }
+    let bridge_id = service.accounts.0.bridge.0;
+    let result: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let result_in = result.clone();
+    service
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                client
+                    .sync_state()
+                    .await
+                    .context("fresh Miden sync before recovery GER reconcile")?;
+                let applied = bridge_snapshot_with_client(client, bridge_id, Some(ger), None, None)
+                    .await?
+                    .ger_applied
+                    .unwrap_or(false);
+                *result_in.lock().expect("recovery reconcile mutex poisoned") = Some(applied);
+                Ok(())
+            })
+        })
+        .await?;
+    let applied = result
+        .lock()
+        .expect("recovery reconcile mutex poisoned")
+        .take()
+        .context("recovery GER reconcile produced no result")?;
+    Ok(if applied {
+        ExactNoteOutcome::AppliedByExactNote
+    } else {
+        ExactNoteOutcome::NotApplied
+    })
+}
+
+/// Recovery-oriented, FRESH claim effect classification (reviewers #3 + #5). Syncs
+/// the Miden view first, then — when the durable handoff `note_id` is known — uses
+/// the EXACT-note classifier so a claim landed by ANOTHER transaction/note is
+/// reported as `AppliedElsewhere` (→ the caller must produce an `AlreadyClaimed`
+/// revert, not a success receipt) rather than conflated with this tx succeeding.
+/// A pure orphan (no note ever prepared) with the index already claimed is
+/// unambiguously `AppliedElsewhere`.
+#[cfg(not(test))]
+pub(crate) async fn reconcile_claim_recovery(
+    service: &ServiceState,
+    global_index: U256,
+    note_id: Option<String>,
+) -> anyhow::Result<ExactNoteOutcome> {
+    let store = service.store.clone();
+    let bridge_id = service.accounts.0.bridge.0;
+    let result: Arc<Mutex<Option<ExactNoteOutcome>>> = Arc::new(Mutex::new(None));
+    let result_in = result.clone();
+    service
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                client
+                    .sync_state()
+                    .await
+                    .context("fresh Miden sync before recovery claim reconcile")?;
+                let outcome = match note_id {
+                    Some(note_id) => {
+                        reconcile_claim_handoff_with_client(
+                            &*store,
+                            client,
+                            bridge_id,
+                            global_index,
+                            note_id,
+                        )
+                        .await?
+                    }
+                    None => {
+                        let applied = store
+                            .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())
+                            .await?
+                            || bridge_snapshot_with_client(
+                                client,
+                                bridge_id,
+                                None,
+                                Some(global_index),
+                                None,
+                            )
+                            .await?
+                            .claim_applied
+                            .unwrap_or(false);
+                        // No exact note of ours exists, so any on-chain claim of this
+                        // index was applied by a DIFFERENT transaction.
+                        if applied {
+                            ExactNoteOutcome::AppliedElsewhere
+                        } else {
+                            ExactNoteOutcome::NotApplied
+                        }
+                    }
+                };
+                *result_in.lock().expect("recovery reconcile mutex poisoned") = Some(outcome);
+                Ok(())
+            })
+        })
+        .await?;
+    result
+        .lock()
+        .expect("recovery reconcile mutex poisoned")
+        .take()
+        .context("recovery claim reconcile produced no outcome")
+}
+
+// Test shims: without a live Miden node the recovery classifiers cannot read the
+// bridge snapshot, so they honour ONLY the local projection (`is_ger_injected` /
+// `has_claim_event_for_global_index`) — mirroring production's store-first check —
+// and report NotApplied otherwise, so unit tests exercise the re-drive/handoff paths
+// deterministically. A projected claim with a still-pending receipt is another
+// transaction's (AppliedElsewhere), matching `reconcile_claim_handoff_with_client`.
+#[cfg(test)]
+pub(crate) async fn reconcile_ger_recovery(
+    service: &ServiceState,
+    ger: [u8; 32],
+) -> anyhow::Result<ExactNoteOutcome> {
+    if service.store.is_ger_injected(&ger).await? {
+        Ok(ExactNoteOutcome::AppliedByExactNote)
+    } else {
+        Ok(ExactNoteOutcome::NotApplied)
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn reconcile_claim_recovery(
+    service: &ServiceState,
+    global_index: U256,
+    _note_id: Option<String>,
+) -> anyhow::Result<ExactNoteOutcome> {
+    if service
+        .store
+        .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())
+        .await?
+    {
+        Ok(ExactNoteOutcome::AppliedElsewhere)
+    } else {
+        Ok(ExactNoteOutcome::NotApplied)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

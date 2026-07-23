@@ -448,13 +448,17 @@ impl Store for PgStore {
                 ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
                 anyhow::anyhow!("stored TxEnvelope for {hash_str} cannot be decoded ({e})")
             })?;
-            let note_id: Option<String> = row.get(4);
-            let handoff = note_id.as_ref().map(|_| {
-                match row.get::<_, Option<String>>(5).as_deref() {
-                    Some("prepared") => NoteHandoffState::Prepared,
-                    // Legacy rows default handoff_state to 'submitted' (mig 012).
-                    _ => NoteHandoffState::Submitted,
-                }
+            // Reviewer #2 — detect the handoff by the tx_note_links ROW EXISTENCE
+            // (via its NOT NULL handoff_state), NOT by note_id. On a legacy/upgraded
+            // DB (pre-migration-012) or a row written by `record_tx_note_link`,
+            // note_id can be NULL while a REAL submitted handoff exists; keying off
+            // note_id would classify it as an orphan and re-prove it every sweep.
+            // A missing link row yields a NULL handoff_state via the LEFT JOIN.
+            let handoff_state: Option<String> = row.get(5);
+            let handoff = handoff_state.as_deref().map(|state| match state {
+                "prepared" => NoteHandoffState::Prepared,
+                // Legacy rows default handoff_state to 'submitted' (mig 012).
+                _ => NoteHandoffState::Submitted,
             });
             out.push(RecoverablePendingTxn {
                 tx_hash,

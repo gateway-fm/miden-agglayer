@@ -131,8 +131,18 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "orphan_recovery_successes_total",
-        "#156: acknowledged transactions recovered — re-driven into the writer or \
-         finalised from already-applied Miden state — without client replay."
+        "#156: acknowledged transactions finalised by recovery from already-applied \
+         Miden state (exact-note success) without client replay."
+    );
+    describe_counter!(
+        "orphan_recovery_redrives_total",
+        "#156: orphaned durable intents re-enqueued into the writer by recovery \
+         (backoff persisted before the enqueue; not yet a durable Miden handoff)."
+    );
+    describe_counter!(
+        "orphan_recovery_already_claimed_total",
+        "#157: recovered claims whose global index was landed by ANOTHER transaction \
+         — finalised as a reverted AlreadyClaimed receipt, not a false success."
     );
     describe_counter!(
         "orphan_recovery_deferred_total",

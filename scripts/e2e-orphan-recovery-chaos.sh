@@ -30,12 +30,21 @@ fail() { echo "[chaos] FAIL: $*"; exit 1; }
 
 pgq() { docker exec "$PG" psql -U agglayer -d agglayer_store -tAX -c "$1" 2>/dev/null; }
 metric() { curl -fsS "$L2_RPC/metrics" 2>/dev/null | grep -E "^$1[[:space:]]" | awk '{print $2}' | tail -1; }
+# Total recovery PROGRESS = effect-applied finalisations + re-drives + AlreadyClaimed
+# reverts. Recovery may resolve a chaos-orphaned tx by ANY of these, so sum them.
+recovery_progress() {
+    local s r a
+    s="$(metric orphan_recovery_successes_total)"; s="${s%.*}"; s="${s:-0}"
+    r="$(metric orphan_recovery_redrives_total)"; r="${r%.*}"; r="${r:-0}"
+    a="$(metric orphan_recovery_already_claimed_total)"; a="${a%.*}"; a="${a:-0}"
+    echo $(( s + r + a ))
+}
 
 for c in "$NODE" "$PROXY" "$PG"; do
     docker inspect "$c" >/dev/null 2>&1 || fail "container $c not found — is the stack up?"
 done
 
-SUCC_BEFORE="$(metric orphan_recovery_successes_total)"; SUCC_BEFORE="${SUCC_BEFORE%.*}"; SUCC_BEFORE="${SUCC_BEFORE:-0}"
+SUCC_BEFORE="$(recovery_progress)"
 
 # ── Chaos injector: node-unavailable + proxy-crash rounds, then quiesce ─────────
 chaos_injector() {
@@ -105,8 +114,8 @@ done
     || fail "$ORPHANS acknowledged pending/unlinked transaction(s) remain unrecovered after the chaos"
 pass "no pending/unlinked transactions remain — every acknowledged tx reached a durable outcome"
 
-SUCC_AFTER="$(metric orphan_recovery_successes_total)"; SUCC_AFTER="${SUCC_AFTER%.*}"; SUCC_AFTER="${SUCC_AFTER:-0}"
-log "orphan_recovery_successes_total: $SUCC_BEFORE -> $SUCC_AFTER"
+SUCC_AFTER="$(recovery_progress)"
+log "orphan_recovery progress (successes+redrives+already_claimed): $SUCC_BEFORE -> $SUCC_AFTER"
 [ "$SUCC_AFTER" -gt "$SUCC_BEFORE" ] \
     || log "note: recovery-success counter did not advance (the writer's own retry may have absorbed the faults); orphan drain above is the authoritative proof"
 

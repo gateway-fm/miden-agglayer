@@ -635,10 +635,11 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|(_, r)| r.result.is_none()) // pending only; terminals excluded
             .map(|(hash, r)| {
-                let handoff = links
-                    .get(&format!("{hash:#x}"))
-                    .filter(|link| link.note_id.is_some())
-                    .map(|link| link.state);
+                // Reviewer #2 — detect the handoff by link-row EXISTENCE + state,
+                // not note_id: a legacy/`record_tx_note_link` row can have a real
+                // (submitted) handoff with a NULL note_id, and keying off note_id
+                // would misclassify it as an orphan and re-prove it every sweep.
+                let handoff = links.get(&format!("{hash:#x}")).map(|link| link.state);
                 RecoverablePendingTxn {
                     tx_hash: *hash,
                     signer: format!("{:#x}", r.signer),

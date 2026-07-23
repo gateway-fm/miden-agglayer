@@ -104,33 +104,6 @@ enum Step {
     StopSigner,
 }
 
-/// Is the transaction's intended effect ALREADY present in AUTHORITATIVE Miden
-/// state? Uses [`crate::applied_state`], which for a GER consults the injected set
-/// AND the Miden bridge snapshot, and for a CLAIM consults the projected
-/// ClaimEvent AND the Miden bridge `isClaimed` snapshot — never the local
-/// `claimed_indices` reservation alone, which only proves a claim was
-/// reserved/submitted, NOT that Miden applied it (that would let recovery finalise
-/// an unexecuted claim). A missing local receipt is never treated as proof the
-/// effect is absent. When the Miden node is unavailable this returns `Err`, and
-/// the caller defers with backoff rather than guessing — reconciliation, not a
-/// blind decision.
-async fn effect_already_applied(
-    service: &ServiceState,
-    envelope: &TxEnvelope,
-) -> anyhow::Result<bool> {
-    match decode_write_call(envelope_input(envelope)) {
-        Ok(DecodedWriteCall::Ger { ger_bytes }) => {
-            crate::applied_state::ger_applied(service, &ger_bytes).await
-        }
-        Ok(DecodedWriteCall::Claim { params }) => {
-            crate::applied_state::claim_applied(service, params.globalIndex).await
-        }
-        // An undecodable write is a deterministic failure, not a transient one; it
-        // cannot have applied and must not be retried as an outage.
-        Err(_) => Ok(false),
-    }
-}
-
 /// Borrow an envelope's calldata `input` for `decode_write_call`.
 fn envelope_input(envelope: &TxEnvelope) -> &Bytes {
     match envelope {
@@ -143,9 +116,13 @@ fn envelope_input(envelope: &TxEnvelope) -> &Bytes {
 }
 
 /// Finalise the original proxy hash with a terminal SUCCESS receipt because the
-/// intended effect is already durable in Miden. Clears recovery backoff and
-/// unblocks the next nonce. Never re-submits.
-async fn finalize_success(service: &ServiceState, tx: &RecoverablePendingTxn) {
+/// intended effect is durable in Miden via THIS tx's exact note. Clears recovery
+/// backoff and unblocks the next nonce. Never re-submits. Returns `true` only when
+/// the terminal receipt was DURABLY written — the caller must stop the signer walk
+/// on `false` (reviewer #6), because a lower nonce that did not durably finalise
+/// must not let a higher nonce proceed.
+#[must_use]
+async fn finalize_success(service: &ServiceState, tx: &RecoverablePendingTxn) -> bool {
     let block = service.store.get_latest_block_number().await.unwrap_or(0);
     let block_hash = service.block_state.get_block_hash(block);
     if let Err(e) = service
@@ -153,12 +130,67 @@ async fn finalize_success(service: &ServiceState, tx: &RecoverablePendingTxn) {
         .txn_commit(tx.tx_hash, Ok(()), block, block_hash)
         .await
     {
-        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: finalize_success txn_commit failed; will retry next sweep");
-        return;
+        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: finalize_success txn_commit failed; stopping signer, will retry next sweep");
+        return false;
     }
     let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
     ::metrics::counter!("orphan_recovery_successes_total").increment(1);
-    tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, "recovery: effect already applied in Miden — finalised original hash without resubmission");
+    tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, "recovery: effect already applied in Miden (exact note) — finalised original hash without resubmission");
+    true
+}
+
+/// Finalise the original proxy hash with a terminal REVERTED (`AlreadyClaimed()`)
+/// receipt because the claim's global index was landed by a DIFFERENT transaction/
+/// note (reviewer #3 — "applied elsewhere"). This tx's exact note was NOT the one
+/// consumed, so a plain success receipt would be a lie; re-driving would build a
+/// note that reverts on-chain. A reverted receipt (status 0x0) is geth-faithful and
+/// matches the admission-path `accept_and_revert_landed_claim` (#55) representation.
+/// Returns `true` only when the receipt was durably written (see [`finalize_success`]).
+#[must_use]
+async fn finalize_already_claimed(
+    service: &ServiceState,
+    tx: &RecoverablePendingTxn,
+    global_index: alloy::primitives::U256,
+) -> bool {
+    let block = service.store.get_latest_block_number().await.unwrap_or(0);
+    let block_hash = service.block_state.get_block_hash(block);
+    let msg =
+        format!("claim for globalIndex {global_index} already landed (AlreadyClaimed); reverted");
+    if let Err(e) = service
+        .store
+        .txn_commit(tx.tx_hash, Err(msg), block, block_hash)
+        .await
+    {
+        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: finalize_already_claimed txn_commit failed; stopping signer, will retry next sweep");
+        return false;
+    }
+    let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
+    ::metrics::counter!("orphan_recovery_already_claimed_total").increment(1);
+    tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, %global_index, "recovery: claim landed via another transaction — finalised original hash as AlreadyClaimed (reverted), not resubmitted");
+    true
+}
+
+/// Finalise the original hash with a terminal FAILURE receipt (a deterministic,
+/// non-retryable error). Returns `true` only when durably written (see #6).
+#[must_use]
+async fn finalize_terminal_failure(
+    service: &ServiceState,
+    tx: &RecoverablePendingTxn,
+    reason: String,
+) -> bool {
+    let block = service.store.get_latest_block_number().await.unwrap_or(0);
+    let block_hash = service.block_state.get_block_hash(block);
+    if let Err(e) = service
+        .store
+        .txn_commit(tx.tx_hash, Err(reason.clone()), block, block_hash)
+        .await
+    {
+        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: terminal-failure txn_commit failed; stopping signer, will retry next sweep");
+        return false;
+    }
+    let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
+    tracing::error!(target: "recovery", tx_hash = %tx.tx_hash, reason, "recovery: recorded terminal failure");
+    true
 }
 
 /// Examine one durable pending transaction (caller holds the signer lock).
@@ -174,34 +206,106 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         return Step::Continue;
     }
 
-    // 2. Reconcile against authoritative Miden state before any resubmission.
-    match effect_already_applied(service, &tx.envelope).await {
-        Ok(true) => {
-            finalize_success(service, tx).await;
-            return Step::Continue;
-        }
-        Ok(false) => {}
+    // Decode the durable write call once — needed both to reconcile against Miden
+    // and, if we must re-drive, to rebuild the writer job.
+    let decoded = match decode_write_call(envelope_input(&tx.envelope)) {
+        Ok(d) => d,
         Err(e) => {
-            // The node is unavailable — a TRANSIENT outage, NOT a per-tx failure.
-            // Do NOT grow the exponential backoff: that would delay recovery long
-            // after the node returns (a node-down window could push the next
-            // attempt minutes out, well past a deposit's claim deadline). The next
-            // sweep (~RECOVERY_SWEEP_INTERVAL_SECS) simply retries the reconcile.
+            // Deterministic decode failure — never transient. Record a terminal
+            // failure so it stops blocking later nonces; stop the signer if that
+            // durable write did NOT land (reviewer #6 — a lower nonce that did not
+            // durably finalise must not let a higher one proceed).
+            let ok = finalize_terminal_failure(
+                service,
+                tx,
+                format!("recovery: undecodable write call ({e})"),
+            )
+            .await;
+            return if ok { Step::Continue } else { Step::StopSigner };
+        }
+    };
+
+    // Read the durable note handoff once: the exact `note_id` for the reconcile
+    // (reviewer #3) and the `note_commitment` for the prepared-expiry path. tx.handoff
+    // (row existence + state) already classified it; here we fetch the identity.
+    let tx_key = format!("{:#x}", tx.tx_hash);
+    let handoff = match service.store.get_note_handoff_for_tx(&tx_key).await {
+        Ok(h) => h,
+        Err(e) => {
+            poll_next_sweep(tx, &format!("handoff read failed (db unavailable?): {e}"));
+            return Step::StopSigner;
+        }
+    };
+    let handoff_note_id = handoff.as_ref().and_then(|h| h.note_id.clone());
+
+    // 2. Reconcile against a FRESH, authoritative Miden view (reviewer #5 — the
+    //    classifier syncs before reading, so a stale local view never reports a false
+    //    "absent"), using the EXACT handoff note when known so a claim landed by a
+    //    DIFFERENT transaction is not mistaken for this one succeeding (reviewer #3).
+    let outcome = match &decoded {
+        DecodedWriteCall::Ger { ger_bytes } => {
+            crate::applied_state::reconcile_ger_recovery(service, *ger_bytes).await
+        }
+        DecodedWriteCall::Claim { params } => {
+            crate::applied_state::reconcile_claim_recovery(
+                service,
+                params.globalIndex,
+                handoff_note_id,
+            )
+            .await
+        }
+    };
+    match outcome {
+        Err(e) => {
+            // Node unavailable OR no fresh view — NEVER decide "absent" from a
+            // stale/absent read. Poll at the sweep cadence (do NOT grow the backoff:
+            // a node-down window would otherwise push recovery minutes out, past a
+            // deposit's claim deadline).
             poll_next_sweep(
                 tx,
-                &format!("Miden state check failed (node unavailable?): {e}"),
+                &format!("Miden reconcile failed (node unavailable/unsynced?): {e}"),
             );
             return Step::StopSigner;
         }
+        Ok(crate::applied_state::ExactNoteOutcome::AppliedByExactNote) => {
+            return if finalize_success(service, tx).await {
+                Step::Continue
+            } else {
+                Step::StopSigner
+            };
+        }
+        Ok(crate::applied_state::ExactNoteOutcome::AppliedElsewhere) => {
+            // GER injection is idempotent + ownership-independent → success. A CLAIM
+            // landed by ANOTHER tx/note → THIS tx would revert AlreadyClaimed, so a
+            // success receipt would be a lie (reviewer #3).
+            return match &decoded {
+                DecodedWriteCall::Ger { .. } => {
+                    if finalize_success(service, tx).await {
+                        Step::Continue
+                    } else {
+                        Step::StopSigner
+                    }
+                }
+                DecodedWriteCall::Claim { params } => {
+                    if finalize_already_claimed(service, tx, params.globalIndex).await {
+                        Step::Continue
+                    } else {
+                        Step::StopSigner
+                    }
+                }
+            };
+        }
+        // NotApplied, or Uncertain (the exact note is Missing/unsynced): do NOT
+        // finalise — fall through to the handoff-state machine, which polls a
+        // submitted note, clears+re-drives a provably-dead prepared note, or
+        // re-drives a pure orphan.
+        Ok(crate::applied_state::ExactNoteOutcome::NotApplied)
+        | Ok(crate::applied_state::ExactNoteOutcome::Uncertain) => {}
     }
 
-    // 3. A CONFIRMED submission — a `Submitted` handoff (the Miden tx committed or
-    //    the exact note was later observed) or a recorded Miden tx id — crossed the
-    //    boundary and Miden already has it. Poll for the effect to become observable
-    //    at the sweep cadence (NOT exponential backoff — the projector observes it
-    //    shortly and finalisation should not be delayed); never re-submit a confirmed
-    //    tx, and hold later nonces until it resolves. (A still-`Prepared` handoff is
-    //    deliberately NOT polled here.)
+    // 3. A CONFIRMED submission — a `Submitted` handoff or a recorded Miden tx id —
+    //    crossed the boundary and Miden already has it. Poll for the effect at the
+    //    sweep cadence; never re-submit, and hold later nonces until it resolves.
     if matches!(tx.handoff, Some(NoteHandoffState::Submitted)) || tx.miden_tx_id.is_some() {
         poll_next_sweep(tx, "submitted handoff; awaiting Miden confirmation");
         return Step::StopSigner;
@@ -217,27 +321,15 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
     //     Miden reconcile cursor has passed its expiration block (proving the creating
     //     tx can never be included, so the note is dead), then re-drive a fresh note.
     //     Until then, poll at the sweep cadence — the note may yet be consumed (→ effect
-    //     applied, finalised in steps 2/3) or will expire. (This relies on submission
-    //     notes carrying a finite expiration delta; see `submission_note_expiration_delta`.)
+    //     applied, finalised in step 2) or will expire. (Relies on submission notes
+    //     carrying a finite expiration delta; see `submission_note_expiration_delta`.)
     if matches!(tx.handoff, Some(NoteHandoffState::Prepared)) {
-        let tx_key = format!("{:#x}", tx.tx_hash);
-        let commitment = match service.store.get_note_handoff_for_tx(&tx_key).await {
-            Ok(Some(handoff)) => handoff.note_commitment,
-            Ok(None) => {
-                // Resolved concurrently (confirmed or cleared); re-reconcile next sweep.
-                poll_next_sweep(
-                    tx,
-                    "prepared handoff no longer present; re-checking next sweep",
-                );
-                return Step::StopSigner;
-            }
-            Err(e) => {
-                poll_next_sweep(
-                    tx,
-                    &format!("prepared-handoff read failed (node/db unavailable?): {e}"),
-                );
-                return Step::StopSigner;
-            }
+        let Some(commitment) = handoff.as_ref().map(|h| h.note_commitment.clone()) else {
+            poll_next_sweep(
+                tx,
+                "prepared handoff no longer present; re-checking next sweep",
+            );
+            return Step::StopSigner;
         };
         match service
             .store
@@ -250,9 +342,6 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
                 tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, "recovery: cleared expired prepared note handoff; re-driving a fresh note");
             }
             Ok(false) => {
-                // Not yet expired: still possibly in-flight. Building a second note now
-                // would conflict (and, once expired, is handled above); wait for the
-                // effect or expiration and retry the reconcile next sweep.
                 poll_next_sweep(
                     tx,
                     "prepared note not yet expired; awaiting consumption or expiration",
@@ -269,10 +358,8 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         }
     }
 
-    // 4b. Orphaned durable intent (or a just-cleared, provably-dead prepared handoff):
-    //     the pending row + nonce CAS are durable but no live note remains, so polling
-    //     alone would never resolve it. Re-drive the exact intent once its persistent
-    //     backoff is due.
+    // 4b. Orphaned durable intent (or a just-cleared, provably-dead prepared handoff).
+    //     Re-drive the exact intent once its persistent backoff is due.
     if let Some(next_at) = tx.next_recovery_at
         && next_at > now_unix()
     {
@@ -281,54 +368,48 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         return Step::StopSigner;
     }
 
-    ::metrics::counter!("orphan_recovery_attempts_total").increment(1);
-
-    // Re-drive by RE-ENQUEUEING the writer job directly for this already-durable
-    // intent. The pending row and the nonce CAS are already persisted, so we must
-    // NOT go back through nonce classification (the public admission path only
-    // resumes a tx exactly one below the expected nonce, which would reject the
-    // lower of several orphans as a stale nonce). Rebuilding the job from the
-    // stored envelope and enqueueing it is the exact work the original admission
-    // did after `durably_admit_and_advance_nonce`, so the nonce never advances
-    // twice and multiple orphans recover in nonce order. Idempotency is preserved
-    // by the writer's handoff fencing and Miden duplicate-protection.
     let Some(handle) = service.writer_handle.as_ref() else {
         defer_with_backoff(service, tx, "no writer handle available").await;
         return Step::StopSigner;
     };
-    let decoded = match decode_write_call(envelope_input(&tx.envelope)) {
-        Ok(d) => d,
-        Err(e) => {
-            // Deterministic decode failure — never a transient outage. Record a
-            // definite terminal failure so it stops blocking later nonces.
-            let block = service.store.get_latest_block_number().await.unwrap_or(0);
-            let block_hash = service.block_state.get_block_hash(block);
-            let _ = service
-                .store
-                .txn_commit(
-                    tx.tx_hash,
-                    Err(format!("recovery: undecodable write call ({e})")),
-                    block,
-                    block_hash,
-                )
-                .await;
-            let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
-            tracing::error!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: envelope is not a supported write call; recorded terminal failure");
-            return Step::Continue;
-        }
-    };
+
+    // Reviewer #1 — persist the next backoff BEFORE the enqueue and clear it only on
+    // a durable handoff/terminal (via `finalize_*`), NEVER merely because the enqueue
+    // was accepted. Otherwise a crash AFTER the enqueue but BEFORE a durable Miden
+    // handoff would leave a zero backoff and the next sweep would re-drive immediately
+    // — an unbounded retry-loop under repeated OOM. Persisting first means: an enqueue
+    // that yields a handoff is polled (steps 3/4a) and finalised (clearing it), while
+    // a crash mid-flight leaves the persisted backoff to gate the next attempt.
+    ::metrics::counter!("orphan_recovery_attempts_total").increment(1);
+    let jitter_seed = u64::from_le_bytes(tx.tx_hash.0[..8].try_into().unwrap_or([0u8; 8]));
+    let next_at = next_backoff_at(tx.recovery_attempts, jitter_seed);
+    let attempts = service
+        .store
+        .record_recovery_attempt(tx.tx_hash, next_at)
+        .await
+        .unwrap_or(tx.recovery_attempts.saturating_add(1));
+    if attempts >= 5 {
+        ::metrics::counter!("orphan_recovery_persistent_failures_total").increment(1);
+        tracing::error!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, attempts, "recovery: transaction has failed recovery repeatedly — operator attention required");
+    }
+
+    // Re-drive by RE-ENQUEUEING the writer job directly for this already-durable
+    // intent (NOT the public admission path, which only resumes a tx exactly one
+    // below the expected nonce and would reject the lower of several orphans as
+    // stale). The nonce CAS is already persisted, so this advances no nonce and
+    // recovers multiple orphans for one signer in nonce order; idempotency is
+    // preserved by the writer's handoff fencing and Miden duplicate-protection.
     let job = decoded.into_job(tx.envelope.clone(), signer, tx.tx_hash);
     match handle.try_enqueue(job) {
         Ok(()) => {
-            let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
-            ::metrics::counter!("orphan_recovery_successes_total").increment(1);
-            tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, attempts = tx.recovery_attempts, "recovery: re-enqueued orphaned durable intent into the writer");
+            ::metrics::counter!("orphan_recovery_redrives_total").increment(1);
+            tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, attempts, "recovery: re-enqueued orphaned durable intent into the writer (backoff persisted pre-enqueue)");
             Step::Continue
         }
         Err(e) => {
-            // Writer saturated or shut down — transient. Defer with backoff; the
-            // row stays durable and recoverable on the next sweep.
-            defer_with_backoff(service, tx, &format!("re-enqueue failed: {e}")).await;
+            // Writer saturated/shut down — the backoff is already persisted above.
+            ::metrics::counter!("orphan_recovery_deferred_total").increment(1);
+            tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, attempts, error = %e, "recovery: re-enqueue failed; deferred with persisted backoff");
             Step::StopSigner
         }
     }
@@ -471,6 +552,44 @@ mod tests {
         (envelope, hash, ger_bytes, key.address())
     }
 
+    /// A `claimAsset` transaction really signed by `key` at `nonce` for
+    /// `global_index`. Proof fields are zeroed — recovery classification never
+    /// executes the proof; it only decodes the global index.
+    fn signed_claim_tx(
+        key: &PrivateKeySigner,
+        nonce: u64,
+        global_index: alloy::primitives::U256,
+        dest_marker: u8,
+    ) -> (TxEnvelope, TxHash, Address) {
+        use crate::claim::claimAssetCall;
+        let params = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: global_index,
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 1,
+            destinationAddress: Address::from([dest_marker; 20]),
+            amount: alloy::primitives::U256::from(1000u64),
+            metadata: Default::default(),
+        };
+        let txn = TxLegacy {
+            nonce,
+            input: params.abi_encode().into(),
+            chain_id: Some(1),
+            gas_price: 1,
+            ..Default::default()
+        };
+        let sig = key
+            .sign_hash_sync(&txn.signature_hash())
+            .expect("sign test claim tx");
+        let signed = txn.into_signed(sig);
+        let hash = *signed.hash();
+        (signed.into(), hash, key.address())
+    }
+
     fn signer_hex(signer: Address) -> String {
         format!("{signer:#x}")
     }
@@ -580,6 +699,67 @@ mod tests {
         assert!(
             !handle.is_inflight(&hash),
             "an already-applied effect must NOT be resubmitted to the writer"
+        );
+    }
+
+    /// Reviewer #3 — a recovered CLAIM whose global index was landed by ANOTHER
+    /// transaction (a projected ClaimEvent for a different tx hash) must be finalised
+    /// as a REVERTED `AlreadyClaimed` receipt, NOT a false success, and must NOT be
+    /// resubmitted (a fresh claim would revert on-chain). This is the exact-note-vs-
+    /// applied-elsewhere distinction the coarse index check conflated.
+    #[tokio::test]
+    async fn claim_applied_elsewhere_finalizes_reverted_not_success() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let global_index = crate::applied_state::global_index_for_claim(7, 0);
+        let (env, hash, signer) = signed_claim_tx(&key, 0, global_index, 0xC7);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        // A DIFFERENT transaction already landed this global index.
+        let gi_bytes = global_index.to_be_bytes::<32>();
+        store
+            .add_claim_event(
+                &format!("{:#x}", Address::from([0xBBu8; 20])),
+                1,
+                [2u8; 32],
+                &format!("{:#x}", TxHash::from([0x0Au8; 32])),
+                &gi_bytes,
+                0,
+                &[0u8; 20],
+                &[0xC7u8; 20],
+                1000,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .has_claim_event_for_global_index(&gi_bytes)
+                .await
+                .unwrap()
+        );
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        let (result, _) = store
+            .txn_receipt(hash)
+            .await
+            .unwrap()
+            .expect("recovery must finalise a terminal receipt for an applied-elsewhere claim");
+        let err = result.expect_err("an applied-elsewhere claim must be REVERTED, not a success");
+        assert!(
+            err.contains("AlreadyClaimed"),
+            "the revert reason must state AlreadyClaimed: {err}"
+        );
+        assert!(
+            !handle.is_inflight(&hash),
+            "an applied-elsewhere claim must NOT be resubmitted to the writer"
+        );
+        assert_eq!(
+            store.nonce_get(&signer_hex(signer)).await.unwrap(),
+            1,
+            "finalising an applied-elsewhere claim must not advance the nonce twice"
         );
     }
 
