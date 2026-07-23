@@ -104,4 +104,29 @@ log "orphan_recovery_successes_total: $SUCC_BEFORE -> $SUCC_AFTER"
 [ "$SUCC_AFTER" -gt "$SUCC_BEFORE" ] \
     || log "note: recovery-success counter did not advance (the writer's own retry may have absorbed the faults); orphan drain above is the authoritative proof"
 
-pass "#156 chaos e2e: node-unavailable + proxy-crash both self-healed with at most a proxy restart, exactly once"
+# ── Post-chaos liveness: the WHOLE pipeline must still work in BOTH directions ──
+# Recovering the chaos'd transaction is not enough — prove the bridge is fully
+# healthy afterwards by running fresh deposits (L1->L2) AND withdrawals (L2->L1),
+# twice each way. A wedged consumer or a stuck nonce would fail these.
+log "post-chaos liveness: 2x deposits (L1->L2) + 2x withdrawals (L2->L1)"
+for i in 1 2; do
+    DEP_LOG="$(mktemp /tmp/postchaos-dep.XXXXXX.log)"
+    if env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh" > "$DEP_LOG" 2>&1; then
+        pass "post-chaos deposit #$i (L1->L2) succeeded"
+    else
+        echo "----- deposit #$i output (tail) -----"; sed -E 's/\x1b\[[0-9;]*m//g' "$DEP_LOG" | tail -15
+        fail "post-chaos L1->L2 deposit #$i FAILED — the bridge did not fully recover after the chaos"
+    fi
+done
+for i in 1 2; do
+    WD_LOG="$(mktemp /tmp/postchaos-wd.XXXXXX.log)"
+    if env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l2-to-l1.sh" > "$WD_LOG" 2>&1; then
+        pass "post-chaos withdrawal #$i (L2->L1) succeeded"
+    else
+        echo "----- withdrawal #$i output (tail) -----"; sed -E 's/\x1b\[[0-9;]*m//g' "$WD_LOG" | tail -15
+        fail "post-chaos L2->L1 withdrawal #$i FAILED — the bridge did not fully recover after the chaos"
+    fi
+done
+pass "post-chaos liveness confirmed: deposits + withdrawals both work (2x each way) after node-unavailable + proxy-crash chaos"
+
+pass "#156 chaos e2e: node-unavailable + proxy-crash both self-healed with at most a proxy restart, exactly once; bridge fully live both ways afterward"
