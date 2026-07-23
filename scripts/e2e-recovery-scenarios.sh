@@ -103,6 +103,18 @@ wait_for_marker() {
 # pending/not-found). Return just the leading digit: 1, 0, or "".
 receipt_status() { cast receipt --rpc-url "$L2_RPC" "$1" status 2>/dev/null | awk '{print $1; exit}'; }
 
+# Wait until the writer is idle (no in-flight jobs), so a controlled submission is
+# PROVED PROMPTLY. A backed-up writer (e.g. after prior scenarios) delays proving
+# past the marker wait and the kill misses the window. Best-effort + a settle.
+wait_quiescent() {
+    for _ in $(seq 1 60); do
+        local inflight; inflight="$(metric_val agglayer_writer_inflight_jobs)"; inflight="${inflight%.*}"
+        [ "${inflight:-1}" = "0" ] && break
+        sleep 3
+    done
+    sleep 4
+}
+
 # ── Fault injectors (verify the target is actually down) ────────────────────────
 crash_node() {
     log "  fault: KILL miden-node (keep down ${NODE_DOWN_SECS:-25}s)"
@@ -127,6 +139,7 @@ scenario_ger() {
     local fault="$1" tag="$2"
     log "═══ SCENARIO ($tag): $fault crash during GER proving ═══"
     local prog0 nonce_before ger since hash
+    wait_quiescent
     prog0="$(recovery_progress)"
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$GER_ADDR")"
     ger="0x$(printf '%064x' "$(( 0xE50000 + RANDOM ))")"
@@ -136,7 +149,7 @@ scenario_ger() {
         "$BRIDGE" 'insertGlobalExitRoot(bytes32)' "$ger" 2>/dev/null)"
     [[ "$hash" == 0x* ]] || fail "controlled GER submit not admitted (hash=$hash; REJECT_UNVERIFIED_GER=true?)"
     log "  admitted $hash (signer=$GER_ADDR nonce=$nonce_before ger=$ger); waiting for PROOF boundary"
-    wait_for_marker "$GER_PROVE_MARKER" "$since" 60 || fail "GER never reached the proof boundary"
+    wait_for_marker "$GER_PROVE_MARKER" "$since" 180 || fail "GER never reached the proof boundary"
 
     case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
 
