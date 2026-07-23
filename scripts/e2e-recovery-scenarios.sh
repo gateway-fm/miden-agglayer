@@ -75,6 +75,20 @@ recovery_progress() {
     echo $(( ${s:-0} + ${r:-0} + ${a:-0} ))
 }
 
+# Assert recovery actually ran. A PROXY restart RESETS the in-process Prometheus
+# counters, so a pre/post delta is invalid there — instead require the post value to
+# be >=1 (recovery incremented it since the restart). For a NODE crash the proxy
+# stays up, so the counter must strictly advance past the pre-fault baseline.
+assert_recovery_ran() {
+    local fault="$1" prog0="$2" prog1="$3" what="$4"
+    if [ "$fault" = "proxy" ]; then
+        [ "${prog1:-0}" -ge 1 ] || fail "no post-restart recovery for this $what (counter=$prog1)"
+    else
+        [ "${prog1:-0}" -gt "${prog0:-0}" ] || fail "recovery counters did not advance for this $what ($prog0 -> $prog1)"
+    fi
+    pass "  recovery ran (counter $prog0 -> $prog1)"
+}
+
 # Wait for a proxy log marker that appeared AFTER $since (unix ts).
 wait_for_marker() {
     local marker="$1" since="$2" tries="${3:-60}"
@@ -148,8 +162,7 @@ scenario_ger() {
     pass "  nonce advanced exactly once ($nonce_before → $nonce_after) — no double-advance / no rebroadcast"
 
     local prog1; prog1="$(recovery_progress)"
-    [ "${prog1:-0}" -gt "${prog0:-0}" ] || fail "recovery counters did not advance for this GER ($prog0 → $prog1)"
-    pass "  recovery counters advanced ($prog0 → $prog1)"
+    assert_recovery_ran "$fault" "$prog0" "$prog1" "GER"
 
     # Next nonce works.
     local ger2 hash2 ok2=""
@@ -223,8 +236,7 @@ scenario_claim() {
     pass "  claim signer nonce advanced exactly once ($nonce_before → $nonce_after)"
 
     local prog1; prog1="$(recovery_progress)"
-    [ "${prog1:-0}" -gt "${prog0:-0}" ] || fail "recovery counters did not advance for this claim ($prog0 → $prog1)"
-    pass "  recovery counters advanced ($prog0 → $prog1)"
+    assert_recovery_ran "$fault" "$prog0" "$prog1" "claim"
 
     # Restart the ClaimTxManager and prove the NEXT claim works (nonce continuity).
     docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
