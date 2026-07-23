@@ -289,21 +289,30 @@ pub(crate) async fn reconcile_claim_handoff_with_client(
     ))
 }
 
-/// Recovery-oriented, FRESH GER effect classification (reviewer #5). Syncs the
-/// Miden view before reading so a stale local view can never report "absent" and
-/// trigger a spurious re-drive. GER injection is idempotent and ownership-
-/// independent, so the exact-note distinction is irrelevant here: any applied
-/// result is a success for the caller; only a truly-absent GER re-drives.
+/// Recovery-oriented, FRESH GER effect classification (reviewers #4 + #5). Syncs the
+/// Miden view first, then — like claims — uses the EXACT handoff note. This matters
+/// because the Miden bridge state (nullifier/GER map) can show a GER applied BEFORE
+/// the SyntheticProjector processes that consumption and emits the GER's
+/// `UpdateHashChainValue` event + finalises the receipt atomically. Finalising off
+/// the bridge snapshot alone would expose a success receipt at the wrong block with
+/// no event. So: exact note Consumed → `AppliedByExactNote` (caller polls, leaves it
+/// projector-owned); GER applied but our note is not the one, or no note → the
+/// idempotent `AppliedElsewhere` (caller uses the confirmed-duplicate success path);
+/// not applied → `NotApplied` (re-drive). A legacy submitted GER (handoff, NULL
+/// note_id) stays `Uncertain` — projection resolves it.
 #[cfg(not(test))]
 pub(crate) async fn reconcile_ger_recovery(
     service: &ServiceState,
     ger: [u8; 32],
+    note_id: Option<String>,
+    has_handoff: bool,
 ) -> anyhow::Result<ExactNoteOutcome> {
-    if service.store.is_ger_injected(&ger).await? {
-        return Ok(ExactNoteOutcome::AppliedByExactNote);
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
     }
+    let store = service.store.clone();
     let bridge_id = service.accounts.0.bridge.0;
-    let result: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let result: Arc<Mutex<Option<ExactNoteOutcome>>> = Arc::new(Mutex::new(None));
     let result_in = result.clone();
     service
         .miden_client
@@ -313,25 +322,43 @@ pub(crate) async fn reconcile_ger_recovery(
                     .sync_state()
                     .await
                     .context("fresh Miden sync before recovery GER reconcile")?;
-                let applied = bridge_snapshot_with_client(client, bridge_id, Some(ger), None, None)
-                    .await?
-                    .ger_applied
-                    .unwrap_or(false);
-                *result_in.lock().expect("recovery reconcile mutex poisoned") = Some(applied);
+                let outcome = match note_id {
+                    Some(note_id) => {
+                        reconcile_ger_handoff_with_client(&*store, client, bridge_id, ger, note_id)
+                            .await?
+                    }
+                    None => {
+                        // A pure orphan (no handoff): no exact note of ours, so an
+                        // applied GER was injected by a DIFFERENT transaction (or is a
+                        // duplicate) — idempotent AppliedElsewhere.
+                        let applied = store.is_ger_injected(&ger).await?
+                            || bridge_snapshot_with_client(
+                                client,
+                                bridge_id,
+                                Some(ger),
+                                None,
+                                None,
+                            )
+                            .await?
+                            .ger_applied
+                            .unwrap_or(false);
+                        if applied {
+                            ExactNoteOutcome::AppliedElsewhere
+                        } else {
+                            ExactNoteOutcome::NotApplied
+                        }
+                    }
+                };
+                *result_in.lock().expect("recovery reconcile mutex poisoned") = Some(outcome);
                 Ok(())
             })
         })
         .await?;
-    let applied = result
+    result
         .lock()
         .expect("recovery reconcile mutex poisoned")
         .take()
-        .context("recovery GER reconcile produced no result")?;
-    Ok(if applied {
-        ExactNoteOutcome::AppliedByExactNote
-    } else {
-        ExactNoteOutcome::NotApplied
-    })
+        .context("recovery GER reconcile produced no outcome")
 }
 
 /// Recovery-oriented, FRESH claim effect classification (reviewers #3 + #5). Syncs
@@ -425,9 +452,18 @@ pub(crate) async fn reconcile_claim_recovery(
 pub(crate) async fn reconcile_ger_recovery(
     service: &ServiceState,
     ger: [u8; 32],
+    note_id: Option<String>,
+    has_handoff: bool,
 ) -> anyhow::Result<ExactNoteOutcome> {
+    // Legacy submitted GER (handoff, NULL note_id) stays Uncertain.
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
+    }
+    // Without a live node the shim honours only the local projection: an applied GER
+    // with no exact note of ours is the idempotent AppliedElsewhere (→ confirmed-
+    // duplicate success), mirroring production; otherwise NotApplied.
     if service.store.is_ger_injected(&ger).await? {
-        Ok(ExactNoteOutcome::AppliedByExactNote)
+        Ok(ExactNoteOutcome::AppliedElsewhere)
     } else {
         Ok(ExactNoteOutcome::NotApplied)
     }

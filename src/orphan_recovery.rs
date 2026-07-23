@@ -115,27 +115,31 @@ fn envelope_input(envelope: &TxEnvelope) -> &Bytes {
     }
 }
 
-/// Finalise the original proxy hash with a terminal SUCCESS receipt because the
-/// intended effect is durable in Miden via THIS tx's exact note. Clears recovery
-/// backoff and unblocks the next nonce. Never re-submits. Returns `true` only when
-/// the terminal receipt was DURABLY written — the caller must stop the signer walk
-/// on `false` (reviewer #6), because a lower nonce that did not durably finalise
-/// must not let a higher nonce proceed.
+/// Finalise the original proxy hash with a terminal SUCCESS receipt for a GER that
+/// was applied ELSEWHERE (injected by another transaction, or a duplicate). GER
+/// injection is idempotent and ownership-independent, so a duplicate is a success.
+///
+/// Uses `txn_commit_confirmed_duplicate` (NOT `txn_commit`): ordinary `txn_commit`
+/// no-ops on a note-linked row (projector-owned), so a LINKED applied-elsewhere GER
+/// would silently loop. The confirmed-duplicate path finalises a linked-or-unlinked
+/// row without emitting an event and without overwriting an existing terminal
+/// receipt. It is used ONLY for `AppliedElsewhere`; an EXACT-note GER is left pending
+/// so the projector finalises it atomically with its `UpdateHashChainValue` event at
+/// the consumption block (reviewer #4). Returns `true` only when durably written.
 #[must_use]
-async fn finalize_success(service: &ServiceState, tx: &RecoverablePendingTxn) -> bool {
+async fn finalize_ger_duplicate(service: &ServiceState, tx: &RecoverablePendingTxn) -> bool {
     let block = service.store.get_latest_block_number().await.unwrap_or(0);
-    let block_hash = service.block_state.get_block_hash(block);
     if let Err(e) = service
         .store
-        .txn_commit(tx.tx_hash, Ok(()), block, block_hash)
+        .txn_commit_confirmed_duplicate(tx.tx_hash, Ok(()), block)
         .await
     {
-        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: finalize_success txn_commit failed; stopping signer, will retry next sweep");
+        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, error = %e, "recovery: finalize_ger_duplicate commit failed; stopping signer, will retry next sweep");
         return false;
     }
     let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
     ::metrics::counter!("orphan_recovery_successes_total").increment(1);
-    tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, "recovery: effect already applied in Miden (exact note) — finalised original hash without resubmission");
+    tracing::info!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, signer = %tx.signer, "recovery: GER already applied elsewhere (idempotent) — finalised original hash as a confirmed duplicate");
     true
 }
 
@@ -268,7 +272,13 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
     //    DIFFERENT transaction is not mistaken for this one succeeding (reviewer #3).
     let outcome = match &decoded {
         DecodedWriteCall::Ger { ger_bytes } => {
-            crate::applied_state::reconcile_ger_recovery(service, *ger_bytes).await
+            crate::applied_state::reconcile_ger_recovery(
+                service,
+                *ger_bytes,
+                handoff_note_id,
+                tx.handoff.is_some(),
+            )
+            .await
         }
         DecodedWriteCall::Claim { params } => {
             crate::applied_state::reconcile_claim_recovery(
@@ -293,43 +303,32 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
             return Step::StopSigner;
         }
         Ok(crate::applied_state::ExactNoteOutcome::AppliedByExactNote) => {
-            // The EXACT note landed. Reviewer #4 — finalisation of an exact landed
-            // note is PROJECTOR-OWNED: the SyntheticProjector finalises the receipt
-            // atomically with its Claim/GER event at the CONSUMPTION block. Recovery
-            // must NOT write a bare success receipt first, or it exposes a success
-            // with no event and the wrong block.
-            return match &decoded {
-                // GER reaches AppliedByExactNote only via `is_ger_injected` — i.e. the
-                // GER event is ALREADY projected — and only for an UNLINKED lost-receipt
-                // orphan (a linked GER is finalised atomically, so it is never pending
-                // here). Finalising is safe: no per-note event gap.
-                DecodedWriteCall::Ger { .. } => {
-                    if finalize_success(service, tx).await {
-                        Step::Continue
-                    } else {
-                        Step::StopSigner
-                    }
-                }
-                // CLAIM reaches AppliedByExactNote only when the note is Consumed but
-                // its ClaimEvent is NOT yet projected. Leave the receipt PENDING and
-                // poll — normal projection finalises it atomically with the ClaimEvent
-                // (mirrors the projector's `finalize_pending_duplicate`).
-                DecodedWriteCall::Claim { .. } => {
-                    poll_next_sweep(
-                        tx,
-                        "claim exact-note consumed; awaiting ClaimEvent projection",
-                    );
-                    Step::StopSigner
-                }
+            // The EXACT note landed. Reviewer #4 — finalisation of an exact landed note
+            // is PROJECTOR-OWNED for BOTH GER and CLAIM: the SyntheticProjector
+            // finalises the receipt atomically with its event (ClaimEvent /
+            // UpdateHashChainValue) at the CONSUMPTION block. The Miden bridge state can
+            // show the effect applied BEFORE the projector processes that block, so
+            // recovery writing a success receipt now would expose a success at the wrong
+            // block with no event. Leave it PENDING and poll — projection finalises it.
+            let what = match &decoded {
+                DecodedWriteCall::Ger { .. } => "GER",
+                DecodedWriteCall::Claim { .. } => "claim",
             };
+            poll_next_sweep(
+                tx,
+                &format!("{what} exact-note consumed; awaiting event projection (projector-owned)"),
+            );
+            return Step::StopSigner;
         }
         Ok(crate::applied_state::ExactNoteOutcome::AppliedElsewhere) => {
-            // GER injection is idempotent + ownership-independent → success. A CLAIM
-            // landed by ANOTHER tx/note → THIS tx would revert AlreadyClaimed, so a
-            // success receipt would be a lie (reviewer #3).
+            // The effect was applied by ANOTHER transaction/note; the projector will
+            // never emit an event for THIS tx's (unconsumed/absent) note, so recovery
+            // finalises it as a confirmed duplicate. GER injection is idempotent →
+            // success; a CLAIM would revert AlreadyClaimed. Both use the confirmed-
+            // duplicate path (works on linked rows; emits no event).
             return match &decoded {
                 DecodedWriteCall::Ger { .. } => {
-                    if finalize_success(service, tx).await {
+                    if finalize_ger_duplicate(service, tx).await {
                         Step::Continue
                     } else {
                         Step::StopSigner
@@ -866,6 +865,39 @@ mod tests {
         assert!(
             !handle.is_inflight(&hash),
             "a submitted (null-note_id) claim must not be re-driven"
+        );
+    }
+
+    /// Reviewer #4 (GER atomicity) — a legacy submitted GER (handoff, NULL note_id)
+    /// must NOT be finalised off the bridge snapshot before the projector emits its
+    /// UpdateHashChainValue event: it stays PENDING (Uncertain) for projection.
+    #[tokio::test]
+    async fn legacy_null_note_id_ger_stays_pending() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xD7);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        // Legacy SUBMITTED handoff with a NULL note_id (record_tx_note_link).
+        store
+            .record_tx_note_link(&format!("{hash:#x}"), "0xcommit")
+            .await
+            .unwrap();
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        // Recovery must NOT finalise it off the bridge snapshot (which would race the
+        // projector's UpdateHashChainValue event): it stays PENDING for projection and
+        // is not re-driven.
+        assert!(
+            store.txn_receipt(hash).await.unwrap().is_none(),
+            "a legacy null-note_id GER must stay PENDING for projection, not be finalised by recovery"
+        );
+        assert!(
+            !handle.is_inflight(&hash),
+            "a legacy null-note_id GER must not be re-driven by recovery"
         );
     }
 

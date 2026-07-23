@@ -103,16 +103,19 @@ wait_for_marker() {
 # pending/not-found). Return just the leading digit: 1, 0, or "".
 receipt_status() { cast receipt --rpc-url "$L2_RPC" "$1" status 2>/dev/null | awk '{print $1; exit}'; }
 
-# Wait until the writer is idle (no in-flight jobs), so a controlled submission is
-# PROVED PROMPTLY. A backed-up writer (e.g. after prior scenarios) delays proving
-# past the marker wait and the kill misses the window. Best-effort + a settle.
-wait_quiescent() {
-    for _ in $(seq 1 60); do
-        local inflight; inflight="$(metric_val agglayer_writer_inflight_jobs)"; inflight="${inflight%.*}"
-        [ "${inflight:-1}" = "0" ] && break
-        sleep 3
-    done
-    sleep 4
+# TRUSTWORTHINESS GUARD: assert the exact tx is pending AND has no note handoff —
+# i.e. we are killing INSIDE the proving window, before the durable handoff is
+# recorded. Fail loudly if the kill would land after proving (handoff already
+# present / already terminal), so the scenario can never silently test nothing.
+assert_pending_no_handoff() {
+    local h="$1" row status linked
+    row="$(pgq "SELECT t.status, (l.tx_hash IS NOT NULL)
+                FROM transactions t LEFT JOIN tx_note_links l ON l.tx_hash=t.tx_hash
+                WHERE t.tx_hash='$h'")"
+    status="${row%%|*}"; linked="${row##*|}"
+    [ "$status" = "pending" ] || fail "tx $h not pending at kill time (status=$status) — kill missed the proving window"
+    [ "$linked" = "f" ] || fail "tx $h already has a note handoff at kill time — kill missed the proving window"
+    log "  verified: tx $h is pending + no handoff (inside the proving window)"
 }
 
 # ── Fault injectors (verify the target is actually down) ────────────────────────
@@ -139,7 +142,6 @@ scenario_ger() {
     local fault="$1" tag="$2"
     log "═══ SCENARIO ($tag): $fault crash during GER proving ═══"
     local prog0 nonce_before ger since hash
-    wait_quiescent
     prog0="$(recovery_progress)"
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$GER_ADDR")"
     ger="0x$(printf '%064x' "$(( 0xE50000 + RANDOM ))")"
@@ -150,6 +152,7 @@ scenario_ger() {
     [[ "$hash" == 0x* ]] || fail "controlled GER submit not admitted (hash=$hash; REJECT_UNVERIFIED_GER=true?)"
     log "  admitted $hash (signer=$GER_ADDR nonce=$nonce_before ger=$ger); waiting for PROOF boundary"
     wait_for_marker "$GER_PROVE_MARKER" "$since" 180 || fail "GER never reached the proof boundary"
+    assert_pending_no_handoff "$hash"
 
     case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
 
@@ -216,6 +219,7 @@ scenario_claim() {
     signer="$(pgq "SELECT lower(signer) FROM transactions WHERE tx_hash='$hash'")"
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
     log "  captured claim $hash (signer=$signer, signer nonce=$nonce_before)"
+    assert_pending_no_handoff "$hash"
 
     # Disable rebroadcast: stop the bridge-service ClaimTxManager (the real L1->L2
     # claim submitter/retry source).
