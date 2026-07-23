@@ -121,11 +121,15 @@ assert_pending_no_handoff() {
 # ── Fault injectors (verify the target is actually down) ────────────────────────
 crash_node() {
     log "  fault: KILL miden-node (keep down ${NODE_DOWN_SECS:-25}s)"
+    # restart:on-failure would auto-restart a SIGKILLed node; disable it so the
+    # down-window is real and recovery (not the auto-restarted original attempt) heals.
+    docker update --restart=no "$NODE" >/dev/null 2>&1 || true
     docker kill "$NODE" >/dev/null 2>&1 || true
     container_running "$NODE" && fail "miden-node still running after kill"
-    log "  verified: miden-node is DOWN"
+    log "  verified: miden-node is DOWN (auto-restart disabled)"
     sleep "${NODE_DOWN_SECS:-25}"
     docker start "$NODE" >/dev/null 2>&1 || true
+    docker update --restart=on-failure "$NODE" >/dev/null 2>&1 || true
 }
 crash_proxy() {
     log "  fault: SIGKILL proxy, then restart (the only remedy)"
@@ -201,8 +205,12 @@ scenario_ger() {
 scenario_claim() {
     local fault="$1" tag="$2"
     log "═══ SCENARIO ($tag): $fault crash during CLAIM proving ═══"
-    local prog0 dep_log
+    local prog0 dep_log scen_start
     prog0="$(recovery_progress)"
+    # DB-clock scenario start: correlate the captured claim to THIS run, since the
+    # isolated-wallet destination is REUSED across deposits and a stale/concurrent
+    # pending claim for the same wallet must never be selected.
+    scen_start="$(pgq "SELECT now()")"
     dep_log="$(mktemp /tmp/scen-claim.XXXXXX.log)"
     env COMPOSE_PROJECT_NAME="$PROJECT"         CLAIM_SUBMIT_TIMEOUT=1000 CLAIM_COMMIT_TIMEOUT=300 BALANCE_ATTEMPTS=40         RECV_POLL_TRIES=120 RECV_POLL_INTERVAL=10         bash "$HERE/e2e-l1-to-l2.sh" > "$dep_log" 2>&1 &
     local dep_pid=$!
@@ -243,6 +251,7 @@ scenario_claim() {
                      WHERE t.status='pending' AND l.tx_hash IS NULL AND t.miden_tx_id IS NULL
                        AND position('${CLAIM_SELECTOR}' in encode(t.envelope_bytes,'hex')) > 0
                        AND position('${desthex}' in encode(t.envelope_bytes,'hex')) > 0
+                       AND t.created_at >= '${scen_start}'
                      ORDER BY t.created_at DESC LIMIT 1")"
         [[ "$hash" == 0x* ]] && break
         sleep 1
@@ -272,24 +281,34 @@ scenario_claim() {
         docker start "$PROXY" >/dev/null 2>&1 || true
         wait_proxy_ready 60 || fail "proxy did not come back after restart"
     else
-        # NODE crash: kill the node, unfreeze the proxy so its in-flight submit hits the
-        # dead node, then keep the node DOWN until THIS claim's submission-failure
-        # evidence (not a fixed sleep), then bring it back.
+        # NODE crash. The node has restart:on-failure, so a SIGKILL would auto-restart
+        # it — disable the policy first so it stays DOWN under our control until we see
+        # the failure evidence (else the original submit could succeed on the auto-
+        # restarted node and bypass recovery — the exact concern here).
+        docker update --restart=no "$NODE" >/dev/null 2>&1 || true
         docker kill "$NODE" >/dev/null 2>&1 || true
         container_running "$NODE" && fail "miden-node still running after kill"
         local kill_ts; kill_ts="$(date +%s)"
         docker unpause "$PROXY" >/dev/null 2>&1 || true
-        log "  fault: miden-node DOWN; proxy unfrozen — awaiting THIS claim's submission-failure evidence"
-        local evidence=""
-        for _ in $(seq 1 120); do
-            if docker logs --since "$kill_ts" "$PROXY" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
-                 | grep -qiE "${hash#0x}.*(ambiguous|leaving receipt pending|error|not committed)|(ambiguous|leaving receipt pending).*${hash#0x}"; then evidence=1; break; fi
-            [ -n "$(pgq "SELECT 1 FROM tx_note_links WHERE tx_hash='$hash' AND handoff_state='prepared'")" ] && { evidence=1; break; }
+        log "  fault: miden-node DOWN (auto-restart disabled); proxy unfrozen — awaiting THIS claim's submission-failure evidence"
+        # Proof that THIS claim's SUBMISSION (not just its pre-submit prepared handoff)
+        # FAILED under the outage: the writer logged an ambiguous/left-pending/errored
+        # submit or a recovery backoff for THIS hash. A `prepared` handoff is written
+        # BEFORE submit_miden_transaction, so it is NOT such proof — bringing the node
+        # back at `prepared` could let the ORIGINAL attempt succeed and bypass recovery.
+        local evidence="" ev_grep
+        ev_grep="${hash#0x}.*(ambiguous|leaving receipt pending|not committed|submit.*fail|backoff|error)"
+        ev_grep="${ev_grep}|(ambiguous|leaving receipt pending|not committed|submit.*fail|backoff).*${hash#0x}"
+        for _ in $(seq 1 180); do
+            container_running "$NODE" && fail "miden-node came back before submission-failure evidence (auto-restart not disabled?)"
+            if ( set +o pipefail; docker logs --since "$kill_ts" "$PROXY" 2>&1 \
+                    | sed -E 's/\x1b\[[0-9;]*m//g' | grep -qiE "$ev_grep" ); then evidence=1; break; fi
             sleep 2
         done
-        [ -n "$evidence" ] || fail "no evidence THIS claim's submission failed while the node was down (target-specific fault unconfirmed)"
-        log "  evidence: THIS claim's submission failed under the node outage; bringing node back"
+        [ -n "$evidence" ] || { docker start "$NODE" >/dev/null 2>&1||true; docker update --restart=on-failure "$NODE" >/dev/null 2>&1||true; fail "no TARGET-HASH submission-failure/backoff evidence for $hash while the node was down (prepared alone is not proof)"; }
+        log "  evidence: THIS claim's submission DEFINITIVELY failed under the node outage; bringing node back"
         docker start "$NODE" >/dev/null 2>&1 || true
+        docker update --restart=on-failure "$NODE" >/dev/null 2>&1 || true
     fi
 
     # The wrapper (widened timeouts) is the oracle: it waits for recovery to re-drive
