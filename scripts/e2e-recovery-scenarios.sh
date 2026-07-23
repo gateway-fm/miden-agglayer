@@ -93,7 +93,7 @@ assert_recovery_ran() {
 wait_for_marker() {
     local marker="$1" since="$2" tries="${3:-60}"
     for _ in $(seq 1 "$tries"); do
-        docker logs --since "$since" "$PROXY" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -qF "$marker" && return 0
+        if ( set +o pipefail; docker logs --since "$since" "$PROXY" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -qF "$marker" ); then return 0; fi
         sleep 1
     done
     return 1
@@ -119,26 +119,53 @@ assert_pending_no_handoff() {
 }
 
 # ── Fault injectors (verify the target is actually down) ────────────────────────
-crash_node() {
-    log "  fault: KILL miden-node (keep down ${NODE_DOWN_SECS:-25}s)"
-    # restart:on-failure would auto-restart a SIGKILLed node; disable it so the
-    # down-window is real and recovery (not the auto-restarted original attempt) heals.
+# Freeze the proxy (docker pause) and assert the target tx is still pending with NO
+# note handoff — INSIDE the recoverable window — so the fault lands atomically with no
+# check-to-fault race. The caller injects the fault (inject_fault) next.
+freeze_and_assert() {
+    local fh="$1"
+    docker pause "$PROXY" >/dev/null 2>&1 || true
+    [ "$(docker inspect -f '{{.State.Status}}' "$PROXY" 2>/dev/null)" = "paused" ] || fail "proxy did not freeze (pause)"
+    assert_pending_no_handoff "$fh"
+    log "  proxy FROZEN at pending + no-handoff"
+}
+
+# Inject the fault while the proxy is FROZEN.
+#  proxy: SIGKILL the frozen proxy, then restart (the only remedy).
+#  node:  disable restart:on-failure (else a SIGKILLed node auto-restarts and the
+#         original submit could succeed post-restart, bypassing recovery), kill it,
+#         unfreeze the proxy so the in-flight submit hits the dead node, hold the node
+#         DOWN until TARGET-HASH submission-failure evidence (a `prepared` handoff
+#         precedes submit, so it is NOT such proof), then restore the policy.
+inject_fault() {
+    local ftype="$1" fhash="$2"
+    if [ "$ftype" = "proxy" ]; then
+        docker kill "$PROXY" >/dev/null 2>&1 || { docker unpause "$PROXY" >/dev/null 2>&1; docker kill "$PROXY" >/dev/null 2>&1; }
+        container_running "$PROXY" && fail "proxy still running after kill"
+        log "  fault: proxy SIGKILLed while frozen; restarting (the only remedy)"
+        docker start "$PROXY" >/dev/null 2>&1 || true
+        wait_proxy_ready 60 || fail "proxy did not come back after restart"
+        return 0
+    fi
     docker update --restart=no "$NODE" >/dev/null 2>&1 || true
     docker kill "$NODE" >/dev/null 2>&1 || true
     container_running "$NODE" && fail "miden-node still running after kill"
-    log "  verified: miden-node is DOWN (auto-restart disabled)"
-    sleep "${NODE_DOWN_SECS:-25}"
+    local kts; kts="$(date +%s)"
+    docker unpause "$PROXY" >/dev/null 2>&1 || true
+    log "  fault: miden-node DOWN (auto-restart disabled); proxy unfrozen — awaiting $fhash submission-failure evidence"
+    local ev="" evg
+    evg="${fhash#0x}.*(ambiguous|leaving receipt pending|not committed|submit.*fail|backoff|error)"
+    evg="${evg}|(ambiguous|leaving receipt pending|not committed|submit.*fail|backoff).*${fhash#0x}"
+    for _ in $(seq 1 180); do
+        container_running "$NODE" && fail "miden-node came back before submission-failure evidence (auto-restart not disabled?)"
+        if ( set +o pipefail; docker logs --since "$kts" "$PROXY" 2>&1 \
+                | sed -E 's/\x1b\[[0-9;]*m//g' | grep -qiE "$evg" ); then ev=1; break; fi
+        sleep 2
+    done
+    [ -n "$ev" ] || { docker start "$NODE" >/dev/null 2>&1||true; docker update --restart=on-failure "$NODE" >/dev/null 2>&1||true; fail "no TARGET-HASH submission-failure/backoff evidence for $fhash while the node was down (prepared alone is not proof)"; }
+    log "  evidence: $fhash submission DEFINITIVELY failed under the node outage; bringing node back"
     docker start "$NODE" >/dev/null 2>&1 || true
     docker update --restart=on-failure "$NODE" >/dev/null 2>&1 || true
-}
-crash_proxy() {
-    log "  fault: SIGKILL proxy, then restart (the only remedy)"
-    docker kill "$PROXY" >/dev/null 2>&1 || true
-    container_running "$PROXY" && fail "proxy still running after kill"
-    log "  verified: proxy is DOWN"
-    sleep 3
-    docker start "$PROXY" >/dev/null 2>&1 || true
-    wait_proxy_ready 60 || fail "proxy did not come back after restart"
 }
 
 # ── GER scenarios (fully controlled tx, no rebroadcaster) ───────────────────────
@@ -156,9 +183,8 @@ scenario_ger() {
     [[ "$hash" == 0x* ]] || fail "controlled GER submit not admitted (hash=$hash; REJECT_UNVERIFIED_GER=true?)"
     log "  admitted $hash (signer=$GER_ADDR nonce=$nonce_before ger=$ger); waiting for PROOF boundary"
     wait_for_marker "$GER_PROVE_MARKER, ger: ${ger#0x}" "$since" 180 || fail "GER never reached the proof boundary (ger ${ger#0x})"
-    assert_pending_no_handoff "$hash"
-
-    case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
+    freeze_and_assert "$hash"
+    inject_fault "$fault" "$hash"
 
     log "  waiting for recovery to heal the SAME hash to success"
     local ok=""
@@ -262,54 +288,14 @@ scenario_claim() {
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
     log "  captured claim $hash (signer=$signer nonce=$nonce_before dest=$dest)"
 
-    # FREEZE the proxy so writer/projector cannot mutate the row between the
-    # no-handoff assertion and the fault (eliminates the check-to-fault window).
-    docker pause "$PROXY" >/dev/null 2>&1 || true
-    [ "$(docker inspect -f '{{.State.Status}}' "$PROXY" 2>/dev/null)" = "paused" ] || fail "proxy did not freeze (pause)"
-    assert_pending_no_handoff "$hash"
-    log "  proxy FROZEN at pending + no-handoff"
+    freeze_and_assert "$hash"
 
     # Disable rebroadcast (ClaimTxManager) for the whole recovery window.
     docker stop "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
     container_running "$BRIDGE_SERVICE" && fail "bridge-service still running after stop (rebroadcast not disabled)"
     log "  verified: bridge-service (ClaimTxManager) is DOWN — no rebroadcast"
 
-    if [ "$fault" = "proxy" ]; then
-        docker kill "$PROXY" >/dev/null 2>&1 || { docker unpause "$PROXY" >/dev/null 2>&1; docker kill "$PROXY" >/dev/null 2>&1; }
-        container_running "$PROXY" && fail "proxy still running after kill"
-        log "  fault: proxy SIGKILLed while frozen; restarting (the only remedy)"
-        docker start "$PROXY" >/dev/null 2>&1 || true
-        wait_proxy_ready 60 || fail "proxy did not come back after restart"
-    else
-        # NODE crash. The node has restart:on-failure, so a SIGKILL would auto-restart
-        # it — disable the policy first so it stays DOWN under our control until we see
-        # the failure evidence (else the original submit could succeed on the auto-
-        # restarted node and bypass recovery — the exact concern here).
-        docker update --restart=no "$NODE" >/dev/null 2>&1 || true
-        docker kill "$NODE" >/dev/null 2>&1 || true
-        container_running "$NODE" && fail "miden-node still running after kill"
-        local kill_ts; kill_ts="$(date +%s)"
-        docker unpause "$PROXY" >/dev/null 2>&1 || true
-        log "  fault: miden-node DOWN (auto-restart disabled); proxy unfrozen — awaiting THIS claim's submission-failure evidence"
-        # Proof that THIS claim's SUBMISSION (not just its pre-submit prepared handoff)
-        # FAILED under the outage: the writer logged an ambiguous/left-pending/errored
-        # submit or a recovery backoff for THIS hash. A `prepared` handoff is written
-        # BEFORE submit_miden_transaction, so it is NOT such proof — bringing the node
-        # back at `prepared` could let the ORIGINAL attempt succeed and bypass recovery.
-        local evidence="" ev_grep
-        ev_grep="${hash#0x}.*(ambiguous|leaving receipt pending|not committed|submit.*fail|backoff|error)"
-        ev_grep="${ev_grep}|(ambiguous|leaving receipt pending|not committed|submit.*fail|backoff).*${hash#0x}"
-        for _ in $(seq 1 180); do
-            container_running "$NODE" && fail "miden-node came back before submission-failure evidence (auto-restart not disabled?)"
-            if ( set +o pipefail; docker logs --since "$kill_ts" "$PROXY" 2>&1 \
-                    | sed -E 's/\x1b\[[0-9;]*m//g' | grep -qiE "$ev_grep" ); then evidence=1; break; fi
-            sleep 2
-        done
-        [ -n "$evidence" ] || { docker start "$NODE" >/dev/null 2>&1||true; docker update --restart=on-failure "$NODE" >/dev/null 2>&1||true; fail "no TARGET-HASH submission-failure/backoff evidence for $hash while the node was down (prepared alone is not proof)"; }
-        log "  evidence: THIS claim's submission DEFINITIVELY failed under the node outage; bringing node back"
-        docker start "$NODE" >/dev/null 2>&1 || true
-        docker update --restart=on-failure "$NODE" >/dev/null 2>&1 || true
-    fi
+    inject_fault "$fault" "$hash"
 
     # The wrapper (widened timeouts) is the oracle: it waits for recovery to re-drive
     # the claim, then asserts the EXACT balance delta credited on THIS destination.
