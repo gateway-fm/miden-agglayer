@@ -219,6 +219,20 @@ scenario_claim() {
     [ -n "$dest" ] || { kill "$dep_pid" 2>/dev/null||true; fail "no deposit destination captured"; }
     desthex="$(printf '%s' "${dest#0x}" | tr 'A-F' 'a-f')"
 
+    # The wrapper's Step 2 (ready_for_claim) queries bridge-service; we must let it
+    # CONFIRM ready_for_claim BEFORE we stop bridge-service to disable rebroadcast,
+    # otherwise its Step 2 stalls (deposits_seen=?) and the deposit hard-times-out.
+    # After Step 2 the wrapper only greps the proxy log + checks the wallet, so
+    # stopping bridge-service then is safe.
+    log "  waiting for the wrapper to CONFIRM ready_for_claim (before disabling rebroadcast)"
+    local rfc=""
+    for _ in $(seq 1 150); do
+        grep -aq "Deposit is ready_for_claim" "$dep_log" && { rfc=1; break; }
+        kill -0 "$dep_pid" 2>/dev/null || { sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -20; fail "deposit exited before ready_for_claim"; }
+        sleep 3
+    done
+    [ -n "$rfc" ] || { kill "$dep_pid" 2>/dev/null||true; fail "deposit never reached ready_for_claim within 450s"; }
+
     # Poll the DB for THIS deposit's claim in the durably-admitted + UNLINKED window,
     # BOUND to this destination (its 20-byte address appears in the claimAsset calldata).
     log "  polling for THIS deposit's claim (dest $dest) in the recoverable window"
