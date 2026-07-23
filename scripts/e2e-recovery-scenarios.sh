@@ -204,25 +204,32 @@ scenario_claim() {
         env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh" > "$dep_log" 2>&1 &
     local dep_pid=$!
 
-    # Drive the real deposit only to the claim PROOF boundary. The wrapper's own
-    # Step-3+ timeouts (e.g. 120s "claim tx submitted") are NOT our oracle — they fire
-    # long before recovery's ~expiration heal and, with the ClaimTxManager stopped,
-    # there is no resubmission. We verify recovery INDEPENDENTLY below.
-    log "  waiting for the claim PROOF boundary"
-    if ! wait_for_marker "$CLAIM_PROVE_MARKER" "$since" 300; then
+    # Drive the real deposit; when the ClaimTxManager submits the claim it is durably
+    # admitted (pending row + nonce) BEFORE any Miden note handoff — the exact
+    # recoverable window. Poll the DB for that pending+UNLINKED claim rather than
+    # racing the ephemeral, undistinguished "proving CLAIM note" log line (which on a
+    # busy stack is missed or matches another claim). This also naturally tolerates a
+    # queued/slow writer (the pending+unlinked window is only longer). The wrapper's
+    # own Step-3+ timeouts are NOT our oracle; we verify recovery INDEPENDENTLY below.
+    log "  polling for MY claim to be durably admitted + unlinked (recoverable window)"
+    local hash=""
+    for _ in $(seq 1 360); do
+        hash="$(pgq "SELECT t.tx_hash FROM transactions t
+                     LEFT JOIN tx_note_links l ON l.tx_hash = t.tx_hash
+                     WHERE t.status='pending' AND l.tx_hash IS NULL AND t.miden_tx_id IS NULL
+                       AND substr(encode(t.envelope_bytes,'hex'),1,220) LIKE '%${CLAIM_SELECTOR}%'
+                     ORDER BY t.created_at DESC LIMIT 1")"
+        [[ "$hash" == 0x* ]] && break
+        sleep 1
+    done
+    [[ "$hash" == 0x* ]] || {
         kill "$dep_pid" 2>/dev/null || true
         sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -20
-        fail "claim never reached the proof boundary within 300s"
-    fi
+        fail "no durably-admitted unlinked claim appeared within 360s (deposit never reached claim?)"
+    }
     # The deposit destination (for the fresh next-claim continuity check).
-    local dest
+    local dest signer nonce_before
     dest="$(sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | grep -aoE 'Dest: +0x[0-9a-fA-F]{40}' | grep -oE '0x[0-9a-fA-F]{40}' | head -1)"
-    # MANDATORY hash capture: the exact pending claim tx recovery must heal.
-    local hash signer nonce_before
-    hash="$(pgq "SELECT tx_hash FROM transactions
-                 WHERE status='pending' AND substr(encode(envelope_bytes,'hex'),1,220) LIKE '%${CLAIM_SELECTOR}%'
-                 ORDER BY created_at DESC LIMIT 1")"
-    [[ "$hash" == 0x* ]] || { kill "$dep_pid" 2>/dev/null || true; fail "could not capture the pending claim tx hash (mandatory)"; }
     signer="$(pgq "SELECT lower(signer) FROM transactions WHERE tx_hash='$hash'")"
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
     log "  captured claim $hash (signer=$signer nonce=$nonce_before dest=$dest)"
