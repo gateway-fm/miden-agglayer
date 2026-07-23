@@ -940,6 +940,10 @@ async fn publish_claim_internal(
     // sequentially. `record_primary_attempt` / `record_fallback_attempt`
     // centralise the metric label set in `metrics.rs`.
     let has_fallback = local_prover_fallback.is_some();
+    // Proof-boundary marker: the Miden proof is the slow, crash-prone window. Logged
+    // at INFO for ops visibility and as the deterministic "kill during proving"
+    // trigger in the recovery-scenario e2e.
+    tracing::info!("proving CLAIM note (Miden proof in progress)");
     let primary_start = std::time::Instant::now();
     let primary_res = client.prove_transaction(&tx_result).await;
     let primary_elapsed = primary_start.elapsed().as_secs_f64();

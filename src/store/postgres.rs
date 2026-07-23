@@ -496,7 +496,14 @@ impl Store for PgStore {
                 ],
             )
             .await?;
-        Ok(row.map(|r| r.get::<_, i32>(0).max(0) as u32).unwrap_or(0))
+        // Reviewer #1 — bail (not Ok(0)) when the UPDATE matched no row, so the caller
+        // never enqueues without a durably-persisted backoff (repeated-OOM loop).
+        row.map(|r| r.get::<_, i32>(0).max(0) as u32)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "record_recovery_attempt updated no row (tx absent); backoff not persisted"
+                )
+            })
     }
 
     async fn clear_recovery_backoff(&self, tx_hash: TxHash) -> anyhow::Result<()> {

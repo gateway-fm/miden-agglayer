@@ -672,7 +672,12 @@ impl Store for InMemoryStore {
                 r.next_recovery_at = Some(next_recovery_at);
                 Ok(r.recovery_attempts)
             }
-            None => Ok(0),
+            // Reviewer #1 — a missing row means the backoff was NOT persisted; the
+            // caller must treat this as a hard failure and NOT enqueue (else a crash
+            // before a durable handoff would re-drive immediately: repeated-OOM loop).
+            None => anyhow::bail!(
+                "record_recovery_attempt updated no row for {tx_hash:#x}; backoff not persisted"
+            ),
         }
     }
 

@@ -346,7 +346,16 @@ pub(crate) async fn reconcile_claim_recovery(
     service: &ServiceState,
     global_index: U256,
     note_id: Option<String>,
+    has_handoff: bool,
 ) -> anyhow::Result<ExactNoteOutcome> {
+    // Reviewer #3 — a LEGACY submitted claim (a durable handoff exists but its
+    // note_id is NULL, e.g. a pre-migration-012 / `record_tx_note_link` row) cannot
+    // prove whether the landed index is ITS OWN note or another claimer's. Labelling
+    // it AlreadyClaimed would risk a false revert on a claim that actually succeeded,
+    // so it must stay Uncertain and let normal projection resolve it.
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
+    }
     let store = service.store.clone();
     let bridge_id = service.accounts.0.bridge.0;
     let result: Arc<Mutex<Option<ExactNoteOutcome>>> = Arc::new(Mutex::new(None));
@@ -384,8 +393,9 @@ pub(crate) async fn reconcile_claim_recovery(
                             .await?
                             .claim_applied
                             .unwrap_or(false);
-                        // No exact note of ours exists, so any on-chain claim of this
-                        // index was applied by a DIFFERENT transaction.
+                        // A PURE orphan (no handoff ever recorded) has no exact note of
+                        // its own, so any on-chain claim of this index was applied by a
+                        // DIFFERENT transaction.
                         if applied {
                             ExactNoteOutcome::AppliedElsewhere
                         } else {
@@ -427,8 +437,13 @@ pub(crate) async fn reconcile_ger_recovery(
 pub(crate) async fn reconcile_claim_recovery(
     service: &ServiceState,
     global_index: U256,
-    _note_id: Option<String>,
+    note_id: Option<String>,
+    has_handoff: bool,
 ) -> anyhow::Result<ExactNoteOutcome> {
+    // A legacy submitted claim (handoff, NULL note_id) stays Uncertain (reviewer #3).
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
+    }
     if service
         .store
         .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())

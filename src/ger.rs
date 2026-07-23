@@ -192,6 +192,13 @@ async fn submit_update_ger_note(
                     .executed_transaction()
                     .expiration_block_num()
                     .as_u64();
+                // Proof-boundary marker: the Miden proof is the slow, crash-prone
+                // window. Logged at INFO for ops visibility and as the deterministic
+                // "kill during proving" trigger in the recovery-scenario e2e.
+                tracing::info!(
+                    ger = %hex::encode(ger_bytes),
+                    "proving UpdateGerNote (Miden proof in progress)"
+                );
                 let proven_tx = crate::metrics::meter_proof(
                     crate::metrics::ProofKind::Ger,
                     client.prove_transaction(&tx_result),

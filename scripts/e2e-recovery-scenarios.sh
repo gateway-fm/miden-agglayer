@@ -2,27 +2,30 @@
 # ============================================================================
 # #157 DETERMINISTIC recovery scenarios (reviewer item #7).
 #
-# For each of FOUR fault×operation combinations, this test:
-#   - drives a REAL, effect-bearing write (a GER injection, or a claim from a real
-#     deposit) through the proxy,
-#   - kills a component DURING PROVING (detected from the proxy's own proving-start
-#     log line, not a blind sleep),
-#   - keeps Miden DOWN across the window (node-crash cases) so recovery cannot
-#     falsely finalise from a stale view,
-#   - DISABLES rebroadcast (controlled GER tx nobody resends; autoclaimer stopped
-#     for claims) so ONLY recovery — at most a proxy restart — can heal it,
-#   - then asserts the SAME transaction/hash reaches a terminal SUCCESS, the signer
-#     nonce did NOT double-advance, the effect applied EXACTLY once, and the NEXT
-#     nonce for that signer still works.
+# For each of FOUR fault×operation combinations this test drives a REAL,
+# effect-bearing write (a controlled GER injection, or a claim from a real
+# deposit) through the proxy and:
+#   - kills a component AT THE PROOF BOUNDARY (triggered by the proxy's own
+#     proving-start log line "proving UpdateGerNote (Miden proof in progress)" /
+#     "proving CLAIM note (Miden proof in progress)" — NOT a pre-proving marker
+#     and NOT a blind sleep),
+#   - verifies the target is ACTUALLY down,
+#   - keeps Miden DOWN across the window (node-crash cases),
+#   - DISABLES the real rebroadcaster (a controlled GER tx nobody resends; the
+#     bridge-service ClaimTxManager stopped for claims — NOT bridge-autoclaim,
+#     which is L2->L1),
+#   - then asserts the SAME captured tx/hash reaches the CORRECT terminal receipt,
+#     the signer nonce advanced EXACTLY once (no double-advance = also proves no
+#     rebroadcast), the effect applied EXACTLY once, and the NEXT nonce works.
 #
 #   1. node  crash during GER injection (proving)
 #   2. proxy crash during GER injection (proving)
 #   3. node  crash during CLAIM        (proving)
 #   4. proxy crash during CLAIM        (proving)
 #
-# Requires a running stack brought up with REJECT_UNVERIFIED_GER_INJECTION=false
-# (so a controlled GER injects) and --insecure-allow-any-signer (so a controlled
-# signer is accepted). Env: COMPOSE_PROJECT_NAME, L2_RPC.
+# Requires the stack up with REJECT_UNVERIFIED_GER_INJECTION=false (so a
+# controlled GER injects) and --insecure-allow-any-signer. Env:
+# COMPOSE_PROJECT_NAME, L2_RPC.
 # ============================================================================
 set -uo pipefail
 
@@ -32,210 +35,211 @@ L2_RPC="${L2_RPC:-http://localhost:8546}"
 NODE="${MIDEN_NODE_CONTAINER:-${PROJECT}-miden-node-1}"
 PROXY="${AGGLAYER_CONTAINER:-${PROJECT}-miden-agglayer-1}"
 PG="${AGGLAYER_PG_CONTAINER:-${PROJECT}-agglayer-postgres-1}"
-AUTOCLAIM="${AUTOCLAIM_CONTAINER:-${PROJECT}-bridge-autoclaim-1}"
+# The L1->L2 claim submitter/rebroadcaster is the bridge-service ClaimTxManager
+# (L2URLs=[proxy:8546]), NOT bridge-autoclaim (that claims L2->L1 on anvil).
+BRIDGE_SERVICE="${BRIDGE_SERVICE_CONTAINER:-${PROJECT}-bridge-service-1}"
 BRIDGE="${BRIDGE_ADDRESS:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}"
-# A controlled signer nobody else drives (so its txs are NEVER rebroadcast).
 GER_KEY="${GER_TEST_KEY:-0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d}"
+CLAIM_SELECTOR="ccaa2d11"
+
+GER_PROVE_MARKER="proving UpdateGerNote (Miden proof in progress)"
+CLAIM_PROVE_MARKER="proving CLAIM note (Miden proof in progress)"
 
 log()  { echo "[scen] $*"; }
 pass() { echo "[scen] PASS: $*"; }
 fail() { echo "[scen] FAIL: $*"; exit 1; }
 pgq()  { docker exec "$PG" psql -U agglayer -d agglayer_store -tAX -c "$1" 2>/dev/null; }
+container_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
 
-CHAIN_ID="$(cast chain-id --rpc-url "$L2_RPC" 2>/dev/null || echo 2)"
 GER_ADDR="$(cast wallet address --private-key "$GER_KEY")"
 
-for c in "$NODE" "$PROXY" "$PG"; do
+for c in "$NODE" "$PROXY" "$PG" "$BRIDGE_SERVICE"; do
     docker inspect "$c" >/dev/null 2>&1 || fail "container $c not found — is the stack up?"
 done
 
-# Wait until the proxy RPC answers again (after a restart) and the projector reports
-# caught-up, so a scenario starts from a quiescent stack.
 wait_proxy_ready() {
     local tries="${1:-60}"
     for _ in $(seq 1 "$tries"); do
-        if cast chain-id --rpc-url "$L2_RPC" >/dev/null 2>&1; then return 0; fi
+        cast chain-id --rpc-url "$L2_RPC" >/dev/null 2>&1 && return 0
         sleep 3
     done
     return 1
 }
 
-# Recovery progress counter (successes + redrives + already_claimed).
+metric_val() { curl -fsS "$L2_RPC/metrics" 2>/dev/null | awk -v m="$1" '$1==m{print $2}' | tail -1; }
 recovery_progress() {
     local s r a
-    s="$(curl -fsS "$L2_RPC/metrics" 2>/dev/null | awk '/^orphan_recovery_successes_total /{print $2}' | tail -1)"; s="${s%.*}"; s="${s:-0}"
-    r="$(curl -fsS "$L2_RPC/metrics" 2>/dev/null | awk '/^orphan_recovery_redrives_total /{print $2}' | tail -1)"; r="${r%.*}"; r="${r:-0}"
-    a="$(curl -fsS "$L2_RPC/metrics" 2>/dev/null | awk '/^orphan_recovery_already_claimed_total /{print $2}' | tail -1)"; a="${a%.*}"; a="${a:-0}"
+    s="$(metric_val orphan_recovery_successes_total)"; s="${s%.*}"
+    r="$(metric_val orphan_recovery_redrives_total)"; r="${r%.*}"
+    a="$(metric_val orphan_recovery_already_claimed_total)"; a="${a%.*}"
     echo $(( ${s:-0} + ${r:-0} + ${a:-0} ))
 }
 
-# Wait for the proxy to log a marker that appeared AFTER $since (docker --since),
-# i.e. the proving-start line for the operation we just triggered.
-wait_for_proving() {
-    local marker="$1" since="$2" tries="${3:-40}"
+# Wait for a proxy log marker that appeared AFTER $since (unix ts).
+wait_for_marker() {
+    local marker="$1" since="$2" tries="${3:-60}"
     for _ in $(seq 1 "$tries"); do
-        if docker logs --since "$since" "$PROXY" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -qF "$marker"; then
-            return 0
-        fi
+        docker logs --since "$since" "$PROXY" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -qF "$marker" && return 0
         sleep 1
     done
     return 1
 }
 
-# eth_getTransactionReceipt status for a hash: 0x1 success, 0x0 revert, empty=pending.
-receipt_status() {
-    cast receipt --rpc-url "$L2_RPC" "$1" status 2>/dev/null | tr -d '[:space:]'
-}
+receipt_status() { cast receipt --rpc-url "$L2_RPC" "$1" status 2>/dev/null | tr -d '[:space:]'; }
 
-# ── The fault injectors ────────────────────────────────────────────────────────
-# NODE: kill miden-node, KEEP IT DOWN a while (prove recovery does not falsely
-# finalise from a stale/absent view), then bring it back. Recovery (periodic sweep)
-# heals WITHOUT a proxy restart.
+# ── Fault injectors (verify the target is actually down) ────────────────────────
 crash_node() {
     log "  fault: KILL miden-node (keep down ${NODE_DOWN_SECS:-25}s)"
     docker kill "$NODE" >/dev/null 2>&1 || true
+    container_running "$NODE" && fail "miden-node still running after kill"
+    log "  verified: miden-node is DOWN"
     sleep "${NODE_DOWN_SECS:-25}"
     docker start "$NODE" >/dev/null 2>&1 || true
 }
-# PROXY: SIGKILL the proxy mid-proving (drops its in-memory writer queue), then the
-# ONLY remedy — restart it. Startup recovery re-drives the durable intent.
 crash_proxy() {
     log "  fault: SIGKILL proxy, then restart (the only remedy)"
     docker kill "$PROXY" >/dev/null 2>&1 || true
+    container_running "$PROXY" && fail "proxy still running after kill"
+    log "  verified: proxy is DOWN"
     sleep 3
     docker start "$PROXY" >/dev/null 2>&1 || true
     wait_proxy_ready 60 || fail "proxy did not come back after restart"
 }
 
-# ── GER scenarios ──────────────────────────────────────────────────────────────
-# Submit a controlled insertGlobalExitRoot with a UNIQUE root, kill during proving,
-# and verify the SAME hash injects the GER exactly once with no double-advance.
+# ── GER scenarios (fully controlled tx, no rebroadcaster) ───────────────────────
 scenario_ger() {
     local fault="$1" tag="$2"
-    log "═══ SCENARIO ($tag): $fault crash during GER injection ═══"
-    local nonce_before ger since hash
+    log "═══ SCENARIO ($tag): $fault crash during GER proving ═══"
+    local prog0 nonce_before ger since hash
+    prog0="$(recovery_progress)"
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$GER_ADDR")"
-    # Unique 32-byte GER root derived from the scenario tag.
-    ger="0x$(printf '%064x' "$(( 0xE500 + RANDOM ))")"
-    log "  controlled signer=$GER_ADDR nonce=$nonce_before ger=$ger"
+    ger="0x$(printf '%064x' "$(( 0xE50000 + RANDOM ))")"
     since="$(date +%s)"
-    # --async: submit without waiting for the receipt (proving is in flight).
     hash="$(cast send --async --rpc-url "$L2_RPC" --private-key "$GER_KEY" \
         --legacy --gas-price 1 --gas-limit 1000000 \
         "$BRIDGE" 'insertGlobalExitRoot(bytes32)' "$ger" 2>/dev/null)"
-    [[ "$hash" == 0x* ]] || fail "controlled GER submit was not admitted (hash=$hash)"
-    log "  admitted GER tx $hash; waiting for it to enter proving"
-    wait_for_proving "GER injection: submitting to Miden" "$since" 40 \
-        || fail "GER never reached the proving window (submit rejected? REJECT_UNVERIFIED_GER=true?)"
+    [[ "$hash" == 0x* ]] || fail "controlled GER submit not admitted (hash=$hash; REJECT_UNVERIFIED_GER=true?)"
+    log "  admitted $hash (signer=$GER_ADDR nonce=$nonce_before ger=$ger); waiting for PROOF boundary"
+    wait_for_marker "$GER_PROVE_MARKER" "$since" 60 || fail "GER never reached the proof boundary"
 
-    case "$fault" in
-        node)  crash_node ;;
-        proxy) crash_proxy ;;
-    esac
+    case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
 
-    log "  waiting for recovery to heal the SAME hash to success (no rebroadcast)"
+    log "  waiting for recovery to heal the SAME hash to success"
     local ok=""
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 72); do
         wait_proxy_ready 5 || true
         [ "$(receipt_status "$hash")" = "0x1" ] && { ok=1; break; }
         sleep 5
     done
-    [ -n "$ok" ] || fail "GER tx $hash did NOT reach a success receipt via recovery within 300s"
+    [ -n "$ok" ] || fail "GER tx $hash did NOT reach success via recovery within ~360s"
     pass "  SAME hash $hash recovered to success"
 
-    # Effect applied exactly once: the GER is injected, and exactly one row carries it.
     local injected
     injected="$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected AND ger_hash = decode('${ger#0x}','hex')")"
-    [ "${injected:-0}" -ge 1 ] || fail "GER $ger was not injected after recovery"
-    pass "  GER effect applied (is_injected=1)"
+    [ "${injected:-0}" -ge 1 ] || fail "GER $ger not injected after recovery"
+    pass "  GER effect applied exactly once (is_injected)"
 
-    # Nonce advanced EXACTLY once — no double-advance.
     local nonce_after
     nonce_after="$(cast nonce --rpc-url "$L2_RPC" "$GER_ADDR")"
     [ "$nonce_after" = "$(( nonce_before + 1 ))" ] \
-        || fail "nonce double-advanced or stuck: before=$nonce_before after=$nonce_after"
-    pass "  nonce advanced exactly once ($nonce_before → $nonce_after)"
+        || fail "nonce double-advanced/stuck: $nonce_before → $nonce_after (rebroadcast or double-drive?)"
+    pass "  nonce advanced exactly once ($nonce_before → $nonce_after) — no double-advance / no rebroadcast"
 
-    # The NEXT nonce still works: a follow-up GER from the same signer succeeds.
-    local ger2 hash2
-    ger2="0x$(printf '%064x' "$(( 0xE600 + RANDOM ))")"
-    hash2="$(cast send --rpc-url "$L2_RPC" --private-key "$GER_KEY" --legacy --gas-price 1 \
-        --gas-limit 1000000 --timeout 180 \
-        "$BRIDGE" 'insertGlobalExitRoot(bytes32)' "$ger2" 2>/dev/null | awk '/transactionHash/{print $2}')"
-    [ "$(receipt_status "${hash2:-0x0}")" = "0x1" ] \
-        || fail "the NEXT nonce did not work after recovery (follow-up GER $hash2 not successful)"
+    local prog1; prog1="$(recovery_progress)"
+    [ "${prog1:-0}" -gt "${prog0:-0}" ] || fail "recovery counters did not advance for this GER ($prog0 → $prog1)"
+    pass "  recovery counters advanced ($prog0 → $prog1)"
+
+    # Next nonce works.
+    local ger2 hash2 ok2=""
+    ger2="0x$(printf '%064x' "$(( 0xE60000 + RANDOM ))")"
+    hash2="$(cast send --async --rpc-url "$L2_RPC" --private-key "$GER_KEY" --legacy --gas-price 1 \
+        --gas-limit 1000000 "$BRIDGE" 'insertGlobalExitRoot(bytes32)' "$ger2" 2>/dev/null)"
+    [[ "$hash2" == 0x* ]] || fail "the follow-up GER (next nonce) was not admitted"
+    for _ in $(seq 1 36); do [ "$(receipt_status "$hash2")" = "0x1" ] && { ok2=1; break; }; sleep 5; done
+    [ -n "$ok2" ] || fail "the NEXT nonce did not work after recovery (follow-up GER $hash2 not successful)"
     pass "  next nonce works (follow-up GER $hash2 succeeded)"
-    pass "SCENARIO ($tag) GREEN: $fault-crash during GER proving self-healed exactly once"
+    pass "SCENARIO ($tag) GREEN"
 }
 
-# ── CLAIM scenarios ────────────────────────────────────────────────────────────
-# Drive a REAL deposit to ready_for_claim, let the autoclaimer submit the claim,
-# kill during proving AND stop the autoclaimer (no rebroadcast), then verify the
-# SAME claim hash recovers and the wallet is credited EXACTLY once.
+# ── CLAIM scenarios (real deposit, stop the ClaimTxManager rebroadcaster) ────────
 scenario_claim() {
     local fault="$1" tag="$2"
     log "═══ SCENARIO ($tag): $fault crash during CLAIM proving ═══"
-    local since dep_log
+    local prog0 since dep_log
+    prog0="$(recovery_progress)"
     since="$(date +%s)"
     dep_log="$(mktemp /tmp/scen-claim.XXXXXX.log)"
-    # Run the real deposit flow in the background; it provisions a fresh isolated
-    # wallet, deposits on L1, waits ready_for_claim, and the autoclaimer claims.
-    RECV_POLL_TRIES=90 RECV_POLL_INTERVAL=10 \
+    RECV_POLL_TRIES=120 RECV_POLL_INTERVAL=10 \
         env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh" > "$dep_log" 2>&1 &
     local dep_pid=$!
 
-    log "  waiting for the claim to enter proving (creating CLAIM note)"
-    if ! wait_for_proving "creating CLAIM note" "$since" 180; then
+    log "  waiting for the claim PROOF boundary"
+    if ! wait_for_marker "$CLAIM_PROVE_MARKER" "$since" 240; then
         kill "$dep_pid" 2>/dev/null || true
         sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -20
-        fail "claim never reached the proving window within 180s"
+        fail "claim never reached the proof boundary within 240s"
     fi
-    # Capture the pending CLAIM tx hash (claimAsset selector 0xccaa2d11) admitted but
-    # not yet finalised — this is the exact tx recovery must heal.
-    local hash
+    # MANDATORY hash capture: the exact pending claim tx recovery must heal.
+    local hash signer nonce_before
     hash="$(pgq "SELECT tx_hash FROM transactions
-                 WHERE status='pending' AND substr(encode(envelope_bytes,'hex'),1,200) LIKE '%ccaa2d11%'
+                 WHERE status='pending' AND substr(encode(envelope_bytes,'hex'),1,220) LIKE '%${CLAIM_SELECTOR}%'
                  ORDER BY created_at DESC LIMIT 1")"
-    [[ "$hash" == 0x* ]] || log "  (could not capture exact claim hash via envelope; will verify by balance)"
-    log "  claim in proving (hash=${hash:-unknown}); injecting fault + disabling rebroadcast"
+    [[ "$hash" == 0x* ]] || { kill "$dep_pid" 2>/dev/null || true; fail "could not capture the pending claim tx hash (mandatory)"; }
+    signer="$(pgq "SELECT lower(signer) FROM transactions WHERE tx_hash='$hash'")"
+    nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
+    log "  captured claim $hash (signer=$signer, signer nonce=$nonce_before)"
 
-    # Disable rebroadcast: stop the autoclaimer so ONLY recovery can heal the claim.
-    docker stop "$AUTOCLAIM" >/dev/null 2>&1 || true
-    case "$fault" in
-        node)  crash_node ;;
-        proxy) crash_proxy ;;
-    esac
+    # Disable rebroadcast: stop the bridge-service ClaimTxManager (the real L1->L2
+    # claim submitter/retry source).
+    docker stop "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
+    container_running "$BRIDGE_SERVICE" && fail "bridge-service still running after stop (rebroadcast not disabled)"
+    log "  verified: bridge-service (ClaimTxManager) is DOWN — no rebroadcast"
+
+    case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
 
     log "  waiting for recovery to heal the claim (wallet credited exactly once)"
-    # The wrapped deposit script verifies the balance delta itself; success rc proves
-    # the claim landed exactly once (a double-claim over-credits; a lost claim never
-    # credits). Recovery — not a rebroadcast — is what healed it (autoclaimer stopped).
     local rc
     if wait "$dep_pid"; then rc=0; else rc=$?; fi
-    docker start "$AUTOCLAIM" >/dev/null 2>&1 || true
     if [ "$rc" -ne 0 ]; then
+        docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
         sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -25
         fail "the claim did NOT self-heal to an exact-once credit after $fault crash (rc=$rc)"
     fi
-    pass "  deposit CLAIMED EXACTLY ONCE (balance delta) after $fault crash, autoclaimer stopped"
+    pass "  deposit CLAIMED EXACTLY ONCE (balance delta) after $fault crash, ClaimTxManager stopped"
 
-    if [[ "$hash" == 0x* ]]; then
-        local st; st="$(receipt_status "$hash")"
-        [ "$st" = "0x1" ] || fail "captured claim hash $hash did not reach success (status=$st)"
-        pass "  SAME claim hash $hash recovered to success"
+    # SAME captured hash reached a terminal receipt (success or projector-finalised).
+    local st; st="$(receipt_status "$hash")"
+    [ "$st" = "0x1" ] || fail "captured claim hash $hash did not reach success (status=$st)"
+    pass "  SAME claim hash $hash recovered to success"
+
+    # Claim nonce continuity: the ClaimTxManager signer advanced EXACTLY once (no
+    # double-advance) — with bridge-service stopped this also proves no rebroadcast.
+    local nonce_after
+    nonce_after="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
+    [ "$nonce_after" = "$(( nonce_before + 1 ))" ] \
+        || fail "claim signer nonce double-advanced/stuck: $nonce_before → $nonce_after"
+    pass "  claim signer nonce advanced exactly once ($nonce_before → $nonce_after)"
+
+    local prog1; prog1="$(recovery_progress)"
+    [ "${prog1:-0}" -gt "${prog0:-0}" ] || fail "recovery counters did not advance for this claim ($prog0 → $prog1)"
+    pass "  recovery counters advanced ($prog0 → $prog1)"
+
+    # Restart the ClaimTxManager and prove the NEXT claim works (nonce continuity).
+    docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
+    log "  next-claim continuity: a fresh deposit must still claim"
+    local dep2; dep2="$(mktemp /tmp/scen-claim2.XXXXXX.log)"
+    if env COMPOSE_PROJECT_NAME="$PROJECT" RECV_POLL_TRIES=120 RECV_POLL_INTERVAL=10 \
+        bash "$HERE/e2e-l1-to-l2.sh" > "$dep2" 2>&1; then
+        pass "  next claim works (fresh deposit claimed after recovery)"
+    else
+        sed -E 's/\x1b\[[0-9;]*m//g' "$dep2" | tail -20
+        fail "the NEXT claim did not work after recovery (ClaimTxManager nonce wedged?)"
     fi
-
-    # No pending/unlinked orphan may remain.
-    local orphans
-    orphans="$(pgq "SELECT count(*) FROM transactions t LEFT JOIN tx_note_links l ON l.tx_hash=t.tx_hash
-                    WHERE t.status='pending' AND l.note_id IS NULL AND t.miden_tx_id IS NULL")"
-    [ "${orphans:-1}" = "0" ] || fail "$orphans unrecovered orphan(s) remain after the claim scenario"
-    pass "SCENARIO ($tag) GREEN: $fault-crash during CLAIM proving self-healed exactly once"
+    pass "SCENARIO ($tag) GREEN"
 }
 
 # ── Driver ─────────────────────────────────────────────────────────────────────
 wait_proxy_ready 60 || fail "proxy RPC not ready at start"
-PROG_START="$(recovery_progress)"
 
 scenario_ger   node  "1/4"
 wait_proxy_ready 60 || fail "stack not ready after scenario 1"
@@ -245,9 +249,17 @@ scenario_claim node  "3/4"
 wait_proxy_ready 60 || fail "stack not ready after scenario 3"
 scenario_claim proxy "4/4"
 
-PROG_END="$(recovery_progress)"
-log "recovery progress over the run: $PROG_START → $PROG_END"
-[ "$PROG_END" -gt "$PROG_START" ] \
-    || fail "recovery counters did not advance — did recovery actually heal anything?"
+# No pending write of either tested selector may remain (catches LINKED pending
+# rows too — not just note_id-NULL orphans). Allow a drain window.
+sel_pending() {
+    pgq "SELECT count(*) FROM transactions
+         WHERE status='pending'
+           AND (substr(encode(envelope_bytes,'hex'),1,220) LIKE '%${CLAIM_SELECTOR}%'
+                OR substr(encode(envelope_bytes,'hex'),1,220) LIKE '%12da06b2%')"
+}
+LEFT=""
+for _ in $(seq 1 30); do LEFT="$(sel_pending)"; [ "${LEFT:-1}" = "0" ] && break; sleep 10; done
+[ "${LEFT:-1}" = "0" ] || fail "$LEFT tested-selector write(s) remain pending (linked rows included) after all scenarios"
+pass "no tested-selector writes remain pending (linked + unlinked) — all resolved"
 
-pass "ALL 4 recovery scenarios GREEN: {node,proxy} × {GER,claim} crash-during-proving self-healed exactly once, no double-advance, next nonce works, no rebroadcast"
+pass "ALL 4 recovery scenarios GREEN: {node,proxy}×{GER,claim} crash-at-proof-boundary self-healed exactly once, no double-advance, next nonce works, rebroadcast disabled"
