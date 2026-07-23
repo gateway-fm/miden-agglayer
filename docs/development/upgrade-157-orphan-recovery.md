@@ -29,9 +29,11 @@ network are untouched — this is an in-place upgrade, not a redeployment.
 Follow `docs/UPGRADE.md` exactly (preserve the Miden store dir + Postgres volume +
 single-replica ownership). The only `#157`-specific expectations:
 
-1. `git diff --name-status <OLD_REF> <NEW_REF> -- migrations` shows **only**
-   `A  migrations/021_orphan_recovery_backoff.sql`. If anything else appears, that is
-   another PR in the release (e.g. #150–153) and needs its own note.
+1. From the last release **v0.15.9**, `git diff --name-status v0.15.9 <NEW_REF> --
+   migrations` shows two **additive** files: `A migrations/019_claim_calldata_repair_
+   pending.sql` (a new `CREATE TABLE IF NOT EXISTS`) and `A migrations/021_orphan_
+   recovery_backoff.sql`. Both apply automatically on startup. Anything else is
+   another PR in the release and needs its own note.
 2. On first start of the new image, expect one startup recovery pass in the logs
    (`target=recovery`). It is bounded by `RECOVERY_SWEEP_INTERVAL_SECS` and spawned,
    so a slow/unavailable Miden node cannot delay the port binding.
@@ -103,24 +105,31 @@ set is bounded to whatever existed at cutover and does not grow.
 
 ## Automated upgrade test
 
-`scripts/e2e-upgrade-recovery.sh` exercises the whole path on one persistent stack:
+Two complementary tests share the release-override mechanism
+(`scripts/upgrade/docker-compose.upgrade-release.yml`, which pins the **release image
+and the release command line** so the old binary is not handed flags it would reject):
 
-1. builds the OLD binary from `origin/main` (pre-#157) and the NEW binary from `HEAD`;
-2. brings the stack up on the OLD binary (asserting the DB has **no** `recovery_attempts`
-   column), runs a baseline deposit to completion, then manufactures a **pending orphan**
-   by SIGKILLing the proxy while a controlled GER is durably-admitted-but-unlinked, and
-   confirms the OLD binary leaves it stuck;
-3. upgrades **only the proxy** in place (retag → `docker compose up -d --no-deps
-   --force-recreate miden-agglayer`, same Postgres + Miden volumes);
-4. asserts: (1) migration `021` applied; (2) the pre-upgrade orphan self-heals to the
-   **same hash** exactly once with the signer nonce **not** re-advanced and the GER
-   effect applied once; (3) the old completed deposit's terminal state is preserved and
-   a fresh post-upgrade deposit works.
+- **`scripts/e2e-upgrade-test.sh`** — the general in-place upgrade harness
+  (R → U1 → RB → U2): no data loss (cursors resume, no genesis re-sweep), **getLogs
+  immutability** across each swap, and live L1↔L2 traffic in every phase.
+- **`scripts/e2e-upgrade-recovery.sh`** — the #157-specific test. On one persistent
+  stack it brings the stack up ON THE RELEASE **v0.15.9** (release override), runs a
+  baseline deposit to completion, then manufactures a **pending orphan** by capturing a
+  REAL deposit's claim while it is durably-admitted-but-unlinked and SIGKILLing the
+  release proxy (v0.15.9 has no recovery loop, so it stays stuck; bridge-service is
+  stopped so no rebroadcast). It then swaps **only the proxy** to the branch image on
+  the same volumes and asserts: (1) migrations 019 + 021 applied; (2) the pre-upgrade
+  orphan self-heals to the **same hash exactly once** — nonce **not** re-advanced,
+  wallet credited exactly once via the deposit wrapper's own balance-delta oracle, and
+  healed by recovery (not a rebroadcast); (3) the baseline terminal state is preserved
+  and a fresh post-upgrade deposit works.
 
-Run it standalone (it needs the `8546`/`18080` ports free — it does not run alongside
-the from-scratch gates):
+Both build `miden-agglayer-e2e:v0.15.9` from the tag (clean worktree) if absent and
+`miden-agglayer-e2e:latest` from the branch. Run standalone (they need the
+`8546`/`9545`/`18080` ports free — not alongside the from-scratch gates):
 
 ```bash
-COMPOSE_PROJECT_NAME=gate55 ./scripts/e2e-upgrade-recovery.sh
-# optional: UPGRADE_FROM_REF=<tag-or-sha> to upgrade from a specific released image
+COMPOSE_PROJECT_NAME=gate55 ./scripts/e2e-upgrade-test.sh        # general
+COMPOSE_PROJECT_NAME=gate55 ./scripts/e2e-upgrade-recovery.sh    # #157 recovery-of-old-state
+# optional: UPGRADE_FROM_REF=<tag> to upgrade from a different released tag
 ```

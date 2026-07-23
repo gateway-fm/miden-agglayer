@@ -1,188 +1,183 @@
 #!/usr/bin/env bash
-# ============================================================================
-# #157 IN-PLACE UPGRADE test: latest release (pre-#157, origin/main) → main+#157.
+# ══════════════════════════════════════════════════════════════════════════════
+# #157 IN-PLACE UPGRADE recovery test: RELEASE v0.15.9 → THIS BRANCH (main+#157).
 #
-# The from-scratch gates never exercise the real upgrade risk: #157's recovery loop
-# runs on startup against DURABLE STATE the OLD version wrote. This test proves that
-# upgrade path end-to-end, on ONE persistent stack (same Postgres + Miden volumes):
+# Companion to scripts/e2e-upgrade-test.sh (which proves no-data-loss / getLogs
+# immutability / liveness across the swap). This one proves the #157-specific risk:
+# the new recovery loop runs on startup against DURABLE STATE the OLD (v0.15.9)
+# binary wrote, and heals it EXACTLY ONCE.
 #
-#   1. MIGRATION — 021 (recovery_attempts / next_recovery_at + partial index) applies
-#      cleanly on a DB that the OLD binary populated.
-#   2. RECOVERY-OF-OLD-STATE — a PENDING ORPHAN created by a mid-proving crash on the
-#      OLD binary (which has NO recovery loop, so it stays stuck) is self-healed by
-#      the NEW binary EXACTLY ONCE, with no re-prove and no nonce double-advance.
-#   3. PRESERVATION + LIVENESS — an already-terminal (successful) deposit from the OLD
-#      binary is untouched, and a fresh deposit works after the upgrade.
+#   R  bring the stack up ON THE RELEASE (v0.15.9 image + release command line, via
+#      scripts/upgrade/docker-compose.upgrade-release.yml), same store/volumes.
+#   • baseline: a deposit completes normally (terminal state to preserve).
+#   • orphan:   a REAL deposit's claim is captured while durably-admitted + unlinked,
+#      then the release proxy is SIGKILLed — an orphan v0.15.9 CANNOT self-heal (no
+#      recovery loop). bridge-service (ClaimTxManager) is stopped so no rebroadcast.
+#   U1 swap ONLY the proxy to the branch image (same volumes). On startup the branch
+#      applies the additive migrations (019 + 021) and its recovery loop sweeps.
+#   • assert: migrations applied; the pre-upgrade orphan self-heals to the SAME hash
+#      exactly once (nonce not re-advanced, credited exactly once via the deposit
+#      wrapper's own exact-balance oracle); the baseline terminal state is preserved;
+#      a fresh post-upgrade deposit works.
 #
-# Mechanics: the compose proxy image is `miden-agglayer-e2e:latest`. We build the OLD
-# binary from origin/main as :preupgrade, tag it AS :latest to bring the stack up on
-# the old code, then retag :latest to the NEW image and force-recreate ONLY the proxy
-# (volumes preserved) — a true in-place upgrade. REJECT_UNVERIFIED_GER=false so a
-# controlled GER can be used to manufacture the orphan deterministically.
-#
-# Run standalone (needs the 8546/18080 ports free). ~50-70 min incl. the old build.
-# ============================================================================
+# Requires images `miden-agglayer-e2e:v0.15.9` (built here from the tag if absent)
+# and `miden-agglayer-e2e:latest` (the branch build). Needs 8546/9545/18080 free.
+# ══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
-
-HERE="$(cd "$(dirname "$0")" && pwd)"
-WT="$(cd "$HERE/.." && pwd)"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+WT="$PWD"
 PROJECT="${COMPOSE_PROJECT_NAME:-gate55}"
 export COMPOSE_PROJECT_NAME="$PROJECT"
-L2_RPC="${L2_RPC:-http://localhost:8546}"
+MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-$(grep -m1 '^MIDEN_NODE_GIT_URL' Makefile | sed 's/.*= *//')}"
+MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-$(grep -m1 '^MIDEN_NODE_GIT_REF' Makefile | sed 's/.*= *//')}"
+export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF
+BASE=(docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env)
+REL=("${BASE[@]}" -f scripts/upgrade/docker-compose.upgrade-release.yml)
 PROXY="${PROJECT}-miden-agglayer-1"
 PG="${PROJECT}-agglayer-postgres-1"
-BRIDGE="${BRIDGE_ADDRESS:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}"
-GER_KEY="${GER_TEST_KEY:-0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d}"
-OLD_REF="${UPGRADE_FROM_REF:-origin/main}"
-OLD_TAG=miden-agglayer-e2e:preupgrade
-NEW_TAG=miden-agglayer-e2e:postupgrade
-RUN_TAG=miden-agglayer-e2e:latest          # what the compose actually runs
-COMPOSE=(docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env)
+BRIDGE_SERVICE="${PROJECT}-bridge-service-1"
+L2_RPC="${L2_RPC:-http://localhost:8546}"
+CLAIM_SELECTOR="ccaa2d11"
+REL_REF="${UPGRADE_FROM_REF:-v0.15.9}"
+REL_IMG="miden-agglayer-e2e:${REL_REF}"
 
-log()  { echo "[upg] $*"; }
-pass() { echo "[upg] PASS: $*"; }
-fail() { echo "[upg] FAIL: $*"; exit 1; }
+ts()   { date '+%H:%M:%S'; }
+log()  { echo "[$(ts)] [upg] $*"; }
+pass() { echo "[$(ts)] [upg] PASS: $*"; }
+fail() { echo "[$(ts)] [upg] FAIL: $*"; exit 1; }
 pgq()  { docker exec "$PG" psql -U agglayer -d agglayer_store -tAX -c "$1" 2>/dev/null; }
 receipt_status() { cast receipt --rpc-url "$L2_RPC" "$1" status 2>/dev/null | awk '{print $1; exit}'; }
 container_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
 proxy_ready() { for _ in $(seq 1 "${1:-60}"); do cast chain-id --rpc-url "$L2_RPC" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
 
-cd "$WT" || fail "cannot cd $WT"
-GER_ADDR="$(cast wallet address --private-key "$GER_KEY")"
-
 # ── Build both images ──────────────────────────────────────────────────────────
-# The NEW image is whatever HEAD currently builds; capture it first.
-log "building NEW image (HEAD = main+#157) → $NEW_TAG"
-"${COMPOSE[@]}" build miden-agglayer >/dev/null 2>&1 || fail "new image build failed"
-docker tag "$RUN_TAG" "$NEW_TAG" || fail "could not tag new image"
+log "ensuring branch image miden-agglayer-e2e:latest (this branch = main+#157)"
+"${BASE[@]}" build miden-agglayer >/dev/null 2>&1 || fail "branch image build failed"
 
-log "building OLD image ($OLD_REF, pre-#157) → $OLD_TAG (isolated worktree)"
-git fetch origin -q 2>/dev/null || true
-OLD_WT="$(mktemp -d /tmp/upg-old.XXXXXX)"
-git worktree add --detach "$OLD_WT" "$OLD_REF" >/dev/null 2>&1 || fail "git worktree add $OLD_REF failed"
-cleanup_wt() { git worktree remove --force "$OLD_WT" >/dev/null 2>&1 || rm -rf "$OLD_WT"; }
-trap cleanup_wt EXIT
-docker build -t "$OLD_TAG" "$OLD_WT" >/dev/null 2>&1 || fail "old image build from $OLD_REF failed"
-OLD_SHA="$(cd "$OLD_WT" && git rev-parse --short HEAD)"
-log "old=$OLD_SHA  new=$(git rev-parse --short HEAD)"
+if ! docker image inspect "$REL_IMG" >/dev/null 2>&1; then
+    log "building RELEASE image $REL_IMG from tag $REL_REF (clean worktree)"
+    git fetch origin --tags -q 2>/dev/null || true
+    git rev-parse -q --verify "refs/tags/${REL_REF}^{commit}" >/dev/null 2>&1 || fail "release tag $REL_REF not found"
+    REL_WT="$(mktemp -d /tmp/upg-rel.XXXXXX)"
+    git worktree add --detach "$REL_WT" "$REL_REF" >/dev/null 2>&1 || fail "git worktree add $REL_REF failed"
+    trap 'git worktree remove --force "$REL_WT" >/dev/null 2>&1 || rm -rf "$REL_WT"' EXIT
+    docker build -t "$REL_IMG" "$REL_WT" >/dev/null 2>&1 || fail "release image build from $REL_REF failed"
+fi
+log "release=$REL_REF  branch=$(git rev-parse --short HEAD)"
 
-# ── Bring up on the OLD binary ──────────────────────────────────────────────────
-log "teardown any prior $PROJECT stack"
-"${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+# ── phase R: fresh deployment ON THE RELEASE ─────────────────────────────────────
+log "teardown + fresh RELEASE bringup ($REL_IMG proxy, release command line)"
+"${BASE[@]}" down -v --remove-orphans >/dev/null 2>&1
 left=$(docker ps -aq --filter "name=$PROJECT"); [ -n "$left" ] && docker rm -f $left >/dev/null 2>&1
-vols=$(docker volume ls -q --filter "name=$PROJECT"); [ -n "$vols" ] && docker volume rm $vols >/dev/null 2>&1
-
-log "pinning the stack to the OLD binary (tag $OLD_TAG → $RUN_TAG) and bringing it up"
-docker tag "$OLD_TAG" "$RUN_TAG" || fail "retag old→latest failed"
-REJECT_UNVERIFIED_GER_INJECTION=false make e2e-l2l2-up >/tmp/upg-up.log 2>&1 || log "(up nonzero — verifying)"
-for i in $(seq 1 100); do [ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${PROJECT}-anvil-1" 2>/dev/null)" = healthy ] && break; sleep 3; done
-for retry in 1 2 3 4 5; do
-    created=$(docker ps -a --filter "name=$PROJECT" --filter status=created -q | wc -l); [ "$created" -eq 0 ] && break
-    MIDEN_NODE_GIT_URL=https://github.com/0xMiden/node.git MIDEN_NODE_GIT_REF=v0.15.0 REJECT_UNVERIFIED_GER_INJECTION=false \
-        "${COMPOSE[@]}" up -d >>/tmp/upg-up.log 2>&1 || true; sleep 15
-done
-STABLE=0; for i in $(seq 1 120); do if docker exec "$PROXY" cat /var/lib/miden-agglayer-service/bridge_accounts.toml >/dev/null 2>&1; then STABLE=$((STABLE+1)); [ "$STABLE" -ge 6 ] && break; else STABLE=0; fi; sleep 5; done
-sleep 15
-[ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || fail "old-binary proxy not healthy"
-# Confirm we are actually on the OLD binary (it must NOT know migration 021).
-docker exec "$PROXY" /usr/local/bin/miden-agglayer-service --version >/dev/null 2>&1 || true
-pass "stack up on the OLD binary ($OLD_SHA); Postgres NOT yet migrated to 021"
+make e2e-clean-data gen-l2b-configs >/dev/null 2>&1 || fail "clean-data/gen-l2b-configs"
+"${REL[@]}" up -d >/tmp/upg-relup.log 2>&1 || fail "release bringup"
+until cast chain-id --rpc-url http://localhost:9545 >/dev/null 2>&1; do sleep 2; done
+L2B_RPC=http://localhost:9545 ./scripts/setup-l2b.sh >/tmp/upg-setup-l2b.log 2>&1 || fail "setup-l2b"
+"${REL[@]}" up -d --force-recreate --wait aggkit-l2b bridge-service-l2b >/dev/null 2>&1 || fail "l2b services"
+proxy_ready 100 || fail "release proxy never became ready"
+docker inspect "$PROXY" --format '{{.Config.Image}}' | grep -q "$REL_REF" || fail "proxy is not the release image ($REL_REF)"
 [ -z "$(pgq "SELECT 1 FROM information_schema.columns WHERE table_name='transactions' AND column_name='recovery_attempts'")" ] \
-    || fail "OLD DB already has recovery_attempts — old image is not actually pre-#157?"
-pass "confirmed: pre-upgrade DB has NO recovery_attempts column (021 not applied)"
+    || fail "release DB already has recovery_attempts — $REL_REF is not actually pre-#157?"
+pass "stack up on the RELEASE $REL_REF; DB is at the pre-#157 schema (no recovery_attempts)"
 
-# ── (a) A COMPLETED deposit on the OLD binary (must be preserved across upgrade) ──
-log "OLD binary: a full L1→L2 deposit that completes normally (terminal state to preserve)"
-DONE_LOG="$(mktemp /tmp/upg-done.XXXXXX.log)"
-env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh" > "$DONE_LOG" 2>&1 \
-    || { sed -E 's/\x1b\[[0-9;]*m//g' "$DONE_LOG" | tail -20; fail "OLD-binary baseline deposit did not complete"; }
-DONE_DEST="$(sed -E 's/\x1b\[[0-9;]*m//g' "$DONE_LOG" | grep -aoE 'Dest: +0x[0-9a-fA-F]{40}' | grep -oE '0x[0-9a-fA-F]{40}' | head -1)"
-DONE_TERMINALS_BEFORE="$(pgq "SELECT count(*) FROM transactions WHERE status <> 'pending'")"
-pass "OLD-binary baseline deposit completed (dest $DONE_DEST); $DONE_TERMINALS_BEFORE terminal txns recorded"
+# ── baseline: a completed deposit on the release (must survive the upgrade) ───────
+log "RELEASE: a full L1→L2 deposit that completes normally (terminal state to preserve)"
+env COMPOSE_PROJECT_NAME="$PROJECT" ./scripts/e2e-l1-to-l2.sh >/tmp/upg-baseline.log 2>&1 \
+    || { sed -E 's/\x1b\[[0-9;]*m//g' /tmp/upg-baseline.log | tail -20; fail "release baseline deposit did not complete"; }
+TERMINALS_BEFORE="$(pgq "SELECT count(*) FROM transactions WHERE status <> 'pending'")"
+pass "release baseline deposit completed; $TERMINALS_BEFORE terminal txns recorded"
 
-# ── (b) Manufacture a PENDING ORPHAN on the OLD binary (mid-proving crash) ────────
-# The old binary has no recovery loop, so this row stays stuck: a durably-admitted
-# GER (pending row + advanced nonce) whose in-memory writer job dies with the proxy.
-log "OLD binary: submitting a controlled GER, then SIGKILL the proxy in its recoverable window"
-NONCE_BEFORE="$(cast nonce --rpc-url "$L2_RPC" "$GER_ADDR")"
-ORPHAN_GER="0x$(printf '%064x' "$(( 0xE70000 + RANDOM ))")"
-ORPHAN_HASH="$(cast send --async --rpc-url "$L2_RPC" --private-key "$GER_KEY" --legacy --gas-price 1 --gas-limit 1000000 \
-    "$BRIDGE" 'insertGlobalExitRoot(bytes32)' "$ORPHAN_GER" 2>/dev/null)"
-[[ "$ORPHAN_HASH" == 0x* ]] || fail "controlled GER not admitted on OLD binary (REJECT_UNVERIFIED_GER=true?)"
-# Wait until it is durably admitted + still UNLINKED (recoverable window), then kill.
-CAUGHT=""
-for _ in $(seq 1 60); do
-    st="$(pgq "SELECT t.status FROM transactions t LEFT JOIN tx_note_links l ON l.tx_hash=t.tx_hash
-               WHERE t.tx_hash='$ORPHAN_HASH' AND t.status='pending' AND l.tx_hash IS NULL AND t.miden_tx_id IS NULL")"
-    [ "$st" = "pending" ] && { CAUGHT=1; break; }
+# ── orphan: a REAL claim, captured durably-admitted+unlinked, then SIGKILL ────────
+log "RELEASE: driving a deposit and capturing its claim in the recoverable window"
+SCEN_START="$(pgq "SELECT now()")"
+ORPHAN_DEP="$(mktemp /tmp/upg-orphan.XXXXXX.log)"
+env COMPOSE_PROJECT_NAME="$PROJECT" \
+    CLAIM_SUBMIT_TIMEOUT=1200 CLAIM_COMMIT_TIMEOUT=400 BALANCE_ATTEMPTS=50 \
+    ./scripts/e2e-l1-to-l2.sh >"$ORPHAN_DEP" 2>&1 &
+ORPHAN_PID=$!
+# capture this deposit's destination, then wait for it to confirm ready_for_claim.
+ODEST=""
+for _ in $(seq 1 150); do
+    ODEST="$(sed -E 's/\x1b\[[0-9;]*m//g' "$ORPHAN_DEP" | grep -aoE 'Dest: +0x[0-9a-fA-F]{40}' | grep -oE '0x[0-9a-fA-F]{40}' | head -1)"
+    [ -n "$ODEST" ] && break
+    kill -0 "$ORPHAN_PID" 2>/dev/null || { sed -E 's/\x1b\[[0-9;]*m//g' "$ORPHAN_DEP" | tail -20; fail "orphan deposit exited before provisioning"; }
+    sleep 2
+done
+[ -n "$ODEST" ] || fail "no orphan-deposit destination captured"
+ODESTHEX="$(printf '%s' "${ODEST#0x}" | tr 'A-F' 'a-f')"
+for _ in $(seq 1 150); do grep -aq "Deposit is ready_for_claim" "$ORPHAN_DEP" && break; kill -0 "$ORPHAN_PID" 2>/dev/null || fail "orphan deposit exited before ready_for_claim"; sleep 3; done
+# poll the DB for THIS deposit's claim, durably admitted + UNLINKED (recoverable window).
+ORPHAN_HASH=""
+for _ in $(seq 1 400); do
+    ORPHAN_HASH="$(pgq "SELECT t.tx_hash FROM transactions t
+        LEFT JOIN tx_note_links l ON l.tx_hash=t.tx_hash
+        WHERE t.status='pending' AND l.tx_hash IS NULL AND t.miden_tx_id IS NULL
+          AND position('${CLAIM_SELECTOR}' in encode(t.envelope_bytes,'hex')) > 0
+          AND position('${ODESTHEX}' in encode(t.envelope_bytes,'hex')) > 0
+          AND t.created_at >= '${SCEN_START}'
+        ORDER BY t.created_at DESC LIMIT 1")"
+    [[ "$ORPHAN_HASH" == 0x* ]] && break
     sleep 1
 done
-[ -n "$CAUGHT" ] || fail "controlled GER never reached the pending+unlinked window on OLD binary"
+[[ "$ORPHAN_HASH" == 0x* ]] || { kill "$ORPHAN_PID" 2>/dev/null||true; fail "orphan claim never entered the recoverable window"; }
+OSIGNER="$(pgq "SELECT lower(signer) FROM transactions WHERE tx_hash='$ORPHAN_HASH'")"
+ONONCE_BEFORE="$(cast nonce --rpc-url "$L2_RPC" "$OSIGNER" 2>/dev/null)"
+log "captured orphan claim $ORPHAN_HASH (signer=$OSIGNER nonce=$ONONCE_BEFORE dest=$ODEST)"
+
+# disable rebroadcast (so ONLY the branch recovery — not the ClaimTxManager — heals it)
+docker stop "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
+container_running "$BRIDGE_SERVICE" && fail "bridge-service still running after stop"
+# SIGKILL the RELEASE proxy with the claim pending+unlinked → an orphan v0.15.9 can't heal.
 docker kill "$PROXY" >/dev/null 2>&1 || true
-container_running "$PROXY" && fail "OLD proxy still running after kill"
-pass "OLD proxy SIGKILLed with $ORPHAN_HASH pending+unlinked (an orphan the old binary cannot self-heal)"
+container_running "$PROXY" && fail "release proxy still running after kill"
+pass "RELEASE proxy SIGKILLed with $ORPHAN_HASH pending+unlinked (an orphan the release binary cannot self-heal)"
 
-# Bring the OLD proxy back and confirm it does NOT recover the orphan (no recovery loop).
-docker start "$PROXY" >/dev/null 2>&1 || true
-proxy_ready 60 || fail "OLD proxy did not restart"
-sleep 45
-ORPHAN_STATE_OLD="$(pgq "SELECT status FROM transactions WHERE tx_hash='$ORPHAN_HASH'")"
-[ "$ORPHAN_STATE_OLD" = "pending" ] || fail "expected the orphan to stay pending on the OLD binary, got '$ORPHAN_STATE_OLD'"
-NONCE_STUCK="$(cast nonce --rpc-url "$L2_RPC" "$GER_ADDR")"
-pass "OLD binary left $ORPHAN_HASH STUCK pending (nonce advanced $NONCE_BEFORE→$NONCE_STUCK, blocking later nonces) — as expected"
+# ── U1: swap ONLY the proxy to the branch image (same volumes) ────────────────────
+log "UPGRADE (U1): swap proxy → branch image (miden-agglayer-e2e:latest), same PG + Miden store"
+REJECT_UNVERIFIED_GER_INJECTION=false "${BASE[@]}" up -d --no-deps --force-recreate miden-agglayer >/tmp/upg-swap.log 2>&1 || fail "proxy swap failed"
+proxy_ready 120 || fail "branch proxy did not come up after the swap"
+docker inspect "$PROXY" --format '{{.Config.Image}}' | grep -q "latest" || fail "proxy is not the branch image after swap"
+[ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || { sleep 25; [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || fail "branch proxy not healthy after swap"; }
+pass "proxy upgraded to the branch binary in place"
 
-# ── UPGRADE IN PLACE: swap ONLY the proxy to the NEW binary, volumes preserved ────
-log "UPGRADE: retag $NEW_TAG → $RUN_TAG and force-recreate ONLY the proxy (same PG + Miden volumes)"
-docker tag "$NEW_TAG" "$RUN_TAG" || fail "retag new→latest failed"
-# Keep REJECT_UNVERIFIED_GER_INJECTION=false on the recreated proxy so the controlled
-# GER orphan can be re-driven to injection by the new recovery loop.
-REJECT_UNVERIFIED_GER_INJECTION=false "${COMPOSE[@]}" up -d --no-deps --force-recreate miden-agglayer >/tmp/upg-recreate.log 2>&1 || fail "proxy recreate failed"
-proxy_ready 90 || fail "NEW-binary proxy did not come up after upgrade"
-[ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || { sleep 20; [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || fail "NEW-binary proxy not healthy after upgrade"; }
-pass "proxy upgraded to the NEW binary in place"
-
-# ── (1) MIGRATION applied cleanly ────────────────────────────────────────────────
+# ── (1) migrations applied cleanly on the release-populated DB ────────────────────
 for c in recovery_attempts next_recovery_at; do
     [ -n "$(pgq "SELECT 1 FROM information_schema.columns WHERE table_name='transactions' AND column_name='$c'")" ] \
         || fail "migration 021 did not add column $c"
 done
-[ -n "$(pgq "SELECT 1 FROM pg_indexes WHERE indexname='idx_txns_pending_recovery'")" ] \
-    || fail "migration 021 did not create idx_txns_pending_recovery"
-pass "(1) migration 021 applied cleanly on the old-populated DB (columns + index present)"
+[ -n "$(pgq "SELECT 1 FROM pg_indexes WHERE indexname='idx_txns_pending_recovery'")" ] || fail "021 index missing"
+[ -n "$(pgq "SELECT to_regclass('public.claim_calldata_repair_pending')")" ] || fail "migration 019 table missing"
+pass "(1) additive migrations 019 + 021 applied cleanly on the release-populated DB"
 
-# ── (3) PRESERVATION: the old completed deposit's terminals are untouched ─────────
-DONE_TERMINALS_AFTER="$(pgq "SELECT count(*) FROM transactions WHERE status <> 'pending'")"
-[ "${DONE_TERMINALS_AFTER:-0}" -ge "${DONE_TERMINALS_BEFORE:-0}" ] \
-    || fail "terminal-txn count decreased across upgrade ($DONE_TERMINALS_BEFORE → $DONE_TERMINALS_AFTER) — old state lost?"
-pass "(3a) already-terminal state preserved across upgrade ($DONE_TERMINALS_BEFORE → $DONE_TERMINALS_AFTER terminals)"
+# ── (3a) already-terminal state preserved across the upgrade ──────────────────────
+TERMINALS_AFTER="$(pgq "SELECT count(*) FROM transactions WHERE status <> 'pending'")"
+[ "${TERMINALS_AFTER:-0}" -ge "${TERMINALS_BEFORE:-0}" ] || fail "terminal-txn count dropped across upgrade ($TERMINALS_BEFORE→$TERMINALS_AFTER)"
+pass "(3a) already-terminal state preserved ($TERMINALS_BEFORE → $TERMINALS_AFTER terminals)"
 
-# ── (2) RECOVERY-OF-OLD-STATE: the pre-upgrade orphan self-heals EXACTLY once ─────
-log "(2) waiting for the NEW recovery loop to heal the OLD-binary orphan $ORPHAN_HASH"
+# ── (2) the release-created orphan self-heals EXACTLY once (recovery, no rebroadcast)
+log "(2) waiting for the branch recovery loop to heal the release orphan $ORPHAN_HASH (bridge-service stopped)"
 HEALED=""
-for _ in $(seq 1 120); do
-    proxy_ready 5 || true
-    [ "$(receipt_status "$ORPHAN_HASH")" = "1" ] && { HEALED=1; break; }
-    sleep 5
-done
-[ -n "$HEALED" ] || fail "the pre-upgrade orphan was NOT recovered by the new binary within ~600s"
-pass "(2) SAME hash $ORPHAN_HASH recovered to success by the NEW recovery loop (no client action)"
-INJECTED="$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected AND ger_hash = decode('${ORPHAN_GER#0x}','hex')")"
-[ "${INJECTED:-0}" -ge 1 ] || fail "orphan GER effect not applied after recovery"
-NONCE_AFTER="$(cast nonce --rpc-url "$L2_RPC" "$GER_ADDR")"
-[ "$NONCE_AFTER" = "$NONCE_STUCK" ] \
-    || fail "signer nonce moved during recovery ($NONCE_STUCK → $NONCE_AFTER) — recovery must NOT re-advance the nonce"
-pass "(2) orphan effect applied EXACTLY once (is_injected) and nonce NOT double-advanced ($NONCE_STUCK held)"
+for _ in $(seq 1 140); do proxy_ready 5 || true; [ "$(receipt_status "$ORPHAN_HASH")" = "1" ] && { HEALED=1; break; }; sleep 5; done
+[ -n "$HEALED" ] || fail "the pre-upgrade orphan was NOT recovered by the branch within ~700s"
+pass "(2) SAME hash $ORPHAN_HASH recovered to success by the branch recovery loop — no rebroadcast"
+ONONCE_AFTER="$(cast nonce --rpc-url "$L2_RPC" "$OSIGNER" 2>/dev/null)"
+[ "$ONONCE_AFTER" = "$ONONCE_BEFORE" ] || fail "signer nonce moved during recovery ($ONONCE_BEFORE→$ONONCE_AFTER) — must NOT re-advance"
+pass "(2) signer nonce NOT double-advanced across recovery ($ONONCE_BEFORE held)"
 
-# ── (3b) LIVENESS: a fresh deposit works after the upgrade ───────────────────────
-log "(3b) post-upgrade liveness: a fresh L1→L2 deposit must complete end-to-end"
-FRESH_LOG="$(mktemp /tmp/upg-fresh.XXXXXX.log)"
-if env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh" > "$FRESH_LOG" 2>&1; then
-    pass "(3b) post-upgrade fresh deposit completed (credited exactly once)"
+# restart the ClaimTxManager; the deposit wrapper (widened timeouts) is our exact-once
+# credit oracle — it now completes off the recovered claim and asserts the balance delta.
+docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
+if wait "$ORPHAN_PID"; then
+    pass "(2) interrupted deposit CREDITED EXACTLY ONCE on dest $ODEST (wrapper exact-balance delta) via recovery across the upgrade"
 else
-    sed -E 's/\x1b\[[0-9;]*m//g' "$FRESH_LOG" | tail -20
-    fail "post-upgrade fresh deposit failed — pipeline not healthy after upgrade"
+    sed -E 's/\x1b\[[0-9;]*m//g' "$ORPHAN_DEP" | tail -25
+    fail "the interrupted deposit did not reach an exact-once credit after the upgrade"
 fi
 
-# restore :latest to the NEW image for any subsequent runs
-docker tag "$NEW_TAG" "$RUN_TAG" >/dev/null 2>&1 || true
-pass "UPGRADE E2E GREEN: $OLD_SHA → main+#157 in place — migration 021 clean, old orphan self-healed exactly once, terminal state preserved, bridge live"
+# ── (3b) liveness: a fresh deposit works after the upgrade ────────────────────────
+log "(3b) post-upgrade liveness: a fresh L1→L2 deposit must complete end-to-end"
+env COMPOSE_PROJECT_NAME="$PROJECT" ./scripts/e2e-l1-to-l2.sh >/tmp/upg-fresh.log 2>&1 \
+    || { sed -E 's/\x1b\[[0-9;]*m//g' /tmp/upg-fresh.log | tail -20; fail "post-upgrade fresh deposit failed"; }
+pass "(3b) post-upgrade fresh deposit completed (credited exactly once)"
+
+pass "UPGRADE-RECOVERY E2E GREEN: $REL_REF → branch in place — migrations 019+021 clean, release orphan self-healed exactly once (no rebroadcast, no nonce double-advance), terminal state preserved, bridge live"
