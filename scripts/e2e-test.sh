@@ -149,6 +149,12 @@ case "$test_filter" in
         # controlled GER injects.
         "$SCRIPT_DIR/e2e-recovery-scenarios.sh"
         ;;
+    upgrade-recovery)
+        # #157 — in-place upgrade test (pre-#157 origin/main -> main+#157). DEDICATED
+        # (NOT in `all`): builds both images, populates old-version durable state, and
+        # upgrades the proxy in place. Needs 8546/18080 free; ~50-70 min.
+        "$SCRIPT_DIR/e2e-upgrade-recovery.sh"
+        ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
         ;;
