@@ -198,7 +198,7 @@ assert_received_faucet() {
     # Canonicalize the expected id up front so a bech32 config id and the hex ids
     # emitted by --list-wallet-faucets compare on identity, not textual form.
     local want_norm; want_norm="$(_norm_account_id "$want_fid")" \
-        || fail "#147/link: $label — expected origin faucet id is unparseable: $want_fid"
+        || fail "#147/link: $label — expected origin faucet id is unparsable: $want_fid"
     local after="" derived="" derived_norm="" attempt fid aamt bamt delta
     # POLL: the just-claimed P2ID note is not consumed/visible instantly. Each snapshot
     # re-syncs + consumes, so retry until a faucet's delta reaches the received amount.
@@ -217,7 +217,7 @@ assert_received_faucet() {
     [[ -n "$derived" ]] \
         || fail "#147/link: $label — NO wallet faucet's vault balance rose by >= $want_amt after the claim (wallet=$WALLET_ID). BEFORE=[$(printf '%s' "$before" | tr '\n' ';')] AFTER=[$(printf '%s' "$after" | tr '\n' ';')] expected-origin-faucet=$want_norm symbol=$want_sym/$want_dec — the received asset was linked to no faucet"
     derived_norm="$(_norm_account_id "$derived")" \
-        || fail "#147/link: $label — derived received faucet id is unparseable: $derived"
+        || fail "#147/link: $label — derived received faucet id is unparsable: $derived"
     [[ "$derived_norm" == "$want_norm" ]] \
         || fail "#147/link: $label — the RECEIVED asset's faucet (DERIVED $derived → $derived_norm, balance rose >= $want_amt) != the expected origin faucet ($want_fid → $want_norm). The wallet received a DIFFERENT asset than the config/RPC/PG id claims. AFTER=[$(printf '%s' "$after" | tr '\n' ';')]"
     log "#147/link: $label — DERIVED received faucet $derived from the wallet's vault delta (>= $want_amt units); verifying its cold-wallet metadata"

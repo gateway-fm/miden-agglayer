@@ -287,10 +287,12 @@ async fn defer_with_backoff(service: &ServiceState, tx: &RecoverablePendingTxn, 
 
 /// Recover every acknowledged pending/unlinked transaction for every signer, each
 /// signer walked in nonce order and stopped at the first unresolved nonce so a
-/// later nonce is never driven ahead of an unresolved lower one. Each re-drive
-/// re-enters the public admission path, which takes the per-signer lock itself, so
-/// recovery serialises against live admission per attempt (holding a lock across
-/// the whole walk would deadlock that re-entry). Best-effort and bounded: a
+/// later nonce is never driven ahead of an unresolved lower one. Each signer's
+/// walk runs UNDER that signer's lock so recovery's read-reconcile-re-enqueue is
+/// serialised against live admission for the same signer (no interleaving at a
+/// nonce recovery is touching); the re-drive enqueues the writer job directly
+/// rather than re-entering the locking admission path, so there is no
+/// self-deadlock. Different signers are independent. Best-effort and bounded: a
 /// failure on one row or one signer never blocks startup or the recovery of
 /// unrelated signers. Runs at startup and on the periodic sweep.
 pub async fn recover_orphaned_pending_txns(service: &ServiceState) -> anyhow::Result<()> {
@@ -329,6 +331,13 @@ pub async fn recover_orphaned_pending_txns(service: &ServiceState) -> anyhow::Re
             tracing::error!(target: "recovery", signer = %signer_str, "recovery: un-parseable signer; skipping");
             continue;
         };
+        // Serialise this signer's recovery against live admission: the walk reads
+        // the pending state, reconciles it against Miden, and re-enqueues under one
+        // continuous hold, so a concurrent `eth_sendRawTransaction` for the same
+        // signer cannot interleave at a nonce recovery is resolving. The re-drive
+        // uses `try_enqueue` directly (it does NOT re-acquire this lock), so the
+        // hold is safe.
+        let _guard = service.per_signer_locks.lock(signer).await;
         for tx in group {
             if let Step::StopSigner = recover_one(service, signer, tx).await {
                 break;
