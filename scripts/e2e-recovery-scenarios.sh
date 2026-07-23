@@ -192,78 +192,110 @@ scenario_ger() {
     pass "SCENARIO ($tag) GREEN"
 }
 
-# ── CLAIM scenarios (real deposit, stop the ClaimTxManager rebroadcaster) ────────
+# ── CLAIM scenarios ─────────────────────────────────────────────────────────────
+# The real deposit is the AUTHORITATIVE oracle (widened Step-3/4/5 timeouts so it
+# OUTLASTS recovery and still asserts the EXACT balance delta on THIS destination).
+# We bind the claim row to this deposit, FREEZE the proxy before the no-handoff
+# assertion + fault (no check-to-fault window), keep the node down until this claim's
+# submission-failure evidence, and disable the ClaimTxManager rebroadcaster.
 scenario_claim() {
     local fault="$1" tag="$2"
     log "═══ SCENARIO ($tag): $fault crash during CLAIM proving ═══"
-    local prog0 since dep_log
+    local prog0 dep_log
     prog0="$(recovery_progress)"
-    since="$(date +%s)"
     dep_log="$(mktemp /tmp/scen-claim.XXXXXX.log)"
-    RECV_POLL_TRIES=120 RECV_POLL_INTERVAL=10 \
-        env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh" > "$dep_log" 2>&1 &
+    env COMPOSE_PROJECT_NAME="$PROJECT"         CLAIM_SUBMIT_TIMEOUT=1000 CLAIM_COMMIT_TIMEOUT=300 BALANCE_ATTEMPTS=40         RECV_POLL_TRIES=120 RECV_POLL_INTERVAL=10         bash "$HERE/e2e-l1-to-l2.sh" > "$dep_log" 2>&1 &
     local dep_pid=$!
 
-    # Drive the real deposit; when the ClaimTxManager submits the claim it is durably
-    # admitted (pending row + nonce) BEFORE any Miden note handoff — the exact
-    # recoverable window. Poll the DB for that pending+UNLINKED claim rather than
-    # racing the ephemeral, undistinguished "proving CLAIM note" log line (which on a
-    # busy stack is missed or matches another claim). This also naturally tolerates a
-    # queued/slow writer (the pending+unlinked window is only longer). The wrapper's
-    # own Step-3+ timeouts are NOT our oracle; we verify recovery INDEPENDENTLY below.
-    log "  polling for MY claim to be durably admitted + unlinked (recoverable window)"
+    # Capture THIS deposit's destination (printed right after provisioning) to BIND
+    # the claim row to this deposit — not "the newest arbitrary pending claim".
+    local dest desthex
+    for _ in $(seq 1 150); do
+        dest="$(sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | grep -aoE 'Dest: +0x[0-9a-fA-F]{40}' | grep -oE '0x[0-9a-fA-F]{40}' | head -1)"
+        [ -n "$dest" ] && break
+        kill -0 "$dep_pid" 2>/dev/null || { sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -20; fail "deposit exited before provisioning a destination"; }
+        sleep 2
+    done
+    [ -n "$dest" ] || { kill "$dep_pid" 2>/dev/null||true; fail "no deposit destination captured"; }
+    desthex="$(printf '%s' "${dest#0x}" | tr 'A-F' 'a-f')"
+
+    # Poll the DB for THIS deposit's claim in the durably-admitted + UNLINKED window,
+    # BOUND to this destination (its 20-byte address appears in the claimAsset calldata).
+    log "  polling for THIS deposit's claim (dest $dest) in the recoverable window"
     local hash=""
-    for _ in $(seq 1 360); do
+    for _ in $(seq 1 400); do
         hash="$(pgq "SELECT t.tx_hash FROM transactions t
                      LEFT JOIN tx_note_links l ON l.tx_hash = t.tx_hash
                      WHERE t.status='pending' AND l.tx_hash IS NULL AND t.miden_tx_id IS NULL
-                       AND substr(encode(t.envelope_bytes,'hex'),1,220) LIKE '%${CLAIM_SELECTOR}%'
+                       AND position('${CLAIM_SELECTOR}' in encode(t.envelope_bytes,'hex')) > 0
+                       AND position('${desthex}' in encode(t.envelope_bytes,'hex')) > 0
                      ORDER BY t.created_at DESC LIMIT 1")"
         [[ "$hash" == 0x* ]] && break
         sleep 1
     done
-    [[ "$hash" == 0x* ]] || {
-        kill "$dep_pid" 2>/dev/null || true
-        sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -20
-        fail "no durably-admitted unlinked claim appeared within 360s (deposit never reached claim?)"
-    }
-    # The deposit destination (for the fresh next-claim continuity check).
-    local dest signer nonce_before
-    dest="$(sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | grep -aoE 'Dest: +0x[0-9a-fA-F]{40}' | grep -oE '0x[0-9a-fA-F]{40}' | head -1)"
+    [[ "$hash" == 0x* ]] || { kill "$dep_pid" 2>/dev/null||true; sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -20; fail "THIS deposit's claim (dest $dest) never entered the recoverable window"; }
+    local signer nonce_before
     signer="$(pgq "SELECT lower(signer) FROM transactions WHERE tx_hash='$hash'")"
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
     log "  captured claim $hash (signer=$signer nonce=$nonce_before dest=$dest)"
-    assert_pending_no_handoff "$hash"
 
-    # Disable rebroadcast: stop the bridge-service ClaimTxManager (the real L1->L2
-    # claim submitter/retry source). It stays DOWN across the recovery wait, so ONLY
-    # recovery — not a rebroadcast — can heal the claim.
+    # FREEZE the proxy so writer/projector cannot mutate the row between the
+    # no-handoff assertion and the fault (eliminates the check-to-fault window).
+    docker pause "$PROXY" >/dev/null 2>&1 || true
+    [ "$(docker inspect -f '{{.State.Status}}' "$PROXY" 2>/dev/null)" = "paused" ] || fail "proxy did not freeze (pause)"
+    assert_pending_no_handoff "$hash"
+    log "  proxy FROZEN at pending + no-handoff"
+
+    # Disable rebroadcast (ClaimTxManager) for the whole recovery window.
     docker stop "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
     container_running "$BRIDGE_SERVICE" && fail "bridge-service still running after stop (rebroadcast not disabled)"
     log "  verified: bridge-service (ClaimTxManager) is DOWN — no rebroadcast"
 
-    case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
-    # The wrapper's own timeouts are irrelevant now; stop it and verify independently.
-    kill "$dep_pid" 2>/dev/null || true
+    if [ "$fault" = "proxy" ]; then
+        docker kill "$PROXY" >/dev/null 2>&1 || { docker unpause "$PROXY" >/dev/null 2>&1; docker kill "$PROXY" >/dev/null 2>&1; }
+        container_running "$PROXY" && fail "proxy still running after kill"
+        log "  fault: proxy SIGKILLed while frozen; restarting (the only remedy)"
+        docker start "$PROXY" >/dev/null 2>&1 || true
+        wait_proxy_ready 60 || fail "proxy did not come back after restart"
+    else
+        # NODE crash: kill the node, unfreeze the proxy so its in-flight submit hits the
+        # dead node, then keep the node DOWN until THIS claim's submission-failure
+        # evidence (not a fixed sleep), then bring it back.
+        docker kill "$NODE" >/dev/null 2>&1 || true
+        container_running "$NODE" && fail "miden-node still running after kill"
+        local kill_ts; kill_ts="$(date +%s)"
+        docker unpause "$PROXY" >/dev/null 2>&1 || true
+        log "  fault: miden-node DOWN; proxy unfrozen — awaiting THIS claim's submission-failure evidence"
+        local evidence=""
+        for _ in $(seq 1 120); do
+            if docker logs --since "$kill_ts" "$PROXY" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+                 | grep -qiE "${hash#0x}.*(ambiguous|leaving receipt pending|error|not committed)|(ambiguous|leaving receipt pending).*${hash#0x}"; then evidence=1; break; fi
+            [ -n "$(pgq "SELECT 1 FROM tx_note_links WHERE tx_hash='$hash' AND handoff_state='prepared'")" ] && { evidence=1; break; }
+            sleep 2
+        done
+        [ -n "$evidence" ] || fail "no evidence THIS claim's submission failed while the node was down (target-specific fault unconfirmed)"
+        log "  evidence: THIS claim's submission failed under the node outage; bringing node back"
+        docker start "$NODE" >/dev/null 2>&1 || true
+    fi
 
-    # Wait for RECOVERY ALONE (ClaimTxManager still stopped) to heal the EXACT claim
-    # to a success receipt. A claim killed at the proof boundary leaves a prepared
-    # handoff, re-driven only after its note expiration (~600s). The projector
-    # finalises the receipt on consumption — success == the claim actually applied.
-    log "  waiting for recovery ALONE to heal claim $hash (ClaimTxManager stopped)"
-    local ok=""
-    for _ in $(seq 1 130); do
-        wait_proxy_ready 5 || true
-        [ "$(receipt_status "$hash")" = "1" ] && { ok=1; break; }
-        sleep 5
-    done
-    [ -n "$ok" ] || fail "claim $hash did NOT reach success via recovery within ~650s (ClaimTxManager stopped)"
-    pass "  SAME claim hash $hash recovered to success — via recovery ALONE, no rebroadcast"
+    # The wrapper (widened timeouts) is the oracle: it waits for recovery to re-drive
+    # the claim, then asserts the EXACT balance delta credited on THIS destination.
+    log "  waiting for recovery to heal + the wrapper's EXACT-balance assertion on dest $dest"
+    local rc
+    if wait "$dep_pid"; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
+        sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -30
+        fail "the interrupted deposit did NOT self-heal to an exact-once credit (dest $dest, rc=$rc)"
+    fi
+    pass "  interrupted deposit CREDITED EXACTLY ONCE on dest $dest (wrapper exact-balance delta), via recovery alone"
 
-    # Claim signer nonce advanced EXACTLY once (with the ClaimTxManager stopped this
-    # also proves no rebroadcast happened).
-    local nonce_after
-    nonce_after="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
+    # SAME captured claim hash reached success (recovery healed the exact tx).
+    [ "$(receipt_status "$hash")" = "1" ] || fail "captured claim $hash did not reach a success receipt"
+    pass "  SAME claim hash $hash recovered to success"
+
+    # Claim signer nonce advanced EXACTLY once (also proves no rebroadcast).
+    local nonce_after; nonce_after="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
     [ "$nonce_after" = "$(( nonce_before + 1 ))" ] \
         || fail "claim signer nonce double-advanced/stuck: $nonce_before → $nonce_after"
     pass "  claim signer nonce advanced exactly once ($nonce_before → $nonce_after) — no rebroadcast"
@@ -271,19 +303,7 @@ scenario_claim() {
     local prog1; prog1="$(recovery_progress)"
     assert_recovery_ran "$fault" "$prog0" "$prog1" "claim"
 
-    # Restart the ClaimTxManager and prove a FRESH deposit still claims end-to-end
-    # (nonce continuity + the whole credit pipeline is live; a full e2e-l1-to-l2 with
-    # its own before/after balance delta).
     docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
-    log "  next-claim continuity: a fresh deposit must claim end-to-end (balance delta)"
-    local dep2; dep2="$(mktemp /tmp/scen-claim2.XXXXXX.log)"
-    if env COMPOSE_PROJECT_NAME="$PROJECT" RECV_POLL_TRIES=120 RECV_POLL_INTERVAL=10 \
-        bash "$HERE/e2e-l1-to-l2.sh" > "$dep2" 2>&1; then
-        pass "  next claim works (fresh deposit credited exactly once after recovery)"
-    else
-        sed -E 's/\x1b\[[0-9;]*m//g' "$dep2" | tail -20
-        fail "the NEXT claim did not work after recovery (ClaimTxManager nonce wedged?)"
-    fi
     pass "SCENARIO ($tag) GREEN"
 }
 
