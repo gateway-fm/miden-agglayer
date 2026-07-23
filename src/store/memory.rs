@@ -665,18 +665,25 @@ impl Store for InMemoryStore {
         tx_hash: TxHash,
         next_recovery_at: u64,
     ) -> anyhow::Result<u32> {
+        // Reviewer (stale-snapshot race) — atomic eligibility CAS mirroring the
+        // PgStore: only a row that is STILL a pending orphan (pending, no miden_tx_id,
+        // no note-link handoff) is updated + backoff-persisted; anything else means
+        // the writer/projector changed it since enumeration, so bail → caller stops +
+        // rescans (never re-proves a linked/terminal tx). (Also subsumes reviewer #1.)
+        let linked = self
+            .tx_note_links
+            .read()
+            .contains_key(&format!("{tx_hash:#x}"));
         let mut txns = self.transactions.lock();
         match txns.get_mut(&tx_hash) {
-            Some(r) => {
+            Some(r) if r.result.is_none() && r.id.is_none() && !linked => {
                 r.recovery_attempts = r.recovery_attempts.saturating_add(1);
                 r.next_recovery_at = Some(next_recovery_at);
                 Ok(r.recovery_attempts)
             }
-            // Reviewer #1 — a missing row means the backoff was NOT persisted; the
-            // caller must treat this as a hard failure and NOT enqueue (else a crash
-            // before a durable handoff would re-drive immediately: repeated-OOM loop).
-            None => anyhow::bail!(
-                "record_recovery_attempt updated no row for {tx_hash:#x}; backoff not persisted"
+            _ => anyhow::bail!(
+                "record_recovery_attempt: row {tx_hash:#x} no longer an eligible orphan \
+                 (concurrently linked / terminalised / miden-id recorded); rescan"
             ),
         }
     }

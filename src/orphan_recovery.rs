@@ -253,9 +253,12 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         }
     };
 
-    // Read the durable note handoff once: the exact `note_id` for the reconcile
-    // (reviewer #3) and the `note_commitment` for the prepared-expiry path. tx.handoff
-    // (row existence + state) already classified it; here we fetch the identity.
+    // Reviewer (stale-snapshot race) — `tx` is a SCAN snapshot from
+    // `recoverable_pending_txns`. The writer and projector do NOT take this signer
+    // lock, so between enumeration and now they may have recorded a note handoff,
+    // recorded a `miden_tx_id`, or terminalised the receipt. Every decision below
+    // must use FRESHLY-read state, not `tx.handoff` / `tx.miden_tx_id`, or recovery
+    // could re-prove a transaction that is already linked or terminal.
     let tx_key = format!("{:#x}", tx.tx_hash);
     let handoff = match service.store.get_note_handoff_for_tx(&tx_key).await {
         Ok(h) => h,
@@ -264,6 +267,25 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
             return Step::StopSigner;
         }
     };
+    let fresh = match service.store.txn_get(tx.tx_hash).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            // Vanished between scan and now — nothing to recover; rescan.
+            return Step::Continue;
+        }
+        Err(e) => {
+            poll_next_sweep(tx, &format!("fresh tx read failed (db unavailable?): {e}"));
+            return Step::StopSigner;
+        }
+    };
+    // Terminalised concurrently (writer/projector finished it) — done, keep walking.
+    if fresh.result.is_some() {
+        tracing::debug!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, "recovery: tx terminalised concurrently; skipping");
+        return Step::Continue;
+    }
+    let fresh_handoff_state = handoff.as_ref().map(|h| h.state);
+    let fresh_has_handoff = handoff.is_some();
+    let fresh_miden_id = fresh.id.is_some();
     let handoff_note_id = handoff.as_ref().and_then(|h| h.note_id.clone());
 
     // 2. Reconcile against a FRESH, authoritative Miden view (reviewer #5 — the
@@ -276,7 +298,7 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
                 service,
                 *ger_bytes,
                 handoff_note_id,
-                tx.handoff.is_some(),
+                fresh_has_handoff,
             )
             .await
         }
@@ -285,7 +307,7 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
                 service,
                 params.globalIndex,
                 handoff_note_id,
-                tx.handoff.is_some(),
+                fresh_has_handoff,
             )
             .await
         }
@@ -354,7 +376,7 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
     // 3. A CONFIRMED submission — a `Submitted` handoff or a recorded Miden tx id —
     //    crossed the boundary and Miden already has it. Poll for the effect at the
     //    sweep cadence; never re-submit, and hold later nonces until it resolves.
-    if matches!(tx.handoff, Some(NoteHandoffState::Submitted)) || tx.miden_tx_id.is_some() {
+    if matches!(fresh_handoff_state, Some(NoteHandoffState::Submitted)) || fresh_miden_id {
         poll_next_sweep(tx, "submitted handoff; awaiting Miden confirmation");
         return Step::StopSigner;
     }
@@ -371,7 +393,7 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
     //     Until then, poll at the sweep cadence — the note may yet be consumed (→ effect
     //     applied, finalised in step 2) or will expire. (Relies on submission notes
     //     carrying a finite expiration delta; see `submission_note_expiration_delta`.)
-    if matches!(tx.handoff, Some(NoteHandoffState::Prepared)) {
+    if matches!(fresh_handoff_state, Some(NoteHandoffState::Prepared)) {
         let Some(commitment) = handoff.as_ref().map(|h| h.note_commitment.clone()) else {
             poll_next_sweep(
                 tx,
@@ -438,10 +460,12 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
     {
         Ok(attempts) => attempts,
         Err(e) => {
-            // Backoff NOT durably persisted — defer to the next sweep rather than
-            // enqueue without a durable gate.
+            // The atomic eligibility CAS matched no row: either the backoff could not
+            // be durably persisted, OR the row is no longer a pending orphan (the
+            // writer/projector linked / terminalised / recorded a miden_tx_id since
+            // enumeration). EITHER way we must NOT enqueue — stop and rescan next sweep.
             ::metrics::counter!("orphan_recovery_deferred_total").increment(1);
-            tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, error = %e, "recovery: backoff persist failed; NOT enqueuing without a durable backoff (deferred to next sweep)");
+            tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, error = %e, "recovery: re-drive not eligible / backoff not persisted; stopping signer to rescan");
             return Step::StopSigner;
         }
     };
@@ -898,6 +922,62 @@ mod tests {
         assert!(
             !handle.is_inflight(&hash),
             "a legacy null-note_id GER must not be re-driven by recovery"
+        );
+    }
+
+    /// Reviewer (stale-snapshot race) — `record_recovery_attempt` is an ATOMIC
+    /// eligibility CAS. The scan enumerates orphans without the signer lock; the
+    /// writer/projector can LINK or TERMINALISE a row before recovery acts on the
+    /// (now stale) snapshot. The CAS must advance the backoff and permit a re-drive
+    /// ONLY while the row is still a pending orphan (pending, no miden_tx_id, no note
+    /// handoff) — otherwise recovery would re-prove a linked or terminal transaction.
+    #[tokio::test]
+    async fn record_recovery_attempt_is_eligibility_cas() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+
+        // (a) a fresh pending orphan IS eligible.
+        let (env_a, hash_a, _g, signer_a) = signed_ger_tx(&key, 0, 0xE1);
+        install_orphan(&store, &env_a, hash_a, signer_a, 0).await;
+        assert!(
+            store
+                .record_recovery_attempt(hash_a, now_unix() + 30)
+                .await
+                .is_ok(),
+            "a still-pending, unlinked orphan must be re-drive eligible"
+        );
+
+        // (b) a row LINKED after the scan (writer recorded a handoff) is NOT eligible.
+        let key_b = PrivateKeySigner::random();
+        let (env_b, hash_b, _g, signer_b) = signed_ger_tx(&key_b, 0, 0xE2);
+        install_orphan(&store, &env_b, hash_b, signer_b, 0).await;
+        store
+            .record_tx_note_link(&format!("{hash_b:#x}"), "0xcommit")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_recovery_attempt(hash_b, now_unix() + 30)
+                .await
+                .is_err(),
+            "a row LINKED since the scan must NOT be re-drive eligible (stale-snapshot race)"
+        );
+
+        // (c) a row TERMINALISED after the scan is NOT eligible.
+        let key_c = PrivateKeySigner::random();
+        let (env_c, hash_c, _g, signer_c) = signed_ger_tx(&key_c, 0, 0xE3);
+        install_orphan(&store, &env_c, hash_c, signer_c, 0).await;
+        store
+            .txn_commit(hash_c, Ok(()), 1, [0u8; 32])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_recovery_attempt(hash_c, now_unix() + 30)
+                .await
+                .is_err(),
+            "a TERMINALISED row must NOT be re-drive eligible (stale-snapshot race)"
         );
     }
 

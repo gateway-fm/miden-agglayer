@@ -482,13 +482,25 @@ impl Store for PgStore {
         next_recovery_at: u64,
     ) -> anyhow::Result<u32> {
         let client = self.pool.get().await?;
+        // Reviewer (stale-snapshot race) — an ATOMIC eligibility CAS: persist the
+        // backoff AND gate the re-drive in one statement that matches ONLY a row that
+        // is still a pending orphan — status 'pending', no recorded miden_tx_id, and
+        // no tx_note_links handoff. The writer/projector may have linked or
+        // terminalised the row since it was enumerated (they do not hold the signer
+        // lock); a zero-row update means the row is no longer eligible, so the caller
+        // must STOP and rescan rather than enqueue another expensive proof for an
+        // already-linked/terminal transaction. (Also subsumes reviewer #1: the backoff
+        // is durably persisted exactly when — and only when — a re-drive is permitted.)
         let row = client
             .query_opt(
-                "UPDATE transactions
+                "UPDATE transactions t
                     SET recovery_attempts = recovery_attempts + 1,
                         next_recovery_at = $2,
                         updated_at = now()
-                  WHERE tx_hash = $1
+                  WHERE t.tx_hash = $1
+                    AND t.status = 'pending'
+                    AND t.miden_tx_id IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM tx_note_links l WHERE l.tx_hash = t.tx_hash)
                   RETURNING recovery_attempts",
                 &[
                     &format!("{tx_hash:#x}"),
@@ -496,12 +508,11 @@ impl Store for PgStore {
                 ],
             )
             .await?;
-        // Reviewer #1 — bail (not Ok(0)) when the UPDATE matched no row, so the caller
-        // never enqueues without a durably-persisted backoff (repeated-OOM loop).
         row.map(|r| r.get::<_, i32>(0).max(0) as u32)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "record_recovery_attempt updated no row (tx absent); backoff not persisted"
+                    "record_recovery_attempt: row no longer an eligible orphan \
+                     (concurrently linked / terminalised / miden-id recorded); rescan"
                 )
             })
     }
