@@ -19,8 +19,13 @@
 //! - **Effect already applied in Miden** (GER injected / global index claimed) —
 //!   finalise the original hash with a terminal success receipt (recovers a lost
 //!   local receipt without re-submitting).
-//! - **Handoff recorded but effect not yet observed** — the intent crossed the
-//!   external submission boundary; poll it with backoff, never blindly re-submit.
+//! - **Confirmed submission but effect not yet observed** — a `Submitted` handoff
+//!   or a recorded Miden tx id: Miden already has it, so poll for the effect with
+//!   backoff and never re-submit.
+//! - **Prepared-but-unconfirmed handoff** — the exact note is durable but Miden
+//!   never confirmed it (e.g. the proxy was killed mid-proving); the submission may
+//!   never have reached Miden, so re-drive the exact note (idempotent via Miden
+//!   duplicate-protection) rather than poll forever.
 //! - **No handoff, no effect** — an orphaned durable intent; re-enqueue its writer
 //!   job (rebuilt from the stored envelope) directly, with persistent exponential
 //!   backoff. The pending row and nonce CAS are already durable, so this is the
@@ -35,7 +40,7 @@
 
 use crate::service_send_raw_txn::decode_write_call;
 use crate::service_state::ServiceState;
-use crate::store::RecoverablePendingTxn;
+use crate::store::{NoteHandoffState, RecoverablePendingTxn};
 use crate::writer_worker::DecodedWriteCall;
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, Bytes};
@@ -95,18 +100,26 @@ enum Step {
     StopSigner,
 }
 
-/// Is the transaction's intended effect ALREADY present in authoritative Miden
-/// state? A GER is checked with `is_ger_injected`; a claim with `is_claimed` on
-/// its global index. A missing local receipt is never treated as proof the effect
-/// is absent — this is the reconciliation the recovery contract requires.
+/// Is the transaction's intended effect ALREADY present in AUTHORITATIVE Miden
+/// state? Uses [`crate::applied_state`], which for a GER consults the injected set
+/// AND the Miden bridge snapshot, and for a CLAIM consults the projected
+/// ClaimEvent AND the Miden bridge `isClaimed` snapshot — never the local
+/// `claimed_indices` reservation alone, which only proves a claim was
+/// reserved/submitted, NOT that Miden applied it (that would let recovery finalise
+/// an unexecuted claim). A missing local receipt is never treated as proof the
+/// effect is absent. When the Miden node is unavailable this returns `Err`, and
+/// the caller defers with backoff rather than guessing — reconciliation, not a
+/// blind decision.
 async fn effect_already_applied(
     service: &ServiceState,
     envelope: &TxEnvelope,
 ) -> anyhow::Result<bool> {
     match decode_write_call(envelope_input(envelope)) {
-        Ok(DecodedWriteCall::Ger { ger_bytes }) => service.store.is_ger_injected(&ger_bytes).await,
+        Ok(DecodedWriteCall::Ger { ger_bytes }) => {
+            crate::applied_state::ger_applied(service, &ger_bytes).await
+        }
         Ok(DecodedWriteCall::Claim { params }) => {
-            service.store.is_claimed(&params.globalIndex).await
+            crate::applied_state::claim_applied(service, params.globalIndex).await
         }
         // An undecodable write is a deterministic failure, not a transient one; it
         // cannot have applied and must not be retried as an outage.
@@ -171,17 +184,28 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         }
     }
 
-    // 3. The intent crossed the external submission boundary (a durable handoff or
-    //    a recorded Miden id) but the effect is not yet observed. Its outcome is
-    //    ambiguous: poll with backoff, never blindly re-submit, and hold later
-    //    nonces until it resolves.
-    if tx.handoff.is_some() || tx.miden_tx_id.is_some() {
-        defer_with_backoff(service, tx, "handoff recorded; awaiting Miden confirmation").await;
+    // 3. A CONFIRMED submission — a `Submitted` handoff (the Miden tx committed or
+    //    the exact note was later observed) or a recorded Miden tx id — crossed the
+    //    boundary and Miden already has it. Poll for the effect to become
+    //    observable; never re-submit a confirmed tx, and hold later nonces until it
+    //    resolves. (A still-`Prepared` handoff is deliberately NOT polled here.)
+    if matches!(tx.handoff, Some(NoteHandoffState::Submitted)) || tx.miden_tx_id.is_some() {
+        defer_with_backoff(
+            service,
+            tx,
+            "submitted handoff; awaiting Miden confirmation",
+        )
+        .await;
         return Step::StopSigner;
     }
 
-    // 4. Orphaned durable intent: no live job, no handoff, effect absent. Re-drive
-    //    the exact stored envelope once its persistent backoff is due.
+    // 4. Orphaned durable intent OR a PREPARED-but-unconfirmed handoff: the writer
+    //    durably recorded the exact note identity but was interrupted (e.g. killed
+    //    mid-proving) BEFORE Miden confirmed it, so the submission may never have
+    //    reached Miden and polling alone would never resolve it. Re-drive the exact
+    //    intent once its persistent backoff is due. Re-submitting a prepared note is
+    //    idempotent — Miden duplicate-protection rejects it if it did apply, and the
+    //    authoritative effect check above already finalised the applied case.
     if let Some(next_at) = tx.next_recovery_at
         && next_at > now_unix()
     {
@@ -517,19 +541,24 @@ mod tests {
         }
     }
 
-    /// #156 test 13 — a durable handoff is recorded but the effect is not yet
-    /// confirmed (Miden outage). Recovery must NOT resubmit; it defers with backoff
-    /// and the schedule is persisted.
+    /// #156 — a CONFIRMED (`Submitted`) handoff whose effect is not yet observed
+    /// (projection lag / Miden outage) is POLLED with backoff, never re-submitted:
+    /// Miden already has it, so re-submitting could duplicate work.
     #[tokio::test]
-    async fn handoff_recorded_is_polled_not_resubmitted() {
+    async fn submitted_handoff_is_polled_not_resubmitted() {
         let concrete = Arc::new(InMemoryStore::new());
         let store: Arc<dyn Store> = concrete.clone();
         let key = PrivateKeySigner::random();
         let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xD0);
         install_orphan(&store, &env, hash, signer, 0).await;
-        // A prepared handoff: the intent crossed the external submission boundary.
+        // A SUBMITTED handoff: Miden committed (or the exact note was observed).
+        let tx_key = format!("{hash:#x}");
         store
-            .prepare_note_handoff(&format!("{hash:#x}"), "0xcommit", "0xnote", 100)
+            .prepare_note_handoff(&tx_key, "0xcommit", "0xnote", 100)
+            .await
+            .unwrap();
+        store
+            .confirm_note_handoff(&tx_key, "0xcommit")
             .await
             .unwrap();
 
@@ -539,7 +568,7 @@ mod tests {
 
         assert!(
             !handle.is_inflight(&hash),
-            "a handoff-recorded tx must be polled, never blindly resubmitted"
+            "a confirmed (submitted) handoff must be polled, never re-submitted"
         );
         let after = store
             .recoverable_pending_txns(10)
@@ -552,9 +581,40 @@ mod tests {
             after.recovery_attempts, 1,
             "backoff attempt must be recorded"
         );
+        assert!(after.next_recovery_at.is_some(), "next-attempt scheduled");
+    }
+
+    /// #156 (reviewer) — a PREPARED-but-unconfirmed handoff (the exact note is
+    /// durable but Miden never confirmed it — the proxy was killed mid-proving)
+    /// must NOT be deferred forever: reconciliation finds the effect absent, so
+    /// recovery re-drives the exact note (idempotent). This is the "killed while
+    /// sending/proving the tx → self-heals" case at the unit level.
+    #[tokio::test]
+    async fn prepared_unconfirmed_handoff_is_redriven() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xD1);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        // A PREPARED handoff only — the Miden submit never confirmed (no
+        // confirm_note_handoff), and the GER is not injected.
+        store
+            .prepare_note_handoff(&format!("{hash:#x}"), "0xcommit", "0xnote", 100)
+            .await
+            .unwrap();
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
         assert!(
-            after.next_recovery_at.is_some(),
-            "next-attempt must be scheduled"
+            handle.is_inflight(&hash),
+            "a prepared-but-unconfirmed handoff must be re-driven, not deferred forever"
+        );
+        assert_eq!(
+            store.nonce_get(&signer_hex(signer)).await.unwrap(),
+            1,
+            "re-driving a prepared handoff must not advance the nonce twice"
         );
     }
 
