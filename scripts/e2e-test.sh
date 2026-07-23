@@ -142,6 +142,13 @@ case "$test_filter" in
     chaos)
         "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"
         ;;
+    recovery-scenarios)
+        # #157 reviewer #7 — deterministic {node,proxy}×{GER,claim} crash-during-
+        # proving recovery. DEDICATED gate (NOT in `all`): the GER cases require the
+        # stack to be brought up with REJECT_UNVERIFIED_GER_INJECTION=false so a
+        # controlled GER injects.
+        "$SCRIPT_DIR/e2e-recovery-scenarios.sh"
+        ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
         ;;
