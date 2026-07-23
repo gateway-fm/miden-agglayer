@@ -192,6 +192,46 @@ pub fn claim_receipt_expiration_blocks() -> u64 {
     }
 }
 
+pub const SUBMISSION_NOTE_EXPIRATION_DELTA_ENV: &str =
+    "AGGLAYER_SUBMISSION_NOTE_EXPIRATION_DELTA_BLOCKS";
+/// Inclusion window (in blocks) for the Miden transaction that CREATES a GER or
+/// claim note. Setting a finite delta (Miden's default is "never expire") is what
+/// lets recovery conclude a `prepared`-but-unconfirmed note is dead: once the
+/// authoritative reconcile cursor passes `creation_block + delta` without the
+/// effect appearing, the creating tx can never be included, so the stale note is
+/// safe to clear and re-drive (see [`crate::store::Store::clear_expired_prepared_note_handoff`]).
+/// Must comfortably exceed normal prove→submit→include latency (a few blocks) so
+/// healthy submissions are never expired spuriously; the default is generous.
+pub const DEFAULT_SUBMISSION_NOTE_EXPIRATION_DELTA: u16 = 64;
+
+/// Expiration delta (blocks) applied to every GER/claim submission note. Shared by
+/// [`crate::ger`] and this module so both honour the same recovery-bounding window.
+pub fn submission_note_expiration_delta() -> u16 {
+    match std::env::var(SUBMISSION_NOTE_EXPIRATION_DELTA_ENV) {
+        Ok(value) => match value.parse::<u16>() {
+            Ok(blocks) if blocks >= 1 => blocks,
+            Ok(_) => {
+                tracing::warn!(
+                    env = SUBMISSION_NOTE_EXPIRATION_DELTA_ENV,
+                    value = %value,
+                    "{SUBMISSION_NOTE_EXPIRATION_DELTA_ENV} must be >= 1 block; using default {DEFAULT_SUBMISSION_NOTE_EXPIRATION_DELTA}"
+                );
+                DEFAULT_SUBMISSION_NOTE_EXPIRATION_DELTA
+            }
+            Err(err) => {
+                tracing::warn!(
+                    env = SUBMISSION_NOTE_EXPIRATION_DELTA_ENV,
+                    value = %value,
+                    error = %err,
+                    "invalid {SUBMISSION_NOTE_EXPIRATION_DELTA_ENV}; using default {DEFAULT_SUBMISSION_NOTE_EXPIRATION_DELTA}"
+                );
+                DEFAULT_SUBMISSION_NOTE_EXPIRATION_DELTA
+            }
+        },
+        Err(_) => DEFAULT_SUBMISSION_NOTE_EXPIRATION_DELTA,
+    }
+}
+
 alloy_core::sol! {
     // https://github.com/agglayer/agglayer-contracts/blob/main/contracts/v2/PolygonZkEVMBridgeV2.sol#L556
     #[derive(Debug)]
@@ -854,6 +894,11 @@ async fn publish_claim_internal(
     // `MidenClient::with` slot for every queued write.
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![claim_note])
+        // Bound the creating tx's inclusion window (see
+        // `submission_note_expiration_delta`) so a prepared-but-unconfirmed claim
+        // handoff can be declared dead and re-driven by recovery rather than
+        // stranded forever with Miden's default "never expire".
+        .expiration_delta(submission_note_expiration_delta())
         .build()?;
 
     // Execute and check the output notes before submission. `ExecutedTransaction` still

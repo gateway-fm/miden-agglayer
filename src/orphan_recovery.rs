@@ -23,9 +23,13 @@
 //!   or a recorded Miden tx id: Miden already has it, so poll for the effect with
 //!   backoff and never re-submit.
 //! - **Prepared-but-unconfirmed handoff** — the exact note is durable but Miden
-//!   never confirmed it (e.g. the proxy was killed mid-proving); the submission may
-//!   never have reached Miden, so re-drive the exact note (idempotent via Miden
-//!   duplicate-protection) rather than poll forever.
+//!   never confirmed it (e.g. the proxy was killed mid-proving). The note cannot be
+//!   reproduced (its serial is random), so we cannot blindly re-drive. Wait until
+//!   the authoritative reconcile cursor passes the note's expiration block — proving
+//!   the creating tx can never be included, so the note is dead — then clear the
+//!   stale link and re-drive a FRESH note; until then poll at the sweep cadence (the
+//!   note may still be consumed). This relies on submission notes carrying a finite
+//!   expiration delta (`claim::submission_note_expiration_delta`).
 //! - **No handoff, no effect** — an orphaned durable intent; re-enqueue its writer
 //!   job (rebuilt from the stored envelope) directly, with persistent exponential
 //!   backoff. The pending row and nonce CAS are already durable, so this is the
@@ -178,34 +182,97 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         }
         Ok(false) => {}
         Err(e) => {
-            // The node is likely unavailable; defer with backoff, do not abandon.
-            defer_with_backoff(service, tx, &format!("effect check failed: {e}")).await;
+            // The node is unavailable — a TRANSIENT outage, NOT a per-tx failure.
+            // Do NOT grow the exponential backoff: that would delay recovery long
+            // after the node returns (a node-down window could push the next
+            // attempt minutes out, well past a deposit's claim deadline). The next
+            // sweep (~RECOVERY_SWEEP_INTERVAL_SECS) simply retries the reconcile.
+            poll_next_sweep(
+                tx,
+                &format!("Miden state check failed (node unavailable?): {e}"),
+            );
             return Step::StopSigner;
         }
     }
 
     // 3. A CONFIRMED submission — a `Submitted` handoff (the Miden tx committed or
     //    the exact note was later observed) or a recorded Miden tx id — crossed the
-    //    boundary and Miden already has it. Poll for the effect to become
-    //    observable; never re-submit a confirmed tx, and hold later nonces until it
-    //    resolves. (A still-`Prepared` handoff is deliberately NOT polled here.)
+    //    boundary and Miden already has it. Poll for the effect to become observable
+    //    at the sweep cadence (NOT exponential backoff — the projector observes it
+    //    shortly and finalisation should not be delayed); never re-submit a confirmed
+    //    tx, and hold later nonces until it resolves. (A still-`Prepared` handoff is
+    //    deliberately NOT polled here.)
     if matches!(tx.handoff, Some(NoteHandoffState::Submitted)) || tx.miden_tx_id.is_some() {
-        defer_with_backoff(
-            service,
-            tx,
-            "submitted handoff; awaiting Miden confirmation",
-        )
-        .await;
+        poll_next_sweep(tx, "submitted handoff; awaiting Miden confirmation");
         return Step::StopSigner;
     }
 
-    // 4. Orphaned durable intent OR a PREPARED-but-unconfirmed handoff: the writer
-    //    durably recorded the exact note identity but was interrupted (e.g. killed
-    //    mid-proving) BEFORE Miden confirmed it, so the submission may never have
-    //    reached Miden and polling alone would never resolve it. Re-drive the exact
-    //    intent once its persistent backoff is due. Re-submitting a prepared note is
-    //    idempotent — Miden duplicate-protection rejects it if it did apply, and the
-    //    authoritative effect check above already finalised the applied case.
+    // 4a. A PREPARED-but-unconfirmed handoff needs care: the writer durably recorded
+    //     an EXACT note identity but was interrupted (e.g. killed mid-proving) before
+    //     Miden confirmed it. We must NOT blindly re-drive — each GER/claim note is
+    //     built with a fresh random serial, so a re-drive produces a DIFFERENT note
+    //     that conflicts with the durable prepared link (`prepare_note_handoff` is
+    //     first-writer-wins) and the outcome stays forever "ambiguous", looping. Mirror
+    //     the public admission path: clear the prepared link ONLY once the authoritative
+    //     Miden reconcile cursor has passed its expiration block (proving the creating
+    //     tx can never be included, so the note is dead), then re-drive a fresh note.
+    //     Until then, poll at the sweep cadence — the note may yet be consumed (→ effect
+    //     applied, finalised in steps 2/3) or will expire. (This relies on submission
+    //     notes carrying a finite expiration delta; see `submission_note_expiration_delta`.)
+    if matches!(tx.handoff, Some(NoteHandoffState::Prepared)) {
+        let tx_key = format!("{:#x}", tx.tx_hash);
+        let commitment = match service.store.get_note_handoff_for_tx(&tx_key).await {
+            Ok(Some(handoff)) => handoff.note_commitment,
+            Ok(None) => {
+                // Resolved concurrently (confirmed or cleared); re-reconcile next sweep.
+                poll_next_sweep(
+                    tx,
+                    "prepared handoff no longer present; re-checking next sweep",
+                );
+                return Step::StopSigner;
+            }
+            Err(e) => {
+                poll_next_sweep(
+                    tx,
+                    &format!("prepared-handoff read failed (node/db unavailable?): {e}"),
+                );
+                return Step::StopSigner;
+            }
+        };
+        match service
+            .store
+            .clear_expired_prepared_note_handoff(&tx_key, &commitment)
+            .await
+        {
+            Ok(true) => {
+                // Expired past the authoritative cursor — the stale note is provably
+                // dead. Fall through to re-drive a fresh note.
+                tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, "recovery: cleared expired prepared note handoff; re-driving a fresh note");
+            }
+            Ok(false) => {
+                // Not yet expired: still possibly in-flight. Building a second note now
+                // would conflict (and, once expired, is handled above); wait for the
+                // effect or expiration and retry the reconcile next sweep.
+                poll_next_sweep(
+                    tx,
+                    "prepared note not yet expired; awaiting consumption or expiration",
+                );
+                return Step::StopSigner;
+            }
+            Err(e) => {
+                poll_next_sweep(
+                    tx,
+                    &format!("prepared-handoff expiration check failed: {e}"),
+                );
+                return Step::StopSigner;
+            }
+        }
+    }
+
+    // 4b. Orphaned durable intent (or a just-cleared, provably-dead prepared handoff):
+    //     the pending row + nonce CAS are durable but no live note remains, so polling
+    //     alone would never resolve it. Re-drive the exact intent once its persistent
+    //     backoff is due.
     if let Some(next_at) = tx.next_recovery_at
         && next_at > now_unix()
     {
@@ -265,6 +332,18 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
             Step::StopSigner
         }
     }
+}
+
+/// Defer to the NEXT periodic sweep without touching the durable backoff schedule.
+/// Used for TRANSIENT conditions — the Miden node being unavailable, or a confirmed
+/// submission still awaiting projection — where the right cadence is the sweep
+/// interval (~[`RECOVERY_SWEEP_INTERVAL_SECS`]) and growing the exponential backoff
+/// would only delay recovery once the condition clears. It records no attempt (so
+/// these do not trip the persistent-failure alert); the oldest-age gauge covers a
+/// genuinely stuck transaction.
+fn poll_next_sweep(tx: &RecoverablePendingTxn, reason: &str) {
+    ::metrics::counter!("orphan_recovery_deferred_total").increment(1);
+    tracing::debug!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, reason, "recovery: deferred to next sweep (transient)");
 }
 
 /// Record a failed/deferred attempt and schedule the next one with persistent
@@ -586,31 +665,42 @@ mod tests {
             .into_iter()
             .find(|t| t.tx_hash == hash)
             .expect("still pending");
+        // A confirmed submission is polled at the sweep cadence, NOT with the
+        // exponential backoff — the projector observes it shortly, and delaying
+        // finalisation would be wrong. So no durable backoff attempt is recorded.
         assert_eq!(
-            after.recovery_attempts, 1,
-            "backoff attempt must be recorded"
+            after.recovery_attempts, 0,
+            "a submitted-handoff poll must not grow the exponential backoff"
         );
-        assert!(after.next_recovery_at.is_some(), "next-attempt scheduled");
+        assert!(
+            after.next_recovery_at.is_none(),
+            "polling a confirmed submission must not schedule an exponential backoff"
+        );
     }
 
-    /// #156 (reviewer) — a PREPARED-but-unconfirmed handoff (the exact note is
-    /// durable but Miden never confirmed it — the proxy was killed mid-proving)
-    /// must NOT be deferred forever: reconciliation finds the effect absent, so
-    /// recovery re-drives the exact note (idempotent). This is the "killed while
-    /// sending/proving the tx → self-heals" case at the unit level.
+    /// #156 (reviewer) — a PREPARED-but-unconfirmed handoff whose note is provably
+    /// DEAD (the authoritative reconcile cursor has passed its expiration block, so
+    /// the creating tx can never be included — the proxy was killed mid-proving) is
+    /// re-driven as a FRESH note, not deferred forever. This is the "killed while
+    /// sending/proving the tx → self-heals" case at the unit level. Re-driving as a
+    /// fresh note (rather than resubmitting the old random-serial one, which would
+    /// conflict with the durable prepared link and loop forever) is the fix.
     #[tokio::test]
-    async fn prepared_unconfirmed_handoff_is_redriven() {
+    async fn expired_prepared_handoff_is_redriven() {
         let concrete = Arc::new(InMemoryStore::new());
         let store: Arc<dyn Store> = concrete.clone();
         let key = PrivateKeySigner::random();
         let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xD1);
         install_orphan(&store, &env, hash, signer, 0).await;
         // A PREPARED handoff only — the Miden submit never confirmed (no
-        // confirm_note_handoff), and the GER is not injected.
+        // confirm_note_handoff), and the GER is not injected. Expiration block 100.
         store
             .prepare_note_handoff(&format!("{hash:#x}"), "0xcommit", "0xnote", 100)
             .await
             .unwrap();
+        // The authoritative reconcile cursor has moved PAST the note's expiration —
+        // the creating tx can never be included, so the stale note is dead.
+        store.set_reconcile_cursor(101).await.unwrap();
 
         let service = with_writer(store.clone(), 64);
         let handle = service.writer_handle.as_ref().unwrap().clone();
@@ -618,12 +708,71 @@ mod tests {
 
         assert!(
             handle.is_inflight(&hash),
-            "a prepared-but-unconfirmed handoff must be re-driven, not deferred forever"
+            "an EXPIRED prepared handoff must be re-driven as a fresh note, not deferred forever"
+        );
+        // The stale prepared link must have been cleared so the fresh re-drive's note
+        // can be recorded without a first-writer-wins conflict.
+        assert!(
+            store
+                .get_note_handoff_for_tx(&format!("{hash:#x}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the expired prepared link must be cleared before re-driving a fresh note"
         );
         assert_eq!(
             store.nonce_get(&signer_hex(signer)).await.unwrap(),
             1,
             "re-driving a prepared handoff must not advance the nonce twice"
+        );
+    }
+
+    /// #156 (reviewer) — a PREPARED-but-unconfirmed handoff that is NOT yet expired
+    /// (the reconcile cursor has not passed its expiration block) must NOT be
+    /// re-driven: the exact note may still be in-flight and consumed, so building a
+    /// second random-serial note would conflict (and, for claims, risk a duplicate).
+    /// Recovery polls at the sweep cadence instead — no re-drive, no backoff growth,
+    /// the durable link is preserved.
+    #[tokio::test]
+    async fn unexpired_prepared_handoff_is_polled_not_redriven() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xD2);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        store
+            .prepare_note_handoff(&format!("{hash:#x}"), "0xcommit", "0xnote", 100)
+            .await
+            .unwrap();
+        // Cursor still BEFORE the expiration — the note may yet be consumed.
+        store.set_reconcile_cursor(50).await.unwrap();
+
+        let service = with_writer(store.clone(), 64);
+        let handle = service.writer_handle.as_ref().unwrap().clone();
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        assert!(
+            !handle.is_inflight(&hash),
+            "an unexpired prepared handoff must be polled, not re-driven"
+        );
+        let after = store
+            .recoverable_pending_txns(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.tx_hash == hash)
+            .expect("still pending");
+        assert_eq!(
+            after.recovery_attempts, 0,
+            "polling an unexpired prepared handoff must not grow the exponential backoff"
+        );
+        assert!(
+            store
+                .get_note_handoff_for_tx(&format!("{hash:#x}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "the durable prepared link must be preserved while the note may still be consumed"
         );
     }
 

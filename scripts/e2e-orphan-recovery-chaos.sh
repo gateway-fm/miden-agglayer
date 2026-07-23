@@ -60,8 +60,14 @@ chaos_injector() {
 log "starting the wrapped l1-to-l2 deposit/claim under chaos"
 L1L2_LOG="$(mktemp /tmp/chaos-l1l2.XXXXXX.log)"
 (
-    # Generous polling so the flow outlasts the chaos + recovery windows.
-    RECV_POLL_TRIES=60 RECV_POLL_INTERVAL=10 \
+    # Generous polling so the flow outlasts the chaos + recovery windows: the chaos
+    # rounds (~130s) can orphan the covering GER as a PREPARED-but-unconfirmed note,
+    # which recovery only re-drives once its inclusion window expires past the
+    # authoritative reconcile cursor (~submission_note_expiration_delta blocks) — then
+    # the fresh GER injects, the deposit becomes claimable, and the claim lands. Allow
+    # 15 min end-to-end so "healed by at most a proxy restart" is what we measure, not
+    # an arbitrary deadline shorter than the (bounded) self-heal latency.
+    RECV_POLL_TRIES=90 RECV_POLL_INTERVAL=10 \
     env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh"
 ) > "$L1L2_LOG" 2>&1 &
 L1L2_PID=$!

@@ -178,6 +178,10 @@ async fn submit_update_ger_note(
                 );
                 let tx_request = TransactionRequestBuilder::new()
                     .own_output_notes(vec![note])
+                    // Bound the creating tx's inclusion window so a prepared-but-
+                    // unconfirmed handoff can be declared dead and re-driven by
+                    // recovery (Miden's default is "never expire", which strands it).
+                    .expiration_delta(crate::claim::submission_note_expiration_delta())
                     .build()?;
                 crate::miden_client::ensure_writable(ger_manager_id)?;
                 let tx_result = client
