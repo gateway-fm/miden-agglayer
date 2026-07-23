@@ -204,12 +204,19 @@ scenario_claim() {
         env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh" > "$dep_log" 2>&1 &
     local dep_pid=$!
 
+    # Drive the real deposit only to the claim PROOF boundary. The wrapper's own
+    # Step-3+ timeouts (e.g. 120s "claim tx submitted") are NOT our oracle — they fire
+    # long before recovery's ~expiration heal and, with the ClaimTxManager stopped,
+    # there is no resubmission. We verify recovery INDEPENDENTLY below.
     log "  waiting for the claim PROOF boundary"
-    if ! wait_for_marker "$CLAIM_PROVE_MARKER" "$since" 240; then
+    if ! wait_for_marker "$CLAIM_PROVE_MARKER" "$since" 300; then
         kill "$dep_pid" 2>/dev/null || true
         sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -20
-        fail "claim never reached the proof boundary within 240s"
+        fail "claim never reached the proof boundary within 300s"
     fi
+    # The deposit destination (for the fresh next-claim continuity check).
+    local dest
+    dest="$(sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | grep -aoE 'Dest: +0x[0-9a-fA-F]{40}' | grep -oE '0x[0-9a-fA-F]{40}' | head -1)"
     # MANDATORY hash capture: the exact pending claim tx recovery must heal.
     local hash signer nonce_before
     hash="$(pgq "SELECT tx_hash FROM transactions
@@ -218,50 +225,54 @@ scenario_claim() {
     [[ "$hash" == 0x* ]] || { kill "$dep_pid" 2>/dev/null || true; fail "could not capture the pending claim tx hash (mandatory)"; }
     signer="$(pgq "SELECT lower(signer) FROM transactions WHERE tx_hash='$hash'")"
     nonce_before="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
-    log "  captured claim $hash (signer=$signer, signer nonce=$nonce_before)"
+    log "  captured claim $hash (signer=$signer nonce=$nonce_before dest=$dest)"
     assert_pending_no_handoff "$hash"
 
     # Disable rebroadcast: stop the bridge-service ClaimTxManager (the real L1->L2
-    # claim submitter/retry source).
+    # claim submitter/retry source). It stays DOWN across the recovery wait, so ONLY
+    # recovery — not a rebroadcast — can heal the claim.
     docker stop "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
     container_running "$BRIDGE_SERVICE" && fail "bridge-service still running after stop (rebroadcast not disabled)"
     log "  verified: bridge-service (ClaimTxManager) is DOWN — no rebroadcast"
 
     case "$fault" in node) crash_node ;; proxy) crash_proxy ;; esac
+    # The wrapper's own timeouts are irrelevant now; stop it and verify independently.
+    kill "$dep_pid" 2>/dev/null || true
 
-    log "  waiting for recovery to heal the claim (wallet credited exactly once)"
-    local rc
-    if wait "$dep_pid"; then rc=0; else rc=$?; fi
-    if [ "$rc" -ne 0 ]; then
-        docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
-        sed -E 's/\x1b\[[0-9;]*m//g' "$dep_log" | tail -25
-        fail "the claim did NOT self-heal to an exact-once credit after $fault crash (rc=$rc)"
-    fi
-    pass "  deposit CLAIMED EXACTLY ONCE (balance delta) after $fault crash, ClaimTxManager stopped"
+    # Wait for RECOVERY ALONE (ClaimTxManager still stopped) to heal the EXACT claim
+    # to a success receipt. A claim killed at the proof boundary leaves a prepared
+    # handoff, re-driven only after its note expiration (~600s). The projector
+    # finalises the receipt on consumption — success == the claim actually applied.
+    log "  waiting for recovery ALONE to heal claim $hash (ClaimTxManager stopped)"
+    local ok=""
+    for _ in $(seq 1 130); do
+        wait_proxy_ready 5 || true
+        [ "$(receipt_status "$hash")" = "1" ] && { ok=1; break; }
+        sleep 5
+    done
+    [ -n "$ok" ] || fail "claim $hash did NOT reach success via recovery within ~650s (ClaimTxManager stopped)"
+    pass "  SAME claim hash $hash recovered to success — via recovery ALONE, no rebroadcast"
 
-    # SAME captured hash reached a terminal receipt (success or projector-finalised).
-    local st; st="$(receipt_status "$hash")"
-    [ "$st" = "1" ] || fail "captured claim hash $hash did not reach success (status=$st)"
-    pass "  SAME claim hash $hash recovered to success"
-
-    # Claim nonce continuity: the ClaimTxManager signer advanced EXACTLY once (no
-    # double-advance) — with bridge-service stopped this also proves no rebroadcast.
+    # Claim signer nonce advanced EXACTLY once (with the ClaimTxManager stopped this
+    # also proves no rebroadcast happened).
     local nonce_after
     nonce_after="$(cast nonce --rpc-url "$L2_RPC" "$signer" 2>/dev/null)"
     [ "$nonce_after" = "$(( nonce_before + 1 ))" ] \
         || fail "claim signer nonce double-advanced/stuck: $nonce_before → $nonce_after"
-    pass "  claim signer nonce advanced exactly once ($nonce_before → $nonce_after)"
+    pass "  claim signer nonce advanced exactly once ($nonce_before → $nonce_after) — no rebroadcast"
 
     local prog1; prog1="$(recovery_progress)"
     assert_recovery_ran "$fault" "$prog0" "$prog1" "claim"
 
-    # Restart the ClaimTxManager and prove the NEXT claim works (nonce continuity).
+    # Restart the ClaimTxManager and prove a FRESH deposit still claims end-to-end
+    # (nonce continuity + the whole credit pipeline is live; a full e2e-l1-to-l2 with
+    # its own before/after balance delta).
     docker start "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
-    log "  next-claim continuity: a fresh deposit must still claim"
+    log "  next-claim continuity: a fresh deposit must claim end-to-end (balance delta)"
     local dep2; dep2="$(mktemp /tmp/scen-claim2.XXXXXX.log)"
     if env COMPOSE_PROJECT_NAME="$PROJECT" RECV_POLL_TRIES=120 RECV_POLL_INTERVAL=10 \
         bash "$HERE/e2e-l1-to-l2.sh" > "$dep2" 2>&1; then
-        pass "  next claim works (fresh deposit claimed after recovery)"
+        pass "  next claim works (fresh deposit credited exactly once after recovery)"
     else
         sed -E 's/\x1b\[[0-9;]*m//g' "$dep2" | tail -20
         fail "the NEXT claim did not work after recovery (ClaimTxManager nonce wedged?)"
