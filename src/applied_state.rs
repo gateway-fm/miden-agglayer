@@ -289,6 +289,208 @@ pub(crate) async fn reconcile_claim_handoff_with_client(
     ))
 }
 
+/// Recovery-oriented, FRESH GER effect classification (reviewers #4 + #5). Syncs the
+/// Miden view first, then — like claims — uses the EXACT handoff note. This matters
+/// because the Miden bridge state (nullifier/GER map) can show a GER applied BEFORE
+/// the SyntheticProjector processes that consumption and emits the GER's
+/// `UpdateHashChainValue` event + finalises the receipt atomically. Finalising off
+/// the bridge snapshot alone would expose a success receipt at the wrong block with
+/// no event. So: exact note Consumed → `AppliedByExactNote` (caller polls, leaves it
+/// projector-owned); GER applied but our note is not the one, or no note → the
+/// idempotent `AppliedElsewhere` (caller uses the confirmed-duplicate success path);
+/// not applied → `NotApplied` (re-drive). A legacy submitted GER (handoff, NULL
+/// note_id) stays `Uncertain` — projection resolves it.
+#[cfg(not(test))]
+pub(crate) async fn reconcile_ger_recovery(
+    service: &ServiceState,
+    ger: [u8; 32],
+    note_id: Option<String>,
+    has_handoff: bool,
+) -> anyhow::Result<ExactNoteOutcome> {
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
+    }
+    let store = service.store.clone();
+    let bridge_id = service.accounts.0.bridge.0;
+    let result: Arc<Mutex<Option<ExactNoteOutcome>>> = Arc::new(Mutex::new(None));
+    let result_in = result.clone();
+    service
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                client
+                    .sync_state()
+                    .await
+                    .context("fresh Miden sync before recovery GER reconcile")?;
+                let outcome = match note_id {
+                    Some(note_id) => {
+                        reconcile_ger_handoff_with_client(&*store, client, bridge_id, ger, note_id)
+                            .await?
+                    }
+                    None => {
+                        // A pure orphan (no handoff): no exact note of ours, so an
+                        // applied GER was injected by a DIFFERENT transaction (or is a
+                        // duplicate) — idempotent AppliedElsewhere.
+                        let applied = store.is_ger_injected(&ger).await?
+                            || bridge_snapshot_with_client(
+                                client,
+                                bridge_id,
+                                Some(ger),
+                                None,
+                                None,
+                            )
+                            .await?
+                            .ger_applied
+                            .unwrap_or(false);
+                        if applied {
+                            ExactNoteOutcome::AppliedElsewhere
+                        } else {
+                            ExactNoteOutcome::NotApplied
+                        }
+                    }
+                };
+                *result_in.lock().expect("recovery reconcile mutex poisoned") = Some(outcome);
+                Ok(())
+            })
+        })
+        .await?;
+    result
+        .lock()
+        .expect("recovery reconcile mutex poisoned")
+        .take()
+        .context("recovery GER reconcile produced no outcome")
+}
+
+/// Recovery-oriented, FRESH claim effect classification (reviewers #3 + #5). Syncs
+/// the Miden view first, then — when the durable handoff `note_id` is known — uses
+/// the EXACT-note classifier so a claim landed by ANOTHER transaction/note is
+/// reported as `AppliedElsewhere` (→ the caller must produce an `AlreadyClaimed`
+/// revert, not a success receipt) rather than conflated with this tx succeeding.
+/// A pure orphan (no note ever prepared) with the index already claimed is
+/// unambiguously `AppliedElsewhere`.
+#[cfg(not(test))]
+pub(crate) async fn reconcile_claim_recovery(
+    service: &ServiceState,
+    global_index: U256,
+    note_id: Option<String>,
+    has_handoff: bool,
+) -> anyhow::Result<ExactNoteOutcome> {
+    // Reviewer #3 — a LEGACY submitted claim (a durable handoff exists but its
+    // note_id is NULL, e.g. a pre-migration-012 / `record_tx_note_link` row) cannot
+    // prove whether the landed index is ITS OWN note or another claimer's. Labelling
+    // it AlreadyClaimed would risk a false revert on a claim that actually succeeded,
+    // so it must stay Uncertain and let normal projection resolve it.
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
+    }
+    let store = service.store.clone();
+    let bridge_id = service.accounts.0.bridge.0;
+    let result: Arc<Mutex<Option<ExactNoteOutcome>>> = Arc::new(Mutex::new(None));
+    let result_in = result.clone();
+    service
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                client
+                    .sync_state()
+                    .await
+                    .context("fresh Miden sync before recovery claim reconcile")?;
+                let outcome = match note_id {
+                    Some(note_id) => {
+                        reconcile_claim_handoff_with_client(
+                            &*store,
+                            client,
+                            bridge_id,
+                            global_index,
+                            note_id,
+                        )
+                        .await?
+                    }
+                    None => {
+                        let applied = store
+                            .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())
+                            .await?
+                            || bridge_snapshot_with_client(
+                                client,
+                                bridge_id,
+                                None,
+                                Some(global_index),
+                                None,
+                            )
+                            .await?
+                            .claim_applied
+                            .unwrap_or(false);
+                        // A PURE orphan (no handoff ever recorded) has no exact note of
+                        // its own, so any on-chain claim of this index was applied by a
+                        // DIFFERENT transaction.
+                        if applied {
+                            ExactNoteOutcome::AppliedElsewhere
+                        } else {
+                            ExactNoteOutcome::NotApplied
+                        }
+                    }
+                };
+                *result_in.lock().expect("recovery reconcile mutex poisoned") = Some(outcome);
+                Ok(())
+            })
+        })
+        .await?;
+    result
+        .lock()
+        .expect("recovery reconcile mutex poisoned")
+        .take()
+        .context("recovery claim reconcile produced no outcome")
+}
+
+// Test shims: without a live Miden node the recovery classifiers cannot read the
+// bridge snapshot, so they honour ONLY the local projection (`is_ger_injected` /
+// `has_claim_event_for_global_index`) — mirroring production's store-first check —
+// and report NotApplied otherwise, so unit tests exercise the re-drive/handoff paths
+// deterministically. A projected claim with a still-pending receipt is another
+// transaction's (AppliedElsewhere), matching `reconcile_claim_handoff_with_client`.
+#[cfg(test)]
+pub(crate) async fn reconcile_ger_recovery(
+    service: &ServiceState,
+    ger: [u8; 32],
+    note_id: Option<String>,
+    has_handoff: bool,
+) -> anyhow::Result<ExactNoteOutcome> {
+    // Legacy submitted GER (handoff, NULL note_id) stays Uncertain.
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
+    }
+    // Without a live node the shim honours only the local projection: an applied GER
+    // with no exact note of ours is the idempotent AppliedElsewhere (→ confirmed-
+    // duplicate success), mirroring production; otherwise NotApplied.
+    if service.store.is_ger_injected(&ger).await? {
+        Ok(ExactNoteOutcome::AppliedElsewhere)
+    } else {
+        Ok(ExactNoteOutcome::NotApplied)
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn reconcile_claim_recovery(
+    service: &ServiceState,
+    global_index: U256,
+    note_id: Option<String>,
+    has_handoff: bool,
+) -> anyhow::Result<ExactNoteOutcome> {
+    // A legacy submitted claim (handoff, NULL note_id) stays Uncertain (reviewer #3).
+    if note_id.is_none() && has_handoff {
+        return Ok(ExactNoteOutcome::Uncertain);
+    }
+    if service
+        .store
+        .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())
+        .await?
+    {
+        Ok(ExactNoteOutcome::AppliedElsewhere)
+    } else {
+        Ok(ExactNoteOutcome::NotApplied)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

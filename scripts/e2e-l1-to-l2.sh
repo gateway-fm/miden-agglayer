@@ -173,22 +173,25 @@ pass "Deposit is ready_for_claim"
 
 # ── Step 3: Wait for CLAIM note submission ────────────────────────────────────
 log "Step 3/5: Waiting for ClaimTxManager auto-claim..."
+# The Step 3/4/5 waits are env-overridable so a caller that deliberately interrupts
+# the claim (e.g. the #157 recovery-scenario harness) can let this flow OUTLAST the
+# recovery heal and still perform its authoritative exact-balance assertion.
 wait_for "claim tx submitted" \
     "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'submitted claim note txn'" \
-    120 5
+    "${CLAIM_SUBMIT_TIMEOUT:-120}" 5
 pass "CLAIM note submitted to Miden"
 
 # ── Step 4: Wait for CLAIM note to commit ──────────────────────────────────
 log "Step 4/5: Waiting for CLAIM commit + NTX builder processing..."
 wait_for "claim tx committed" \
     "docker logs --since $TEST_START_TIME $AGGLAYER_CONTAINER 2>&1 | grep -q 'claim tx.*committed to block'" \
-    60 3
+    "${CLAIM_COMMIT_TIMEOUT:-60}" 3
 pass "CLAIM committed — waiting for NTX builder to create P2ID..."
 
 # ── Step 5: Verify wallet balance ──────────────────────────────────────────────
 log "Step 5/5: Checking wallet balance (sync + consume P2ID notes, isolated store)..."
 BALANCE="$BAL_BEFORE"
-for attempt in $(seq 1 15); do
+for attempt in $(seq 1 "${BALANCE_ATTEMPTS:-15}"); do
     sleep 10
     BALANCE=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
     BALANCE="${BALANCE:-0}"

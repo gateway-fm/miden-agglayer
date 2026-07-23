@@ -1,8 +1,8 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, Store, TxnData,
-    TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
+    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
+    RecoverablePendingTxn, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
 };
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
@@ -30,6 +30,9 @@ struct TxnReceipt {
     result: Option<Result<(), String>>,
     block_num: u64,
     logs: Vec<LogData>,
+    // #156 durable recovery backoff (0 / None until an orphan re-drive is recorded).
+    recovery_attempts: u32,
+    next_recovery_at: Option<u64>,
 }
 
 /// #55 BLOCKER 1 — in-memory fenced admission-lease reservation row.
@@ -619,6 +622,81 @@ impl Store for InMemoryStore {
             .collect())
     }
 
+    async fn recoverable_pending_txns(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RecoverablePendingTxn>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let links = self.tx_note_links.read();
+        let txns = self.transactions.lock();
+        let mut out: Vec<RecoverablePendingTxn> = txns
+            .iter()
+            .filter(|(_, r)| r.result.is_none()) // pending only; terminals excluded
+            .map(|(hash, r)| {
+                // Reviewer #2 — detect the handoff by link-row EXISTENCE + state,
+                // not note_id: a legacy/`record_tx_note_link` row can have a real
+                // (submitted) handoff with a NULL note_id, and keying off note_id
+                // would misclassify it as an orphan and re-prove it every sweep.
+                let handoff = links.get(&format!("{hash:#x}")).map(|link| link.state);
+                RecoverablePendingTxn {
+                    tx_hash: *hash,
+                    signer: format!("{:#x}", r.signer),
+                    nonce: super::envelope_nonce(&r.envelope),
+                    envelope: r.envelope.clone(),
+                    miden_tx_id: r.id.map(|id| id.to_string()),
+                    handoff,
+                    recovery_attempts: r.recovery_attempts,
+                    next_recovery_at: r.next_recovery_at,
+                    // The in-memory store keeps no admission timestamp; the
+                    // authoritative PgStore reports real age for the alert gauge.
+                    age_secs: 0,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.signer.cmp(&b.signer).then(a.nonce.cmp(&b.nonce)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn record_recovery_attempt(
+        &self,
+        tx_hash: TxHash,
+        next_recovery_at: u64,
+    ) -> anyhow::Result<u32> {
+        // Reviewer (stale-snapshot race) — atomic eligibility CAS mirroring the
+        // PgStore: only a row that is STILL a pending orphan (pending, no miden_tx_id,
+        // no note-link handoff) is updated + backoff-persisted; anything else means
+        // the writer/projector changed it since enumeration, so bail → caller stops +
+        // rescans (never re-proves a linked/terminal tx). (Also subsumes reviewer #1.)
+        let linked = self
+            .tx_note_links
+            .read()
+            .contains_key(&format!("{tx_hash:#x}"));
+        let mut txns = self.transactions.lock();
+        match txns.get_mut(&tx_hash) {
+            Some(r) if r.result.is_none() && r.id.is_none() && !linked => {
+                r.recovery_attempts = r.recovery_attempts.saturating_add(1);
+                r.next_recovery_at = Some(next_recovery_at);
+                Ok(r.recovery_attempts)
+            }
+            _ => anyhow::bail!(
+                "record_recovery_attempt: row {tx_hash:#x} no longer an eligible orphan \
+                 (concurrently linked / terminalised / miden-id recorded); rescan"
+            ),
+        }
+    }
+
+    async fn clear_recovery_backoff(&self, tx_hash: TxHash) -> anyhow::Result<()> {
+        let mut txns = self.transactions.lock();
+        if let Some(r) = txns.get_mut(&tx_hash) {
+            r.recovery_attempts = 0;
+            r.next_recovery_at = None;
+        }
+        Ok(())
+    }
+
     async fn prepare_note_handoff(
         &self,
         tx_hash: &str,
@@ -1047,6 +1125,8 @@ impl Store for InMemoryStore {
             result: None,
             block_num: 0,
             logs: entry.logs,
+            recovery_attempts: 0,
+            next_recovery_at: None,
         };
         let _ = txns.put(tx_hash, receipt);
         Ok(())
@@ -1076,6 +1156,8 @@ impl Store for InMemoryStore {
             result: None,
             block_num: 0,
             logs: entry.logs,
+            recovery_attempts: 0,
+            next_recovery_at: None,
         };
         let _ = txns.put(tx_hash, receipt);
         Ok(true)
@@ -1500,6 +1582,8 @@ impl Store for InMemoryStore {
                 result: Some(Err(reason)),
                 block_num,
                 logs: vec![],
+                recovery_attempts: 0,
+                next_recovery_at: None,
             };
             let _ = txns.put(tx_hash, receipt);
         }

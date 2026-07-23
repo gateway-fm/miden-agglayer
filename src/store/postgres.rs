@@ -4,9 +4,9 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, Store, TxnData,
-    TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim,
-    UnclaimableReason,
+    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
+    RecoverablePendingTxn, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
+    UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
@@ -409,6 +409,125 @@ impl Store for PgStore {
                 })
             })
             .collect()
+    }
+
+    async fn recoverable_pending_txns(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RecoverablePendingTxn>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await?;
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Oldest-first so a LIMIT keeps the most urgent orphans; nonce is not a
+        // stored column, so we regroup and order by (signer, nonce) in Rust.
+        let rows = client
+            .query(
+                "SELECT t.tx_hash, t.signer, t.envelope_bytes, t.miden_tx_id,
+                        l.note_id, l.handoff_state,
+                        t.recovery_attempts, t.next_recovery_at,
+                        CAST(EXTRACT(EPOCH FROM (now() - t.created_at)) AS BIGINT) AS age_secs
+                 FROM transactions t
+                 LEFT JOIN tx_note_links l ON l.tx_hash = t.tx_hash
+                 WHERE t.status = 'pending'
+                 ORDER BY t.created_at ASC
+                 LIMIT $1",
+                &[&limit_i],
+            )
+            .await?;
+        use alloy::eips::Decodable2718;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let hash_str: String = row.get(0);
+            let tx_hash = hash_str.parse::<TxHash>().map_err(|error| {
+                anyhow::anyhow!("invalid recoverable pending tx hash {hash_str}: {error}")
+            })?;
+            let envelope_bytes: &[u8] = row.get(2);
+            let envelope = TxEnvelope::decode_2718(&mut &envelope_bytes[..]).map_err(|e| {
+                ::metrics::counter!("store_envelope_decode_errors_total").increment(1);
+                anyhow::anyhow!("stored TxEnvelope for {hash_str} cannot be decoded ({e})")
+            })?;
+            // Reviewer #2 — detect the handoff by the tx_note_links ROW EXISTENCE
+            // (via its NOT NULL handoff_state), NOT by note_id. On a legacy/upgraded
+            // DB (pre-migration-012) or a row written by `record_tx_note_link`,
+            // note_id can be NULL while a REAL submitted handoff exists; keying off
+            // note_id would classify it as an orphan and re-prove it every sweep.
+            // A missing link row yields a NULL handoff_state via the LEFT JOIN.
+            let handoff_state: Option<String> = row.get(5);
+            let handoff = handoff_state.as_deref().map(|state| match state {
+                "prepared" => NoteHandoffState::Prepared,
+                // Legacy rows default handoff_state to 'submitted' (mig 012).
+                _ => NoteHandoffState::Submitted,
+            });
+            out.push(RecoverablePendingTxn {
+                tx_hash,
+                signer: row.get::<_, String>(1).to_lowercase(),
+                nonce: super::envelope_nonce(&envelope),
+                envelope,
+                miden_tx_id: row.get::<_, Option<String>>(3),
+                handoff,
+                recovery_attempts: row.get::<_, i32>(6).max(0) as u32,
+                next_recovery_at: row.get::<_, Option<i64>>(7).map(|v| v.max(0) as u64),
+                age_secs: row.get::<_, Option<i64>>(8).unwrap_or(0).max(0) as u64,
+            });
+        }
+        out.sort_by(|a, b| a.signer.cmp(&b.signer).then(a.nonce.cmp(&b.nonce)));
+        Ok(out)
+    }
+
+    async fn record_recovery_attempt(
+        &self,
+        tx_hash: TxHash,
+        next_recovery_at: u64,
+    ) -> anyhow::Result<u32> {
+        let client = self.pool.get().await?;
+        // Reviewer (stale-snapshot race) — an ATOMIC eligibility CAS: persist the
+        // backoff AND gate the re-drive in one statement that matches ONLY a row that
+        // is still a pending orphan — status 'pending', no recorded miden_tx_id, and
+        // no tx_note_links handoff. The writer/projector may have linked or
+        // terminalised the row since it was enumerated (they do not hold the signer
+        // lock); a zero-row update means the row is no longer eligible, so the caller
+        // must STOP and rescan rather than enqueue another expensive proof for an
+        // already-linked/terminal transaction. (Also subsumes reviewer #1: the backoff
+        // is durably persisted exactly when — and only when — a re-drive is permitted.)
+        let row = client
+            .query_opt(
+                "UPDATE transactions t
+                    SET recovery_attempts = recovery_attempts + 1,
+                        next_recovery_at = $2,
+                        updated_at = now()
+                  WHERE t.tx_hash = $1
+                    AND t.status = 'pending'
+                    AND t.miden_tx_id IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM tx_note_links l WHERE l.tx_hash = t.tx_hash)
+                  RETURNING recovery_attempts",
+                &[
+                    &format!("{tx_hash:#x}"),
+                    &i64::try_from(next_recovery_at).unwrap_or(i64::MAX),
+                ],
+            )
+            .await?;
+        row.map(|r| r.get::<_, i32>(0).max(0) as u32)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "record_recovery_attempt: row no longer an eligible orphan \
+                     (concurrently linked / terminalised / miden-id recorded); rescan"
+                )
+            })
+    }
+
+    async fn clear_recovery_backoff(&self, tx_hash: TxHash) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE transactions
+                    SET recovery_attempts = 0, next_recovery_at = NULL
+                  WHERE tx_hash = $1",
+                &[&format!("{tx_hash:#x}")],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn prepare_note_handoff(

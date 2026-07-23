@@ -108,6 +108,53 @@ pub fn init_metrics() {
     );
     describe_counter!("ger_injections_total", "Total GER injections");
     describe_gauge!(
+        "last_ger_injection_timestamp_seconds",
+        "Unix time (seconds) of the most recent GER injection (new insert or a \
+         recovery reconciliation that confirmed one applied). Alert on staleness \
+         with `time() - last_ger_injection_timestamp_seconds > <threshold>`: a \
+         climbing value means GER injection has stalled."
+    );
+    // #156 orphan recovery of acknowledged pending/unlinked transactions.
+    describe_gauge!(
+        "pending_unlinked_txns",
+        "#156: durable `pending` transactions observed by the last recovery sweep \
+         (0 in steady state; a persistent positive value signals stuck admissions)."
+    );
+    describe_gauge!(
+        "pending_unlinked_oldest_age_seconds",
+        "#156: age of the oldest durable pending transaction with no note handoff. \
+         Alert when it exceeds a configurable age — an acknowledged tx is stuck."
+    );
+    describe_counter!(
+        "orphan_recovery_attempts_total",
+        "#156: orphan re-drive attempts made by the recovery loop."
+    );
+    describe_counter!(
+        "orphan_recovery_successes_total",
+        "#156: acknowledged transactions finalised by recovery from already-applied \
+         Miden state (exact-note success) without client replay."
+    );
+    describe_counter!(
+        "orphan_recovery_redrives_total",
+        "#156: orphaned durable intents re-enqueued into the writer by recovery \
+         (backoff persisted before the enqueue; not yet a durable Miden handoff)."
+    );
+    describe_counter!(
+        "orphan_recovery_already_claimed_total",
+        "#157: recovered claims whose global index was landed by ANOTHER transaction \
+         — finalised as a reverted AlreadyClaimed receipt, not a false success."
+    );
+    describe_counter!(
+        "orphan_recovery_deferred_total",
+        "#156: recovery attempts deferred by backoff (dependency unavailable, \
+         handoff awaiting confirmation, or not yet due)."
+    );
+    describe_counter!(
+        "orphan_recovery_persistent_failures_total",
+        "#156: transactions that have failed recovery repeatedly and need operator \
+         attention (alert on any increase)."
+    );
+    describe_gauge!(
         "projector_visibility_barrier_held_blocks",
         "#30 visibility barrier: blocks the projector is holding because the reconciler \
          sweep cursor is behind the Miden tip (0 in steady state; >0 signals reconciler lag)"

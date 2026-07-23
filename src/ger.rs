@@ -178,6 +178,10 @@ async fn submit_update_ger_note(
                 );
                 let tx_request = TransactionRequestBuilder::new()
                     .own_output_notes(vec![note])
+                    // Bound the creating tx's inclusion window so a prepared-but-
+                    // unconfirmed handoff can be declared dead and re-driven by
+                    // recovery (Miden's default is "never expire", which strands it).
+                    .expiration_delta(crate::claim::submission_note_expiration_delta())
                     .build()?;
                 crate::miden_client::ensure_writable(ger_manager_id)?;
                 let tx_result = client
@@ -188,6 +192,13 @@ async fn submit_update_ger_note(
                     .executed_transaction()
                     .expiration_block_num()
                     .as_u64();
+                // Proof-boundary marker: the Miden proof is the slow, crash-prone
+                // window. Logged at INFO for ops visibility and as the deterministic
+                // "kill during proving" trigger in the recovery-scenario e2e.
+                tracing::info!(
+                    ger = %hex::encode(ger_bytes),
+                    "proving UpdateGerNote (Miden proof in progress)"
+                );
                 let proven_tx = crate::metrics::meter_proof(
                     crate::metrics::ProofKind::Ger,
                     client.prove_transaction(&tx_result),
