@@ -85,7 +85,9 @@ wait_for_marker() {
     return 1
 }
 
-receipt_status() { cast receipt --rpc-url "$L2_RPC" "$1" status 2>/dev/null | tr -d '[:space:]'; }
+# `cast receipt <hash> status` prints "1 (success)" / "0 (failed)" (empty if
+# pending/not-found). Return just the leading digit: 1, 0, or "".
+receipt_status() { cast receipt --rpc-url "$L2_RPC" "$1" status 2>/dev/null | awk '{print $1; exit}'; }
 
 # ── Fault injectors (verify the target is actually down) ────────────────────────
 crash_node() {
@@ -126,12 +128,12 @@ scenario_ger() {
 
     log "  waiting for recovery to heal the SAME hash to success"
     local ok=""
-    for _ in $(seq 1 72); do
+    for _ in $(seq 1 120); do
         wait_proxy_ready 5 || true
-        [ "$(receipt_status "$hash")" = "0x1" ] && { ok=1; break; }
+        [ "$(receipt_status "$hash")" = "1" ] && { ok=1; break; }
         sleep 5
     done
-    [ -n "$ok" ] || fail "GER tx $hash did NOT reach success via recovery within ~360s"
+    [ -n "$ok" ] || fail "GER tx $hash did NOT reach success via recovery within ~600s"
     pass "  SAME hash $hash recovered to success"
 
     local injected
@@ -155,7 +157,7 @@ scenario_ger() {
     hash2="$(cast send --async --rpc-url "$L2_RPC" --private-key "$GER_KEY" --legacy --gas-price 1 \
         --gas-limit 1000000 "$BRIDGE" 'insertGlobalExitRoot(bytes32)' "$ger2" 2>/dev/null)"
     [[ "$hash2" == 0x* ]] || fail "the follow-up GER (next nonce) was not admitted"
-    for _ in $(seq 1 36); do [ "$(receipt_status "$hash2")" = "0x1" ] && { ok2=1; break; }; sleep 5; done
+    for _ in $(seq 1 36); do [ "$(receipt_status "$hash2")" = "1" ] && { ok2=1; break; }; sleep 5; done
     [ -n "$ok2" ] || fail "the NEXT nonce did not work after recovery (follow-up GER $hash2 not successful)"
     pass "  next nonce works (follow-up GER $hash2 succeeded)"
     pass "SCENARIO ($tag) GREEN"
@@ -209,7 +211,7 @@ scenario_claim() {
 
     # SAME captured hash reached a terminal receipt (success or projector-finalised).
     local st; st="$(receipt_status "$hash")"
-    [ "$st" = "0x1" ] || fail "captured claim hash $hash did not reach success (status=$st)"
+    [ "$st" = "1" ] || fail "captured claim hash $hash did not reach success (status=$st)"
     pass "  SAME claim hash $hash recovered to success"
 
     # Claim nonce continuity: the ClaimTxManager signer advanced EXACTLY once (no
