@@ -133,6 +133,14 @@ case "$test_filter" in
         # optional ALLOWLIST_LEG=1 phase (restarts the proxy) is NOT enabled
         # here — it is only for disposable stacks, run manually.
         "$SCRIPT_DIR/e2e-manual-user-claim.sh"
+
+        # #156 chaos MUST run LAST: it SIGKILLs the miden-node and the proxy
+        # process repeatedly to prove acknowledged work self-heals with at most a
+        # proxy restart. Running it earlier would disrupt every later test.
+        "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"
+        ;;
+    chaos)
+        "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
