@@ -121,8 +121,18 @@ for _ in $(seq 1 400); do
 done
 [[ "$ORPHAN_HASH" == 0x* ]] || { kill "$ORPHAN_PID" 2>/dev/null||true; fail "orphan claim never entered the recoverable window"; }
 OSIGNER="$(pgq "SELECT lower(signer) FROM transactions WHERE tx_hash='$ORPHAN_HASH'")"
+# Two distinct nonce views (this proxy):
+#   • `latest` = min(accepted_nonce, lowest_pending) — the SETTLED boundary. While
+#     the orphan is pending+unlinked it reads the orphan's own nonce; once the orphan
+#     SETTLES via recovery it advances by exactly 1. (mirror of the deterministic
+#     e2e-recovery-scenarios.sh assertion.)
+#   • `pending` = accepted_nonce — the true ADMISSION counter. The orphan already
+#     advanced it at admit time; recovery must REUSE that nonce, never reserve a new
+#     one, so this value must be UNCHANGED across recovery (the real double-advance /
+#     nonce-gap guard).
 ONONCE_BEFORE="$(cast nonce --rpc-url "$L2_RPC" "$OSIGNER" 2>/dev/null)"
-log "captured orphan claim $ORPHAN_HASH (signer=$OSIGNER nonce=$ONONCE_BEFORE dest=$ODEST)"
+OACCEPTED_BEFORE="$(cast nonce --block pending --rpc-url "$L2_RPC" "$OSIGNER" 2>/dev/null)"
+log "captured orphan claim $ORPHAN_HASH (signer=$OSIGNER latest=$ONONCE_BEFORE accepted=$OACCEPTED_BEFORE dest=$ODEST)"
 
 # disable rebroadcast (so ONLY the branch recovery — not the ClaimTxManager — heals it)
 docker stop "$BRIDGE_SERVICE" >/dev/null 2>&1 || true
@@ -161,8 +171,15 @@ for _ in $(seq 1 140); do proxy_ready 5 || true; [ "$(receipt_status "$ORPHAN_HA
 [ -n "$HEALED" ] || fail "the pre-upgrade orphan was NOT recovered by the branch within ~700s"
 pass "(2) SAME hash $ORPHAN_HASH recovered to success by the branch recovery loop — no rebroadcast"
 ONONCE_AFTER="$(cast nonce --rpc-url "$L2_RPC" "$OSIGNER" 2>/dev/null)"
-[ "$ONONCE_AFTER" = "$ONONCE_BEFORE" ] || fail "signer nonce moved during recovery ($ONONCE_BEFORE→$ONONCE_AFTER) — must NOT re-advance"
-pass "(2) signer nonce NOT double-advanced across recovery ($ONONCE_BEFORE held)"
+OACCEPTED_AFTER="$(cast nonce --block pending --rpc-url "$L2_RPC" "$OSIGNER" 2>/dev/null)"
+# (a) admission counter MUST be untouched — recovery reused the orphan's nonce, no new reservation.
+[ "$OACCEPTED_AFTER" = "$OACCEPTED_BEFORE" ] \
+    || fail "accepted (admission) nonce moved during recovery ($OACCEPTED_BEFORE→$OACCEPTED_AFTER) — recovery re-reserved a nonce / left a gap"
+pass "(2a) admission nonce NOT re-reserved across recovery (accepted=$OACCEPTED_BEFORE held) — no double-advance / no gap"
+# (b) settled boundary advances by EXACTLY 1 — the orphan landed once (also proves no rebroadcast).
+[ "$ONONCE_AFTER" = "$(( ONONCE_BEFORE + 1 ))" ] \
+    || fail "settled nonce did not advance exactly once ($ONONCE_BEFORE→$ONONCE_AFTER) — orphan not settled, or rebroadcast/double-drive"
+pass "(2b) settled nonce advanced exactly once ($ONONCE_BEFORE→$ONONCE_AFTER) — orphan landed exactly once"
 
 # restart the ClaimTxManager; the deposit wrapper (widened timeouts) is our exact-once
 # credit oracle — it now completes off the recovered claim and asserts the balance delta.
