@@ -51,8 +51,17 @@ container_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/nu
 proxy_ready() { for _ in $(seq 1 "${1:-60}"); do cast chain-id --rpc-url "$L2_RPC" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
 
 # ── Build both images ──────────────────────────────────────────────────────────
+# Guard the branch build on image absence (mirrors the release-image guard below):
+# a pre-built miden-agglayer-e2e:latest is honoured as-is so an operator can supply
+# an image built out-of-band (e.g. `docker build --network=host` on a host whose
+# default docker0 bridge is unavailable to `compose build`). Set REBUILD_BRANCH=1
+# to force a rebuild.
 log "ensuring branch image miden-agglayer-e2e:latest (this branch = main+#157)"
-"${BASE[@]}" build miden-agglayer >/dev/null 2>&1 || fail "branch image build failed"
+if [ "${REBUILD_BRANCH:-0}" = 1 ] || ! docker image inspect miden-agglayer-e2e:latest >/dev/null 2>&1; then
+    "${BASE[@]}" build miden-agglayer >/dev/null 2>&1 || fail "branch image build failed"
+else
+    log "branch image already present — using it as-is (REBUILD_BRANCH=1 to force)"
+fi
 
 if ! docker image inspect "$REL_IMG" >/dev/null 2>&1; then
     log "building RELEASE image $REL_IMG from tag $REL_REF (clean worktree)"
