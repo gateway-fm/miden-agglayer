@@ -1134,15 +1134,26 @@ impl BridgeOutScanner {
             {
                 let b2agg_root_bytes = B2AggNote::script_root().as_bytes();
                 let claim_root_bytes = miden_base_agglayer::ClaimNote::script().root().as_bytes();
+                // 0.16: the bridge also consumes canonical ADMIN notes —
+                // register-faucet CONFIG (public since 0.16, which is why the
+                // pre-0.16 two-root allowlist started false-alerting on init),
+                // UPDATE_GER, and the new REMOVE_GER / DEREGISTER_AGG_FAUCET.
+                let admin_roots: [[u8; 32]; 4] = [
+                    miden_base_agglayer::ConfigAggBridgeNote::script_root().as_bytes(),
+                    miden_base_agglayer::UpdateGerNote::script_root().as_bytes(),
+                    miden_base_agglayer::RemoveGerNote::script_root().as_bytes(),
+                    miden_base_agglayer::DeregisterAggFaucetNote::script_root().as_bytes(),
+                ];
                 let observed_bytes = note.details().script().root().as_bytes();
                 use crate::unknown_wrapper_detector::{
-                    BridgeConsumerScript, classify_bridge_consumer_script,
+                    BridgeConsumerScript, classify_bridge_consumer_script_with_admin,
                 };
                 if matches!(
-                    classify_bridge_consumer_script(
+                    classify_bridge_consumer_script_with_admin(
                         observed_bytes,
                         b2agg_root_bytes,
                         claim_root_bytes,
+                        &admin_roots,
                     ),
                     BridgeConsumerScript::Unknown
                 ) {

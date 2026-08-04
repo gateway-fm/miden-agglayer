@@ -41,6 +41,8 @@
 /// Outcome of checking a single bridge-account-consumed note's script root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeConsumerScript {
+    /// Canonical bridge-admin script (CONFIG/UPDATE_GER/REMOVE_GER/DEREGISTER).
+    KnownAdmin,
     /// Note is a recognised B2AGG bridge-out wrapper. Normal flow.
     KnownB2Agg,
     /// Note is a recognised CLAIM consumed by the bridge to trigger a MINT.
@@ -69,10 +71,31 @@ pub fn classify_bridge_consumer_script(
     known_b2agg_root: [u8; 32],
     known_claim_root: [u8; 32],
 ) -> BridgeConsumerScript {
+    classify_bridge_consumer_script_with_admin(
+        observed_root,
+        known_b2agg_root,
+        known_claim_root,
+        &[],
+    )
+}
+
+/// Like [`classify_bridge_consumer_script`], additionally accepting the
+/// canonical ADMIN note scripts the bridge consumes by design (0.16:
+/// CONFIG_AGG_BRIDGE register-faucet, UPDATE_GER, REMOVE_GER,
+/// DEREGISTER_AGG_FAUCET). Only roots outside every canonical set are the
+/// MA#4 alternate-wrapper signature.
+pub fn classify_bridge_consumer_script_with_admin(
+    observed_root: [u8; 32],
+    known_b2agg_root: [u8; 32],
+    known_claim_root: [u8; 32],
+    known_admin_roots: &[[u8; 32]],
+) -> BridgeConsumerScript {
     if observed_root == known_b2agg_root {
         BridgeConsumerScript::KnownB2Agg
     } else if observed_root == known_claim_root {
         BridgeConsumerScript::KnownClaim
+    } else if known_admin_roots.contains(&observed_root) {
+        BridgeConsumerScript::KnownAdmin
     } else {
         BridgeConsumerScript::Unknown
     }
