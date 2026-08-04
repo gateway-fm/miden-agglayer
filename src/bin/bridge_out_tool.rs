@@ -16,7 +16,7 @@ use clap::Parser;
 use miden_base_agglayer::{B2AggNote, EthAddress};
 use miden_client::ClientError;
 use miden_client::RemoteTransactionProver;
-use miden_client::asset::{Asset, AssetCallbackFlag, FungibleAsset};
+use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;

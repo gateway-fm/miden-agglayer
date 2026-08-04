@@ -1,0 +1,5 @@
+# Exclude generated + vendored TOML from `taplo fmt --check` (make lint):
+# miden-protocol 0.16's build.rs emits miden-project.toml files under target/,
+# and vendor/miden-agglayer is an upstream crate vendored verbatim (only the
+# MIDEN_NETWORK_ID MASM constant changed) — neither is ours to format.
+exclude = ["target/**", "vendor/**"]

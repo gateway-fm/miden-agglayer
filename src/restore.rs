@@ -2814,7 +2814,6 @@ mod tests {
     #[test]
     fn restore_replay_is_complete_and_preserves_same_details_note_ids() {
         use miden_client::rpc::domain::transaction::TransactionRecord;
-        use miden_protocol::asset::FungibleAsset;
         use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{NoteHeader, Nullifier};
         use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
@@ -3639,12 +3638,11 @@ mod tests {
     #[test]
     fn finding69_build_claim_replay_joins_by_nullifier_fallback() {
         use miden_client::rpc::domain::transaction::TransactionRecord;
-        use miden_protocol::asset::FungibleAsset;
         use miden_protocol::block::BlockNumber;
         use miden_protocol::note::Nullifier;
         use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
 
-        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        let (_faucet_id, bridge_id, _sender_id) = ma3_accounts();
         let details = claim_input_note(Some(bridge_id), 0x69).details().clone();
         let (metadata, attachments) = make_metadata(id(TEST_SENDER_MANAGER), Some(bridge_id));
         let note_id = miden_protocol::note::NoteId::new(details.commitment(), &metadata);

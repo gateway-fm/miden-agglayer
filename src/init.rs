@@ -10,10 +10,8 @@ use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
 use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
-use miden_protocol::note::NoteType;
 use miden_standards::account::auth::{Approver, AuthSingleSig};
 use miden_standards::account::wallets::BasicWallet;
-use miden_standards::note::P2idNote;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 

@@ -24,25 +24,15 @@ autobenches = false
 description = "Agglayer components for the Miden protocol"
 homepage = "https://miden.xyz"
 readme = false
-keywords = [
-    "agglayer",
-    "miden",
-]
+keywords = ["agglayer", "miden"]
 categories = ["no-std"]
 license = "MIT"
 repository = "https://github.com/0xMiden/protocol"
 
 [features]
 default = ["std"]
-std = [
-    "miden-assembly/std",
-    "miden-core/std",
-]
-testing = [
-    "dep:serde",
-    "dep:serde_json",
-    "miden-protocol/testing",
-]
+std = ["miden-assembly/std", "miden-core/std"]
+testing = ["dep:serde", "dep:serde_json", "miden-protocol/testing"]
 
 [lib]
 name = "miden_agglayer"
@@ -84,10 +74,7 @@ default-features = false
 
 [dependencies.serde]
 version = "1.0"
-features = [
-    "alloc",
-    "derive",
-]
+features = ["alloc", "derive"]
 optional = true
 default-features = false
 

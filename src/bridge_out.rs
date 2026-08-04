@@ -2567,7 +2567,6 @@ mod tests {
                 let consumer =
                     consumer.expect("sender-carrying test notes need a consumer account");
                 // Dummy consuming tx id — the scanner never reads it.
-                let faucet_typed = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
                 let tx_id = miden_protocol::transaction::TransactionId::new(
                     miden_protocol::Word::default(),
                     miden_protocol::Word::default(),
