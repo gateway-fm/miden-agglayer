@@ -334,6 +334,36 @@ pub struct PendingNonceFrontier {
     pub lowest_unlinked: Option<u64>,
 }
 
+/// A durable `pending` transaction the #156 recovery loop may need to reconcile
+/// or re-drive. Enumerated from the authoritative transactions row — the signed
+/// `envelope` is the recovery source of truth, so no second durable queue is
+/// needed. `handoff` distinguishes a tx that has crossed the external Miden
+/// submission boundary (reconcile it) from a durable-but-unsubmitted intent
+/// (safe to re-drive). The backoff fields make the retry schedule survive a
+/// restart.
+#[derive(Debug, Clone)]
+pub struct RecoverablePendingTxn {
+    pub tx_hash: TxHash,
+    /// Lowercased hex signer address.
+    pub signer: String,
+    /// Nonce this transaction owns (decoded from the envelope).
+    pub nonce: u64,
+    pub envelope: TxEnvelope,
+    /// Recorded Miden transaction id (raw stored form), if the write path got
+    /// that far — a secondary "crossed the submission boundary" signal alongside
+    /// `handoff`.
+    pub miden_tx_id: Option<String>,
+    /// Durable note-handoff state, or `None` if no handoff was ever recorded
+    /// (the tx has not crossed the external submission boundary).
+    pub handoff: Option<NoteHandoffState>,
+    /// Durable count of orphan re-drive attempts already made.
+    pub recovery_attempts: u32,
+    /// Earliest unix time (seconds) the next re-drive may run; `None` = now.
+    pub next_recovery_at: Option<u64>,
+    /// Seconds since the row was first admitted, for the oldest-age gauge/alert.
+    pub age_secs: u64,
+}
+
 pub(crate) fn envelope_nonce(envelope: &TxEnvelope) -> u64 {
     match envelope {
         TxEnvelope::Eip1559(s) => s.tx().nonce,
@@ -547,6 +577,30 @@ pub trait Store: Send + Sync + 'static {
         after: Option<TxHash>,
         limit: usize,
     ) -> anyhow::Result<Vec<TxHash>>;
+
+    /// Enumerate up to `limit` durable `pending` transactions with their handoff
+    /// state, recorded Miden id, and persisted recovery backoff — ordered by
+    /// signer then nonce so the #156 recovery loop processes each signer in nonce
+    /// order. Terminal rows are excluded. The signed envelope is included so the
+    /// recovery loop can re-drive the exact intent without a second durable queue.
+    async fn recoverable_pending_txns(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RecoverablePendingTxn>>;
+
+    /// Record an orphan re-drive attempt: bump the durable attempt count and set
+    /// the earliest unix time (seconds) the next attempt may run. Returns the new
+    /// attempt count. Survives restart so recovery pressure is not lost (#156).
+    async fn record_recovery_attempt(
+        &self,
+        tx_hash: TxHash,
+        next_recovery_at: u64,
+    ) -> anyhow::Result<u32>;
+
+    /// Reset recovery backoff (attempts to 0, next-attempt cleared) once the
+    /// transaction reaches a durable handoff or a terminal receipt (#156).
+    async fn clear_recovery_backoff(&self, tx_hash: TxHash) -> anyhow::Result<()>;
+
     /// Persist an exact note identity immediately before the external submit.
     async fn prepare_note_handoff(
         &self,

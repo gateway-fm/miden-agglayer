@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
-# In-place upgrade test: RELEASE (v0.15.7) → THIS BRANCH → rollback → re-upgrade.
+# In-place upgrade test: RELEASE (v0.15.9) → THIS BRANCH → rollback → re-upgrade.
 #
 # Faithful scenario: a live deployment created BY the release is upgraded by
 # swapping only the proxy image on the SAME store (bind mount ./.miden-agglayer-data)
@@ -14,7 +14,7 @@
 # Phases:  R  release bringup + traffic     U1 upgrade → branch image + traffic
 #          RB rollback → release + traffic  U2 re-upgrade → branch + traffic
 #
-# Requires: images `miden-agglayer-e2e:v0.15.7` and `miden-agglayer-e2e:latest`
+# Requires: images `miden-agglayer-e2e:v0.15.9` and `miden-agglayer-e2e:latest`
 # (the branch build) present; run from the repo root. Wipes the current stack.
 # ══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
@@ -87,7 +87,7 @@ swap() {  # $1 = "release" | "branch"; recreates ONLY the proxy on the same volu
 }
 
 # ── phase R: fresh deployment ON THE RELEASE ─────────────────────────────────
-step "teardown + fresh RELEASE bringup (v0.15.7 proxy, same stack otherwise)"
+step "teardown + fresh RELEASE bringup (v0.15.9 proxy, same stack otherwise)"
 "${BASE[@]}" down -v --remove-orphans >/dev/null 2>&1
 make e2e-clean-data gen-l2b-configs >/dev/null 2>&1 || fail "clean-data/gen-l2b-configs"
 "${REL[@]}" up -d || fail "release bringup"
@@ -95,7 +95,7 @@ until cast chain-id --rpc-url http://localhost:9545 >/dev/null 2>&1; do sleep 2;
 L2B_RPC=http://localhost:9545 ./scripts/setup-l2b.sh > .upgrade-setup-l2b.log 2>&1 || fail "setup-l2b"
 "${REL[@]}" up -d --force-recreate --wait aggkit-l2b bridge-service-l2b || fail "l2b services"
 wait_healthy 300 || fail "release proxy never became healthy"
-docker inspect "$PROXY" --format '{{.Config.Image}}' | grep -q v0.15.7 || fail "proxy is not the release image"
+docker inspect "$PROXY" --format '{{.Config.Image}}' | grep -q v0.15.9 || fail "proxy is not the release image"
 pass "release stack up (proxy $(docker inspect "$PROXY" --format '{{.Config.Image}}'))"
 traffic R
 

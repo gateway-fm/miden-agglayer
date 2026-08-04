@@ -133,6 +133,27 @@ case "$test_filter" in
         # optional ALLOWLIST_LEG=1 phase (restarts the proxy) is NOT enabled
         # here — it is only for disposable stacks, run manually.
         "$SCRIPT_DIR/e2e-manual-user-claim.sh"
+
+        # #156 chaos MUST run LAST: it SIGKILLs the miden-node and the proxy
+        # process repeatedly to prove acknowledged work self-heals with at most a
+        # proxy restart. Running it earlier would disrupt every later test.
+        "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"
+        ;;
+    chaos)
+        "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"
+        ;;
+    recovery-scenarios)
+        # #157 reviewer #7 — deterministic {node,proxy}×{GER,claim} crash-during-
+        # proving recovery. DEDICATED gate (NOT in `all`): the GER cases require the
+        # stack to be brought up with REJECT_UNVERIFIED_GER_INJECTION=false so a
+        # controlled GER injects.
+        "$SCRIPT_DIR/e2e-recovery-scenarios.sh"
+        ;;
+    upgrade-recovery)
+        # #157 — in-place upgrade test (pre-#157 origin/main -> main+#157). DEDICATED
+        # (NOT in `all`): builds both images, populates old-version durable state, and
+        # upgrades the proxy in place. Needs 8546/18080 free; ~50-70 min.
+        "$SCRIPT_DIR/e2e-upgrade-recovery.sh"
         ;;
     tip-consistency)
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"

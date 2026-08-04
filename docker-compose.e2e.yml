@@ -26,10 +26,10 @@ services:
       # (bit us when a stale l1-raw-txs.txt mount skipped the replay: the stack
       # came up "healthy" with NO contracts and agglayer/aggkit crash-looped).
       test: ["CMD-SHELL", "cast rpc eth_getCode 0xC8cbEBf950B9Df44d987c8619f092beA980fF038 latest --rpc-url http://localhost:8545 2>/dev/null | grep -vE '^\"?0x\"?$$'"]
-      interval: 3s
-      timeout: 3s
+      interval: 5s
+      timeout: 15s
       retries: 30
-      start_period: 10s
+      start_period: 45s
 
   # ── Database (bridge-service) ──────────────────────────────────────────────
   postgres:

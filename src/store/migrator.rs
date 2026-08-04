@@ -122,6 +122,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "019_claim_calldata_repair_pending.sql",
         include_str!("../../migrations/019_claim_calldata_repair_pending.sql"),
     ),
+    // 020 is reserved for #146's `queued_txns`; #156 takes 021 so the two land
+    // without a migration-number collision. Migrations apply in this array's
+    // order, so a gap is harmless.
+    (
+        "021_orphan_recovery_backoff.sql",
+        include_str!("../../migrations/021_orphan_recovery_backoff.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

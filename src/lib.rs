@@ -26,6 +26,7 @@ pub mod metadata_recovery;
 pub mod metrics;
 pub mod miden_client;
 pub mod mint_target_monitor;
+pub mod orphan_recovery;
 pub mod recovery;
 pub mod restore;
 pub mod service;

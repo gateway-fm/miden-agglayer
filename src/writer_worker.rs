@@ -360,6 +360,15 @@ pub struct WriterWorkerHandle {
     queue_depth: usize,
 }
 
+/// Keep-alive for a [`WriterWorkerHandle::saturated_for_test`] handle: holds the
+/// un-drained receiver (channel stays open) and the owned permit (the sole slot
+/// stays reserved, so `available_capacity()` stays 0).
+#[cfg(test)]
+pub struct SaturatedWriterGuard {
+    _rx: mpsc::Receiver<WriteJob>,
+    _permit: mpsc::OwnedPermit<WriteJob>,
+}
+
 impl WriterWorkerHandle {
     /// Configured mpsc capacity (the static `queue_depth` argument passed to
     /// `WriterWorker::spawn`). Read-only.
@@ -404,6 +413,33 @@ impl WriterWorkerHandle {
     /// `agglayer_writer_queue_depth` gauge on each enqueue attempt.
     pub fn available_capacity(&self) -> usize {
         self.sender.capacity()
+    }
+
+    /// Build a handle whose write channel reports `available_capacity() == 0`
+    /// deterministically (no draining worker), by holding the single buffer slot
+    /// with an owned permit. Used to test that a durable admission whose enqueue
+    /// is rejected under saturation stays automatically recoverable (#156). The
+    /// returned guard MUST be held for the test's duration — it pins the
+    /// reservation and keeps the channel open.
+    #[cfg(test)]
+    pub fn saturated_for_test() -> (Self, SaturatedWriterGuard) {
+        let (sender, rx) = mpsc::channel::<WriteJob>(1);
+        let permit = sender
+            .clone()
+            .try_reserve_owned()
+            .expect("the sole channel slot must be reservable");
+        let handle = Self {
+            sender,
+            inflight: Arc::new(DashMap::new()),
+            queue_depth: 1,
+        };
+        (
+            handle,
+            SaturatedWriterGuard {
+                _rx: rx,
+                _permit: permit,
+            },
+        )
     }
 
     /// RD-940 Phase 5 — total non-terminal in-flight count (Queued +

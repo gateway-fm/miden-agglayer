@@ -1278,6 +1278,61 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // #156 — recover acknowledged pending/unlinked transactions. On startup, drive
+    // every durable orphan (pending row + advanced nonce, no handoff, no live
+    // writer job) back toward a durable outcome without a client rebroadcast; then
+    // keep sweeping on a bounded interval so a Miden outage self-heals when the
+    // node returns. Best-effort: recovery failures must not prevent startup.
+    // Reviewer #4 — startup recovery MUST NOT block the HTTP bind. A slow or
+    // hung Miden node would otherwise stall the `.await` here and the port below
+    // would never bind (health/readiness could not even answer). Run the initial
+    // recovery pass in a bounded background task so `service::serve` binds
+    // immediately; the periodic sweep (below) continues the self-heal regardless.
+    {
+        let startup_state = state.clone();
+        tokio::spawn(async move {
+            let bound = std::time::Duration::from_secs(
+                miden_agglayer_service::orphan_recovery::RECOVERY_SWEEP_INTERVAL_SECS,
+            );
+            match tokio::time::timeout(
+                bound,
+                miden_agglayer_service::orphan_recovery::recover_orphaned_pending_txns(
+                    &startup_state,
+                ),
+            )
+            .await
+            {
+                Err(_) => tracing::warn!(
+                    "startup orphan recovery timed out (Miden slow/unavailable?); periodic sweep will continue"
+                ),
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "startup orphan recovery failed (periodic sweep will retry)")
+                }
+                Ok(Ok(())) => {}
+            }
+        });
+    }
+    {
+        let recovery_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                miden_agglayer_service::orphan_recovery::RECOVERY_SWEEP_INTERVAL_SECS,
+            ));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                if let Err(e) =
+                    miden_agglayer_service::orphan_recovery::recover_orphaned_pending_txns(
+                        &recovery_state,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "periodic orphan recovery sweep failed (will retry next tick)");
+                }
+            }
+        });
+    }
+
     let url = build_service_url(&command.bind, command.port)?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
