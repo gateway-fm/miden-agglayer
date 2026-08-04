@@ -7,8 +7,6 @@ COPY src src
 COPY axum-jrpc axum-jrpc
 COPY migrations migrations
 COPY Cargo.* .
-# vendored miden-agglayer network-id patch (see [patch.crates-io] in Cargo.toml)
-COPY vendor vendor
 
 # build
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse

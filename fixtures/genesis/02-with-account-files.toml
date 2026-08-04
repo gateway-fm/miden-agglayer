@@ -12,4 +12,3 @@ version = 1
 
 [fee_parameters]
 verification_base_fee = 0
-

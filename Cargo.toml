@@ -139,7 +139,10 @@ futures-util = { version = "0.3", optional = true }
 # Protocol 0.16.0-alpha migration (feat/protocol-0.16). Official matrix from the
 # core team's migration guide (2026-08-04):
 #   - protocol crates (miden-protocol / miden-standards / miden-agglayer /
-#     miden-tx) = 0.16.0-alpha.4
+#     miden-tx) = 0.16.0-alpha.5 (alpha.5 backports the runtime-configurable
+#     bridge network id — a storage slot set at account creation, restoring
+#     the 0.15.3 model — which alpha.4 had regressed to a compile-time MASM
+#     constant; the short-lived vendored network-id patch is gone)
 #   - miden-client = 0.16.0-alpha.1 (published from the 0xMiden/rust-sdk repo —
 #     client development moved there; the old miden-client repo's main still
 #     tracks 0.15.3 and is NOT the source of this release)
@@ -160,12 +163,12 @@ futures-util = { version = "0.3", optional = true }
 # miden-assembly/core 0.25.x; keep these in lockstep with the deployed
 # miden-node v0.16.0-alpha.x release and tighten to an exact patch if a root
 # mismatch resurfaces during the e2e regression.
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.16.0-alpha.4" }
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.16.0-alpha.5" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "=0.16.0-alpha.4" }
-miden-standards = { default-features = false, version = "=0.16.0-alpha.4" }
-miden-tx = { default-features = false, version = "=0.16.0-alpha.4" }
+], version = "=0.16.0-alpha.5" }
+miden-standards = { default-features = false, version = "=0.16.0-alpha.5" }
+miden-tx = { default-features = false, version = "=0.16.0-alpha.5" }
 
 miden-assembly = { default-features = false, version = "0.25" }
 miden-core = { default-features = false, version = "0.25" }
@@ -188,18 +191,3 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 # storage slot written at bridge-account creation (`create_bridge_account(..,
 # network_id)`), so no MASM patch is needed and the vendor crate was removed.
 # The deployment's network id is now passed explicitly at genesis/init time.
-
-# ── vendored network-id patch (0.16 migration) ────────────────────────────────
-# 0.16 moved the AggLayer network id BACK to a compile-time MASM constant
-# (asm/agglayer/common/constants.masm: MIDEN_NETWORK_ID, upstream value 77);
-# it is no longer a create_bridge_account arg / runtime storage slot as in
-# 0.15.3. Our L1 RollupManager fixture assigns this rollup network id 1, so we
-# vendor the crate with ONLY that constant changed (77 -> 1); the crate's
-# build.rs regenerates agglayer_constants.rs from the .masm at build time, so
-# Rust's AggLayerBridge::MIDEN_NETWORK_ID and every MASM consumer stay in sync.
-# The patch redirects every consumer in the graph (incl. miden-client) to the
-# vendored copy, so all note/account MAST roots in our binary are consistent.
-# Same playbook as the 0.14-era network-id vendor patch. Revisit when upstream
-# makes the network id configurable again.
-[patch.crates-io]
-miden-agglayer = { path = "vendor/miden-agglayer" }

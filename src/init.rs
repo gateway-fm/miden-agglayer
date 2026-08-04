@@ -3,7 +3,7 @@ use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::faucet_ops;
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
-use miden_base_agglayer::{AggLayerBridge, MetadataHash, create_bridge_account};
+use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
@@ -91,26 +91,19 @@ async fn add_bridge(
     ger_manager_id: AccountId,
     network_id: u32,
 ) -> anyhow::Result<Account> {
-    // 0.16: the AggLayer network id is a compile-time MASM constant again
-    // (MIDEN_NETWORK_ID, vendored to 1 in vendor/miden-agglayer — see
-    // Cargo.toml [patch.crates-io]); it is no longer a constructor argument.
-    // Fail fast if the operator-configured id disagrees with the compiled-in
-    // constant, or claims would fail destination-network checks on both ends.
-    anyhow::ensure!(
-        network_id == AggLayerBridge::MIDEN_NETWORK_ID,
-        "--network-id {} does not match the compiled-in AggLayer network id {} \
-         (MIDEN_NETWORK_ID in vendor/miden-agglayer/asm/agglayer/common/constants.masm)",
-        network_id,
-        AggLayerBridge::MIDEN_NETWORK_ID,
-    );
-    // 0.16 split the GER-manager role into injector + remover; we assign both
-    // roles to the same ger_manager account (mirrors the upstream rust-sdk
-    // integration-test setup).
+    // 0.16.0-alpha.5: the AggLayer network id is a per-bridge storage slot
+    // again (agglayer::bridge::network_id, written once at account creation —
+    // the 0.15.3 model; alpha.4 briefly regressed it to a compile-time MASM
+    // constant). Must match the id the L1 RollupManager assigns this rollup,
+    // or claims fail destination-network checks on both ends. 0.16 also split
+    // the GER-manager role into injector + remover; we assign both roles to
+    // the same ger_manager account (mirrors the upstream rust-sdk reference).
     let account = create_bridge_account(
         client.rng().draw_word(),
         service_id,
         ger_manager_id,
         ger_manager_id,
+        network_id,
     );
     client.add_account(&account, false).await?;
 

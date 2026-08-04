@@ -646,22 +646,15 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e:?}"))?;
 
-        // Foreign bridge (mirrors init.rs::add_bridge). 0.16: the network id is
-        // a compile-time MASM constant (not a constructor arg) and the GER role
-        // is split injector/remover — same account fills both here.
-        if args.foreign_network_id != miden_base_agglayer::AggLayerBridge::MIDEN_NETWORK_ID {
-            eprintln!(
-                "[foreign-bridge] note: --foreign-network-id {} ignored — 0.16 fixes the \
-                 network id at compile time ({})",
-                args.foreign_network_id,
-                miden_base_agglayer::AggLayerBridge::MIDEN_NETWORK_ID
-            );
-        }
+        // Foreign bridge (mirrors init.rs::add_bridge). 0.16.0-alpha.5: the
+        // network id is a per-bridge storage slot set at creation, and the GER
+        // role is split injector/remover — same account fills both here.
         let bridge = create_bridge_account(
             client.rng().draw_word(),
             service.id(),
             ger_manager.id(),
             ger_manager.id(),
+            args.foreign_network_id,
         );
         client
             .add_account(&bridge, false)

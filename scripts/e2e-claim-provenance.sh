@@ -67,17 +67,13 @@ PG_PASS="${PG_PASS:-agglayer}"
 PG_DB="${PG_DB:-agglayer_store}"
 
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
-# The foreign deployment's AggLayer network id. 0.16: the network id is a
-# compile-time MASM constant shared by EVERY bridge built from the crate
-# (MIDEN_NETWORK_ID=1 in our vendored copy), and the claim MASM asserts the
-# leaf's destination network equals it — so the fabricated leaf MUST target 1
-# or the foreign bridge aborts with
-# ERR_CLAIM_LEAF_DESTINATION_NETWORK_MISMATCH. Provenance isolation no longer
-# comes from a distinct network id but from distinct ACCOUNTS (foreign
-# bridge/service/faucet), and the fabricated exit root never exists on L1 or
-# in bridge-service, so our aggkit can never auto-claim this global index
-# regardless of network id.
-FOREIGN_NETWORK_ID="${FOREIGN_NETWORK_ID:-1}"
+# The foreign deployment's AggLayer network id. MUST differ from our stack's
+# (NETWORK_ID, default 1): our aggkit then never auto-claims the deposit, so
+# the foreign claim is the only claimant of its global index. 0.16.0-alpha.5:
+# the network id is a per-bridge storage slot set at account creation (the
+# 0.15.3 model; alpha.4 briefly hardcoded it in MASM), so the foreign bridge
+# accepts leaves targeting ITS OWN id — the fabricated leaf targets this id.
+FOREIGN_NETWORK_ID="${FOREIGN_NETWORK_ID:-2}"
 DEPOSIT_AMOUNT="10000000000000" # 10^13 wei → 1000 Miden units at scale 10^10
 # How long we give the proxy's reconciler+projector to observe the consumed
 # foreign CLAIM and fire the gate (sweep tick is 5s; import must precede the
