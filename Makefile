@@ -200,7 +200,7 @@ MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
 # node-store callback-vault-key bug is fixed upstream at this tag (the buggy
 # select_vault_balances_by_faucet_ids is gone), so fixtures/patches/0001 is no
 # longer applied. Network id is now a runtime storage slot, so no vendor patch.
-MIDEN_NODE_GIT_REF := v0.15.0
+MIDEN_NODE_GIT_REF := v0.16.0-alpha.2
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 

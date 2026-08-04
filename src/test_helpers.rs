@@ -86,7 +86,6 @@ pub fn create_test_service_with_store(store: Arc<dyn Store>) -> ServiceState {
 /// second client next to the process-wide `MidenClient` singleton.
 #[cfg(test)]
 pub async fn offline_miden_client_lib() -> crate::miden_client::MidenClientLib {
-    use miden_client::DebugMode;
     use miden_client::builder::ClientBuilder;
     use miden_client::keystore::FilesystemKeyStore;
     use miden_client::rpc::Endpoint;
@@ -105,7 +104,6 @@ pub async fn offline_miden_client_lib() -> crate::miden_client::MidenClientLib {
         ))
         .sqlite_store(store_dir.join("store.sqlite3"))
         .authenticator(keystore)
-        .in_debug_mode(DebugMode::Disabled)
         .build()
         .await
         .expect("offline MidenClientLib must build without a node")

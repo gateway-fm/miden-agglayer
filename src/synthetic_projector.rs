@@ -70,8 +70,9 @@ use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{
-    NoteAttachments, NoteDetails, NoteFile, NoteId, NoteMetadata, NoteTag, Nullifier,
+    NoteAttachments, NoteDetails, NoteId, NoteMetadata, NoteTag, Nullifier,
 };
+use miden_standards::note::NoteFile;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -814,6 +815,10 @@ impl SyntheticProjector {
                 nullifier_block_height: BlockNumber::from(cref.block as u32),
                 consumer_account: Some(self.bridge_id),
                 consumed_tx_order: Some(cref.order),
+                // 0.16: ConsumedExternalNoteState retains note metadata when the
+                // prior state had it; we reconstruct from bare details (no prior
+                // state), matching the pre-0.16 record-level metadata of None.
+                metadata: None,
             });
             InputNoteRecord::new(details, attachments, None, state)
         };
@@ -1872,6 +1877,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(block),
             consumer_account: consumer,
             consumed_tx_order: tx_order,
+            metadata: None,
         });
         InputNoteRecord::new(details, attachments, None, state)
     }
@@ -2831,7 +2837,6 @@ mod tests {
                     final_state,
                     InputNotes::new(commitments).unwrap(),
                     vec![],
-                    FungibleAsset::new(aid(FAUCET), 0).unwrap(),
                 ),
                 output_notes: vec![],
                 erased_output_notes: vec![],

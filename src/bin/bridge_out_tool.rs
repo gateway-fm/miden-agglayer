@@ -14,13 +14,13 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use miden_base_agglayer::{B2AggNote, EthAddress};
+use miden_client::ClientError;
 use miden_client::RemoteTransactionProver;
 use miden_client::asset::{Asset, AssetCallbackFlag, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteAssets;
 use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
-use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 
@@ -469,11 +469,11 @@ async fn main() -> anyhow::Result<()> {
     let node_endpoint = miden_agglayer_service::miden_client::parse_node_url(&args.node_url)
         .map_err(|e| anyhow!("invalid node URL {}: {e}", args.node_url))?;
 
-    let mode = if args.miden_debug {
-        DebugMode::Enabled
-    } else {
-        DebugMode::Disabled
-    };
+    // 0.16: DebugMode / ClientBuilder::in_debug_mode were removed; the
+    // --miden-debug flag now only widens tracing (kept for CLI compat).
+    if args.miden_debug {
+        tracing::info!("--miden-debug set (client-side DebugMode removed in 0.16)");
+    }
 
     // Build miden client from the store (existing for bridge-out, freshly
     // created for --create-wallet).
@@ -488,8 +488,7 @@ async fn main() -> anyhow::Result<()> {
     let mut builder = ClientBuilder::new()
         .rpc(rpc)
         .sqlite_store(store_path.clone())
-        .authenticator(keystore.clone())
-        .in_debug_mode(mode);
+        .authenticator(keystore.clone());
     if let Some(prover_url) = args.miden_prover_url.as_deref() {
         // Mirrors the main service wiring: when a remote prover URL is set,
         // offload all proving to it (avoiding the bali OOM cause of in-process
@@ -647,12 +646,22 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e:?}"))?;
 
-        // Foreign bridge (mirrors init.rs::add_bridge).
+        // Foreign bridge (mirrors init.rs::add_bridge). 0.16: the network id is
+        // a compile-time MASM constant (not a constructor arg) and the GER role
+        // is split injector/remover — same account fills both here.
+        if args.foreign_network_id != miden_base_agglayer::AggLayerBridge::MIDEN_NETWORK_ID {
+            eprintln!(
+                "[foreign-bridge] note: --foreign-network-id {} ignored — 0.16 fixes the \
+                 network id at compile time ({})",
+                args.foreign_network_id,
+                miden_base_agglayer::AggLayerBridge::MIDEN_NETWORK_ID
+            );
+        }
         let bridge = create_bridge_account(
             client.rng().draw_word(),
             service.id(),
             ger_manager.id(),
-            args.foreign_network_id,
+            ger_manager.id(),
         );
         client
             .add_account(&bridge, false)
@@ -731,9 +740,7 @@ async fn main() -> anyhow::Result<()> {
         use miden_protocol::asset::TokenSymbol;
         use miden_protocol::note::{Note, NoteType};
         use miden_standards::account::faucets::{FungibleFaucet, TokenName};
-        use miden_standards::account::policies::{
-            BurnPolicyConfig, MintPolicyConfig, PolicyRegistration, TokenPolicyManager,
-        };
+        use miden_standards::account::policies::{BurnPolicy, MintPolicy, TokenPolicyManager};
 
         let wallet_hex = args
             .wallet_id
@@ -765,11 +772,10 @@ async fn main() -> anyhow::Result<()> {
         // policy slots the mint tx aborts with "storage slot ... does not exist". Only
         // mint/burn (no transfer policies — those force AssetCallbackFlag::Enabled keys,
         // which FungibleAsset::new does not set).
-        let policy_manager = TokenPolicyManager::new()
-            .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
-            .map_err(|e| anyhow!("mint policy failed: {e:?}"))?
-            .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
-            .map_err(|e| anyhow!("burn policy failed: {e:?}"))?;
+        let policy_manager = TokenPolicyManager::builder()
+            .active_mint_policy(MintPolicy::allow_all())
+            .active_burn_policy(BurnPolicy::allow_all())
+            .build();
         let (auth_component, key_pair) = create_auth_component(&mut client)?;
         let faucet = Account::builder(client.rng().draw_word().into())
             .account_type(AccountType::Public)
@@ -1129,7 +1135,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow!("failed to get balance: {e:?}"))?;
     println!("[bridge-out] wallet balance: {balance}");
 
-    if balance < args.amount {
+    if balance.as_u64() < args.amount {
         return Err(anyhow!(
             "insufficient balance: have {balance}, need {}",
             args.amount
@@ -1142,21 +1148,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Create B2AGG note.
     //
-    // Protocol 0.15 introduced per-asset callbacks: the asset vault is keyed by
-    // (faucet_id, callback_flag), and AggLayer faucets are registered with
-    // callbacks ENABLED. The bridged-in assets therefore sit in the wallet vault
-    // under the callbacks-enabled key. `FungibleAsset::new` defaults to
-    // callbacks DISABLED, so a default-flag asset addresses a different (empty)
-    // vault slot and the bridge-out tx fails with "amount in the vault is less
-    // than the amount to remove". Match the vault by enabling callbacks.
-    let cb_flag = if args.asset_callbacks_disabled {
-        AssetCallbackFlag::Disabled // Miden-native operator faucet: assets in the disabled slot
-    } else {
-        AssetCallbackFlag::Enabled // AggLayer bridge-owned wrapped faucet: enabled slot
-    };
+    // 0.16: the asset-callback flag moved INTO the faucet AccountId (bit 5 of
+    // the id prefix), so the vault has exactly one key per faucet and
+    // per-asset with_callbacks() is gone. --asset-callbacks-disabled is kept
+    // for CLI compat but no longer selects a vault slot.
+    if args.asset_callbacks_disabled {
+        eprintln!(
+            "[bridge-out] note: --asset-callbacks-disabled is a no-op on 0.16 \
+             (callback flag is part of the faucet account id)"
+        );
+    }
     let asset: Asset = FungibleAsset::new(faucet_id, args.amount)
         .map_err(|e| anyhow!("invalid asset: {e}"))?
-        .with_callbacks(cb_flag)
         .into();
     let note_assets = NoteAssets::new(vec![asset]).map_err(|e| anyhow!("note assets: {e}"))?;
 
@@ -1325,6 +1328,7 @@ async fn main() -> anyhow::Result<()> {
         .account_reader(wallet_id)
         .get_balance(faucet_id)
         .await
+        .map(|amount| amount.as_u64())
         .unwrap_or(0);
     println!("[bridge-out] wallet balance after: {new_balance}");
     println!("[bridge-out] done");

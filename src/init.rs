@@ -3,7 +3,7 @@ use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::faucet_ops;
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
-use miden_base_agglayer::{MetadataHash, create_bridge_account};
+use miden_base_agglayer::{AggLayerBridge, MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
@@ -11,7 +11,7 @@ use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
 use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
 use miden_protocol::note::NoteType;
-use miden_standards::account::auth::AuthSingleSig;
+use miden_standards::account::auth::{Approver, AuthSingleSig};
 use miden_standards::account::wallets::BasicWallet;
 use miden_standards::note::P2idNote;
 use std::path::PathBuf;
@@ -47,10 +47,10 @@ pub fn create_auth_component(
     client: &mut MidenClientLib,
 ) -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
     let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
-    let auth_component = AuthSingleSig::new(
+    let auth_component = AuthSingleSig::new(Approver::new(
         key_pair.public_key().to_commitment(),
         AuthScheme::Falcon512Poseidon2,
-    );
+    ));
     Ok((auth_component, key_pair))
 }
 
@@ -93,15 +93,26 @@ async fn add_bridge(
     ger_manager_id: AccountId,
     network_id: u32,
 ) -> anyhow::Result<Account> {
-    // 0.15.3: the AggLayer network id is written into a bridge storage slot at
-    // creation (was a hardcoded MASM constant pre-0.15.3). Must match the id the
-    // L1 RollupManager assigns this rollup, or claims fail destination-network
-    // checks on both ends.
+    // 0.16: the AggLayer network id is a compile-time MASM constant again
+    // (MIDEN_NETWORK_ID, vendored to 1 in vendor/miden-agglayer — see
+    // Cargo.toml [patch.crates-io]); it is no longer a constructor argument.
+    // Fail fast if the operator-configured id disagrees with the compiled-in
+    // constant, or claims would fail destination-network checks on both ends.
+    anyhow::ensure!(
+        network_id == AggLayerBridge::MIDEN_NETWORK_ID,
+        "--network-id {} does not match the compiled-in AggLayer network id {} \
+         (MIDEN_NETWORK_ID in vendor/miden-agglayer/asm/agglayer/common/constants.masm)",
+        network_id,
+        AggLayerBridge::MIDEN_NETWORK_ID,
+    );
+    // 0.16 split the GER-manager role into injector + remover; we assign both
+    // roles to the same ger_manager account (mirrors the upstream rust-sdk
+    // integration-test setup).
     let account = create_bridge_account(
         client.rng().draw_word(),
         service_id,
         ger_manager_id,
-        network_id,
+        ger_manager_id,
     );
     client.add_account(&account, false).await?;
 
@@ -248,34 +259,6 @@ async fn add_accounts(
     })
 }
 
-async fn register_p2id_script(
-    client: &mut MidenClientLib,
-    sender: AccountId,
-) -> anyhow::Result<()> {
-    tracing::info!("registering P2ID script...");
-    // dummy note to register its script on the node
-    let note = P2idNote::create(
-        sender,
-        /* target = */ sender,
-        /* assets = */ vec![],
-        NoteType::Public,
-        /* attachment = */ Default::default(),
-        client.rng(),
-    )?;
-
-    let txn = TransactionRequestBuilder::new()
-        .own_output_notes(vec![note])
-        .build()?;
-
-    let txn_id = crate::metrics::meter_proof(
-        crate::metrics::ProofKind::Init,
-        crate::miden_client::submit_new_transaction(client, sender, txn),
-    )
-    .await?;
-    tracing::info!("registered P2ID script with txn_id {txn_id}");
-    Ok(())
-}
-
 async fn init_internal(
     client: &mut MidenClientLib,
     keystore: Arc<FilesystemKeyStore>,
@@ -297,7 +280,12 @@ async fn init_internal(
 
     // Faucet bridge registration is handled in create_and_register_faucet (via add_faucet)
 
-    register_p2id_script(client, accounts.service.id()).await?;
+    // 0.16: the 0.15-era register_p2id_script dummy-note step is gone. P2ID
+    // notes are NoteType::Public and carry their script, and 0.16 requires
+    // B2AGG notes to be public too, so the node no longer needs a script
+    // pre-registered before NTX MINT->P2ID outputs (the upstream rust-sdk
+    // agglayer reference flow performs no registration either). P2idNote also
+    // now rejects empty asset lists, so the old dummy note cannot be built.
 
     let config = AccountsConfig::from(accounts);
     let config_path = accounts_config::save_config(config, &net_id, miden_store_dir)?;

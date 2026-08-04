@@ -988,6 +988,9 @@ async fn restore_bridge_outs(
                         nullifier_block_height: BlockNumber::from(replay.block as u32),
                         consumer_account: Some(bridge_id),
                         consumed_tx_order: Some(replay.tx_order),
+                        // 0.16: metadata is retained through consumption when known;
+                        // restore replays from bare details (none available).
+                        metadata: None,
                     });
                     let note = InputNoteRecord::new(
                         replay.body.details,
@@ -2794,6 +2797,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: consumer,
             consumed_tx_order: None,
+            metadata: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
     }
@@ -2844,7 +2848,6 @@ mod tests {
                 Word::new([Felt::new(1).unwrap(); 4]),
                 inputs,
                 vec![],
-                FungibleAsset::new(faucet_id, 0).unwrap(),
             ),
             output_notes: vec![],
             erased_output_notes: vec![],
@@ -3290,6 +3293,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: Some(consumer),
             consumed_tx_order: None,
+            metadata: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
     }
@@ -3495,6 +3499,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: Some(bridge),
             consumed_tx_order: None,
+            metadata: None,
         });
         let record = InputNoteRecord::new(details, attachments, None, state);
         let key = record.details_commitment().as_bytes();
@@ -3620,6 +3625,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: consumer,
             consumed_tx_order: None,
+            metadata: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
     }
@@ -3658,7 +3664,6 @@ mod tests {
                 Word::new([Felt::new(1).unwrap(); 4]),
                 inputs,
                 vec![],
-                FungibleAsset::new(faucet_id, 0).unwrap(),
             ),
             output_notes: vec![],
             erased_output_notes: vec![],

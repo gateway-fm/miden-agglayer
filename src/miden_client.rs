@@ -1,4 +1,5 @@
 use anyhow::{Context, anyhow};
+use miden_client::ClientError;
 use miden_client::RemoteTransactionProver;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
@@ -6,7 +7,6 @@ use miden_client::rpc::domain::transaction::TransactionRecord;
 use miden_client::rpc::{Endpoint, GrpcClient, GrpcError, NodeRpcClient, RpcError};
 use miden_client::sync::SyncSummary;
 use miden_client::transaction::{LocalTransactionProver, TransactionProver};
-use miden_client::{ClientError, DebugMode};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::note::NoteId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -715,11 +715,14 @@ impl MidenClient {
     ) -> anyhow::Result<()> {
         // node client — retry build with exponential backoff
         let node_timeout_ms: u64 = 10_000;
-        let mode = if debug_mode {
-            DebugMode::Enabled
-        } else {
-            DebugMode::Disabled
-        };
+        // 0.16: DebugMode / ClientBuilder::in_debug_mode were removed upstream;
+        // the --miden-debug flag is kept for CLI compatibility and logged only.
+        if debug_mode {
+            tracing::info!(
+                target: crate::COMPONENT,
+                "--miden-debug set (client-side DebugMode removed in 0.16)"
+            );
+        }
 
         let tx_prover: Option<Arc<dyn TransactionProver + Send + Sync>> =
             prover_url.as_deref().map(|url| {
@@ -758,8 +761,7 @@ impl MidenClient {
                     api_key.as_deref(),
                 ))
                 .sqlite_store(store_path)
-                .authenticator(keystore.clone())
-                .in_debug_mode(mode);
+                .authenticator(keystore.clone());
             if let Some(p) = tx_prover.clone() {
                 builder = builder.prover(p);
             }
