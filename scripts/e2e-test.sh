@@ -26,6 +26,10 @@ case "$test_filter" in
         # 2026-07-04 frozen-eth_blockNumber regression). Quick-fails the suite.
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
         echo ""
+        # #146 — future-nonce mempool: park + promote out-of-order submissions.
+        # A cheap, self-contained RPC-contract test on a throwaway signer.
+        "$SCRIPT_DIR/e2e-future-nonce-mempool.sh"
+        echo ""
         "$SCRIPT_DIR/e2e-l1-to-l2.sh"
         echo ""
         "$SCRIPT_DIR/e2e-l2-to-l1.sh"
@@ -142,6 +146,9 @@ case "$test_filter" in
         ;;
     l2-to-l1)
         "$SCRIPT_DIR/e2e-l2-to-l1.sh"
+        ;;
+    future-nonce-mempool)
+        "$SCRIPT_DIR/e2e-future-nonce-mempool.sh"
         ;;
     dynamic-erc20)
         "$SCRIPT_DIR/e2e-dynamic-erc20.sh"
