@@ -769,7 +769,7 @@ async fn main() -> anyhow::Result<()> {
             .active_mint_policy(MintPolicy::allow_all())
             .active_burn_policy(BurnPolicy::allow_all())
             .build();
-        let (auth_component, key_pair) = create_auth_component(&mut client)?;
+        let (auth_component, key_pair) = create_auth_component()?;
         let faucet = Account::builder(client.rng().draw_word().into())
             .account_type(AccountType::Public)
             .with_component(faucet_component)

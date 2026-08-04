@@ -7,7 +7,7 @@ use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
-use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
+use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
 use miden_standards::account::auth::{Approver, AuthSingleSig};
@@ -41,14 +41,20 @@ impl From<Accounts> for AccountsConfig {
 
 // pub so external operator tooling (bridge-out app's --create-native-faucet) can
 // create a NON-service, operator-owned faucet with the same auth scheme as the proxy.
-pub fn create_auth_component(
-    client: &mut MidenClientLib,
-) -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
-    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
-    let auth_component = AuthSingleSig::new(Approver::new(
-        key_pair.public_key().to_commitment(),
-        AuthScheme::Falcon512Poseidon2,
-    ));
+//
+// feat/016-ecdsa-accounts: all deployed accounts authenticate with
+// EcdsaK256Keccak (secp256k1 + keccak) — Falcon512Poseidon2 support is
+// removed from the proxy (no backward compatibility; fresh deployments only).
+// Note the upstream caveat: ECDSA approvers disclose their public key and
+// signature at proving time, so there is no signer-key privacy — an accepted
+// trade-off for these operator-owned infrastructure accounts.
+//
+// Key material comes from the OS CSPRNG (rand::rng() is a CryptoRng); the
+// client's deterministic Felt coin is NOT a CryptoRng and must never be a
+// secp256k1 key source.
+pub fn create_auth_component() -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
+    let key_pair = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+    let auth_component = AuthSingleSig::new(Approver::from(&key_pair.public_key()));
     Ok((auth_component, key_pair))
 }
 
@@ -163,7 +169,7 @@ async fn add_wallet(
     // by users yet`. Public gives us the recovery property (state on-chain,
     // import-by-id works) without the network-tx-builder semantics, which
     // the proxy doesn't use anyway.
-    let (auth_component, key_pair) = create_auth_component(client)?;
+    let (auth_component, key_pair) = create_auth_component()?;
     let account = Account::builder(client.rng().draw_word().into())
         .account_type(AccountType::Public)
         .with_component(BasicWallet)
