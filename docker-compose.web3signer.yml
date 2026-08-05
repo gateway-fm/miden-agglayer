@@ -38,19 +38,14 @@ services:
       start_period: 10s
 
   miden-agglayer:
-    # The base stack passes --insecure-local-keystore; remote custody is
-    # mutually exclusive with it, so the command is restated here WITHOUT that
-    # flag. (compose replaces `command` wholesale rather than merging it.)
-    command:
-      - --port=8546
-      - --miden-node=http://miden-node:57291
-      - --miden-store-dir=/var/lib/miden-agglayer-service
-      - --l1-rpc-url=http://anvil:8545
-      - --ger-l1-address=0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674
-      - --l1-indexer-from-block=1
-      - --l1-evidence-tag=${L1_EVIDENCE_TAG:-latest}
-      - --insecure-allow-any-signer
+    # Custody is flipped purely through env so this overlay composes with the
+    # others (notably l2l2, which contributes --network-rpc-url): compose merges
+    # `environment` but REPLACES `command`, so overriding the command here would
+    # silently drop the l2l2 flags.
     environment:
+      # Mutually exclusive with the signer URL below — the proxy refuses to
+      # start if both are set, so this must be turned off explicitly.
+      AGGLAYER_INSECURE_LOCAL_KEYSTORE: "false"
       # This URL selects remote custody. The proxy fails to start if the signer
       # is unreachable or holds no usable key, so a broken custody setup can
       # never be mistaken for a healthy boot.

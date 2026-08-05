@@ -69,9 +69,12 @@ done
     || fail "the proxy never became healthy with --signer-url set (a fail-closed startup error?)"
 docker logs "$PROXY" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -q "remote signer attached" \
     || fail "the proxy did not report attaching the remote signer — is AGGLAYER_SIGNER_URL set?"
-# Custody is either/or: the proxy must NOT also be running with on-disk keys.
-docker inspect "$PROXY" --format '{{json .Config.Cmd}}' 2>/dev/null | grep -q 'insecure-local-keystore' \
-    && fail "the proxy is running with --insecure-local-keystore AND a signer — custody must be either/or"
+# Custody is either/or: the proxy must NOT also be configured for on-disk keys.
+# (The proxy refuses to start with both, so reaching a healthy state already
+# implies this — asserting it anyway keeps the guarantee visible in the log.)
+docker inspect "$PROXY" --format '{{json .Config.Env}}' 2>/dev/null \
+    | grep -q 'AGGLAYER_INSECURE_LOCAL_KEYSTORE=true' \
+    && fail "the proxy has AGGLAYER_INSECURE_LOCAL_KEYSTORE=true AND a signer — custody must be either/or"
 pass "proxy started in remote-only custody mode (fail-closed startup passed)"
 
 # ── 2. the proxy holds NO secret for the remote key ──────────────────────────
