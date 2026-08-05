@@ -1,0 +1,48 @@
+# Remote-signing overlay: runs a Web3Signer sidecar and points the proxy at it,
+# so the e2e exercises the SAME code path a KMS-backed production deployment
+# uses (proxy -> HTTP -> signer -> custody backend). Only the custody backend
+# differs: this overlay configures Web3Signer's raw-file key source, production
+# swaps that one config file for `aws-kms` / `azure` / `hashicorp` — the proxy
+# and this compose topology are unchanged.
+#
+# Usage:
+#   ./scripts/gen-web3signer-keys.sh    # generates the key + its config
+#   docker compose -f docker-compose.e2e.yml -f docker-compose.web3signer.yml \
+#     --env-file fixtures/.env up -d
+#
+# The e2e wrapper `scripts/e2e-web3signer.sh` does all of the above.
+
+services:
+  web3signer:
+    image: consensys/web3signer:24.12.0
+    # eth1 mode is the secp256k1 signing surface (POST /api/v1/eth1/sign/{key});
+    # eth2 would load keys into memory, defeating the point of vault custody.
+    command:
+      - --key-store-path=/keys
+      - --http-listen-host=0.0.0.0
+      - --http-listen-port=9000
+      - --http-host-allowlist=*
+      - eth1
+      - --chain-id=${CHAIN_ID:-2}
+    volumes:
+      - ./fixtures/web3signer-keys:/keys:ro
+    ports:
+      # Host-published so the e2e can assert against the signer directly
+      # (list keys, compare a signature) without exec'ing into the container.
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/upcheck || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  miden-agglayer:
+    environment:
+      # Presence of this URL is what flips the proxy onto remote signing; the
+      # proxy fails to start if the signer is unreachable or holds no usable
+      # key, so a broken custody setup can never be mistaken for a healthy boot.
+      AGGLAYER_SIGNER_URL: "http://web3signer:9000"
+    depends_on:
+      web3signer:
+        condition: service_healthy

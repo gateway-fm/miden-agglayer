@@ -199,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn local_only_keystore_signs_with_local_keys() {
         let keystore = ProxyKeystore::local(temp_local());
-        let key = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
         let account = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
         let commitment = key.public_key().to_commitment();
         keystore.add_key(&key, account).await.expect("add_key");
@@ -231,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn key_management_stays_local() {
         let keystore = ProxyKeystore::local(temp_local());
-        let key = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
         let account = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
         let commitment = key.public_key().to_commitment();
         keystore.add_key(&key, account).await.expect("add_key");

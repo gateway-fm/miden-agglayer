@@ -4,6 +4,7 @@ use crate::faucet_ops;
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
 use crate::proxy_keystore::ProxyKeystore;
+use anyhow::Context;
 use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::Keystore;
@@ -13,6 +14,7 @@ use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
 use miden_standards::account::auth::{Approver, AuthSingleSig};
 use miden_standards::account::wallets::BasicWallet;
+use miden_tx::auth::TransactionAuthenticator;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -61,10 +63,36 @@ impl From<Accounts> for AccountsConfig {
 // with miden's own version (PR #160 review). What matters either way is that the
 // client's deterministic Felt coin is NOT a CryptoRng and must never be a
 // secp256k1 key source.
-pub fn create_auth_component() -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
+// When a remote signer (`--signer-url`) is configured, the account is bound to
+// a key the SIGNER holds: we read its public key, build the approver from that,
+// and generate nothing locally — the secret never exists on this host. The
+// returned `AuthSecretKey` is `None` in that case, which is what tells the
+// caller there is no local key to store.
+//
+// Production note: provision one signer key per account for blast-radius
+// isolation. This picks the signer's first key deterministically, so a
+// single-key signer (the e2e setup) binds every account to that key — valid,
+// but not what a production deployment should do.
+pub async fn create_auth_component(
+    keystore: &ProxyKeystore,
+) -> anyhow::Result<(AuthSingleSig, Option<AuthSecretKey>)> {
+    if let Some(commitment) = keystore.remote_commitments().first().copied() {
+        let public_key = keystore
+            .get_public_key(commitment)
+            .await
+            .context("remote signer listed a key commitment it cannot resolve to a public key")?;
+        tracing::info!(
+            target: crate::COMPONENT,
+            "binding a new account to a REMOTE signer key — no secret is generated locally"
+        );
+        return Ok((
+            AuthSingleSig::new(Approver::from(public_key.as_ref())),
+            None,
+        ));
+    }
     let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
     let auth_component = AuthSingleSig::new(Approver::from(&key_pair.public_key()));
-    Ok((auth_component, key_pair))
+    Ok((auth_component, Some(key_pair)))
 }
 
 async fn deploy_account(
@@ -178,13 +206,16 @@ async fn add_wallet(
     // by users yet`. Public gives us the recovery property (state on-chain,
     // import-by-id works) without the network-tx-builder semantics, which
     // the proxy doesn't use anyway.
-    let (auth_component, key_pair) = create_auth_component()?;
+    let (auth_component, key_pair) = create_auth_component(keystore.as_ref()).await?;
     let account = Account::builder(client.rng().draw_word().into())
         .account_type(AccountType::Public)
         .with_component(BasicWallet)
         .with_auth_component(auth_component)
         .build()?;
-    keystore.add_key(&key_pair, account.id()).await?;
+    // Remote-signer accounts have no local secret to persist.
+    if let Some(key_pair) = key_pair.as_ref() {
+        keystore.add_key(key_pair, account.id()).await?;
+    }
     client.add_account(&account, false).await?;
     Ok(account)
 }

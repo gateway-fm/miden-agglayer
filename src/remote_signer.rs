@@ -233,7 +233,7 @@ mod tests {
     /// back, and verifying against the public key.
     #[test]
     fn remote_signature_matches_local_sign() {
-        let key = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
         let AuthSecretKey::EcdsaK256Keccak(signing_key) = &key else {
             panic!("requested an ECDSA key, got another scheme");
         };
