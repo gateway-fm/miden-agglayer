@@ -116,8 +116,34 @@ iso_inspect_faucet() {
 # NOT render this asset as `Unknown`. Exports INSPECT_SYMBOL/INSPECT_DECIMALS.
 assert_faucet_symbol() {
     local fid="$1" want_sym="$2" want_dec="$3" label="$4" insp
-    insp=$(iso_inspect_faucet "$fid") \
-        || fail "#147: faucet metadata UNRESOLVABLE (a cold wallet would show 'Unknown') for $label faucet=$fid — $insp"
+    local tries=0 max_tries="${INSPECT_FAUCET_TRIES:-6}" interval="${INSPECT_FAUCET_INTERVAL:-5}"
+    # Retry ONLY transport failures. Under the chaos tier the node is killed and
+    # restarted repeatedly, so docker DNS can briefly fail to resolve it
+    # ("Temporary failure in name resolution") — a single-shot probe then reports
+    # a metadata defect that does not exist. That false failure cost a gate run:
+    # the deposit had fully self-healed and its balance assertion passed, but this
+    # probe's rc=1 made the chaos wrapper report "the deposit did NOT self-heal".
+    #
+    # A genuine "metadata unresolvable" is NOT retried: that is exactly the #147
+    # cold-wallet-shows-Unknown defect this assertion exists to catch, and
+    # retrying it would let a real regression pass on a later attempt.
+    while :; do
+        if insp=$(iso_inspect_faucet "$fid"); then break; fi
+        case "$insp" in
+            *ConnectionError*|*"dns error"*|*"name resolution"*|*"tcp connect error"*|\
+            *"Connection refused"*|*"transport error"*|*"error trying to connect"*)
+                tries=$((tries + 1))
+                if [ "$tries" -ge "$max_tries" ]; then
+                    fail "#147: the node stayed unreachable for faucet metadata after $tries attempts for $label faucet=$fid — $insp"
+                fi
+                echo "  #147: transport error reaching the node (attempt $tries/$max_tries); retrying in ${interval}s"
+                sleep "$interval"
+                ;;
+            *)
+                fail "#147: faucet metadata UNRESOLVABLE (a cold wallet would show 'Unknown') for $label faucet=$fid — $insp"
+                ;;
+        esac
+    done
     INSPECT_SYMBOL=$(printf '%s\n' "$insp" | grep -oE 'symbol=[^ ]+' | head -1 | cut -d= -f2)
     INSPECT_DECIMALS=$(printf '%s\n' "$insp" | grep -oE 'decimals=[0-9]+' | head -1 | cut -d= -f2)
     [[ "$INSPECT_SYMBOL" == "$want_sym" && "$INSPECT_DECIMALS" == "$want_dec" ]] \
