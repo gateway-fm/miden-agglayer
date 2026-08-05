@@ -41,6 +41,12 @@ use std::time::Duration;
 
 /// Bytes of a compressed SEC1 secp256k1 public key (Web3Signer's key identifier).
 const SEC1_COMPRESSED_LEN: usize = 33;
+/// Tagged uncompressed SEC1: `0x04 || x || y`.
+const SEC1_UNCOMPRESSED_LEN: usize = 65;
+/// Ethereum/Web3Signer raw uncompressed point: `x || y`, no `0x04` tag.
+const SEC1_UNCOMPRESSED_UNTAGGED_LEN: usize = 64;
+/// The SEC1 tag byte identifying an uncompressed point.
+const SEC1_UNCOMPRESSED_TAG: u8 = 0x04;
 /// `r || s || v`.
 const SIGNATURE_WITH_RECOVERY_LEN: usize = 65;
 
@@ -141,17 +147,49 @@ pub(crate) fn decode_signature(
         .map_err(|err| anyhow!("remote signature is not a valid secp256k1 signature: {err}"))
 }
 
-/// Parses a compressed-SEC1 hex public key into Miden's `PublicKey`.
+/// Parses a hex secp256k1 public key into Miden's `PublicKey`, accepting every
+/// encoding a Web3Signer-compatible service may publish.
+///
+/// Miden's `read_from_bytes` takes only the 33-byte compressed SEC1 form, but
+/// Web3Signer's eth1 `publicKeys` endpoint returns the Ethereum-style 64-byte
+/// RAW uncompressed point (`x || y`, with the SEC1 `0x04` tag stripped, since
+/// that is the preimage Ethereum addresses are derived from). Accepting only
+/// compressed keys means rejecting the very signer this module exists to talk
+/// to, so all three encodings are normalized to compressed here.
+///
+/// This widens the accepted *encodings*, not the accepted *keys*:
+/// `from_sec1_bytes` rejects anything that is not actually a point on
+/// secp256k1, so a malformed or attacker-supplied value cannot be laundered
+/// into the key directory by the conversion.
 pub(crate) fn parse_public_key(sec1_hex: &str) -> anyhow::Result<ecdsa_k256_keccak::PublicKey> {
     let raw =
         hex::decode(sec1_hex.trim_start_matches("0x")).context("public key is not valid hex")?;
-    if raw.len() != SEC1_COMPRESSED_LEN {
-        return Err(anyhow!(
-            "public key is {} bytes, expected {SEC1_COMPRESSED_LEN} (compressed SEC1)",
-            raw.len()
-        ));
-    }
-    ecdsa_k256_keccak::PublicKey::read_from_bytes(&raw)
+
+    let compressed: Vec<u8> = match raw.len() {
+        SEC1_COMPRESSED_LEN => raw,
+        SEC1_UNCOMPRESSED_LEN | SEC1_UNCOMPRESSED_UNTAGGED_LEN => {
+            let tagged = if raw.len() == SEC1_UNCOMPRESSED_UNTAGGED_LEN {
+                let mut buf = Vec::with_capacity(SEC1_UNCOMPRESSED_LEN);
+                buf.push(SEC1_UNCOMPRESSED_TAG);
+                buf.extend_from_slice(&raw);
+                buf
+            } else {
+                raw
+            };
+            let verifying = alloy::signers::k256::ecdsa::VerifyingKey::from_sec1_bytes(&tagged)
+                .map_err(|err| anyhow!("public key is not a valid secp256k1 point: {err}"))?;
+            verifying.to_encoded_point(true).as_bytes().to_vec()
+        }
+        other => {
+            return Err(anyhow!(
+                "public key is {other} bytes, expected {SEC1_COMPRESSED_LEN} (compressed SEC1), \
+                 {SEC1_UNCOMPRESSED_UNTAGGED_LEN} (raw x||y, as Web3Signer's eth1 API returns), \
+                 or {SEC1_UNCOMPRESSED_LEN} (tagged uncompressed SEC1)"
+            ));
+        }
+    };
+
+    ecdsa_k256_keccak::PublicKey::read_from_bytes(&compressed)
         .map_err(|err| anyhow!("public key is not a valid secp256k1 point: {err}"))
 }
 
@@ -368,6 +406,62 @@ mod tests {
         assert!(
             parse_public_key(&hex::encode([2u8; 10])).is_err(),
             "a truncated public key must fail"
+        );
+    }
+
+    /// The gate found this the hard way: Web3Signer's eth1 `publicKeys`
+    /// endpoint publishes the Ethereum-style RAW 64-byte point (`x || y`), not
+    /// compressed SEC1, so a compressed-only parser rejects every key the
+    /// signer holds and the proxy refuses to boot against a perfectly good
+    /// signer.
+    ///
+    /// All three encodings must resolve to the SAME key — if they did not, the
+    /// commitment would differ and the proxy would look up the wrong signer
+    /// identifier at signing time.
+    #[test]
+    fn accepts_every_sec1_encoding_a_signer_may_publish() {
+        let secret = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+        let AuthSecretKey::EcdsaK256Keccak(inner) = &secret else {
+            panic!("requested an ecdsa key");
+        };
+        let public = inner.public_key();
+        let verifying = alloy::signers::k256::ecdsa::VerifyingKey::from_sec1_bytes(
+            &miden_protocol::utils::serde::Serializable::to_bytes(&public),
+        )
+        .expect("miden's own serialization must round-trip through k256");
+
+        let compressed = verifying.to_encoded_point(true);
+        let uncompressed = verifying.to_encoded_point(false);
+        let untagged = &uncompressed.as_bytes()[1..]; // strip the 0x04 tag
+
+        assert_eq!(uncompressed.as_bytes().len(), 65);
+        assert_eq!(untagged.len(), 64, "the shape Web3Signer actually returns");
+
+        let from_compressed =
+            parse_public_key(&hex::encode(compressed.as_bytes())).expect("compressed SEC1");
+        let from_uncompressed =
+            parse_public_key(&hex::encode(uncompressed.as_bytes())).expect("tagged uncompressed");
+        let from_untagged =
+            parse_public_key(&hex::encode(untagged)).expect("raw x||y — the Web3Signer shape");
+
+        // `0x`-prefixed is what the API actually serves.
+        let from_prefixed = parse_public_key(&format!("0x{}", hex::encode(untagged)))
+            .expect("0x-prefixed raw x||y");
+
+        assert_eq!(from_compressed.to_commitment(), public.to_commitment());
+        assert_eq!(from_uncompressed.to_commitment(), public.to_commitment());
+        assert_eq!(from_untagged.to_commitment(), public.to_commitment());
+        assert_eq!(from_prefixed.to_commitment(), public.to_commitment());
+    }
+
+    /// Widening the accepted encodings must not widen the accepted KEYS: a
+    /// 64-byte blob that is not a point on secp256k1 has to be rejected, not
+    /// silently indexed into the key directory.
+    #[test]
+    fn rejects_a_64_byte_value_that_is_not_on_the_curve() {
+        assert!(
+            parse_public_key(&hex::encode([0xABu8; 64])).is_err(),
+            "an off-curve 64-byte value must not be accepted as a public key"
         );
     }
 }

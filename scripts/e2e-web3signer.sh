@@ -26,6 +26,10 @@ export COMPOSE_PROJECT_NAME="$PROJECT"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-$(grep -m1 '^MIDEN_NODE_GIT_URL' Makefile | sed 's/.*= *//')}"
 MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-$(grep -m1 '^MIDEN_NODE_GIT_REF' Makefile | sed 's/.*= *//')}"
 export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF
+# The signer container must run as the owner of fixtures/web3signer-keys (0700),
+# or it silently starts with zero keys loaded. See docker-compose.web3signer.yml.
+WEB3SIGNER_UID="$(id -u)"; WEB3SIGNER_GID="$(id -g)"
+export WEB3SIGNER_UID WEB3SIGNER_GID
 COMPOSE=(docker compose -f docker-compose.e2e.yml -f docker-compose.web3signer.yml --env-file fixtures/.env)
 PROXY="${PROJECT}-miden-agglayer-1"
 SIGNER="${PROJECT}-web3signer-1"

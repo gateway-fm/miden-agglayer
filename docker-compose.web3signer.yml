@@ -15,6 +15,14 @@
 services:
   web3signer:
     image: consensys/web3signer:24.12.0
+    # The image's own user is uid 1001, but `fixtures/web3signer-keys` is created
+    # 0700 by the host user (gen-web3signer-keys.sh keeps a private key mode-tight
+    # rather than world-readable). uid 1001 therefore cannot even LIST /keys, and
+    # Web3Signer's response to that is to log the IOException and start anyway
+    # with zero signers loaded — a healthy /upcheck serving an empty key list.
+    # Running as the directory's owner is what makes the mount readable without
+    # relaxing the key file to 0644 on a shared host.
+    user: "${WEB3SIGNER_UID:-1000}:${WEB3SIGNER_GID:-1000}"
     # eth1 mode is the secp256k1 signing surface (POST /api/v1/eth1/sign/{key});
     # eth2 would load keys into memory, defeating the point of vault custody.
     command:
@@ -31,7 +39,11 @@ services:
       # (list keys, compare a signature) without exec'ing into the container.
       - "127.0.0.1:9000:9000"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9000/upcheck || exit 1"]
+      # NOT /upcheck alone: Web3Signer reports UP with zero keys loaded, so a
+      # key directory it cannot read looks exactly like a working signer and the
+      # failure only surfaces later as a confusing proxy boot error. Require a
+      # non-empty key list, so "healthy" means "can actually sign for someone".
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/upcheck >/dev/null && curl -sf http://localhost:9000/api/v1/eth1/publicKeys | grep -q '0x' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30
