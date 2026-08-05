@@ -155,6 +155,46 @@ pub(crate) fn parse_public_key(sec1_hex: &str) -> anyhow::Result<ecdsa_k256_kecc
         .map_err(|err| anyhow!("public key is not a valid secp256k1 point: {err}"))
 }
 
+/// How the proxy holds account keys for this process's lifetime.
+///
+/// Resolved once at startup from the CLI so every client built later agrees:
+/// there is no per-call or per-account choice, by design (see
+/// `crate::proxy_keystore`).
+#[derive(Debug, Clone)]
+pub enum CustodyMode {
+    /// Keys held by a remote signer at this base URL (the default).
+    RemoteSigner { base_url: String },
+    /// Keys on this host's disk (explicit `--insecure-local-keystore`).
+    InsecureLocalKeystore,
+}
+
+impl CustodyMode {
+    /// Resolves the mode from the two mutually exclusive CLI options.
+    ///
+    /// Requiring one of them — rather than defaulting to local — is what makes
+    /// on-disk keys a deliberate act: a deployment that forgets to configure
+    /// custody fails to start instead of quietly running with local secrets.
+    pub fn resolve(signer_url: Option<&str>, insecure_local: bool) -> anyhow::Result<Self> {
+        match (signer_url, insecure_local) {
+            (Some(_), true) => Err(anyhow!(
+                "--signer-url and --insecure-local-keystore are mutually exclusive: custody is \
+                 either remote or local, never both (a mixed keystore makes \"which key signed \
+                 this?\" unanswerable). Pick one."
+            )),
+            (Some(base_url), false) => Ok(Self::RemoteSigner {
+                base_url: base_url.to_string(),
+            }),
+            (None, true) => Ok(Self::InsecureLocalKeystore),
+            (None, false) => Err(anyhow!(
+                "no key custody configured: set --signer-url to a Web3Signer-compatible service \
+                 (recommended — key material stays in a KMS/HSM), or pass \
+                 --insecure-local-keystore to keep account private keys on this host's disk \
+                 (development and e2e only)"
+            )),
+        }
+    }
+}
+
 /// The keys a remote signer exposes, indexed by the commitment Miden accounts
 /// actually reference.
 #[derive(Debug, Default)]
@@ -274,6 +314,42 @@ mod tests {
                 .unwrap_or_else(|err| panic!("v={wire_v} must decode: {err}"));
             assert_eq!(decoded.v(), expected, "v={wire_v} must normalise");
         }
+    }
+
+    /// Custody must be an explicit choice. Forgetting to configure it is a
+    /// startup error, NOT a silent fall back to on-disk keys — that default is
+    /// the whole point of the flag pair.
+    #[test]
+    fn custody_must_be_configured_explicitly() {
+        let err =
+            CustodyMode::resolve(None, false).expect_err("no custody configured must fail closed");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("--signer-url") && rendered.contains("--insecure-local-keystore"),
+            "the error must name both ways to configure custody, got: {rendered}"
+        );
+    }
+
+    /// Mixed custody is refused outright — the ambiguity it creates is exactly
+    /// what remote-signing mode exists to remove.
+    #[test]
+    fn custody_modes_are_mutually_exclusive() {
+        assert!(
+            CustodyMode::resolve(Some("http://signer:9000"), true).is_err(),
+            "asking for both remote and local custody must fail"
+        );
+    }
+
+    #[test]
+    fn custody_resolves_each_mode() {
+        assert!(matches!(
+            CustodyMode::resolve(Some("http://signer:9000"), false),
+            Ok(CustodyMode::RemoteSigner { .. })
+        ));
+        assert!(matches!(
+            CustodyMode::resolve(None, true),
+            Ok(CustodyMode::InsecureLocalKeystore)
+        ));
     }
 
     #[test]

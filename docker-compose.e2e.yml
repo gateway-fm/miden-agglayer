@@ -324,6 +324,11 @@ services:
       # is accepted. (`--require-hardening` is intentionally NOT set here, so
       # this flag does not trip the hardening gate.)
       - "--insecure-allow-any-signer"
+      # Key custody is now an explicit choice and remote signing is the default
+      # (see src/proxy_keystore.rs). The base e2e stack keeps keys on disk, so
+      # it must say so; the web3signer overlay drops this flag and sets
+      # AGGLAYER_SIGNER_URL instead.
+      - "--insecure-local-keystore"
       # R1 admin-auth key is supplied via the `ADMIN_API_KEY` env var
       # from `fixtures/.env`, generated fresh per setup by
       # scripts/setup-fixtures.sh (or scripts/ensure-e2e-secrets.sh on

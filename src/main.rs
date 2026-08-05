@@ -254,14 +254,27 @@ struct Command {
     miden_prover_url: Option<String>,
 
     /// Base URL of a Web3Signer-compatible remote signing service (e.g.
-    /// `http://web3signer:9000`). When set, any account key the signer holds is
-    /// signed remotely — key material stays in the signer's custody backend
-    /// (AWS KMS / Azure Key Vault / HashiCorp Vault) and never touches this
-    /// process. Keys the signer does not hold keep using the local keystore, so
-    /// a deployment can migrate one account at a time. Unset = local keystore
-    /// only (the default).
+    /// `http://web3signer:9000`). Remote signing is the DEFAULT custody mode:
+    /// every account signature is produced by the signer, whose backend (AWS
+    /// KMS / Azure Key Vault / HashiCorp Vault) owns the key — this process
+    /// holds, generates and stores no secret. There is deliberately no
+    /// per-account fallback: a key the signer does not hold is a hard error,
+    /// never a silent local signature.
+    ///
+    /// Required unless `--insecure-local-keystore` is set.
     #[arg(long, env = "AGGLAYER_SIGNER_URL")]
     signer_url: Option<String>,
+
+    /// DANGEROUS: keep account private keys on this host's disk instead of in a
+    /// remote signer. Explicit opt-in for development and the e2e suite; a
+    /// production deployment should use `--signer-url` so key material lives in
+    /// a KMS/HSM. Refused by `--require-hardening`.
+    #[arg(
+        long,
+        env = "AGGLAYER_INSECURE_LOCAL_KEYSTORE",
+        default_value_t = false
+    )]
+    insecure_local_keystore: bool,
 
     /// Per-request timeout for the remote Miden prover, in seconds. Default 120s.
     /// Has no effect when --miden-prover-url is unset.
@@ -308,6 +321,14 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
             "  - --allowed-signers is unset (eth_sendRawTransaction would reject \
              every signer — audit C2 fail-closed default). Set ALLOWED_SIGNERS \
              to a comma-separated allow-list."
+                .to_string(),
+        );
+    }
+    if command.insecure_local_keystore {
+        reasons.push(
+            "  - --insecure-local-keystore is set (account private keys live on this \
+             host's disk instead of a KMS/HSM). Remove it and set --signer-url to a \
+             Web3Signer-compatible service."
                 .to_string(),
         );
     }
@@ -560,6 +581,11 @@ impl std::fmt::Debug for Command {
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
             .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
+            .field("insecure_local_keystore", &self.insecure_local_keystore)
+            .field(
+                "signer_url",
+                &self.signer_url.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("reject_unverified_ger", &self.reject_unverified_ger)
             .field("require_hardening", &self.require_hardening)
             .field(
@@ -668,6 +694,14 @@ async fn main() -> anyhow::Result<()> {
         base.join(".miden")
     });
 
+    // Resolve key custody ONCE for the process: remote signer (default) or an
+    // explicit on-disk keystore. Doing it here means a misconfiguration is a
+    // startup error before any client, store or listener is built.
+    let custody = miden_agglayer_service::remote_signer::CustodyMode::resolve(
+        command.signer_url.as_deref(),
+        command.insecure_local_keystore,
+    )?;
+
     // Surgical recovery: clear stale `locked` flags in miden-client's sqlite
     // and exit. Operator restarts the proxy afterwards.
     if command.unlock_miden_accounts {
@@ -711,7 +745,7 @@ async fn main() -> anyhow::Result<()> {
             command.miden_prover_fallback_to_local,
             sync_listeners,
             command.miden_debug,
-            command.signer_url.clone(),
+            custody.clone(),
         )?;
 
         // Resolve the NetworkId from the same `--miden-node` flag MidenClient uses,
@@ -957,7 +991,7 @@ async fn main() -> anyhow::Result<()> {
         command.miden_prover_fallback_to_local,
         sync_listeners,
         command.miden_debug,
-        command.signer_url.clone(),
+        custody.clone(),
     )?;
 
     // Self-heal is RUNTIME-only, not startup-only. See `src/account_recovery.rs`
@@ -1458,6 +1492,7 @@ mod hardening_tests {
             require_hardening: require,
             miden_api_key: None,
             signer_url: None,
+            insecure_local_keystore: true,
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,

@@ -69,7 +69,10 @@ done
     || fail "the proxy never became healthy with --signer-url set (a fail-closed startup error?)"
 docker logs "$PROXY" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -q "remote signer attached" \
     || fail "the proxy did not report attaching the remote signer — is AGGLAYER_SIGNER_URL set?"
-pass "proxy started with the remote signer attached (fail-closed startup passed)"
+# Custody is either/or: the proxy must NOT also be running with on-disk keys.
+docker inspect "$PROXY" --format '{{json .Config.Cmd}}' 2>/dev/null | grep -q 'insecure-local-keystore' \
+    && fail "the proxy is running with --insecure-local-keystore AND a signer — custody must be either/or"
+pass "proxy started in remote-only custody mode (fail-closed startup passed)"
 
 # ── 2. the proxy holds NO secret for the remote key ──────────────────────────
 # The whole point of vault custody: the account's signing key must not exist on
