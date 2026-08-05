@@ -139,32 +139,50 @@ pass "the signer served $SIGNED signing request(s) during the deposit (counter $
 # ── 5. NEGATIVE CONTROL: without the signer, signing must fail ───────────────
 # Without this, a silent local-key fallback would make every assertion above
 # pass while custody was never actually remote.
+#
+# The TRIGGER is the load-bearing part. The first version drove a fabricated
+# GER injection, which never reaches the signing path at all: the proxy runs
+# with --reject-unverified-ger, so a made-up GER is refused during verification
+# long before an account signature is needed. The proxy then correctly logged
+# NOTHING, and this control read "no error" as "it signed" and accused the
+# product of a local-key fallback that cannot exist. Absence of an error is not
+# evidence of a signature.
+#
+# So drive the operation step 3 just PROVED reaches the signer: a real L1->L2
+# deposit, whose claim drew 4 signatures. With the signer down, the proxy must
+# report a signing failure on that path.
 log "negative control: stopping the signer — account signing must now fail"
 docker stop "$SIGNER" >/dev/null 2>&1 || fail "could not stop the signer"
 NEG_START="$(date -u +%s)"
-# Drive a GER injection (a proxy-signed account operation) and require an error.
-cast send --async --rpc-url "${L2_RPC:-http://127.0.0.1:8546}" \
-    --private-key "${GER_KEY:-0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6}" \
-    --legacy --gas-price 1 --gas-limit 1000000 \
-    "${BRIDGE_ADDR:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}" \
-    'insertGlobalExitRoot(bytes32)' \
-    "0x$(printf '%064x' $(( 0xDEAD0000 + RANDOM )))" >/dev/null 2>&1 || true
+
+./scripts/e2e-l1-to-l2.sh > /tmp/e2e-web3signer-neg.log 2>&1 &
+NEG_PID=$!
+
 SAW_FAILURE=""
-for _ in $(seq 1 30); do
-    # Same pipefail/SIGPIPE reason as above: capture, then match. Getting this
-    # wrong here would be worse than a flake — the negative control would never
-    # observe the failure and would report that custody is NOT remote.
+for _ in $(seq 1 90); do
+    # Capture, then match: `| grep -q` under pipefail can report a successful
+    # match as a failure (see the note at the top of this file).
     NEG_LOG="$(docker logs "$PROXY" --since "$NEG_START" 2>&1 \
         | sed -e 's/\x1b\[[0-9;]*m//g' | tr '[:upper:]' '[:lower:]')"
     case "$NEG_LOG" in
-        *"remote signer failed"*|*"remote signer refused"*|*"error sending request"*)
+        *"remote signer failed"*|*"remote signer refused"*|*"remote signer does not hold"*|\
+        *"error sending request"*|*"connection refused"*|*"tcp connect error"*)
             SAW_FAILURE=1; break ;;
     esac
     sleep 2
 done
+
+# Stop driving traffic and restore the signer before asserting, so a failure
+# here never leaves the stack wedged for whatever runs next.
+kill "$NEG_PID" 2>/dev/null || true
+wait "$NEG_PID" 2>/dev/null || true
 docker start "$SIGNER" >/dev/null 2>&1 || true
+
+# The message names BOTH possibilities rather than asserting a fallback as
+# fact: a control that cannot distinguish "never tried to sign" from "signed
+# locally" must not claim to have caught the latter.
 [ -n "$SAW_FAILURE" ] \
-    || fail "with the signer DOWN the proxy still signed — it is falling back to a local key, so custody is not actually remote"
+    || fail "with the signer DOWN the proxy never reported a signing failure. Either the trigger did not reach the signing path (harness bug — check /tmp/e2e-web3signer-neg.log), or the proxy signed without the signer, which would mean custody is not actually remote."
 pass "with the signer down, account signing fails — signatures genuinely come from the signer"
 
 echo ""
