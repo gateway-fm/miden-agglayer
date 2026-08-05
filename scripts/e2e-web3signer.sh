@@ -71,14 +71,23 @@ for _ in $(seq 1 90); do
 done
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] \
     || fail "the proxy never became healthy with --signer-url set (a fail-closed startup error?)"
-docker logs "$PROXY" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -q "remote signer attached" \
-    || fail "the proxy did not report attaching the remote signer — is AGGLAYER_SIGNER_URL set?"
+# NOTE: no `| grep -q` here. Under `set -o pipefail`, grep -q exits on its
+# FIRST match and closes the pipe, so the upstream `sed` dies of SIGPIPE (141)
+# and the pipeline reports failure for a SUCCESSFUL match. Capture first, then
+# match on the string.
+PROXY_LOG="$(docker logs "$PROXY" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')"
+case "$PROXY_LOG" in
+    *"remote signer attached"*) ;;
+    *) fail "the proxy did not report attaching the remote signer — is AGGLAYER_SIGNER_URL set?" ;;
+esac
 # Custody is either/or: the proxy must NOT also be configured for on-disk keys.
 # (The proxy refuses to start with both, so reaching a healthy state already
 # implies this — asserting it anyway keeps the guarantee visible in the log.)
-docker inspect "$PROXY" --format '{{json .Config.Env}}' 2>/dev/null \
-    | grep -q 'AGGLAYER_INSECURE_LOCAL_KEYSTORE=true' \
-    && fail "the proxy has AGGLAYER_INSECURE_LOCAL_KEYSTORE=true AND a signer — custody must be either/or"
+PROXY_ENV="$(docker inspect "$PROXY" --format '{{json .Config.Env}}' 2>/dev/null)"
+case "$PROXY_ENV" in
+    *AGGLAYER_INSECURE_LOCAL_KEYSTORE=true*)
+        fail "the proxy has AGGLAYER_INSECURE_LOCAL_KEYSTORE=true AND a signer — custody must be either/or" ;;
+esac
 pass "proxy started in remote-only custody mode (fail-closed startup passed)"
 
 # ── 2. the proxy holds NO secret for the remote key ──────────────────────────
@@ -124,10 +133,15 @@ cast send --async --rpc-url "${L2_RPC:-http://127.0.0.1:8546}" \
     "0x$(printf '%064x' $(( 0xDEAD0000 + RANDOM )))" >/dev/null 2>&1 || true
 SAW_FAILURE=""
 for _ in $(seq 1 30); do
-    if docker logs "$PROXY" --since "$NEG_START" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' \
-        | grep -qiE 'remote signer (failed|refused)|error sending request'; then
-        SAW_FAILURE=1; break
-    fi
+    # Same pipefail/SIGPIPE reason as above: capture, then match. Getting this
+    # wrong here would be worse than a flake — the negative control would never
+    # observe the failure and would report that custody is NOT remote.
+    NEG_LOG="$(docker logs "$PROXY" --since "$NEG_START" 2>&1 \
+        | sed -e 's/\x1b\[[0-9;]*m//g' | tr '[:upper:]' '[:lower:]')"
+    case "$NEG_LOG" in
+        *"remote signer failed"*|*"remote signer refused"*|*"error sending request"*)
+            SAW_FAILURE=1; break ;;
+    esac
     sleep 2
 done
 docker start "$SIGNER" >/dev/null 2>&1 || true
