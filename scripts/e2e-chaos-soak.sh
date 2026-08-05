@@ -120,9 +120,13 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
       [ "$known" = 0 ] || continue        # proxy knows it (or probe failed) -> #157 recovery's job, not ours
       [ -z "${seen[$tx]:-}" ] || continue # one bounce per lost tx
       seen[$tx]=1
-      echo "$(date +%H:%M:%S) WATCHDOG: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — bouncing aggkit" \
+      total=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null || echo 0)
+      [ "${total:-0}" -lt 6 ] || continue  # heal budget: past this it's a hard failure, not flakiness
+      svc=aggkit; [ "$AK" = "${PROJECT}-aggkit-l2b-1" ] && svc=aggkit-l2b
+      echo "$(date +%H:%M:%S) WATCHDOG: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — FORCE-RECREATING $svc (ephemeral monitor DB must be wiped; docker restart preserves the container fs and the poisoned DB with it)" \
           | tee -a "$WATCHDOG_HEALS_FILE"
-      docker restart "$AK" >/dev/null 2>&1 || true
+      COMPOSE_PROJECT_NAME="$PROJECT" docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml \
+          --env-file fixtures/.env up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
     done
   done
 ) >>/tmp/chaos-watchdog.out 2>&1 &
