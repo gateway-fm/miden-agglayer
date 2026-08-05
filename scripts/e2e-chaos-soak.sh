@@ -120,8 +120,9 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
       [ "$known" = 0 ] || continue        # proxy knows it (or probe failed) -> #157 recovery's job, not ours
       [ -z "${seen[$tx]:-}" ] || continue # one bounce per lost tx
       seen[$tx]=1
-      total=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null || echo 0)
-      [ "${total:-0}" -lt 6 ] || continue  # heal budget: past this it's a hard failure, not flakiness
+      total=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1)
+      total=${total:-0}
+      [ "$total" -lt 6 ] || continue  # heal budget: past this it's a hard failure, not flakiness
       svc=aggkit; [ "$AK" = "${PROJECT}-aggkit-l2b-1" ] && svc=aggkit-l2b
       echo "$(date +%H:%M:%S) WATCHDOG: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — FORCE-RECREATING $svc (ephemeral monitor DB must be wiped; docker restart preserves the container fs and the poisoned DB with it)" \
           | tee -a "$WATCHDOG_HEALS_FILE"
@@ -149,7 +150,7 @@ say "=== stopping injectors + restoring all faults ==="
 kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
 kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
 kill "$WATCHDOG_PID" 2>/dev/null || true; wait "$WATCHDOG_PID" 2>/dev/null || true
-WATCHDOG_HEALS=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null || echo 0)
+WATCHDOG_HEALS=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); WATCHDOG_HEALS=${WATCHDOG_HEALS:-0}
 # belt-and-suspenders restore in case a trap raced (correct container names)
 docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
 NET="$(docker inspect "$AGGLAYER_CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')"
