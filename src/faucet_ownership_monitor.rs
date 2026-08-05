@@ -51,6 +51,7 @@ pub fn check_faucet_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::{Felt, Word};
 
     fn aid(hex: &str) -> AccountId {
         AccountId::from_hex(hex).unwrap()
@@ -84,6 +85,83 @@ mod tests {
 
         // Renounced — DoS variant.
         assert_eq!(check_faucet_owner(bridge, None), OwnershipState::Renounced);
+    }
+
+    /// Cantina #4, the half the predicate tests cannot reach: the OBSERVED
+    /// owner has to actually come out of account storage. The predicate above
+    /// is handed an `Option<AccountId>` already decoded, so it stays green even
+    /// if the decode is completely broken — and a monitor that cannot read the
+    /// slot reports exactly the same "no drift" as a healthy one.
+    ///
+    /// This pins the decode itself against a faucet built by the real 0.16
+    /// builder, so a storage-layout or code-commitment change upstream breaks a
+    /// test instead of silently blinding the monitor in production.
+    #[test]
+    fn cantina_4_owner_decodes_from_real_0_16_faucet_storage() {
+        let bridge = aid("0xac0000000000dd110000ee000000fc");
+        let faucet = miden_base_agglayer::create_agglayer_faucet(
+            Word::from([1u32, 2, 3, 4]),
+            "TST",
+            8,
+            Felt::new(1_000_000).unwrap(),
+            bridge,
+        );
+
+        let observed = miden_base_agglayer::AggLayerFaucet::owner_account_id(&faucet)
+            .expect("0.16 faucet storage must decode to an owner");
+        assert_eq!(
+            observed, bridge,
+            "the builder sets Ownable2Step to the bridge; the decode must round-trip it"
+        );
+        assert_eq!(
+            check_faucet_owner(bridge, Some(observed)),
+            OwnershipState::Expected,
+            "a freshly built bridge-owned faucet must read as healthy end to end"
+        );
+    }
+
+    /// A NATIVE operator faucet legitimately has no `Ownable2Step` slots, so the
+    /// AggLayer decode fails on it — by design, not by breakage. The monitor
+    /// therefore cannot treat "decode failed" as "nothing to see": it must
+    /// classify first, or it buries a genuinely broken AggLayer decode in the
+    /// same silent skip it uses for every native faucet.
+    #[test]
+    fn cantina_4_native_faucet_is_not_decodable_and_must_be_classified() {
+        use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
+        use miden_protocol::asset::{AssetAmount, TokenSymbol};
+        use miden_standards::account::auth::{Approver, AuthSingleSig};
+        use miden_standards::account::faucets::{FungibleFaucet, TokenName};
+
+        let native = FungibleFaucet::builder()
+            .name(TokenName::new("native").unwrap())
+            .symbol(TokenSymbol::try_from("NAT").unwrap())
+            .decimals(8)
+            .max_supply(AssetAmount::from(1_000_000u32))
+            .build()
+            .expect("native faucet component");
+        // Same auth scheme the proxy deploys with; irrelevant to the decode but
+        // the builder requires one.
+        let key = AuthSecretKey::new_falcon512_poseidon2();
+        let account = miden_protocol::account::AccountBuilder::new([7u8; 32])
+            .with_component(native)
+            .with_auth_component(AuthSingleSig::new(Approver::new(
+                key.public_key().to_commitment(),
+                AuthScheme::Falcon512Poseidon2,
+            )))
+            .build()
+            .expect("native faucet account");
+
+        assert!(
+            miden_base_agglayer::AggLayerFaucet::owner_account_id(&account).is_err(),
+            "a native faucet has no AggLayer ownership slots — the decode must fail"
+        );
+        assert_eq!(
+            crate::faucet_ops::classify_faucet_account(&account)
+                .expect("a native faucet is a SUPPORTED kind")
+                .0,
+            crate::faucet_ops::FaucetKind::NativeFungible,
+            "classification is what distinguishes 'not applicable' from 'broken'"
+        );
     }
 
     /// The expected bridge is opaque — even if it equals the attacker's

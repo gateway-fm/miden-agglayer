@@ -1598,42 +1598,123 @@ impl SyncListener for BridgeOutScanner {
 }
 
 impl BridgeOutScanner {
-    /// Cantina #4 ownership monitor. Iterates the registered faucet list,
-    /// FPI-fetches each one's `owner` storage slot, compares against the
-    /// configured bridge account id.
+    /// Record that one registered faucet went unverified this pass, and why.
+    ///
+    /// Split out so every `continue` in the monitor has to name its reason —
+    /// an unaccounted early return is what made the old version silently blind.
+    fn count_ownership_unchecked(faucet_id: AccountId, reason: &'static str) {
+        metrics::counter!(
+            "bridge_faucet_ownership_unchecked_total",
+            "reason" => reason
+        )
+        .increment(1);
+        let _ = faucet_id;
+    }
+
+    /// Cantina #4 ownership monitor. Iterates the registered faucet list, reads
+    /// each AggLayer-owned faucet's `owner` storage slot from the synced account
+    /// state, and compares it against the configured bridge account id.
+    ///
+    /// # Why every skip is counted
+    ///
+    /// This is a detection control, so the failure that matters most is not a
+    /// false alarm but a *silent* one: if the monitor cannot read a faucet's
+    /// owner, it emits exactly the same "no drift" as a healthy pass, and a
+    /// dashboard showing `drift_total == 0` looks identical whether the bridge
+    /// is safe or the monitor has been blind for a week.
+    ///
+    /// Two skips are legitimate and one is not, and the old code could not tell
+    /// them apart because it tried the AggLayer decode on everything:
+    ///
+    /// * a NATIVE operator faucet has no `Ownable2Step` slots at all, so the
+    ///   decode fails *by design* — there is no bridge ownership to verify;
+    /// * a faucet the client has not synced yet simply is not readable *yet*;
+    /// * an AggLayer-owned faucet whose owner will not decode is a genuine
+    ///   problem — an upstream storage-layout or code-commitment change — and
+    ///   used to be swallowed by the same `warn` the native faucets produced on
+    ///   every single pass.
+    ///
+    /// So we classify first and account for every faucet: either it was checked
+    /// or it is counted in `bridge_faucet_ownership_unchecked_total` with the
+    /// reason. Coverage becomes assertable — `checked + unchecked` must equal
+    /// the registered faucet count.
     async fn run_faucet_ownership_check(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
         let faucets = self.store.list_faucets().await?;
         for entry in faucets {
             let acct = match client.get_account(entry.faucet_id).await {
                 Ok(Some(acct)) => acct,
-                Ok(None) => continue, // not yet synced
+                Ok(None) => {
+                    // Not yet synced — readable later, but until then this
+                    // faucet is genuinely unverified and must say so.
+                    Self::count_ownership_unchecked(entry.faucet_id, "unsynced");
+                    continue;
+                }
                 Err(e) => {
+                    Self::count_ownership_unchecked(entry.faucet_id, "fetch_failed");
                     tracing::warn!(
                         target: "bridge_out::ownership",
                         faucet_id = %entry.faucet_id,
                         error = ?e,
-                        "Cantina #4: faucet account fetch failed"
+                        "Cantina #4: faucet account fetch failed — ownership NOT verified this pass"
                     );
                     continue;
                 }
             };
+
+            // Classify before decoding, so "not applicable" and "broken" stop
+            // sharing a code path.
+            match crate::faucet_ops::classify_faucet_account(&acct) {
+                Ok((crate::faucet_ops::FaucetKind::AggLayerOwned, _)) => {}
+                Ok((crate::faucet_ops::FaucetKind::NativeFungible, _)) => {
+                    // Operator-owned by design; the bridge never owns it, so
+                    // there is no ownership invariant to check here.
+                    Self::count_ownership_unchecked(entry.faucet_id, "native_faucet");
+                    tracing::debug!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        "Cantina #4: native operator faucet — no bridge ownership to verify"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // Registered in the bridge but matching NO supported type.
+                    // That is the faucet-registry tripwire, not a monitor hiccup.
+                    Self::count_ownership_unchecked(entry.faucet_id, "unknown_type");
+                    tracing::error!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        error = ?e,
+                        "Cantina #4: registered faucet matches NO supported type — \
+                         ownership cannot be verified"
+                    );
+                    continue;
+                }
+            }
+
             // The Ownable2Step component stores the owner AccountId at a
-            // known slot. Upstream exposes `owner_account_id` returning
+            // named slot. Upstream exposes `owner_account_id` returning
             // `Err(OwnershipRenounced)` for the renounced case.
             let observed: Option<AccountId> =
                 match miden_base_agglayer::AggLayerFaucet::owner_account_id(&acct) {
                     Ok(id) => Some(id),
                     Err(miden_base_agglayer::AgglayerFaucetError::OwnershipRenounced) => None,
                     Err(e) => {
-                        tracing::warn!(
+                        // Classification already proved this IS an AggLayer
+                        // faucet, so a decode failure here means the monitor
+                        // cannot see a faucet it is responsible for. Loud.
+                        Self::count_ownership_unchecked(entry.faucet_id, "undecodable");
+                        tracing::error!(
                             target: "bridge_out::ownership",
                             faucet_id = %entry.faucet_id,
                             error = ?e,
-                            "Cantina #4: failed to decode faucet owner — skipping"
+                            "Cantina #4: AggLayer faucet owner failed to decode — the ownership \
+                             monitor is BLIND for this faucet (upstream storage layout or code \
+                             commitment change?)"
                         );
                         continue;
                     }
                 };
+            metrics::counter!("bridge_faucet_ownership_checked_total").increment(1);
             match crate::faucet_ownership_monitor::check_faucet_owner(
                 self.bridge_account_id,
                 observed,
