@@ -253,6 +253,16 @@ struct Command {
     #[arg(long, env = "MIDEN_PROVER_URL")]
     miden_prover_url: Option<String>,
 
+    /// Base URL of a Web3Signer-compatible remote signing service (e.g.
+    /// `http://web3signer:9000`). When set, any account key the signer holds is
+    /// signed remotely — key material stays in the signer's custody backend
+    /// (AWS KMS / Azure Key Vault / HashiCorp Vault) and never touches this
+    /// process. Keys the signer does not hold keep using the local keystore, so
+    /// a deployment can migrate one account at a time. Unset = local keystore
+    /// only (the default).
+    #[arg(long, env = "AGGLAYER_SIGNER_URL")]
+    signer_url: Option<String>,
+
     /// Per-request timeout for the remote Miden prover, in seconds. Default 120s.
     /// Has no effect when --miden-prover-url is unset.
     #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
@@ -701,6 +711,7 @@ async fn main() -> anyhow::Result<()> {
             command.miden_prover_fallback_to_local,
             sync_listeners,
             command.miden_debug,
+            command.signer_url.clone(),
         )?;
 
         // Resolve the NetworkId from the same `--miden-node` flag MidenClient uses,
@@ -946,6 +957,7 @@ async fn main() -> anyhow::Result<()> {
         command.miden_prover_fallback_to_local,
         sync_listeners,
         command.miden_debug,
+        command.signer_url.clone(),
     )?;
 
     // Self-heal is RUNTIME-only, not startup-only. See `src/account_recovery.rs`
@@ -1445,6 +1457,7 @@ mod hardening_tests {
             reject_zero_padding_addresses: false,
             require_hardening: require,
             miden_api_key: None,
+            signer_url: None,
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,

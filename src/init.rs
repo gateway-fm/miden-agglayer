@@ -3,9 +3,10 @@ use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::faucet_ops;
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
+use crate::proxy_keystore::ProxyKeystore;
 use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
-use miden_client::keystore::{FilesystemKeyStore, Keystore};
+use miden_client::keystore::Keystore;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::account::{Account, AccountId, AccountType};
@@ -100,7 +101,7 @@ async fn deploy_account(
 
 async fn add_bridge(
     client: &mut MidenClientLib,
-    _keystore: Arc<FilesystemKeyStore>,
+    _keystore: Arc<ProxyKeystore>,
     service_id: AccountId,
     ger_manager_id: AccountId,
     network_id: u32,
@@ -155,7 +156,7 @@ async fn add_faucet(
 
 async fn add_wallet(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
 ) -> anyhow::Result<Account> {
     // Public storage mode is REQUIRED for the proxy's infrastructure accounts
     // (service, ger_manager) so a missing local sqlite row can
@@ -218,7 +219,7 @@ pub(crate) async fn register_wallet_p2id_tag(
 /// is responsible for syncing afterwards to settle the account on the node.
 pub async fn create_standalone_wallet(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
 ) -> anyhow::Result<Account> {
     let account = add_wallet(client, keystore).await?;
     register_wallet_p2id_tag(client, account.id()).await?;
@@ -227,7 +228,7 @@ pub async fn create_standalone_wallet(
 
 async fn add_accounts(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
     network_id: u32,
 ) -> anyhow::Result<Accounts> {
     let service = add_wallet(client, keystore.clone()).await?;
@@ -266,7 +267,7 @@ async fn add_accounts(
 
 async fn init_internal(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
     net_id: NetworkId,
     network_id: u32,
     miden_store_dir: Option<PathBuf>,

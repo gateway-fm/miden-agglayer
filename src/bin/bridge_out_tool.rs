@@ -477,7 +477,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Build miden client from the store (existing for bridge-out, freshly
     // created for --create-wallet).
-    let keystore = Arc::new(FilesystemKeyStore::new(keystore_path)?);
+    let keystore = Arc::new(
+        miden_agglayer_service::proxy_keystore::ProxyKeystore::local(FilesystemKeyStore::new(
+            keystore_path,
+        )?),
+    );
     let rpc = miden_agglayer_service::miden_client::build_rpc_client(
         &node_endpoint,
         10_000,

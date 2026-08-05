@@ -107,7 +107,7 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(BACKOFF_MAX)
 }
 
-pub type MidenClientLib = miden_client::Client<FilesystemKeyStore>;
+pub type MidenClientLib = miden_client::Client<crate::proxy_keystore::ProxyKeystore>;
 
 type BoxFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 type BoxFutureFactory =
@@ -272,7 +272,7 @@ pub(crate) fn ordered_account_transactions(
 }
 
 pub struct MidenClient {
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<crate::proxy_keystore::ProxyKeystore>,
     task: std::sync::Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>,
     sender: mpsc::Sender<Request>,
     done_sender: std::sync::Mutex<Option<oneshot::Sender<()>>>,
@@ -324,6 +324,11 @@ impl MidenClient {
         fallback_to_local: bool,
         sync_listeners: Vec<Arc<dyn SyncListener>>,
         debug_mode: bool,
+        // `signer_url`: base URL of a Web3Signer-compatible signing service.
+        // When set, keys the signer holds are signed remotely (KMS/HSM
+        // custody); everything else keeps using the local keystore. See
+        // `crate::remote_signer`.
+        signer_url: Option<String>,
     ) -> anyhow::Result<Self> {
         // Critical section: enforce a single live production MidenClient. The
         // flag is cleared by the background thread on clean shutdown (see the
@@ -345,7 +350,7 @@ impl MidenClient {
         let node_endpoint = node_url
             .map(Self::parse_node_url)
             .unwrap_or(Ok(Endpoint::localhost()))?;
-        let keystore = Self::create_keystore(store_dir.clone())?;
+        let keystore = Self::create_keystore(store_dir.clone(), signer_url.as_deref())?;
         let keystore_for_run = keystore.clone();
         let prover_url_for_run = prover_url.clone();
 
@@ -481,7 +486,9 @@ impl MidenClient {
         let store_dir = tempfile::tempdir().unwrap().keep();
         let keystore_path = store_dir.join("keystore");
         std::fs::create_dir_all(&keystore_path).unwrap();
-        let keystore = FilesystemKeyStore::new(keystore_path).unwrap();
+        let keystore = crate::proxy_keystore::ProxyKeystore::local(
+            FilesystemKeyStore::new(keystore_path).unwrap(),
+        );
         let keystore = Arc::new(keystore);
         let (sender, mut receiver) = mpsc::channel::<Request>(1);
         let (done_sender, _done_receiver) = oneshot::channel::<()>();
@@ -526,7 +533,9 @@ impl MidenClient {
         let store_dir = tempfile::tempdir().unwrap().keep();
         let keystore_path = store_dir.join("keystore");
         std::fs::create_dir_all(&keystore_path).unwrap();
-        let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).unwrap());
+        let keystore = Arc::new(crate::proxy_keystore::ProxyKeystore::local(
+            FilesystemKeyStore::new(keystore_path).unwrap(),
+        ));
         let (sender, mut receiver) = mpsc::channel::<Request>(1);
         let (done_sender, _done_receiver) = oneshot::channel::<()>();
         let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
@@ -578,7 +587,10 @@ impl MidenClient {
         parse_node_url(&node_url)
     }
 
-    fn create_keystore(store_dir: PathBuf) -> anyhow::Result<Arc<FilesystemKeyStore>> {
+    fn create_keystore(
+        store_dir: PathBuf,
+        signer_url: Option<&str>,
+    ) -> anyhow::Result<Arc<crate::proxy_keystore::ProxyKeystore>> {
         let keystore_path = store_dir.join("keystore");
         if !keystore_path.exists() {
             std::fs::create_dir_all(&keystore_path)?;
@@ -589,11 +601,31 @@ impl MidenClient {
             let perms = std::fs::Permissions::from_mode(0o700);
             std::fs::set_permissions(&keystore_path, perms)?;
         }
-        let keystore = FilesystemKeyStore::new(keystore_path)?;
+        let local = FilesystemKeyStore::new(keystore_path)?;
+        let Some(signer_url) = signer_url else {
+            return Ok(Arc::new(crate::proxy_keystore::ProxyKeystore::local(local)));
+        };
+        // A configured signer must be reachable AND usable before we accept
+        // traffic: attaching it here (blocking the caller's runtime) makes a
+        // broken custody setup a startup failure, never a mid-transaction one.
+        let client = crate::remote_signer::RemoteSignerClient::new(
+            signer_url,
+            std::time::Duration::from_secs(
+                std::env::var("AGGLAYER_SIGNER_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or(30),
+            ),
+        )?;
+        let keystore = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                crate::proxy_keystore::ProxyKeystore::with_remote_signer(local, client),
+            )
+        })?;
         Ok(Arc::new(keystore))
     }
 
-    pub fn get_keystore(&self) -> Arc<FilesystemKeyStore> {
+    pub fn get_keystore(&self) -> Arc<crate::proxy_keystore::ProxyKeystore> {
         self.keystore.clone()
     }
 
@@ -705,7 +737,7 @@ impl MidenClient {
         api_key: Option<String>,
         prover_url: Option<String>,
         prover_timeout_secs: u64,
-        keystore: Arc<FilesystemKeyStore>,
+        keystore: Arc<crate::proxy_keystore::ProxyKeystore>,
         receiver: &mut mpsc::Receiver<Request>,
         done_receiver: &mut oneshot::Receiver<()>,
         sync_listeners: &[Arc<dyn SyncListener>],

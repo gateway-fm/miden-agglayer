@@ -6,6 +6,9 @@ extend-exclude = ["*.lock", "dist", "target", "fixtures"]
 # Test fixture for constant_time_eq() — `abd` is intentionally a one-byte
 # variant of `abc`, not a typo of `and`/`bad`.
 abd = "abd"
+# Vendor name: HashiCorp Vault, a custody backend Web3Signer fronts (see
+# src/remote_signer.rs). typos-cli splits it as `Hashi` -> `Hash`.
+Hashi = "Hashi"
 
 [default.extend-identifiers]
 # Short commit-SHA fragments referenced in postmortems, runbooks, and source
