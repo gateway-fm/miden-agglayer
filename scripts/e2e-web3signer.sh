@@ -34,6 +34,7 @@ COMPOSE=(docker compose -f docker-compose.e2e.yml -f docker-compose.web3signer.y
 PROXY="${PROJECT}-miden-agglayer-1"
 SIGNER="${PROJECT}-web3signer-1"
 SIGNER_URL="${SIGNER_URL:-http://127.0.0.1:9000}"
+SIGNER_METRICS="${SIGNER_METRICS:-http://127.0.0.1:9001}"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 ts() { date '+%H:%M:%S'; }
@@ -105,18 +106,35 @@ fi
 pass "the proxy holds no local secret — account keys live only in the signer"
 
 # ── 3. a full deposit completes, remote-signed throughout ────────────────────
-SIGN_BEFORE="$(docker logs "$SIGNER" 2>&1 | grep -c 'eth1/sign' || true)"
+# Web3Signer does NOT log individual signing requests (its entire log is ~15
+# startup lines), so counting log lines here would report 0 signatures while
+# signing worked perfectly — a guaranteed false failure. Its Prometheus counter
+# is the authoritative signal; verified to advance exactly once per signature.
+signer_signature_count() {
+    curl -s "$SIGNER_METRICS/metrics" 2>/dev/null \
+        | awk '/^signing_secp256k1_signing_duration_count/ {print $2; found=1}
+               END {if (!found) print "MISSING"}'
+}
+SIGN_BEFORE="$(signer_signature_count)"
+if [ "$SIGN_BEFORE" = MISSING ]; then
+    fail "the signer exposes no signing counter at $SIGNER_METRICS — is --metrics-enabled set?"
+fi
+
 log "running a full L1->L2 deposit with every account signature served remotely"
 ./scripts/e2e-l1-to-l2.sh > /tmp/e2e-web3signer-l1l2.log 2>&1 \
     || { tail -25 /tmp/e2e-web3signer-l1l2.log; fail "the L1->L2 deposit failed with remote signing"; }
 pass "L1->L2 deposit completed with remote signing"
 
 # ── 4. the signer actually served signatures ─────────────────────────────────
-SIGN_AFTER="$(docker logs "$SIGNER" 2>&1 | grep -c 'eth1/sign' || true)"
-SIGNED=$(( SIGN_AFTER - SIGN_BEFORE ))
+SIGN_AFTER="$(signer_signature_count)"
+if [ "$SIGN_AFTER" = MISSING ]; then
+    fail "the signer stopped exposing its signing counter mid-test — did it die?"
+fi
+# The counter is a float ("12.0"); compare as integers.
+SIGNED=$(( ${SIGN_AFTER%%.*} - ${SIGN_BEFORE%%.*} ))
 [ "$SIGNED" -gt 0 ] \
-    || fail "the signer served 0 signing requests during the deposit — signing did not go remote"
-pass "the signer served $SIGNED signing request(s) during the deposit"
+    || fail "the signer served 0 signing requests during the deposit (counter ${SIGN_BEFORE} -> ${SIGN_AFTER}) — signing did not go remote"
+pass "the signer served $SIGNED signing request(s) during the deposit (counter ${SIGN_BEFORE} -> ${SIGN_AFTER})"
 
 # ── 5. NEGATIVE CONTROL: without the signer, signing must fail ───────────────
 # Without this, a silent local-key fallback would make every assertion above

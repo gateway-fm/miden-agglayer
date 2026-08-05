@@ -30,6 +30,15 @@ services:
       - --http-listen-host=0.0.0.0
       - --http-listen-port=9000
       - --http-host-allowlist=*
+      # Metrics are how the e2e proves signing actually happened: Web3Signer
+      # does NOT log individual signing requests at any default level (its whole
+      # log is ~15 startup lines), so counting log lines would report zero
+      # signatures while signing correctly. `signing_secp256k1_signing_duration_count`
+      # is the authoritative counter.
+      - --metrics-enabled=true
+      - --metrics-host=0.0.0.0
+      - --metrics-port=9001
+      - --metrics-host-allowlist=*
       - eth1
       - --chain-id=${CHAIN_ID:-2}
     volumes:
@@ -38,6 +47,8 @@ services:
       # Host-published so the e2e can assert against the signer directly
       # (list keys, compare a signature) without exec'ing into the container.
       - "127.0.0.1:9000:9000"
+      # Metrics: the e2e reads the signing counter from here.
+      - "127.0.0.1:9001:9001"
     healthcheck:
       # NOT /upcheck alone: Web3Signer reports UP with zero keys loaded, so a
       # key directory it cannot read looks exactly like a working signer and the
