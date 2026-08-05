@@ -293,7 +293,7 @@ say "  foreign_skipped_total: $BASE_FOREIGN_SKIP -> $NOW_FOREIGN_SKIP (garbo for
 source "$SCRIPT_DIR/lib-chaos-verdict.sh"
 say "======================================================================"
 say "  UNIFIED CHAOS SOAK RESULT"
-say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})  allow_late=$ALLOW_LATE"
+say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})  allow_late=$ALLOW_LATE  aggkit_watchdog_heals=${WATCHDOG_HEALS:-0}"
 say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=$FOREIGN_LEAK  private_leak=$PRIVATE_LEAK"
 # The mixed loadtest (MIX_VERIFY=0) now enforces its FULL operational verdict
 # (all fwd/back landed, clash distinct, L1 rc) and skips only the duplicate
