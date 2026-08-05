@@ -281,12 +281,44 @@ STATUS=$(printf '%s\n' "$CLAIM_TX" | awk '$1=="status"{print $2; exit}')
 if [[ "$STATUS" == "1" ]]; then
     pass "L1 claim transaction succeeded!"
 else
-    # Revert here usually means the autoclaimer beat us between proof fetch
-    # and submission (AlreadyClaimed) — verify its claim instead of failing.
-    TX_NOW=$(refresh_claim_tx)
-    [[ -n "$TX_NOW" ]] && finish_via_autoclaim "$TX_NOW"
-    warn "L1 claim tx output: $CLAIM_TX"
-    fail "L1 claim transaction failed (status=$STATUS)"
+    # Our send did not report success. That is NOT the same as "the withdrawal
+    # failed": the autoclaimer races us and usually wins (AlreadyClaimed), and
+    # an empty $STATUS just means `cast send` itself errored (its failure is
+    # swallowed by the `|| true` above) — after chaos that is typically the
+    # autoclaimer's claim landing while our send was in flight, or the RPC
+    # blipping mid-restart.
+    #
+    # The authoritative question is on-chain: is this exit claimed? Poll that,
+    # and only fail if it is still unclaimed once the window closes. A single
+    # refresh_claim_tx() check raced a restarting autoclaimer and produced
+    # three separate false "the bridge did not recover" failures.
+    warn "our L1 claim send did not report success (status=${STATUS:-<none>}) — checking whether the exit is claimed on-chain"
+    CLAIM_SETTLED=""
+    for _ in $(seq 1 "${L1_CLAIM_SETTLE_TRIES:-30}"); do
+        TX_NOW=$(refresh_claim_tx)
+        if [[ -n "$TX_NOW" ]]; then
+            log "  autoclaimer recorded claim tx $TX_NOW"
+            finish_via_autoclaim "$TX_NOW"
+            CLAIM_SETTLED=1
+            break
+        fi
+        # No recorded tx yet — ask the L1 bridge directly. isClaimed is the
+        # invariant the test actually cares about; who submitted it is not.
+        IS_CLAIMED_CALLDATA=$(cast calldata 'isClaimed(uint32,uint32)' "$DEPOSIT_CNT" 1 2>/dev/null || true)
+        if [[ -n "$IS_CLAIMED_CALLDATA" ]]; then
+            IS_CLAIMED=$(cast call --rpc-url "$L1_RPC" "$BRIDGE_ADDRESS" "$IS_CLAIMED_CALLDATA" 2>/dev/null || true)
+            if [[ -n "$IS_CLAIMED" ]] && [[ $((IS_CLAIMED)) -eq 1 ]]; then
+                pass "L1 exit is claimed on-chain (isClaimed=true) — the withdrawal completed"
+                CLAIM_SETTLED=1
+                break
+            fi
+        fi
+        sleep "${L1_CLAIM_SETTLE_INTERVAL:-5}"
+    done
+    if [[ -z "$CLAIM_SETTLED" ]]; then
+        warn "L1 claim tx output: $CLAIM_TX"
+        fail "L1 claim transaction failed and the exit is still UNCLAIMED on-chain after the settle window (status=${STATUS:-<none>})"
+    fi
 fi
 
 # Verify L1 balance change
