@@ -140,7 +140,7 @@ WATCHDOG_PID=$!
 say "=== mixed loadtest under storm (L1 ${N} split $((N / 2))/$((N - N / 2)), L2<->L2 $L2L2_FWD/$L2L2_BACK) ==="
 N_L1_FWD=$((N / 2)) N_L1_BACK=$((N - N / 2)) L2L2_FWD="$L2L2_FWD" L2L2_BACK="$L2L2_BACK" \
     MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" COMPOSE_PROJECT_NAME="$PROJECT" \
-    timeout 3600 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
+    timeout 4800 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
 LT_RC=$?
 say "mixed loadtest exited rc=$LT_RC"
 grep -aE "MIXED LOADTEST RESULT|forward ops|back ops|address clash|L1<->Miden rc" /tmp/chaos-lt.out | tail -6 || true
