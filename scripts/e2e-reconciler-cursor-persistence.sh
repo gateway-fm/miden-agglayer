@@ -44,7 +44,9 @@ source "$FIXTURES_DIR/.env"
 # `docker compose run` invocations the file is fully interpolated. Same
 # defaults as the Makefile (source-of-truth — bump both together).
 export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/node.git}"
-export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.15.0}"
+# Node ref comes from the Makefile so a standalone run can never build a
+# 0.15 node against this 0.16 proxy (PR #159 review).
+export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-$(grep -m1 '^MIDEN_NODE_GIT_REF' "$(dirname "${BASH_SOURCE[0]}")/../Makefile" | sed 's/.*= *//')}"
 
 L2_RPC="http://localhost:8546"
 PG_HOST="localhost"

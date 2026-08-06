@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run-all.sh — provision the protocol-0.15 miden-agglayer e2e stack FROM SCRATCH,
+# run-all.sh — provision the protocol-0.16 miden-agglayer e2e stack FROM SCRATCH,
 # run the tests, and report EVERYTHING: L1 transactions + receipts, synthetic
 # BridgeEvents, Miden note IDs (GER / CLAIM / MINT / P2ID / B2AGG), Global Exit
 # Roots, AggLayer certificates + settlement txs, and balances on both sides.
@@ -39,7 +39,9 @@ REPORT="$OUT/RUN-ALL-REPORT.txt"
 
 # Pin coords (kept in sync with the Makefile / setup-fixtures expectations).
 export MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-export MIDEN_NODE_GIT_REF="v0.15.0"
+# Must track the Makefile pin: this branch is protocol 0.16 and a 0.15 node
+# produces an incompatible account/genesis format (PR #159 review).
+export MIDEN_NODE_GIT_REF="v0.16.0-alpha.2"
 export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
 [ -s "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" 2>/dev/null || true
 

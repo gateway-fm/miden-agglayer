@@ -1,5 +1,14 @@
 # Release upgrade note — #157 (automatic orphan recovery)
 
+> **Protocol 0.16 note.** The v0.15.9-based in-place upgrade rehearsal described
+> below is NOT a supported path on the 0.16 branch: 0.16 changes the
+> account/genesis format, so a 0.15-created store cannot be carried across.
+> `scripts/e2e-upgrade-test.sh` and `scripts/e2e-upgrade-recovery.sh` now refuse
+> to run unless `ALLOW_CROSS_PROTOCOL_UPGRADE_TEST=1` is set, and a pass under
+> that override does not certify an operator-performable upgrade. Deploy 0.16
+> fresh. This document is retained as the record of the #157 validation done on
+> the 0.15 line.
+
 Release-specific companion to the version-neutral [`docs/UPGRADE.md`](../UPGRADE.md).
 Read that first for the safety invariants and the in-place procedure; this note
 records what changes in the `main + #157` release and how to verify the upgrade.

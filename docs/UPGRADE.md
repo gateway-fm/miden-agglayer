@@ -1,5 +1,13 @@
 # In-place upgrade guide
 
+> **Protocol 0.16.** The in-place, proxy-only upgrade this document describes
+> applies WITHIN a protocol line. Moving to 0.16 is not such an upgrade: the
+> account/genesis format changes, so a 0.15-created store and node state cannot
+> be carried across by swapping the proxy image. Deploy 0.16 as a FRESH stack
+> unless and until a coordinated chain migration is built and tested (PR #159
+> review).
+
+
 This is the version-neutral procedure for replacing a running
 `miden-agglayer-service` image while preserving its Miden account identity and
 synthetic EVM history. Release-specific migration and flag assumptions belong
