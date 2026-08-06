@@ -49,11 +49,14 @@ impl From<Accounts> for AccountsConfig {
 // signature at proving time, so there is no signer-key privacy — an accepted
 // trade-off for these operator-owned infrastructure accounts.
 //
-// Key material comes from the OS CSPRNG (rand::rng() is a CryptoRng); the
+// Key material comes from the OS CSPRNG. `new_ecdsa_k256_keccak()` sources that
+// randomness itself, which is why this does not thread an explicit `rand`
+// generator: fewer moving parts, and no direct `rand` dependency to keep in step
+// with miden's own version (PR #160 review). What matters either way is that the
 // client's deterministic Felt coin is NOT a CryptoRng and must never be a
 // secp256k1 key source.
 pub fn create_auth_component() -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
-    let key_pair = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+    let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
     let auth_component = AuthSingleSig::new(Approver::from(&key_pair.public_key()));
     Ok((auth_component, key_pair))
 }
@@ -310,4 +313,58 @@ pub async fn init(
     future.await?;
 
     Ok(result.get().unwrap().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miden_protocol::account::auth::AuthScheme;
+
+    /// PR #160 review: this branch's ONLY security-sensitive behaviour is which
+    /// signature scheme newly provisioned operator accounts are deployed with,
+    /// and it had no direct regression test. A silent revert to Falcon — or an
+    /// approver derived from a different key than the one we keep — would have
+    /// been caught by nothing.
+    ///
+    /// Pins all three halves of the binding:
+    ///   * the secret key we persist is EcdsaK256Keccak;
+    ///   * the auth component advertises EcdsaK256Keccak; and
+    ///   * the component's approver commits to THAT key, not another.
+    #[test]
+    fn create_auth_component_pins_ecdsa_k256_keccak() {
+        let (component, key_pair) = create_auth_component().expect("auth component");
+
+        assert_eq!(
+            key_pair.auth_scheme(),
+            AuthScheme::EcdsaK256Keccak,
+            "the generated secret key must be secp256k1/keccak — a Falcon key here would \
+             silently re-introduce the scheme this branch removes"
+        );
+        assert_eq!(
+            component.approver().auth_scheme(),
+            AuthScheme::EcdsaK256Keccak,
+            "the deployed component must advertise the same scheme as the key it is bound to"
+        );
+        assert_eq!(
+            component.approver().pub_key(),
+            key_pair.public_key().to_commitment(),
+            "the approver must commit to the key we actually keep; a mismatch deploys an \
+             account nobody can sign for"
+        );
+    }
+
+    /// Two calls must not return the same key. Cheap, but it is the assertion
+    /// that fails loudly if the key source is ever swapped for the client's
+    /// deterministic Felt coin (which is NOT a CryptoRng).
+    #[test]
+    fn create_auth_component_draws_fresh_key_material() {
+        let (a, ka) = create_auth_component().expect("first");
+        let (b, kb) = create_auth_component().expect("second");
+        assert_ne!(
+            ka.public_key().to_commitment(),
+            kb.public_key().to_commitment(),
+            "two provisioned accounts must not share a key"
+        );
+        assert_ne!(a.approver().pub_key(), b.approver().pub_key());
+    }
 }

@@ -92,9 +92,6 @@ parking_lot = { version = "0.12" }
 # ECDSA account keys (feat/016-ecdsa-accounts): secp256k1 key GENERATION needs
 # a CryptoRng; the miden-client ClientRng is a deterministic Felt coin and does
 # not implement it, so keys come from the OS CSPRNG via rand::rng(). Version
-# 0.10 matches the rand miden-protocol's Rng/CryptoRng trait bounds come from
-# (trait identity across crates).
-rand = { version = "0.10" }
 # Direct dep so we can surgically clear stale `locked` flags in miden-client's
 # sqlite when a full --reset-miden-store would be overkill. Version matches
 # what miden-client-sqlite-store pulls in transitively.
