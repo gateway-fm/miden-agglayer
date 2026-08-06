@@ -39,7 +39,7 @@ cat > "$KEY_FILE" <<EOF
 # Swapping this block for a vault type is the entire production delta:
 #   type: aws-kms
 #   region: eu-west-1
-#   keyId: arn:aws:kms:...
+#   kmsKeyId: arn:aws:kms:...   # NOTE: kmsKeyId, not keyId
 type: file-raw
 keyType: SECP256K1
 privateKey: "0x${PRIV}"

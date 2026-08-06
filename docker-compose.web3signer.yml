@@ -14,7 +14,12 @@
 
 services:
   web3signer:
-    image: consensys/web3signer:24.12.0
+    # 25.2.0 is the FIRST release carrying the Netty 4.1.118 upgrade that fixes
+    # CVE-2025-24970; 24.12.0 predates it. Certifying a custody feature on a
+    # signer with a known network-stack CVE would undercut the whole point of
+    # moving keys off this host (PR #162 review).
+    # https://github.com/Consensys/web3signer/releases/tag/25.2.0
+    image: consensys/web3signer:25.2.0
     # The image's own user is uid 1001, but `fixtures/web3signer-keys` is created
     # 0700 by the host user (gen-web3signer-keys.sh keeps a private key mode-tight
     # rather than world-readable). uid 1001 therefore cannot even LIST /keys, and
