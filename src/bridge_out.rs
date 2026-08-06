@@ -1661,31 +1661,41 @@ impl BridgeOutScanner {
                 }
             };
 
-            // Classify before decoding, so "not applicable" and "broken" stop
-            // sharing a code path.
-            match crate::faucet_ops::classify_faucet_account(&acct) {
-                Ok((crate::faucet_ops::FaucetKind::AggLayerOwned, _)) => {}
-                Ok((crate::faucet_ops::FaucetKind::NativeFungible, _)) => {
-                    // Operator-owned by design; the bridge never owns it, so
-                    // there is no ownership invariant to check here.
+            // Decide what we OWE this faucet from authoritative registration
+            // metadata FIRST, then hold the decoder to it. Trusting the
+            // classifier alone lets a degraded AggLayer decode fall through to
+            // the benign native bucket (PR #159 review) — the same blindness in
+            // a new costume.
+            let duty = crate::faucet_ownership_monitor::ownership_duty(
+                entry.origin_network,
+                self.local_network_id,
+            );
+            let observed_kind = crate::faucet_ops::classify_faucet_account(&acct)
+                .ok()
+                .map(|(kind, _)| kind);
+            match crate::faucet_ownership_monitor::reconcile_classification(duty, observed_kind) {
+                crate::faucet_ownership_monitor::ClassificationVerdict::Verify => {}
+                crate::faucet_ownership_monitor::ClassificationVerdict::SkipNative => {
+                    // Miden-originated, operator-owned: the bridge never owns
+                    // it, so there is no ownership invariant to check.
                     Self::count_ownership_unchecked(entry.faucet_id, "native_faucet");
                     tracing::debug!(
                         target: "bridge_out::ownership",
                         faucet_id = %entry.faucet_id,
-                        "Cantina #4: native operator faucet — no bridge ownership to verify"
+                        "Cantina #4: registered-native faucet — no bridge ownership to verify"
                     );
                     continue;
                 }
-                Err(e) => {
-                    // Registered in the bridge but matching NO supported type.
-                    // That is the faucet-registry tripwire, not a monitor hiccup.
-                    Self::count_ownership_unchecked(entry.faucet_id, "unknown_type");
+                crate::faucet_ownership_monitor::ClassificationVerdict::Undecodable(why) => {
+                    Self::count_ownership_unchecked(entry.faucet_id, "undecodable");
                     tracing::error!(
                         target: "bridge_out::ownership",
                         faucet_id = %entry.faucet_id,
-                        error = ?e,
-                        "Cantina #4: registered faucet matches NO supported type — \
-                         ownership cannot be verified"
+                        origin_network = entry.origin_network,
+                        observed_kind = ?observed_kind,
+                        reason = why,
+                        "Cantina #4: the ownership monitor is BLIND for a faucet the bridge \
+                         is supposed to own"
                     );
                     continue;
                 }

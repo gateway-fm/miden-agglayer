@@ -270,13 +270,14 @@ pub fn init_metrics() {
         "bridge_faucet_ownership_unchecked_total",
         "A registered faucet that the Cantina #4 ownership monitor could NOT \
          verify this pass, by reason. reason=native_faucet is expected and \
-         benign (operator-owned, no bridge ownership to check). \
+         benign (registered Miden-originated, so the bridge never owns it). \
          reason=unsynced is transient. reason=fetch_failed warrants \
-         investigation if sustained. reason=undecodable means an AggLayer \
-         faucet's owner slot would not decode — the monitor is BLIND for it \
-         (suspect an upstream storage-layout/code-commitment change); \
-         reason=unknown_type means a registered faucet matches no supported \
-         type. Alert on a sustained non-zero undecodable or unknown_type."
+         investigation if sustained. reason=undecodable means the monitor is \
+         BLIND for a faucet the bridge is supposed to own: the faucet is \
+         registered foreign-origin (origin_network != ours) but either matches \
+         no supported type, or degrades to the plain fungible view because its \
+         AggLayer code commitment / storage layout drifted. ALERT on any \
+         sustained non-zero undecodable."
     );
     describe_counter!(
         "bridge_forged_mint_total",

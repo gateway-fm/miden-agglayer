@@ -163,15 +163,20 @@ pass. The reasons, and what to do about them:
 
 | `reason` | Meaning | Action |
 |---|---|---|
-| `native_faucet` | Operator-owned native faucet. It has no `Ownable2Step` slots because the bridge does not own it. | None — expected, and normally the bulk of the count. |
+| `native_faucet` | Registered Miden-originated (`origin_network` == this deployment's). Operator-owned, so the bridge never owns it. | None — expected, and normally the bulk of the count. |
 | `unsynced` | The client has not synced this faucet account yet. | None if transient; investigate if it persists across passes. |
 | `fetch_failed` | Account fetch errored. | Investigate if sustained. |
-| `undecodable` | An **AggLayer-owned** faucet whose owner slot would not decode. The monitor is blind for a faucet it is responsible for — typically an upstream storage-layout or code-commitment change. | **Alert.** |
-| `unknown_type` | A registered faucet matching no supported faucet type. | **Alert** — faucet-registry tripwire. |
+| `undecodable` | The monitor is blind for a faucet the bridge is supposed to own: registered foreign-origin, but it either matches no supported type or **degrades to the plain fungible view** because its AggLayer code commitment / storage layout drifted. | **Alert.** |
 
-The useful alert is therefore "`drift_total` increased" **or** "`undecodable` /
-`unknown_type` sustained non-zero", plus a staleness check that
-`checked_total` is still advancing at all.
+The useful alert is therefore "`drift_total` increased" **or** "`undecodable`
+sustained non-zero", plus a staleness check that `checked_total` is still
+advancing at all.
+
+The kind is taken from **registration metadata** (`origin_network` vs this
+deployment's network id), never from the account decoder. The decoder falls back
+to a plain-fungible view when the AggLayer decode fails, so trusting it would let
+a drifted bridge-owned faucet be silently reclassified as a benign native one —
+the blindness this monitor exists to prevent.
 
 ## Bridge integrity: page on increase
 
@@ -183,7 +188,7 @@ These counters represent fail-close integrity detections, not routine traffic:
 - `bridge_twin_note_detected_total`;
 - `bridge_mint_target_mismatch_total`;
 - `bridge_faucet_ownership_drift_total`;
-- `bridge_faucet_ownership_unchecked_total{reason=undecodable|unknown_type}`;
+- `bridge_faucet_ownership_unchecked_total{reason=undecodable}`;
 - `bridge_forged_mint_total`;
 - `bridge_unknown_wrapper_consumed_total`;
 - `bridge_out_self_targeted_total`;
