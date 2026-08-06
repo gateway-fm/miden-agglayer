@@ -89,9 +89,6 @@ reqwest = { version = "0.12", default-features = false, features = [
 http = { version = "1.3" }
 lru = { default-features = false, version = "0.16" }
 parking_lot = { version = "0.12" }
-# ECDSA account keys (feat/016-ecdsa-accounts): secp256k1 key GENERATION needs
-# a CryptoRng; the miden-client ClientRng is a deterministic Felt coin and does
-# not implement it, so keys come from the OS CSPRNG via rand::rng(). Version
 # Direct dep so we can surgically clear stale `locked` flags in miden-client's
 # sqlite when a full --reset-miden-store would be overkill. Version matches
 # what miden-client-sqlite-store pulls in transitively.

@@ -42,9 +42,14 @@ impl From<Accounts> for AccountsConfig {
 // pub so external operator tooling (bridge-out app's --create-native-faucet) can
 // create a NON-service, operator-owned faucet with the same auth scheme as the proxy.
 //
-// feat/016-ecdsa-accounts: all deployed accounts authenticate with
-// EcdsaK256Keccak (secp256k1 + keccak) — Falcon512Poseidon2 support is
-// removed from the proxy (no backward compatibility; fresh deployments only).
+// feat/016-ecdsa-accounts: NEWLY PROVISIONED operator signer accounts (service,
+// GER manager, standalone/foreign wallets, operator-native faucets) authenticate
+// with EcdsaK256Keccak (secp256k1 + keccak) instead of Falcon512Poseidon2.
+// This changes the DEFAULT for new accounts only. It does not rekey existing
+// Falcon accounts and does not remove Falcon support: the keystore and the
+// signing path still handle Falcon keys, so a deployment provisioned before this
+// change keeps working. Bridge and AggLayer-owned wrapped-faucet authorization
+// are outside this helper entirely.
 // Note the upstream caveat: ECDSA approvers disclose their public key and
 // signature at proving time, so there is no signer-key privacy — an accepted
 // trade-off for these operator-owned infrastructure accounts.
@@ -353,9 +358,11 @@ mod tests {
         );
     }
 
-    /// Two calls must not return the same key. Cheap, but it is the assertion
-    /// that fails loudly if the key source is ever swapped for the client's
-    /// deterministic Felt coin (which is NOT a CryptoRng).
+    /// Two calls must not return the same key — i.e. this detects KEY REUSE
+    /// across provisioned accounts. It is deliberately not a randomness-quality
+    /// test: a single inequality cannot demonstrate that an RNG is sound, only
+    /// that two draws differed. What it does catch is the concrete mistake of
+    /// binding every account to one shared key.
     #[test]
     fn create_auth_component_draws_fresh_key_material() {
         let (a, ka) = create_auth_component().expect("first");
@@ -363,7 +370,7 @@ mod tests {
         assert_ne!(
             ka.public_key().to_commitment(),
             kb.public_key().to_commitment(),
-            "two provisioned accounts must not share a key"
+            "two provisioned accounts must not share a key (blast-radius isolation)"
         );
         assert_ne!(a.approver().pub_key(), b.approver().pub_key());
     }
