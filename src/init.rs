@@ -357,6 +357,13 @@ mod tests {
     use super::*;
     use miden_protocol::account::auth::AuthScheme;
 
+    fn local_keystore() -> crate::proxy_keystore::ProxyKeystore {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        crate::proxy_keystore::ProxyKeystore::local(
+            miden_client::keystore::FilesystemKeyStore::new(dir).expect("filesystem keystore"),
+        )
+    }
+
     /// PR #160 review: this branch's ONLY security-sensitive behaviour is which
     /// signature scheme newly provisioned operator accounts are deployed with,
     /// and it had no direct regression test. A silent revert to Falcon — or an
@@ -367,9 +374,17 @@ mod tests {
     ///   * the secret key we persist is EcdsaK256Keccak;
     ///   * the auth component advertises EcdsaK256Keccak; and
     ///   * the component's approver commits to THAT key, not another.
-    #[test]
-    fn create_auth_component_pins_ecdsa_k256_keccak() {
-        let (component, key_pair) = create_auth_component().expect("auth component");
+    /// On this branch `create_auth_component` is signer-aware, so the test runs
+    /// it in LOCAL custody — the only mode that generates a key here at all. In
+    /// remote custody the approver comes from the signer and there is no local
+    /// secret to pin (that path is covered by `proxy_keystore`'s tests).
+    #[tokio::test]
+    async fn create_auth_component_pins_ecdsa_k256_keccak() {
+        let keystore = local_keystore();
+        let (component, key_pair) = create_auth_component(&keystore)
+            .await
+            .expect("auth component");
+        let key_pair = key_pair.expect("local custody must generate a local key");
 
         assert_eq!(
             key_pair.auth_scheme(),
@@ -395,10 +410,15 @@ mod tests {
     /// test: a single inequality cannot demonstrate that an RNG is sound, only
     /// that two draws differed. What it does catch is the concrete mistake of
     /// binding every account to one shared key.
-    #[test]
-    fn create_auth_component_draws_fresh_key_material() {
-        let (a, ka) = create_auth_component().expect("first");
-        let (b, kb) = create_auth_component().expect("second");
+    #[tokio::test]
+    async fn create_auth_component_draws_fresh_key_material() {
+        let keystore = local_keystore();
+        let (a, ka) = create_auth_component(&keystore).await.expect("first");
+        let (b, kb) = create_auth_component(&keystore).await.expect("second");
+        let (ka, kb) = (
+            ka.expect("local custody generates a key"),
+            kb.expect("local custody generates a key"),
+        );
         assert_ne!(
             ka.public_key().to_commitment(),
             kb.public_key().to_commitment(),

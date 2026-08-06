@@ -420,7 +420,7 @@ mod tests {
     /// identifier at signing time.
     #[test]
     fn accepts_every_sec1_encoding_a_signer_may_publish() {
-        let secret = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+        let secret = AuthSecretKey::new_ecdsa_k256_keccak();
         let AuthSecretKey::EcdsaK256Keccak(inner) = &secret else {
             panic!("requested an ecdsa key");
         };

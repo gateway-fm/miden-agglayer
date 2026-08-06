@@ -241,7 +241,7 @@ mod tests {
     }
 
     fn some_commitment() -> PublicKeyCommitment {
-        AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng())
+        AuthSecretKey::new_ecdsa_k256_keccak()
             .public_key()
             .to_commitment()
     }
@@ -287,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn remote_mode_refuses_to_store_secrets() {
         let keystore = unreachable_remote();
-        let key = AuthSecretKey::new_ecdsa_k256_keccak_with_rng(&mut rand::rng());
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
         let account = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
 
         assert!(keystore.is_remote(), "remote mode must report as remote");
