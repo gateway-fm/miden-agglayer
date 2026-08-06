@@ -260,6 +260,26 @@ pub fn init_metrics() {
          Page critical."
     );
     describe_counter!(
+        "bridge_faucet_ownership_checked_total",
+        "AggLayer-owned faucets whose owner slot was successfully read and \
+         compared against the configured bridge (Cantina #4). Pair this with \
+         bridge_faucet_ownership_unchecked_total: a drift_total of 0 only means \
+         'no takeover' if checked_total is actually advancing."
+    );
+    describe_counter!(
+        "bridge_faucet_ownership_unchecked_total",
+        "A registered faucet that the Cantina #4 ownership monitor could NOT \
+         verify this pass, by reason. reason=native_faucet is expected and \
+         benign (registered Miden-originated, so the bridge never owns it). \
+         reason=unsynced is transient. reason=fetch_failed warrants \
+         investigation if sustained. reason=undecodable means the monitor is \
+         BLIND for a faucet the bridge is supposed to own: the faucet is \
+         registered foreign-origin (origin_network != ours) but either matches \
+         no supported type, or degrades to the plain fungible view because its \
+         AggLayer code commitment / storage layout drifted. ALERT on any \
+         sustained non-zero undecodable."
+    );
+    describe_counter!(
         "bridge_forged_mint_total",
         "MINT note observed consumed that does NOT reconcile to an \
          aggkit-recorded claim (Cantina #4). Forged via NoAuth bridge note \

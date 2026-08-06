@@ -988,6 +988,9 @@ async fn restore_bridge_outs(
                         nullifier_block_height: BlockNumber::from(replay.block as u32),
                         consumer_account: Some(bridge_id),
                         consumed_tx_order: Some(replay.tx_order),
+                        // 0.16: metadata is retained through consumption when known;
+                        // restore replays from bare details (none available).
+                        metadata: None,
                     });
                     let note = InputNoteRecord::new(
                         replay.body.details,
@@ -2794,6 +2797,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: consumer,
             consumed_tx_order: None,
+            metadata: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
     }
@@ -2810,7 +2814,6 @@ mod tests {
     #[test]
     fn restore_replay_is_complete_and_preserves_same_details_note_ids() {
         use miden_client::rpc::domain::transaction::TransactionRecord;
-        use miden_protocol::asset::FungibleAsset;
         use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{NoteHeader, Nullifier};
         use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
@@ -2844,7 +2847,6 @@ mod tests {
                 Word::new([Felt::new(1).unwrap(); 4]),
                 inputs,
                 vec![],
-                FungibleAsset::new(faucet_id, 0).unwrap(),
             ),
             output_notes: vec![],
             erased_output_notes: vec![],
@@ -3290,6 +3292,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: Some(consumer),
             consumed_tx_order: None,
+            metadata: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
     }
@@ -3495,6 +3498,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: Some(bridge),
             consumed_tx_order: None,
+            metadata: None,
         });
         let record = InputNoteRecord::new(details, attachments, None, state);
         let key = record.details_commitment().as_bytes();
@@ -3620,6 +3624,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: consumer,
             consumed_tx_order: None,
+            metadata: None,
         });
         InputNoteRecord::new(details, NoteAttachments::default(), None, state)
     }
@@ -3633,12 +3638,11 @@ mod tests {
     #[test]
     fn finding69_build_claim_replay_joins_by_nullifier_fallback() {
         use miden_client::rpc::domain::transaction::TransactionRecord;
-        use miden_protocol::asset::FungibleAsset;
         use miden_protocol::block::BlockNumber;
         use miden_protocol::note::Nullifier;
         use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
 
-        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        let (_faucet_id, bridge_id, _sender_id) = ma3_accounts();
         let details = claim_input_note(Some(bridge_id), 0x69).details().clone();
         let (metadata, attachments) = make_metadata(id(TEST_SENDER_MANAGER), Some(bridge_id));
         let note_id = miden_protocol::note::NoteId::new(details.commitment(), &metadata);
@@ -3658,7 +3662,6 @@ mod tests {
                 Word::new([Felt::new(1).unwrap(); 4]),
                 inputs,
                 vec![],
-                FungibleAsset::new(faucet_id, 0).unwrap(),
             ),
             output_notes: vec![],
             erased_output_notes: vec![],

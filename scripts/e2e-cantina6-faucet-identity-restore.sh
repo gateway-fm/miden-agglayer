@@ -48,7 +48,9 @@ source "$FIXTURES_DIR/.env"
 # Required by docker-compose.e2e.yml's build args (interpolated even for a
 # --no-deps one-shot run). Mirrors e2e-restore.sh.
 export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-https://github.com/0xMiden/node.git}"
-export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-v0.15.0}"
+# Node ref comes from the Makefile so a standalone run can never build a
+# 0.15 node against this 0.16 proxy (PR #159 review).
+export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-$(grep -m1 '^MIDEN_NODE_GIT_REF' "$(dirname "${BASH_SOURCE[0]}")/../Makefile" | sed 's/.*= *//')}"
 
 L1_RPC="http://localhost:8545"
 L2_RPC="http://localhost:8546"

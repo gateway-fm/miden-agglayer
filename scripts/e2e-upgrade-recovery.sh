@@ -24,6 +24,27 @@
 # and `miden-agglayer-e2e:latest` (the branch build). Needs 8546/9545/18080 free.
 # ══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
+
+# ─── PROTOCOL 0.16: THIS PATH IS NOT SUPPORTED ────────────────────────────────
+# This script swaps ONLY the proxy image over a store and chain created by the
+# v0.15.9 release. That is a valid rehearsal while the account/genesis format is
+# unchanged; protocol 0.16 changes it. A 0.15-created store and node state are
+# not readable by a 0.16 proxy, so an in-place swap here does not model any
+# upgrade an operator can actually perform — it would either fail confusingly or,
+# worse, appear to pass against state it never really migrated (PR #159 review).
+#
+# 0.16 is a FRESH DEPLOYMENT. Until a coordinated chain migration is actually
+# built and tested, this script must not run on this branch by default.
+if [ "${ALLOW_CROSS_PROTOCOL_UPGRADE_TEST:-0}" != 1 ]; then
+    echo "REFUSING: in-place 0.15.9 -> branch upgrade is not a supported path on protocol 0.16." >&2
+    echo "  0.16 changes the account/genesis format, so a 0.15-created store cannot be" >&2
+    echo "  carried across. Deploy 0.16 fresh instead." >&2
+    echo "  Set ALLOW_CROSS_PROTOCOL_UPGRADE_TEST=1 only if you are deliberately" >&2
+    echo "  developing the migration itself and understand the result is not a pass." >&2
+    exit 2
+fi
+# ──────────────────────────────────────────────────────────────────────────────
+
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 WT="$PWD"
 PROJECT="${COMPOSE_PROJECT_NAME:-gate55}"

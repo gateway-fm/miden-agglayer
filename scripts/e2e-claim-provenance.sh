@@ -69,7 +69,10 @@ PG_DB="${PG_DB:-agglayer_store}"
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
 # The foreign deployment's AggLayer network id. MUST differ from our stack's
 # (NETWORK_ID, default 1): our aggkit then never auto-claims the deposit, so
-# the foreign claim is the only claimant of its global index.
+# the foreign claim is the only claimant of its global index. 0.16.0-alpha.5:
+# the network id is a per-bridge storage slot set at account creation (the
+# 0.15.3 model; alpha.4 briefly hardcoded it in MASM), so the foreign bridge
+# accepts leaves targeting ITS OWN id — the fabricated leaf targets this id.
 FOREIGN_NETWORK_ID="${FOREIGN_NETWORK_ID:-2}"
 DEPOSIT_AMOUNT="10000000000000" # 10^13 wei → 1000 Miden units at scale 10^10
 # How long we give the proxy's reconciler+projector to observe the consumed

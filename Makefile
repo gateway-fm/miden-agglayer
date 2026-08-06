@@ -182,25 +182,23 @@ install-tools: ## Install development tools
 # from miden-agglayer's account builders, so the e2e image is fully
 # reproducible.
 #
-# Protocol 0.15.x: the node repo was renamed `0xMiden/miden-node` ->
-# `0xMiden/node` (package name stays `miden-node`, so `--bin miden-node` and
-# the `bundled bootstrap/start` CLI are unchanged, and the genesis sample
-# `02-with-account-files.toml` is at the same path). We pin to the exact rev
-# the miden-client 0.15 branch (PR #2224) was built against, so the node's
-# transitive miden-protocol 0.15.2 / miden-assembly 0.23.x match our
-# Cargo.toml pins and the BURN/MINT/CLAIM MAST roots agree on both sides.
-# When a stable v0.15.x miden-node tag ships, pin to the tag instead.
+# Protocol 0.16: the node repo is `0xMiden/node` (package name stays
+# `miden-node`, so `--bin miden-node` and the `bundled bootstrap/start` CLI are
+# unchanged, and the genesis sample `02-with-account-files.toml` is at the same
+# path). We pin to the alpha tag whose transitive miden-protocol/assembly
+# versions match our Cargo.toml pins, so the BURN/MINT/CLAIM/B2AGG MAST roots
+# agree across the node/client boundary. When a stable v0.16.x tag ships, pin
+# to that instead.
 #
 # Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
 # docker-compose so the Dockerfile picks it up at build time.
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
-# v0.15.0 (final tag). Builds against miden-protocol/standards/tx 0.15.3 — the
-# same base crates as our service — so BURN/MINT/CLAIM/B2AGG MAST roots agree
-# across the node/client boundary with no Cargo.lock-alignment hack. The
-# node-store callback-vault-key bug is fixed upstream at this tag (the buggy
-# select_vault_balances_by_faucet_ids is gone), so fixtures/patches/0001 is no
-# longer applied. Network id is now a runtime storage slot, so no vendor patch.
-MIDEN_NODE_GIT_REF := v0.15.0
+# v0.16.0-alpha.2. Builds against the miden-protocol/standards/tx 0.16 alphas
+# our service pins, so BURN/MINT/CLAIM/B2AGG MAST roots agree across the
+# node/client boundary with no Cargo.lock-alignment hack. fixtures/patches/0001
+# is not applied (the node-store callback-vault-key bug is fixed upstream), and
+# the AggLayer network id is a runtime storage slot again, so no vendor patch.
+MIDEN_NODE_GIT_REF := v0.16.0-alpha.2
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
@@ -219,7 +217,7 @@ e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
 
 .PHONY: e2e-clean-data
 e2e-clean-data: ## Wipe .miden-agglayer-data/ + .b2agg-store/ + node_data volume so the stack re-inits against fresh genesis
-	# Proto 0.15: the node is a microservice stack whose state (genesis block,
+	# Proto 0.16: the node is a microservice stack whose state (genesis block,
 	# store, validator + ntx-builder DBs) lives in the `node_data` Docker volume,
 	# and the proxy's genesis pin lives in .miden-agglayer-data/store.sqlite3.
 	# Mounting stale node state under a fresh proxy (or vice-versa) makes the

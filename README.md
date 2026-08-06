@@ -48,7 +48,7 @@ Operational deployment, recovery, and alert guidance lives in
 
 ## Prerequisites
 
-- Rust 1.93 or newer (the release container currently builds with Rust nightly)
+- Rust 1.96 or newer (matches `rust-version` in Cargo.toml; the release container currently builds with Rust nightly)
 - Docker with Compose for the integration stack
 - Foundry (`cast`) for integration scripts
 - `jq`, Python 3, and Bash for the scripts

@@ -148,6 +148,35 @@ aggoracle or GER-indexing lag, not writer saturation.
 | `bridge_mint_target_mismatch_total` | MINT note **in our deployment's flow** whose intended faucet is unregistered or differs from the faucet that consumed it. This covers both misregistration and the Cantina #2 cross-faucet exploit. Positively foreign deployments' MINTs are excluded. | #2 |
 | `bridge_forged_mint_total{reason}` | MINT note **in our deployment's flow** that does not reconcile to an aggkit-recorded claim. `reason=no_claim`: its serial matches no recorded claim's PROOF_DATA_KEY (after a short grace window). `reason=identity_undetermined`: a claim exists but its expected identity remains unavailable after the grace window. `reason=detail_mismatch`: its canonical recipient, amount, asset, callback flag, or routing attachment differs from the claim-derived expectation and fires immediately. Native claims create no authorization. | #4 |
 | `bridge_monitor_registry_unavailable_total` | The faucet registry was unreadable. Provenance fails closed: no note is classified foreign and no claim writes legitimacy without positive local evidence. | #2/#4 |
+| `bridge_faucet_ownership_checked_total` / `bridge_faucet_ownership_unchecked_total{reason}` | Coverage for the faucet-ownership monitor. See "Reading the ownership monitor" below — `drift_total == 0` is only meaningful alongside these. | #4 |
+
+### Reading the ownership monitor
+
+`bridge_faucet_ownership_drift_total` is a *detection* counter, so zero is
+ambiguous on its own: a monitor that cannot read any faucet's owner reports the
+same zero as one that checked every faucet and found them all healthy. The
+coverage counters disambiguate it.
+
+Every registered faucet lands in exactly one bucket per pass, so
+`checked_total + unchecked_total` advances by the registered faucet count each
+pass. The reasons, and what to do about them:
+
+| `reason` | Meaning | Action |
+|---|---|---|
+| `native_faucet` | Registered Miden-originated (`origin_network` == this deployment's). Operator-owned, so the bridge never owns it. | None — expected, and normally the bulk of the count. |
+| `unsynced` | The client has not synced this faucet account yet. | None if transient; investigate if it persists across passes. |
+| `fetch_failed` | Account fetch errored. | Investigate if sustained. |
+| `undecodable` | The monitor is blind for a faucet the bridge is supposed to own: registered foreign-origin, but it either matches no supported type or **degrades to the plain fungible view** because its AggLayer code commitment / storage layout drifted. | **Alert.** |
+
+The useful alert is therefore "`drift_total` increased" **or** "`undecodable`
+sustained non-zero", plus a staleness check that `checked_total` is still
+advancing at all.
+
+The kind is taken from **registration metadata** (`origin_network` vs this
+deployment's network id), never from the account decoder. The decoder falls back
+to a plain-fungible view when the AggLayer decode fails, so trusting it would let
+a drifted bridge-owned faucet be silently reclassified as a benign native one —
+the blindness this monitor exists to prevent.
 
 ## Bridge integrity: page on increase
 
@@ -159,6 +188,7 @@ These counters represent fail-close integrity detections, not routine traffic:
 - `bridge_twin_note_detected_total`;
 - `bridge_mint_target_mismatch_total`;
 - `bridge_faucet_ownership_drift_total`;
+- `bridge_faucet_ownership_unchecked_total{reason=undecodable}`;
 - `bridge_forged_mint_total`;
 - `bridge_unknown_wrapper_consumed_total`;
 - `bridge_out_self_targeted_total`;

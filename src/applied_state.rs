@@ -11,7 +11,7 @@ use crate::store::Store;
 use alloy::primitives::U256;
 use anyhow::Context;
 use miden_base_agglayer::{AggLayerBridge, ExitRoot};
-use miden_protocol::account::AccountId;
+use miden_protocol::account::{AccountId, StorageMapKey};
 use miden_protocol::crypto::hash::poseidon2::Poseidon2;
 use miden_protocol::note::NoteId;
 use miden_protocol::{Felt, Word};
@@ -83,7 +83,10 @@ fn claim_is_set(
     ];
     let nullifier = Poseidon2::hash_elements(&nullifier_elements);
     let value = storage
-        .get_map_item(AggLayerBridge::claim_nullifiers_slot_name(), nullifier)
+        .get_map_item(
+            AggLayerBridge::claim_nullifiers_slot_name(),
+            StorageMapKey::new(nullifier),
+        )
         .context("reading bridge claim-nullifier map")?;
     Ok(value == Word::from([1u32, 0, 0, 0]))
 }

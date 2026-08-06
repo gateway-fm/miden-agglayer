@@ -561,7 +561,7 @@ struct ObservedMintIdentity {
     faucet: AccountId,
     amount: u64,
     destination: AccountId,
-    callbacks: miden_protocol::asset::AssetCallbackFlag,
+    callbacks: miden_protocol::account::AssetCallbackFlag,
 }
 
 const MONITOR_CACHE_CAPACITY: usize = 100_000;
@@ -629,7 +629,7 @@ fn observed_mint_identity(note: &InputNoteRecord) -> Option<ObservedMintIdentity
 
     let key = Word::from(<[Felt; 4]>::try_from(&items[8..12]).ok()?);
     let value = Word::from(<[Felt; 4]>::try_from(&items[12..16]).ok()?);
-    let asset = FungibleAsset::from_key_value_words(key, value).ok()?;
+    let asset = FungibleAsset::from_id_and_value_words(key, value).ok()?;
     let destination = P2idNoteStorage::try_from(&items[20..22]).ok()?.target();
     if items[16] != Felt::from(NoteTag::with_account_target(destination))
         || items[17..20].iter().any(|felt| *felt != Felt::ZERO)
@@ -1134,15 +1134,26 @@ impl BridgeOutScanner {
             {
                 let b2agg_root_bytes = B2AggNote::script_root().as_bytes();
                 let claim_root_bytes = miden_base_agglayer::ClaimNote::script().root().as_bytes();
+                // 0.16: the bridge also consumes canonical ADMIN notes —
+                // register-faucet CONFIG (public since 0.16, which is why the
+                // pre-0.16 two-root allowlist started false-alerting on init),
+                // UPDATE_GER, and the new REMOVE_GER / DEREGISTER_AGG_FAUCET.
+                let admin_roots: [[u8; 32]; 4] = [
+                    miden_base_agglayer::ConfigAggBridgeNote::script_root().as_bytes(),
+                    miden_base_agglayer::UpdateGerNote::script_root().as_bytes(),
+                    miden_base_agglayer::RemoveGerNote::script_root().as_bytes(),
+                    miden_base_agglayer::DeregisterAggFaucetNote::script_root().as_bytes(),
+                ];
                 let observed_bytes = note.details().script().root().as_bytes();
                 use crate::unknown_wrapper_detector::{
-                    BridgeConsumerScript, classify_bridge_consumer_script,
+                    BridgeConsumerScript, classify_bridge_consumer_script_with_admin,
                 };
                 if matches!(
-                    classify_bridge_consumer_script(
+                    classify_bridge_consumer_script_with_admin(
                         observed_bytes,
                         b2agg_root_bytes,
                         claim_root_bytes,
+                        &admin_roots,
                     ),
                     BridgeConsumerScript::Unknown
                 ) {
@@ -1358,7 +1369,7 @@ impl BridgeOutScanner {
                 observed: observed.amount.to_string(),
             };
         }
-        if observed.callbacks != miden_protocol::asset::AssetCallbackFlag::Enabled {
+        if observed.callbacks != miden_protocol::account::AssetCallbackFlag::Enabled {
             return MintIdentityCheck::Mismatch {
                 field: "asset_callbacks",
                 expected: "Enabled".to_string(),
@@ -1587,42 +1598,133 @@ impl SyncListener for BridgeOutScanner {
 }
 
 impl BridgeOutScanner {
-    /// Cantina #4 ownership monitor. Iterates the registered faucet list,
-    /// FPI-fetches each one's `owner` storage slot, compares against the
-    /// configured bridge account id.
+    /// Record that one registered faucet went unverified this pass, and why.
+    ///
+    /// Split out so every `continue` in the monitor has to name its reason —
+    /// an unaccounted early return is what made the old version silently blind.
+    fn count_ownership_unchecked(faucet_id: AccountId, reason: &'static str) {
+        metrics::counter!(
+            "bridge_faucet_ownership_unchecked_total",
+            "reason" => reason
+        )
+        .increment(1);
+        let _ = faucet_id;
+    }
+
+    /// Cantina #4 ownership monitor. Iterates the registered faucet list, reads
+    /// each AggLayer-owned faucet's `owner` storage slot from the synced account
+    /// state, and compares it against the configured bridge account id.
+    ///
+    /// # Why every skip is counted
+    ///
+    /// This is a detection control, so the failure that matters most is not a
+    /// false alarm but a *silent* one: if the monitor cannot read a faucet's
+    /// owner, it emits exactly the same "no drift" as a healthy pass, and a
+    /// dashboard showing `drift_total == 0` looks identical whether the bridge
+    /// is safe or the monitor has been blind for a week.
+    ///
+    /// Two skips are legitimate and one is not, and the old code could not tell
+    /// them apart because it tried the AggLayer decode on everything:
+    ///
+    /// * a NATIVE operator faucet has no `Ownable2Step` slots at all, so the
+    ///   decode fails *by design* — there is no bridge ownership to verify;
+    /// * a faucet the client has not synced yet simply is not readable *yet*;
+    /// * an AggLayer-owned faucet whose owner will not decode is a genuine
+    ///   problem — an upstream storage-layout or code-commitment change — and
+    ///   used to be swallowed by the same `warn` the native faucets produced on
+    ///   every single pass.
+    ///
+    /// So we classify first and account for every faucet: either it was checked
+    /// or it is counted in `bridge_faucet_ownership_unchecked_total` with the
+    /// reason. Coverage becomes assertable — `checked + unchecked` must equal
+    /// the registered faucet count.
     async fn run_faucet_ownership_check(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
         let faucets = self.store.list_faucets().await?;
         for entry in faucets {
             let acct = match client.get_account(entry.faucet_id).await {
                 Ok(Some(acct)) => acct,
-                Ok(None) => continue, // not yet synced
+                Ok(None) => {
+                    // Not yet synced — readable later, but until then this
+                    // faucet is genuinely unverified and must say so.
+                    Self::count_ownership_unchecked(entry.faucet_id, "unsynced");
+                    continue;
+                }
                 Err(e) => {
+                    Self::count_ownership_unchecked(entry.faucet_id, "fetch_failed");
                     tracing::warn!(
                         target: "bridge_out::ownership",
                         faucet_id = %entry.faucet_id,
                         error = ?e,
-                        "Cantina #4: faucet account fetch failed"
+                        "Cantina #4: faucet account fetch failed — ownership NOT verified this pass"
                     );
                     continue;
                 }
             };
+
+            // Decide what we OWE this faucet from authoritative registration
+            // metadata FIRST, then hold the decoder to it. Trusting the
+            // classifier alone lets a degraded AggLayer decode fall through to
+            // the benign native bucket (PR #159 review) — the same blindness in
+            // a new costume.
+            let duty = crate::faucet_ownership_monitor::ownership_duty(
+                entry.origin_network,
+                self.local_network_id,
+            );
+            let observed_kind = crate::faucet_ops::classify_faucet_account(&acct)
+                .ok()
+                .map(|(kind, _)| kind);
+            match crate::faucet_ownership_monitor::reconcile_classification(duty, observed_kind) {
+                crate::faucet_ownership_monitor::ClassificationVerdict::Verify => {}
+                crate::faucet_ownership_monitor::ClassificationVerdict::SkipNative => {
+                    // Miden-originated, operator-owned: the bridge never owns
+                    // it, so there is no ownership invariant to check.
+                    Self::count_ownership_unchecked(entry.faucet_id, "native_faucet");
+                    tracing::debug!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        "Cantina #4: registered-native faucet — no bridge ownership to verify"
+                    );
+                    continue;
+                }
+                crate::faucet_ownership_monitor::ClassificationVerdict::Undecodable(why) => {
+                    Self::count_ownership_unchecked(entry.faucet_id, "undecodable");
+                    tracing::error!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        origin_network = entry.origin_network,
+                        observed_kind = ?observed_kind,
+                        reason = why,
+                        "Cantina #4: the ownership monitor is BLIND for a faucet the bridge \
+                         is supposed to own"
+                    );
+                    continue;
+                }
+            }
+
             // The Ownable2Step component stores the owner AccountId at a
-            // known slot. Upstream exposes `owner_account_id` returning
+            // named slot. Upstream exposes `owner_account_id` returning
             // `Err(OwnershipRenounced)` for the renounced case.
             let observed: Option<AccountId> =
                 match miden_base_agglayer::AggLayerFaucet::owner_account_id(&acct) {
                     Ok(id) => Some(id),
                     Err(miden_base_agglayer::AgglayerFaucetError::OwnershipRenounced) => None,
                     Err(e) => {
-                        tracing::warn!(
+                        // Classification already proved this IS an AggLayer
+                        // faucet, so a decode failure here means the monitor
+                        // cannot see a faucet it is responsible for. Loud.
+                        Self::count_ownership_unchecked(entry.faucet_id, "undecodable");
+                        tracing::error!(
                             target: "bridge_out::ownership",
                             faucet_id = %entry.faucet_id,
                             error = ?e,
-                            "Cantina #4: failed to decode faucet owner — skipping"
+                            "Cantina #4: AggLayer faucet owner failed to decode — the ownership \
+                             monitor is BLIND for this faucet (upstream storage layout or code \
+                             commitment change?)"
                         );
                         continue;
                     }
                 };
+            metrics::counter!("bridge_faucet_ownership_checked_total").increment(1);
             match crate::faucet_ownership_monitor::check_faucet_owner(
                 self.bridge_account_id,
                 observed,
@@ -2122,7 +2224,7 @@ mod tests {
     fn ma3_classify_b2agg_consumer_branches() {
         // Two distinct AccountIds (last hex char differs).
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+        let user_id = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
         assert_ne!(bridge_id, user_id, "test ids must be distinct");
 
         // 1. Bridge-consumed → Emit (real bridge-out).
@@ -2171,7 +2273,7 @@ mod tests {
     fn prov_ids() -> ProvIds {
         ProvIds {
             bridge: AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap(),
-            faucet_a: AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap(),
+            faucet_a: AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap(),
             faucet_b: AccountId::from_hex("0xaa0000000000bb110000cc000000fd").unwrap(),
             unregistered: AccountId::from_hex("0xab0000000000cd110000cd000000ef").unwrap(),
             foreign_bridge: AccountId::from_hex("0xba0000000000ab110000ab000000ba").unwrap(),
@@ -2567,13 +2669,11 @@ mod tests {
                 let consumer =
                     consumer.expect("sender-carrying test notes need a consumer account");
                 // Dummy consuming tx id — the scanner never reads it.
-                let faucet_typed = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
                 let tx_id = miden_protocol::transaction::TransactionId::new(
                     miden_protocol::Word::default(),
                     miden_protocol::Word::default(),
                     miden_protocol::Word::default(),
                     miden_protocol::Word::default(),
-                    miden_protocol::asset::FungibleAsset::new(faucet_typed, 1).unwrap(),
                 );
                 InputNoteState::ConsumedUnauthenticatedLocal(
                     ConsumedUnauthenticatedLocalNoteState {
@@ -2595,6 +2695,7 @@ mod tests {
                 nullifier_block_height: BlockNumber::from(0u32),
                 consumer_account: consumer,
                 consumed_tx_order: None,
+                metadata: None,
             }),
         };
         InputNoteRecord::new(details, attachments, None, state)
@@ -2620,11 +2721,30 @@ mod tests {
             faucet,
             amount,
             destination,
-            miden_protocol::asset::AssetCallbackFlag::Enabled,
+            miden_protocol::account::AssetCallbackFlag::Enabled,
             sender,
             attachment_target,
             consumer,
         )
+    }
+
+    /// 0.16: the asset-callback flag is bit 5 of the id prefix's low byte, so a
+    /// "Disabled-callbacks asset" requires a faucet id with that bit clear.
+    /// Enabled requests leave the id untouched (callers rely on exact id
+    /// equality between note storage and their fixture ids); Disabled clears
+    /// the bit, yielding the same faucet id modulo the flag.
+    fn faucet_with_callback_flag(
+        faucet: AccountId,
+        flag: miden_protocol::account::AssetCallbackFlag,
+    ) -> AccountId {
+        if flag == miden_protocol::account::AssetCallbackFlag::Enabled {
+            return faucet;
+        }
+        let hex = faucet.to_hex();
+        let mut bytes = hex::decode(&hex[2..]).expect("valid account id hex");
+        bytes[7] &= !0x20;
+        AccountId::from_hex(&format!("0x{}", hex::encode(bytes)))
+            .expect("callback-flag toggle keeps the id valid")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2633,7 +2753,7 @@ mod tests {
         faucet: AccountId,
         amount: u64,
         destination: AccountId,
-        callbacks: miden_protocol::asset::AssetCallbackFlag,
+        callbacks: miden_protocol::account::AssetCallbackFlag,
         sender: Option<AccountId>,
         attachment_target: Option<AccountId>,
         consumer: Option<AccountId>,
@@ -2642,15 +2762,18 @@ mod tests {
         use miden_protocol::note::{NoteStorage, NoteTag};
         use miden_standards::note::{MintNoteStorage, P2idNoteStorage};
 
-        let asset = FungibleAsset::new(faucet, amount)
-            .unwrap()
-            .with_callbacks(callbacks);
+        // 0.16: the callback flag is bit 5 of the faucet id prefix's low byte
+        // (AccountIdV1::ASSET_CALLBACK_FLAG_SHIFT), no longer a per-asset
+        // attribute. Derive a faucet id carrying the requested flag so the
+        // storage's asset-id word round-trips to the desired observed flag.
+        let faucet = faucet_with_callback_flag(faucet, callbacks);
+        let asset = FungibleAsset::new(faucet, amount).unwrap();
         let p2id_recipient = P2idNoteStorage::new(destination).into_recipient(serial);
         let storage = NoteStorage::from(
-            MintNoteStorage::new_public(
+            MintNoteStorage::new_fungible_public(
                 p2id_recipient,
                 asset,
-                miden_protocol::Felt::from(NoteTag::with_account_target(destination)),
+                NoteTag::with_account_target(destination),
             )
             .unwrap(),
         );
@@ -2808,7 +2931,7 @@ mod tests {
                 faucet: ids.faucet_a,
                 amount: 5_000,
                 destination: ids.local_service,
-                callbacks: miden_protocol::asset::AssetCallbackFlag::Enabled,
+                callbacks: miden_protocol::account::AssetCallbackFlag::Enabled,
             })
         );
         assert!(
@@ -2898,7 +3021,7 @@ mod tests {
             ids.faucet_a,
             5_000,
             ids.local_service,
-            miden_protocol::asset::AssetCallbackFlag::Disabled,
+            miden_protocol::account::AssetCallbackFlag::Disabled,
             None,
             Some(ids.faucet_a),
             None,
@@ -3477,6 +3600,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account,
             consumed_tx_order: None,
+            metadata: None,
         });
 
         miden_client::store::InputNoteRecord::new(
@@ -3525,6 +3649,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: Some(consumer),
             consumed_tx_order: None,
+            metadata: None,
         });
         miden_client::store::InputNoteRecord::new(
             details,
@@ -3594,7 +3719,7 @@ mod tests {
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let faucet_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+        let faucet_id = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
 
         // ERC-20 faucet (non-zero origin address) with EMPTY metadata — the legacy/DB-loss
         // state Layer 2 must guard.
@@ -3664,7 +3789,7 @@ mod tests {
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let faucet_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+        let faucet_id = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
 
         // Native ETH faucet: zero origin address, empty metadata (correct).
         store
@@ -3707,7 +3832,7 @@ mod tests {
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+        let user_id = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
 
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = test_b2agg_note_id(&note, bridge_id).to_hex();
@@ -3822,6 +3947,7 @@ mod tests {
             nullifier_block_height: BlockNumber::from(0u32),
             consumer_account: Some(consumer_account),
             consumed_tx_order: None,
+            metadata: None,
         });
 
         miden_client::store::InputNoteRecord::new(
@@ -3930,7 +4056,7 @@ mod tests {
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let user_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+        let user_id = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
 
         let note = build_b2agg_note_with_consumer(Some(user_id));
         let note_id_str = test_b2agg_note_id(&note, bridge_id).to_hex();
@@ -4069,7 +4195,7 @@ mod tests {
 
         let store: StdArc<dyn crate::store::Store> = StdArc::new(InMemoryStore::new());
         let bridge_id = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-        let faucet_id = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+        let faucet_id = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
 
         // Seed a distinctive, non-zero tip: any per-note advance would move it.
         const TIP: u64 = 4242;

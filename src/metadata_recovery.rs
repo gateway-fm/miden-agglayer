@@ -22,7 +22,9 @@
 //! [`AggLayerBridge::faucet_metadata_map_slot_name`]: miden_base_agglayer::AggLayerBridge
 
 use miden_base_agglayer::{AggLayerBridge, MetadataHash};
-use miden_protocol::account::{Account, AccountId, AccountStorage, StorageSlotContent};
+use miden_protocol::account::{
+    Account, AccountId, AccountStorage, StorageMapKey, StorageSlotContent,
+};
 use miden_protocol::{Felt, Word};
 
 /// Metric incremented whenever an ERC-20 bridge-out is gated because its
@@ -191,8 +193,12 @@ pub fn read_faucet_metadata_hash(
     let key_hi = Word::new([Felt::from(3u32), zero, suffix, prefix]);
 
     let storage = bridge_account.storage();
-    let lo = storage.get_map_item(slot, key_lo).ok()?;
-    let hi = storage.get_map_item(slot, key_hi).ok()?;
+    let lo = storage
+        .get_map_item(slot, StorageMapKey::new(key_lo))
+        .ok()?;
+    let hi = storage
+        .get_map_item(slot, StorageMapKey::new(key_hi))
+        .ok()?;
 
     let mut bytes = [0u8; 32];
     for (i, felt) in lo
@@ -263,8 +269,12 @@ pub fn read_faucet_conversion_metadata(
     let key_lo = Word::new([Felt::from(0u32), zero, suffix, prefix]);
     let key_hi = Word::new([Felt::from(1u32), zero, suffix, prefix]);
 
-    let lo = bridge_storage.get_map_item(slot, key_lo).ok()?;
-    let hi = bridge_storage.get_map_item(slot, key_hi).ok()?;
+    let lo = bridge_storage
+        .get_map_item(slot, StorageMapKey::new(key_lo))
+        .ok()?;
+    let hi = bridge_storage
+        .get_map_item(slot, StorageMapKey::new(key_hi))
+        .ok()?;
     let lo_elems = lo.as_elements();
     let hi_elems = hi.as_elements();
 

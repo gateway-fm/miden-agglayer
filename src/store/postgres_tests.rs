@@ -1093,7 +1093,7 @@ async fn test_pgstore_commit_b2agg_event_atomic_idempotent() {
         .unwrap();
 
     assert_eq!(dc1, dc2, "retry must reuse the same deposit_count");
-    assert!(store.get_deposit_count().await.unwrap() >= dc_before + 1);
+    assert!(store.get_deposit_count().await.unwrap() > dc_before);
 }
 
 /// Audit H1/H3 — PG-layer log-once idempotency. Calling

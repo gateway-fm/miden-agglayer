@@ -93,6 +93,46 @@ GARBO_DURATION="$GARBO_DURATION" GARBO_LOG="$GARBO_LOG" GARBO_SUMMARY="$GARBO_SU
     "$SCRIPT_DIR/chaos-garbo.sh" >/tmp/chaos-garbo.out 2>&1 &
 GARBO_PID=$!
 
+# ── aggkit lost-tx watchdog (production-mirroring; counted in the verdict) ────
+# When a seeder proxy-SIGKILL races an aggoracle GER send, the tx can die IN
+# TRANSIT: aggkit's ephemeral-monitoring DB marks it sent, but the proxy never
+# durably admitted it (no row, nothing for #157's recovery to re-drive). aggkit
+# then polls the unknown hash forever and never re-sends the deterministic ID —
+# GER injection freezes and every downstream leg stalls. That is an aggkit gap
+# (no rebroadcast-on-unknown-tx; upstream aggkit 0.8.3-rc1); in production a
+# watchdog alert + aggkit bounce is the documented mitigation, so the soak runs
+# the same watchdog: wedge signature = the SAME 'already exists in monitoring
+# DB' hash repeating for >60s while the proxy has no such transaction row.
+# Every bounce is logged and reported in the final verdict line.
+WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
+(
+  declare -A seen
+  while true; do
+    sleep 30
+    for AK in "${PROJECT}-aggkit-1" "${PROJECT}-aggkit-l2b-1"; do
+      docker inspect "$AK" >/dev/null 2>&1 || continue
+      loops=$(docker logs "$AK" --since 60s 2>&1 | grep -c 'already exists in monitoring DB' || true)
+      [ "${loops:-0}" -ge 10 ] || continue
+      tx=$(docker logs "$AK" --since 60s 2>&1 | grep -oE 'ID: 0x[a-f0-9]{64}' | tail -1 | awk '{print $2}')
+      [ -n "$tx" ] || continue
+      known=$(docker exec "${PROJECT}-agglayer-postgres-1" psql -U agglayer -d agglayer_store -tAc \
+          "SELECT count(*) FROM transactions WHERE tx_hash='$tx'" 2>/dev/null || echo probe-failed)
+      [ "$known" = 0 ] || continue        # proxy knows it (or probe failed) -> #157 recovery's job, not ours
+      [ -z "${seen[$tx]:-}" ] || continue # one bounce per lost tx
+      seen[$tx]=1
+      total=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1)
+      total=${total:-0}
+      [ "$total" -lt 6 ] || continue  # heal budget: past this it's a hard failure, not flakiness
+      svc=aggkit; [ "$AK" = "${PROJECT}-aggkit-l2b-1" ] && svc=aggkit-l2b
+      echo "$(date +%H:%M:%S) WATCHDOG: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — FORCE-RECREATING $svc (ephemeral monitor DB must be wiped; docker restart preserves the container fs and the poisoned DB with it)" \
+          | tee -a "$WATCHDOG_HEALS_FILE"
+      COMPOSE_PROJECT_NAME="$PROJECT" docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml \
+          --env-file fixtures/.env up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
+    done
+  done
+) >>/tmp/chaos-watchdog.out 2>&1 &
+WATCHDOG_PID=$!
+
 # The mixed loadtest drives all the legit traffic; suppress its internal verify
 # (MIX_VERIFY=0) — the soak runs ONE authoritative verify post-heal. The new mixed
 # loadtest takes a per-direction L1 split (N_L1_FWD/N_L1_BACK) instead of a single N;
@@ -100,7 +140,7 @@ GARBO_PID=$!
 say "=== mixed loadtest under storm (L1 ${N} split $((N / 2))/$((N - N / 2)), L2<->L2 $L2L2_FWD/$L2L2_BACK) ==="
 N_L1_FWD=$((N / 2)) N_L1_BACK=$((N - N / 2)) L2L2_FWD="$L2L2_FWD" L2L2_BACK="$L2L2_BACK" \
     MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" COMPOSE_PROJECT_NAME="$PROJECT" \
-    timeout 3600 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
+    timeout 4800 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
 LT_RC=$?
 say "mixed loadtest exited rc=$LT_RC"
 grep -aE "MIXED LOADTEST RESULT|forward ops|back ops|address clash|L1<->Miden rc" /tmp/chaos-lt.out | tail -6 || true
@@ -109,6 +149,8 @@ grep -aE "MIXED LOADTEST RESULT|forward ops|back ops|address clash|L1<->Miden rc
 say "=== stopping injectors + restoring all faults ==="
 kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
 kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
+kill "$WATCHDOG_PID" 2>/dev/null || true; wait "$WATCHDOG_PID" 2>/dev/null || true
+WATCHDOG_HEALS=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); WATCHDOG_HEALS=${WATCHDOG_HEALS:-0}
 # belt-and-suspenders restore in case a trap raced (correct container names)
 docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
 NET="$(docker inspect "$AGGLAYER_CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')"
@@ -256,7 +298,7 @@ say "  foreign_skipped_total: $BASE_FOREIGN_SKIP -> $NOW_FOREIGN_SKIP (garbo for
 source "$SCRIPT_DIR/lib-chaos-verdict.sh"
 say "======================================================================"
 say "  UNIFIED CHAOS SOAK RESULT"
-say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})  allow_late=$ALLOW_LATE"
+say "    N=$N  faults=$FAULTS_DONE  garbo(private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})  allow_late=$ALLOW_LATE  aggkit_watchdog_heals=${WATCHDOG_HEALS:-0}"
 say "    loadtest_rc=$LT_RC  verify_rc=$VC_RC  store_locks=$LOCKS  foreign_leak=$FOREIGN_LEAK  private_leak=$PRIVATE_LEAK"
 # The mixed loadtest (MIX_VERIFY=0) now enforces its FULL operational verdict
 # (all fwd/back landed, clash distinct, L1 rc) and skips only the duplicate

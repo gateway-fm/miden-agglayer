@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run-all.sh — provision the protocol-0.15 miden-agglayer e2e stack FROM SCRATCH,
+# run-all.sh — provision the protocol-0.16 miden-agglayer e2e stack FROM SCRATCH,
 # run the tests, and report EVERYTHING: L1 transactions + receipts, synthetic
 # BridgeEvents, Miden note IDs (GER / CLAIM / MINT / P2ID / B2AGG), Global Exit
 # Roots, AggLayer certificates + settlement txs, and balances on both sides.
@@ -39,7 +39,9 @@ REPORT="$OUT/RUN-ALL-REPORT.txt"
 
 # Pin coords (kept in sync with the Makefile / setup-fixtures expectations).
 export MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-export MIDEN_NODE_GIT_REF="v0.15.0"
+# Must track the Makefile pin: this branch is protocol 0.16 and a 0.15 node
+# produces an incompatible account/genesis format (PR #159 review).
+export MIDEN_NODE_GIT_REF="v0.16.0-alpha.2"
 export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
 [ -s "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" 2>/dev/null || true
 
@@ -112,11 +114,16 @@ provision() {
   [ -d "$WORK/miden-node-src" ] || git clone --depth 1 --branch "$MIDEN_NODE_GIT_REF" "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src"
   # Raise the ntx-builder remote-prover client timeout (10s default < ~12.5s
   # B2AGG proof on a normal VM) so L2->L1 consumption isn't cancelled.
+  # 0.15 shape: RemoteTransactionProver::new(url).with_timeout(..) appended.
+  # 0.16 shape: the ctor takes (url, timeout); lib.rs uses the
+  # DEFAULT_PROVER_TIMEOUT const and actor/mod.rs an inline from_secs(10).
   for f in bin/ntx-builder/src/lib.rs bin/ntx-builder/src/actor/mod.rs; do
     p="$WORK/miden-node-src/$f"
     grep -q "with_timeout(Duration::from_secs(180))" "$p" 2>/dev/null || \
       sed -i 's#RemoteTransactionProver::new(\(self\.\)\?\(tx_prover_url\|url\)\.as_str())#&\n                    .with_timeout(Duration::from_secs(180))#' "$p" 2>/dev/null || true
   done
+  sed -i 's/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(10);/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(180);/' "$WORK/miden-node-src/bin/ntx-builder/src/lib.rs" 2>/dev/null || true
+  sed -i 's/RemoteTransactionProver::new(url.clone(), Duration::from_secs(10))/RemoteTransactionProver::new(url.clone(), Duration::from_secs(180))/' "$WORK/miden-node-src/bin/ntx-builder/src/actor/mod.rs" 2>/dev/null || true
   [ -d "$WORK/zkevm-bridge-service" ] || git clone --depth 1 --branch fix/pending-bridges-rollup-disambiguation https://github.com/revitteth/zkevm-bridge-service.git "$WORK/zkevm-bridge-service"
   ok "repos present under $WORK"
 
