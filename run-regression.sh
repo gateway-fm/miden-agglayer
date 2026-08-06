@@ -9,12 +9,12 @@ set -uo pipefail
 # portable across checkouts instead of pinned to one contributor's path.
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Protocol 0.15.x: node repo renamed 0xMiden/miden-node -> 0xMiden/node. Pinned
-# to the v0.15.0 tag, which builds against base crates 0.15.3 (matching our
-# service) for MAST consistency. NOTE: the Makefile sets these with `:=` so its
-# values win; kept here in sync.
-export MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-export MIDEN_NODE_GIT_REF="v0.15.0"
+# Node ref is DERIVED from the Makefile rather than duplicated here. A hardcoded
+# copy went stale at v0.15.0 while the Makefile moved to 0.16, so a direct run of
+# this script built a 0.15 node against a 0.16 proxy (PR #159 review). The
+# Makefile is the single source of truth; override MIDEN_NODE_GIT_REF to pin.
+export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-$(grep -m1 '^MIDEN_NODE_GIT_URL' "$(dirname "${BASH_SOURCE[0]}")/Makefile" | sed 's/.*= *//')}"
+export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-$(grep -m1 '^MIDEN_NODE_GIT_REF' "$(dirname "${BASH_SOURCE[0]}")/Makefile" | sed 's/.*= *//')}"
 # Prefer locally-installed foundry/node/etc; keep the contributor dirs as
 # fallbacks if present.
 export PATH="/usr/local/bin:$HOME/.local/bin:$HOME/.foundry/bin:$PATH"
