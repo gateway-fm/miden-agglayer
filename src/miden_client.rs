@@ -610,7 +610,7 @@ impl MidenClient {
                 let local = FilesystemKeyStore::new(keystore_path)?;
                 return Ok(Arc::new(crate::proxy_keystore::ProxyKeystore::local(local)));
             }
-            crate::remote_signer::CustodyMode::RemoteSigner { base_url } => base_url.as_str(),
+            crate::remote_signer::CustodyMode::RemoteSigner { base_url, .. } => base_url.as_str(),
         };
         // A configured signer must be reachable AND usable before we accept
         // traffic: attaching it here (blocking the caller's runtime) makes a
@@ -625,8 +625,19 @@ impl MidenClient {
             ),
         )?;
         let keystore = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(crate::proxy_keystore::ProxyKeystore::remote(client))
+            tokio::runtime::Handle::current().block_on(
+                crate::proxy_keystore::ProxyKeystore::remote(
+                    client,
+                    match custody {
+                        crate::remote_signer::CustodyMode::RemoteSigner {
+                            key_bindings, ..
+                        } => key_bindings.clone(),
+                        crate::remote_signer::CustodyMode::InsecureLocalKeystore => {
+                            Default::default()
+                        }
+                    },
+                ),
+            )
         })?;
         Ok(Arc::new(keystore))
     }

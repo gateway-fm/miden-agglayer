@@ -78,6 +78,11 @@ services:
       # is unreachable or holds no usable key, so a broken custody setup can
       # never be mistaken for a healthy boot.
       AGGLAYER_SIGNER_URL: "http://web3signer:9000"
+      # One key PER ROLE. The proxy refuses to start if a role is unbound, if two
+      # roles share a key, or if the signer does not actually expose a named key
+      # — so this cannot silently degrade to "bind everything to key #1".
+      # Generated into fixtures/web3signer-keys.env by gen-web3signer-keys.sh.
+      AGGLAYER_SIGNER_KEYS: "${AGGLAYER_SIGNER_KEYS:?run scripts/gen-web3signer-keys.sh and source fixtures/web3signer-keys.env}"
     depends_on:
       web3signer:
         condition: service_healthy

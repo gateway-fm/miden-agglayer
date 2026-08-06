@@ -200,8 +200,12 @@ pub(crate) fn parse_public_key(sec1_hex: &str) -> anyhow::Result<ecdsa_k256_kecc
 /// `crate::proxy_keystore`).
 #[derive(Debug, Clone)]
 pub enum CustodyMode {
-    /// Keys held by a remote signer at this base URL (the default).
-    RemoteSigner { base_url: String },
+    /// Keys held by a remote signer at this base URL (the default), with the
+    /// operator's role→key bindings.
+    RemoteSigner {
+        base_url: String,
+        key_bindings: SignerKeyBindings,
+    },
     /// Keys on this host's disk (explicit `--insecure-local-keystore`).
     InsecureLocalKeystore,
 }
@@ -212,7 +216,24 @@ impl CustodyMode {
     /// Requiring one of them — rather than defaulting to local — is what makes
     /// on-disk keys a deliberate act: a deployment that forgets to configure
     /// custody fails to start instead of quietly running with local secrets.
-    pub fn resolve(signer_url: Option<&str>, insecure_local: bool) -> anyhow::Result<Self> {
+    pub fn resolve(
+        signer_url: Option<&str>,
+        insecure_local: bool,
+        key_bindings: SignerKeyBindings,
+    ) -> anyhow::Result<Self> {
+        if signer_url.is_some() && !key_bindings.missing_roles().is_empty() {
+            return Err(anyhow!(
+                "remote custody needs a signer key for every role; missing: {}. Pass \
+                 --signer-key <role>=<identifier> for each (key creation and IAM stay outside \
+                 this process).",
+                key_bindings
+                    .missing_roles()
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         match (signer_url, insecure_local) {
             (Some(_), true) => Err(anyhow!(
                 "--signer-url and --insecure-local-keystore are mutually exclusive: custody is \
@@ -221,6 +242,7 @@ impl CustodyMode {
             )),
             (Some(base_url), false) => Ok(Self::RemoteSigner {
                 base_url: base_url.to_string(),
+                key_bindings,
             }),
             (None, true) => Ok(Self::InsecureLocalKeystore),
             (None, false) => Err(anyhow!(
@@ -276,6 +298,30 @@ impl RemoteKeyDirectory {
     /// True when the signer exposed no key this proxy can use.
     pub fn is_empty(&self) -> bool {
         self.by_commitment.is_empty()
+    }
+
+    /// The commitment for an operator-named key IDENTIFIER, if the signer
+    /// exposes it.
+    ///
+    /// Matching is by COMMITMENT, not by string. The operator may reasonably
+    /// write the key in any valid SEC1 encoding (compressed, tagged or raw
+    /// uncompressed) while the signer publishes its own; comparing the strings
+    /// would reject a correct configuration purely on formatting — the same
+    /// encoding-mismatch class that made the first remote startup fail. Parsing
+    /// both sides to a commitment makes the comparison encoding-independent.
+    /// A non-key identifier still falls back to a case-insensitive string match.
+    pub fn commitment_for_identifier(&self, identifier: &str) -> Option<PublicKeyCommitment> {
+        if let Ok(parsed) = parse_public_key(identifier) {
+            let commitment = PublicKey::EcdsaK256Keccak(parsed).to_commitment();
+            if self.by_commitment.contains_key(&commitment) {
+                return Some(commitment);
+            }
+            return None;
+        }
+        self.by_commitment
+            .iter()
+            .find(|(_, (id, _))| id.eq_ignore_ascii_case(identifier))
+            .map(|(commitment, _)| *commitment)
     }
 
     /// The signer's identifier for `commitment`, if it holds that key.
@@ -359,8 +405,8 @@ mod tests {
     /// the whole point of the flag pair.
     #[test]
     fn custody_must_be_configured_explicitly() {
-        let err =
-            CustodyMode::resolve(None, false).expect_err("no custody configured must fail closed");
+        let err = CustodyMode::resolve(None, false, SignerKeyBindings::default())
+            .expect_err("no custody configured must fail closed");
         let rendered = format!("{err}");
         assert!(
             rendered.contains("--signer-url") && rendered.contains("--insecure-local-keystore"),
@@ -373,7 +419,16 @@ mod tests {
     #[test]
     fn custody_modes_are_mutually_exclusive() {
         assert!(
-            CustodyMode::resolve(Some("http://signer:9000"), true).is_err(),
+            CustodyMode::resolve(
+                Some("http://signer:9000"),
+                true,
+                SignerKeyBindings::parse(&[
+                    "service=0xaaa".to_string(),
+                    "ger-manager=0xbbb".to_string()
+                ])
+                .unwrap()
+            )
+            .is_err(),
             "asking for both remote and local custody must fail"
         );
     }
@@ -381,11 +436,19 @@ mod tests {
     #[test]
     fn custody_resolves_each_mode() {
         assert!(matches!(
-            CustodyMode::resolve(Some("http://signer:9000"), false),
+            CustodyMode::resolve(
+                Some("http://signer:9000"),
+                false,
+                SignerKeyBindings::parse(&[
+                    "service=0xaaa".to_string(),
+                    "ger-manager=0xbbb".to_string()
+                ])
+                .unwrap()
+            ),
             Ok(CustodyMode::RemoteSigner { .. })
         ));
         assert!(matches!(
-            CustodyMode::resolve(None, true),
+            CustodyMode::resolve(None, true, SignerKeyBindings::default()),
             Ok(CustodyMode::InsecureLocalKeystore)
         ));
     }
@@ -462,6 +525,183 @@ mod tests {
         assert!(
             parse_public_key(&hex::encode([0xABu8; 64])).is_err(),
             "an off-curve 64-byte value must not be accepted as a public key"
+        );
+    }
+}
+
+/// The operator roles that get their own signer key.
+///
+/// # Why a role→key contract instead of "whatever the signer lists first"
+///
+/// The first version bound every account to `remote_commitments().first()`.
+/// Signer key ORDER is not an operator configuration contract — it can change
+/// when a key is added, removed or rotated — so the binding was both arbitrary
+/// and unstable. Worse, a single-key signer (the e2e setup) silently bound the
+/// service AND the GER manager to the same key, which is the opposite of
+/// blast-radius isolation: one compromised or rotated key takes out both roles.
+///
+/// The operator now names the key for each role explicitly. Key creation and IAM
+/// grants stay outside this process — the proxy only verifies that each named
+/// key really is exposed by the signer, and binds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SignerRole {
+    /// The proxy's service account.
+    Service,
+    /// The dedicated GER-injection account.
+    GerManager,
+}
+
+impl SignerRole {
+    /// The name accepted in `--signer-key <role>=<identifier>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::GerManager => "ger-manager",
+        }
+    }
+
+    /// Every role that must be bound in remote custody.
+    pub fn all() -> [SignerRole; 2] {
+        [Self::Service, Self::GerManager]
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name.trim() {
+            "service" => Some(Self::Service),
+            "ger-manager" | "ger_manager" => Some(Self::GerManager),
+            _ => None,
+        }
+    }
+}
+
+/// Operator-declared role → signer key identifier.
+#[derive(Debug, Clone, Default)]
+pub struct SignerKeyBindings {
+    by_role: BTreeMap<SignerRole, String>,
+}
+
+impl SignerKeyBindings {
+    /// Parses repeated `role=identifier` arguments.
+    pub fn parse(pairs: &[String]) -> anyhow::Result<Self> {
+        let mut by_role: BTreeMap<SignerRole, String> = BTreeMap::new();
+        for pair in pairs {
+            let (role, identifier) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow!("--signer-key expects <role>=<identifier>, got {pair:?}"))?;
+            let parsed = SignerRole::parse(role).ok_or_else(|| {
+                anyhow!(
+                    "unknown signer role {role:?}; expected one of: {}",
+                    SignerRole::all()
+                        .iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            let identifier = identifier.trim();
+            if identifier.is_empty() {
+                return Err(anyhow!(
+                    "--signer-key {}= has an empty identifier",
+                    parsed.as_str()
+                ));
+            }
+            if by_role.insert(parsed, identifier.to_string()).is_some() {
+                return Err(anyhow!("--signer-key {} given twice", parsed.as_str()));
+            }
+        }
+        // Distinct roles sharing one key defeats the isolation this exists for.
+        let mut seen: BTreeMap<&str, SignerRole> = BTreeMap::new();
+        for (role, id) in &by_role {
+            if let Some(other) = seen.insert(id.as_str(), *role) {
+                return Err(anyhow!(
+                    "roles {} and {} are bound to the SAME signer key {id}; give each role its \
+                     own key so a compromised or rotated key affects exactly one account",
+                    other.as_str(),
+                    role.as_str()
+                ));
+            }
+        }
+        Ok(Self { by_role })
+    }
+
+    /// The identifier bound to `role`, if configured.
+    pub fn identifier(&self, role: SignerRole) -> Option<&str> {
+        self.by_role.get(&role).map(String::as_str)
+    }
+
+    /// True when no role was configured.
+    pub fn is_empty(&self) -> bool {
+        self.by_role.is_empty()
+    }
+
+    /// Roles with no configured key.
+    pub fn missing_roles(&self) -> Vec<SignerRole> {
+        SignerRole::all()
+            .into_iter()
+            .filter(|r| !self.by_role.contains_key(r))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod key_binding_tests {
+    use super::*;
+
+    fn b(pairs: &[&str]) -> anyhow::Result<SignerKeyBindings> {
+        SignerKeyBindings::parse(&pairs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    /// PR #162 blocker: signer key ORDER is not an operator contract, so each
+    /// role must name its key explicitly.
+    #[test]
+    fn roles_bind_to_their_configured_key() {
+        let bindings = b(&["service=0xaaa", "ger-manager=0xbbb"]).expect("parse");
+        assert_eq!(bindings.identifier(SignerRole::Service), Some("0xaaa"));
+        assert_eq!(bindings.identifier(SignerRole::GerManager), Some("0xbbb"));
+        assert!(bindings.missing_roles().is_empty());
+    }
+
+    /// Blast-radius isolation is the entire point: two roles on one key is the
+    /// exact state the old `.first()` binding produced against a single-key
+    /// signer, so it must be rejected rather than silently accepted.
+    #[test]
+    fn two_roles_may_not_share_one_key() {
+        let err = b(&["service=0xsame", "ger-manager=0xsame"]).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SAME signer key"),
+            "the error must explain the isolation problem, got: {msg}"
+        );
+    }
+
+    /// A partially-configured signer must not start: the unconfigured role would
+    /// otherwise have to fall back to an arbitrary key.
+    #[test]
+    fn remote_custody_requires_every_role() {
+        let partial = b(&["service=0xaaa"]).expect("parse");
+        assert_eq!(partial.missing_roles(), vec![SignerRole::GerManager]);
+        let err = CustodyMode::resolve(Some("http://signer:9000"), false, partial)
+            .expect_err("must refuse a partial binding");
+        assert!(format!("{err}").contains("ger-manager"));
+    }
+
+    /// Local custody does not need signer keys.
+    #[test]
+    fn local_custody_needs_no_signer_keys() {
+        assert!(matches!(
+            CustodyMode::resolve(None, true, SignerKeyBindings::default()),
+            Ok(CustodyMode::InsecureLocalKeystore)
+        ));
+    }
+
+    #[test]
+    fn malformed_bindings_are_rejected() {
+        assert!(b(&["service"]).is_err(), "missing '=' must fail");
+        assert!(b(&["service="]).is_err(), "empty identifier must fail");
+        assert!(b(&["nope=0xaaa"]).is_err(), "unknown role must fail");
+        assert!(
+            b(&["service=0xa", "service=0xb"]).is_err(),
+            "duplicate role must fail"
         );
     }
 }

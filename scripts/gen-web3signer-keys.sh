@@ -19,13 +19,41 @@ KEY_DIR="fixtures/web3signer-keys"
 mkdir -p "$KEY_DIR"
 chmod 700 "$KEY_DIR"
 
-if compgen -G "$KEY_DIR/*.yaml" >/dev/null; then
-    echo "[web3signer-keys] reusing existing key: $(ls "$KEY_DIR"/*.yaml)"
-    exit 0
+# One key PER ROLE (service, ger-manager): blast-radius isolation, and the proxy
+# now refuses to bind two roles to the same key (PR #162 review).
+ROLES=(service ger-manager)
+
+# The proxy binds roles to keys by IDENTIFIER, so emit the role=publickey pairs
+# compose feeds in as AGGLAYER_SIGNER_KEYS. Written on BOTH the reuse and the
+# generate path — a reused key set still needs its env file, and forgetting that
+# is how the file goes stale while the keys look fine.
+emit_env() {
+    local env_file="$KEY_DIR/../web3signer-keys.env" sep="" role priv pub
+    {
+        printf 'AGGLAYER_SIGNER_KEYS='
+        for f in "$KEY_DIR"/*.yaml; do
+            role="$(basename "$f" | sed 's/-0x.*//')"
+            priv="$(awk -F'"' '/privateKey:/ {print $2}' "$f")"
+            pub="$(cast wallet public-key --private-key "$priv" 2>/dev/null)"
+            [ -n "$pub" ] || { echo "[web3signer-keys] FAIL: cannot derive public key for $role" >&2; return 1; }
+            printf '%s%s=%s' "$sep" "$role" "$pub"
+            sep=","
+        done
+        printf '\n'
+    } > "$env_file" || return 1
+    echo "[web3signer-keys] wrote $env_file"
+}
+have=$(compgen -G "$KEY_DIR/*.yaml" >/dev/null && ls "$KEY_DIR"/*.yaml | wc -l || echo 0)
+if [ "$have" -ge "${#ROLES[@]}" ]; then
+    echo "[web3signer-keys] reusing ${have} existing key(s):"
+    ls "$KEY_DIR"/*.yaml | sed 's/^/  /'
+    emit_env
+    exit $?
 fi
 
 # `cast wallet new` gives us a secp256k1 keypair; Web3Signer's file-raw format
 # wants the private key hex (no 0x) and derives the public key itself.
+for ROLE in "${ROLES[@]}"; do
 WALLET="$(cast wallet new)"
 PRIV="$(echo "$WALLET" | awk '/Private key:/ {print $3}' | sed 's/^0x//')"
 ADDR="$(echo "$WALLET" | awk '/Address:/ {print $2}')"
@@ -33,7 +61,7 @@ ADDR="$(echo "$WALLET" | awk '/Address:/ {print $2}')"
 
 # Name the file after the address purely for human traceability; Web3Signer
 # identifies keys by their public key at the API layer regardless of filename.
-KEY_FILE="$KEY_DIR/${ADDR}.yaml"
+KEY_FILE="$KEY_DIR/${ROLE}-${ADDR}.yaml"
 cat > "$KEY_FILE" <<EOF
 # Web3Signer raw-file key (E2E ONLY — production uses aws-kms/azure/hashicorp).
 # Swapping this block for a vault type is the entire production delta:
@@ -45,4 +73,7 @@ keyType: SECP256K1
 privateKey: "0x${PRIV}"
 EOF
 chmod 600 "$KEY_FILE"
-echo "[web3signer-keys] wrote $KEY_FILE (address $ADDR)"
+echo "[web3signer-keys] wrote $KEY_FILE (role $ROLE, address $ADDR)"
+done
+
+emit_env

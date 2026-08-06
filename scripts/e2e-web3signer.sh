@@ -44,7 +44,9 @@ fail() { echo -e "${RED}[$(ts)] FAIL:${NC} $*"; exit 1; }
 
 # ── 0. provision the signer's key + bring the stack up ───────────────────────
 log "provisioning the signer key"
-./scripts/gen-web3signer-keys.sh || fail "could not provision the signer key"
+./scripts/gen-web3signer-keys.sh || fail "could not provision the signer keys"
+# Per-role bindings (AGGLAYER_SIGNER_KEYS) for the compose overlay.
+set -a; . ./fixtures/web3signer-keys.env; set +a
 
 log "bringing up the stack with the web3signer overlay"
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1

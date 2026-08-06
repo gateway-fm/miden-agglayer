@@ -276,6 +276,23 @@ struct Command {
     )]
     insecure_local_keystore: bool,
 
+    /// Bind an operator role to a specific signer key: `--signer-key
+    /// <role>=<identifier>`, repeatable. Roles: `service`, `ger-manager`.
+    ///
+    /// One key per role is deliberate: a compromised or rotated key then affects
+    /// exactly one account. Two roles sharing an identifier is rejected, as is a
+    /// role whose key the signer does not actually expose — the proxy verifies
+    /// each named key at startup rather than binding to whatever key happens to
+    /// be listed first. Key creation and IAM grants stay OUTSIDE this process.
+    ///
+    /// Required (for every role) when `--signer-url` is set.
+    #[arg(
+        long = "signer-key",
+        env = "AGGLAYER_SIGNER_KEYS",
+        value_delimiter = ','
+    )]
+    signer_keys: Vec<String>,
+
     /// Per-request timeout for the remote Miden prover, in seconds. Default 120s.
     /// Has no effect when --miden-prover-url is unset.
     #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
@@ -583,6 +600,14 @@ impl std::fmt::Debug for Command {
             .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
             .field("insecure_local_keystore", &self.insecure_local_keystore)
             .field(
+                "signer_keys",
+                &self
+                    .signer_keys
+                    .iter()
+                    .map(|_| "[REDACTED]")
+                    .collect::<Vec<_>>(),
+            )
+            .field(
                 "signer_url",
                 &self.signer_url.as_ref().map(|_| "[REDACTED]"),
             )
@@ -697,9 +722,12 @@ async fn main() -> anyhow::Result<()> {
     // Resolve key custody ONCE for the process: remote signer (default) or an
     // explicit on-disk keystore. Doing it here means a misconfiguration is a
     // startup error before any client, store or listener is built.
+    let signer_key_bindings =
+        miden_agglayer_service::remote_signer::SignerKeyBindings::parse(&command.signer_keys)?;
     let custody = miden_agglayer_service::remote_signer::CustodyMode::resolve(
         command.signer_url.as_deref(),
         command.insecure_local_keystore,
+        signer_key_bindings,
     )?;
 
     // Surgical recovery: clear stale `locked` flags in miden-client's sqlite
@@ -1493,6 +1521,7 @@ mod hardening_tests {
             miden_api_key: None,
             signer_url: None,
             insecure_local_keystore: true,
+            signer_keys: Vec::new(),
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,

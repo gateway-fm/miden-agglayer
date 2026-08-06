@@ -4,6 +4,7 @@ use crate::faucet_ops;
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
 use crate::proxy_keystore::ProxyKeystore;
+use crate::remote_signer::SignerRole;
 use anyhow::Context;
 use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
@@ -64,26 +65,42 @@ impl From<Accounts> for AccountsConfig {
 // client's deterministic Felt coin is NOT a CryptoRng and must never be a
 // secp256k1 key source.
 // When a remote signer (`--signer-url`) is configured, the account is bound to
-// a key the SIGNER holds: we read its public key, build the approver from that,
-// and generate nothing locally — the secret never exists on this host. The
-// returned `AuthSecretKey` is `None` in that case, which is what tells the
-// caller there is no local key to store.
+// the key the operator named for THIS ROLE: we resolve that identifier against
+// the signer's key directory, fail if the signer does not expose it, build the
+// approver from it, and generate nothing locally — the secret never exists on
+// this host. The returned `AuthSecretKey` is `None` in that case, which is what
+// tells the caller there is no local key to store.
 //
-// Production note: provision one signer key per account for blast-radius
-// isolation. This picks the signer's first key deterministically, so a
-// single-key signer (the e2e setup) binds every account to that key — valid,
-// but not what a production deployment should do.
+// The role→key mapping is an explicit operator contract. An earlier version took
+// `remote_commitments().first()`, but signer key ORDER is not a contract (it
+// shifts when keys are added, removed or rotated) and a single-key signer bound
+// every role to the same key — the opposite of blast-radius isolation.
 pub async fn create_auth_component(
     keystore: &ProxyKeystore,
+    role: Option<SignerRole>,
 ) -> anyhow::Result<(AuthSingleSig, Option<AuthSecretKey>)> {
-    if let Some(commitment) = keystore.remote_commitments().first().copied() {
+    if keystore.is_remote() {
+        let role = role.ok_or_else(|| {
+            anyhow::anyhow!(
+                "remote custody requires a signer role for every provisioned account, so each                  one binds to its own operator-named key"
+            )
+        })?;
+        let identifier = keystore.signer_key_identifier(role).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no signer key configured for role {}; pass --signer-key {}=<identifier>",
+                role.as_str(),
+                role.as_str()
+            )
+        })?;
+        let commitment = keystore.commitment_for_identifier(&identifier)?;
         let public_key = keystore
             .get_public_key(commitment)
             .await
             .context("remote signer listed a key commitment it cannot resolve to a public key")?;
         tracing::info!(
             target: crate::COMPONENT,
-            "binding a new account to a REMOTE signer key — no secret is generated locally"
+            role = role.as_str(),
+            "binding a new account to the REMOTE signer key configured for this role — no secret              is generated locally"
         );
         return Ok((
             AuthSingleSig::new(Approver::from(public_key.as_ref())),
@@ -185,6 +202,7 @@ async fn add_faucet(
 async fn add_wallet(
     client: &mut MidenClientLib,
     keystore: Arc<ProxyKeystore>,
+    role: Option<SignerRole>,
 ) -> anyhow::Result<Account> {
     // Public storage mode is REQUIRED for the proxy's infrastructure accounts
     // (service, ger_manager) so a missing local sqlite row can
@@ -206,12 +224,18 @@ async fn add_wallet(
     // by users yet`. Public gives us the recovery property (state on-chain,
     // import-by-id works) without the network-tx-builder semantics, which
     // the proxy doesn't use anyway.
-    let (auth_component, key_pair) = create_auth_component(keystore.as_ref()).await?;
+    let (auth_component, key_pair) = create_auth_component(keystore.as_ref(), role).await?;
+    // Capture the commitment BEFORE the component is moved into the builder, so
+    // the account↔key binding can be recorded once the id exists.
+    let bound_commitment = auth_component.approver().pub_key();
     let account = Account::builder(client.rng().draw_word().into())
         .account_type(AccountType::Public)
         .with_component(BasicWallet)
         .with_auth_component(auth_component)
         .build()?;
+    // Remote custody: remember which signer key signs for this account. Local
+    // custody keeps its own index in the filesystem keystore, so this is a no-op.
+    keystore.bind_account(account.id(), bound_commitment);
     // Remote-signer accounts have no local secret to persist.
     if let Some(key_pair) = key_pair.as_ref() {
         keystore.add_key(key_pair, account.id()).await?;
@@ -252,7 +276,9 @@ pub async fn create_standalone_wallet(
     client: &mut MidenClientLib,
     keystore: Arc<ProxyKeystore>,
 ) -> anyhow::Result<Account> {
-    let account = add_wallet(client, keystore).await?;
+    // Operator tooling (bridge-out-tool) provisions these in LOCAL custody; in
+    // remote custody this fails loudly rather than binding to an arbitrary key.
+    let account = add_wallet(client, keystore, None).await?;
     register_wallet_p2id_tag(client, account.id()).await?;
     Ok(account)
 }
@@ -262,8 +288,8 @@ async fn add_accounts(
     keystore: Arc<ProxyKeystore>,
     network_id: u32,
 ) -> anyhow::Result<Accounts> {
-    let service = add_wallet(client, keystore.clone()).await?;
-    let ger_manager = add_wallet(client, keystore.clone()).await?;
+    let service = add_wallet(client, keystore.clone(), Some(SignerRole::Service)).await?;
+    let ger_manager = add_wallet(client, keystore.clone(), Some(SignerRole::GerManager)).await?;
     deploy_account(client, ger_manager.id(), "ger_manager").await?;
     let bridge = add_bridge(
         client,
@@ -381,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn create_auth_component_pins_ecdsa_k256_keccak() {
         let keystore = local_keystore();
-        let (component, key_pair) = create_auth_component(&keystore)
+        let (component, key_pair) = create_auth_component(&keystore, None)
             .await
             .expect("auth component");
         let key_pair = key_pair.expect("local custody must generate a local key");
@@ -413,8 +439,10 @@ mod tests {
     #[tokio::test]
     async fn create_auth_component_draws_fresh_key_material() {
         let keystore = local_keystore();
-        let (a, ka) = create_auth_component(&keystore).await.expect("first");
-        let (b, kb) = create_auth_component(&keystore).await.expect("second");
+        let (a, ka) = create_auth_component(&keystore, None).await.expect("first");
+        let (b, kb) = create_auth_component(&keystore, None)
+            .await
+            .expect("second");
         let (ka, kb) = (
             ka.expect("local custody generates a key"),
             kb.expect("local custody generates a key"),

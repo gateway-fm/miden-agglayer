@@ -29,7 +29,7 @@ use miden_protocol::account::AccountId;
 use miden_protocol::account::auth::{AuthSecretKey, PublicKey, PublicKeyCommitment, Signature};
 use miden_tx::AuthenticationError;
 use miden_tx::auth::{SigningInputs, TransactionAuthenticator};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Custody mode: local keys on disk, or a remote signer. Never both.
@@ -41,11 +41,44 @@ pub enum ProxyKeystore {
     Remote(Arc<RemoteBackend>),
 }
 
-/// A remote signer plus the key directory it exposed at startup.
+/// A remote signer plus the key directory it exposed at startup, and the
+/// account↔commitment bindings this deployment actually uses.
+///
+/// The binding map holds only PUBLIC data (account id ↔ public-key commitment).
+/// It exists because the `Keystore` contract is account-scoped: without it,
+/// `get_account_key_commitments` had to return every key the signer holds for
+/// every account, and the reverse lookup could only answer `None` — so the
+/// account association was lost and startup could prove no more than "the signer
+/// has SOME key" (PR #162 review).
 #[derive(Debug)]
 pub struct RemoteBackend {
     client: RemoteSignerClient,
     directory: RemoteKeyDirectory,
+    /// account → the one commitment that account is bound to.
+    bindings: std::sync::RwLock<BTreeMap<AccountId, PublicKeyCommitment>>,
+    /// operator-declared role → signer key identifier.
+    key_bindings: crate::remote_signer::SignerKeyBindings,
+}
+
+impl RemoteBackend {
+    /// The commitment `account` is bound to, if any.
+    fn binding_for(&self, account: AccountId) -> Option<PublicKeyCommitment> {
+        self.bindings
+            .read()
+            .expect("bindings lock")
+            .get(&account)
+            .copied()
+    }
+
+    /// The account bound to `commitment`, if any.
+    fn account_for(&self, commitment: PublicKeyCommitment) -> Option<AccountId> {
+        self.bindings
+            .read()
+            .expect("bindings lock")
+            .iter()
+            .find(|(_, c)| **c == commitment)
+            .map(|(a, _)| *a)
+    }
 }
 
 impl ProxyKeystore {
@@ -60,7 +93,10 @@ impl ProxyKeystore {
     /// Errors if the signer is unreachable or exposes no usable key — a
     /// configured-but-unusable signer must fail at boot, not at the first
     /// transaction.
-    pub async fn remote(client: RemoteSignerClient) -> anyhow::Result<Self> {
+    pub async fn remote(
+        client: RemoteSignerClient,
+        key_bindings: crate::remote_signer::SignerKeyBindings,
+    ) -> anyhow::Result<Self> {
         let directory = RemoteKeyDirectory::load(&client).await?;
         if directory.is_empty() {
             anyhow::bail!(
@@ -73,7 +109,12 @@ impl ProxyKeystore {
             remote_keys = directory.len(),
             "remote signer attached — ALL account signing is remote; this process holds no key"
         );
-        Ok(Self::Remote(Arc::new(RemoteBackend { client, directory })))
+        Ok(Self::Remote(Arc::new(RemoteBackend {
+            client,
+            directory,
+            bindings: std::sync::RwLock::new(BTreeMap::new()),
+            key_bindings,
+        })))
     }
 
     /// Builds a remote backend from parts (test seam).
@@ -82,7 +123,83 @@ impl ProxyKeystore {
         client: RemoteSignerClient,
         directory: RemoteKeyDirectory,
     ) -> Self {
-        Self::Remote(Arc::new(RemoteBackend { client, directory }))
+        Self::Remote(Arc::new(RemoteBackend {
+            client,
+            directory,
+            bindings: std::sync::RwLock::new(BTreeMap::new()),
+            key_bindings: Default::default(),
+        }))
+    }
+
+    /// The operator-configured signer key identifier for `role`.
+    pub fn signer_key_identifier(&self, role: crate::remote_signer::SignerRole) -> Option<String> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(backend) => backend.key_bindings.identifier(role).map(str::to_string),
+        }
+    }
+
+    /// Records that `account` is signed for by `commitment` (public data only).
+    ///
+    /// Called once per account at init/restore so the account association the
+    /// `Keystore` contract depends on actually exists in remote custody.
+    pub fn bind_account(&self, account: AccountId, commitment: PublicKeyCommitment) {
+        if let Self::Remote(backend) = self {
+            backend
+                .bindings
+                .write()
+                .expect("bindings lock")
+                .insert(account, commitment);
+        }
+    }
+
+    /// Resolves a signer key IDENTIFIER to the commitment Miden accounts use,
+    /// failing if the signer does not expose that exact key.
+    ///
+    /// This is what turns "the signer has some key" into "the signer has THIS
+    /// key": an operator-named identifier that the signer does not hold is a
+    /// configuration error, and must stop startup rather than silently fall
+    /// through to whatever key happens to be first.
+    pub fn commitment_for_identifier(
+        &self,
+        identifier: &str,
+    ) -> anyhow::Result<PublicKeyCommitment> {
+        match self {
+            Self::Local(_) => Err(anyhow::anyhow!(
+                "signer key identifiers are only meaningful in remote custody"
+            )),
+            Self::Remote(backend) => backend
+                .directory
+                .commitment_for_identifier(identifier)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the remote signer does not expose the configured key {identifier:?};                          provision it in the signer (or correct --signer-key) — refusing to bind                          an account to a different key"
+                    )
+                }),
+        }
+    }
+
+    /// Fails unless every bound account's commitment is still exposed by the
+    /// signer. Run at startup so a signer that lost a key (or a restore against
+    /// the wrong signer) is caught before any traffic is accepted.
+    pub fn verify_bound_accounts(&self) -> anyhow::Result<usize> {
+        let Self::Remote(backend) = self else {
+            return Ok(0);
+        };
+        let bindings = backend.bindings.read().expect("bindings lock");
+        let mut missing = Vec::new();
+        for (account, commitment) in bindings.iter() {
+            if backend.directory.identifier(*commitment).is_none() {
+                missing.push(*account);
+            }
+        }
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "the remote signer does not hold the key(s) bound to {} configured account(s)                  ({missing:?}); this deployment cannot sign for them — check that --signer-url                  points at the right signer and that the keys were not removed or rotated",
+                missing.len()
+            );
+        }
+        Ok(bindings.len())
     }
 
     /// True when signing is remote.
@@ -197,11 +314,11 @@ impl Keystore for ProxyKeystore {
     ) -> Result<BTreeSet<PublicKeyCommitment>, KeyStoreError> {
         match self {
             Self::Local(local) => local.get_account_key_commitments(account_id).await,
-            // In remote mode the signer's keys are the only ones that can sign
-            // for any account; the account's own auth component pins which
-            // commitment is actually required, and `get_signature` rejects
-            // anything the signer does not hold.
-            Self::Remote(backend) => Ok(backend.directory.commitments().collect()),
+            // ONLY the key this account is bound to. Returning the signer's whole
+            // key set here broke the account association the `Keystore` contract
+            // is built on, and made every account look like it could be signed
+            // for by every key.
+            Self::Remote(backend) => Ok(backend.binding_for(*account_id).into_iter().collect()),
         }
     }
 
@@ -215,9 +332,10 @@ impl Keystore for ProxyKeystore {
                     .get_account_id_by_key_commitment(pub_key_commitment)
                     .await
             }
-            // A vault key is not owned by a single account here; the binding
-            // lives in the deployed accounts themselves.
-            Self::Remote(_) => Ok(None),
+            // The reverse of the binding map. Previously always `None`, which
+            // silently broke callers that resolve a signer key back to its
+            // account.
+            Self::Remote(backend) => Ok(backend.account_for(pub_key_commitment)),
         }
     }
 }

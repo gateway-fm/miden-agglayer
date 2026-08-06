@@ -775,7 +775,8 @@ async fn main() -> anyhow::Result<()> {
             .build();
         // The operator tool always signs locally: it deploys an operator-owned
         // faucet whose key the operator keeps, not a proxy/vault key.
-        let (auth_component, key_pair) = create_auth_component(keystore.as_ref()).await?;
+        // operator tooling runs local-custody only; no signer role applies.
+        let (auth_component, key_pair) = create_auth_component(keystore.as_ref(), None).await?;
         let faucet = Account::builder(client.rng().draw_word().into())
             .account_type(AccountType::Public)
             .with_component(faucet_component)
