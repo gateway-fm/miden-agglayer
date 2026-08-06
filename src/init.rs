@@ -7,7 +7,7 @@ use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::transaction::TransactionRequestBuilder;
-use miden_protocol::account::auth::{AuthScheme, AuthSecretKey};
+use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
 use miden_standards::account::auth::{Approver, AuthSingleSig};
@@ -41,14 +41,28 @@ impl From<Accounts> for AccountsConfig {
 
 // pub so external operator tooling (bridge-out app's --create-native-faucet) can
 // create a NON-service, operator-owned faucet with the same auth scheme as the proxy.
-pub fn create_auth_component(
-    client: &mut MidenClientLib,
-) -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
-    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
-    let auth_component = AuthSingleSig::new(Approver::new(
-        key_pair.public_key().to_commitment(),
-        AuthScheme::Falcon512Poseidon2,
-    ));
+//
+// feat/016-ecdsa-accounts: NEWLY PROVISIONED operator signer accounts (service,
+// GER manager, standalone/foreign wallets, operator-native faucets) authenticate
+// with EcdsaK256Keccak (secp256k1 + keccak) instead of Falcon512Poseidon2.
+// This changes the DEFAULT for new accounts only. It does not rekey existing
+// Falcon accounts and does not remove Falcon support: the keystore and the
+// signing path still handle Falcon keys, so a deployment provisioned before this
+// change keeps working. Bridge and AggLayer-owned wrapped-faucet authorization
+// are outside this helper entirely.
+// Note the upstream caveat: ECDSA approvers disclose their public key and
+// signature at proving time, so there is no signer-key privacy — an accepted
+// trade-off for these operator-owned infrastructure accounts.
+//
+// Key material comes from the OS CSPRNG. `new_ecdsa_k256_keccak()` sources that
+// randomness itself, which is why this does not thread an explicit `rand`
+// generator: fewer moving parts, and no direct `rand` dependency to keep in step
+// with miden's own version (PR #160 review). What matters either way is that the
+// client's deterministic Felt coin is NOT a CryptoRng and must never be a
+// secp256k1 key source.
+pub fn create_auth_component() -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
+    let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
+    let auth_component = AuthSingleSig::new(Approver::from(&key_pair.public_key()));
     Ok((auth_component, key_pair))
 }
 
@@ -163,7 +177,7 @@ async fn add_wallet(
     // by users yet`. Public gives us the recovery property (state on-chain,
     // import-by-id works) without the network-tx-builder semantics, which
     // the proxy doesn't use anyway.
-    let (auth_component, key_pair) = create_auth_component(client)?;
+    let (auth_component, key_pair) = create_auth_component()?;
     let account = Account::builder(client.rng().draw_word().into())
         .account_type(AccountType::Public)
         .with_component(BasicWallet)
@@ -304,4 +318,60 @@ pub async fn init(
     future.await?;
 
     Ok(result.get().unwrap().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miden_protocol::account::auth::AuthScheme;
+
+    /// PR #160 review: this branch's ONLY security-sensitive behaviour is which
+    /// signature scheme newly provisioned operator accounts are deployed with,
+    /// and it had no direct regression test. A silent revert to Falcon — or an
+    /// approver derived from a different key than the one we keep — would have
+    /// been caught by nothing.
+    ///
+    /// Pins all three halves of the binding:
+    ///   * the secret key we persist is EcdsaK256Keccak;
+    ///   * the auth component advertises EcdsaK256Keccak; and
+    ///   * the component's approver commits to THAT key, not another.
+    #[test]
+    fn create_auth_component_pins_ecdsa_k256_keccak() {
+        let (component, key_pair) = create_auth_component().expect("auth component");
+
+        assert_eq!(
+            key_pair.auth_scheme(),
+            AuthScheme::EcdsaK256Keccak,
+            "the generated secret key must be secp256k1/keccak — a Falcon key here would \
+             silently re-introduce the scheme this branch removes"
+        );
+        assert_eq!(
+            component.approver().auth_scheme(),
+            AuthScheme::EcdsaK256Keccak,
+            "the deployed component must advertise the same scheme as the key it is bound to"
+        );
+        assert_eq!(
+            component.approver().pub_key(),
+            key_pair.public_key().to_commitment(),
+            "the approver must commit to the key we actually keep; a mismatch deploys an \
+             account nobody can sign for"
+        );
+    }
+
+    /// Two calls must not return the same key — i.e. this detects KEY REUSE
+    /// across provisioned accounts. It is deliberately not a randomness-quality
+    /// test: a single inequality cannot demonstrate that an RNG is sound, only
+    /// that two draws differed. What it does catch is the concrete mistake of
+    /// binding every account to one shared key.
+    #[test]
+    fn create_auth_component_draws_fresh_key_material() {
+        let (a, ka) = create_auth_component().expect("first");
+        let (b, kb) = create_auth_component().expect("second");
+        assert_ne!(
+            ka.public_key().to_commitment(),
+            kb.public_key().to_commitment(),
+            "two provisioned accounts must not share a key (blast-radius isolation)"
+        );
+        assert_ne!(a.approver().pub_key(), b.approver().pub_key());
+    }
 }
