@@ -260,6 +260,21 @@ pub fn init_metrics() {
          Page critical."
     );
     describe_counter!(
+        "remote_signer_signature_failures_total",
+        "Account signatures the REMOTE signer failed to produce (unreachable, \
+         refused, or holding no key for the requested commitment). The proxy \
+         never falls back to a local key, so a sustained non-zero value means \
+         signing — and therefore claims and GER injection — is STALLED. This is \
+         how signer loss AFTER a successful startup becomes visible; the \
+         fail-closed startup check only covers boot."
+    );
+    describe_counter!(
+        "remote_signer_signatures_total",
+        "Account signatures successfully produced by the remote signer. Pair \
+         with remote_signer_signature_failures_total: a failures counter that is \
+         zero only means 'no signer trouble' while this one is advancing."
+    );
+    describe_counter!(
         "bridge_faucet_ownership_checked_total",
         "AggLayer-owned faucets whose owner slot was successfully read and \
          compared against the configured bridge (Cantina #4). Pair this with \

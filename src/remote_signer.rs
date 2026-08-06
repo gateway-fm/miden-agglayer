@@ -705,3 +705,115 @@ mod key_binding_tests {
         );
     }
 }
+
+/// Whether a signer endpoint is safe to use without transport authentication.
+///
+/// # Why this gate exists (PR #162 review)
+///
+/// A KMS stops an attacker EXTRACTING the key. It does not stop anyone who can
+/// reach the signing API from using it as a signing ORACLE — the proxy's whole
+/// authority is "can talk to the signer". `--require-hardening` previously
+/// accepted an arbitrary unauthenticated `http://` endpoint, so a hardened
+/// deployment could point at a signer across the network with no authentication
+/// and no transport integrity, and nothing would object.
+///
+/// Rather than invent an auth scheme, this enforces the KISS boundary the review
+/// asked for: either the signer is reachable only from this host / a
+/// private-sidecar address (no network exposure to authenticate), or the
+/// transport is `https` (TLS/mTLS/service-mesh terminated). Anything else is a
+/// deliberate insecure-dev opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerTransport {
+    /// `https://` — authenticated/encrypted transport.
+    Tls,
+    /// Loopback or a compose-style private sidecar host: no network exposure.
+    PrivateSidecar,
+    /// Plain `http://` to a non-local host. A signing oracle on the network.
+    UnauthenticatedRemote,
+}
+
+/// Classifies a signer URL for the hardening gate.
+pub fn classify_signer_transport(base_url: &str) -> SignerTransport {
+    let lowered = base_url.trim().to_ascii_lowercase();
+    if lowered.starts_with("https://") {
+        return SignerTransport::Tls;
+    }
+    let host = lowered
+        .strip_prefix("http://")
+        .unwrap_or(&lowered)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| {
+            lowered
+                .strip_prefix("http://")
+                .unwrap_or(&lowered)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        });
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    // Loopback, or a single-label host (docker-compose service name / k8s
+    // sidecar) which is not routable off the private network.
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.starts_with("127.")
+        || (!host.is_empty() && !host.contains('.') && host != "0.0.0.0")
+    {
+        return SignerTransport::PrivateSidecar;
+    }
+    SignerTransport::UnauthenticatedRemote
+}
+
+#[cfg(test)]
+mod transport_gate_tests {
+    use super::*;
+
+    /// The hardening gate's job: a signing API reachable over the network with
+    /// no authentication is a signing oracle, and KMS custody does not help.
+    #[test]
+    fn plain_http_to_a_remote_host_is_unauthenticated() {
+        for url in [
+            "http://signer.internal.example.com:9000",
+            "http://10.0.0.5:9000",
+            "http://signer.example.com",
+        ] {
+            assert_eq!(
+                classify_signer_transport(url),
+                SignerTransport::UnauthenticatedRemote,
+                "{url} must be treated as an exposed signing oracle"
+            );
+        }
+    }
+
+    /// TLS terminates the concern (mTLS/service mesh included).
+    #[test]
+    fn https_is_accepted() {
+        assert_eq!(
+            classify_signer_transport("https://signer.example.com:9000"),
+            SignerTransport::Tls
+        );
+    }
+
+    /// Loopback and compose/k8s sidecar names have no network exposure to
+    /// authenticate — this is what keeps the e2e (and a same-pod sidecar)
+    /// working under --require-hardening without an opt-out.
+    #[test]
+    fn loopback_and_sidecars_are_private() {
+        for url in [
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+            "http://web3signer:9000",
+        ] {
+            assert_eq!(
+                classify_signer_transport(url),
+                SignerTransport::PrivateSidecar,
+                "{url} is not network-exposed"
+            );
+        }
+    }
+}

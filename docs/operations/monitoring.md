@@ -178,6 +178,27 @@ to a plain-fungible view when the AggLayer decode fails, so trusting it would le
 a drifted bridge-owned faucet be silently reclassified as a benign native one —
 the blindness this monitor exists to prevent.
 
+## Remote signer (KMS custody)
+
+When `--signer-url` is set, every account signature leaves this host. The proxy
+never falls back to a local key, so losing the signer stalls claims and GER
+injection outright — and the fail-closed startup check only covers boot.
+
+| Metric | Meaning |
+|---|---|
+| `remote_signer_signatures_total` | Signatures the signer produced. |
+| `remote_signer_signature_failures_total` | Signatures it failed to produce (unreachable, refused, or no key for the requested commitment). |
+
+Alert on any sustained `remote_signer_signature_failures_total`, and treat a
+failures counter of zero as meaningful ONLY while `remote_signer_signatures_total`
+is advancing — otherwise "no failures" may just mean nothing is being signed.
+
+Transport: under `--require-hardening` the signer URL must be `https://` or a
+loopback/private-sidecar host. A plain `http://` endpoint on a routable host is
+refused, because an unauthenticated signing API is a signing oracle regardless of
+where the key material lives. `--insecure-signer-transport` overrides this for
+development only.
+
 ## Bridge integrity: page on increase
 
 These counters represent fail-close integrity detections, not routine traffic:

@@ -235,6 +235,7 @@ impl TransactionAuthenticator for ProxyKeystore {
                 // is not provisioned for this account, and signing it from
                 // anywhere else would defeat the custody boundary.
                 let identifier = backend.directory.identifier(pub_key).ok_or_else(|| {
+                    metrics::counter!("remote_signer_signature_failures_total").increment(1);
                     AuthenticationError::other(format!(
                         "remote signer does not hold the key for {pub_key:?}; refusing to sign \
                          (remote-signing mode never falls back to a local key — provision this \
@@ -247,11 +248,18 @@ impl TransactionAuthenticator for ProxyKeystore {
                     .client
                     .sign(identifier, signing_info.to_commitment())
                     .await
+                    .inspect_err(|_| {
+                        // Signer loss AFTER startup is otherwise invisible: the
+                        // boot check has already passed and there is no fallback
+                        // path to notice.
+                        metrics::counter!("remote_signer_signature_failures_total").increment(1);
+                    })
                     .map_err(|err| {
                         AuthenticationError::other(format!(
                             "remote signer failed to sign for {identifier}: {err:#}"
                         ))
                     })?;
+                metrics::counter!("remote_signer_signatures_total").increment(1);
                 Ok(Signature::EcdsaK256Keccak(signature))
             }
         }

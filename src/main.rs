@@ -276,6 +276,18 @@ struct Command {
     )]
     insecure_local_keystore: bool,
 
+    /// DANGEROUS: allow `--require-hardening` to accept a plain `http://` signer
+    /// endpoint on a non-local host. A KMS stops key EXTRACTION, but anyone who
+    /// can reach an unauthenticated signing API has a signing ORACLE, which is
+    /// the proxy's entire authority. Use `https://` (TLS/mTLS/service mesh) or
+    /// keep the signer on localhost / a private sidecar instead.
+    #[arg(
+        long,
+        env = "AGGLAYER_INSECURE_SIGNER_TRANSPORT",
+        default_value_t = false
+    )]
+    insecure_signer_transport: bool,
+
     /// Bind an operator role to a specific signer key: `--signer-key
     /// <role>=<identifier>`, repeatable. Roles: `service`, `ger-manager`.
     ///
@@ -322,6 +334,20 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
         return Ok(());
     }
     let mut reasons = Vec::new();
+    if let Some(signer_url) = command.signer_url.as_deref()
+        && !command.insecure_signer_transport
+        && miden_agglayer_service::remote_signer::classify_signer_transport(signer_url)
+            == miden_agglayer_service::remote_signer::SignerTransport::UnauthenticatedRemote
+    {
+        reasons.push(
+            "  - --signer-url points at a plain http:// endpoint on a non-local host. \
+             A KMS prevents key extraction, but an unauthenticated signing API reachable \
+             over the network IS a signing oracle. Use https:// (TLS/mTLS/service mesh), \
+             or keep the signer on localhost / a private sidecar. \
+             --insecure-signer-transport overrides this for development."
+                .to_string(),
+        );
+    }
     if command.admin_api_key.is_none() {
         reasons.push(
             "  - --admin-api-key is unset (admin_* methods would be open). \
@@ -599,6 +625,7 @@ impl std::fmt::Debug for Command {
             .field("allowed_signers", &self.allowed_signers)
             .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
             .field("insecure_local_keystore", &self.insecure_local_keystore)
+            .field("insecure_signer_transport", &self.insecure_signer_transport)
             .field(
                 "signer_keys",
                 &self
@@ -1521,6 +1548,7 @@ mod hardening_tests {
             miden_api_key: None,
             signer_url: None,
             insecure_local_keystore: true,
+            insecure_signer_transport: false,
             signer_keys: Vec::new(),
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
