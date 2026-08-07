@@ -63,7 +63,7 @@ FAUCET2=$(iso_tool --create-native-faucet --native-symbol "PL2" --native-decimal
 [[ -n "$FAUCET2" ]] || fail "second native faucet deploy failed"
 RESP2=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"miden_registerNativeFaucet\",
   \"params\":[{\"faucet_id\":\"$FAUCET2\",\"origin_token_address\":\"$SQUAT\",
-    \"symbol\":\"HAX\",\"decimals\":18}]}") || fail "second registration unreachable"
+    \"symbol\":\"XXX\",\"decimals\":18}]}") || fail "second registration unreachable"
 ORIGIN2=$(echo "$RESP2" | jq_field origin_token_address)
 SYMBOL2=$(echo "$RESP2" | jq_field symbol)
 [[ "$ORIGIN2" != "$SQUAT" ]] \
