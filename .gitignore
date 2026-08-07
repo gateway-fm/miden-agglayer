@@ -50,3 +50,5 @@ fixtures/bridge-config-l2b.toml
 fixtures/l2b/gas_token.env
 *-up.log
 anvil-l2b-watch.log
+fixtures/web3signer-keys/
+fixtures/web3signer-keys.env

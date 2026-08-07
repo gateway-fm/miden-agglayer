@@ -178,6 +178,44 @@ to a plain-fungible view when the AggLayer decode fails, so trusting it would le
 a drifted bridge-owned faucet be silently reclassified as a benign native one —
 the blindness this monitor exists to prevent.
 
+## Remote signer (KMS custody)
+
+When `--signer-url` is set, every account signature leaves this host. The proxy
+never falls back to a local key, so losing the signer stalls claims and GER
+injection outright — and the fail-closed startup check only covers boot.
+
+| Metric | Meaning |
+|---|---|
+| `remote_signer_signatures_total` | Signatures the signer produced. |
+| `remote_signer_signature_failures_total` | Signatures it failed to produce (unreachable, refused, or no key for the requested commitment). |
+
+Alert on the RATE, not the absolute value. A counter never returns to zero, so
+"sustained non-zero" would page forever after a single transient failure:
+
+```promql
+# signing is failing NOW
+increase(remote_signer_signature_failures_total[5m]) > 0
+# ...and is not recovering: failures continuing while nothing succeeds
+increase(remote_signer_signature_failures_total[15m]) > 0
+  and increase(remote_signer_signatures_total[15m]) == 0
+```
+
+The second condition is the one that means custody is down rather than flaky.
+Treat a zero failure rate as meaningful ONLY while
+`increase(remote_signer_signatures_total[...])` is positive — otherwise "no
+failures" may just mean nothing is being signed at all.
+
+Transport: under `--require-hardening` the signer URL must be a **loopback**
+address. There is no override flag.
+
+`https://` is deliberately NOT sufficient for hardened deployments. It
+authenticates the *server* to us and encrypts the channel, but this client sends
+no certificate, token or other identity, so any caller that can reach the signing
+API still has a signing oracle — and a KMS only prevents key *extraction*, not
+key *use*. Until caller authentication is implemented, run Web3Signer (or an
+authenticated relay in front of it) on the same host/pod and point
+`--signer-url` at `127.0.0.1`.
+
 ## Bridge integrity: page on increase
 
 These counters represent fail-close integrity detections, not routine traffic:

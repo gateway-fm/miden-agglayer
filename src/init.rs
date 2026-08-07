@@ -3,15 +3,19 @@ use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::faucet_ops;
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
+use crate::proxy_keystore::ProxyKeystore;
+use crate::remote_signer::SignerRole;
+use anyhow::Context;
 use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
-use miden_client::keystore::{FilesystemKeyStore, Keystore};
+use miden_client::keystore::Keystore;
 use miden_client::transaction::TransactionRequestBuilder;
-use miden_protocol::account::auth::AuthSecretKey;
+use miden_protocol::account::auth::{AuthSecretKey, PublicKeyCommitment};
 use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
 use miden_standards::account::auth::{Approver, AuthSingleSig};
 use miden_standards::account::wallets::BasicWallet;
+use miden_tx::auth::TransactionAuthenticator;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -60,10 +64,52 @@ impl From<Accounts> for AccountsConfig {
 // with miden's own version (PR #160 review). What matters either way is that the
 // client's deterministic Felt coin is NOT a CryptoRng and must never be a
 // secp256k1 key source.
-pub fn create_auth_component() -> anyhow::Result<(AuthSingleSig, AuthSecretKey)> {
+// When a remote signer (`--signer-url`) is configured, the account is bound to
+// the key the operator named for THIS ROLE: we resolve that identifier against
+// the signer's key directory, fail if the signer does not expose it, build the
+// approver from it, and generate nothing locally — the secret never exists on
+// this host. The returned `AuthSecretKey` is `None` in that case, which is what
+// tells the caller there is no local key to store.
+//
+// The role→key mapping is an explicit operator contract. An earlier version took
+// `remote_commitments().first()`, but signer key ORDER is not a contract (it
+// shifts when keys are added, removed or rotated) and a single-key signer bound
+// every role to the same key — the opposite of blast-radius isolation.
+pub async fn create_auth_component(
+    keystore: &ProxyKeystore,
+    role: Option<SignerRole>,
+) -> anyhow::Result<(AuthSingleSig, Option<AuthSecretKey>)> {
+    if keystore.is_remote() {
+        let role = role.ok_or_else(|| {
+            anyhow::anyhow!(
+                "remote custody requires a signer role for every provisioned account, so each                  one binds to its own operator-named key"
+            )
+        })?;
+        let identifier = keystore.signer_key_identifier(role).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no signer key configured for role {}; pass --signer-key {}=<identifier>",
+                role.as_str(),
+                role.as_str()
+            )
+        })?;
+        let commitment = keystore.commitment_for_identifier(&identifier)?;
+        let public_key = keystore
+            .get_public_key(commitment)
+            .await
+            .context("remote signer listed a key commitment it cannot resolve to a public key")?;
+        tracing::info!(
+            target: crate::COMPONENT,
+            role = role.as_str(),
+            "binding a new account to the REMOTE signer key configured for this role — no secret              is generated locally"
+        );
+        return Ok((
+            AuthSingleSig::new(Approver::from(public_key.as_ref())),
+            None,
+        ));
+    }
     let key_pair = AuthSecretKey::new_ecdsa_k256_keccak();
     let auth_component = AuthSingleSig::new(Approver::from(&key_pair.public_key()));
-    Ok((auth_component, key_pair))
+    Ok((auth_component, Some(key_pair)))
 }
 
 async fn deploy_account(
@@ -100,7 +146,7 @@ async fn deploy_account(
 
 async fn add_bridge(
     client: &mut MidenClientLib,
-    _keystore: Arc<FilesystemKeyStore>,
+    _keystore: Arc<ProxyKeystore>,
     service_id: AccountId,
     ger_manager_id: AccountId,
     network_id: u32,
@@ -155,7 +201,8 @@ async fn add_faucet(
 
 async fn add_wallet(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
+    role: Option<SignerRole>,
 ) -> anyhow::Result<Account> {
     // Public storage mode is REQUIRED for the proxy's infrastructure accounts
     // (service, ger_manager) so a missing local sqlite row can
@@ -177,13 +224,22 @@ async fn add_wallet(
     // by users yet`. Public gives us the recovery property (state on-chain,
     // import-by-id works) without the network-tx-builder semantics, which
     // the proxy doesn't use anyway.
-    let (auth_component, key_pair) = create_auth_component()?;
+    let (auth_component, key_pair) = create_auth_component(keystore.as_ref(), role).await?;
+    // Capture the commitment BEFORE the component is moved into the builder, so
+    // the account↔key binding can be recorded once the id exists.
+    let bound_commitment = auth_component.approver().pub_key();
     let account = Account::builder(client.rng().draw_word().into())
         .account_type(AccountType::Public)
         .with_component(BasicWallet)
         .with_auth_component(auth_component)
         .build()?;
-    keystore.add_key(&key_pair, account.id()).await?;
+    // Remote custody: remember which signer key signs for this account. Local
+    // custody keeps its own index in the filesystem keystore, so this is a no-op.
+    keystore.bind_account(account.id(), bound_commitment);
+    // Remote-signer accounts have no local secret to persist.
+    if let Some(key_pair) = key_pair.as_ref() {
+        keystore.add_key(key_pair, account.id()).await?;
+    }
     client.add_account(&account, false).await?;
     Ok(account)
 }
@@ -218,20 +274,22 @@ pub(crate) async fn register_wallet_p2id_tag(
 /// is responsible for syncing afterwards to settle the account on the node.
 pub async fn create_standalone_wallet(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
 ) -> anyhow::Result<Account> {
-    let account = add_wallet(client, keystore).await?;
+    // Operator tooling (bridge-out-tool) provisions these in LOCAL custody; in
+    // remote custody this fails loudly rather than binding to an arbitrary key.
+    let account = add_wallet(client, keystore, None).await?;
     register_wallet_p2id_tag(client, account.id()).await?;
     Ok(account)
 }
 
 async fn add_accounts(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
     network_id: u32,
 ) -> anyhow::Result<Accounts> {
-    let service = add_wallet(client, keystore.clone()).await?;
-    let ger_manager = add_wallet(client, keystore.clone()).await?;
+    let service = add_wallet(client, keystore.clone(), Some(SignerRole::Service)).await?;
+    let ger_manager = add_wallet(client, keystore.clone(), Some(SignerRole::GerManager)).await?;
     deploy_account(client, ger_manager.id(), "ger_manager").await?;
     let bridge = add_bridge(
         client,
@@ -266,12 +324,42 @@ async fn add_accounts(
 
 async fn init_internal(
     client: &mut MidenClientLib,
-    keystore: Arc<FilesystemKeyStore>,
+    keystore: Arc<ProxyKeystore>,
     net_id: NetworkId,
     network_id: u32,
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
+    // PREFLIGHT before ANY init side effect (PR #162 review). Roles were
+    // previously resolved one at a time inside `create_auth_component`, so a
+    // fresh deployment could get half-way: a missing GER key left an ORPHAN
+    // service account, and one physical key given in two encodings created BOTH
+    // accounts (and deployed GER/bridge state) before phase-3 verification
+    // finally rejected it. Correcting the config cannot un-create those
+    // accounts. Resolve every configured identifier, and enforce commitment
+    // uniqueness, while failing is still free.
+    if keystore.is_remote() {
+        let resolved = keystore.resolve_role_commitments().context(
+            "signer key preflight failed BEFORE any account was created (nothing was \
+             provisioned; fix --signer-key and retry)",
+        )?;
+        for role in crate::remote_signer::SignerRole::all() {
+            if !resolved.contains_key(&role) {
+                anyhow::bail!(
+                    "no signer key configured for role {}; pass --signer-key {}=<identifier>. \
+                     Refusing to create ANY account: a partial provision would leave orphan \
+                     accounts that correcting the config cannot repair.",
+                    role.as_str(),
+                    role.as_str()
+                );
+            }
+        }
+        tracing::info!(
+            target: crate::COMPONENT,
+            roles = resolved.len(),
+            "signer key preflight passed — every role resolves to a distinct key the signer holds"
+        );
+    }
     let accounts = add_accounts(client, keystore, network_id).await?;
 
     // Wait for the NTX builder to process account creation transactions
@@ -320,10 +408,128 @@ pub async fn init(
     Ok(result.get().unwrap().clone())
 }
 
+/// Rebuilds and VERIFIES the account↔signer-key bindings on every serving
+/// startup (PR #162 review).
+///
+/// # Why this must run outside init
+///
+/// `bind_account` only ran while phase-1 init was creating accounts, against a
+/// temporary client that is then shut down. The serving process builds a fresh
+/// keystore, and a normal restart skips init entirely — so the binding map was
+/// empty exactly when it mattered and `verify_bound_accounts` had nothing to
+/// check. A verification that only runs on the one boot that creates the
+/// accounts is not a verification.
+///
+/// # Why the deployed account is the source of truth
+///
+/// Inserting the CONFIGURED commitment and then checking it would be circular:
+/// it proves the config agrees with itself. What matters is that the account
+/// actually deployed on chain is signed for by the key the operator configured
+/// AND that the signer still holds it. So for each role we read the account's
+/// real auth commitment out of its `AuthSingleSig` storage slot and require all
+/// three to agree.
+pub async fn verify_remote_bindings(
+    client: &mut MidenClientLib,
+    keystore: &ProxyKeystore,
+    accounts: &crate::accounts_config::AccountsConfig,
+) -> anyhow::Result<usize> {
+    use miden_standards::account::auth::AuthSingleSig;
+
+    if !keystore.is_remote() {
+        return Ok(0);
+    }
+
+    let configured = keystore.resolve_role_commitments()?;
+    let mut roles: Vec<(SignerRole, AccountId)> = vec![(SignerRole::Service, accounts.service.0)];
+    if let Some(ger) = accounts.ger_manager.as_ref() {
+        roles.push((SignerRole::GerManager, ger.0));
+    }
+
+    for (role, account_id) in roles {
+        let expected = configured.get(&role).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no signer key configured for role {}; pass --signer-key {}=<identifier>",
+                role.as_str(),
+                role.as_str()
+            )
+        })?;
+
+        // Import-by-id so a restart with a cold local store still verifies
+        // against real on-chain state rather than skipping the check.
+        if client
+            .get_account(account_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            client.import_account_by_id(account_id).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot read the deployed {} account {account_id} to verify its signer key: {e}",
+                    role.as_str()
+                )
+            })?;
+        }
+        let account = client
+            .get_account(account_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_account({account_id}): {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the deployed {} account {account_id} is unavailable; cannot verify custody",
+                    role.as_str()
+                )
+            })?;
+
+        let deployed: PublicKeyCommitment = account
+            .storage()
+            .get_item(AuthSingleSig::public_key_slot())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot read the auth key slot of the deployed {} account {account_id}: {e}",
+                    role.as_str()
+                )
+            })?
+            .into();
+
+        if deployed != expected {
+            anyhow::bail!(
+                "the deployed {} account {account_id} is signed for by a DIFFERENT key than \
+                 --signer-key configures for that role. This deployment cannot sign for it. \
+                 Either the signer/config was changed after the account was created, or this \
+                 store was restored against the wrong signer.",
+                role.as_str()
+            );
+        }
+        keystore.bind_account(account_id, deployed);
+    }
+
+    let verified = keystore.verify_bound_accounts()?;
+    // Stable, format-independent signal. Log FIELD rendering depends on the
+    // tracing subscriber's formatter, so an e2e that greps `accounts: 2` (or
+    // `accounts=2`) is asserting on a formatting detail rather than on the
+    // property (PR #162 review).
+    metrics::gauge!("remote_signer_verified_accounts").set(verified as f64);
+    tracing::info!(
+        target: crate::COMPONENT,
+        accounts = verified,
+        "remote custody verified: every configured account's deployed auth key is the one \
+         --signer-key names, and the signer still holds it"
+    );
+    Ok(verified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use miden_protocol::account::auth::AuthScheme;
+
+    fn local_keystore() -> crate::proxy_keystore::ProxyKeystore {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        crate::proxy_keystore::ProxyKeystore::local(
+            miden_client::keystore::FilesystemKeyStore::new(dir).expect("filesystem keystore"),
+        )
+    }
 
     /// PR #160 review: this branch's ONLY security-sensitive behaviour is which
     /// signature scheme newly provisioned operator accounts are deployed with,
@@ -335,9 +541,17 @@ mod tests {
     ///   * the secret key we persist is EcdsaK256Keccak;
     ///   * the auth component advertises EcdsaK256Keccak; and
     ///   * the component's approver commits to THAT key, not another.
-    #[test]
-    fn create_auth_component_pins_ecdsa_k256_keccak() {
-        let (component, key_pair) = create_auth_component().expect("auth component");
+    /// On this branch `create_auth_component` is signer-aware, so the test runs
+    /// it in LOCAL custody — the only mode that generates a key here at all. In
+    /// remote custody the approver comes from the signer and there is no local
+    /// secret to pin (that path is covered by `proxy_keystore`'s tests).
+    #[tokio::test]
+    async fn create_auth_component_pins_ecdsa_k256_keccak() {
+        let keystore = local_keystore();
+        let (component, key_pair) = create_auth_component(&keystore, None)
+            .await
+            .expect("auth component");
+        let key_pair = key_pair.expect("local custody must generate a local key");
 
         assert_eq!(
             key_pair.auth_scheme(),
@@ -363,10 +577,17 @@ mod tests {
     /// test: a single inequality cannot demonstrate that an RNG is sound, only
     /// that two draws differed. What it does catch is the concrete mistake of
     /// binding every account to one shared key.
-    #[test]
-    fn create_auth_component_draws_fresh_key_material() {
-        let (a, ka) = create_auth_component().expect("first");
-        let (b, kb) = create_auth_component().expect("second");
+    #[tokio::test]
+    async fn create_auth_component_draws_fresh_key_material() {
+        let keystore = local_keystore();
+        let (a, ka) = create_auth_component(&keystore, None).await.expect("first");
+        let (b, kb) = create_auth_component(&keystore, None)
+            .await
+            .expect("second");
+        let (ka, kb) = (
+            ka.expect("local custody generates a key"),
+            kb.expect("local custody generates a key"),
+        );
         assert_ne!(
             ka.public_key().to_commitment(),
             kb.public_key().to_commitment(),

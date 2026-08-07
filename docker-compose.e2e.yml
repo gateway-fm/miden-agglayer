@@ -243,6 +243,13 @@ services:
       # external prover is actually exercised (assert
       # miden_proof_generations_total{outcome="ok"} > 0, no local fallback).
       MIDEN_PROVER_URL: "${MIDEN_PROVER_URL:-http://tx-prover:50051}"
+      # Key custody is an explicit choice and remote signing is the default
+      # (see src/proxy_keystore.rs). The base e2e stack keeps keys on disk, so
+      # it says so HERE rather than on the command line: docker compose replaces
+      # `command` wholesale, so a command-line flag would force every overlay
+      # (l2l2, web3signer) to restate the full command and risk dropping each
+      # other's flags. An env var merges instead.
+      AGGLAYER_INSECURE_LOCAL_KEYSTORE: "${AGGLAYER_INSECURE_LOCAL_KEYSTORE:-true}"
       # Force all tmp I/O onto the bind-mounted dir so rocksdb / rusqlite
       # atomic-rename operations stay on the same device. Without this,
       # miden-client's on-disk store fails at startup with
