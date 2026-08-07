@@ -856,11 +856,12 @@ mod key_binding_tests {
 /// deployment could point at a signer across the network with no authentication
 /// and no transport integrity, and nothing would object.
 ///
-/// Rather than invent an auth scheme, this enforces the KISS boundary the review
-/// asked for: either the signer is reachable only from this host / a
-/// private-sidecar address (no network exposure to authenticate), or the
-/// transport is `https` (TLS/mTLS/service-mesh terminated). Anything else is a
-/// deliberate insecure-dev opt-in.
+/// This enum is a TRANSPORT CLASSIFICATION, not an authorization decision.
+/// `Tls` records that the channel is encrypted and the SERVER authenticated —
+/// it does NOT mean hardening accepts it. `hardening_signer_rejection` accepts
+/// only `PrivateSidecar` (genuine loopback), because this client presents no
+/// identity to the signer, so an `https` endpoint reachable by others is still
+/// a signing oracle. There is no insecure override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignerTransport {
     /// `https://` — the SERVER is authenticated and the channel encrypted, but
@@ -994,12 +995,19 @@ mod transport_gate_tests {
         }
     }
 
-    /// TLS terminates the concern (mTLS/service mesh included).
+    /// `https` CLASSIFIES as Tls — that is a statement about the transport, not
+    /// about acceptance. Hardening still rejects it (see
+    /// `hardening_accepts_only_loopback`), because server authentication is not
+    /// caller authentication.
     #[test]
-    fn https_is_accepted() {
+    fn https_classifies_as_tls_but_is_not_a_hardened_boundary() {
         assert_eq!(
             classify_signer_transport("https://signer.example.com:9000"),
             SignerTransport::Tls
+        );
+        assert!(
+            hardening_signer_rejection(Some("https://signer.example.com:9000")).is_some(),
+            "classification as Tls must NOT imply hardening accepts it"
         );
     }
 

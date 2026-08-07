@@ -206,9 +206,7 @@ Treat a zero failure rate as meaningful ONLY while
 failures" may just mean nothing is being signed at all.
 
 Transport: under `--require-hardening` the signer URL must be a **loopback**
-address, and `--insecure-signer-transport` is **rejected** (it does not override
-the rule — a mode that claims to be hardened while an escape hatch is active is a
-misleading claim; drop `--require-hardening` if you need that flag).
+address. There is no override flag.
 
 `https://` is deliberately NOT sufficient for hardened deployments. It
 authenticates the *server* to us and encrypts the channel, but this client sends

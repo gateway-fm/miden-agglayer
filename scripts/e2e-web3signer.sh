@@ -163,6 +163,10 @@ proxy_metric() {
 }
 FAILS_BEFORE_OUTAGE="$(proxy_metric remote_signer_signature_failures_total)"
 docker stop "$SIGNER" >/dev/null 2>&1 || fail "could not stop the signer"
+# Safety net only — the real restore happens after the recovery baseline. This
+# exists so a failing assertion between here and there cannot leave the signer
+# down for whatever runs next.
+trap 'docker start "$SIGNER" >/dev/null 2>&1 || true' EXIT
 NEG_START="$(date -u +%s)"
 
 ./scripts/e2e-l1-to-l2.sh > /tmp/e2e-web3signer-neg.log 2>&1 &
@@ -182,11 +186,13 @@ for _ in $(seq 1 90); do
     sleep 2
 done
 
-# Stop driving traffic and restore the signer before asserting, so a failure
-# here never leaves the stack wedged for whatever runs next.
+# Stop driving traffic. The signer is deliberately NOT restarted here: doing so
+# left a window between the restore and the recovery baseline in which a pending
+# retry could sign, which is exactly the false-pass this baseline exists to
+# prevent. The EXIT trap set when we stopped it guarantees the stack is not left
+# wedged if an assertion below fails.
 kill "$NEG_PID" 2>/dev/null || true
 wait "$NEG_PID" 2>/dev/null || true
-docker start "$SIGNER" >/dev/null 2>&1 || true
 
 # The message names BOTH possibilities rather than asserting a fallback as
 # fact: a control that cannot distinguish "never tried to sign" from "signed
@@ -213,7 +219,8 @@ pass "signer outage is visible in metrics (failures ${FAILS_BEFORE_OUTAGE} -> ${
 # signature can land, which would make the recovery check pass instantly even if
 # signing never resumed (PR #162 review).
 SIGS_BEFORE_RECOVERY="$(proxy_metric remote_signer_signatures_total)"
-docker start "$SIGNER" >/dev/null 2>&1 || true
+docker start "$SIGNER" >/dev/null 2>&1 || fail "could not restart the signer"
+trap - EXIT
 log "asserting signing RESUMES now that the signer is back"
 RECOVERED=""
 for _ in $(seq 1 45); do

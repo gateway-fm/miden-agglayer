@@ -1555,9 +1555,14 @@ mod hardening_tests {
             reject_zero_padding_addresses: false,
             require_hardening: require,
             miden_api_key: None,
-            signer_url: None,
-            insecure_local_keystore: true,
-            signer_keys: Vec::new(),
+            // A hardened config uses REMOTE custody on a loopback signer. The
+            // fixture previously set insecure_local_keystore=true, which trips
+            // the custody invariant and shifted every expected reason count by
+            // one — invisible because `make test-unit` runs --lib and these
+            // tests live in the binary (PR #162 review).
+            insecure_local_keystore: false,
+            signer_url: Some("http://127.0.0.1:9000".into()),
+            signer_keys: vec!["service=0xaaa".into(), "ger-manager=0xbbb".into()],
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
