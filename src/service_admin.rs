@@ -1053,7 +1053,7 @@ pub async fn miden_register_native_faucet(
     if let Some(existing) = state.store.get_faucet_by_id(faucet_id).await? {
         if existing.origin_address != origin_address || existing.origin_network != origin_network {
             anyhow::bail!(
-                "miden_registerNativeFaucet: faucet {} is already registered with a DIFFERENT \
+                "miden_registerNativeFaucet: faucet {} is already registered with a different \
                  origin identity (network {}), which this method cannot change. It was likely \
                  registered through the admin API with an operator-chosen address; use that API \
                  to modify it. No state was changed.",
@@ -1111,7 +1111,7 @@ pub async fn miden_register_native_faucet(
                 if kind != faucet_ops::FaucetKind::NativeFungible {
                     anyhow::bail!(
                         "miden_registerNativeFaucet: faucet {faucet_id} is not an operator-owned \
-                         native faucet (it is {kind:?}); only Miden-ORIGINATED tokens can be \
+                         native faucet (it is {kind:?}); only Miden-originated tokens can be \
                          registered this way"
                     );
                 }

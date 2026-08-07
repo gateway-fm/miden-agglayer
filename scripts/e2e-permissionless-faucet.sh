@@ -106,8 +106,13 @@ if [[ -n "$ADMIN_REGISTERED" ]]; then
   BEFORE=$(pgq "SELECT origin_address FROM faucet_registry WHERE lower(faucet_id)=lower('$ADMIN_REGISTERED');")
   RESP4=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"miden_registerNativeFaucet\",
     \"params\":[{\"faucet_id\":\"$ADMIN_REGISTERED\"}]}")
-  echo "$RESP4" | grep -qi "different origin" \
+  # Match on wording that survives the RPC error redactor. It scrubs any
+  # ALL-CAPS word of 4+ chars as a suspected env var, so emphasis words are not
+  # safe anchors — "DIFFERENT" came back as "<redacted>" and false-failed this.
+  echo "$RESP4" | grep -qi "cannot change" \
     || fail "permissionless rebind of an admin-registered faucet was not refused: $RESP4"
+  echo "$RESP4" | grep -qi "no state was changed" \
+    || fail "the refusal did not state that no state changed: $RESP4"
   AFTER=$(pgq "SELECT origin_address FROM faucet_registry WHERE lower(faucet_id)=lower('$ADMIN_REGISTERED');")
   [[ "$BEFORE" == "$AFTER" ]] \
     || fail "the refused rebind CHANGED state ($BEFORE -> $AFTER); conflicts must not mutate"
