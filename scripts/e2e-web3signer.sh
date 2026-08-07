@@ -272,5 +272,83 @@ SIGS_AFTER_RESTART_OP="$(proxy_metric remote_signer_signatures_total)"
 (${SIGS_BEFORE_RESTART_OP} -> ${SIGS_AFTER_RESTART_OP}) — signing did not survive the restart"
 pass "post-restart deposit signed remotely (signatures ${SIGS_BEFORE_RESTART_OP} -> ${SIGS_AFTER_RESTART_OP})"
 
+# ── 8. DEPLOYED-vs-CONFIGURED mismatch must refuse to serve ──────────────────
+# The accounts on chain are signed for by the key --signer-key names. Config is
+# cheap to change; a deployed account's auth key is not. If they ever disagree,
+# the proxy holds a configuration claiming authority over an account it
+# fundamentally CANNOT sign for — and without this check that looks perfectly
+# healthy at boot and fails at the first claim or GER injection.
+#
+# Real ways to reach it: a store restored against the wrong signer, a key rotated
+# in the KMS after deployment, an edited --signer-key, or a config copied between
+# environments. Reproduce it honestly: give the signer a SPARE key it genuinely
+# holds, then point the service role at that spare while the deployed account
+# still uses the original. Nothing is malformed — only the binding is wrong,
+# which is exactly why only comparing the DEPLOYED commitment can catch it.
+log "negative: pointing a role at a key the deployed account does NOT use"
+SPARE_WALLET="$(cast wallet new)"
+SPARE_PRIV="$(echo "$SPARE_WALLET" | awk '/Private key:/ {print $3}' | sed 's/^0x//')"
+SPARE_ADDR="$(echo "$SPARE_WALLET" | awk '/Address:/ {print $2}')"
+[ -n "$SPARE_PRIV" ] || fail "could not generate a spare key"
+# `spare-` is not a role name, so gen-web3signer-keys.sh ignores it for binding
+# while Web3Signer still loads and serves it.
+cat > "fixtures/web3signer-keys/spare-${SPARE_ADDR}.yaml" <<SPAREEOF
+type: file-raw
+keyType: SECP256K1
+privateKey: "0x${SPARE_PRIV}"
+SPAREEOF
+chmod 600 "fixtures/web3signer-keys/spare-${SPARE_ADDR}.yaml"
+cleanup_spare() { rm -f "fixtures/web3signer-keys/spare-${SPARE_ADDR}.yaml"; }
+trap cleanup_spare EXIT
+
+"${COMPOSE[@]}" restart web3signer >/dev/null 2>&1 || fail "could not reload the signer"
+for _ in $(seq 1 60); do
+    curl -sf "$SIGNER_URL/api/v1/eth1/publicKeys" 2>/dev/null | grep -q '0x' && break
+    sleep 2
+done
+SPARE_PUB="$(cast wallet public-key --private-key "0x${SPARE_PRIV}" 2>/dev/null)"
+[ -n "$SPARE_PUB" ] || fail "could not derive the spare public key"
+
+GER_BINDING="$(printf '%s' "$AGGLAYER_SIGNER_KEYS" | tr ',' '\n' | grep '^ger-manager=')"
+MISMATCH_TS="$(date -u +%s)"
+AGGLAYER_SIGNER_KEYS="service=${SPARE_PUB},${GER_BINDING}" \
+    "${COMPOSE[@]}" up -d --force-recreate --no-deps miden-agglayer >/dev/null 2>&1 || true
+
+# It must NOT become healthy: serving here would mean accepting an account it
+# cannot sign for.
+BECAME_HEALTHY=""
+for _ in $(seq 1 30); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] \
+        && { BECAME_HEALTHY=1; break; }
+    sleep 2
+done
+MISMATCH_LOG="$(docker logs "$PROXY" --since "$MISMATCH_TS" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')"
+
+# Restore the correct binding first, so a failed assertion cannot leave the
+# stack wedged for whatever runs next.
+"${COMPOSE[@]}" up -d --force-recreate --no-deps miden-agglayer >/dev/null 2>&1 || true
+
+[ -z "$BECAME_HEALTHY" ] \
+    || fail "the proxy served normally while a role was bound to a key the DEPLOYED account does \
+not use — it cannot sign for that account, so this would fail at the first claim instead of at \
+startup"
+case "$MISMATCH_LOG" in
+    *"signed for by a DIFFERENT key"*) ;;
+    *) fail "the proxy refused to start but not for the deployed-vs-configured mismatch; the \
+operator would have no idea which account or key is wrong. Log tail: $(printf '%s' \
+"$MISMATCH_LOG" | tail -5)" ;;
+esac
+pass "a role bound to the wrong key is refused at STARTUP, naming the account and the cause"
+
+for _ in $(seq 1 90); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] && break
+    sleep 2
+done
+[ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] \
+    || fail "the proxy did not recover after the correct binding was restored"
+cleanup_spare
+trap - EXIT
+pass "restoring the correct binding brings the proxy back — the refusal is not sticky"
+
 echo ""
 pass "WEB3SIGNER E2E COMPLETE — remote custody proven: no local secret, full deposit remote-signed, and signing provably depends on the signer"
