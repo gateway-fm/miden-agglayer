@@ -276,11 +276,16 @@ struct Command {
     )]
     insecure_local_keystore: bool,
 
-    /// DANGEROUS: allow `--require-hardening` to accept a plain `http://` signer
-    /// endpoint on a non-local host. A KMS stops key EXTRACTION, but anyone who
-    /// can reach an unauthenticated signing API has a signing ORACLE, which is
-    /// the proxy's entire authority. Use `https://` (TLS/mTLS/service mesh) or
-    /// keep the signer on localhost / a private sidecar instead.
+    /// DANGEROUS, development only: allow a non-loopback signer endpoint.
+    ///
+    /// This does NOT relax `--require-hardening` — hardening REJECTS this flag
+    /// outright, because a mode that claims to be hardened while an escape hatch
+    /// is active is a misleading claim. Use it only on deployments that do not
+    /// pass `--require-hardening`.
+    ///
+    /// A KMS stops key EXTRACTION; it does nothing about a reachable signing API,
+    /// which is a signing ORACLE. Note this client presents no identity to the
+    /// signer, so `https` authenticates the server to us and not us to it.
     #[arg(
         long,
         env = "AGGLAYER_INSECURE_SIGNER_TRANSPORT",
@@ -347,17 +352,23 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
                 .to_string(),
         );
     }
+    // Hardening requires an actually authenticated boundary. `https` gives
+    // SERVER authentication only — this client sends no certificate, token or
+    // other identity, so every other caller that can reach the signer keeps the
+    // signing oracle. Until caller authentication exists, the only honest
+    // boundary we can enforce is genuine loopback (same host/pod), so that is
+    // what hardening demands (PR #162 review).
     if let Some(signer_url) = command.signer_url.as_deref()
         && miden_agglayer_service::remote_signer::classify_signer_transport(signer_url)
-            == miden_agglayer_service::remote_signer::SignerTransport::UnauthenticatedRemote
+            != miden_agglayer_service::remote_signer::SignerTransport::PrivateSidecar
     {
         reasons.push(
-            "  - --signer-url points at a plain http:// endpoint on a non-local host. \
-             A KMS prevents key extraction, but an unauthenticated signing API reachable \
-             over the network IS a signing oracle. Use https:// (TLS/mTLS/service mesh), \
-             or keep the signer on a loopback address (a same-pod sidecar can). \
-             Note https authenticates the SERVER only — this client presents no identity, so \
-             terminate mTLS/service-mesh auth in front of the signer."
+            "  - --signer-url is not a loopback address. A KMS prevents key EXTRACTION, but \
+             any caller that can reach the signing API has a signing ORACLE, and this client \
+             authenticates itself to the signer in no way at all — https proves only that WE \
+             authenticated the SERVER. Until caller authentication (mTLS client cert / token) \
+             is implemented, run Web3Signer (or an authenticated relay) on the same host/pod \
+             and point --signer-url at 127.0.0.1."
                 .to_string(),
         );
     }

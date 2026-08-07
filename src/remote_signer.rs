@@ -781,6 +781,26 @@ mod key_binding_tests {
         );
     }
 
+    /// PR #162: a partially-configured signer must fail BEFORE provisioning.
+    ///
+    /// The init preflight resolves every role up front precisely so this state
+    /// cannot get half-way: previously each role resolved independently while
+    /// accounts were being created, so a missing GER key left an ORPHAN service
+    /// account that fixing the config could not un-create.
+    #[test]
+    fn missing_role_key_is_detected_before_any_account_exists() {
+        let partial = b(&["service=0xaaa"]).expect("parse");
+        assert_eq!(
+            partial.missing_roles(),
+            vec![SignerRole::GerManager],
+            "the preflight must see the gap while failing is still free"
+        );
+        assert!(
+            CustodyMode::resolve(Some("http://127.0.0.1:9000"), false, partial).is_err(),
+            "remote custody must refuse to start with a role unbound"
+        );
+    }
+
     /// An identifier the signer does not expose must fail loudly.
     #[test]
     fn unknown_identifier_is_rejected() {
@@ -843,7 +863,9 @@ mod key_binding_tests {
 /// deliberate insecure-dev opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignerTransport {
-    /// `https://` — authenticated/encrypted transport.
+    /// `https://` — the SERVER is authenticated and the channel encrypted, but
+    /// this client presents no identity, so any other caller with network reach
+    /// can still use the signing API. NOT a custody boundary on its own.
     Tls,
     /// Loopback or a compose-style private sidecar host: no network exposure.
     PrivateSidecar,
@@ -860,8 +882,8 @@ pub enum SignerTransport {
 /// is reachable by every other workload on that network, which is not the
 /// same-pod guarantee the classification implied (PR #162 review).
 ///
-/// Plaintext is now permitted ONLY for a genuine loopback address, which a
-/// same-pod sidecar can use. Everything else must be `https`.
+/// Plaintext is permitted ONLY for a genuine loopback address, which a same-pod
+/// sidecar can use.
 pub fn classify_signer_transport(base_url: &str) -> SignerTransport {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
         return SignerTransport::UnauthenticatedRemote;

@@ -154,6 +154,15 @@ pass "the signer served $SIGNED signing request(s) during the deposit (counter $
 # deposit, whose claim drew 4 signatures. With the signer down, the proxy must
 # report a signing failure on that path.
 log "negative control: stopping the signer — account signing must now fail"
+# Baselines captured BEFORE the outage. Taking the success baseline after
+# `docker start` races a fast recovered retry: the retry can advance the counter
+# before the baseline is read, after which recovery looks stuck.
+proxy_metric() {
+    curl -s "http://127.0.0.1:8546/metrics" 2>/dev/null \
+        | awk -v m="$1" '$1 == m {print $2; found=1} END {if (!found) print 0}'
+}
+FAILS_BEFORE_OUTAGE="$(proxy_metric remote_signer_signature_failures_total)"
+SIGS_BEFORE_RECOVERY="$(proxy_metric remote_signer_signatures_total)"
 docker stop "$SIGNER" >/dev/null 2>&1 || fail "could not stop the signer"
 NEG_START="$(date -u +%s)"
 
@@ -192,18 +201,15 @@ pass "with the signer down, account signing fails — signatures genuinely come 
 # untested: the failure must show up in metrics (that is what pages someone) and
 # the system must come back once the signer returns. A custody feature that
 # fails visibly but never recovers is not usable.
-proxy_metric() {
-    curl -s "http://127.0.0.1:8546/metrics" 2>/dev/null \
-        | awk -v m="$1" '$1 == m {print $2; found=1} END {if (!found) print 0}'
-}
 FAILS_AFTER_OUTAGE="$(proxy_metric remote_signer_signature_failures_total)"
-[ "${FAILS_AFTER_OUTAGE%%.*}" -gt 0 ] \
-    || fail "the signer outage produced no remote_signer_signature_failures_total — the outage \
-would be invisible to monitoring"
-pass "signer outage is visible in metrics (failures=${FAILS_AFTER_OUTAGE})"
+# DELTA, not "> 0": an absolute threshold can be satisfied by a failure from
+# earlier in the run, which would let a completely unobserved outage pass.
+[ "$(( ${FAILS_AFTER_OUTAGE%%.*} - ${FAILS_BEFORE_OUTAGE%%.*} ))" -gt 0 ] \
+    || fail "the signer outage did not advance remote_signer_signature_failures_total \
+(${FAILS_BEFORE_OUTAGE} -> ${FAILS_AFTER_OUTAGE}) — the outage would be invisible to monitoring"
+pass "signer outage is visible in metrics (failures ${FAILS_BEFORE_OUTAGE} -> ${FAILS_AFTER_OUTAGE})"
 
 log "asserting signing RESUMES now that the signer is back"
-SIGS_BEFORE_RECOVERY="$(proxy_metric remote_signer_signatures_total)"
 RECOVERED=""
 for _ in $(seq 1 45); do
     NOW="$(proxy_metric remote_signer_signatures_total)"
@@ -214,6 +220,49 @@ done
     || fail "signing did not resume after the signer came back (successes stuck at \
 ${SIGS_BEFORE_RECOVERY}) — the outage is unrecoverable without a restart"
 pass "signing resumed after the signer returned — the outage is self-healing"
+
+# ── 7. PROXY RESTART on persisted state — the exact lifecycle that was broken ──
+# The defect this suite exists to catch was NOT signer loss: it was that the
+# account↔key verification ran only in the temporary phase-1 init client and was
+# absent from the serving process and from every subsequent restart. Restarting
+# the SIGNER never exercised that. So restart the PROXY against its persisted
+# account/node state, require it to re-verify BOTH role bindings on the way up,
+# and then drive a real signed operation to prove it can still sign.
+log "restarting the PROXY on persisted state — bindings must re-verify on the way up"
+RESTART_TS="$(date -u +%s)"
+docker restart "$PROXY" >/dev/null 2>&1 || fail "could not restart the proxy"
+for _ in $(seq 1 90); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] && break
+    sleep 2
+done
+[ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] \
+    || { docker logs --since "$RESTART_TS" "$PROXY" 2>&1 | tail -20
+         fail "the proxy did not come back healthy after a restart on persisted state"; }
+
+RESTART_LOG="$(docker logs "$PROXY" --since "$RESTART_TS" 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')"
+case "$RESTART_LOG" in
+    *"remote custody verified"*) ;;
+    *) fail "the proxy restarted WITHOUT re-verifying its account↔signer-key bindings — this is \
+the exact lifecycle hole the verification was added to close (init-only verification)" ;;
+esac
+# It must have verified BOTH roles, not just booted.
+case "$RESTART_LOG" in
+    *"accounts: 2"*) ;;
+    *) fail "the restart verified fewer than 2 accounts; both the service and ger-manager \
+bindings must be re-checked against the deployed accounts" ;;
+esac
+pass "proxy restart re-verified both role bindings against the deployed accounts"
+
+SIGS_BEFORE_RESTART_OP="$(proxy_metric remote_signer_signatures_total)"
+log "driving a signed operation after the restart"
+./scripts/e2e-l1-to-l2.sh > /tmp/e2e-web3signer-postrestart.log 2>&1 \
+    || { tail -20 /tmp/e2e-web3signer-postrestart.log
+         fail "the bridge could not complete a deposit after the proxy restart"; }
+SIGS_AFTER_RESTART_OP="$(proxy_metric remote_signer_signatures_total)"
+[ "$(( ${SIGS_AFTER_RESTART_OP%%.*} - ${SIGS_BEFORE_RESTART_OP%%.*} ))" -gt 0 ] \
+    || fail "the post-restart deposit produced no remote signatures \
+(${SIGS_BEFORE_RESTART_OP} -> ${SIGS_AFTER_RESTART_OP}) — signing did not survive the restart"
+pass "post-restart deposit signed remotely (signatures ${SIGS_BEFORE_RESTART_OP} -> ${SIGS_AFTER_RESTART_OP})"
 
 echo ""
 pass "WEB3SIGNER E2E COMPLETE — remote custody proven: no local secret, full deposit remote-signed, and signing provably depends on the signer"

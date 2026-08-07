@@ -330,6 +330,36 @@ async fn init_internal(
     miden_store_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     client.sync_state().await?;
+    // PREFLIGHT before ANY init side effect (PR #162 review). Roles were
+    // previously resolved one at a time inside `create_auth_component`, so a
+    // fresh deployment could get half-way: a missing GER key left an ORPHAN
+    // service account, and one physical key given in two encodings created BOTH
+    // accounts (and deployed GER/bridge state) before phase-3 verification
+    // finally rejected it. Correcting the config cannot un-create those
+    // accounts. Resolve every configured identifier, and enforce commitment
+    // uniqueness, while failing is still free.
+    if keystore.is_remote() {
+        let resolved = keystore.resolve_role_commitments().context(
+            "signer key preflight failed BEFORE any account was created (nothing was \
+             provisioned; fix --signer-key and retry)",
+        )?;
+        for role in crate::remote_signer::SignerRole::all() {
+            if !resolved.contains_key(&role) {
+                anyhow::bail!(
+                    "no signer key configured for role {}; pass --signer-key {}=<identifier>. \
+                     Refusing to create ANY account: a partial provision would leave orphan \
+                     accounts that correcting the config cannot repair.",
+                    role.as_str(),
+                    role.as_str()
+                );
+            }
+        }
+        tracing::info!(
+            target: crate::COMPONENT,
+            roles = resolved.len(),
+            "signer key preflight passed — every role resolves to a distinct key the signer holds"
+        );
+    }
     let accounts = add_accounts(client, keystore, network_id).await?;
 
     // Wait for the NTX builder to process account creation transactions

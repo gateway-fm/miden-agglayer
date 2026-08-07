@@ -205,11 +205,18 @@ Treat a zero failure rate as meaningful ONLY while
 `increase(remote_signer_signatures_total[...])` is positive — otherwise "no
 failures" may just mean nothing is being signed at all.
 
-Transport: under `--require-hardening` the signer URL must be `https://` or a
-loopback/private-sidecar host. A plain `http://` endpoint on a routable host is
-refused, because an unauthenticated signing API is a signing oracle regardless of
-where the key material lives. `--insecure-signer-transport` overrides this for
-development only.
+Transport: under `--require-hardening` the signer URL must be a **loopback**
+address, and `--insecure-signer-transport` is **rejected** (it does not override
+the rule — a mode that claims to be hardened while an escape hatch is active is a
+misleading claim; drop `--require-hardening` if you need that flag).
+
+`https://` is deliberately NOT sufficient for hardened deployments. It
+authenticates the *server* to us and encrypts the channel, but this client sends
+no certificate, token or other identity, so any caller that can reach the signing
+API still has a signing oracle — and a KMS only prevents key *extraction*, not
+key *use*. Until caller authentication is implemented, run Web3Signer (or an
+authenticated relay in front of it) on the same host/pod and point
+`--signer-url` at `127.0.0.1`.
 
 ## Bridge integrity: page on increase
 
