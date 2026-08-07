@@ -187,5 +187,33 @@ docker start "$SIGNER" >/dev/null 2>&1 || true
     || fail "with the signer DOWN the proxy never reported a signing failure. Either the trigger did not reach the signing path (harness bug — check /tmp/e2e-web3signer-neg.log), or the proxy signed without the signer, which would mean custody is not actually remote."
 pass "with the signer down, account signing fails — signatures genuinely come from the signer"
 
+# ── 6. the failure is OBSERVABLE, and signing RECOVERS ───────────────────────
+# A negative control that only proves "it broke" leaves the operator-facing half
+# untested: the failure must show up in metrics (that is what pages someone) and
+# the system must come back once the signer returns. A custody feature that
+# fails visibly but never recovers is not usable.
+proxy_metric() {
+    curl -s "http://127.0.0.1:8546/metrics" 2>/dev/null \
+        | awk -v m="$1" '$1 == m {print $2; found=1} END {if (!found) print 0}'
+}
+FAILS_AFTER_OUTAGE="$(proxy_metric remote_signer_signature_failures_total)"
+[ "${FAILS_AFTER_OUTAGE%%.*}" -gt 0 ] \
+    || fail "the signer outage produced no remote_signer_signature_failures_total — the outage \
+would be invisible to monitoring"
+pass "signer outage is visible in metrics (failures=${FAILS_AFTER_OUTAGE})"
+
+log "asserting signing RESUMES now that the signer is back"
+SIGS_BEFORE_RECOVERY="$(proxy_metric remote_signer_signatures_total)"
+RECOVERED=""
+for _ in $(seq 1 45); do
+    NOW="$(proxy_metric remote_signer_signatures_total)"
+    if [ "${NOW%%.*}" -gt "${SIGS_BEFORE_RECOVERY%%.*}" ]; then RECOVERED=1; break; fi
+    sleep 4
+done
+[ -n "$RECOVERED" ] \
+    || fail "signing did not resume after the signer came back (successes stuck at \
+${SIGS_BEFORE_RECOVERY}) — the outage is unrecoverable without a restart"
+pass "signing resumed after the signer returned — the outage is self-healing"
+
 echo ""
 pass "WEB3SIGNER E2E COMPLETE — remote custody proven: no local secret, full deposit remote-signed, and signing provably depends on the signer"

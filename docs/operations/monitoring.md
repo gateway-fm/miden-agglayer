@@ -189,9 +189,21 @@ injection outright — and the fail-closed startup check only covers boot.
 | `remote_signer_signatures_total` | Signatures the signer produced. |
 | `remote_signer_signature_failures_total` | Signatures it failed to produce (unreachable, refused, or no key for the requested commitment). |
 
-Alert on any sustained `remote_signer_signature_failures_total`, and treat a
-failures counter of zero as meaningful ONLY while `remote_signer_signatures_total`
-is advancing — otherwise "no failures" may just mean nothing is being signed.
+Alert on the RATE, not the absolute value. A counter never returns to zero, so
+"sustained non-zero" would page forever after a single transient failure:
+
+```promql
+# signing is failing NOW
+increase(remote_signer_signature_failures_total[5m]) > 0
+# ...and is not recovering: failures continuing while nothing succeeds
+increase(remote_signer_signature_failures_total[15m]) > 0
+  and increase(remote_signer_signatures_total[15m]) == 0
+```
+
+The second condition is the one that means custody is down rather than flaky.
+Treat a zero failure rate as meaningful ONLY while
+`increase(remote_signer_signatures_total[...])` is positive — otherwise "no
+failures" may just mean nothing is being signed at all.
 
 Transport: under `--require-hardening` the signer URL must be `https://` or a
 loopback/private-sidecar host. A plain `http://` endpoint on a routable host is

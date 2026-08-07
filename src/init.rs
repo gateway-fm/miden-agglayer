@@ -10,7 +10,7 @@ use miden_base_agglayer::{MetadataHash, create_bridge_account};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::Keystore;
 use miden_client::transaction::TransactionRequestBuilder;
-use miden_protocol::account::auth::AuthSecretKey;
+use miden_protocol::account::auth::{AuthSecretKey, PublicKeyCommitment};
 use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
 use miden_standards::account::auth::{Approver, AuthSingleSig};
@@ -376,6 +376,112 @@ pub async fn init(
     future.await?;
 
     Ok(result.get().unwrap().clone())
+}
+
+/// Rebuilds and VERIFIES the account↔signer-key bindings on every serving
+/// startup (PR #162 review).
+///
+/// # Why this must run outside init
+///
+/// `bind_account` only ran while phase-1 init was creating accounts, against a
+/// temporary client that is then shut down. The serving process builds a fresh
+/// keystore, and a normal restart skips init entirely — so the binding map was
+/// empty exactly when it mattered and `verify_bound_accounts` had nothing to
+/// check. A verification that only runs on the one boot that creates the
+/// accounts is not a verification.
+///
+/// # Why the deployed account is the source of truth
+///
+/// Inserting the CONFIGURED commitment and then checking it would be circular:
+/// it proves the config agrees with itself. What matters is that the account
+/// actually deployed on chain is signed for by the key the operator configured
+/// AND that the signer still holds it. So for each role we read the account's
+/// real auth commitment out of its `AuthSingleSig` storage slot and require all
+/// three to agree.
+pub async fn verify_remote_bindings(
+    client: &mut MidenClientLib,
+    keystore: &ProxyKeystore,
+    accounts: &crate::accounts_config::AccountsConfig,
+) -> anyhow::Result<usize> {
+    use miden_standards::account::auth::AuthSingleSig;
+
+    if !keystore.is_remote() {
+        return Ok(0);
+    }
+
+    let configured = keystore.resolve_role_commitments()?;
+    let mut roles: Vec<(SignerRole, AccountId)> = vec![(SignerRole::Service, accounts.service.0)];
+    if let Some(ger) = accounts.ger_manager.as_ref() {
+        roles.push((SignerRole::GerManager, ger.0));
+    }
+
+    for (role, account_id) in roles {
+        let expected = configured.get(&role).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no signer key configured for role {}; pass --signer-key {}=<identifier>",
+                role.as_str(),
+                role.as_str()
+            )
+        })?;
+
+        // Import-by-id so a restart with a cold local store still verifies
+        // against real on-chain state rather than skipping the check.
+        if client
+            .get_account(account_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            client.import_account_by_id(account_id).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot read the deployed {} account {account_id} to verify its signer key: {e}",
+                    role.as_str()
+                )
+            })?;
+        }
+        let account = client
+            .get_account(account_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_account({account_id}): {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the deployed {} account {account_id} is unavailable; cannot verify custody",
+                    role.as_str()
+                )
+            })?;
+
+        let deployed: PublicKeyCommitment = account
+            .storage()
+            .get_item(AuthSingleSig::public_key_slot())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot read the auth key slot of the deployed {} account {account_id}: {e}",
+                    role.as_str()
+                )
+            })?
+            .into();
+
+        if deployed != expected {
+            anyhow::bail!(
+                "the deployed {} account {account_id} is signed for by a DIFFERENT key than \
+                 --signer-key configures for that role. This deployment cannot sign for it. \
+                 Either the signer/config was changed after the account was created, or this \
+                 store was restored against the wrong signer.",
+                role.as_str()
+            );
+        }
+        keystore.bind_account(account_id, deployed);
+    }
+
+    let verified = keystore.verify_bound_accounts()?;
+    tracing::info!(
+        target: crate::COMPONENT,
+        accounts = verified,
+        "remote custody verified: every configured account's deployed auth key is the one \
+         --signer-key names, and the signer still holds it"
+    );
+    Ok(verified)
 }
 
 #[cfg(test)]

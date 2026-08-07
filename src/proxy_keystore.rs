@@ -131,6 +131,17 @@ impl ProxyKeystore {
         }))
     }
 
+    /// Resolves every configured role to its commitment, rejecting two roles
+    /// that resolve to the same physical key.
+    pub fn resolve_role_commitments(
+        &self,
+    ) -> anyhow::Result<BTreeMap<crate::remote_signer::SignerRole, PublicKeyCommitment>> {
+        match self {
+            Self::Local(_) => Ok(BTreeMap::new()),
+            Self::Remote(backend) => backend.key_bindings.resolve_unique(&backend.directory),
+        }
+    }
+
     /// The operator-configured signer key identifier for `role`.
     pub fn signer_key_identifier(&self, role: crate::remote_signer::SignerRole) -> Option<String> {
         match self {

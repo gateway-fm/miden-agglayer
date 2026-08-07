@@ -334,8 +334,20 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
         return Ok(());
     }
     let mut reasons = Vec::new();
+    // The override does not WEAKEN hardening — hardening refuses it outright,
+    // the same way it refuses the other insecure flags. A mode that claims to be
+    // hardened while an insecure escape hatch is active is a misleading claim;
+    // a deployment that needs the escape hatch should drop --require-hardening
+    // (PR #162 review).
+    if command.insecure_signer_transport {
+        reasons.push(
+            "  - --insecure-signer-transport is set. Hardening does not permit an insecure \
+             signer transport; drop --require-hardening if you genuinely need it (development \
+             only)."
+                .to_string(),
+        );
+    }
     if let Some(signer_url) = command.signer_url.as_deref()
-        && !command.insecure_signer_transport
         && miden_agglayer_service::remote_signer::classify_signer_transport(signer_url)
             == miden_agglayer_service::remote_signer::SignerTransport::UnauthenticatedRemote
     {
@@ -343,8 +355,9 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
             "  - --signer-url points at a plain http:// endpoint on a non-local host. \
              A KMS prevents key extraction, but an unauthenticated signing API reachable \
              over the network IS a signing oracle. Use https:// (TLS/mTLS/service mesh), \
-             or keep the signer on localhost / a private sidecar. \
-             --insecure-signer-transport overrides this for development."
+             or keep the signer on a loopback address (a same-pod sidecar can). \
+             Note https authenticates the SERVER only — this client presents no identity, so \
+             terminate mTLS/service-mesh auth in front of the signer."
                 .to_string(),
         );
     }
@@ -1048,6 +1061,35 @@ async fn main() -> anyhow::Result<()> {
         command.miden_debug,
         custody.clone(),
     )?;
+
+    // Remote custody: rebuild and VERIFY the account↔signer-key bindings before
+    // this process starts serving. This runs on EVERY startup — including plain
+    // restarts, which skip init entirely — because a check that only runs on the
+    // boot that creates the accounts verifies nothing afterwards (PR #162
+    // review). Fail-closed: a deployed account signed for by a key other than
+    // the one --signer-key names, or a key the signer no longer holds, stops the
+    // proxy here rather than at the first claim.
+    {
+        let keystore = client.get_keystore();
+        if keystore.is_remote() {
+            let accounts_for_verify = accounts.0.clone();
+            let ks = keystore.clone();
+            client
+                .with(move |c| {
+                    Box::new(async move {
+                        miden_agglayer_service::init::verify_remote_bindings(
+                            c,
+                            ks.as_ref(),
+                            &accounts_for_verify,
+                        )
+                        .await
+                        .map(|_| ())
+                    })
+                })
+                .await
+                .context("remote custody verification failed at startup")?;
+        }
+    }
 
     // Self-heal is RUNTIME-only, not startup-only. See `src/account_recovery.rs`
     // — when a Miden submission inside `insert_ger` or `publish_claim` returns

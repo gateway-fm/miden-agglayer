@@ -31,8 +31,10 @@ emit_env() {
     local env_file="$KEY_DIR/../web3signer-keys.env" sep="" role priv pub
     {
         printf 'AGGLAYER_SIGNER_KEYS='
-        for f in "$KEY_DIR"/*.yaml; do
-            role="$(basename "$f" | sed 's/-0x.*//')"
+        for role_name in "${ROLES[@]}"; do
+            f="$(ls "$KEY_DIR/${role_name}-0x"*.yaml 2>/dev/null | head -1)"
+            [ -n "$f" ] || { echo "[web3signer-keys] FAIL: no key file for role $role_name" >&2; return 1; }
+            role="$role_name"
             priv="$(awk -F'"' '/privateKey:/ {print $2}' "$f")"
             pub="$(cast wallet public-key --private-key "$priv" 2>/dev/null)"
             [ -n "$pub" ] || { echo "[web3signer-keys] FAIL: cannot derive public key for $role" >&2; return 1; }
@@ -43,17 +45,32 @@ emit_env() {
     } > "$env_file" || return 1
     echo "[web3signer-keys] wrote $env_file"
 }
-have=$(compgen -G "$KEY_DIR/*.yaml" >/dev/null && ls "$KEY_DIR"/*.yaml | wc -l || echo 0)
-if [ "$have" -ge "${#ROLES[@]}" ]; then
-    echo "[web3signer-keys] reusing ${have} existing key(s):"
-    ls "$KEY_DIR"/*.yaml | sed 's/^/  /'
+# Count keys PER ROLE, not files. A pre-role-binding key dir holds one
+# unprefixed <ADDR>.yaml; counting files would (a) see "1 of 2" and generate two
+# MORE, leaving three, and (b) later let emit_env turn that legacy filename into
+# a bogus role. With two arbitrary files it would even read as complete. So:
+# require one file per REQUIRED role, and ignore anything that is not role-named.
+missing_roles=()
+for role in "${ROLES[@]}"; do
+    compgen -G "$KEY_DIR/${role}-0x*.yaml" >/dev/null || missing_roles+=("$role")
+done
+legacy=$(compgen -G "$KEY_DIR/0x*.yaml" >/dev/null && ls "$KEY_DIR"/0x*.yaml 2>/dev/null | wc -l || echo 0)
+if [ "$legacy" -gt 0 ]; then
+    echo "[web3signer-keys] NOTE: ignoring $legacy legacy pre-role key file(s) (0x*.yaml)."
+    echo "                 They are not role-named, so they cannot be bound to a role."
+    echo "                 Delete them if the signer should not load them at all."
+fi
+if [ ${#missing_roles[@]} -eq 0 ]; then
+    echo "[web3signer-keys] reusing existing per-role key(s):"
+    for role in "${ROLES[@]}"; do ls "$KEY_DIR/${role}-0x"*.yaml | sed 's/^/  /'; done
     emit_env
     exit $?
 fi
+echo "[web3signer-keys] generating key(s) for role(s): ${missing_roles[*]}"
 
 # `cast wallet new` gives us a secp256k1 keypair; Web3Signer's file-raw format
 # wants the private key hex (no 0x) and derives the public key itself.
-for ROLE in "${ROLES[@]}"; do
+for ROLE in "${missing_roles[@]}"; do
 WALLET="$(cast wallet new)"
 PRIV="$(echo "$WALLET" | awk '/Private key:/ {print $3}' | sed 's/^0x//')"
 ADDR="$(echo "$WALLET" | awk '/Address:/ {print $2}')"

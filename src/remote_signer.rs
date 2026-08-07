@@ -290,6 +290,15 @@ impl RemoteKeyDirectory {
         Ok(Self { by_commitment })
     }
 
+    /// Test seam: insert a key without going through the signer.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, identifier: String, public_key: PublicKey) {
+        self.by_commitment.insert(
+            public_key.to_commitment(),
+            (identifier, Arc::new(public_key)),
+        );
+    }
+
     /// Number of usable keys.
     pub fn len(&self) -> usize {
         self.by_commitment.len()
@@ -609,18 +618,12 @@ impl SignerKeyBindings {
                 return Err(anyhow!("--signer-key {} given twice", parsed.as_str()));
             }
         }
-        // Distinct roles sharing one key defeats the isolation this exists for.
-        let mut seen: BTreeMap<&str, SignerRole> = BTreeMap::new();
-        for (role, id) in &by_role {
-            if let Some(other) = seen.insert(id.as_str(), *role) {
-                return Err(anyhow!(
-                    "roles {} and {} are bound to the SAME signer key {id}; give each role its \
-                     own key so a compromised or rotated key affects exactly one account",
-                    other.as_str(),
-                    role.as_str()
-                ));
-            }
-        }
+        // NOTE: uniqueness is NOT checked here. Two identifiers can be different
+        // STRINGS and still be the same physical key — compressed vs tagged vs
+        // raw SEC1, or different casing — and a string comparison would wave that
+        // through while `commitment_for_identifier` happily resolves both to one
+        // commitment. Uniqueness is therefore enforced in `resolve_unique`, after
+        // every identifier has been reduced to its commitment.
         Ok(Self { by_role })
     }
 
@@ -632,6 +635,44 @@ impl SignerKeyBindings {
     /// True when no role was configured.
     pub fn is_empty(&self) -> bool {
         self.by_role.is_empty()
+    }
+
+    /// Resolves every configured role to its commitment against `directory`,
+    /// rejecting two roles that resolve to the SAME physical key.
+    ///
+    /// This is where blast-radius isolation is actually enforced. Comparing the
+    /// operator's identifier STRINGS cannot do it: the same key written as
+    /// compressed SEC1, tagged uncompressed, raw `x||y`, or in different casing
+    /// gives different strings and one commitment, so a string check would bind
+    /// both roles to one key while reporting success.
+    pub fn resolve_unique(
+        &self,
+        directory: &RemoteKeyDirectory,
+    ) -> anyhow::Result<BTreeMap<SignerRole, PublicKeyCommitment>> {
+        let mut by_role = BTreeMap::new();
+        let mut seen: BTreeMap<PublicKeyCommitment, SignerRole> = BTreeMap::new();
+        for (role, identifier) in &self.by_role {
+            let commitment = directory
+                .commitment_for_identifier(identifier)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "the remote signer does not expose the key configured for role {}; \
+                         provision it in the signer (or correct --signer-key)",
+                        role.as_str()
+                    )
+                })?;
+            if let Some(other) = seen.insert(commitment, *role) {
+                return Err(anyhow!(
+                    "roles {} and {} resolve to the SAME signer key (identifiers differ only by \
+                     encoding or casing); give each role its own key so a compromised or rotated \
+                     key affects exactly one account",
+                    other.as_str(),
+                    role.as_str()
+                ));
+            }
+            by_role.insert(*role, commitment);
+        }
+        Ok(by_role)
     }
 
     /// Roles with no configured key.
@@ -661,16 +702,94 @@ mod key_binding_tests {
         assert!(bindings.missing_roles().is_empty());
     }
 
-    /// Blast-radius isolation is the entire point: two roles on one key is the
-    /// exact state the old `.first()` binding produced against a single-key
-    /// signer, so it must be rejected rather than silently accepted.
+    /// Blast-radius isolation, enforced at COMMITMENT level.
+    ///
+    /// The first version compared identifier STRINGS, which the review correctly
+    /// rejected: the same physical key written as compressed SEC1 and as raw
+    /// `x||y` gives two different strings and one commitment, so a string check
+    /// would bind both roles to one key and report success. This builds exactly
+    /// that case — one key, two valid encodings — and requires it to fail.
     #[test]
-    fn two_roles_may_not_share_one_key() {
-        let err = b(&["service=0xsame", "ger-manager=0xsame"]).expect_err("must reject");
-        let msg = format!("{err}");
+    fn two_roles_may_not_share_one_key_in_different_encodings() {
+        use miden_protocol::account::auth::AuthSecretKey;
+        let secret = AuthSecretKey::new_ecdsa_k256_keccak();
+        let AuthSecretKey::EcdsaK256Keccak(inner) = &secret else {
+            panic!("requested an ecdsa key")
+        };
+        let public = inner.public_key();
+        let verifying = alloy::signers::k256::ecdsa::VerifyingKey::from_sec1_bytes(
+            &miden_protocol::utils::serde::Serializable::to_bytes(&public),
+        )
+        .expect("round-trip");
+        let compressed = hex::encode(verifying.to_encoded_point(true).as_bytes());
+        let raw = hex::encode(&verifying.to_encoded_point(false).as_bytes()[1..]);
+        assert_ne!(compressed, raw, "the two encodings must differ as STRINGS");
+
+        // A directory that holds exactly this one key.
+        let mut directory = RemoteKeyDirectory::default();
+        directory.insert_for_test(
+            format!("0x{raw}"),
+            PublicKey::EcdsaK256Keccak(public.clone()),
+        );
+
+        let bindings = b(&[
+            &format!("service=0x{compressed}"),
+            &format!("ger-manager=0x{raw}"),
+        ])
+        .expect("parse accepts them; uniqueness is a resolve-time property");
+
+        let err = bindings
+            .resolve_unique(&directory)
+            .expect_err("one physical key must not bind two roles");
         assert!(
-            msg.contains("SAME signer key"),
-            "the error must explain the isolation problem, got: {msg}"
+            format!("{err}").contains("SAME signer key"),
+            "the error must explain the isolation problem, got: {err}"
+        );
+    }
+
+    /// Distinct keys resolve cleanly.
+    #[test]
+    fn distinct_keys_resolve_per_role() {
+        use miden_protocol::account::auth::AuthSecretKey;
+        let mut directory = RemoteKeyDirectory::default();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let secret = AuthSecretKey::new_ecdsa_k256_keccak();
+            let AuthSecretKey::EcdsaK256Keccak(inner) = &secret else {
+                panic!()
+            };
+            let public = inner.public_key();
+            let id = format!(
+                "0x{}",
+                hex::encode(miden_protocol::utils::serde::Serializable::to_bytes(
+                    &public
+                ))
+            );
+            directory.insert_for_test(id.clone(), PublicKey::EcdsaK256Keccak(public.clone()));
+            ids.push(id);
+        }
+        let bindings = b(&[
+            &format!("service={}", ids[0]),
+            &format!("ger-manager={}", ids[1]),
+        ])
+        .expect("parse");
+        let resolved = bindings.resolve_unique(&directory).expect("distinct keys");
+        assert_eq!(resolved.len(), 2);
+        assert_ne!(
+            resolved[&SignerRole::Service],
+            resolved[&SignerRole::GerManager]
+        );
+    }
+
+    /// An identifier the signer does not expose must fail loudly.
+    #[test]
+    fn unknown_identifier_is_rejected() {
+        let bindings = b(&["service=0xdeadbeef", "ger-manager=0xfeedface"]).expect("parse");
+        assert!(
+            bindings
+                .resolve_unique(&RemoteKeyDirectory::default())
+                .is_err(),
+            "a key the signer does not hold must not bind"
         );
     }
 
@@ -733,40 +852,41 @@ pub enum SignerTransport {
 }
 
 /// Classifies a signer URL for the hardening gate.
+///
+/// Parsed with a real URL parser rather than string prefixes. The hand-rolled
+/// version accepted `http://127.attacker.example` (it merely started with
+/// "127."), could be confused by userinfo-shaped URLs, and treated any
+/// single-label host as a private sidecar — but a Docker/Kubernetes Service name
+/// is reachable by every other workload on that network, which is not the
+/// same-pod guarantee the classification implied (PR #162 review).
+///
+/// Plaintext is now permitted ONLY for a genuine loopback address, which a
+/// same-pod sidecar can use. Everything else must be `https`.
 pub fn classify_signer_transport(base_url: &str) -> SignerTransport {
-    let lowered = base_url.trim().to_ascii_lowercase();
-    if lowered.starts_with("https://") {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return SignerTransport::UnauthenticatedRemote;
+    };
+    // Credentials in the URL are never a boundary and often a typo/injection
+    // vector; refuse to treat such a URL as trusted regardless of scheme.
+    if !url.username().is_empty() || url.password().is_some() {
+        return SignerTransport::UnauthenticatedRemote;
+    }
+    if url.scheme().eq_ignore_ascii_case("https") {
         return SignerTransport::Tls;
     }
-    let host = lowered
-        .strip_prefix("http://")
-        .unwrap_or(&lowered)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .rsplit_once(':')
-        .map(|(h, _)| h.to_string())
-        .unwrap_or_else(|| {
-            lowered
-                .strip_prefix("http://")
-                .unwrap_or(&lowered)
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .to_string()
-        });
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    // Loopback, or a single-label host (docker-compose service name / k8s
-    // sidecar) which is not routable off the private network.
-    if host == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host.starts_with("127.")
-        || (!host.is_empty() && !host.contains('.') && host != "0.0.0.0")
-    {
-        return SignerTransport::PrivateSidecar;
+    if !url.scheme().eq_ignore_ascii_case("http") {
+        return SignerTransport::UnauthenticatedRemote;
     }
-    SignerTransport::UnauthenticatedRemote
+    match url.host() {
+        // Literal loopback IPs only — a NAME that merely looks loopback-ish
+        // (`127.attacker.example`) resolves wherever its owner wants.
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => SignerTransport::PrivateSidecar,
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => SignerTransport::PrivateSidecar,
+        Some(url::Host::Domain(d)) if d.eq_ignore_ascii_case("localhost") => {
+            SignerTransport::PrivateSidecar
+        }
+        _ => SignerTransport::UnauthenticatedRemote,
+    }
 }
 
 #[cfg(test)]
@@ -799,20 +919,42 @@ mod transport_gate_tests {
         );
     }
 
-    /// Loopback and compose/k8s sidecar names have no network exposure to
-    /// authenticate — this is what keeps the e2e (and a same-pod sidecar)
-    /// working under --require-hardening without an opt-out.
+    /// Only a GENUINE loopback address counts as private. A same-pod sidecar
+    /// can use loopback; a shared-network service name cannot make that claim.
     #[test]
-    fn loopback_and_sidecars_are_private() {
+    fn only_real_loopback_is_private() {
         for url in [
             "http://localhost:9000",
             "http://127.0.0.1:9000",
-            "http://web3signer:9000",
+            "http://[::1]:9000",
         ] {
             assert_eq!(
                 classify_signer_transport(url),
                 SignerTransport::PrivateSidecar,
-                "{url} is not network-exposed"
+                "{url} is genuine loopback"
+            );
+        }
+    }
+
+    /// The spoofing cases the previous string-prefix classifier accepted.
+    #[test]
+    fn loopback_lookalikes_and_userinfo_are_rejected() {
+        for url in [
+            // resolves wherever its owner points it — merely STARTS WITH "127."
+            "http://127.attacker.example:9000",
+            // a shared-network service name is reachable by other workloads
+            "http://web3signer:9000",
+            // userinfo is never a boundary
+            "http://user:pass@127.0.0.1:9000",
+            "https://user:pass@signer.example.com",
+            // non-http schemes
+            "ftp://signer.example.com",
+            "not a url",
+        ] {
+            assert_eq!(
+                classify_signer_transport(url),
+                SignerTransport::UnauthenticatedRemote,
+                "{url} must NOT be treated as a trusted boundary"
             );
         }
     }
