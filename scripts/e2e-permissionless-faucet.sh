@@ -41,9 +41,18 @@ if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
 l2l2_miden_identities
 
 step "1. deploy a native faucet, then register it with NO admin key"
-FAUCET_ID=$(iso_tool --create-native-faucet --native-symbol "PLS" --native-decimals 8 \
-    --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" 2>&1 | awk '/faucet-id:/{print $NF}') || true
-[[ -n "$FAUCET_ID" ]] || fail "native faucet deploy failed"
+# Capture the tool output: piping straight into awk discards the reason a deploy
+# failed, which is exactly what made the first run of this test undiagnosable.
+_deploy_log=$(mktemp)
+iso_tool --create-native-faucet --native-symbol "PLS" --native-decimals 8 \
+    --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" > "$_deploy_log" 2>&1
+FAUCET_ID=$(awk '/faucet-id:/{print $NF}' "$_deploy_log")
+if [[ -z "$FAUCET_ID" ]]; then
+    echo "─── bridge-out-tool --create-native-faucet output ───"; cat "$_deploy_log"
+    echo "─── end tool output ───"; rm -f "$_deploy_log"
+    fail "native faucet deploy failed (tool output above)"
+fi
+rm -f "$_deploy_log"
 
 RESP=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"miden_registerNativeFaucet\",
   \"params\":[{\"faucet_id\":\"$FAUCET_ID\"}]}") \
@@ -55,23 +64,24 @@ DERIVED_ORIGIN=$(echo "$RESP" | jq_field origin_token_address)
 pass "registered without an admin key; derived origin identity $DERIVED_ORIGIN"
 
 step "2. the derived identity is NOT caller-controllable (anti-squatting)"
-# Hand the API a different faucet AND an attacker-chosen origin address. If the
-# address were honoured, an attacker could squat any token's AggLayer identity.
+# Re-register the SAME faucet while supplying a hostile origin address AND
+# hostile metadata. If either were honoured, a public caller could squat a
+# token's AggLayer identity or misdescribe it. Reusing the faucet keeps this
+# test to ONE deploy — the "two faucets derive different origins" property needs
+# no chain state and is unit-tested (origin_identity_is_deterministic_and_faucet_bound).
 SQUAT="0x000000000000000000000000000000000000dead"
-FAUCET2=$(iso_tool --create-native-faucet --native-symbol "PL2" --native-decimals 8 \
-    --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" 2>&1 | awk '/faucet-id:/{print $NF}') || true
-[[ -n "$FAUCET2" ]] || fail "second native faucet deploy failed"
 RESP2=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"miden_registerNativeFaucet\",
-  \"params\":[{\"faucet_id\":\"$FAUCET2\",\"origin_token_address\":\"$SQUAT\",
-    \"symbol\":\"XXX\",\"decimals\":18}]}") || fail "second registration unreachable"
+  \"params\":[{\"faucet_id\":\"$FAUCET_ID\",\"origin_token_address\":\"$SQUAT\",
+    \"symbol\":\"XXX\",\"decimals\":18}]}") || fail "hostile re-registration unreachable"
 ORIGIN2=$(echo "$RESP2" | jq_field origin_token_address)
 SYMBOL2=$(echo "$RESP2" | jq_field symbol)
 [[ "$ORIGIN2" != "$SQUAT" ]] \
   || fail "the caller's origin_token_address was HONOURED ($SQUAT) — anyone could squat a token's AggLayer identity"
-[[ "$ORIGIN2" != "$DERIVED_ORIGIN" ]] || fail "two different faucets derived the SAME origin identity"
-[[ "$SYMBOL2" == "PL2" ]] \
+[[ "$ORIGIN2" == "$DERIVED_ORIGIN" ]] \
+  || fail "the origin changed under hostile input ($DERIVED_ORIGIN -> $ORIGIN2); it must be a pure function of the faucet"
+[[ "$SYMBOL2" == "PLS" ]] \
   || fail "the recorded symbol came from the CALLER ($SYMBOL2), not the deployed faucet — metadata must be authoritative"
-pass "caller-supplied origin address and metadata are ignored; identity derived from the faucet"
+pass "caller-supplied origin address and metadata are ignored; identity stays $DERIVED_ORIGIN"
 
 step "3. idempotent — a repeat returns the same route, not a second one"
 RESP3=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"miden_registerNativeFaucet\",
@@ -85,27 +95,27 @@ ROWS=$(pgq "SELECT count(*) FROM faucet_registry WHERE lower(faucet_id)=lower('$
 pass "repeat registration is idempotent (1 registry row, same origin)"
 
 step "4. cannot rebind a faucet already bound to a DIFFERENT origin"
-# Register a third faucet through the ADMIN path with an operator-chosen address,
-# then try to claim it permissionlessly: the derived identity differs, so this
-# must fail WITHOUT changing the existing binding.
-ADMIN_ORIGIN="0x0d1de0$(python3 -c 'import secrets;print(secrets.token_hex(17))')"
-FAUCET3=$(iso_tool --create-native-faucet --native-symbol "PL3" --native-decimals 8 \
-    --mint-units "$MINT_UNITS" --wallet-id "$WALLET_ID" 2>&1 | awk '/faucet-id:/{print $NF}') || true
-[[ -n "$FAUCET3" ]] || fail "third native faucet deploy failed"
-curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_API_KEY}" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"admin_registerNativeFaucet\",
-    \"params\":[{\"faucet_id\":\"$FAUCET3\",\"origin_token_address\":\"$ADMIN_ORIGIN\",
-      \"symbol\":\"PL3\",\"decimals\":8}]}" >/dev/null 2>&1 \
-  || fail "admin registration of the third faucet failed"
-BEFORE=$(pgq "SELECT origin_address FROM faucet_registry WHERE lower(faucet_id)=lower('$FAUCET3');")
-RESP4=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"miden_registerNativeFaucet\",
-  \"params\":[{\"faucet_id\":\"$FAUCET3\"}]}")
-echo "$RESP4" | grep -qi "different origin" \
-  || fail "permissionless rebind of an admin-registered faucet was not refused: $RESP4"
-AFTER=$(pgq "SELECT origin_address FROM faucet_registry WHERE lower(faucet_id)=lower('$FAUCET3');")
-[[ "$BEFORE" == "$AFTER" ]] \
-  || fail "the refused rebind CHANGED state ($BEFORE -> $AFTER); conflicts must not mutate"
-pass "a conflicting rebind is refused and leaves the existing binding untouched"
+# Reuse a native faucet the earlier miden-origin tests registered through the
+# ADMIN path with an operator-chosen address — its stored origin therefore does
+# NOT equal what we would derive, which is exactly the conflict case. No extra
+# deploy needed.
+ADMIN_REGISTERED=$(pgq "SELECT faucet_id FROM faucet_registry
+  WHERE origin_network = ${MIDEN_NETWORK_ID} AND lower(faucet_id) <> lower('$FAUCET_ID') LIMIT 1;")
+ADMIN_REGISTERED="${ADMIN_REGISTERED// /}"
+if [[ -n "$ADMIN_REGISTERED" ]]; then
+  BEFORE=$(pgq "SELECT origin_address FROM faucet_registry WHERE lower(faucet_id)=lower('$ADMIN_REGISTERED');")
+  RESP4=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"miden_registerNativeFaucet\",
+    \"params\":[{\"faucet_id\":\"$ADMIN_REGISTERED\"}]}")
+  echo "$RESP4" | grep -qi "different origin" \
+    || fail "permissionless rebind of an admin-registered faucet was not refused: $RESP4"
+  AFTER=$(pgq "SELECT origin_address FROM faucet_registry WHERE lower(faucet_id)=lower('$ADMIN_REGISTERED');")
+  [[ "$BEFORE" == "$AFTER" ]] \
+    || fail "the refused rebind CHANGED state ($BEFORE -> $AFTER); conflicts must not mutate"
+  pass "a conflicting rebind is refused and leaves the existing binding untouched"
+else
+  fail "no admin-registered native faucet found to test the rebind conflict against — this \
+assertion must not be silently skipped"
+fi
 
 step "5. refuses a non-native (AggLayer-owned wrapped) faucet"
 WRAPPED=$(pgq "SELECT faucet_id FROM faucet_registry WHERE origin_network <> ${MIDEN_NETWORK_ID} LIMIT 1;")
