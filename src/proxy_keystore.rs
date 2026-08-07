@@ -442,6 +442,73 @@ mod tests {
         );
     }
 
+    /// PR #162 lifecycle thread: a store RESTORED against the wrong signer.
+    ///
+    /// This is the case the every-startup verification exists for. The account
+    /// was deployed against key A; the signer this process talks to holds only
+    /// key B. Nothing about the local config is wrong, so only comparing the
+    /// DEPLOYED account's commitment can catch it — which is why the verifier
+    /// reads the auth slot instead of re-inserting the configured value.
+    #[tokio::test]
+    async fn restored_against_the_wrong_signer_fails_verification() {
+        let deployed_key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let signer_key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let account = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
+
+        // The signer holds ONLY the other key.
+        let mut directory = RemoteKeyDirectory::default();
+        let AuthSecretKey::EcdsaK256Keccak(inner) = &signer_key else {
+            panic!()
+        };
+        directory.insert_for_test(
+            "0xsigner".into(),
+            PublicKey::EcdsaK256Keccak(inner.public_key()),
+        );
+        let keystore = ProxyKeystore::remote_from_parts(
+            RemoteSignerClient::new("http://127.0.0.1:1", std::time::Duration::from_secs(1))
+                .expect("client"),
+            directory,
+        );
+
+        // Bind what the DEPLOYED account actually says.
+        keystore.bind_account(account, deployed_key.public_key().to_commitment());
+
+        let err = keystore
+            .verify_bound_accounts()
+            .expect_err("a store restored against the wrong signer must not serve");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not hold"),
+            "the error must say the signer lacks the deployed account's key, got: {msg}"
+        );
+    }
+
+    /// The healthy case: deployed key IS the one the signer holds.
+    #[tokio::test]
+    async fn matching_signer_verifies() {
+        let key = AuthSecretKey::new_ecdsa_k256_keccak();
+        let account = AccountId::from_hex("0xaa0000000000bc310000bc000000de").unwrap();
+        let AuthSecretKey::EcdsaK256Keccak(inner) = &key else {
+            panic!()
+        };
+        let mut directory = RemoteKeyDirectory::default();
+        directory.insert_for_test(
+            "0xsigner".into(),
+            PublicKey::EcdsaK256Keccak(inner.public_key()),
+        );
+        let keystore = ProxyKeystore::remote_from_parts(
+            RemoteSignerClient::new("http://127.0.0.1:1", std::time::Duration::from_secs(1))
+                .expect("client"),
+            directory,
+        );
+        keystore.bind_account(account, key.public_key().to_commitment());
+        assert_eq!(
+            keystore.verify_bound_accounts().expect("must verify"),
+            1,
+            "one bound account, verified"
+        );
+    }
+
     /// The no-fallback rule: a key the signer does not hold is an error, not a
     /// silent local signature. This is what keeps "which key signed this?"
     /// unambiguous.

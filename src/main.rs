@@ -276,23 +276,6 @@ struct Command {
     )]
     insecure_local_keystore: bool,
 
-    /// DANGEROUS, development only: allow a non-loopback signer endpoint.
-    ///
-    /// This does NOT relax `--require-hardening` — hardening REJECTS this flag
-    /// outright, because a mode that claims to be hardened while an escape hatch
-    /// is active is a misleading claim. Use it only on deployments that do not
-    /// pass `--require-hardening`.
-    ///
-    /// A KMS stops key EXTRACTION; it does nothing about a reachable signing API,
-    /// which is a signing ORACLE. Note this client presents no identity to the
-    /// signer, so `https` authenticates the server to us and not us to it.
-    #[arg(
-        long,
-        env = "AGGLAYER_INSECURE_SIGNER_TRANSPORT",
-        default_value_t = false
-    )]
-    insecure_signer_transport: bool,
-
     /// Bind an operator role to a specific signer key: `--signer-key
     /// <role>=<identifier>`, repeatable. Roles: `service`, `ger-manager`.
     ///
@@ -339,38 +322,12 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
         return Ok(());
     }
     let mut reasons = Vec::new();
-    // The override does not WEAKEN hardening — hardening refuses it outright,
-    // the same way it refuses the other insecure flags. A mode that claims to be
-    // hardened while an insecure escape hatch is active is a misleading claim;
-    // a deployment that needs the escape hatch should drop --require-hardening
-    // (PR #162 review).
-    if command.insecure_signer_transport {
-        reasons.push(
-            "  - --insecure-signer-transport is set. Hardening does not permit an insecure \
-             signer transport; drop --require-hardening if you genuinely need it (development \
-             only)."
-                .to_string(),
-        );
-    }
-    // Hardening requires an actually authenticated boundary. `https` gives
-    // SERVER authentication only — this client sends no certificate, token or
-    // other identity, so every other caller that can reach the signer keeps the
-    // signing oracle. Until caller authentication exists, the only honest
-    // boundary we can enforce is genuine loopback (same host/pod), so that is
-    // what hardening demands (PR #162 review).
-    if let Some(signer_url) = command.signer_url.as_deref()
-        && miden_agglayer_service::remote_signer::classify_signer_transport(signer_url)
-            != miden_agglayer_service::remote_signer::SignerTransport::PrivateSidecar
-    {
-        reasons.push(
-            "  - --signer-url is not a loopback address. A KMS prevents key EXTRACTION, but \
-             any caller that can reach the signing API has a signing ORACLE, and this client \
-             authenticates itself to the signer in no way at all — https proves only that WE \
-             authenticated the SERVER. Until caller authentication (mTLS client cert / token) \
-             is implemented, run Web3Signer (or an authenticated relay) on the same host/pod \
-             and point --signer-url at 127.0.0.1."
-                .to_string(),
-        );
+    // Signer-transport boundary lives in the library so CI's `--lib` unit target
+    // actually covers it (PR #162 review).
+    if let Some(reason) = miden_agglayer_service::remote_signer::hardening_signer_rejection(
+        command.signer_url.as_deref(),
+    ) {
+        reasons.push(reason);
     }
     if command.admin_api_key.is_none() {
         reasons.push(
@@ -649,7 +606,6 @@ impl std::fmt::Debug for Command {
             .field("allowed_signers", &self.allowed_signers)
             .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
             .field("insecure_local_keystore", &self.insecure_local_keystore)
-            .field("insecure_signer_transport", &self.insecure_signer_transport)
             .field(
                 "signer_keys",
                 &self
@@ -1601,7 +1557,6 @@ mod hardening_tests {
             miden_api_key: None,
             signer_url: None,
             insecure_local_keystore: true,
-            insecure_signer_transport: false,
             signer_keys: Vec::new(),
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,

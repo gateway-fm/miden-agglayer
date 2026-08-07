@@ -32,8 +32,18 @@ emit_env() {
     {
         printf 'AGGLAYER_SIGNER_KEYS='
         for role_name in "${ROLES[@]}"; do
-            f="$(ls "$KEY_DIR/${role_name}-0x"*.yaml 2>/dev/null | head -1)"
-            [ -n "$f" ] || { echo "[web3signer-keys] FAIL: no key file for role $role_name" >&2; return 1; }
+            # EXACTLY one file per role. `head -1` would silently pick one of
+            # several (e.g. a stale key left by a partial regeneration) and bind
+            # a role to a key the operator did not mean.
+            local -a matches=("$KEY_DIR/${role_name}-0x"*.yaml)
+            [ -e "${matches[0]}" ] || { echo "[web3signer-keys] FAIL: no key file for role $role_name" >&2; return 1; }
+            if [ "${#matches[@]}" -ne 1 ]; then
+                echo "[web3signer-keys] FAIL: ${#matches[@]} key files for role $role_name:" >&2
+                printf '  %s\n' "${matches[@]}" >&2
+                echo "  Remove the stale one(s); refusing to guess which key this role should use." >&2
+                return 1
+            fi
+            f="${matches[0]}"
             role="$role_name"
             priv="$(awk -F'"' '/privateKey:/ {print $2}' "$f")"
             pub="$(cast wallet public-key --private-key "$priv" 2>/dev/null)"

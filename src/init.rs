@@ -505,6 +505,11 @@ pub async fn verify_remote_bindings(
     }
 
     let verified = keystore.verify_bound_accounts()?;
+    // Stable, format-independent signal. Log FIELD rendering depends on the
+    // tracing subscriber's formatter, so an e2e that greps `accounts: 2` (or
+    // `accounts=2`) is asserting on a formatting detail rather than on the
+    // property (PR #162 review).
+    metrics::gauge!("remote_signer_verified_accounts").set(verified as f64);
     tracing::info!(
         target: crate::COMPONENT,
         accounts = verified,

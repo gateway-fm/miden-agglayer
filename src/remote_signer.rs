@@ -911,6 +911,68 @@ pub fn classify_signer_transport(base_url: &str) -> SignerTransport {
     }
 }
 
+/// The signer-transport half of `--require-hardening`, as a pure function.
+///
+/// Lives in the LIBRARY on purpose: `make test-unit` runs `cargo test --lib`, so
+/// a security boundary tested only inside the binary target is a boundary CI
+/// does not check (PR #162 review). Returns the operator-facing reason when
+/// hardening must refuse, `None` when the endpoint is acceptable.
+pub fn hardening_signer_rejection(signer_url: Option<&str>) -> Option<String> {
+    let url = signer_url?;
+    match classify_signer_transport(url) {
+        SignerTransport::PrivateSidecar => None,
+        // `https` authenticates the SERVER to us; it does not authenticate US to
+        // the signer. This client sends no certificate or token, so any caller
+        // with network reach keeps the signing oracle — and a KMS prevents key
+        // EXTRACTION, not key USE.
+        SignerTransport::Tls | SignerTransport::UnauthenticatedRemote => Some(
+            "  - --signer-url is not a loopback address. A KMS prevents key EXTRACTION, but any              caller that can reach the signing API has a signing ORACLE, and this client              authenticates itself to the signer in no way at all — https proves only that WE              authenticated the SERVER. Until caller authentication (mTLS client cert / token)              is implemented, run Web3Signer (or an authenticated relay) on the same host/pod              and point --signer-url at 127.0.0.1."
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod hardening_boundary_tests {
+    use super::*;
+
+    /// The four cases the review asked CI to cover.
+    #[test]
+    fn hardening_accepts_only_loopback() {
+        assert!(
+            hardening_signer_rejection(Some("http://127.0.0.1:9000")).is_none(),
+            "loopback is the boundary hardening permits"
+        );
+        assert!(
+            hardening_signer_rejection(Some("http://localhost:9000")).is_none(),
+            "localhost is loopback"
+        );
+        assert!(
+            hardening_signer_rejection(Some("http://signer.example.com:9000")).is_some(),
+            "plain http to a remote host is a signing oracle"
+        );
+        assert!(
+            hardening_signer_rejection(Some("https://signer.example.com")).is_some(),
+            "https authenticates the SERVER only — it is not a custody boundary"
+        );
+        assert!(
+            hardening_signer_rejection(None).is_none(),
+            "local custody configures no signer endpoint"
+        );
+    }
+
+    /// The rejection reason must name the actual problem (caller authentication),
+    /// not merely say "use TLS" — which is what an operator would otherwise do,
+    /// and which would not fix it.
+    #[test]
+    fn rejection_reason_explains_caller_authentication() {
+        let reason =
+            hardening_signer_rejection(Some("https://signer.example.com")).expect("reject");
+        assert!(reason.contains("authenticates itself to the signer in no way"));
+        assert!(reason.contains("127.0.0.1"), "must say what to do instead");
+    }
+}
+
 #[cfg(test)]
 mod transport_gate_tests {
     use super::*;

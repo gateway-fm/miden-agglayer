@@ -259,6 +259,15 @@ pub fn init_metrics() {
          another account) or kind=renounced (owner cleared, faucet wedged). \
          Page critical."
     );
+    describe_gauge!(
+        "remote_signer_verified_accounts",
+        "Accounts whose DEPLOYED auth commitment was verified at this startup to \
+         equal the key --signer-key configures for their role, with the signer \
+         still holding it. Set on every serving startup (including restarts). A \
+         value below the number of configured roles means custody is only \
+         partially verified; the proxy refuses to serve in that case, so this is \
+         also the stable signal tests assert on instead of parsing log text."
+    );
     describe_counter!(
         "remote_signer_signature_failures_total",
         "Account signatures the REMOTE signer failed to produce (unreachable, \
