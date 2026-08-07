@@ -89,6 +89,12 @@ case "$test_filter" in
             echo ""
             DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
             echo ""
+            # #154 — permissionless registration. Runs after the native
+            # round-trips so a wrapped (AggLayer-owned) faucet already exists for
+            # the "must refuse a non-native faucet" assertion to have a subject.
+            echo "== #154 permissionless native-faucet registration =="
+            "$SCRIPT_DIR/e2e-permissionless-faucet.sh"
+            echo ""
             # #148 recovery-readiness is DELIBERATELY NOT run inside `all`. It is genuinely
             # DESTRUCTIVE — it stops the proxy, resets the Miden store, drops bridge_db, and
             # --force-recreates aggkit (fresh BridgeL2Sync cursor), leaving bridge-service +

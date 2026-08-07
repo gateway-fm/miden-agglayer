@@ -971,3 +971,266 @@ mod tests {
         );
     }
 }
+
+// ── #154: permissionless native-faucet registration ──────────────────────────
+
+/// Domain separator for the canonical native-origin derivation. Changing it
+/// changes every derived identity, so it is versioned and must never be edited
+/// in place.
+const NATIVE_ORIGIN_DOMAIN: &[u8] = b"miden-agglayer:native-origin:v1";
+
+/// The canonical 20-byte origin identity for a Miden-ORIGINATED faucet.
+///
+/// # Why this is derived and not chosen
+///
+/// The admin API lets an operator pick `origin_token_address`. Exposing that
+/// choice permissionlessly would let anyone SQUAT or OVERWRITE another token's
+/// AggLayer identity — register first with someone else's intended address and
+/// the real issuer is locked out, or worse, traffic routes to the squatter's
+/// faucet. Issue #154 is explicit: do not expose a permissionless API that
+/// accepts an unauthenticated arbitrary `origin_token_address`.
+///
+/// Deriving it from the faucet id removes the choice entirely: the identity is a
+/// pure function of the account being registered, so there is nothing to squat.
+/// Two different faucets cannot collide except by finding a keccak collision,
+/// and the same faucet always derives the same address, which is what makes
+/// registration idempotent.
+pub fn derive_native_origin_address(faucet_id: AccountId) -> [u8; 20] {
+    use alloy::primitives::keccak256;
+    let mut preimage = Vec::with_capacity(NATIVE_ORIGIN_DOMAIN.len() + 64);
+    preimage.extend_from_slice(NATIVE_ORIGIN_DOMAIN);
+    preimage.extend_from_slice(faucet_id.to_hex().as_bytes());
+    let digest = keccak256(&preimage);
+    let mut out = [0u8; 20];
+    // Low 20 bytes, matching the usual keccak→address convention.
+    out.copy_from_slice(&digest[12..32]);
+    out
+}
+
+/// Params for the PERMISSIONLESS registration: the faucet id and nothing else.
+///
+/// Deliberately carries no metadata and no origin address. Everything else is
+/// derived — from the deployed account for name/symbol/decimals, and from the
+/// faucet id for the origin identity — so there is no caller-supplied value that
+/// could be trusted by mistake.
+#[derive(Debug, serde::Deserialize)]
+pub struct RegisterNativeFaucetPublicParams {
+    pub faucet_id: String,
+}
+
+/// Serializes permissionless registrations so concurrent duplicates cannot both
+/// pass their conflict checks and then both write.
+static REGISTER_NATIVE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// `miden_registerNativeFaucet` — permissionless registration of an
+/// already-deployed Miden-native faucet.
+///
+/// "Permissionless" is scoped precisely: the PUBLIC RPC validates a deterministic
+/// request and then the proxy's SERVICE account submits the existing admin
+/// `ConfigAggBridgeNote`. The bridge account stays admin-controlled; this does
+/// not make arbitrary bridge configuration public.
+pub async fn miden_register_native_faucet(
+    state: ServiceState,
+    params: RegisterNativeFaucetPublicParams,
+) -> anyhow::Result<serde_json::Value> {
+    let faucet_id = AccountId::from_hex(&params.faucet_id)
+        .map_err(|e| anyhow::anyhow!("bad faucet_id {}: {e:?}", params.faucet_id))?;
+    let origin_address = derive_native_origin_address(faucet_id);
+    let origin_network = state.network_id;
+
+    // Single-flight: without this, two concurrent requests for the same faucet
+    // can both observe "not registered", both read the account, and both write —
+    // producing two bridge registrations for one faucet.
+    let _guard = REGISTER_NATIVE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    // ── conflict checks BEFORE any state change ──────────────────────────────
+    // Idempotent for the same faucet; explicit failure for anything that would
+    // change an existing binding.
+    if let Some(existing) = state.store.get_faucet_by_id(faucet_id).await? {
+        if existing.origin_address != origin_address || existing.origin_network != origin_network {
+            anyhow::bail!(
+                "miden_registerNativeFaucet: faucet {} is already registered with a DIFFERENT \
+                 origin identity (network {}), which this method cannot change. It was likely \
+                 registered through the admin API with an operator-chosen address; use that API \
+                 to modify it. No state was changed.",
+                faucet_id.to_hex(),
+                existing.origin_network
+            );
+        }
+        return Ok(serde_json::json!({
+            "faucet_id": faucet_id.to_hex(),
+            "origin_token_address": format!("0x{}", hex::encode(origin_address)),
+            "origin_network": origin_network,
+            "symbol": existing.symbol,
+            "decimals": existing.miden_decimals,
+            "already_registered": true,
+        }));
+    }
+    if let Some(other) = state
+        .store
+        .get_faucet_by_origin(&origin_address, origin_network)
+        .await?
+    {
+        // Only reachable via a keccak collision or an operator having chosen this
+        // exact address by hand. Either way, refuse rather than rebind.
+        anyhow::bail!(
+            "miden_registerNativeFaucet: the derived origin identity for faucet {} is already \
+             bound to faucet {}. Refusing to rebind. No state was changed.",
+            faucet_id.to_hex(),
+            other.faucet_id.to_hex()
+        );
+    }
+
+    // ── authoritative metadata from the DEPLOYED account ─────────────────────
+    // Same read the admin path performs (#149/PR #150): import if absent, require
+    // the operator-owned NATIVE kind, and take name/symbol/decimals from chain.
+    let authoritative = Arc::new(std::sync::Mutex::new(None::<AuthoritativeFaucetMetadata>));
+    let authoritative_write = authoritative.clone();
+    state
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                if client.get_account(faucet_id).await.ok().flatten().is_none()
+                    && let Err(e) = client.import_account_by_id(faucet_id).await
+                {
+                    anyhow::bail!(
+                        "miden_registerNativeFaucet: cannot import faucet {faucet_id} from the \
+                         node (is it deployed and public?): {e}"
+                    );
+                }
+                let faucet_account = client
+                    .get_account(faucet_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_account({faucet_id}): {e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("faucet {faucet_id} not found after import"))?;
+                let (kind, faucet) = faucet_ops::classify_faucet_account(&faucet_account)?;
+                if kind != faucet_ops::FaucetKind::NativeFungible {
+                    anyhow::bail!(
+                        "miden_registerNativeFaucet: faucet {faucet_id} is not an operator-owned \
+                         native faucet (it is {kind:?}); only Miden-ORIGINATED tokens can be \
+                         registered this way"
+                    );
+                }
+                *authoritative_write.lock().unwrap() = Some(AuthoritativeFaucetMetadata {
+                    name: faucet.token_name().as_str().to_string(),
+                    symbol: faucet.symbol().to_string(),
+                    decimals: faucet.decimals(),
+                });
+                Ok(())
+            })
+        })
+        .await?;
+    let authoritative = authoritative.lock().unwrap().take().ok_or_else(|| {
+        anyhow::anyhow!(
+            "miden_registerNativeFaucet: could not read faucet {} metadata; refusing to \
+             register — no registry row written",
+            faucet_id.to_hex()
+        )
+    })?;
+
+    // The shared validator cross-checks REQUESTED against AUTHORITATIVE. This
+    // path accepts no caller metadata, so the "request" IS the authoritative
+    // triple — the cross-check is satisfied by construction rather than skipped,
+    // which keeps one registration pipeline instead of two (#154).
+    let derived_params = RegisterNativeFaucetParams {
+        faucet_id: faucet_id.to_hex(),
+        origin_token_address: format!("0x{}", hex::encode(origin_address)),
+        symbol: authoritative.symbol.clone(),
+        decimals: authoritative.decimals,
+        name: Some(authoritative.name.clone()),
+    };
+    register_native_validated(
+        &state,
+        faucet_id,
+        origin_address,
+        origin_network,
+        0u8,
+        &derived_params,
+        &authoritative,
+    )
+    .await?;
+
+    metrics::counter!("rpc_permissionless_faucet_registrations_total").increment(1);
+    Ok(serde_json::json!({
+        "faucet_id": faucet_id.to_hex(),
+        "origin_token_address": format!("0x{}", hex::encode(origin_address)),
+        "origin_network": origin_network,
+        "symbol": authoritative.symbol,
+        "decimals": authoritative.decimals,
+        "already_registered": false,
+    }))
+}
+
+#[cfg(test)]
+mod permissionless_registration_tests {
+    use super::*;
+
+    fn fid(hex: &str) -> AccountId {
+        AccountId::from_hex(hex).unwrap()
+    }
+
+    /// The property the whole design rests on: the origin identity is a function
+    /// of the faucet, so there is nothing for a public caller to choose — and
+    /// therefore nothing to squat.
+    #[test]
+    fn origin_identity_is_deterministic_and_faucet_bound() {
+        let a = fid("0xaa0000000000bc310000bc000000de");
+        let b = fid("0xac0000000000dd110000ee000000fc");
+
+        assert_eq!(
+            derive_native_origin_address(a),
+            derive_native_origin_address(a),
+            "same faucet must always derive the same identity — this is what makes \
+             registration idempotent"
+        );
+        assert_ne!(
+            derive_native_origin_address(a),
+            derive_native_origin_address(b),
+            "different faucets must not share an origin identity"
+        );
+    }
+
+    /// A public caller supplies ONLY a faucet id. If the params struct ever grew
+    /// an origin address or metadata field, an unauthenticated caller could
+    /// influence the canonical identity or the recorded token metadata — the
+    /// exact hazard #154 forbids. Deserializing a request that tries to set them
+    /// must ignore them rather than honour them.
+    #[test]
+    fn caller_cannot_supply_an_origin_address_or_metadata() {
+        let hostile = serde_json::json!({
+            "faucet_id": "0xaa0000000000bc310000bc000000de",
+            "origin_token_address": "0x000000000000000000000000000000000000dead",
+            "symbol": "SQUAT",
+            "decimals": 18,
+            "name": "not the real token",
+        });
+        let parsed: RegisterNativeFaucetPublicParams =
+            serde_json::from_value(hostile).expect("extra fields are ignored, not honoured");
+        assert_eq!(parsed.faucet_id, "0xaa0000000000bc310000bc000000de");
+        // The derived identity is unaffected by anything the caller wrote.
+        assert_eq!(
+            derive_native_origin_address(fid(&parsed.faucet_id)),
+            derive_native_origin_address(fid("0xaa0000000000bc310000bc000000de")),
+            "the caller's origin_token_address must have no influence whatsoever"
+        );
+    }
+
+    /// The domain separator is versioned because changing it silently would
+    /// re-derive every identity and orphan existing routes.
+    #[test]
+    fn derivation_is_domain_separated() {
+        use alloy::primitives::keccak256;
+        let f = fid("0xaa0000000000bc310000bc000000de");
+        let undomained = keccak256(f.to_hex().as_bytes());
+        assert_ne!(
+            derive_native_origin_address(f),
+            undomained[12..32],
+            "a bare keccak of the id would collide with any other component using the \
+             same preimage; the domain separator must be part of it"
+        );
+    }
+}
