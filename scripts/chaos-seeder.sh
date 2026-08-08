@@ -98,24 +98,18 @@ fault_kill_prover() {
 fault_restart_proxy() {
     if docker restart -t 2 "$PROXY" >/dev/null 2>&1; then
         log "FAULT restart-proxy — crash the proxy mid-flight (injected; tests cursor persist + late-sweep heal)"
-        # Runbook pairing (aggkit 0.8.3-rc1 limitation): a proxy restart can lose
-        # an aggoracle GER send IN TRANSIT — aggkit's ephemeral monitoring DB
-        # marks it sent, the proxy never admitted it, and aggkit's deterministic
-        # tx-ID dedup blocks any re-send forever (GER injection freezes; nothing
-        # proxy-side can re-drive a tx it never received). Production runbook =
-        # reset aggkit's monitor DB after proxy restarts; the seeder applies the
-        # same pairing: force-recreate the aggkits (no data volume -> fresh fs ->
-        # clean monitor DB -> chain-nonce refetch + GER re-send). docker restart
-        # would NOT work here: it preserves the container fs and the poisoned DB.
-        for _svc in aggkit aggkit-l2b; do
-            docker inspect "${PROJECT}-${_svc}-1" >/dev/null 2>&1 || continue
-            COMPOSE_PROJECT_NAME="$PROJECT" docker compose \
-                -f docker-compose.e2e.yml -f docker-compose.l2l2.yml \
-                --env-file fixtures/.env up -d --no-deps --force-recreate "$_svc" \
-                >/dev/null 2>&1 \
-                && log "HEAL  reset-aggkit-db — force-recreated ${_svc} (runbook pairing for restart-proxy)" \
-                || log "SKIP  reset-aggkit-db (${_svc} force-recreate failed)"
-        done
+        # Runbook pairing RETIRED (2026-08-08): the blind force-recreate here was
+        # DESTROYING sync state and cert lineage to clear one poisoned file —
+        # observed live: recreating aggkit-l2b on an aged stack cold-resyncs
+        # into anvil's 256-state retention wall (#87) and PERMANENTLY halts
+        # bridgesync ("failed to extract bridge event data" hard-loop, L2<->L2
+        # dead). The lost-in-transit wedge this paired against is now healed by
+        # the standing PRESERVE-HEAL watchdog (soak harness): it detects the
+        # actual wedge signature (same tx hash repeating, unknown to the proxy)
+        # and recreates with every DB EXCEPT ethtxmanager-aggoracle.sqlite
+        # restored — monitor DB cleared, sync cursors + aggsender lineage kept.
+        # The seeder must not race or duplicate that; it only injects faults.
+        log "NOTE  restart-proxy pairing: lost-tx wedge (if any) is left to the preserve-heal watchdog"
     else
         log "SKIP restart-proxy (docker restart $PROXY failed — not injected)"
     fi
