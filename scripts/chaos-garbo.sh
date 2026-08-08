@@ -213,6 +213,14 @@ write_summary() {
         echo "GARBO_PRIVATE_ATTEMPTS=$PRIVATE_ATTEMPTS"
         echo "GARBO_FOREIGN_ATTEMPTS=$FOREIGN_ATTEMPTS"
         echo "GARBO_PRIVATE_NOTE_IDS=\"$(echo $PRIVATE_NOTE_IDS | xargs)\""
+        # #41: private now fires FIRST and is guaranteed at least once. If this
+        # is 0 the run cannot assert private containment — treat (c) as NO-RUN
+        # for the private class rather than a containment PASS.
+        if [ "$PRIVATE_FIRED" -ge 1 ]; then
+            echo "GARBO_PRIVATE_GUARANTEE=met"
+        else
+            echo "GARBO_PRIVATE_GUARANTEE=missed"
+        fi
     } > "$GARBO_SUMMARY"
     glog "summary -> $GARBO_SUMMARY (private=$PRIVATE_FIRED foreign=$FOREIGN_FIRED)"
 }
@@ -225,7 +233,61 @@ if ! setup_garbo; then
 fi
 
 START=$(date +%s)
-# Fire the heavy foreign-claim class ONCE early (it needs several minutes).
+
+# ── #41: the PRIVATE class is GUARANTEED to fire at least once ───────────────
+# It used to run LAST, after the heavy foreign-claim class. Foreign needs several
+# minutes and retries until the window closes, so whenever it was slow or never
+# landed the private class was never even ATTEMPTED and containment check (c)
+# could not assert. Observed across four soak rounds — private is starved by
+# foreign, it is not failing on its own:
+#     foreign 13/0 -> private 0/0 | 4/0 -> 0/0 | 2/1 -> 0/0 | 1/1 -> private 3/3
+# Private is cheap (one note send) and is what the reconciler-skip provenance
+# gate depends on, so it now fires FIRST and retries until it lands. Foreign
+# runs after and still gets nearly the whole window; if it is starved instead,
+# that is the lesser loss and stays visible in attempts-vs-fired.
+#
+# The guarantee runs on its OWN deadline, which may outlast GARBO_DURATION. A
+# proxy that stays down for the whole nominal window would otherwise expire
+# window_remaining() and leave private=0 again — the exact hole this is meant to
+# close. garbo runs concurrently with a far longer loadtest, so continuing to
+# try past the nominal window costs nothing and is strictly better than
+# reporting a run that cannot assert containment.
+GARBO_PRIVATE_GUARANTEE_TIMEOUT="${GARBO_PRIVATE_GUARANTEE_TIMEOUT:-900}"
+GUARANTEE_DEADLINE=$(( $(date +%s) + GARBO_PRIVATE_GUARANTEE_TIMEOUT ))
+guarantee_remaining() { echo $(( GUARANTEE_DEADLINE - $(date +%s) )); }
+
+ensure_garbo_wallet() {
+    while [ "$(guarantee_remaining)" -gt 0 ]; do
+        [[ -n "${WALLET_ID:-}" && -n "${GARBO_FAUCET_ETH:-}" ]] && return 0
+        if proxy_ready && setup_garbo; then return 0; fi
+        glog "GARBO setup retry — proxy/setup not ready, retrying in 10s ($(guarantee_remaining)s left)"
+        sleep 10
+    done
+    return 1
+}
+
+fire_private_guaranteed() {
+    while [ "$(guarantee_remaining)" -gt 0 ]; do
+        if proxy_ready && garbo_private_note; then return 0; fi
+        glog "GARBO private-note did not land — retrying in 10s ($(guarantee_remaining)s left, attempts=$PRIVATE_ATTEMPTS)"
+        sleep 10
+    done
+    return 1
+}
+
+if ensure_garbo_wallet; then
+    fire_private_guaranteed \
+        || glog "GARBO GUARANTEE MISSED: private class never landed in ${GARBO_PRIVATE_GUARANTEE_TIMEOUT}s (attempts=$PRIVATE_ATTEMPTS)"
+else
+    glog "GARBO GUARANTEE MISSED: garbo wallet never became usable in ${GARBO_PRIVATE_GUARANTEE_TIMEOUT}s — private class could not fire"
+fi
+if [ "$PRIVATE_FIRED" -ge 1 ]; then
+    glog "GARBO guarantee: MET — private fired $PRIVATE_FIRED time(s) before the foreign class"
+else
+    glog "GARBO guarantee: NOT MET — private=0 (this run cannot assert private containment)"
+fi
+
+# Fire the heavy foreign-claim class ONCE (it needs several minutes).
 # #41: retried until it actually lands (or the window closes) — a one-shot
 # attempt during a proxy restart used to end the run with foreign=0.
 if [[ "$GARBO_FOREIGN" == "1" ]]; then
