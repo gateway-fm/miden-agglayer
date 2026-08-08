@@ -260,6 +260,16 @@ struct RecoveredBridgeOuts {
     /// Finding #69 — CLAIM bodies collected by the same block walk.
     claim_id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
     claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody>,
+    /// #88 — node-authoritative metadata for EVERY public note seen by the
+    /// block walk, keyed by details commitment (the client store's
+    /// `details_commitment()` key). The MA#28 provenance source that survives
+    /// a FULL drop-restore: with the miden-client store wiped alongside the
+    /// proxy store, consumed records are metadata-less (`ConsumedExternal`)
+    /// and the own-output-record fallback is empty — without this map every
+    /// historical UpdateGerNote is skipped as MissingMetadata and the restored
+    /// GER ledger (UHC logs + is_injected) silently loses history. Fail-closed
+    /// holds: only notes the NODE returned as Public contribute.
+    public_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata>,
 }
 
 struct ReplayBridgeOut {
@@ -357,6 +367,10 @@ pub async fn restore(
         "Phase 1.5 complete: found {} B2AGG note(s)",
         recovered.by_id.len()
     );
+    // #88 — keep the node-authoritative metadata map alive past the
+    // `recovered` move: Phase 4's GER replay needs it when the client store
+    // was wiped along with the proxy store.
+    let node_note_metadata = recovered.public_note_metadata.clone();
     let (bridge_replay, claim_replay) =
         restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
             .await
@@ -496,8 +510,15 @@ pub async fn restore(
 
     // Phase 3: Scan consumed UpdateGerNote notes on Miden
     tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
-    let (gers, ger_logs) =
-        restore_gers(store, miden_client, accounts, block_state, miden_tip).await?;
+    let (gers, ger_logs) = restore_gers(
+        store,
+        miden_client,
+        accounts,
+        block_state,
+        miden_tip,
+        node_note_metadata,
+    )
+    .await?;
     total_logs += ger_logs;
     tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
 
@@ -605,6 +626,8 @@ async fn scan_bridge_out_bodies(
     let mut claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody> =
         std::collections::HashMap::new();
     let mut claim_id_by_nullifier = std::collections::HashMap::new();
+    let mut public_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> =
+        std::collections::HashMap::new();
     let mut scanned = 0usize;
     for b in 0..=to_block {
         let block = rpc
@@ -630,6 +653,10 @@ async fn scan_bridge_out_bodies(
                     // mint-proof provenance path needs post `--reset-miden-store`.
                     let metadata = *note.metadata();
                     let details: NoteDetails = note.into();
+                    // #88: retain node-authoritative metadata for EVERY public
+                    // note (not just B2AGG/CLAIM) — the GER replay's MA#28
+                    // check needs it when the client store was wiped too.
+                    public_note_metadata.insert(details.commitment().as_bytes(), metadata);
                     if is_b2agg_note(&details) {
                         if by_id
                             .insert(
@@ -699,6 +726,7 @@ async fn scan_bridge_out_bodies(
         by_id,
         claim_id_by_nullifier,
         claims_by_id,
+        public_note_metadata,
     })
 }
 
@@ -2306,6 +2334,10 @@ async fn restore_gers(
     accounts: &AccountsConfig,
     block_state: &Arc<BlockState>,
     restore_block: u64,
+    // #88 — node-authoritative metadata from `scan_bridge_out_bodies`' block
+    // walk, keyed by details commitment. Merged UNDER own-output records (own
+    // records win) so MA#28 still passes when the client store was wiped too.
+    node_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata>,
 ) -> anyhow::Result<(usize, usize)> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -2343,13 +2375,25 @@ async fn restore_gers(
                 // strictly stronger than the plain sender check: a GER-shaped
                 // note we did not mint has no output record, stays metadata-less,
                 // and is skipped as MissingMetadata — exactly the MA#28 posture.
-                let own_output_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> = client
-                    .get_output_notes(NoteFilter::All)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
-                    .into_iter()
-                    .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
-                    .collect();
+                let mut own_output_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> =
+                    client
+                        .get_output_notes(NoteFilter::All)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
+                        .into_iter()
+                        .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
+                        .collect();
+                // #88 — FULL drop-restore also wipes the client store, so both
+                // the record metadata AND the own-output fallback above are
+                // empty for historical notes; MA#28 then skipped every old
+                // UpdateGerNote as MissingMetadata and the restored GER ledger
+                // lost history (UHC logs + is_injected). Merge the NODE-scanned
+                // metadata UNDER own records (own records win): the node is the
+                // durable truth the client store was caching. Fail-closed
+                // holds — only node-returned Public notes are in this map.
+                for (k, v) in &node_note_metadata {
+                    own_output_metadata.entry(*k).or_insert(*v);
+                }
 
                 let mut ger_count = 0usize;
                 let mut log_count = 0usize;
