@@ -154,6 +154,13 @@ case "$test_filter" in
         # proxy holds no local secret — a topology the other tiers do not use.
         "$SCRIPT_DIR/e2e-web3signer.sh"
         ;;
+    full-db-loss)
+        # #88 gate — FULL proxy state loss (postgres + miden-client sqlite) must
+        # restore byte-identical synthetic history (incl. hash_chain_value), mint
+        # zero ERR_GER_ALREADY_REGISTERED poison notes, and leave the pipeline
+        # live. DESTRUCTIVE to the proxy store by design; runs on the live stack.
+        "$SCRIPT_DIR/e2e-full-db-loss-recovery.sh"
+        ;;
     recovery-scenarios)
         # #157 reviewer #7 — deterministic {node,proxy}×{GER,claim} crash-during-
         # proving recovery. DEDICATED gate (NOT in `all`): the GER cases require the
