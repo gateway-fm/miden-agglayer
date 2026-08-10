@@ -360,17 +360,17 @@ pub async fn restore(
         scan_tip,
         "Phase 1.5: scanning bridge-out notes from the node..."
     );
-    let recovered = scan_bridge_out_bodies(&*rpc, accounts.bridge.0, scan_tip)
+    let mut recovered = scan_bridge_out_bodies(&*rpc, accounts.bridge.0, scan_tip)
         .await
         .map_err(|e| anyhow::anyhow!("restore bridge-out body scan failed: {e:#}"))?;
     tracing::info!(
         "Phase 1.5 complete: found {} B2AGG note(s)",
         recovered.by_id.len()
     );
-    // #88 — keep the node-authoritative metadata map alive past the
-    // `recovered` move: Phase 4's GER replay needs it when the client store
-    // was wiped along with the proxy store.
-    let node_note_metadata = recovered.public_note_metadata.clone();
+    // #88 — take (not clone) the node-authoritative GER metadata map out before
+    // `recovered` is consumed by restore_bridge_replay; Phase 4's GER replay
+    // needs it when the client store was wiped along with the proxy store.
+    let node_note_metadata = std::mem::take(&mut recovered.public_note_metadata);
     let (bridge_replay, claim_replay) =
         restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
             .await
@@ -613,6 +613,34 @@ async fn sync_miden_snapshot(
 
 /// Scans every block in a fixed snapshot and retains public B2AGG bodies by unique NoteId.
 /// Any incomplete RPC response aborts restore; a partial identity set is unsafe to replay.
+/// #88 / PR#164 — merge one GER-shaped node note's metadata into the restore
+/// map, ambiguity-safe. Details commitment excludes metadata, so if two
+/// GER-shaped notes share details but carry DIFFERENT metadata we drop the key
+/// into `ambiguous` and never serve it again — the replay then fails closed
+/// rather than joining a GER to a last-writer's provenance. Identical
+/// metadata for the same key is idempotent. Pure + unit-tested.
+fn record_ger_node_metadata(
+    map: &mut std::collections::HashMap<[u8; 32], NoteMetadata>,
+    ambiguous: &mut std::collections::HashSet<[u8; 32]>,
+    key: [u8; 32],
+    metadata: NoteMetadata,
+) {
+    if ambiguous.contains(&key) {
+        return;
+    }
+    match map.get(&key) {
+        Some(existing) if *existing != metadata => {
+            map.remove(&key);
+            ambiguous.insert(key);
+            ::metrics::counter!("restore_ger_meta_ambiguous_total").increment(1);
+        }
+        Some(_) => {}
+        None => {
+            map.insert(key, metadata);
+        }
+    }
+}
+
 async fn scan_bridge_out_bodies(
     rpc: &dyn miden_client::rpc::NodeRpcClient,
     bridge_id: AccountId,
@@ -621,13 +649,26 @@ async fn scan_bridge_out_bodies(
     use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
     let claim_root = miden_base_agglayer::ClaimNote::script().root();
+    let ger_root = UpdateGerNote::script_root();
     let mut by_id = std::collections::HashMap::new();
     let mut id_by_nullifier = std::collections::HashMap::new();
     let mut claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody> =
         std::collections::HashMap::new();
     let mut claim_id_by_nullifier = std::collections::HashMap::new();
+    // #88 / PR#164: node-authoritative GER metadata for the restore replay,
+    // keyed by details commitment. Restricted to GER-shaped notes (bounds
+    // memory to the GER count, not total chain traffic) and ambiguity-safe:
+    // details commitment excludes metadata, so if two public GER-shaped notes
+    // share details but carry DIFFERENT metadata (different sender), we drop
+    // the key into `ambiguous` and never serve it — the replay then fails
+    // closed (MissingMetadata) rather than joining a GER to a last-writer's
+    // provenance. A legit GER note has a random serial, so a genuine collision
+    // is effectively unreachable; this is correctness-by-construction, not a
+    // hot path.
     let mut public_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> =
         std::collections::HashMap::new();
+    let mut ambiguous_ger_meta: std::collections::HashSet<[u8; 32]> =
+        std::collections::HashSet::new();
     let mut scanned = 0usize;
     for b in 0..=to_block {
         let block = rpc
@@ -653,10 +694,18 @@ async fn scan_bridge_out_bodies(
                     // mint-proof provenance path needs post `--reset-miden-store`.
                     let metadata = *note.metadata();
                     let details: NoteDetails = note.into();
-                    // #88: retain node-authoritative metadata for EVERY public
-                    // note (not just B2AGG/CLAIM) — the GER replay's MA#28
-                    // check needs it when the client store was wiped too.
-                    public_note_metadata.insert(details.commitment().as_bytes(), metadata);
+                    // #88 / PR#164: retain node-authoritative metadata ONLY for
+                    // GER-shaped notes (bounds memory), and fail closed on a
+                    // details-commitment collision that carries different
+                    // metadata instead of last-write-wins.
+                    if details.script().root() == ger_root {
+                        record_ger_node_metadata(
+                            &mut public_note_metadata,
+                            &mut ambiguous_ger_meta,
+                            details.commitment().as_bytes(),
+                            metadata,
+                        );
+                    }
                     if is_b2agg_note(&details) {
                         if by_id
                             .insert(
@@ -2476,6 +2525,45 @@ mod tests {
 
     fn id(hex: &str) -> AccountId {
         AccountId::from_hex(hex).expect("hex must decode")
+    }
+
+    // PR#164 blocker #1 — the node-metadata join must fail closed on a
+    // details-commitment collision that carries different provenance, never
+    // last-write-wins.
+    #[test]
+    fn ger_node_metadata_is_ambiguity_safe() {
+        let (manager_meta, _) = make_metadata(id(TEST_SENDER_MANAGER), None);
+        let (attacker_meta, _) = make_metadata(id(TEST_SENDER_ATTACKER), None);
+        assert_ne!(manager_meta, attacker_meta);
+        let key = [0x11u8; 32];
+
+        let mut map = std::collections::HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+
+        // First writer lands.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
+        assert_eq!(map.get(&key), Some(&manager_meta));
+
+        // Idempotent: identical metadata for the same key is a no-op.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
+        assert_eq!(map.get(&key), Some(&manager_meta));
+
+        // A DIFFERENT metadata for the same key poisons the key: removed +
+        // marked ambiguous, so the replay serves nothing (fail closed), NOT the
+        // attacker's provenance and NOT the original last-write-wins.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, attacker_meta);
+        assert!(map.get(&key).is_none(), "ambiguous key must not be served");
+        assert!(ambiguous.contains(&key));
+
+        // Once ambiguous, even a later "correct" write stays out — we can no
+        // longer trust which is authentic.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
+        assert!(map.get(&key).is_none());
+
+        // A distinct key is unaffected.
+        let key2 = [0x22u8; 32];
+        record_ger_node_metadata(&mut map, &mut ambiguous, key2, manager_meta);
+        assert_eq!(map.get(&key2), Some(&manager_meta));
     }
 
     fn make_metadata(
