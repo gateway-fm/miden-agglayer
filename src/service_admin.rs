@@ -388,6 +388,13 @@ pub async fn admin_register_native_faucet(
     let origin_network = state.network_id;
     let scale = 0u8;
 
+    // Shared single-flight with the public path (REGISTER_NATIVE_LOCK). The admin
+    // path is trusted, so it WAITS on the lock rather than shedding — but it must
+    // hold the SAME lock so a concurrent permissionless registration cannot
+    // interleave between this path's checks and its config-note emission. Held to
+    // end of function.
+    let _guard = REGISTER_NATIVE_LOCK.lock().await;
+
     // Idempotent: an existing native route for this (origin_address, origin_network) is
     // returned as-is (register-if-absent), matching admin_registerFaucet's contract.
     if let Some(existing) = state
@@ -405,6 +412,32 @@ pub async fn admin_register_native_faucet(
             "admin_registerNativeFaucet: a route already exists for this origin — returning the existing route's faucet"
         );
         return Ok(existing.faucet_id.to_hex());
+    }
+
+    // Authoritative on-chain preflight (same as the public path): the local
+    // registry can be empty after DB loss while the bridge still binds this
+    // faucet or its origin. Refuse to emit a rebinding note; return the existing
+    // binding idempotently.
+    match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
+        BridgeBinding::OriginBoundToOther(other) => {
+            tracing::info!(
+                origin_network,
+                existing_faucet_id = %other.to_hex(),
+                requested_faucet_id = %faucet_id.to_hex(),
+                "admin_registerNativeFaucet: origin already bound on the bridge to a different \
+                 faucet — returning the existing binding, emitting no rebinding note"
+            );
+            return Ok(other.to_hex());
+        }
+        BridgeBinding::AlreadyThisFaucet => {
+            tracing::info!(
+                faucet_id = %faucet_id.to_hex(),
+                "admin_registerNativeFaucet: faucet already registered on the bridge — no note \
+                 emitted (local registry will be reconciled by restore/rebuild)"
+            );
+            return Ok(faucet_id.to_hex());
+        }
+        BridgeBinding::Unbound => { /* safe to register below */ }
     }
 
     // #149 — read the deployed faucet account's AUTHORITATIVE metadata BEFORE any
@@ -1016,10 +1049,93 @@ pub struct RegisterNativeFaucetPublicParams {
     pub faucet_id: String,
 }
 
-/// Serializes permissionless registrations so concurrent duplicates cannot both
-/// pass their conflict checks and then both write.
-static REGISTER_NATIVE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
+/// Process-wide single-flight for native-faucet registration, SHARED by the
+/// public (`miden_registerNativeFaucet`) and admin (`admin_registerNativeFaucet`)
+/// paths so the "read authoritative state → decide → emit config note → persist"
+/// critical section is serialized ACROSS both. Without a shared lock a public
+/// call and a concurrent admin call could each observe "not registered" and both
+/// submit a config note (the exact rebind the reviewer flagged).
+///
+/// Admission is BOUNDED, not queued: the untrusted public path acquires it with
+/// `try_lock()` and sheds on contention (an unauthenticated flood cannot pile up
+/// unbounded slow tasks behind one lock), while the trusted admin path may wait
+/// on `lock().await`. Cross-replica coordination is intentionally out of scope
+/// (#142); this is within-one-process only.
+static REGISTER_NATIVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The authoritative on-chain binding for a native faucet, read from the bridge
+/// account's `faucet_metadata_map` UNDER the registration lock. The local
+/// `faucet_registry` alone is not authoritative: after DB loss/lag it can be
+/// empty while the bridge still binds the faucet (or its origin), so trusting it
+/// would let the public path emit a duplicate/rebinding config note. This is the
+/// preflight the reviewer required before any note is emitted.
+enum BridgeBinding {
+    /// This exact faucet is already registered on the bridge — registration is a
+    /// no-op; only the local registry may need reconciling.
+    AlreadyThisFaucet,
+    /// The derived origin `(address, network)` is already bound to a DIFFERENT
+    /// faucet on the bridge — refuse rather than rebind.
+    OriginBoundToOther(AccountId),
+    /// Neither the faucet nor its origin is on the bridge — safe to register.
+    Unbound,
+}
+
+/// Read the authoritative bridge binding for `(faucet_id, origin_address,
+/// origin_network)` from the on-chain `faucet_metadata_map`. Caller MUST hold
+/// [`REGISTER_NATIVE_LOCK`] so the read-decide-emit sequence is atomic w.r.t. the
+/// other registration path.
+async fn preflight_bridge_binding(
+    state: &ServiceState,
+    faucet_id: AccountId,
+    origin_address: [u8; 20],
+    origin_network: u32,
+) -> anyhow::Result<BridgeBinding> {
+    let bridge_id = state.accounts.0.bridge.0;
+    let out = Arc::new(std::sync::Mutex::new(None::<BridgeBinding>));
+    let out_write = out.clone();
+    state
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                let bridge = client
+                    .get_account(bridge_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("preflight: get_account(bridge {bridge_id}): {e}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("preflight: bridge account {bridge_id} not found locally")
+                    })?;
+                let storage = bridge.storage();
+                let binding = if crate::metadata_recovery::read_faucet_conversion_metadata(
+                    storage, faucet_id,
+                )
+                .is_some()
+                {
+                    BridgeBinding::AlreadyThisFaucet
+                } else if let Some((other, _conv)) =
+                    crate::metadata_recovery::find_registered_faucet_for_origin(
+                        storage,
+                        &origin_address,
+                        origin_network,
+                    ) {
+                    // Can only be a different faucet: if it were `faucet_id` the
+                    // conversion read above would have matched (AlreadyThisFaucet).
+                    if other == faucet_id {
+                        BridgeBinding::AlreadyThisFaucet
+                    } else {
+                        BridgeBinding::OriginBoundToOther(other)
+                    }
+                } else {
+                    BridgeBinding::Unbound
+                };
+                *out_write.lock().unwrap() = Some(binding);
+                Ok(())
+            })
+        })
+        .await?;
+    out.lock().unwrap().take().ok_or_else(|| {
+        anyhow::anyhow!("preflight: bridge-binding read produced no result for faucet {faucet_id}")
+    })
+}
 
 /// `miden_registerNativeFaucet` — permissionless registration of an
 /// already-deployed Miden-native faucet.
@@ -1037,13 +1153,17 @@ pub async fn miden_register_native_faucet(
     let origin_address = derive_native_origin_address(faucet_id);
     let origin_network = state.network_id;
 
-    // Single-flight: without this, two concurrent requests for the same faucet
-    // can both observe "not registered", both read the account, and both write —
-    // producing two bridge registrations for one faucet.
-    let _guard = REGISTER_NATIVE_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
+    // Bounded single-flight (shared with the admin path). `try_lock` sheds under
+    // contention instead of queueing, so an unauthenticated flood cannot pile up
+    // unbounded slow registration tasks behind one lock; and because the admin
+    // path takes the SAME lock, a concurrent admin registration cannot slip a
+    // rebinding config note past this path's checks. Held to end of function.
+    let _guard = REGISTER_NATIVE_LOCK.try_lock().map_err(|_| {
+        anyhow::anyhow!(
+            "miden_registerNativeFaucet: another native-faucet registration is in progress; \
+             retry shortly (bounded admission — requests are not queued)"
+        )
+    })?;
 
     // ── conflict checks BEFORE any state change ──────────────────────────────
     // Idempotent for the same faucet; explicit failure for anything that would
@@ -1130,6 +1250,57 @@ pub async fn miden_register_native_faucet(
             faucet_id.to_hex()
         )
     })?;
+
+    // Preflight the AUTHORITATIVE on-chain binding under the lock, before any
+    // note is emitted. The local registry checks above can be stale (DB loss/lag)
+    // or racing the admin path; the bridge's faucet_metadata_map is the source of
+    // truth for what is actually bound.
+    match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
+        BridgeBinding::OriginBoundToOther(other) => {
+            anyhow::bail!(
+                "miden_registerNativeFaucet: the derived origin identity for faucet {} is \
+                 already bound on the bridge to a DIFFERENT faucet {}. Refusing to rebind. \
+                 No note emitted, no state changed.",
+                faucet_id.to_hex(),
+                other.to_hex()
+            );
+        }
+        BridgeBinding::AlreadyThisFaucet => {
+            // The bridge already binds this faucet; emitting another config note
+            // would be a duplicate. Reconcile the local registry (it may be empty
+            // after DB loss) from the authoritative metadata, then report the
+            // idempotent success WITHOUT touching the bridge.
+            use alloy_core::sol_types::SolValue;
+            let metadata_bytes = AdminTokenMetadata {
+                name: authoritative.name.clone(),
+                symbol: authoritative.symbol.clone(),
+                decimals: authoritative.decimals,
+            }
+            .abi_encode_params();
+            state
+                .store
+                .register_faucet(FaucetEntry {
+                    faucet_id,
+                    origin_address,
+                    origin_network,
+                    symbol: authoritative.symbol.clone(),
+                    origin_decimals: authoritative.decimals,
+                    miden_decimals: authoritative.decimals,
+                    scale: 0u8,
+                    metadata: metadata_bytes,
+                })
+                .await?;
+            return Ok(serde_json::json!({
+                "faucet_id": faucet_id.to_hex(),
+                "origin_token_address": format!("0x{}", hex::encode(origin_address)),
+                "origin_network": origin_network,
+                "symbol": authoritative.symbol,
+                "decimals": authoritative.decimals,
+                "already_registered": true,
+            }));
+        }
+        BridgeBinding::Unbound => { /* safe to register below */ }
+    }
 
     // The shared validator cross-checks REQUESTED against AUTHORITATIVE. This
     // path accepts no caller metadata, so the "request" IS the authoritative
@@ -1229,6 +1400,25 @@ mod permissionless_registration_tests {
     ///      Miden account (`is_miden_compatible_address` accepts it), so an
     ///      operator can recover the faucet from the on-chain origin with no
     ///      lookup table.
+    /// Bounded admission (PR#164 #3): while one registration holds the shared
+    /// single-flight lock, a second public-path attempt (`try_lock`) is SHED
+    /// immediately rather than queued. This is what stops an unauthenticated
+    /// flood from piling up unbounded slow tasks behind one global lock, and it
+    /// makes the "bounded, not queued" claim executable rather than inferred.
+    #[tokio::test]
+    async fn native_registration_admission_is_bounded_not_queued() {
+        let held = REGISTER_NATIVE_LOCK.lock().await;
+        assert!(
+            REGISTER_NATIVE_LOCK.try_lock().is_err(),
+            "a concurrent public registration must be shed (not queued) while one is in flight"
+        );
+        drop(held);
+        assert!(
+            REGISTER_NATIVE_LOCK.try_lock().is_ok(),
+            "admission must be available again once the in-flight registration completes"
+        );
+    }
+
     #[test]
     fn origin_identity_is_the_reversible_protocol_encoding() {
         let faucet = fid("0xaa0000000000bc310000bc000000de");
