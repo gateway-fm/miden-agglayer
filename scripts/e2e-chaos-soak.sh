@@ -124,10 +124,15 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
       total=${total:-0}
       [ "$total" -lt 6 ] || continue  # heal budget: past this it's a hard failure, not flakiness
       svc=aggkit; [ "$AK" = "${PROJECT}-aggkit-l2b-1" ] && svc=aggkit-l2b
-      echo "$(date +%H:%M:%S) WATCHDOG: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — FORCE-RECREATING $svc (ephemeral monitor DB must be wiped; docker restart preserves the container fs and the poisoned DB with it)" \
+      # PR#164 #8: PRESERVE-HEAL instead of a blind force-recreate. The old
+      # recreate wiped the whole container fs to clear one poisoned file,
+      # destroying aggsender cert lineage (#89) and the bridgesync cursors
+      # (cold resync into anvil's 256-state wall permanently halts L2<->L2,
+      # #87). aggkit-preserve-heal.sh wipes ONLY ethtxmanager-aggoracle.sqlite
+      # and restores every other DB — the versioned, self-contained primitive.
+      echo "$(date +%H:%M:%S) WATCHDOG: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — PRESERVE-HEALING $svc" \
           | tee -a "$WATCHDOG_HEALS_FILE"
-      COMPOSE_PROJECT_NAME="$PROJECT" docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml \
-          --env-file fixtures/.env up -d --no-deps --force-recreate "$svc" >/dev/null 2>&1 || true
+      PROJECT="$PROJECT" FORCE=1 "$SCRIPT_DIR/aggkit-preserve-heal.sh" "$svc" >/dev/null 2>&1 || true
     done
   done
 ) >>/tmp/chaos-watchdog.out 2>&1 &

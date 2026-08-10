@@ -98,18 +98,16 @@ fault_kill_prover() {
 fault_restart_proxy() {
     if docker restart -t 2 "$PROXY" >/dev/null 2>&1; then
         log "FAULT restart-proxy — crash the proxy mid-flight (injected; tests cursor persist + late-sweep heal)"
-        # Runbook pairing RETIRED (2026-08-08): the blind force-recreate here was
-        # DESTROYING sync state and cert lineage to clear one poisoned file —
-        # observed live: recreating aggkit-l2b on an aged stack cold-resyncs
-        # into anvil's 256-state retention wall (#87) and PERMANENTLY halts
-        # bridgesync ("failed to extract bridge event data" hard-loop, L2<->L2
-        # dead). The lost-in-transit wedge this paired against is now healed by
-        # the standing PRESERVE-HEAL watchdog (soak harness): it detects the
-        # actual wedge signature (same tx hash repeating, unknown to the proxy)
-        # and recreates with every DB EXCEPT ethtxmanager-aggoracle.sqlite
-        # restored — monitor DB cleared, sync cursors + aggsender lineage kept.
-        # The seeder must not race or duplicate that; it only injects faults.
-        log "NOTE  restart-proxy pairing: lost-tx wedge (if any) is left to the preserve-heal watchdog"
+        # Runbook pairing RETIRED (PR#164): the old blind force-recreate here
+        # DESTROYED sync state + cert lineage to clear one poisoned file —
+        # recreating aggkit-l2b on an aged stack cold-resyncs into anvil's
+        # 256-state wall (#87) and permanently halts bridgesync. The seeder only
+        # injects faults; recovery of the lost-in-transit wedge this can cause is
+        # the VERSIONED, self-contained scripts/aggkit-preserve-heal.sh (wipes
+        # ONLY ethtxmanager-aggoracle.sqlite; keeps cert lineage + sync cursors),
+        # run as a standing watchdog by the repo chaos orchestrator
+        # (e2e-chaos-soak.sh) — no external/scratchpad component required.
+        log "NOTE  restart-proxy: any lost-tx wedge is healed by scripts/aggkit-preserve-heal.sh (run by e2e-chaos-soak.sh)"
     else
         log "SKIP restart-proxy (docker restart $PROXY failed — not injected)"
     fi
