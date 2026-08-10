@@ -974,11 +974,6 @@ mod tests {
 
 // ── #154: permissionless native-faucet registration ──────────────────────────
 
-/// Domain separator for the canonical native-origin derivation. Changing it
-/// changes every derived identity, so it is versioned and must never be edited
-/// in place.
-const NATIVE_ORIGIN_DOMAIN: &[u8] = b"miden-agglayer:native-origin:v1";
-
 /// The canonical 20-byte origin identity for a Miden-ORIGINATED faucet.
 ///
 /// # Why this is derived and not chosen
@@ -992,19 +987,22 @@ const NATIVE_ORIGIN_DOMAIN: &[u8] = b"miden-agglayer:native-origin:v1";
 ///
 /// Deriving it from the faucet id removes the choice entirely: the identity is a
 /// pure function of the account being registered, so there is nothing to squat.
-/// Two different faucets cannot collide except by finding a keccak collision,
-/// and the same faucet always derives the same address, which is what makes
-/// registration idempotent.
+///
+/// # Why the protocol `EthEmbeddedAccountId` encoding, not a proxy-local hash
+///
+/// The identity is the protocol's canonical `EthEmbeddedAccountId` encoding of
+/// the faucet id — the SAME 20-byte form every other address↔account path in
+/// this proxy already uses (`address_mapper::account_id_from_address`,
+/// `bridge_out::embedded_address`). That encoding is REVERSIBLE:
+/// `[4 zero bytes][prefix(8)][suffix(8)]` embeds the AccountId losslessly, so an
+/// operator (or the aggkit side) can recover the originating faucet from the
+/// on-chain origin address with no lookup table. A proxy-local
+/// `last20(keccak(domain || id))` would be one-way and would disagree with the
+/// encoding used everywhere else, orphaning that reversibility. It is collision-
+/// free by construction (distinct AccountIds embed to distinct addresses) and
+/// deterministic, which is what makes registration idempotent.
 pub fn derive_native_origin_address(faucet_id: AccountId) -> [u8; 20] {
-    use alloy::primitives::keccak256;
-    let mut preimage = Vec::with_capacity(NATIVE_ORIGIN_DOMAIN.len() + 64);
-    preimage.extend_from_slice(NATIVE_ORIGIN_DOMAIN);
-    preimage.extend_from_slice(faucet_id.to_hex().as_bytes());
-    let digest = keccak256(&preimage);
-    let mut out = [0u8; 20];
-    // Low 20 bytes, matching the usual keccak→address convention.
-    out.copy_from_slice(&digest[12..32]);
-    out
+    miden_base_agglayer::EthEmbeddedAccountId::from(faucet_id).into()
 }
 
 /// Params for the PERMISSIONLESS registration: the faucet id and nothing else.
@@ -1075,8 +1073,9 @@ pub async fn miden_register_native_faucet(
         .get_faucet_by_origin(&origin_address, origin_network)
         .await?
     {
-        // Only reachable via a keccak collision or an operator having chosen this
-        // exact address by hand. Either way, refuse rather than rebind.
+        // The encoding is collision-free, so this is only reachable when an
+        // operator chose this exact address by hand via the admin API. Either
+        // way, refuse rather than rebind.
         anyhow::bail!(
             "miden_registerNativeFaucet: the derived origin identity for faucet {} is already \
              bound to faucet {}. Refusing to rebind. No state was changed.",
@@ -1219,18 +1218,34 @@ mod permissionless_registration_tests {
         );
     }
 
-    /// The domain separator is versioned because changing it silently would
-    /// re-derive every identity and orphan existing routes.
+    /// Interoperability + reversibility: the derived origin address is the
+    /// protocol's canonical `EthEmbeddedAccountId` encoding, which every other
+    /// address↔account path in the proxy shares. Two properties matter and are
+    /// pinned here:
+    ///   1. It agrees byte-for-byte with `account_id_from_address`'s inverse —
+    ///      i.e. the address we persist round-trips BACK to the exact faucet id.
+    ///      A proxy-local keccak identity could never satisfy this.
+    ///   2. It is the same 20-byte form the rest of the codebase produces for a
+    ///      Miden account (`is_miden_compatible_address` accepts it), so an
+    ///      operator can recover the faucet from the on-chain origin with no
+    ///      lookup table.
     #[test]
-    fn derivation_is_domain_separated() {
-        use alloy::primitives::keccak256;
-        let f = fid("0xaa0000000000bc310000bc000000de");
-        let undomained = keccak256(f.to_hex().as_bytes());
-        assert_ne!(
-            derive_native_origin_address(f),
-            undomained[12..32],
-            "a bare keccak of the id would collide with any other component using the \
-             same preimage; the domain separator must be part of it"
+    fn origin_identity_is_the_reversible_protocol_encoding() {
+        let faucet = fid("0xaa0000000000bc310000bc000000de");
+        let origin = derive_native_origin_address(faucet);
+
+        // The persisted origin is a canonical zero-padded Miden address...
+        let as_addr = alloy::primitives::Address::from(origin);
+        assert!(
+            crate::address_mapper::is_miden_compatible_address(as_addr),
+            "the origin identity must be a canonical Miden-compatible address"
+        );
+        // ...and it reverses back to EXACTLY the faucet we registered.
+        assert_eq!(
+            crate::address_mapper::account_id_from_address(as_addr),
+            Some(faucet),
+            "the derived origin address must round-trip back to the faucet id — \
+             this is the reversibility a keccak identity would lose"
         );
     }
 }
