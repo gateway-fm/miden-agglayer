@@ -298,13 +298,24 @@ pub async fn register_faucet_in_bridge(
         std::time::Duration::from_secs(1),
     )
     .await?;
-    if committed {
-        tracing::info!("register faucet tx {txn_id} committed");
-        // Extra wait for NTX builder to process the config note
-        for _ in 0..5 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            client.sync_state().await?;
-        }
+    // PR#164: fail-closed on a non-committed config tx. Returning Ok here let the
+    // caller persist a durable registry row for a bridge route that never
+    // landed — future registrations then short-circuit as `already_registered`
+    // while the bridge has no config note (durable DB/bridge disagreement).
+    // A timeout is recoverable: the note carries a finite expiration, so the
+    // caller (or a retry) can re-drive; we must NOT record success until the
+    // exact config tx is observed committed.
+    if !committed {
+        anyhow::bail!(
+            "register {faucet_name} faucet: config tx {txn_id} not observed committed within 20s; \
+             no registry row written — retry once the network catches up"
+        );
+    }
+    tracing::info!("register faucet tx {txn_id} committed");
+    // Extra wait for NTX builder to process the config note
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        client.sync_state().await?;
     }
     Ok(())
 }
