@@ -38,14 +38,43 @@ export MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-$(grep -m1 '^MIDEN_NODE_GIT_URL
 export MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-$(grep -m1 '^MIDEN_NODE_GIT_REF' "$PROJECT_DIR/Makefile" | sed 's/.*= *//')}"
 export WEB3SIGNER_UID="${WEB3SIGNER_UID:-$(id -u)}" WEB3SIGNER_GID="${WEB3SIGNER_GID:-$(id -g)}"
 
-# Auto-detect the live compose project from the running proxy (chaos-harness
-# pattern) so this runs against wt-* soak stacks and plain stacks alike.
-PROXY_CONTAINER="${PROXY_CONTAINER:-$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' | head -1)}"
-[[ -n "$PROXY_CONTAINER" ]] || { echo "FATAL: no running *-miden-agglayer-1 container"; exit 1; }
+# PR#164 blocker #6 — this test IRREVERSIBLY DROPS a database. It must NEVER
+# guess its victim. Require an explicit PROXY_CONTAINER, or auto-select ONLY
+# when exactly one candidate is running; refuse on ambiguity.
+CANDIDATES="$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' || true)"
+if [[ -n "${PROXY_CONTAINER:-}" ]]; then
+    grep -qxF "$PROXY_CONTAINER" <<<"$CANDIDATES" \
+        || { echo "FATAL: PROXY_CONTAINER='$PROXY_CONTAINER' is not a running *-miden-agglayer-1 container"; exit 1; }
+else
+    n_cand="$(grep -c . <<<"$CANDIDATES" 2>/dev/null || echo 0)"
+    if [[ "$n_cand" -eq 0 ]]; then
+        echo "FATAL: no running *-miden-agglayer-1 container"; exit 1
+    elif [[ "$n_cand" -gt 1 ]]; then
+        echo "FATAL: $n_cand proxy stacks are running — refusing to guess which DB to DROP."
+        echo "       Set PROXY_CONTAINER=<one of> explicitly:"; sed 's/^/         /' <<<"$CANDIDATES"
+        exit 1
+    fi
+    PROXY_CONTAINER="$CANDIDATES"
+fi
 PROJECT="${PROXY_CONTAINER%-miden-agglayer-1}"
 PG_CONTAINER="$PROJECT-agglayer-postgres-1"
 NTX_CONTAINER="$PROJECT-ntx-builder-1"
 export COMPOSE_PROJECT_NAME="$PROJECT"
+
+# Verify the postgres we are about to DROP is THIS proxy's configured store:
+# the container must exist, be in the same compose project, and the proxy must
+# actually reference it (its store URL names this postgres host). A destructive
+# test must confirm — not assume — its target.
+docker inspect "$PG_CONTAINER" >/dev/null 2>&1 \
+    || { echo "FATAL: expected store container $PG_CONTAINER not found for proxy $PROXY_CONTAINER"; exit 1; }
+PROXY_PROJECT_LABEL="$(docker inspect "$PROXY_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null)"
+PG_PROJECT_LABEL="$(docker inspect "$PG_CONTAINER"    --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null)"
+[[ -n "$PROXY_PROJECT_LABEL" && "$PROXY_PROJECT_LABEL" == "$PG_PROJECT_LABEL" ]] \
+    || { echo "FATAL: $PG_CONTAINER (project '$PG_PROJECT_LABEL') is not in the proxy's project ('$PROXY_PROJECT_LABEL')"; exit 1; }
+if ! docker inspect "$PROXY_CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+        | grep -qiE "(postgres|store|database).*(${PG_CONTAINER}|agglayer-postgres)"; then
+    echo "WARN: could not confirm proxy $PROXY_CONTAINER references $PG_CONTAINER via env; relying on project-label match"
+fi
 
 COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
 [[ -f "$PROJECT_DIR/docker-compose.l2l2.yml" ]] && docker ps --format '{{.Names}}' | grep -q "^$PROJECT-anvil-l2b-1$" \
@@ -72,14 +101,35 @@ pass() { printf '[%s] PASS: %s\n' "$(ts)" "$*" | tee -a "$EVIDENCE"; }
 
 pgq() { docker exec "$PG_CONTAINER" psql -U agglayer -d agglayer_store -tAc "$1"; }
 
-fingerprint() {  # -> "uhc inj bridge claim hcv"
+# PR#164 blocker #7 — COUNT comparison is unsafe: losing one row and
+# reconstructing a different row passes with the same count. `fingerprint`
+# digests the ORDERED identities/content of each row set (so a swapped row
+# changes the digest), and `counts` stays for human logging + the thinness gate.
+#   - synthetic_logs digest: md5 over (tx_hash:log_index:data) ordered
+#   - injected-GER set digest: md5 over ger_hash ordered
+#   - hash_chain_value: the order-sensitive rolling-chain assertion (kept as-is)
+log_digest() { # $1 = topic0 hex prefix
+    pgq "SELECT md5(coalesce(string_agg(transaction_hash || ':' || log_index || ':' || data, '|' \
+         ORDER BY transaction_hash, log_index), '')) \
+         FROM synthetic_logs WHERE topics[1] LIKE '$1%'"
+}
+fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
     local uhc inj bridge claim hcv
+    uhc=$(log_digest '0x65d3bf36')
+    inj=$(pgq "SELECT md5(coalesce(string_agg(encode(ger_hash,'hex'), '|' ORDER BY ger_hash), '')) \
+               FROM ger_entries WHERE is_injected=true")
+    bridge=$(log_digest '0x50178120')
+    claim=$(log_digest '0x1df3f2a9')
+    hcv=$(pgq "SELECT encode(hash_chain_value,'hex') FROM service_state WHERE id=1")
+    echo "$uhc $inj $bridge $claim $hcv"
+}
+counts() {  # -> "uhc inj bridge claim"  (integers, for logging + thinness gate)
+    local uhc inj bridge claim
     uhc=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'")
     inj=$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected=true")
     bridge=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%'")
     claim=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'")
-    hcv=$(pgq "SELECT encode(hash_chain_value,'hex') FROM service_state WHERE id=1")
-    echo "$uhc $inj $bridge $claim $hcv"
+    echo "$uhc $inj $bridge $claim"
 }
 
 wait_healthy() {
@@ -93,10 +143,12 @@ wait_healthy() {
 
 # ── Phase 0: pre-drop fingerprint on the live, quiesced stack ────────────────
 step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
+read -r NUHC0 NINJ0 NBR0 NCL0 <<<"$(counts)"
 read -r UHC0 INJ0 BR0 CL0 HCV0 <<<"$(fingerprint)"
-say "before: UHC=$UHC0 injected=$INJ0 Bridge=$BR0 Claim=$CL0 hash_chain=${HCV0:0:16}…"
-[[ "$UHC0" -ge 1 && "$INJ0" -ge 1 ]] || fail "fixture too thin (UHC=$UHC0 inj=$INJ0) — run traffic first"
-[[ "$UHC0" == "$INJ0" ]] || say "note: UHC($UHC0) != injected($INJ0) pre-drop — carrying the delta forward"
+say "before: counts UHC=$NUHC0 injected=$NINJ0 Bridge=$NBR0 Claim=$NCL0  hash_chain=${HCV0:0:16}…"
+say "before: digests uhc=${UHC0:0:12} inj=${INJ0:0:12} bridge=${BR0:0:12} claim=${CL0:0:12}"
+[[ "$NUHC0" -ge 1 && "$NINJ0" -ge 1 ]] || fail "fixture too thin (UHC=$NUHC0 inj=$NINJ0) — run traffic first"
+[[ "$NUHC0" == "$NINJ0" ]] || say "note: UHC($NUHC0) != injected($NINJ0) pre-drop — carrying the delta forward"
 NTX_MARK=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
 say "ntx kernel-assert (poison) lines so far: $NTX_MARK"
 
@@ -136,17 +188,20 @@ wait_healthy 180 || fail "proxy not healthy within 180s after restore"
 pass "proxy healthy"
 sleep 10   # let the reconcile catch-up settle anything the one-shot left
 
+read -r NUHC1 NINJ1 NBR1 NCL1 <<<"$(counts)"
 read -r UHC1 INJ1 BR1 CL1 HCV1 <<<"$(fingerprint)"
-say "after : UHC=$UHC1 injected=$INJ1 Bridge=$BR1 Claim=$CL1 hash_chain=${HCV1:0:16}…"
-[[ "$UHC1" == "$UHC0" ]] || fail "#88: UpdateHashChain logs lost across restore ($UHC0 -> $UHC1)"
-pass "UpdateHashChain log count preserved ($UHC1)"
-[[ "$INJ1" == "$INJ0" ]] || fail "#88: is_injected lost across restore ($INJ0 -> $INJ1)"
-pass "is_injected set preserved ($INJ1)"
+say "after : counts UHC=$NUHC1 injected=$NINJ1 Bridge=$NBR1 Claim=$NCL1  hash_chain=${HCV1:0:16}…"
+# Ordered-content digests (blocker #7): a swapped/reconstructed row changes the
+# digest even when the count is identical.
+[[ "$UHC1" == "$UHC0" ]] || fail "#88: UpdateHashChain rows differ across restore (digest $UHC0 -> $UHC1; counts $NUHC0 -> $NUHC1)"
+pass "UpdateHashChain rows identical (count $NUHC1, digest ${UHC1:0:12})"
+[[ "$INJ1" == "$INJ0" ]] || fail "#88: injected-GER set differs across restore (digest $INJ0 -> $INJ1; counts $NINJ0 -> $NINJ1)"
+pass "injected-GER set identical (count $NINJ1, digest ${INJ1:0:12})"
 [[ "$HCV1" == "$HCV0" ]] || fail "#88: hash_chain_value diverged (order-sensitive replay broke): $HCV0 vs $HCV1"
 pass "hash_chain_value identical (order-faithful replay)"
-[[ "$BR1" == "$BR0" ]] || fail "#69/#136 regression: BridgeEvent logs $BR0 -> $BR1"
-[[ "$CL1" == "$CL0" ]] || fail "#69/#136 regression: ClaimEvent logs $CL0 -> $CL1"
-pass "BridgeEvent ($BR1) + ClaimEvent ($CL1) preserved"
+[[ "$BR1" == "$BR0" ]] || fail "#69/#136 regression: BridgeEvent rows differ (digest $BR0 -> $BR1)"
+[[ "$CL1" == "$CL0" ]] || fail "#69/#136 regression: ClaimEvent rows differ (digest $CL0 -> $CL1)"
+pass "BridgeEvent (count $NBR1) + ClaimEvent (count $NCL1) rows identical"
 
 # ── Phase 4: no poison minted, pipeline alive ────────────────────────────────
 step "Phase 4 — no ERR_GER_ALREADY_REGISTERED poison; pipeline processes NEW traffic"
