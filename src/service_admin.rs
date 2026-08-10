@@ -479,11 +479,25 @@ pub async fn admin_register_native_faucet(
         )
     })?;
 
-    // Authoritative on-chain preflight UNDER THE LOCK, after the metadata read and
-    // before any note is emitted (same guarantee as the public path). The local
-    // registry can be empty after DB loss while the bridge still binds this faucet
-    // or its origin; refuse to emit a rebinding note and return the existing
-    // binding idempotently.
+    // #149 — validate the REQUESTED metadata against the AUTHORITATIVE faucet
+    // account BEFORE the idempotency preflight. A caller supplying wrong metadata
+    // for an already-bound faucet must still be rejected (the mismatch is a hard
+    // error), so this MUST precede the "already bound → no-op" short-circuit;
+    // otherwise a wrong-metadata request would return success just because the
+    // faucet happens to be on the bridge. `register_native_validated` re-runs this
+    // pure resolve, which is cheap and keeps it the single source of truth.
+    resolve_native_faucet_metadata(
+        params.name.as_deref(),
+        &params.symbol,
+        params.decimals,
+        &authoritative,
+    )?;
+
+    // Authoritative on-chain preflight UNDER THE LOCK, after validation and before
+    // any note is emitted (same guarantee as the public path). The local registry
+    // can be empty after DB loss while the bridge still binds this faucet or its
+    // origin; refuse to emit a rebinding note and return the existing binding
+    // idempotently.
     match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
         BridgeBinding::OriginBoundToOther(other) => {
             tracing::info!(
@@ -495,11 +509,22 @@ pub async fn admin_register_native_faucet(
             );
             return Ok(other.to_hex());
         }
-        BridgeBinding::AlreadyThisFaucet => {
+        BridgeBinding::FaucetBoundToDifferentOrigin(bound) => {
+            anyhow::bail!(
+                "admin_registerNativeFaucet: faucet {} is already bound on the bridge to origin \
+                 0x{}, which differs from the requested origin 0x{}. Rebinding a native faucet to \
+                 a new origin is not supported (it would double-bind the faucet). No note emitted, \
+                 no state changed.",
+                faucet_id.to_hex(),
+                hex::encode(bound),
+                hex::encode(origin_address),
+            );
+        }
+        BridgeBinding::AlreadyBound => {
             tracing::info!(
                 faucet_id = %faucet_id.to_hex(),
-                "admin_registerNativeFaucet: faucet already registered on the bridge — no note \
-                 emitted (local registry will be reconciled by restore/rebuild)"
+                "admin_registerNativeFaucet: faucet already registered on the bridge at this \
+                 origin — no note emitted (local registry will be reconciled by restore/rebuild)"
             );
             return Ok(faucet_id.to_hex());
         }
@@ -1071,10 +1096,18 @@ static REGISTER_NATIVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 /// would let the public path emit a duplicate/rebinding config note. This is the
 /// preflight the reviewer required before any note is emitted.
 enum BridgeBinding {
-    /// This exact faucet is already registered on the bridge — registration is a
-    /// no-op; only the local registry may need reconciling.
-    AlreadyThisFaucet,
-    /// The derived origin `(address, network)` is already bound to a DIFFERENT
+    /// The faucet is bound on the bridge at EXACTLY the requested `(origin,
+    /// network)` — registration is a no-op; only the local registry may need
+    /// reconciling, and reconciling with the requested origin is SAFE because it
+    /// equals the on-chain one.
+    AlreadyBound,
+    /// The faucet is bound on the bridge but at a DIFFERENT origin than requested
+    /// (e.g. it was admin-registered with an operator-chosen origin, and the
+    /// public path derives a different one). Refuse to rebind, and never reconcile
+    /// a local row with the requested origin — that would disagree with the
+    /// bridge. Carries the origin it is ACTUALLY bound to.
+    FaucetBoundToDifferentOrigin([u8; 20]),
+    /// The requested origin `(address, network)` is already bound to a DIFFERENT
     /// faucet on the bridge — refuse rather than rebind.
     OriginBoundToOther(AccountId),
     /// Neither the faucet nor its origin is on the bridge — safe to register.
@@ -1108,28 +1141,28 @@ async fn preflight_bridge_binding(
                         anyhow::anyhow!("preflight: bridge account {bridge_id} not found locally")
                     })?;
                 let storage = bridge.storage();
-                let binding = if crate::metadata_recovery::read_faucet_conversion_metadata(
+                let binding = match crate::metadata_recovery::read_faucet_conversion_metadata(
                     storage, faucet_id,
-                )
-                .is_some()
-                {
-                    BridgeBinding::AlreadyThisFaucet
-                } else if let Some((other, _conv)) =
-                    crate::metadata_recovery::find_registered_faucet_for_origin(
+                ) {
+                    // Faucet already bound — is it at the SAME origin we're asked to
+                    // register? Only then is it an idempotent no-op.
+                    Some(conv)
+                        if conv.origin_address == origin_address
+                            && conv.origin_network == origin_network =>
+                    {
+                        BridgeBinding::AlreadyBound
+                    }
+                    // Bound, but at a different origin than requested — a rebind.
+                    Some(conv) => BridgeBinding::FaucetBoundToDifferentOrigin(conv.origin_address),
+                    // Faucet not bound; is the requested origin taken by another faucet?
+                    None => match crate::metadata_recovery::find_registered_faucet_for_origin(
                         storage,
                         &origin_address,
                         origin_network,
-                    )
-                {
-                    // Can only be a different faucet: if it were `faucet_id` the
-                    // conversion read above would have matched (AlreadyThisFaucet).
-                    if other == faucet_id {
-                        BridgeBinding::AlreadyThisFaucet
-                    } else {
-                        BridgeBinding::OriginBoundToOther(other)
-                    }
-                } else {
-                    BridgeBinding::Unbound
+                    ) {
+                        Some((other, _conv)) => BridgeBinding::OriginBoundToOther(other),
+                        None => BridgeBinding::Unbound,
+                    },
                 };
                 *out_write.lock().unwrap() = Some(binding);
                 Ok(())
@@ -1269,7 +1302,21 @@ pub async fn miden_register_native_faucet(
                 other.to_hex()
             );
         }
-        BridgeBinding::AlreadyThisFaucet => {
+        BridgeBinding::FaucetBoundToDifferentOrigin(bound) => {
+            // The faucet is on the bridge but at an origin that differs from the
+            // one this path derives — it was almost certainly admin-registered
+            // with an operator-chosen origin. Reconciling a local row with the
+            // derived origin would disagree with the bridge, so refuse.
+            anyhow::bail!(
+                "miden_registerNativeFaucet: faucet {} is already registered on the bridge with a \
+                 different origin identity (0x{}) than this method derives (0x{}); it was likely \
+                 registered through the admin API. This method cannot change it. No state changed.",
+                faucet_id.to_hex(),
+                hex::encode(bound),
+                hex::encode(origin_address),
+            );
+        }
+        BridgeBinding::AlreadyBound => {
             // The bridge already binds this faucet; emitting another config note
             // would be a duplicate. Reconcile the local registry (it may be empty
             // after DB loss) from the authoritative metadata, then report the
