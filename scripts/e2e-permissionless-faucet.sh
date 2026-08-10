@@ -15,9 +15,21 @@
 #   4. it cannot rebind a faucet that already has a different origin identity;
 #   5. it refuses a faucet that is not an operator-owned native one (e.g. an
 #      AggLayer-owned wrapped faucet), so it cannot be used to hijack routing;
-#   6. a bogus faucet id fails without writing anything.
+#   6. a bogus faucet id fails without writing anything;
+#   7. concurrent registrations of the same faucet collapse to ONE row (the
+#      bounded, shared single-flight from PR#164 #3 — try_lock sheds, never
+#      queues, never double-writes);
+#   8. a registration is DURABLE across a proxy restart, and after a local
+#      DB loss a re-registration RE-HEALS from the authoritative bridge binding
+#      (already_registered, no rebinding note) — the #3 on-chain preflight;
+#   9. the derived-origin faucet is actually USABLE: a full Miden->L2B->Miden
+#      round-trip (bridge-out + return claim) runs against the origin the
+#      permissionless RPC derived (delegated to e2e-miden-origin.sh in
+#      REGISTER_MODE=permissionless).
 #
 # Usage: ./scripts/e2e-permissionless-faucet.sh   (expects a running l2l2 stack)
+#   SKIP_PERMISSIONLESS_ROUNDTRIP=1 skips step 9 when the suite already runs the
+#   permissionless round-trip as its own tier.
 # ══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -144,5 +156,98 @@ ROWS_AFTER=$(pgq "SELECT count(*) FROM faucet_registry;")
   || fail "a failed registration changed the registry ($ROWS_BEFORE -> $ROWS_AFTER)"
 pass "an invalid request fails with no registry change"
 
+step "7. concurrent registrations of the SAME faucet collapse to ONE row (bounded single-flight)"
+# PR#164 #3 made admission BOUNDED + shared: try_lock sheds concurrent public
+# callers instead of queueing, and the read-decide-write is serialized. Fire many
+# simultaneous registrations of ONE fresh faucet and assert the outcome is exactly
+# one registry row and one origin — every response must be either a success/
+# already_registered OR the explicit "another registration is in progress" shed,
+# never a second row and never a rebind.
+_cc_log=$(mktemp)
+iso_tool --create-native-faucet --native-symbol "CCX" --native-decimals 8 \
+    --mint-units 0 --wallet-id "$WALLET_ID" > "$_cc_log" 2>&1
+CC_FAUCET=$(awk '/faucet-id:/{print $NF}' "$_cc_log")
+[[ -n "$CC_FAUCET" ]] || { cat "$_cc_log"; rm -f "$_cc_log"; fail "concurrent-case faucet deploy failed"; }
+rm -f "$_cc_log"
+CC_DIR=$(mktemp -d)
+for i in $(seq 1 8); do
+  ( rpc_public "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"miden_registerNativeFaucet\",
+      \"params\":[{\"faucet_id\":\"$CC_FAUCET\"}]}" > "$CC_DIR/resp.$i" 2>&1 ) &
+done
+wait
+# Every response must be well-formed and either accept or explicitly shed — never
+# a raw crash and never a distinct second origin.
+CC_ORIGINS=$(mktemp)
+for f in "$CC_DIR"/resp.*; do
+  body=$(cat "$f")
+  if echo "$body" | grep -qiE "in progress|not queued|retry shortly"; then
+    continue   # bounded-admission shed — acceptable
+  fi
+  o=$(echo "$body" | jq_field origin_token_address)
+  [[ "$o" =~ ^0x[0-9a-f]{40}$ ]] \
+    || fail "a concurrent registration neither succeeded nor shed cleanly: $body"
+  echo "$o" >> "$CC_ORIGINS"
+done
+# All successful responses must agree on ONE derived origin.
+DISTINCT=$(sort -u "$CC_ORIGINS" | grep -c . || true)
+[[ "$DISTINCT" -le 1 ]] || fail "concurrent registrations produced $DISTINCT distinct origins — single-flight broken"
+rm -f "$CC_ORIGINS"; rm -rf "$CC_DIR"
+CC_ROWS=$(pgq "SELECT count(*) FROM faucet_registry WHERE lower(faucet_id)=lower('$CC_FAUCET');")
+[[ "${CC_ROWS// /}" == "1" ]] \
+  || fail "faucet $CC_FAUCET has ${CC_ROWS// /} rows after 8 concurrent registrations; expected exactly 1"
+pass "8 concurrent registrations collapsed to exactly 1 row / 1 origin (bounded single-flight holds)"
+
+step "8. durability + DB-loss reconcile — registration survives a proxy restart and re-heals from the bridge"
+# The registration must be DURABLE across a proxy crash, and — because the local
+# registry can be lost/lagged after a full DB loss while the bridge still binds the
+# faucet — a re-registration must NOT emit a duplicate/rebinding note; the #3
+# authoritative on-chain preflight must detect the existing bridge binding and
+# RECONCILE the local row instead (already_registered=true).
+docker restart -t 10 "$AGG_C" >/dev/null 2>&1 || fail "could not restart proxy $AGG_C"
+# Wait for the proxy RPC to answer again (a bogus-id call returns 200+error once up).
+_up=0
+for _i in $(seq 1 60); do
+  if rpc_public "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"miden_registerNativeFaucet\",
+      \"params\":[{\"faucet_id\":\"0x00\"}]}" >/dev/null 2>&1; then _up=1; break; fi
+  sleep 3
+done
+[[ "$_up" == "1" ]] || fail "proxy $AGG_C did not come back up after restart"
+# Durability: the row registered in step 1 is still present.
+SURV=$(pgq "SELECT count(*) FROM faucet_registry WHERE lower(faucet_id)=lower('$FAUCET_ID');")
+[[ "${SURV// /}" == "1" ]] || fail "faucet $FAUCET_ID registration did NOT survive the proxy restart (${SURV// /} rows)"
+# DB-loss reconcile: delete the local row (simulate loss/lag), then re-register.
+# The bridge still binds the faucet, so the preflight must return already_registered
+# and re-materialise the local row WITHOUT a second bridge note.
+pgq "DELETE FROM faucet_registry WHERE lower(faucet_id)=lower('$FAUCET_ID');" >/dev/null 2>&1
+GONE=$(pgq "SELECT count(*) FROM faucet_registry WHERE lower(faucet_id)=lower('$FAUCET_ID');")
+[[ "${GONE// /}" == "0" ]] || fail "test setup: local row for $FAUCET_ID was not deleted"
+RESP8=$(rpc_public "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"miden_registerNativeFaucet\",
+  \"params\":[{\"faucet_id\":\"$FAUCET_ID\"}]}") || fail "reconcile re-registration unreachable"
+ALREADY=$(echo "$RESP8" | python3 -c "import json,sys;print(json.load(sys.stdin).get('result',{}).get('already_registered',''))" 2>/dev/null)
+ORIGIN8=$(echo "$RESP8" | jq_field origin_token_address)
+[[ "$ALREADY" == "True" ]] \
+  || fail "after DB loss the re-registration must report already_registered=true (bridge preflight), got: $RESP8"
+[[ "$ORIGIN8" == "$DERIVED_ORIGIN" ]] \
+  || fail "reconcile produced a different origin ($ORIGIN8 vs $DERIVED_ORIGIN)"
+RE_ROWS=$(pgq "SELECT count(*) FROM faucet_registry WHERE lower(faucet_id)=lower('$FAUCET_ID');")
+[[ "${RE_ROWS// /}" == "1" ]] \
+  || fail "DB-loss reconcile did not re-materialise exactly 1 local row (${RE_ROWS// /})"
+pass "registration is durable across restart AND re-heals from the authoritative bridge binding after DB loss (no rebind)"
+
+step "9. FULL round-trip: register via miden_registerNativeFaucet, then bridge Miden->L2B->Miden (both directions)"
+# The completeness assertion the reviewer required: the registered faucet must be
+# USABLE end-to-end, not merely present in the DB. Delegate to the parameterized
+# Miden-origin round-trip in PERMISSIONLESS mode, which registers through
+# miden_registerNativeFaucet (deriving the origin) and exercises bridge-out +
+# return claim. Skipped only when the suite already ran it as its own tier.
+if [[ "${SKIP_PERMISSIONLESS_ROUNDTRIP:-0}" == "1" ]]; then
+  log "  (SKIP_PERMISSIONLESS_ROUNDTRIP=1 — the suite runs the permissionless round-trip as its own tier)"
+else
+  REGISTER_MODE=permissionless DEST=l2b bash "$SCRIPT_DIR/e2e-miden-origin.sh" \
+    || fail "permissionless Miden->L2B->Miden round-trip failed — the derived-origin faucet is not usable end-to-end"
+  pass "permissionless-registered native faucet completed a full Miden->L2B->Miden round-trip (both directions)"
+fi
+
 echo ""
-pass "#154 COMPLETE — permissionless registration works, and the origin identity is derived, idempotent, conflict-safe and not caller-controllable"
+pass "#154 COMPLETE — permissionless registration works; the derived origin is idempotent, conflict-safe, \
+concurrency-bounded, restart-durable, DB-loss self-healing, and usable for a full bridge round-trip"

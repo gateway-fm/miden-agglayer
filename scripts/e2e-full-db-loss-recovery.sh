@@ -143,12 +143,12 @@ wait_healthy() {
 
 # ── Phase 0: pre-drop fingerprint on the live, quiesced stack ────────────────
 step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
-read -r NUHC0 NINJ0 NBR0 NCL0 <<<"$(counts)"
+read -r NUHC0 NINJECTED0 NBR0 NCL0 <<<"$(counts)"
 read -r UHC0 INJ0 BR0 CL0 HCV0 <<<"$(fingerprint)"
-say "before: counts UHC=$NUHC0 injected=$NINJ0 Bridge=$NBR0 Claim=$NCL0  hash_chain=${HCV0:0:16}…"
+say "before: counts UHC=$NUHC0 injected=$NINJECTED0 Bridge=$NBR0 Claim=$NCL0  hash_chain=${HCV0:0:16}…"
 say "before: digests uhc=${UHC0:0:12} inj=${INJ0:0:12} bridge=${BR0:0:12} claim=${CL0:0:12}"
-[[ "$NUHC0" -ge 1 && "$NINJ0" -ge 1 ]] || fail "fixture too thin (UHC=$NUHC0 inj=$NINJ0) — run traffic first"
-[[ "$NUHC0" == "$NINJ0" ]] || say "note: UHC($NUHC0) != injected($NINJ0) pre-drop — carrying the delta forward"
+[[ "$NUHC0" -ge 1 && "$NINJECTED0" -ge 1 ]] || fail "fixture too thin (UHC=$NUHC0 inj=$NINJECTED0) — run traffic first"
+[[ "$NUHC0" == "$NINJECTED0" ]] || say "note: UHC($NUHC0) != injected($NINJECTED0) pre-drop — carrying the delta forward"
 NTX_MARK=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
 say "ntx kernel-assert (poison) lines so far: $NTX_MARK"
 
@@ -188,15 +188,15 @@ wait_healthy 180 || fail "proxy not healthy within 180s after restore"
 pass "proxy healthy"
 sleep 10   # let the reconcile catch-up settle anything the one-shot left
 
-read -r NUHC1 NINJ1 NBR1 NCL1 <<<"$(counts)"
+read -r NUHC1 NINJECTED1 NBR1 NCL1 <<<"$(counts)"
 read -r UHC1 INJ1 BR1 CL1 HCV1 <<<"$(fingerprint)"
-say "after : counts UHC=$NUHC1 injected=$NINJ1 Bridge=$NBR1 Claim=$NCL1  hash_chain=${HCV1:0:16}…"
+say "after : counts UHC=$NUHC1 injected=$NINJECTED1 Bridge=$NBR1 Claim=$NCL1  hash_chain=${HCV1:0:16}…"
 # Ordered-content digests (blocker #7): a swapped/reconstructed row changes the
 # digest even when the count is identical.
 [[ "$UHC1" == "$UHC0" ]] || fail "#88: UpdateHashChain rows differ across restore (digest $UHC0 -> $UHC1; counts $NUHC0 -> $NUHC1)"
 pass "UpdateHashChain rows identical (count $NUHC1, digest ${UHC1:0:12})"
-[[ "$INJ1" == "$INJ0" ]] || fail "#88: injected-GER set differs across restore (digest $INJ0 -> $INJ1; counts $NINJ0 -> $NINJ1)"
-pass "injected-GER set identical (count $NINJ1, digest ${INJ1:0:12})"
+[[ "$INJ1" == "$INJ0" ]] || fail "#88: injected-GER set differs across restore (digest $INJ0 -> $INJ1; counts $NINJECTED0 -> $NINJECTED1)"
+pass "injected-GER set identical (count $NINJECTED1, digest ${INJ1:0:12})"
 [[ "$HCV1" == "$HCV0" ]] || fail "#88: hash_chain_value diverged (order-sensitive replay broke): $HCV0 vs $HCV1"
 pass "hash_chain_value identical (order-faithful replay)"
 [[ "$BR1" == "$BR0" ]] || fail "#69/#136 regression: BridgeEvent rows differ (digest $BR0 -> $BR1)"

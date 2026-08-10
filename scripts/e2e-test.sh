@@ -89,11 +89,20 @@ case "$test_filter" in
             echo ""
             DEST=l1  "$SCRIPT_DIR/e2e-miden-origin.sh"
             echo ""
-            # #154 — permissionless registration. Runs after the native
-            # round-trips so a wrapped (AggLayer-owned) faucet already exists for
-            # the "must refuse a non-native faucet" assertion to have a subject.
+            # #154 — the SAME round-trip driven through the PUBLIC
+            # miden_registerNativeFaucet (derived origin, no admin key), proving
+            # the permissionless-registered faucet is usable end-to-end in both
+            # directions (PR#164 #5).
+            echo "== #154 permissionless native round-trip (Miden->L2B->Miden via public RPC) =="
+            REGISTER_MODE=permissionless DEST=l2b "$SCRIPT_DIR/e2e-miden-origin.sh"
+            echo ""
+            # #154 — permissionless registration RPC/DB/concurrency/durability
+            # assertions. Runs after the native round-trips so a wrapped
+            # (AggLayer-owned) faucet already exists for the "must refuse a
+            # non-native faucet" assertion to have a subject. The round-trip leg
+            # (step 9) is skipped here — it just ran as its own tier above.
             echo "== #154 permissionless native-faucet registration =="
-            "$SCRIPT_DIR/e2e-permissionless-faucet.sh"
+            SKIP_PERMISSIONLESS_ROUNDTRIP=1 "$SCRIPT_DIR/e2e-permissionless-faucet.sh"
             echo ""
             # #148 recovery-readiness is DELIBERATELY NOT run inside `all`. It is genuinely
             # DESTRUCTIVE — it stops the proxy, resets the Miden store, drops bridge_db, and

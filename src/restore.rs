@@ -2552,13 +2552,13 @@ mod tests {
         // marked ambiguous, so the replay serves nothing (fail closed), NOT the
         // attacker's provenance and NOT the original last-write-wins.
         record_ger_node_metadata(&mut map, &mut ambiguous, key, attacker_meta);
-        assert!(map.get(&key).is_none(), "ambiguous key must not be served");
+        assert!(!map.contains_key(&key), "ambiguous key must not be served");
         assert!(ambiguous.contains(&key));
 
         // Once ambiguous, even a later "correct" write stays out — we can no
         // longer trust which is authentic.
         record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
-        assert!(map.get(&key).is_none());
+        assert!(!map.contains_key(&key));
 
         // A distinct key is unaffected.
         let key2 = [0x22u8; 32];

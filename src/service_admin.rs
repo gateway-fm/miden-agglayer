@@ -414,32 +414,6 @@ pub async fn admin_register_native_faucet(
         return Ok(existing.faucet_id.to_hex());
     }
 
-    // Authoritative on-chain preflight (same as the public path): the local
-    // registry can be empty after DB loss while the bridge still binds this
-    // faucet or its origin. Refuse to emit a rebinding note; return the existing
-    // binding idempotently.
-    match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
-        BridgeBinding::OriginBoundToOther(other) => {
-            tracing::info!(
-                origin_network,
-                existing_faucet_id = %other.to_hex(),
-                requested_faucet_id = %faucet_id.to_hex(),
-                "admin_registerNativeFaucet: origin already bound on the bridge to a different \
-                 faucet — returning the existing binding, emitting no rebinding note"
-            );
-            return Ok(other.to_hex());
-        }
-        BridgeBinding::AlreadyThisFaucet => {
-            tracing::info!(
-                faucet_id = %faucet_id.to_hex(),
-                "admin_registerNativeFaucet: faucet already registered on the bridge — no note \
-                 emitted (local registry will be reconciled by restore/rebuild)"
-            );
-            return Ok(faucet_id.to_hex());
-        }
-        BridgeBinding::Unbound => { /* safe to register below */ }
-    }
-
     // #149 — read the deployed faucet account's AUTHORITATIVE metadata BEFORE any
     // state change. The persisted + emitted metadata-hash preimage
     // (`abi.encode(name, symbol, decimals)`) must be reconstructable from chain
@@ -504,6 +478,33 @@ pub async fn admin_register_native_faucet(
              — no registry row written"
         )
     })?;
+
+    // Authoritative on-chain preflight UNDER THE LOCK, after the metadata read and
+    // before any note is emitted (same guarantee as the public path). The local
+    // registry can be empty after DB loss while the bridge still binds this faucet
+    // or its origin; refuse to emit a rebinding note and return the existing
+    // binding idempotently.
+    match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
+        BridgeBinding::OriginBoundToOther(other) => {
+            tracing::info!(
+                origin_network,
+                existing_faucet_id = %other.to_hex(),
+                requested_faucet_id = %faucet_id.to_hex(),
+                "admin_registerNativeFaucet: origin already bound on the bridge to a different \
+                 faucet — returning the existing binding, emitting no rebinding note"
+            );
+            return Ok(other.to_hex());
+        }
+        BridgeBinding::AlreadyThisFaucet => {
+            tracing::info!(
+                faucet_id = %faucet_id.to_hex(),
+                "admin_registerNativeFaucet: faucet already registered on the bridge — no note \
+                 emitted (local registry will be reconciled by restore/rebuild)"
+            );
+            return Ok(faucet_id.to_hex());
+        }
+        BridgeBinding::Unbound => { /* safe to register below */ }
+    }
 
     // #149 — validate + register from AUTHORITATIVE state. Split out so the
     // "successful read → mismatch → NO bridge ConfigAggBridgeNote" path is
@@ -1100,7 +1101,9 @@ async fn preflight_bridge_binding(
                 let bridge = client
                     .get_account(bridge_id)
                     .await
-                    .map_err(|e| anyhow::anyhow!("preflight: get_account(bridge {bridge_id}): {e}"))?
+                    .map_err(|e| {
+                        anyhow::anyhow!("preflight: get_account(bridge {bridge_id}): {e}")
+                    })?
                     .ok_or_else(|| {
                         anyhow::anyhow!("preflight: bridge account {bridge_id} not found locally")
                     })?;
@@ -1116,7 +1119,8 @@ async fn preflight_bridge_binding(
                         storage,
                         &origin_address,
                         origin_network,
-                    ) {
+                    )
+                {
                     // Can only be a different faucet: if it were `faucet_id` the
                     // conversion read above would have matched (AlreadyThisFaucet).
                     if other == faucet_id {
