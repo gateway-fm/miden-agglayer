@@ -67,7 +67,10 @@ test: test-unit test-e2e ## Run everything: unit tests, then spin up stack and r
 
 .PHONY: test-unit
 test-unit: ## Run unit tests (no docker needed)
-	cargo test --workspace --profile=$(CARGO_PROFILE) --lib
+	# --lib AND --bins: the hardening invariants live in the binary target, and
+	# with --lib alone their tests never ran in CI — they sat broken (stale
+	# expected reason counts) until a reviewer noticed (PR #162).
+	cargo test --workspace --profile=$(CARGO_PROFILE) --lib --bins
 
 .PHONY: test-scripts
 test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker needed)

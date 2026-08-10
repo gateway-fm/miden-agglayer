@@ -253,6 +253,46 @@ struct Command {
     #[arg(long, env = "MIDEN_PROVER_URL")]
     miden_prover_url: Option<String>,
 
+    /// Base URL of a Web3Signer-compatible remote signing service (e.g.
+    /// `http://web3signer:9000`). Remote signing is the DEFAULT custody mode:
+    /// every account signature is produced by the signer, whose backend (AWS
+    /// KMS / Azure Key Vault / HashiCorp Vault) owns the key — this process
+    /// holds, generates and stores no secret. There is deliberately no
+    /// per-account fallback: a key the signer does not hold is a hard error,
+    /// never a silent local signature.
+    ///
+    /// Required unless `--insecure-local-keystore` is set.
+    #[arg(long, env = "AGGLAYER_SIGNER_URL")]
+    signer_url: Option<String>,
+
+    /// DANGEROUS: keep account private keys on this host's disk instead of in a
+    /// remote signer. Explicit opt-in for development and the e2e suite; a
+    /// production deployment should use `--signer-url` so key material lives in
+    /// a KMS/HSM. Refused by `--require-hardening`.
+    #[arg(
+        long,
+        env = "AGGLAYER_INSECURE_LOCAL_KEYSTORE",
+        default_value_t = false
+    )]
+    insecure_local_keystore: bool,
+
+    /// Bind an operator role to a specific signer key: `--signer-key
+    /// <role>=<identifier>`, repeatable. Roles: `service`, `ger-manager`.
+    ///
+    /// One key per role is deliberate: a compromised or rotated key then affects
+    /// exactly one account. Two roles sharing an identifier is rejected, as is a
+    /// role whose key the signer does not actually expose — the proxy verifies
+    /// each named key at startup rather than binding to whatever key happens to
+    /// be listed first. Key creation and IAM grants stay OUTSIDE this process.
+    ///
+    /// Required (for every role) when `--signer-url` is set.
+    #[arg(
+        long = "signer-key",
+        env = "AGGLAYER_SIGNER_KEYS",
+        value_delimiter = ','
+    )]
+    signer_keys: Vec<String>,
+
     /// Per-request timeout for the remote Miden prover, in seconds. Default 120s.
     /// Has no effect when --miden-prover-url is unset.
     #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
@@ -282,6 +322,13 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
         return Ok(());
     }
     let mut reasons = Vec::new();
+    // Signer-transport boundary lives in the library so CI's `--lib` unit target
+    // actually covers it (PR #162 review).
+    if let Some(reason) = miden_agglayer_service::remote_signer::hardening_signer_rejection(
+        command.signer_url.as_deref(),
+    ) {
+        reasons.push(reason);
+    }
     if command.admin_api_key.is_none() {
         reasons.push(
             "  - --admin-api-key is unset (admin_* methods would be open). \
@@ -298,6 +345,14 @@ fn check_hardening_invariants(command: &Command) -> Result<(), Vec<String>> {
             "  - --allowed-signers is unset (eth_sendRawTransaction would reject \
              every signer — audit C2 fail-closed default). Set ALLOWED_SIGNERS \
              to a comma-separated allow-list."
+                .to_string(),
+        );
+    }
+    if command.insecure_local_keystore {
+        reasons.push(
+            "  - --insecure-local-keystore is set (account private keys live on this \
+             host's disk instead of a KMS/HSM). Remove it and set --signer-url to a \
+             Web3Signer-compatible service."
                 .to_string(),
         );
     }
@@ -550,6 +605,19 @@ impl std::fmt::Debug for Command {
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_signers", &self.allowed_signers)
             .field("insecure_allow_any_signer", &self.insecure_allow_any_signer)
+            .field("insecure_local_keystore", &self.insecure_local_keystore)
+            .field(
+                "signer_keys",
+                &self
+                    .signer_keys
+                    .iter()
+                    .map(|_| "[REDACTED]")
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "signer_url",
+                &self.signer_url.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("reject_unverified_ger", &self.reject_unverified_ger)
             .field("require_hardening", &self.require_hardening)
             .field(
@@ -658,6 +726,17 @@ async fn main() -> anyhow::Result<()> {
         base.join(".miden")
     });
 
+    // Resolve key custody ONCE for the process: remote signer (default) or an
+    // explicit on-disk keystore. Doing it here means a misconfiguration is a
+    // startup error before any client, store or listener is built.
+    let signer_key_bindings =
+        miden_agglayer_service::remote_signer::SignerKeyBindings::parse(&command.signer_keys)?;
+    let custody = miden_agglayer_service::remote_signer::CustodyMode::resolve(
+        command.signer_url.as_deref(),
+        command.insecure_local_keystore,
+        signer_key_bindings,
+    )?;
+
     // Surgical recovery: clear stale `locked` flags in miden-client's sqlite
     // and exit. Operator restarts the proxy afterwards.
     if command.unlock_miden_accounts {
@@ -701,6 +780,7 @@ async fn main() -> anyhow::Result<()> {
             command.miden_prover_fallback_to_local,
             sync_listeners,
             command.miden_debug,
+            custody.clone(),
         )?;
 
         // Resolve the NetworkId from the same `--miden-node` flag MidenClient uses,
@@ -946,7 +1026,37 @@ async fn main() -> anyhow::Result<()> {
         command.miden_prover_fallback_to_local,
         sync_listeners,
         command.miden_debug,
+        custody.clone(),
     )?;
+
+    // Remote custody: rebuild and VERIFY the account↔signer-key bindings before
+    // this process starts serving. This runs on EVERY startup — including plain
+    // restarts, which skip init entirely — because a check that only runs on the
+    // boot that creates the accounts verifies nothing afterwards (PR #162
+    // review). Fail-closed: a deployed account signed for by a key other than
+    // the one --signer-key names, or a key the signer no longer holds, stops the
+    // proxy here rather than at the first claim.
+    {
+        let keystore = client.get_keystore();
+        if keystore.is_remote() {
+            let accounts_for_verify = accounts.0.clone();
+            let ks = keystore.clone();
+            client
+                .with(move |c| {
+                    Box::new(async move {
+                        miden_agglayer_service::init::verify_remote_bindings(
+                            c,
+                            ks.as_ref(),
+                            &accounts_for_verify,
+                        )
+                        .await
+                        .map(|_| ())
+                    })
+                })
+                .await
+                .context("remote custody verification failed at startup")?;
+        }
+    }
 
     // Self-heal is RUNTIME-only, not startup-only. See `src/account_recovery.rs`
     // — when a Miden submission inside `insert_ger` or `publish_claim` returns
@@ -1445,6 +1555,14 @@ mod hardening_tests {
             reject_zero_padding_addresses: false,
             require_hardening: require,
             miden_api_key: None,
+            // A hardened config uses REMOTE custody on a loopback signer. The
+            // fixture previously set insecure_local_keystore=true, which trips
+            // the custody invariant and shifted every expected reason count by
+            // one — invisible because `make test-unit` runs --lib and these
+            // tests live in the binary (PR #162 review).
+            insecure_local_keystore: false,
+            signer_url: Some("http://127.0.0.1:9000".into()),
+            signer_keys: vec!["service=0xaaa".into(), "ger-manager=0xbbb".into()],
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,

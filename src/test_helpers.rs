@@ -94,7 +94,9 @@ pub async fn offline_miden_client_lib() -> crate::miden_client::MidenClientLib {
     let store_dir = tempfile::tempdir().expect("tempdir").keep();
     let keystore_path = store_dir.join("keystore");
     std::fs::create_dir_all(&keystore_path).expect("keystore dir");
-    let keystore = Arc::new(FilesystemKeyStore::new(keystore_path).expect("keystore"));
+    let keystore = Arc::new(crate::proxy_keystore::ProxyKeystore::local(
+        FilesystemKeyStore::new(keystore_path).expect("keystore"),
+    ));
 
     ClientBuilder::new()
         .rpc(crate::miden_client::build_rpc_client(

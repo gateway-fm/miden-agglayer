@@ -1,0 +1,88 @@
+# Remote-signing overlay: runs a Web3Signer sidecar and points the proxy at it,
+# so the e2e exercises the SAME code path a KMS-backed production deployment
+# uses (proxy -> HTTP -> signer -> custody backend). Only the custody backend
+# differs: this overlay configures Web3Signer's raw-file key source, production
+# swaps that one config file for `aws-kms` / `azure` / `hashicorp` — the proxy
+# and this compose topology are unchanged.
+#
+# Usage:
+#   ./scripts/gen-web3signer-keys.sh    # generates the key + its config
+#   docker compose -f docker-compose.e2e.yml -f docker-compose.web3signer.yml \
+#     --env-file fixtures/.env up -d
+#
+# The e2e wrapper `scripts/e2e-web3signer.sh` does all of the above.
+
+services:
+  web3signer:
+    # 25.2.0 is the FIRST release carrying the Netty 4.1.118 upgrade that fixes
+    # CVE-2025-24970; 24.12.0 predates it. Certifying a custody feature on a
+    # signer with a known network-stack CVE would undercut the whole point of
+    # moving keys off this host (PR #162 review).
+    # https://github.com/Consensys/web3signer/releases/tag/25.2.0
+    image: consensys/web3signer:25.2.0
+    # The image's own user is uid 1001, but `fixtures/web3signer-keys` is created
+    # 0700 by the host user (gen-web3signer-keys.sh keeps a private key mode-tight
+    # rather than world-readable). uid 1001 therefore cannot even LIST /keys, and
+    # Web3Signer's response to that is to log the IOException and start anyway
+    # with zero signers loaded — a healthy /upcheck serving an empty key list.
+    # Running as the directory's owner is what makes the mount readable without
+    # relaxing the key file to 0644 on a shared host.
+    user: "${WEB3SIGNER_UID:-1000}:${WEB3SIGNER_GID:-1000}"
+    # eth1 mode is the secp256k1 signing surface (POST /api/v1/eth1/sign/{key});
+    # eth2 would load keys into memory, defeating the point of vault custody.
+    command:
+      - --key-store-path=/keys
+      - --http-listen-host=0.0.0.0
+      - --http-listen-port=9000
+      - --http-host-allowlist=*
+      # Metrics are how the e2e proves signing actually happened: Web3Signer
+      # does NOT log individual signing requests at any default level (its whole
+      # log is ~15 startup lines), so counting log lines would report zero
+      # signatures while signing correctly. `signing_secp256k1_signing_duration_count`
+      # is the authoritative counter.
+      - --metrics-enabled=true
+      - --metrics-host=0.0.0.0
+      - --metrics-port=9001
+      - --metrics-host-allowlist=*
+      - eth1
+      - --chain-id=${CHAIN_ID:-2}
+    volumes:
+      - ./fixtures/web3signer-keys:/keys:ro
+    ports:
+      # Host-published so the e2e can assert against the signer directly
+      # (list keys, compare a signature) without exec'ing into the container.
+      - "127.0.0.1:9000:9000"
+      # Metrics: the e2e reads the signing counter from here.
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      # NOT /upcheck alone: Web3Signer reports UP with zero keys loaded, so a
+      # key directory it cannot read looks exactly like a working signer and the
+      # failure only surfaces later as a confusing proxy boot error. Require a
+      # non-empty key list, so "healthy" means "can actually sign for someone".
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/upcheck >/dev/null && curl -sf http://localhost:9000/api/v1/eth1/publicKeys | grep -q '0x' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  miden-agglayer:
+    # Custody is flipped purely through env so this overlay composes with the
+    # others (notably l2l2, which contributes --network-rpc-url): compose merges
+    # `environment` but REPLACES `command`, so overriding the command here would
+    # silently drop the l2l2 flags.
+    environment:
+      # Mutually exclusive with the signer URL below — the proxy refuses to
+      # start if both are set, so this must be turned off explicitly.
+      AGGLAYER_INSECURE_LOCAL_KEYSTORE: "false"
+      # This URL selects remote custody. The proxy fails to start if the signer
+      # is unreachable or holds no usable key, so a broken custody setup can
+      # never be mistaken for a healthy boot.
+      AGGLAYER_SIGNER_URL: "http://web3signer:9000"
+      # One key PER ROLE. The proxy refuses to start if a role is unbound, if two
+      # roles share a key, or if the signer does not actually expose a named key
+      # — so this cannot silently degrade to "bind everything to key #1".
+      # Generated into fixtures/web3signer-keys.env by gen-web3signer-keys.sh.
+      AGGLAYER_SIGNER_KEYS: "${AGGLAYER_SIGNER_KEYS:?run scripts/gen-web3signer-keys.sh and source fixtures/web3signer-keys.env}"
+    depends_on:
+      web3signer:
+        condition: service_healthy

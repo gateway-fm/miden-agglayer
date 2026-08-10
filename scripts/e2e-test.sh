@@ -142,6 +142,12 @@ case "$test_filter" in
     chaos)
         "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"
         ;;
+    web3signer)
+        # Remote-signer custody (KMS-shaped). DEDICATED gate (NOT in `all`): it
+        # brings up its own stack with the web3signer overlay and asserts the
+        # proxy holds no local secret — a topology the other tiers do not use.
+        "$SCRIPT_DIR/e2e-web3signer.sh"
+        ;;
     recovery-scenarios)
         # #157 reviewer #7 — deterministic {node,proxy}×{GER,claim} crash-during-
         # proving recovery. DEDICATED gate (NOT in `all`): the GER cases require the

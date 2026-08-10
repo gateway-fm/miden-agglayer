@@ -477,7 +477,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Build miden client from the store (existing for bridge-out, freshly
     // created for --create-wallet).
-    let keystore = Arc::new(FilesystemKeyStore::new(keystore_path)?);
+    let keystore = Arc::new(
+        miden_agglayer_service::proxy_keystore::ProxyKeystore::local(FilesystemKeyStore::new(
+            keystore_path,
+        )?),
+    );
     let rpc = miden_agglayer_service::miden_client::build_rpc_client(
         &node_endpoint,
         10_000,
@@ -769,7 +773,10 @@ async fn main() -> anyhow::Result<()> {
             .active_mint_policy(MintPolicy::allow_all())
             .active_burn_policy(BurnPolicy::allow_all())
             .build();
-        let (auth_component, key_pair) = create_auth_component()?;
+        // The operator tool always signs locally: it deploys an operator-owned
+        // faucet whose key the operator keeps, not a proxy/vault key.
+        // operator tooling runs local-custody only; no signer role applies.
+        let (auth_component, key_pair) = create_auth_component(keystore.as_ref(), None).await?;
         let faucet = Account::builder(client.rng().draw_word().into())
             .account_type(AccountType::Public)
             .with_component(faucet_component)
@@ -777,7 +784,9 @@ async fn main() -> anyhow::Result<()> {
             .with_auth_component(auth_component)
             .build_with_schema_commitment()
             .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
-        keystore.add_key(&key_pair, faucet.id()).await?;
+        if let Some(key_pair) = key_pair.as_ref() {
+            keystore.add_key(key_pair, faucet.id()).await?;
+        }
         client.add_account(&faucet, false).await?;
         let dummy = TransactionRequestBuilder::new().build()?;
         let txn_id = submit_new_transaction(&mut client, faucet.id(), dummy)
