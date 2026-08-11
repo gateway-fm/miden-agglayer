@@ -1374,6 +1374,43 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce
         // only on success and never compared the incoming `tx.nonce` against
         // the expected next value. That allowed replay and skipped sequencing.
+        // #90 — a full-DB-loss restore rebuilds the store from chain state, but the
+        // nonce ledger has NO chain source: it is proxy-local bookkeeping of the L2
+        // transactions this proxy accepted. Every row is therefore gone, while a
+        // CONTINUING signer keeps submitting from where it left off. `nonce_get`
+        // reports 0, the tx looks like a future nonce, and it parks in the queue
+        // waiting for nonces 0..N-1 that can never be submitted — a PERMANENT wedge
+        // (measured: GER injector at `expected=0, got=21`, 34,287 retries in ~30min,
+        // ~19/s, injection dead).
+        //
+        // Parking a gap is correct while LIVE — the missing tx is in flight. It is
+        // only fatal when the ledger was WIPED, and an absent row alone cannot tell
+        // those apart. So restore sets a durable marker, and here — only for a
+        // signer with NO row at all, on a store flagged as rebuilt — we adopt the
+        // first observed nonce as that signer's baseline.
+        //
+        // Safety: this cannot enable replay of a LOWER nonce (seeding high makes
+        // every lower nonce stale, which R4 still rejects), and from the seed
+        // onward ordinary R4 sequencing applies. Double-EFFECTS remain prevented by
+        // the domain-level idempotency that DOES survive a restore
+        // (`is_ger_injected`, `claimed_indices` / `is_note_processed`).
+        if tx_nonce > 0 && service.store.is_nonce_ledger_rebuilt().await? {
+            let seeded = service
+                .store
+                .nonce_bootstrap_if_absent(&signer_str, tx_nonce)
+                .await?;
+            if seeded {
+                ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
+                tracing::warn!(
+                    target: "rpc::nonce_repair",
+                    signer = %signer_str,
+                    adopted_nonce = tx_nonce,
+                    "#90: no nonce ledger entry for this signer after a store rebuild — \
+                     adopting the first observed nonce as the baseline so a continuing \
+                     wallet can resume; R4 sequencing applies from here on"
+                );
+            }
+        }
         let expected_nonce = service.store.nonce_get(&signer_str).await?;
         let durable_frontier = service.store.pending_nonce_frontier(&signer_str).await?;
         if let Some(lower_nonce) = durable_frontier.lowest_unlinked
@@ -2600,6 +2637,87 @@ mod tests {
         assert!(
             msg.contains("missing chain_id") || msg.contains("EIP-155"),
             "unexpected: {msg}"
+        );
+    }
+
+    /// #90 — the wedge itself, as a regression. On a store whose ledger was
+    /// REBUILT by restore, a continuing signer's first tx (nonce 21, no ledger
+    /// row) must be ADMITTED by adopting 21 as the baseline. Pre-fix this parked
+    /// in the future-nonce queue forever waiting for nonce 0 — the GER injector
+    /// spun 34,287 times in ~30min and injection never resumed.
+    #[tokio::test]
+    async fn finding90_rebuilt_ledger_bootstraps_continuing_signer() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xAAu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 21);
+        let signer_str = format!("{signer:#x}");
+
+        // Must not hang in the future-nonce queue and must not reject.
+        let _ = service_send_raw_txn(service.clone(), input_hex).await;
+
+        // The baseline was adopted, so the NEXT expected nonce is 22 — ordinary R4
+        // sequencing resumes from the seed rather than from 0.
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            22,
+            "a continuing signer must resume at its own nonce after a ledger rebuild"
+        );
+    }
+
+    /// #90 fail-safe: WITHOUT the rebuild marker (an ordinary live deployment) a
+    /// nonce gap must still be treated as a gap — parked/rejected, never adopted.
+    /// Otherwise the future-nonce queue's whole purpose (wait for the in-flight
+    /// lower nonce) would be defeated and out-of-order admission allowed.
+    #[tokio::test]
+    async fn finding90_live_ledger_does_not_bootstrap_a_gap() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        // No marker set — this is a normal running deployment.
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xBBu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 21);
+        let signer_str = format!("{signer:#x}");
+
+        let _ = service_send_raw_txn(service.clone(), input_hex).await;
+
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "a live deployment must NOT adopt a future nonce — the gap is real and the \
+             missing tx is expected to arrive"
+        );
+    }
+
+    /// #90 — bootstrapping is first-contact ONLY. Once a signer has a row, the
+    /// marker must not let a later out-of-order nonce re-seed it (that would
+    /// reopen the replay/ordering hole R4 exists to close).
+    #[tokio::test]
+    async fn finding90_bootstrap_is_first_contact_only() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        let addr = "0x00000000000000000000000000000000000000aa";
+
+        assert!(
+            store.nonce_bootstrap_if_absent(addr, 21).await.unwrap(),
+            "first contact seeds the baseline"
+        );
+        assert!(
+            !store.nonce_bootstrap_if_absent(addr, 99).await.unwrap(),
+            "a second attempt must be a no-op — the row already exists"
+        );
+        assert_eq!(
+            store.nonce_get(addr).await.unwrap(),
+            21,
+            "the original baseline must survive; a later nonce cannot re-seed it"
         );
     }
 

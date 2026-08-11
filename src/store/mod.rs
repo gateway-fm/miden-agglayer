@@ -492,6 +492,38 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// #90 — did a restore rebuild this store, leaving the `nonces` table empty?
+    ///
+    /// The expected nonce is proxy-local bookkeeping of accepted L2 transactions
+    /// and has NO chain source, so a full-DB-loss restore cannot reconstruct it.
+    /// A CONTINUING signer then submits from where it left off while the ledger
+    /// reports 0, and the tx parks in the future-nonce queue forever (measured on
+    /// the 2026-08-11 gate: 34,287 retries in ~30min at `expected=0, got=21`,
+    /// halting GER injection and the whole certificate pipeline).
+    ///
+    /// Parking a nonce gap is CORRECT while live — the missing tx is in flight.
+    /// It is fatal only when the ledger was WIPED, because then the gap is an
+    /// artifact of recovery and can never be filled. An absent row alone cannot
+    /// distinguish those two, so restore records the fact and admission reads it.
+    async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Mark that this store's nonce ledger was rebuilt from nothing (restore).
+    async fn set_nonce_ledger_rebuilt(&self, _rebuilt: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// #90 — seed a signer's nonce baseline iff it has NO row yet. Insert-if-absent,
+    /// so it is atomic and idempotent across replicas: exactly one caller seeds and
+    /// every later call is a no-op. Returns `true` iff this call created the row.
+    ///
+    /// Only ever invoked for a signer with no ledger entry, on a store whose ledger
+    /// was rebuilt. Once seeded, the row exists and ordinary R4 ordering/replay
+    /// protection applies to that signer again — so the blast radius is exactly
+    /// first-contact-per-signer after a rebuild.
+    async fn nonce_bootstrap_if_absent(&self, _addr: &str, _nonce: u64) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// #148 — readiness backlog: how many ClaimEvent-bearing synthetic
     /// transactions still have NO persisted `claimAsset` calldata envelope in
     /// the `transactions` table. In steady state this is 0 — a claim's envelope

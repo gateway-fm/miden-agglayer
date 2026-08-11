@@ -184,6 +184,8 @@ pub struct InMemoryStore {
     // `service_state.reconcile_cursor` column (migration 010). See
     // Store::get_reconcile_cursor.
     reconcile_cursor: RwLock<u64>,
+    /// #90 — set by restore when it rebuilt the store and left `nonces` empty.
+    nonce_ledger_rebuilt: RwLock<bool>,
 
     // Cursor of the one configured L1 evidence scan. PostgreSQL stores this in
     // the legacy `finalized_scan_cursor` column for upgrade-safe provenance.
@@ -268,6 +270,7 @@ impl InMemoryStore {
             fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
+            nonce_ledger_rebuilt: RwLock::new(false),
             l1_evidence_cursor: RwLock::new(0),
             l1_evidence_policy: RwLock::new(None),
             tx_note_links: RwLock::new(HashMap::new()),
@@ -456,6 +459,29 @@ impl Store for InMemoryStore {
     async fn set_reconcile_cursor(&self, block: u64) -> anyhow::Result<()> {
         *self.reconcile_cursor.write() = block;
         Ok(())
+    }
+
+    // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
+
+    async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
+        Ok(*self.nonce_ledger_rebuilt.read())
+    }
+
+    async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
+        *self.nonce_ledger_rebuilt.write() = rebuilt;
+        Ok(())
+    }
+
+    async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
+        let key = addr.to_lowercase();
+        // One lock for the check + insert, matching the postgres insert-if-absent
+        // atomicity so a concurrent pair cannot both seed.
+        let mut nonces = self.nonces.write();
+        if nonces.contains_key(&key) {
+            return Ok(false);
+        }
+        nonces.insert(key, nonce);
+        Ok(true)
     }
 
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {

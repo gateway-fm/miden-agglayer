@@ -600,6 +600,22 @@ pub(crate) async fn finalize_restore_cursors(
     store.set_latest_block_number(miden_tip).await?;
     store.set_projector_cursor(miden_tip).await?;
     tracing::info!("Phase 4: synthetic tip + projector cursor set to Miden tip {miden_tip}");
+
+    // #90 — the `nonces` table has NO chain source, so a rebuilt store starts with
+    // an EMPTY nonce ledger while CONTINUING signers (aggkit's aggoracle/aggsender
+    // wallets) keep submitting from where they left off. Without this marker the
+    // admission path sees `expected 0` vs `tx.nonce N`, parks the tx in the
+    // future-nonce queue, and waits for a nonce that can never be submitted — on
+    // the 2026-08-11 gate the GER injector spun 34,287 times in ~30min and
+    // injection never resumed. Record that the ledger was rebuilt so admission can
+    // adopt each signer's first observed nonce as its baseline instead of
+    // demanding 0.
+    store.set_nonce_ledger_rebuilt(true).await?;
+    tracing::warn!(
+        "Phase 4: nonce ledger is EMPTY after restore — flagged for first-contact \
+         bootstrap (#90); ordinary R4 ordering resumes per signer once seeded"
+    );
+
     // Recovery now performs the healing sweep ITSELF (Phase 1.1), before the
     // replay phases that depend on it. When that sweep reached the tip there is
     // nothing left to re-discover, so leaving the cursor there avoids a second

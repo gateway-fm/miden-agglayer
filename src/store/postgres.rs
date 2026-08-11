@@ -238,6 +238,46 @@ impl Store for PgStore {
         Ok(())
     }
 
+    // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
+
+    async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT nonce_ledger_rebuilt FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(row.get::<_, bool>(0))
+    }
+
+    async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET nonce_ledger_rebuilt = $1, updated_at = now() WHERE id = 1",
+                &[&rebuilt],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        // Insert-if-absent: atomic and idempotent across replicas — exactly one
+        // caller seeds the baseline, everyone else sees 0 rows affected and falls
+        // through to the ordinary R4 path against the now-existing row.
+        let affected = client
+            .execute(
+                "INSERT INTO nonces (address, nonce) VALUES ($1, $2)
+                 ON CONFLICT (address) DO NOTHING",
+                &[&key, &(nonce as i64)],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         // O(1) read of the durable repair-backlog set (migration 019), seeded once
