@@ -37,7 +37,13 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
 source "$SCRIPT_DIR/lib-l2l2.sh"
 
-AGG_C="l2l2-miden-agglayer-1"
+# PR#164 re-review — use the container the shared library DETECTED, never a
+# hard-coded project name. The suite can run under a non-`l2l2` compose project
+# (lib-l2l2.sh derives it from the running stack, or COMPOSE_PROJECT_NAME), and a
+# literal here would restart some other project's proxy — or nothing at all —
+# while the real proxy under test kept running. Step 8's durability assertion
+# would then be measuring nothing.
+AGG_C="$AGGLAYER_CONTAINER"
 MINT_UNITS=500000
 
 rpc_public() {  # NO admin bearer — that is the point
@@ -203,6 +209,12 @@ step "8. durability + DB-loss reconcile — registration survives a proxy restar
 # faucet — a re-registration must NOT emit a duplicate/rebinding note; the #3
 # authoritative on-chain preflight must detect the existing bridge binding and
 # RECONCILE the local row instead (already_registered=true).
+# Fail LOUDLY if the resolved proxy container is not actually running: a silent
+# no-op restart would leave step 8 "passing" while the real proxy under test was
+# never bounced, so the durability claim would be measuring nothing.
+docker inspect "$AGG_C" >/dev/null 2>&1 \
+  || fail "resolved proxy container '$AGG_C' does not exist (compose project \
+'${COMPOSE_PROJECT_NAME:-?}') — refusing to assert restart durability against a container that is not under test"
 docker restart -t 10 "$AGG_C" >/dev/null 2>&1 || fail "could not restart proxy $AGG_C"
 # Wait for the proxy RPC to answer again (a bogus-id call returns 200+error once up).
 _up=0
