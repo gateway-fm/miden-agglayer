@@ -237,7 +237,32 @@ write_summary() {
     } > "$GARBO_SUMMARY"
     glog "summary -> $GARBO_SUMMARY (private=$pf/$pa foreign=$ff/$fa)"
 }
-trap write_summary EXIT
+# PR#164 re-review — stopping the PARENT must stop the WORKERS. The soak kills
+# only this script's PID; with a summary-only EXIT trap the private/foreign
+# workers survived as orphans and kept injecting garbage traffic for up to their
+# full duration (900s) — straight through the post-chaos settle window and the
+# completeness verdict that is supposed to run on a QUIET stack. Any "extra"
+# events they produced would be attributed to the product.
+#
+# So: forward termination to both children, REAP them, and only then write the
+# summary — the summary must describe a stopped system, not a running one.
+stop_workers() {
+    local pid
+    for pid in "${PRIV_PID:-}" "${FOR_PID:-}"; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${PRIV_PID:-}" "${FOR_PID:-}"; do
+        [ -n "$pid" ] || continue
+        wait "$pid" 2>/dev/null || true
+    done
+}
+on_exit() { stop_workers; write_summary; }
+trap on_exit EXIT
+# Terminating signals run the EXIT trap via explicit exit, so a `kill` from the
+# soak reaps the workers instead of orphaning them.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 rm -rf "$STATE"; mkdir -p "$STATE"
 

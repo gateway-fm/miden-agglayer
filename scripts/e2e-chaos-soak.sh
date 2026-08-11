@@ -130,9 +130,20 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
       # (cold resync into anvil's 256-state wall permanently halts L2<->L2,
       # #87). aggkit-preserve-heal.sh wipes ONLY ethtxmanager-aggoracle.sqlite
       # and restores every other DB — the versioned, self-contained primitive.
-      echo "$(date +%H:%M:%S) WATCHDOG: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — PRESERVE-HEALING $svc" \
-          | tee -a "$WATCHDOG_HEALS_FILE"
-      PROJECT="$PROJECT" FORCE=1 "$SCRIPT_DIR/aggkit-preserve-heal.sh" "$svc" >/dev/null 2>&1 || true
+      # PR#164 re-review — count a heal only AFTER it actually succeeded. The old
+      # form logged the attempt into the heal ledger and swallowed the exit code
+      # with `|| true`, so a heal that failed (or refused to run, e.g. the new
+      # fail-closed staging guard) still consumed heal budget and still read as a
+      # successful intervention. Log the attempt separately from the outcome, and
+      # only the OUTCOME feeds the counted ledger.
+      echo "$(date +%H:%M:%S) WATCHDOG-ATTEMPT: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — preserve-healing $svc"
+      if PROJECT="$PROJECT" FORCE=1 "$SCRIPT_DIR/aggkit-preserve-heal.sh" "$svc" >/dev/null 2>&1; then
+        echo "$(date +%H:%M:%S) WATCHDOG: preserve-heal of $svc SUCCEEDED (tx $tx)" \
+            | tee -a "$WATCHDOG_HEALS_FILE"
+      else
+        rc=$?
+        echo "$(date +%H:%M:%S) WATCHDOG-FAILED: preserve-heal of $svc returned rc=$rc (tx $tx) — NOT counted as a heal"
+      fi
     done
   done
 ) >>/tmp/chaos-watchdog.out 2>&1 &

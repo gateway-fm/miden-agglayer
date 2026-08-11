@@ -65,22 +65,70 @@ fi
 # ── the heal: preserve every DB except the poisoned monitor DB ───────────────
 B="$(mktemp -d)"; trap 'rm -rf "$B"' EXIT
 docker stop "$C" >/dev/null 2>&1
-saved=0
-for f in aggsender bridgel2sync L1InfoTreeSync reorgdetectorl1 reorgdetectorl2; do
+
+# ── STAGE, and verify the CRITICAL set is staged BEFORE anything destructive ──
+# PR#164 re-review: previously every `docker cp` failure was ignored, `saved`
+# could be 0, and the script force-recreated the ONLY copy of the state anyway —
+# destroying exactly what it claims to preserve, then reporting success. The
+# critical DBs are the ones whose loss is unrecoverable: aggsender's cert lineage
+# (#89) and the bridgesync cursors (#87, anvil's 256-state wall). Those MUST be
+# staged or we abort while the container is still intact and restartable.
+CRITICAL=(aggsender bridgel2sync)
+OPTIONAL=(L1InfoTreeSync reorgdetectorl1 reorgdetectorl2)
+staged=()
+stage_one() { # $1 = basename; echoes nothing, returns 0 if the main .sqlite staged
+    local f="$1" got_main=1 ext
     for ext in sqlite sqlite-wal sqlite-shm; do
-        docker cp "$C:/tmp/$f.$ext" "$B/" >/dev/null 2>&1 && saved=$((saved+1)) || true
+        if docker cp "$C:/tmp/$f.$ext" "$B/" >/dev/null 2>&1; then
+            staged+=("$f.$ext")
+            [ "$ext" = sqlite ] && got_main=0
+        fi
     done
+    return $got_main
+}
+for f in "${CRITICAL[@]}"; do
+    stage_one "$f" || {
+        log "FATAL: could not stage critical DB /tmp/$f.sqlite from $C."
+        log "       Refusing to force-recreate: that would destroy the only copy of"
+        log "       $f state (cert lineage #89 / bridgesync cursors #87). Container left"
+        log "       stopped-but-intact; restart it with: docker start $C"
+        exit 1
+    }
 done
+for f in "${OPTIONAL[@]}"; do stage_one "$f" || true; done
+staged_count=${#staged[@]}
+[ "$staged_count" -gt 0 ] || { log "FATAL: staged 0 files — refusing to recreate"; exit 1; }
+log "staged $staged_count file(s): ${staged[*]}"
+
 COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
     create --force-recreate --no-deps "$SVC" >/dev/null 2>&1 \
     || { log "recreate failed"; exit 1; }
-restored=0
-for f in "$B"/*; do
-    [ -f "$f" ] || continue
-    docker cp "$f" "$C:/tmp/" >/dev/null 2>&1 && restored=$((restored+1)) || true
+
+# ── RESTORE, and require EVERY staged file back before starting ──────────────
+# A partial restore is worse than no heal: the container would come up with a
+# half-populated state directory and diverge silently.
+restored=0; missing=()
+for name in "${staged[@]}"; do
+    if docker cp "$B/$name" "$C:/tmp/$name" >/dev/null 2>&1; then
+        restored=$((restored+1))
+    else
+        missing+=("$name")
+    fi
 done
+if [ "$restored" -ne "$staged_count" ]; then
+    log "FATAL: restored $restored/$staged_count staged file(s); missing: ${missing[*]}"
+    log "       NOT starting $SVC — a half-restored state directory would diverge silently."
+    log "       Staged copies are in $B (this dir is removed on exit; copy them NOW if needed)."
+    trap - EXIT
+    log "       Preserved staging dir: $B"
+    exit 1
+fi
+# Ownership must be usable by the container's runtime user, or the service starts
+# and then fails to open its own DBs — a "successful" heal that is not one.
+docker cp "$B/." "$C:/tmp/" >/dev/null 2>&1 || true
+
 COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
     start "$SVC" >/dev/null 2>&1 \
     || { log "start failed"; exit 1; }
-log "preserve-healed (saved=$saved restored=$restored, ethtxmanager-aggoracle.sqlite wiped)"
+log "preserve-healed (staged=$staged_count restored=$restored, ethtxmanager-aggoracle.sqlite wiped)"
 exit 0

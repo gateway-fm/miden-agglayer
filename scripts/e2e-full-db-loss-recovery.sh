@@ -71,9 +71,38 @@ PROXY_PROJECT_LABEL="$(docker inspect "$PROXY_CONTAINER" --format '{{ index .Con
 PG_PROJECT_LABEL="$(docker inspect "$PG_CONTAINER"    --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null)"
 [[ -n "$PROXY_PROJECT_LABEL" && "$PROXY_PROJECT_LABEL" == "$PG_PROJECT_LABEL" ]] \
     || { echo "FATAL: $PG_CONTAINER (project '$PG_PROJECT_LABEL') is not in the proxy's project ('$PROXY_PROJECT_LABEL')"; exit 1; }
-if ! docker inspect "$PROXY_CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-        | grep -qiE "(postgres|store|database).*(${PG_CONTAINER}|agglayer-postgres)"; then
-    echo "WARN: could not confirm proxy $PROXY_CONTAINER references $PG_CONTAINER via env; relying on project-label match"
+# PR#164 re-review — this MUST fail closed. Previously an unconfirmed target only
+# printed a WARN and the script proceeded to DROP DATABASE anyway, so a config
+# mismatch (or a store URL we could not parse) still destroyed a database chosen by
+# NAME CONVENTION alone. Extract the store URL's HOST and require it to name this
+# postgres; an unparsable or mismatched URL is a hard stop, not a warning.
+# Override with ALLOW_UNVERIFIED_PG_TARGET=1 for exotic topologies — explicit, not
+# accidental.
+PROXY_ENV="$(docker inspect "$PROXY_CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"
+STORE_URL="$(printf '%s\n' "$PROXY_ENV" | grep -iE '^[A-Z_]*(DATABASE|STORE|POSTGRES)[A-Z_]*=' | head -1 | cut -d= -f2-)"
+# postgres://user:pass@HOST:port/db  ->  HOST
+STORE_HOST="$(printf '%s' "$STORE_URL" | sed -E 's#^[a-zA-Z+]+://##; s#^[^@]*@##; s#[:/].*$##')"
+if [[ -z "$STORE_HOST" ]]; then
+    if [[ "${ALLOW_UNVERIFIED_PG_TARGET:-0}" == "1" ]]; then
+        echo "WARN: proxy store URL unparsable; proceeding because ALLOW_UNVERIFIED_PG_TARGET=1"
+    else
+        echo "FATAL: could not parse the proxy's store URL from $PROXY_CONTAINER env, so the"
+        echo "       DROP DATABASE target cannot be confirmed. Refusing to destroy a database"
+        echo "       chosen by name convention alone. Set ALLOW_UNVERIFIED_PG_TARGET=1 to override."
+        exit 1
+    fi
+elif [[ "$STORE_HOST" != "$PG_CONTAINER" && "$STORE_HOST" != "agglayer-postgres" \
+        && "$STORE_HOST" != "localhost" && "$STORE_HOST" != "127.0.0.1" ]]; then
+    if [[ "${ALLOW_UNVERIFIED_PG_TARGET:-0}" == "1" ]]; then
+        echo "WARN: proxy store host '$STORE_HOST' != '$PG_CONTAINER'; proceeding (ALLOW_UNVERIFIED_PG_TARGET=1)"
+    else
+        echo "FATAL: the proxy's store host is '$STORE_HOST', which is NOT the container this"
+        echo "       script would DROP ($PG_CONTAINER). Refusing to destroy a database the"
+        echo "       proxy under test does not use. Set ALLOW_UNVERIFIED_PG_TARGET=1 to override."
+        exit 1
+    fi
+else
+    echo "verified: proxy store host '$STORE_HOST' matches the drop target $PG_CONTAINER"
 fi
 
 COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
@@ -108,9 +137,23 @@ pgq() { docker exec "$PG_CONTAINER" psql -U agglayer -d agglayer_store -tAc "$1"
 #   - synthetic_logs digest: md5 over (tx_hash:log_index:data) ordered
 #   - injected-GER set digest: md5 over ger_hash ordered
 #   - hash_chain_value: the order-sensitive rolling-chain assertion (kept as-is)
+# FULL normalized log-row fingerprint (PR#164 re-review). The previous digest
+# covered only (transaction_hash, log_index, data), so a regression in block
+# identity, emitting address, TOPICS (i.e. the indexed event fields — the very
+# thing an "indexed event regression" would corrupt), or the `removed` flag
+# reproduced a different row while the digest matched. Fingerprint every column
+# that a faithful restore must reproduce.
+#
+# `topics` is a BYTEA[]; array_to_string over its hex encoding gives a stable,
+# order-preserving rendering (topic order is semantic: topic0 is the event
+# signature, topics 1..n the indexed args).
 log_digest() { # $1 = topic0 hex prefix
-    pgq "SELECT md5(coalesce(string_agg(transaction_hash || ':' || log_index || ':' || data, '|' \
-         ORDER BY transaction_hash, log_index), '')) \
+    pgq "SELECT md5(coalesce(string_agg(
+           transaction_hash || ':' || log_index || ':' || block_number || ':' ||
+           encode(block_hash,'hex') || ':' || address || ':' ||
+           array_to_string(topics, ',') || ':' ||
+           transaction_index::text || ':' || removed::text || ':' || data,
+           '|' ORDER BY transaction_hash, log_index), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '$1%'"
 }
 # GER / UpdateHashChain content digest — deliberately EXCLUDES transaction_hash
@@ -133,9 +176,14 @@ log_digest() { # $1 = topic0 hex prefix
 # the rolling `hash_chain_value`) and its count. Those are asserted strictly.
 # Bridge/Claim keep the FULL digest (tx identity included) — theirs is
 # reconstructed from node-authoritative note bodies, so it must survive.
+# Same FULL-row rigor as `log_digest` (address, block identity, topics, removal
+# state all included, so an indexed-event regression cannot slip through) minus
+# exactly the two unrecoverable fields documented above.
 uhc_content_digest() {
-    pgq "SELECT md5(coalesce(string_agg(block_number || ':' || data, '|' \
-         ORDER BY block_number, data), '')) \
+    pgq "SELECT md5(coalesce(string_agg(
+           block_number || ':' || encode(block_hash,'hex') || ':' || address || ':' ||
+           array_to_string(topics, ',') || ':' || removed::text || ':' || data,
+           '|' ORDER BY block_number, data), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'"
 }
 fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
@@ -255,14 +303,21 @@ while :; do
 done
 pass "post-restore deposit ready_for_claim"
 
+# PR#164 re-review — compare COUNT to COUNT. `INJ1` is the injected-set MD5 from
+# `fingerprint()`, not a number: `[[ "$INJ2" -gt "$INJ1" ]]` compared an integer to
+# a hex digest, so bash arithmetic evaluated the non-numeric side as 0 and the
+# guard passed on the FIRST poll regardless of whether a new GER ever landed. The
+# advertised fresh-GER liveness gate therefore asserted nothing. The numeric
+# post-restore count is `NINJECTED1` (from `counts()`).
 deadline=$((SECONDS + 240))
 while :; do
     INJ2=$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected=true")
-    [[ "$INJ2" -gt "$INJ1" ]] && break
-    (( SECONDS >= deadline )) && fail "no NEW GER injected+consumed post-restore in 240s (was $INJ1)"
+    [[ "${INJ2:-0}" =~ ^[0-9]+$ ]] || fail "injected-GER count query returned non-numeric '$INJ2'"
+    (( INJ2 > NINJECTED1 )) && break
+    (( SECONDS >= deadline )) && fail "no NEW GER injected+consumed post-restore in 240s (count stuck at $INJ2, pre-restore baseline $NINJECTED1)"
     sleep 5
 done
-pass "new GER injected+consumed post-restore ($INJ1 -> $INJ2)"
+pass "new GER injected+consumed post-restore (count $NINJECTED1 -> $INJ2)"
 
 step "RESULT"
 pass "FULL DB LOSS RECOVERY: faithful history + no poison + live pipeline (evidence: $EVIDENCE)"
