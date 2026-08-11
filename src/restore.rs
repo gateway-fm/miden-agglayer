@@ -255,6 +255,11 @@ struct ReplayBridgeOut {
     body: RecoveredBridgeBody,
     block: u64,
     tx_order: u32,
+    /// Position of this note among its consuming transaction's inputs — the
+    /// authoritative within-transaction order the live projector uses to break
+    /// same-transaction B2AGG sibling ties (`within_tx_pos`). Without it, two
+    /// siblings in one transaction have an unknowable relative order.
+    within_tx_pos: u32,
 }
 
 /// Finding #69 — a bridge-consumed CLAIM joined to its consuming bridge
@@ -268,6 +273,10 @@ struct ReplayClaim {
     body: RecoveredClaimBody,
     block: u64,
     tx_order: u32,
+    /// Input position, captured for parity with [`ReplayBridgeOut`]. NOTE: the
+    /// ordering key deliberately does NOT use it — see `replay_sort_key`.
+    #[allow(dead_code)]
+    within_tx_pos: u32,
 }
 
 /// Run the full restore algorithm.
@@ -937,7 +946,8 @@ fn build_bridge_replay(
     } = recovered;
     let mut replay = Vec::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
-        for input in tx.transaction_header.input_notes().iter() {
+        for (within_tx_pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
+            let within_tx_pos = within_tx_pos as u32;
             let id = input
                 .header()
                 .map(|header| header.id())
@@ -956,6 +966,7 @@ fn build_bridge_replay(
                 body,
                 block,
                 tx_order: order,
+                within_tx_pos,
             });
         }
     }
@@ -980,7 +991,8 @@ fn build_claim_replay(
 ) -> anyhow::Result<Vec<ReplayClaim>> {
     let mut replay = Vec::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
-        for input in tx.transaction_header.input_notes().iter() {
+        for (within_tx_pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
+            let within_tx_pos = within_tx_pos as u32;
             let id = input
                 .header()
                 .map(|header| header.id())
@@ -999,6 +1011,7 @@ fn build_claim_replay(
                 body,
                 block,
                 tx_order: order,
+                within_tx_pos,
             });
         }
     }
@@ -1178,24 +1191,43 @@ enum ReplayItem<'a> {
     Consumed(&'a InputNoteRecord),
 }
 
-/// The canonical projection order, identical to the live projector's and to the
-/// `ORDER` stage in `docs/design/UNIFIED-PROJECTOR.md`:
-/// `(block, transaction order, details commitment)`.
+/// The canonical projection order — the `ORDER` stage of
+/// `docs/design/UNIFIED-PROJECTOR.md`, and byte-for-byte the comparator the live
+/// projector applies in `project_block_notes`:
+///
+///   `(block, transaction order, input position, details commitment, NoteId)`
+///
+/// # Why `within_tx_pos` is B2AGG-only
+///
+/// Live populates its `within_tx_pos` map ONLY from `resolve_b2agg_consumptions`
+/// — the authoritative bridge-transaction feed — and every other note falls
+/// through its `unwrap_or(0)`. Restore must reproduce the live log stream
+/// EXACTLY, so it mirrors that: the real input position for B2AGG, `0` for
+/// everything else. Feeding real positions for claims would be "more accurate"
+/// and would produce a DIFFERENT order than live, which is the bug, not the fix.
+///
+/// Getting this wrong is not subtle in its effects: an UpdateHashChain log
+/// carries the rolling chain value in its topics, so a single misordered pair
+/// re-chains every log after it.
 ///
 /// `tx_order` is `Option` so a consumed record without one sorts before records
-/// that have one (`None` < `Some`), which is how the per-kind sort this replaces
-/// ordered them; the node-scanned sources always know theirs.
-fn replay_sort_key(item: &ReplayItem<'_>) -> (u64, Option<u32>, [u8; 32]) {
+/// that have one (`None` < `Some`), matching the per-kind sort this replaced.
+fn replay_sort_key(item: &ReplayItem<'_>) -> (u64, Option<u32>, u32, [u8; 32], Option<[u8; 32]>) {
     match item {
         ReplayItem::BridgeOut(r) => (
             r.block,
             Some(r.tx_order),
+            // The only kind live knows an input position for.
+            r.within_tx_pos,
             r.body.details.commitment().as_bytes(),
+            Some(r.id.as_bytes()),
         ),
         ReplayItem::NodeClaim(r) => (
             r.block,
             Some(r.tx_order),
+            0,
             r.body.details.commitment().as_bytes(),
+            Some(r.id.as_bytes()),
         ),
         ReplayItem::Consumed(n) => (
             n.state()
@@ -1203,7 +1235,9 @@ fn replay_sort_key(item: &ReplayItem<'_>) -> (u64, Option<u32>, [u8; 32]) {
                 .map(|h| h.as_u64())
                 .unwrap_or(0),
             n.state().consumed_tx_order(),
+            0,
             n.details_commitment().as_bytes(),
+            n.id().map(|i| i.as_bytes()),
         ),
     }
 }
@@ -2745,7 +2779,7 @@ mod tests {
             "earliest BLOCK first — block outranks everything"
         );
         assert_eq!(
-            keys[1],
+            (keys[1].0, keys[1].1, keys[1].3),
             (97, Some(1), mid_earlier_tx.details_commitment().as_bytes()),
             "within a block, lower tx_order first"
         );
@@ -2756,15 +2790,61 @@ mod tests {
         );
         let (lo, hi) = if c_a < c_b { (c_a, c_b) } else { (c_b, c_a) };
         assert_eq!(
-            keys[2],
+            (keys[2].0, keys[2].1, keys[2].3),
             (97, Some(3), lo),
             "same (block, tx_order): commitment breaks the tie"
         );
-        assert_eq!(keys[3], (97, Some(3), hi));
+        assert_eq!((keys[3].0, keys[3].1, keys[3].3), (97, Some(3), hi));
         assert_eq!(
             keys[4].0, 432,
             "latest block LAST — under the old kind-major replay this B2AGG-shaped \
              record would have been emitted first regardless of its block"
+        );
+    }
+
+    /// The case that motivated carrying `within_tx_pos`: TWO B2AGG siblings in ONE
+    /// transaction. Their relative order is decided by the authoritative input
+    /// position, NOT by details commitment — so the sibling with the LOWER input
+    /// position must sort first even when its commitment is larger.
+    ///
+    /// Before this, restore fell straight through to the commitment tiebreak and
+    /// could emit same-transaction siblings in the opposite order to live. Because
+    /// an UpdateHashChain log carries the rolling chain value in its topics, one
+    /// such inversion re-chains every subsequent log — which is exactly what the
+    /// full-DB-loss content digest caught.
+    #[test]
+    fn replay_order_uses_input_position_for_same_tx_b2agg_siblings() {
+        // Same block + same tx_order; commitment order is deliberately the INVERSE
+        // of the input-position order, so only `within_tx_pos` can decide.
+        let a = ordered_consumed(50, Some(2), 0xFF); // larger commitment seed
+        let b = ordered_consumed(50, Some(2), 0x01); // smaller commitment seed
+
+        let key = |block, tx, pos: u32, n: &InputNoteRecord| {
+            (
+                block,
+                Some(tx),
+                pos,
+                n.details_commitment().as_bytes(),
+                None::<[u8; 32]>,
+            )
+        };
+        // `a` is input 0, `b` is input 1 — position must win over commitment.
+        let ka = key(50u64, 2u32, 0, &a);
+        let kb = key(50u64, 2u32, 1, &b);
+        assert!(
+            ka < kb,
+            "input position must outrank the commitment tiebreak for same-transaction \
+             siblings — otherwise restore can invert live's order and re-chain every \
+             following UpdateHashChain log"
+        );
+
+        // Sanity: with positions EQUAL (the non-B2AGG case, both 0) the commitment
+        // tiebreak still applies, so ordering stays deterministic.
+        let ka0 = key(50u64, 2u32, 0, &a);
+        let kb0 = key(50u64, 2u32, 0, &b);
+        assert!(
+            kb0 < ka0,
+            "with no authoritative position, the commitment breaks the tie deterministically"
         );
     }
 
