@@ -663,11 +663,50 @@ async fn register_native_validated(
         })
         .await?;
 
+    // PR#164 re-review — VERIFY the exact persisted binding before reporting
+    // success. `register_faucet` upserts under a
+    // `WHERE faucet_registry.faucet_id = EXCLUDED.faucet_id` guard, so when a
+    // STALE row for a DIFFERENT faucet already holds this origin the statement
+    // affects ZERO rows and still returns Ok. The bridge would then be bound to
+    // the faucet we just registered while Postgres still pointed at the old one —
+    // a silent split-brain reported as success. Read the row back and require it
+    // to be exactly what we registered.
+    let persisted = state
+        .store
+        .get_faucet_by_origin(&origin_address, origin_network)
+        .await?;
+    match persisted {
+        Some(row) if row.faucet_id == faucet_id => {}
+        Some(row) => {
+            anyhow::bail!(
+                "registerNativeFaucet: the bridge was bound to faucet {} but the registry still \
+                 records faucet {} for origin 0x{} (network {}) — the guarded upsert affected no \
+                 rows because a stale row holds this origin. Refusing to report success on a \
+                 split registry/bridge state; resolve the stale row and retry.",
+                faucet_id.to_hex(),
+                row.faucet_id.to_hex(),
+                hex::encode(origin_address),
+                origin_network,
+            );
+        }
+        None => {
+            anyhow::bail!(
+                "registerNativeFaucet: the bridge was bound to faucet {} but no registry row for \
+                 origin 0x{} (network {}) is readable afterwards — refusing to report success on \
+                 an unpersisted registration.",
+                faucet_id.to_hex(),
+                hex::encode(origin_address),
+                origin_network,
+            );
+        }
+    }
+
     let id_hex = faucet_id.to_hex();
     tracing::info!(
         faucet_id = %id_hex,
         origin_network,
-        "admin_registerNativeFaucet: native faucet allowlisted on the bridge"
+        "admin_registerNativeFaucet: native faucet allowlisted on the bridge (persisted binding \
+         verified)"
     );
     Ok(id_hex)
 }
@@ -1306,6 +1345,14 @@ pub async fn miden_register_native_faucet(
         .store
         .get_faucet_by_origin(&origin_address, origin_network)
         .await?
+        // PR#164 re-review — EXCLUDE our own row. The derived origin is a pure
+        // function of `faucet_id`, so a stale row for THIS faucet necessarily
+        // matches this lookup too. Bailing on it made the `Unbound` re-drive above
+        // unreachable (the heal could never run) and produced a nonsensical error
+        // claiming the faucet was "already bound" to ITSELF. That case is fully
+        // decided by the get_faucet_by_id branch above — reached here only when it
+        // chose to re-drive, and `register_faucet` upserts our own row in place.
+        .filter(|other| other.faucet_id != faucet_id)
     {
         // The encoding is collision-free, so this is only reachable when an
         // operator chose this exact address by hand via the admin API. Either

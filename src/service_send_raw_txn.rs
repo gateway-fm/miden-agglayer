@@ -299,6 +299,74 @@ async fn accept_and_revert_landed_claim(
     Ok(())
 }
 
+/// #90 (re-review) — how long after a store rebuild the first-contact nonce
+/// bootstrap stays available, in seconds. Bounded so "recovery mode" cannot linger
+/// indefinitely: the marker applied to EVERY previously-unseen signer for the life
+/// of the deployment, which is far broader than the continuing wallets it exists
+/// for. A continuing aggkit wallet submits within seconds of coming back, so a
+/// short window is ample.
+fn recovery_bootstrap_window() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("NONCE_RECOVERY_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800),
+    )
+}
+
+/// When this process first observed the rebuild marker. The window is measured
+/// from first observation rather than persisted, so no extra migration is needed
+/// and a restart cannot silently extend recovery mode indefinitely.
+static RECOVERY_MODE_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Lowest nonce observed per signer while recovery mode is active. The baseline is
+/// taken from this MINIMUM, never from whichever request arrived first.
+static RECOVERY_MIN_NONCE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn note_recovery_nonce(signer: &str, nonce: u64) {
+    let mut m = RECOVERY_MIN_NONCE.lock().unwrap();
+    m.entry(signer.to_string())
+        .and_modify(|lowest| {
+            if nonce < *lowest {
+                *lowest = nonce;
+            }
+        })
+        .or_insert(nonce);
+}
+
+fn lowest_recovery_nonce(signer: &str) -> Option<u64> {
+    RECOVERY_MIN_NONCE.lock().unwrap().get(signer).copied()
+}
+
+/// Is the post-rebuild nonce bootstrap currently permitted?
+///
+/// True only while the durable rebuild marker is set AND this process has been
+/// observing it for less than [`recovery_bootstrap_window`]. Once the window
+/// lapses the marker is CLEARED durably, so recovery mode ends on its own instead
+/// of applying to every future unseen signer forever.
+async fn recovery_bootstrap_active(service: &ServiceState) -> anyhow::Result<bool> {
+    if !service.store.is_nonce_ledger_rebuilt().await? {
+        return Ok(false);
+    }
+    let since = *RECOVERY_MODE_SINCE.get_or_init(std::time::Instant::now);
+    if since.elapsed() < recovery_bootstrap_window() {
+        return Ok(true);
+    }
+    // Window lapsed — retire recovery mode durably and permanently.
+    service.store.set_nonce_ledger_rebuilt(false).await?;
+    RECOVERY_MIN_NONCE.lock().unwrap().clear();
+    ::metrics::counter!("rpc_nonce_recovery_mode_expired_total").increment(1);
+    tracing::info!(
+        target: "rpc::nonce_repair",
+        window_secs = recovery_bootstrap_window().as_secs(),
+        "#90: post-rebuild nonce recovery window elapsed — bootstrap disabled; ordinary \
+         R4 admission applies to every signer from here on"
+    );
+    Ok(false)
+}
+
 /// #55 BLOCKER C/D — idempotent crash-gap nonce repair via store-level CAS.
 ///
 /// On the accept path the durable receipt write and the nonce advance are
@@ -1394,24 +1462,15 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // onward ordinary R4 sequencing applies. Double-EFFECTS remain prevented by
         // the domain-level idempotency that DOES survive a restore
         // (`is_ger_injected`, `claimed_indices` / `is_note_processed`).
-        if tx_nonce > 0 && service.store.is_nonce_ledger_rebuilt().await? {
-            let seeded = service
-                .store
-                .nonce_bootstrap_if_absent(&signer_str, tx_nonce)
-                .await?;
-            if seeded {
-                ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
-                tracing::warn!(
-                    target: "rpc::nonce_repair",
-                    signer = %signer_str,
-                    adopted_nonce = tx_nonce,
-                    "#90: no nonce ledger entry for this signer after a store rebuild — \
-                     adopting the first observed nonce as the baseline so a continuing \
-                     wallet can resume; R4 sequencing applies from here on"
-                );
-            }
+        // Recovery mode is TIME-SCOPED and self-clearing (see
+        // `recovery_bootstrap_active`), and while it is active we only RECORD each
+        // observed nonce here. Seeding is deliberately deferred until the ordering
+        // window below is exhausted, so an in-flight LOWER nonce still wins.
+        let recovery_bootstrap = recovery_bootstrap_active(&service).await?;
+        if recovery_bootstrap && tx_nonce > 0 {
+            note_recovery_nonce(&signer_str, tx_nonce);
         }
-        let expected_nonce = service.store.nonce_get(&signer_str).await?;
+        let mut expected_nonce = service.store.nonce_get(&signer_str).await?;
         let durable_frontier = service.store.pending_nonce_frontier(&signer_str).await?;
         if let Some(lower_nonce) = durable_frontier.lowest_unlinked
             && lower_nonce < tx_nonce
@@ -1431,6 +1490,49 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let can_wait_for_future_nonce = service.writer_handle.is_some()
             && tx_nonce > expected_nonce
             && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
+
+        // #90 (re-review) — seed the baseline ONLY once the future-nonce ordering
+        // window is exhausted, and seed with the LOWEST nonce observed for this
+        // signer during that window, never with whichever request happened to
+        // arrive first.
+        //
+        // Seeding on first arrival was wrong twice over: HTTP/retry ordering can
+        // deliver N+1 before a still-pending N, which would seed N+1 and strand N
+        // as permanently stale; and doing it above bypassed the very ordering
+        // protection sitting right here. Deferring to window-exhaustion gives a
+        // genuinely in-flight lower nonce the FULL window to arrive and win, and
+        // taking the minimum means the request that seeds need not be the one that
+        // is finally admitted — with baseline N seeded, the N request matches and
+        // proceeds while N+1 simply retries into its normal sequential slot.
+        if recovery_bootstrap
+            && tx_nonce > 0
+            && !can_wait_for_future_nonce
+            && tx_nonce != expected_nonce
+        {
+            let baseline = lowest_recovery_nonce(&signer_str).unwrap_or(tx_nonce);
+            if service
+                .store
+                .nonce_bootstrap_if_absent(&signer_str, baseline)
+                .await?
+            {
+                ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
+                tracing::warn!(
+                    target: "rpc::nonce_repair",
+                    signer = %signer_str,
+                    adopted_nonce = baseline,
+                    observed_nonce = tx_nonce,
+                    "#90: no nonce ledger entry for this signer after a store rebuild — \
+                     adopting the LOWEST nonce observed during the ordering window as the \
+                     baseline so a continuing wallet can resume; R4 sequencing applies from \
+                     here on"
+                );
+                // Re-read: the seed may have been a LOWER nonce than this request,
+                // in which case this one correctly waits its turn.
+                expected_nonce = service.store.nonce_get(&signer_str).await?;
+            }
+        }
+        let can_wait_for_future_nonce = can_wait_for_future_nonce && tx_nonce > expected_nonce;
+
         let nonce_action = if tx_nonce == expected_nonce || durable_resume_nonce {
             "accept"
         } else if can_wait_for_future_nonce {
@@ -2693,6 +2795,70 @@ mod tests {
             0,
             "a live deployment must NOT adopt a future nonce — the gap is real and the \
              missing tx is expected to arrive"
+        );
+    }
+
+    /// #90 (re-review) — ORDERING: `N+1` may reach the proxy before a still-pending
+    /// `N` (HTTP reordering, a retry, concurrent submitters). Seeding from whichever
+    /// request arrived FIRST would adopt `N+1` and strand `N` as permanently stale —
+    /// silently dropping a transaction the wallet believes is live.
+    ///
+    /// The baseline is therefore taken from the LOWEST nonce observed during the
+    /// ordering window, not the first. Here `22` is observed before `21`, and the
+    /// seeded baseline must still be `21`.
+    #[tokio::test]
+    async fn finding90_seeds_lowest_observed_nonce_not_first_arrival() {
+        let addr = "0x00000000000000000000000000000000000000bb";
+        // Observed out of order: the higher nonce arrives first.
+        note_recovery_nonce(addr, 22);
+        note_recovery_nonce(addr, 21);
+        assert_eq!(
+            lowest_recovery_nonce(addr),
+            Some(21),
+            "the baseline must track the LOWEST nonce seen in the window, so an \
+             out-of-order N+1 cannot strand the pending N"
+        );
+
+        // And seeding uses that minimum, so the N request matches and proceeds
+        // while N+1 simply waits its turn.
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        let baseline = lowest_recovery_nonce(addr).unwrap();
+        assert!(
+            store
+                .nonce_bootstrap_if_absent(addr, baseline)
+                .await
+                .unwrap(),
+            "first seed wins"
+        );
+        assert_eq!(
+            store.nonce_get(addr).await.unwrap(),
+            21,
+            "the ledger must resume at the lowest outstanding nonce, not at N+1"
+        );
+    }
+
+    /// #90 (re-review) — recovery mode must not be a permanent global amnesty. It is
+    /// time-scoped from first observation and CLEARS the durable marker when the
+    /// window lapses, so it cannot keep applying to every previously-unseen signer
+    /// for the life of the deployment.
+    #[tokio::test]
+    async fn finding90_recovery_mode_is_scoped_and_self_clearing() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+
+        // A zero-length window means the very first check retires recovery mode.
+        unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
+        let active = recovery_bootstrap_active(&service).await.unwrap();
+        unsafe { std::env::remove_var("NONCE_RECOVERY_WINDOW_SECS") };
+
+        assert!(!active, "an elapsed window must not permit bootstrap");
+        assert!(
+            !store.is_nonce_ledger_rebuilt().await.unwrap(),
+            "the durable marker must be CLEARED once the window lapses — recovery mode \
+             must not apply indefinitely to every future unseen signer"
         );
     }
 
