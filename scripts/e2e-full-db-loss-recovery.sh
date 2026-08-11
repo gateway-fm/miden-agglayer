@@ -113,9 +113,34 @@ log_digest() { # $1 = topic0 hex prefix
          ORDER BY transaction_hash, log_index), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '$1%'"
 }
+# GER / UpdateHashChain content digest — deliberately EXCLUDES transaction_hash
+# and log_index, because neither can survive a full DB loss even when the
+# restored history is perfectly faithful:
+#
+#   * transaction_hash — the injection is carried by an eth-tx aggoracle submits
+#     to THIS proxy's own L2 RPC (`eth_sendRawTransaction` -> `insert_ger`). Its
+#     hash is derived from the signed raw tx and is recorded ONLY in the proxy's
+#     `transactions` / `tx_note_links` rows, which this drill drops. It was never
+#     on L1 and is not carried by the Miden note, so there is no source left to
+#     recover it from; restore falls back to a deterministic derived hash.
+#   * log_index — a SINGLE global counter shared by Bridge/Claim/UHC emissions.
+#     Restore replays by phase (all B2AGG, then CLAIM, then GER) rather than in
+#     the original interleaved arrival order, so the indices are re-numbered even
+#     when every event is faithfully reproduced.
+#
+# What MUST be identical is the part that carries meaning: each injected GER's
+# VALUE, its per-block attribution, its ORDER (asserted separately and exactly by
+# the rolling `hash_chain_value`) and its count. Those are asserted strictly.
+# Bridge/Claim keep the FULL digest (tx identity included) — theirs is
+# reconstructed from node-authoritative note bodies, so it must survive.
+uhc_content_digest() {
+    pgq "SELECT md5(coalesce(string_agg(block_number || ':' || data, '|' \
+         ORDER BY block_number, data), '')) \
+         FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'"
+}
 fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
     local uhc inj bridge claim hcv
-    uhc=$(log_digest '0x65d3bf36')
+    uhc=$(uhc_content_digest)
     inj=$(pgq "SELECT md5(coalesce(string_agg(encode(ger_hash,'hex'), '|' ORDER BY ger_hash), '')) \
                FROM ger_entries WHERE is_injected=true")
     bridge=$(log_digest '0x50178120')
@@ -193,8 +218,9 @@ read -r UHC1 INJ1 BR1 CL1 HCV1 <<<"$(fingerprint)"
 say "after : counts UHC=$NUHC1 injected=$NINJECTED1 Bridge=$NBR1 Claim=$NCL1  hash_chain=${HCV1:0:16}…"
 # Ordered-content digests (blocker #7): a swapped/reconstructed row changes the
 # digest even when the count is identical.
-[[ "$UHC1" == "$UHC0" ]] || fail "#88: UpdateHashChain rows differ across restore (digest $UHC0 -> $UHC1; counts $NUHC0 -> $NUHC1)"
-pass "UpdateHashChain rows identical (count $NUHC1, digest ${UHC1:0:12})"
+[[ "$NUHC1" == "$NUHC0" ]] || fail "#88: UpdateHashChain log COUNT changed across restore ($NUHC0 -> $NUHC1) — GER history was lost or duplicated"
+[[ "$UHC1" == "$UHC0" ]] || fail "#88: UpdateHashChain CONTENT differs across restore (per-block GER values; digest $UHC0 -> $UHC1; counts $NUHC0 -> $NUHC1)"
+pass "UpdateHashChain content identical — same GER values at the same blocks (count $NUHC1, digest ${UHC1:0:12}); tx_hash/log_index intentionally excluded (unrecoverable after full DB loss — see log_digest notes), with ORDER asserted exactly by hash_chain_value below"
 [[ "$INJ1" == "$INJ0" ]] || fail "#88: injected-GER set differs across restore (digest $INJ0 -> $INJ1; counts $NINJECTED0 -> $NINJECTED1)"
 pass "injected-GER set identical (count $NINJECTED1, digest ${INJ1:0:12})"
 [[ "$HCV1" == "$HCV0" ]] || fail "#88: hash_chain_value diverged (order-sensitive replay broke): $HCV0 vs $HCV1"
