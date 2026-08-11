@@ -312,13 +312,57 @@ pub async fn register_faucet_in_bridge(
         );
     }
     tracing::info!("register faucet tx {txn_id} committed");
-    // Extra wait for NTX builder to process the config note
-    for _ in 0..5 {
+
+    // PR#164 re-review: committing the SERVICE transaction only proves the
+    // ConfigAggBridgeNote was CREATED. The route is NOT active until the BRIDGE
+    // account consumes that note and writes the `faucet_metadata_map` entry —
+    // a separate, later transaction built by the NTX builder. The previous code
+    // waited five fixed seconds and returned Ok, so a config note that was never
+    // consumed (NTX down/backlogged, note expired) still reported success and the
+    // caller persisted a durable registry row for an INACTIVE route. Future
+    // registrations then short-circuit as `already_registered` while the bridge
+    // has no binding.
+    //
+    // Poll the AUTHORITATIVE binding instead, and require it to match the exact
+    // (origin_address, origin_network) we asked for. Fail closed on timeout: the
+    // caller's `?` aborts before any registry write, and the operation stays
+    // retryable (the note carries a finite expiration).
+    let mut bound = false;
+    for _ in 0..BRIDGE_BINDING_POLL_ATTEMPTS {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         client.sync_state().await?;
+        let Some(bridge) = client.get_account(bridge_id).await.ok().flatten() else {
+            continue;
+        };
+        if let Some(conv) =
+            crate::metadata_recovery::read_faucet_conversion_metadata(bridge.storage(), faucet_id)
+            && EthAddress::new(conv.origin_address) == *origin_token_address
+            && conv.origin_network == origin_network
+        {
+            bound = true;
+            break;
+        }
     }
+    if !bound {
+        anyhow::bail!(
+            "register {faucet_name} faucet: the bridge never bound faucet {faucet_id} to the \
+             requested origin within {BRIDGE_BINDING_POLL_ATTEMPTS}s — the ConfigAggBridgeNote \
+             (tx {txn_id}) committed but was not consumed into faucet_metadata_map, so the route \
+             is NOT active. No registry row written; retry once the NTX builder catches up."
+        );
+    }
+    tracing::info!(
+        "bridge binding confirmed for faucet {faucet_id} (origin_network {origin_network}) — \
+         route is active"
+    );
     Ok(())
 }
+
+/// Seconds to wait for the BRIDGE to consume a ConfigAggBridgeNote and publish
+/// the `faucet_metadata_map` binding. Registration reports success only after the
+/// binding is observed, so this bounds how long a healthy-but-backlogged NTX
+/// builder may take before the caller is told to retry.
+const BRIDGE_BINDING_POLL_ATTEMPTS: usize = 30;
 
 /// Maximum decimals a local Miden faucet may declare. Mirrors
 /// [`miden_standards::account::faucets::FungibleFaucet::MAX_DECIMALS`], which the

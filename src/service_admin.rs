@@ -405,13 +405,44 @@ pub async fn admin_register_native_faucet(
         // Return the EXISTING route's faucet_id, not the caller-supplied one: the origin
         // is already bound to `existing.faucet_id`, and echoing the caller's (possibly
         // different) id would falsely imply THAT faucet is the registered route.
-        tracing::info!(
-            origin_network,
-            existing_faucet_id = %existing.faucet_id.to_hex(),
-            requested_faucet_id = %faucet_id.to_hex(),
-            "admin_registerNativeFaucet: a route already exists for this origin — returning the existing route's faucet"
-        );
-        return Ok(existing.faucet_id.to_hex());
+        // PR#164 re-review: confirm the cached row against the AUTHORITATIVE
+        // bridge binding before reporting an existing route. A stale row (earlier
+        // false-success, partial restore) would otherwise be echoed back forever
+        // as a live route the bridge never had.
+        match preflight_bridge_binding(&state, existing.faucet_id, origin_address, origin_network)
+            .await?
+        {
+            BridgeBinding::AlreadyBound => {
+                tracing::info!(
+                    origin_network,
+                    existing_faucet_id = %existing.faucet_id.to_hex(),
+                    requested_faucet_id = %faucet_id.to_hex(),
+                    "admin_registerNativeFaucet: a route already exists for this origin (confirmed \
+                     on-chain) — returning the existing route's faucet"
+                );
+                return Ok(existing.faucet_id.to_hex());
+            }
+            BridgeBinding::Unbound | BridgeBinding::FaucetBoundToDifferentOrigin(_) => {
+                ::metrics::counter!("faucet_registry_stale_row_redriven_total").increment(1);
+                tracing::warn!(
+                    origin_network,
+                    existing_faucet_id = %existing.faucet_id.to_hex(),
+                    "admin_registerNativeFaucet: local row claims this origin but the bridge has \
+                     no matching binding (stale row) — re-driving registration instead of \
+                     reporting a route that does not exist"
+                );
+            }
+            BridgeBinding::OriginBoundToOther(other) => {
+                tracing::info!(
+                    origin_network,
+                    on_chain_faucet_id = %other.to_hex(),
+                    "admin_registerNativeFaucet: origin is bound on-chain to {} — returning the \
+                     authoritative binding, not the local row",
+                    other.to_hex()
+                );
+                return Ok(other.to_hex());
+            }
+        }
     }
 
     // #149 — read the deployed faucet account's AUTHORITATIVE metadata BEFORE any
@@ -1131,6 +1162,11 @@ async fn preflight_bridge_binding(
         .miden_client
         .with(move |client| {
             Box::new(async move {
+                // Explicit sync: `get_account` serves the LOCAL view, which can
+                // lag the chain. An idempotent "already registered" answer is
+                // only trustworthy if the binding it rests on is current
+                // (PR#164 re-review).
+                client.sync_state().await?;
                 let bridge = client
                     .get_account(bridge_id)
                     .await
@@ -1216,14 +1252,55 @@ pub async fn miden_register_native_faucet(
                 existing.origin_network
             );
         }
-        return Ok(serde_json::json!({
-            "faucet_id": faucet_id.to_hex(),
-            "origin_token_address": format!("0x{}", hex::encode(origin_address)),
-            "origin_network": origin_network,
-            "symbol": existing.symbol,
-            "decimals": existing.miden_decimals,
-            "already_registered": true,
-        }));
+        // PR#164 re-review: the local row is a CACHE, not proof of an active
+        // route. It can be stale — written by an earlier false-success (config
+        // note created but never consumed), or left by a partial restore — so
+        // answering `already_registered` on its word alone reports a binding the
+        // bridge may not have, and the caller never retries. Confirm against the
+        // AUTHORITATIVE on-chain binding before claiming success.
+        match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
+            BridgeBinding::AlreadyBound => {
+                return Ok(serde_json::json!({
+                    "faucet_id": faucet_id.to_hex(),
+                    "origin_token_address": format!("0x{}", hex::encode(origin_address)),
+                    "origin_network": origin_network,
+                    "symbol": existing.symbol,
+                    "decimals": existing.miden_decimals,
+                    "already_registered": true,
+                }));
+            }
+            BridgeBinding::OriginBoundToOther(other) => {
+                anyhow::bail!(
+                    "miden_registerNativeFaucet: the local registry claims faucet {} owns this \
+                     origin, but the bridge binds it to a DIFFERENT faucet {}. Refusing to \
+                     report success on a stale row. No state was changed.",
+                    faucet_id.to_hex(),
+                    other.to_hex()
+                );
+            }
+            BridgeBinding::FaucetBoundToDifferentOrigin(bound) => {
+                anyhow::bail!(
+                    "miden_registerNativeFaucet: the local registry records origin 0x{} for \
+                     faucet {}, but the bridge binds it to 0x{}. Refusing to report success on a \
+                     divergent row. No state was changed.",
+                    hex::encode(origin_address),
+                    faucet_id.to_hex(),
+                    hex::encode(bound),
+                );
+            }
+            BridgeBinding::Unbound => {
+                // Stale row: we recorded a registration the bridge never got.
+                // Do NOT report success — fall through and re-drive the
+                // registration, which heals the row (and now only returns Ok
+                // once the bridge binding is actually observed).
+                ::metrics::counter!("faucet_registry_stale_row_redriven_total").increment(1);
+                tracing::warn!(
+                    faucet_id = %faucet_id.to_hex(),
+                    "miden_registerNativeFaucet: local registry row exists but the bridge has NO \
+                     binding for it (stale/false-success row) — re-driving registration"
+                );
+            }
+        }
     }
     if let Some(other) = state
         .store
