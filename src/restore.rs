@@ -390,9 +390,17 @@ pub async fn restore(
         scan_tip,
         "Phase 1.5: scanning bridge-out notes from the node..."
     );
-    let mut recovered = scan_bridge_out_bodies(&*rpc, accounts.bridge.0, scan_tip)
-        .await
-        .map_err(|e| anyhow::anyhow!("restore bridge-out body scan failed: {e:#}"))?;
+    // MA#28 sender for the GER-metadata provenance gate — same ger_manager /
+    // service fallback `restore_gers` and `submit_update_ger_note` resolve.
+    let expected_ger_sender = accounts
+        .ger_manager
+        .as_ref()
+        .map(|a| a.0)
+        .unwrap_or(accounts.service.0);
+    let mut recovered =
+        scan_bridge_out_bodies(&*rpc, accounts.bridge.0, expected_ger_sender, scan_tip)
+            .await
+            .map_err(|e| anyhow::anyhow!("restore bridge-out body scan failed: {e:#}"))?;
     tracing::info!(
         "Phase 1.5 complete: found {} B2AGG note(s)",
         recovered.by_id.len()
@@ -783,6 +791,10 @@ fn record_ger_node_metadata(
 async fn scan_bridge_out_bodies(
     rpc: &dyn miden_client::rpc::NodeRpcClient,
     bridge_id: AccountId,
+    // #164 re-review — the MA#28 sender the GER-metadata candidates must carry.
+    // Gating candidates on provenance AT SCAN TIME is what makes the join
+    // un-griefable; see `record_ger_node_metadata`.
+    expected_ger_sender: AccountId,
     to_block: u32,
 ) -> anyhow::Result<RecoveredBridgeOuts> {
     use miden_client::rpc::domain::note::FetchedNote;
@@ -837,7 +849,33 @@ async fn scan_bridge_out_bodies(
                     // GER-shaped notes (bounds memory), and fail closed on a
                     // details-commitment collision that carries different
                     // metadata instead of last-write-wins.
-                    if details.script().root() == ger_root {
+                    // #164 re-review — GER-shaped is NOT enough. Anyone can publish a
+                    // note with the SAME details as a legitimate UpdateGerNote (details
+                    // are public and exclude metadata) but their own sender. Both would
+                    // land under one details-commitment key, the ambiguity guard would
+                    // fail closed, and the GENUINE entry would be dropped — a griefing
+                    // DoS that silently deletes GER history on every later restore.
+                    //
+                    // Gate candidates on MA#28 PROVENANCE here, using the very predicate
+                    // that decides acceptance later (`classify_ger_note`). A clone cannot
+                    // forge `metadata.sender`: it is stamped by the account that executed
+                    // the minting transaction, so only the real ger_manager's notes are
+                    // recorded and an impostor never enters the map. Two notes that both
+                    // pass this gate with identical details necessarily share sender and
+                    // attachment, so their metadata is equal and the idempotent branch
+                    // handles them — ambiguity then means a genuine protocol anomaly,
+                    // which is exactly when failing closed is right.
+                    if details.script().root() == ger_root
+                        && matches!(
+                            classify_ger_note(
+                                Some(&metadata),
+                                &attachments,
+                                expected_ger_sender,
+                                bridge_id,
+                            ),
+                            GerNoteVerdict::Accept
+                        )
+                    {
                         record_ger_node_metadata(
                             &mut public_note_metadata,
                             &mut ambiguous_ger_meta,
@@ -2699,10 +2737,80 @@ mod tests {
         record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
         assert!(!map.contains_key(&key));
 
+        // NOTE: the poisoning above is only reachable for candidates that ALREADY
+        // passed the MA#28 provenance gate in `scan_bridge_out_bodies` — see
+        // `ger_metadata_clone_cannot_evict_the_genuine_entry`, which pins that an
+        // impostor never reaches this map in the first place.
+        //
+        // (assertions continue below)
+
         // A distinct key is unaffected.
         let key2 = [0x22u8; 32];
         record_ger_node_metadata(&mut map, &mut ambiguous, key2, manager_meta);
         assert_eq!(map.get(&key2), Some(&manager_meta));
+    }
+
+    /// #164 re-review (griefing DoS) — details are PUBLIC and exclude metadata, so
+    /// anyone can publish a note whose details match a legitimate UpdateGerNote but
+    /// whose sender is their own. Keyed on details-commitment alone, that clone
+    /// collides with the genuine entry, trips the ambiguity guard, and DELETES the
+    /// real GER's provenance — recovery then loses that GER forever, on demand, for
+    /// free. This is not a hash collision; it is a chosen-input attack.
+    ///
+    /// The defence is to gate candidates on MA#28 provenance BEFORE they are
+    /// recorded, using the same `classify_ger_note` predicate that governs
+    /// acceptance. `metadata.sender` is stamped by the account that executed the
+    /// minting transaction and cannot be forged, so the impostor is rejected at the
+    /// scan and never reaches the map — the genuine entry survives intact.
+    #[test]
+    fn ger_metadata_clone_cannot_evict_the_genuine_entry() {
+        let manager = id(TEST_SENDER_MANAGER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        let attacker = id(TEST_SENDER_ATTACKER);
+
+        let (genuine_meta, genuine_attachments) = make_metadata(manager, Some(bridge));
+        let (clone_meta, clone_attachments) = make_metadata(attacker, Some(bridge));
+
+        // The gate the scan applies, verbatim.
+        let accepts = |meta: &NoteMetadata, att: &NoteAttachments| {
+            matches!(
+                classify_ger_note(Some(meta), att, manager, bridge),
+                GerNoteVerdict::Accept
+            )
+        };
+
+        assert!(
+            accepts(&genuine_meta, &genuine_attachments),
+            "the real ger_manager's note must be recorded as a candidate"
+        );
+        assert!(
+            !accepts(&clone_meta, &clone_attachments),
+            "a same-details clone from another sender must be REJECTED at scan time — \
+             otherwise it poisons the key and evicts the genuine entry"
+        );
+
+        // End to end over the map: only the accepted candidate is ever recorded, so
+        // the genuine provenance is still served after the clone is observed.
+        let mut map = std::collections::HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        let key = [0x42u8; 32];
+        for (meta, att) in [
+            (genuine_meta, genuine_attachments),
+            (clone_meta, clone_attachments),
+        ] {
+            if accepts(&meta, &att) {
+                record_ger_node_metadata(&mut map, &mut ambiguous, key, meta);
+            }
+        }
+        assert!(
+            !ambiguous.contains(&key),
+            "an impostor must not be able to mark a genuine GER key ambiguous"
+        );
+        assert_eq!(
+            map.get(&key).map(|m| m.sender()),
+            Some(manager),
+            "the genuine ger_manager provenance must survive the clone attempt"
+        );
     }
 
     fn make_metadata(
