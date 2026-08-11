@@ -2798,6 +2798,11 @@ mod tests {
         );
     }
 
+    /// `RECOVERY_MIN_NONCE` / `RECOVERY_MODE_SINCE` are process-wide statics, and the
+    /// window-expiry path CLEARS the min-nonce map. Tests that touch either must not
+    /// run concurrently or one will wipe the other's observations mid-assertion.
+    static NONCE_RECOVERY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// #90 (re-review) — ORDERING: `N+1` may reach the proxy before a still-pending
     /// `N` (HTTP reordering, a retry, concurrent submitters). Seeding from whichever
     /// request arrived FIRST would adopt `N+1` and strand `N` as permanently stale —
@@ -2809,22 +2814,32 @@ mod tests {
     #[tokio::test]
     async fn finding90_seeds_lowest_observed_nonce_not_first_arrival() {
         let addr = "0x00000000000000000000000000000000000000bb";
-        // Observed out of order: the higher nonce arrives first.
-        note_recovery_nonce(addr, 22);
-        note_recovery_nonce(addr, 21);
-        assert_eq!(
-            lowest_recovery_nonce(addr),
-            Some(21),
-            "the baseline must track the LOWEST nonce seen in the window, so an \
-             out-of-order N+1 cannot strand the pending N"
-        );
+        // Scope the guard to the SYNCHRONOUS section touching the shared statics:
+        // holding a std Mutex across an await is a clippy error and a real deadlock
+        // hazard. The window-expiry path clears this map, so the two tests that use
+        // it must not interleave here.
+        let baseline = {
+            let _guard = NONCE_RECOVERY_TEST_GUARD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Observed out of order: the higher nonce arrives first.
+            note_recovery_nonce(addr, 22);
+            note_recovery_nonce(addr, 21);
+            let lowest = lowest_recovery_nonce(addr);
+            assert_eq!(
+                lowest,
+                Some(21),
+                "the baseline must track the LOWEST nonce seen in the window, so an \
+                 out-of-order N+1 cannot strand the pending N"
+            );
+            lowest.expect("min tracked under the guard")
+        };
 
         // And seeding uses that minimum, so the N request matches and proceeds
         // while N+1 simply waits its turn.
         let service = create_test_service();
         let store = service.store.clone();
         store.set_nonce_ledger_rebuilt(true).await.unwrap();
-        let baseline = lowest_recovery_nonce(addr).unwrap();
         assert!(
             store
                 .nonce_bootstrap_if_absent(addr, baseline)
@@ -2850,7 +2865,14 @@ mod tests {
         store.set_nonce_ledger_rebuilt(true).await.unwrap();
 
         // A zero-length window means the very first check retires recovery mode.
-        unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
+        // The guard covers only the shared-static mutation (see the sibling test):
+        // a std Mutex must not be held across an await.
+        {
+            let _guard = NONCE_RECOVERY_TEST_GUARD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
+        }
         let active = recovery_bootstrap_active(&service).await.unwrap();
         unsafe { std::env::remove_var("NONCE_RECOVERY_WINDOW_SECS") };
 
