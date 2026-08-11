@@ -528,6 +528,53 @@ impl SyntheticProjector {
             .await
     }
 
+    /// Drive the note-visibility sweep to COMPLETION (genesis → `tip`). This is
+    /// the recovery one-shot's healing pass.
+    ///
+    /// [`Self::reconcile_notes`] is tick-shaped: it returns when
+    /// `RECONCILE_TICK_BUDGET_MS` is spent so a live tick stays responsive.
+    /// Recovery has no such constraint, and it has a HARD ORDERING DEPENDENCY
+    /// that a partial sweep silently breaks: `restore_gers` replays the
+    /// order-sensitive GER hash chain from the client store's CONSUMED feed —
+    /// exactly what `--reset-miden-store` just emptied. Deferring the heal to the
+    /// serving proxy's first ticks is TOO LATE: restore parks the projector
+    /// cursor at the tip, so notes imported after it are never projected and the
+    /// GER history is lost permanently (observed: UpdateHashChain 40 → 0, and the
+    /// re-injection of already-registered GERs then mints immortal
+    /// ERR_GER_ALREADY_REGISTERED poison notes, #86). So recovery performs the
+    /// sweep itself, to completion, BEFORE the replay that consumes it.
+    ///
+    /// Fails closed: a batch that makes no forward progress aborts rather than
+    /// looping forever or returning a silently incomplete feed.
+    pub(crate) async fn sweep_notes_to_completion(
+        &self,
+        client: &mut MidenClientLib,
+        tip: u64,
+    ) -> anyhow::Result<u64> {
+        loop {
+            let before = self.reconcile_cursor.load(Ordering::Acquire);
+            if before >= tip {
+                return Ok(before);
+            }
+            self.reconcile_notes(client, &self.node_rpc, tip).await?;
+            let after = self.reconcile_cursor.load(Ordering::Acquire);
+            if after <= before {
+                anyhow::bail!(
+                    "recovery note sweep stalled at block {after} (tip {tip}): a window made no \
+                     forward progress, so the consumed-note feed is INCOMPLETE. Refusing to \
+                     continue — replaying the GER hash chain from a partial feed would silently \
+                     drop history."
+                );
+            }
+            tracing::info!(
+                from = before,
+                to = after,
+                tip,
+                "recovery note sweep: window batch complete"
+            );
+        }
+    }
+
     /// Catch-up driver behind [`Self::reconcile_notes`], with the window fetch
     /// abstracted behind [`ReconcileFetcher`] so the ordering/budget contract is
     /// unit-testable. `client` and `rpc` are only touched when a window actually

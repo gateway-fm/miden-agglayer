@@ -347,6 +347,36 @@ pub async fn restore(
     let (miden_tip, let_leaves) = sync_miden_snapshot(miden_client, accounts.bridge.0).await?;
     tracing::info!("Phase 1 complete: miden tip {miden_tip}, LET leaves {let_leaves}");
 
+    // Phase 1.1: HEALING SWEEP — recovery performs the genesis note re-sweep
+    // ITSELF, before any phase that reads the client store's consumed feed.
+    //
+    // The canonical recovery invocation is `--reset-miden-store --restore`, which
+    // empties the miden-client store. Phases 2/2.5/3 replay from that store's
+    // CONSUMED feed. Historically the heal was deferred to the serving proxy's
+    // reconciler ("the genesis sweep IS the healing pass"), but Phase 4 parks the
+    // projector cursor at the tip — so notes the sweep imports AFTERWARDS are
+    // never projected. The GER replay (Phase 3), whose only source is that feed,
+    // therefore rebuilt NOTHING on a full-DB-loss recovery: UpdateHashChain went
+    // 40 -> 0 and is_injected 40 -> 0, permanently, which then lets aggoracle
+    // re-inject already-registered GERs (immortal poison notes, #86).
+    //
+    // Ordering it here makes recovery self-sufficient: the sweep that PRODUCES
+    // the consumed feed runs before every replay that CONSUMES it, and the
+    // post-restore sweep becomes a cheap no-op instead of a load-bearing (but
+    // too-late) dependency — which also removes the duplicated full block walk.
+    let swept_to = sweep_notes_for_recovery(
+        store,
+        miden_client,
+        accounts,
+        local_network_id,
+        block_state,
+        network_rpcs.clone(),
+        node_url,
+        api_key,
+        miden_tip,
+    )
+    .await?;
+
     let mut total_logs = 0usize;
 
     // Recover full public B2AGG bodies and join them directly to the bridge transaction
@@ -532,7 +562,7 @@ pub async fn restore(
 
     // Phase 4: cursor finalization (factored into a helper so the reconcile-
     // cursor reset is unit-testable — see `finalize_restore_cursors`).
-    finalize_restore_cursors(store, miden_tip).await?;
+    finalize_restore_cursors(store, miden_tip, Some(swept_to)).await?;
 
     // Phase 5: Verify
     tracing::info!("Phase 5: verification");
@@ -565,16 +595,109 @@ pub async fn restore(
 pub(crate) async fn finalize_restore_cursors(
     store: &Arc<dyn Store>,
     miden_tip: u64,
+    swept_to: Option<u64>,
 ) -> anyhow::Result<()> {
     store.set_latest_block_number(miden_tip).await?;
     store.set_projector_cursor(miden_tip).await?;
     tracing::info!("Phase 4: synthetic tip + projector cursor set to Miden tip {miden_tip}");
-    store.set_reconcile_cursor(0).await?;
-    tracing::info!(
-        "reconcile cursor reset — full-history re-sweep will run (restore rebuilds the miden \
-         store; the genesis sweep is the healing pass that re-discovers external notes)"
-    );
+    // Recovery now performs the healing sweep ITSELF (Phase 1.1), before the
+    // replay phases that depend on it. When that sweep reached the tip there is
+    // nothing left to re-discover, so leaving the cursor there avoids a second
+    // full-history block walk on the next boot (the old behaviour: restore
+    // walked every block, then the serving proxy walked them all again — and,
+    // because the projector cursor is parked at the tip above, that second walk
+    // could not project anything anyway).
+    //
+    // Fail-safe: if the sweep did NOT reach the tip, fall back to the historical
+    // reset-to-genesis so the serving proxy still attempts the heal.
+    match swept_to {
+        Some(t) if t >= miden_tip => {
+            store.set_reconcile_cursor(t).await?;
+            tracing::info!(
+                swept_to = t,
+                "reconcile cursor left at the swept tip — recovery already ran the healing \
+                 sweep (Phase 1.1); no redundant genesis re-walk on the next boot"
+            );
+        }
+        other => {
+            store.set_reconcile_cursor(0).await?;
+            tracing::warn!(
+                swept_to = ?other,
+                "reconcile cursor reset to genesis — recovery's healing sweep did not reach the \
+                 tip, so the serving proxy must re-sweep"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Phase 1.1 — run the note-visibility sweep from GENESIS to `miden_tip` inside
+/// recovery, so every later replay phase reads a COMPLETE consumed-note feed.
+///
+/// Returns the block the sweep reached (== `miden_tip` on success). Any failure
+/// propagates: a partial feed would make the GER hash-chain replay silently lose
+/// history, which is precisely the failure this exists to prevent.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_notes_for_recovery(
+    store: &Arc<dyn Store>,
+    miden_client: &MidenClient,
+    accounts: &AccountsConfig,
+    local_network_id: u32,
+    block_state: &Arc<BlockState>,
+    network_rpcs: crate::metadata_recovery::NetworkRpcMap,
+    node_url: &str,
+    api_key: Option<&str>,
+    miden_tip: u64,
+) -> anyhow::Result<u64> {
+    // Start at genesis: the client store was just wiped, so a stale persisted
+    // cursor must not skip the heal. Set BEFORE constructing the projector —
+    // `SyntheticProjector::new` loads the cursor once, in `new()`.
+    store.set_reconcile_cursor(0).await?;
+    let projector = Arc::new(
+        crate::synthetic_projector::SyntheticProjector::new(
+            store.clone(),
+            block_state.clone(),
+            accounts,
+            local_network_id,
+            network_rpcs,
+            node_url.to_string(),
+            api_key.map(str::to_string),
+        )
+        .await?,
+    );
+    tracing::info!(
+        miden_tip,
+        "Phase 1.1: recovery healing sweep — importing notes from genesis before any replay..."
+    );
+    let reached = Arc::new(std::sync::Mutex::new(None::<u64>));
+    let reached_inner = reached.clone();
+    let projector_inner = projector.clone();
+    miden_client
+        .with(move |client| {
+            Box::new(async move {
+                let to = projector_inner
+                    .sweep_notes_to_completion(client, miden_tip)
+                    .await?;
+                // The sweep imports notes; a final sync resolves their
+                // consumption (nullifier check) so the consumed feed the replay
+                // phases read is actually populated, not merely "known".
+                client.sync_state().await?;
+                *reached_inner.lock().unwrap() = Some(to);
+                Ok(())
+            })
+        })
+        .await?;
+    let reached = reached
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Phase 1.1: healing sweep produced no result"))?;
+    tracing::info!(
+        swept_to = reached,
+        miden_tip,
+        "Phase 1.1 complete: consumed-note feed healed to the Miden tip"
+    );
+    Ok(reached)
 }
 
 /// Phase 1: sync miden and return the current MIDEN tip (sync height) — the
@@ -2860,12 +2983,14 @@ mod tests {
 
     /// Regression lock for the prod restart-resync incident: a restore run
     /// rebuilds the miden store, so the client has forgotten every imported
-    /// note — the genesis re-sweep IS the healing pass. `restore`'s Phase 4
-    /// (`finalize_restore_cursors`) must therefore reset the persisted
-    /// note-reconciler sweep cursor to 0, even when a previous deployment
-    /// left it deep in history — while the projector cursor jumps to the tip.
+    /// note. Recovery now runs that healing sweep ITSELF (Phase 1.1), before the
+    /// replay phases that read the consumed feed. When the sweep reached the tip
+    /// there is nothing left to re-discover, so Phase 4 leaves the reconcile
+    /// cursor AT the swept tip — the next boot must not re-walk all of history
+    /// (it could not project anything anyway: the projector cursor is parked at
+    /// the tip, which is exactly how the GER history used to be lost).
     #[tokio::test]
-    async fn restore_resets_reconcile_cursor_to_genesis() {
+    async fn restore_leaves_reconcile_cursor_at_swept_tip() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
 
         // Simulate a long-running pre-restore deployment: both cursors deep
@@ -2873,13 +2998,16 @@ mod tests {
         store.set_reconcile_cursor(123_456).await.unwrap();
         store.set_projector_cursor(100_000).await.unwrap();
 
-        // Phase 4 of restore() — the exact code path the real restore runs.
-        finalize_restore_cursors(&store, 130_000).await.unwrap();
+        // Phase 4 of restore() — the exact code path the real restore runs,
+        // with Phase 1.1's healing sweep having reached the tip.
+        finalize_restore_cursors(&store, 130_000, Some(130_000))
+            .await
+            .unwrap();
 
         assert_eq!(
             store.get_reconcile_cursor().await.unwrap(),
-            0,
-            "restore must reset the reconcile cursor to genesis (full-history heal sweep)"
+            130_000,
+            "recovery already swept to the tip — the next boot must not redo the full walk"
         );
         assert_eq!(
             store.get_projector_cursor().await.unwrap(),
@@ -2887,6 +3015,28 @@ mod tests {
             "projector cursor resumes at the Miden tip (restore already replayed history)"
         );
         assert_eq!(store.get_latest_block_number().await.unwrap(), 130_000);
+    }
+
+    /// Fail-safe half of the contract above: if recovery's healing sweep did NOT
+    /// reach the tip (never ran, or stopped short), the reconcile cursor must
+    /// fall back to genesis so the serving proxy still attempts the heal. Parking
+    /// it at a short tip would strand the un-swept range forever.
+    #[tokio::test]
+    async fn restore_resets_reconcile_cursor_when_heal_incomplete() {
+        for swept in [None, Some(129_999u64)] {
+            let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+            store.set_reconcile_cursor(123_456).await.unwrap();
+
+            finalize_restore_cursors(&store, 130_000, swept)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store.get_reconcile_cursor().await.unwrap(),
+                0,
+                "an incomplete heal ({swept:?} vs tip 130000) must fall back to a genesis re-sweep"
+            );
+        }
     }
 
     /// `(faucet_id, bridge_id, sender_id)` — valid protocol-0.15 ids. The faucet
