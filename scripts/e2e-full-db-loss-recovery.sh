@@ -79,9 +79,26 @@ PG_PROJECT_LABEL="$(docker inspect "$PG_CONTAINER"    --format '{{ index .Config
 # Override with ALLOW_UNVERIFIED_PG_TARGET=1 for exotic topologies — explicit, not
 # accidental.
 PROXY_ENV="$(docker inspect "$PROXY_CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"
-STORE_URL="$(printf '%s\n' "$PROXY_ENV" | grep -iE '^[A-Z_]*(DATABASE|STORE|POSTGRES)[A-Z_]*=' | head -1 | cut -d= -f2-)"
-# postgres://user:pass@HOST:port/db  ->  HOST
-STORE_HOST="$(printf '%s' "$STORE_URL" | sed -E 's#^[a-zA-Z+]+://##; s#^[^@]*@##; s#[:/].*$##')"
+# Select the connection string by EXACT variable name. A fuzzy
+# `(DATABASE|STORE|POSTGRES)` pattern matched `AGGLAYER_INSECURE_LOCAL_KEYSTORE`
+# ("KEY-STORE"!) and parsed its value `true` as the store host, so this guard
+# fail-closed on a perfectly healthy stack and aborted the whole recovery gate.
+# A safety check that blocks correct runs gets disabled, which is worse than no
+# check — so match precisely.
+STORE_URL="$(printf '%s\n' "$PROXY_ENV" | sed -n 's/^DATABASE_URL=//p' | head -1)"
+[[ -z "$STORE_URL" ]] && STORE_URL="$(printf '%s\n' "$PROXY_ENV" \
+    | grep -E '^[A-Z_]*(DATABASE|POSTGRES)_URL=' | head -1 | cut -d= -f2-)"
+# Two accepted encodings:
+#   libpq keywords : "host=agglayer-postgres user=… dbname=…"   (what this stack uses)
+#   URL            : "postgres://user:pass@HOST:port/db"
+if [[ "$STORE_URL" == *host=* ]]; then
+    STORE_HOST="$(sed -E 's/.*(^|[[:space:]])host=([^[:space:]]+).*/\2/' <<<"$STORE_URL")"
+else
+    STORE_HOST="$(printf '%s' "$STORE_URL" | sed -E 's#^[a-zA-Z+]+://##; s#^[^@]*@##; s#[:/].*$##')"
+fi
+# The proxy addresses postgres by its compose SERVICE name; accept that as well as
+# the container name (`<project>-<service>-1`).
+PG_SERVICE="${PG_CONTAINER#"$PROJECT-"}"; PG_SERVICE="${PG_SERVICE%-1}"
 if [[ -z "$STORE_HOST" ]]; then
     if [[ "${ALLOW_UNVERIFIED_PG_TARGET:-0}" == "1" ]]; then
         echo "WARN: proxy store URL unparsable; proceeding because ALLOW_UNVERIFIED_PG_TARGET=1"
@@ -91,7 +108,8 @@ if [[ -z "$STORE_HOST" ]]; then
         echo "       chosen by name convention alone. Set ALLOW_UNVERIFIED_PG_TARGET=1 to override."
         exit 1
     fi
-elif [[ "$STORE_HOST" != "$PG_CONTAINER" && "$STORE_HOST" != "agglayer-postgres" \
+elif [[ "$STORE_HOST" != "$PG_CONTAINER" && "$STORE_HOST" != "$PG_SERVICE" \
+        && "$STORE_HOST" != "agglayer-postgres" \
         && "$STORE_HOST" != "localhost" && "$STORE_HOST" != "127.0.0.1" ]]; then
     if [[ "${ALLOW_UNVERIFIED_PG_TARGET:-0}" == "1" ]]; then
         echo "WARN: proxy store host '$STORE_HOST' != '$PG_CONTAINER'; proceeding (ALLOW_UNVERIFIED_PG_TARGET=1)"
