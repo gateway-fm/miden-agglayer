@@ -219,18 +219,36 @@ dump_rows() { # $1 = topic0 prefix, $2 = output file
 
 # ClaimEvent digest — every field EXCEPT transaction_hash.
 #
-# Measured on the 2026-08-12 diagnostic: of 17 restored ClaimEvents, 16 reproduced
-# their transaction hash EXACTLY and one did not, with every other field —
-# log_index (51 == 51), block_number, block_hash, address, topics, data,
-# transaction_index, removed — byte-identical. A user/sponsor-submitted claim's
-# real eth-tx hash lives ONLY in the `transactions` / `tx_note_links` rows this
-# drill destroys; it was never on L1 and the Miden note does not carry it, so
-# restore falls back to a deterministic derived hash. That is the same
-# unrecoverable-identity limitation already documented for UpdateHashChain.
+# A claim's tx_hash has TWO possible values, and a full DB loss forces the second:
 #
-# BridgeEvent deliberately KEEPS transaction_hash: its hash is commitment-derived
-# and byte-identical across first-observation and restore (restore.rs), and it
-# verified identical on the same run — so nothing is loosened where it is provable.
+#   observed_tx_hash (note_handoff)  -> real eth-tx hash   [table DROPPED by this drill]
+#   get_tx_for_note  (tx_note_links) -> real eth-tx hash   [table DROPPED by this drill]
+#   otherwise                        -> derive_manual_claim_tx_hash(note_commitment)
+#
+# Both real-hash sources live ONLY in the proxy's Postgres. A claim that rode a real
+# eth-tx (the `publish_claim` path) therefore CANNOT keep that hash across a full DB
+# loss: it was never on L1 and the Miden note does not carry it. Restore falls back to
+# the derived hash, which is a deterministic keccak over the note commitment.
+#
+# So the rule is: a claim's tx_hash is rewritten real->derived on its FIRST restore and
+# is a bit-exact no-op on EVERY restore thereafter. The number of rows that move equals
+# the number of claims that rode a real eth-tx since the previous restore — which for a
+# first restore of a production store is ALL of them, not an edge case.
+#
+# Verified 2026-08-12 by recomputing keccak(tag||note_commitment) with `cast` for all 17
+# restored claims: every one matched the derived hash, and the 16 that compared equal
+# pre/post were already derived (converged by an earlier restore of this long-lived
+# stack). Only the claim created live since the last restore moved. Every other field —
+# log_index (51 == 51), block_number, block_hash, address, topics, data,
+# transaction_index, removed — was byte-identical.
+#
+# This is not data loss: #136/#67 guarantee the full claimAsset calldata is servable
+# under WHICHEVER hash carries the event, which is why aggkit keeps settling across the
+# rewrite.
+#
+# BridgeEvent deliberately KEEPS transaction_hash: its hash is commitment-derived on BOTH
+# paths (never real-eth-tx-linked), so it is stable by construction and verified identical
+# on the same run — nothing is loosened where identity is actually provable.
 claim_content_digest() {
     pgq "SELECT md5(coalesce(string_agg(
            log_index || ':' || block_number || ':' || encode(block_hash,'hex') || ':' ||
