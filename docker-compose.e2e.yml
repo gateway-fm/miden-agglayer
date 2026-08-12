@@ -243,6 +243,19 @@ services:
       # external prover is actually exercised (assert
       # miden_proof_generations_total{outcome="ok"} > 0, no local fallback).
       MIDEN_PROVER_URL: "${MIDEN_PROVER_URL:-http://tx-prover:50051}"
+      # Finding #85/#99: the default 500/s per-IP limit 429s the stack's OWN
+      # infrastructure under N=30 bursts (measured 879/392/949 rate-limit hits
+      # across three runs). claimtxman pre-assigns nonces to its monitored claim
+      # txs and NEVER re-nonces a dropped one, so a 429-exhausted tx leaves a
+      # permanent gap the R4 ledger then rejects everything behind (108 nonce
+      # mismatches; tx.nonce=86-89 vs expected 11) — wedging L1->Miden autoclaims
+      # (the funding-claim stall AND the clash net-0 flake are this one wedge).
+      # The e2e stack is a closed network of trusted infra, so give it headroom;
+      # the production default stays 500/500 (deployments must size the limit
+      # above their claimtxman burst rate — see runbook). The re-nonce gap is
+      # claimtxman's own bug, tracked upstream.
+      RATE_LIMIT_PER_SECOND: "${RATE_LIMIT_PER_SECOND:-5000}"
+      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-5000}"
       # Key custody is an explicit choice and remote signing is the default
       # (see src/proxy_keystore.rs). The base e2e stack keeps keys on disk, so
       # it says so HERE rather than on the command line: docker compose replaces

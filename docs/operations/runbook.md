@@ -42,6 +42,21 @@ an advisory lock before the pool opens. A previously applied file whose
 checksum differs aborts startup. Do not use a parallel migration init
 container, edit an applied migration, or mark one applied manually.
 
+### Rate-limit sizing vs the claim pipeline
+
+The per-IP rate limit (`RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST`, default
+500/500) MUST be sized above your claimtxman/aggkit burst rate. Measured on the
+N=30 loadtest: the stack's own infrastructure generates 400-1000 rate-limited
+requests per run at the default. The failure mode is not throttling — it is a
+PERMANENT wedge: claimtxman pre-assigns nonces to monitored claim txs and never
+re-nonces one it drops, so a 429-exhausted tx leaves a nonce gap that the R4
+anti-replay ledger then rejects everything behind (observed: `tx.nonce = 86-89,
+expected 11`, L1→L2 autoclaims stalled indefinitely). If autoclaims stall and
+the proxy log shows rate-limit hits alongside `nonce mismatch` errors from the
+claimtxman address, raise the limit for the infra network — the wedged
+claimtxman txs themselves need their sqlite state cleared (recreate the
+container) to re-nonce.
+
 ### Private listener and authentication
 
 The listener defaults to `0.0.0.0:8546`. Bind to an IP address on loopback or a
