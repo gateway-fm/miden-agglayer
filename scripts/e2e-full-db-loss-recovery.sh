@@ -257,6 +257,29 @@ claim_content_digest() {
            '|' ORDER BY block_number, log_index), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'"
 }
+# CONSUMER-LEVEL capture: what an actual client sees via eth_getLogs, not what our
+# own SQL says. The SQL digests above read the table we wrote; this reads the JSON-RPC
+# surface aggkit/bridge-service actually consume, so a serialisation-level regression
+# (field omitted, hex padding, ordering) cannot hide behind a matching row digest.
+#
+# Emits one TSV line per log, ordered by (blockNumber, logIndex) NUMERICALLY — hex
+# strings of differing width do not sort lexically.
+PROXY_RPC="${PROXY_RPC:-http://localhost:8546}"
+getlogs_dump() { # $1 = output file
+    curl -s -m 120 -X POST "$PROXY_RPC" -H 'content-type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x0","toBlock":"latest"}]}' \
+    | jq -r '
+        def h2d: ltrimstr("0x") | explode
+                 | reduce .[] as $c (0; . * 16 + (if $c >= 48 and $c <= 57 then $c - 48
+                                                  elif $c >= 97 then $c - 87 else $c - 55 end));
+        [ .result[] | { b: (.blockNumber|h2d), i: (.logIndex|h2d), r: . } ]
+        | sort_by([.b, .i])[]
+        | [ (.b|tostring), (.i|tostring), .r.address, (.r.topics|join(",")), .r.data,
+            .r.transactionIndex, (.r.removed|tostring), .r.transactionHash ]
+        | @tsv' > "$1" 2>/dev/null
+    [[ -s "$1" ]]
+}
+
 fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
     local uhc inj bridge claim hcv
     uhc=$(uhc_content_digest)
@@ -292,9 +315,41 @@ read -r UHC0 INJ0 BR0 CL0 HCV0 <<<"$(fingerprint)"
 dump_rows '0x50178120' "/tmp/fdl-bridge-before-${RUN_SUFFIX}.txt"
 dump_rows '0x1df3f2a9' "/tmp/fdl-claim-before-${RUN_SUFFIX}.txt"
 dump_rows '0x65d3bf36' "/tmp/fdl-uhc-before-${RUN_SUFFIX}.txt"
+if getlogs_dump "/tmp/fdl-getlogs-before-${RUN_SUFFIX}.tsv"; then
+    say "before: eth_getLogs captured ($(wc -l < "/tmp/fdl-getlogs-before-${RUN_SUFFIX}.tsv") logs) from $PROXY_RPC"
+else
+    fail "eth_getLogs baseline capture FAILED against $PROXY_RPC — refusing to run a drill \
+whose consumer-level comparison cannot be made (set PROXY_RPC)"
+fi
 say "before: counts UHC=$NUHC0 injected=$NINJECTED0 Bridge=$NBR0 Claim=$NCL0  hash_chain=${HCV0:0:16}…"
 say "before: digests uhc=${UHC0:0:12} inj=${INJ0:0:12} bridge=${BR0:0:12} claim=${CL0:0:12}"
 [[ "$NUHC0" -ge 1 && "$NINJECTED0" -ge 1 ]] || fail "fixture too thin (UHC=$NUHC0 inj=$NINJECTED0) — run traffic first"
+
+# BASELINE PROVENANCE — the drill is only meaningful if the "before" state was built
+# LIVE. If this store is itself the output of an earlier restore, every value has
+# already converged to its post-restore form (claim tx_hashes rewritten real->derived,
+# ordering already replay-ordered) and the comparison degenerates into "restore is
+# idempotent" — necessary, but NOT the fidelity claim this drill exists to make.
+# `nonce_ledger_rebuilt` is written ONLY by restore (finalize_restore_cursors), so it is
+# an exact tripwire. Caught live 2026-08-12: a P4 diagnostic had been re-run on an
+# already-restored stack and its green verdict silently meant far less than it read.
+BASELINE_RESTORED=$(pgq "SELECT coalesce(bool_or(nonce_ledger_rebuilt), false) FROM service_state")
+if [[ "$BASELINE_RESTORED" == "t" ]]; then
+    if [[ "${ALLOW_RESTORED_BASELINE:-0}" == "1" ]]; then
+        say "WARNING: baseline store is RESTORE OUTPUT (nonce_ledger_rebuilt=t). This run \
+measures restore-vs-restore IDEMPOTENCE, not live-vs-restore FIDELITY. Proceeding \
+because ALLOW_RESTORED_BASELINE=1."
+        BASELINE_KIND="restored (idempotence only)"
+    else
+        fail "baseline store is RESTORE OUTPUT (service_state.nonce_ledger_rebuilt=t) — this \
+would compare restore-vs-restore, not live-vs-restore, and would report a misleadingly \
+green verdict. Run this drill on a stack whose state was built LIVE (fresh stack + \
+traffic), or set ALLOW_RESTORED_BASELINE=1 to explicitly accept an idempotence-only run."
+    fi
+else
+    BASELINE_KIND="live (true fidelity comparison)"
+fi
+say "baseline provenance: $BASELINE_KIND"
 [[ "$NUHC0" == "$NINJECTED0" ]] || say "note: UHC($NUHC0) != injected($NINJECTED0) pre-drop — carrying the delta forward"
 NTX_MARK=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
 say "ntx kernel-assert (poison) lines so far: $NTX_MARK"
@@ -349,6 +404,44 @@ read -r UHC1 INJ1 BR1 CL1 HCV1 <<<"$(fingerprint)"
 dump_rows '0x50178120' "/tmp/fdl-bridge-after-${RUN_SUFFIX}.txt"
 dump_rows '0x1df3f2a9' "/tmp/fdl-claim-after-${RUN_SUFFIX}.txt"
 dump_rows '0x65d3bf36' "/tmp/fdl-uhc-after-${RUN_SUFFIX}.txt"
+
+# ── Consumer-level verdict: eth_getLogs before vs after ─────────────────────
+# Captured BEFORE the post-restore liveness injection, so both sides cover the same
+# history. Compared twice: whole-record, then with transactionHash blanked. If the
+# whole-record diff is non-empty but the blanked diff is EMPTY, the ONLY thing that
+# moved is transaction_hash — the one field a full DB loss provably cannot preserve
+# (see claim_content_digest above). Anything else differing is a real regression.
+GL_BEFORE="/tmp/fdl-getlogs-before-${RUN_SUFFIX}.tsv"
+GL_AFTER="/tmp/fdl-getlogs-after-${RUN_SUFFIX}.tsv"
+if ! getlogs_dump "$GL_AFTER"; then
+    fail "eth_getLogs post-restore capture FAILED against $PROXY_RPC — cannot render a \
+consumer-level verdict"
+fi
+NGL0=$(wc -l < "$GL_BEFORE"); NGL1=$(wc -l < "$GL_AFTER")
+say "eth_getLogs: before=$NGL0 logs after=$NGL1 logs"
+(( NGL1 >= NGL0 )) || fail "eth_getLogs LOST logs across restore: $NGL0 -> $NGL1 (consumer-visible history shrank)"
+# Blank field 8 (transactionHash) on both sides.
+blank_txh() { awk -F'\t' 'BEGIN{OFS="\t"} {$8="<txh>"; print}' "$1"; }
+blank_txh "$GL_BEFORE" > "${GL_BEFORE}.notxh"; blank_txh "$GL_AFTER" > "${GL_AFTER}.notxh"
+# Compare only the shared prefix of history (after >= before; extra tail is new traffic).
+head -n "$NGL0" "$GL_AFTER" > "${GL_AFTER}.trunc"
+head -n "$NGL0" "${GL_AFTER}.notxh" > "${GL_AFTER}.notxh.trunc"
+GL_FULL_DIFF=$(diff -u "$GL_BEFORE" "${GL_AFTER}.trunc" | grep -c '^[+-][^+-]' || true)
+GL_NOTXH_DIFF=$(diff -u "${GL_BEFORE}.notxh" "${GL_AFTER}.notxh.trunc" | grep -c '^[+-][^+-]' || true)
+if (( GL_NOTXH_DIFF == 0 )); then
+    if (( GL_FULL_DIFF == 0 )); then
+        say "PASS: eth_getLogs BIT-IDENTICAL across restore ($NGL0 logs, transaction_hash included)"
+    else
+        NTXH=$(( GL_FULL_DIFF / 2 ))
+        say "PASS: eth_getLogs identical across restore EXCEPT transaction_hash on ${NTXH} log(s) \
+— every other field (block, log_index, address, topics, data, tx_index, removed) byte-identical"
+    fi
+else
+    say "eth_getLogs DIFFERS in fields other than transaction_hash — first 40 diff lines:"
+    diff -u "${GL_BEFORE}.notxh" "${GL_AFTER}.notxh.trunc" | head -40 || true
+    fail "CONSUMER-LEVEL REGRESSION: eth_getLogs differs beyond transaction_hash \
+($GL_NOTXH_DIFF differing lines) — baseline=$BASELINE_KIND"
+fi
 say "after : counts UHC=$NUHC1 injected=$NINJECTED1 Bridge=$NBR1 Claim=$NCL1  hash_chain=${HCV1:0:16}…"
 # Ordered-content digests (blocker #7): a swapped/reconstructed row changes the
 # digest even when the count is identical.
