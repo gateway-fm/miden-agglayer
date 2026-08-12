@@ -204,6 +204,19 @@ uhc_content_digest() {
            '|' ORDER BY block_number, data), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'"
 }
+
+# Row-level dump for diagnosis. A digest tells you THAT something differs; this
+# tells you WHICH FIELD. Written before the drop and after the restore so a
+# mismatch prints an exact per-field diff instead of two opaque md5s.
+dump_rows() { # $1 = topic0 prefix, $2 = output file
+    pgq "SELECT log_index || ' | blk=' || block_number || ' | txh=' || transaction_hash
+         || ' | txi=' || transaction_index || ' | rm=' || removed
+         || ' | bh=' || encode(block_hash,'hex') || ' | addr=' || address
+         || ' | topics=' || array_to_string(topics, ',') || ' | data=' || data
+         FROM synthetic_logs WHERE topics[1] LIKE '$1%'
+         ORDER BY block_number, log_index" > "$2" 2>/dev/null
+}
+
 fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
     local uhc inj bridge claim hcv
     uhc=$(uhc_content_digest)
@@ -236,6 +249,9 @@ wait_healthy() {
 step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
 read -r NUHC0 NINJECTED0 NBR0 NCL0 <<<"$(counts)"
 read -r UHC0 INJ0 BR0 CL0 HCV0 <<<"$(fingerprint)"
+dump_rows '0x50178120' "/tmp/fdl-bridge-before-${RUN_SUFFIX}.txt"
+dump_rows '0x1df3f2a9' "/tmp/fdl-claim-before-${RUN_SUFFIX}.txt"
+dump_rows '0x65d3bf36' "/tmp/fdl-uhc-before-${RUN_SUFFIX}.txt"
 say "before: counts UHC=$NUHC0 injected=$NINJECTED0 Bridge=$NBR0 Claim=$NCL0  hash_chain=${HCV0:0:16}…"
 say "before: digests uhc=${UHC0:0:12} inj=${INJ0:0:12} bridge=${BR0:0:12} claim=${CL0:0:12}"
 [[ "$NUHC0" -ge 1 && "$NINJECTED0" -ge 1 ]] || fail "fixture too thin (UHC=$NUHC0 inj=$NINJECTED0) — run traffic first"
@@ -279,8 +295,20 @@ wait_healthy 180 || fail "proxy not healthy within 180s after restore"
 pass "proxy healthy"
 sleep 10   # let the reconcile catch-up settle anything the one-shot left
 
+
+# Print the exact differing rows for a kind, then fail with the digest pair.
+fail_with_diff() { # $1=label $2=before-file $3=after-file $4=digest-before $5=digest-after
+    echo "--- $1: per-field diff (before -> after) ---" | tee -a "$EVIDENCE"
+    diff -u "$2" "$3" 2>/dev/null | head -40 | tee -a "$EVIDENCE" || true
+    echo "--- end $1 diff ---" | tee -a "$EVIDENCE"
+    fail "$1 rows differ (digest $4 -> $5)"
+}
+
 read -r NUHC1 NINJECTED1 NBR1 NCL1 <<<"$(counts)"
 read -r UHC1 INJ1 BR1 CL1 HCV1 <<<"$(fingerprint)"
+dump_rows '0x50178120' "/tmp/fdl-bridge-after-${RUN_SUFFIX}.txt"
+dump_rows '0x1df3f2a9' "/tmp/fdl-claim-after-${RUN_SUFFIX}.txt"
+dump_rows '0x65d3bf36' "/tmp/fdl-uhc-after-${RUN_SUFFIX}.txt"
 say "after : counts UHC=$NUHC1 injected=$NINJECTED1 Bridge=$NBR1 Claim=$NCL1  hash_chain=${HCV1:0:16}…"
 # Ordered-content digests (blocker #7): a swapped/reconstructed row changes the
 # digest even when the count is identical.
@@ -291,8 +319,10 @@ pass "UpdateHashChain content identical — same GER values at the same blocks (
 pass "injected-GER set identical (count $NINJECTED1, digest ${INJ1:0:12})"
 [[ "$HCV1" == "$HCV0" ]] || fail "#88: hash_chain_value diverged (order-sensitive replay broke): $HCV0 vs $HCV1"
 pass "hash_chain_value identical (order-faithful replay)"
-[[ "$BR1" == "$BR0" ]] || fail "#69/#136 regression: BridgeEvent rows differ (digest $BR0 -> $BR1)"
-[[ "$CL1" == "$CL0" ]] || fail "#69/#136 regression: ClaimEvent rows differ (digest $CL0 -> $CL1)"
+[[ "$BR1" == "$BR0" ]] || fail_with_diff "#69/#136 BridgeEvent" \
+    "/tmp/fdl-bridge-before-${RUN_SUFFIX}.txt" "/tmp/fdl-bridge-after-${RUN_SUFFIX}.txt" "$BR0" "$BR1"
+[[ "$CL1" == "$CL0" ]] || fail_with_diff "#69/#136 ClaimEvent" \
+    "/tmp/fdl-claim-before-${RUN_SUFFIX}.txt" "/tmp/fdl-claim-after-${RUN_SUFFIX}.txt" "$CL0" "$CL1"
 pass "BridgeEvent (count $NBR1) + ClaimEvent (count $NCL1) rows identical"
 
 # ── Phase 4: no poison minted, pipeline alive ────────────────────────────────
