@@ -244,6 +244,51 @@ complete log fingerprint before starting the normal service. `--restore`
 replays synthetic events during this offline reconstruction; the
 `SyntheticProjector` remains the sole producer in normal live operation.
 
+### What a restore preserves — and the one field it cannot
+
+A restore reconstructs synthetic history from authoritative Miden state. Every
+consumer-visible field of every log is reproduced exactly — `block_number`,
+`log_index`, `block_hash`, `address`, `topics`, `data`, `transaction_index`,
+`removed` — as is `hash_chain_value`. `BridgeEvent.transaction_hash` is likewise
+stable, because it is derived from the note commitment on both the live and the
+restore path.
+
+**`ClaimEvent.transaction_hash` is the exception, and operators must expect it to
+change.** A claim's tx hash has two possible sources:
+
+| source | table | survives full DB loss? |
+| --- | --- | --- |
+| `observed_tx_hash` | `note_handoff` | no — lives only in Postgres |
+| `get_tx_for_note` | `tx_note_links` | no — lives only in Postgres |
+| `derive_manual_claim_tx_hash(note_commitment)` | — (deterministic keccak) | yes |
+
+A claim that rode a real eth-tx (the `publish_claim` path) recorded that hash only
+in Postgres — it was never written to L1 and the Miden note does not carry it. So
+after a full DB loss the restore falls back to the derived hash. The rule:
+
+> A claim's `transaction_hash` is rewritten real → derived on its **first**
+> restore, and is a bit-exact no-op on every restore afterwards.
+
+On a first restore of a production store this affects **every** claim that was
+submitted through `publish_claim`, not a rare edge case.
+
+**This is not data loss.** The log itself is intact and still fetchable by
+`(block, log_index)`, and #136/#67 guarantee the full `claimAsset` calldata stays
+servable under whichever hash carries the event — which is why aggkit continues to
+settle across the rewrite. aggkit resolves through the note, so it is unaffected.
+
+**Operator implication:** an external consumer that cached a claim's
+`transaction_hash` before the restore will not find that hash afterwards. Consumers
+that key on `(block_number, log_index)` or on the claim's global index are
+unaffected. If you run such a consumer, re-index it from the restored logs rather
+than reconciling by tx hash.
+
+`scripts/e2e-full-db-loss-recovery.sh` asserts exactly this boundary: it compares
+`eth_getLogs` before and after at the JSON-RPC level and fails if **anything other
+than** `transaction_hash` differs. It also refuses to run against a store that is
+itself restore output (`service_state.nonce_ledger_rebuilt = true`), because such a
+run would only measure idempotence, not fidelity.
+
 ### Full Miden sqlite reset plus restore
 
 Use only when sqlite divergence cannot be repaired surgically and the managed
