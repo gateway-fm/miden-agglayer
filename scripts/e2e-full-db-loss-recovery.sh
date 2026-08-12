@@ -265,18 +265,33 @@ claim_content_digest() {
 # Emits one TSV line per log, ordered by (blockNumber, logIndex) NUMERICALLY — hex
 # strings of differing width do not sort lexically.
 PROXY_RPC="${PROXY_RPC:-http://localhost:8546}"
+# The proxy enforces a max eth_getLogs range (10000 blocks) as a DoS guard and returns
+# -32602 "block range too large, paginate" beyond it, so the capture PAGINATES — which
+# also exercises that guard on the real serving path. Window kept under the limit.
+GETLOGS_WINDOW="${GETLOGS_WINDOW:-9000}"
+rpc() { curl -s -m 120 -X POST "$PROXY_RPC" -H 'content-type: application/json' -d "$1"; }
 getlogs_dump() { # $1 = output file
-    curl -s -m 120 -X POST "$PROXY_RPC" -H 'content-type: application/json' \
-        -d '{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x0","toBlock":"latest"}]}' \
-    | jq -r '
-        def h2d: ltrimstr("0x") | explode
-                 | reduce .[] as $c (0; . * 16 + (if $c >= 48 and $c <= 57 then $c - 48
-                                                  elif $c >= 97 then $c - 87 else $c - 55 end));
-        [ .result[] | { b: (.blockNumber|h2d), i: (.logIndex|h2d), r: . } ]
-        | sort_by([.b, .i])[]
-        | [ (.b|tostring), (.i|tostring), .r.address, (.r.topics|join(",")), .r.data,
-            .r.transactionIndex, (.r.removed|tostring), .r.transactionHash ]
-        | @tsv' > "$1" 2>/dev/null
+    local tip from to raw chunk err
+    tip=$(rpc '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' | jq -r '.result // empty')
+    [[ -n "$tip" ]] || { say "getlogs: eth_blockNumber returned nothing"; return 1; }
+    tip=$((tip)); raw="${1}.raw"; : > "$raw"
+    for (( from=0; from<=tip; from+=GETLOGS_WINDOW )); do
+        to=$(( from + GETLOGS_WINDOW - 1 )); (( to > tip )) && to=$tip
+        chunk=$(rpc "$(printf '{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x"}]}' "$from" "$to")")
+        err=$(printf '%s' "$chunk" | jq -r '.error.message // empty')
+        [[ -n "$err" ]] && { say "getlogs: window $from-$to failed: $err"; return 1; }
+        printf '%s' "$chunk" | jq -r '
+            def h2d: ltrimstr("0x") | explode
+                     | reduce .[] as $c (0; . * 16 + (if $c >= 48 and $c <= 57 then $c - 48
+                                                      elif $c >= 97 then $c - 87 else $c - 55 end));
+            .result[]
+            | [ (.blockNumber|h2d|tostring), (.logIndex|h2d|tostring), .address,
+                (.topics|join(",")), .data, .transactionIndex, (.removed|tostring),
+                .transactionHash ] | @tsv' >> "$raw" || return 1
+    done
+    # NUMERIC sort by (block, log_index) — hex strings of differing width do not sort
+    # lexically, and window boundaries mean the raw append order is only block-major.
+    sort -t"$(printf '\t')" -k1,1n -k2,2n "$raw" > "$1"
     [[ -s "$1" ]]
 }
 
