@@ -958,11 +958,137 @@ async fn restore_bridge_replay(
         .await
         .map_err(|e| anyhow::anyhow!("restore: sync bridge transactions 0..{to_block}: {e}"))?;
 
-    let claims_by_id = std::mem::take(&mut recovered.claims_by_id);
-    let claim_id_by_nullifier = std::mem::take(&mut recovered.claim_id_by_nullifier);
+    let mut claims_by_id = std::mem::take(&mut recovered.claims_by_id);
+    let mut claim_id_by_nullifier = std::mem::take(&mut recovered.claim_id_by_nullifier);
+    recover_erased_bridge_inputs(
+        rpc,
+        bridge_id,
+        &txs,
+        &mut recovered.by_id,
+        &mut recovered.id_by_nullifier,
+        &mut claims_by_id,
+        &mut claim_id_by_nullifier,
+    )
+    .await?;
     let bridge_replay = build_bridge_replay(&txs, bridge_id, recovered)?;
     let claim_replay = build_claim_replay(&txs, bridge_id, claims_by_id, claim_id_by_nullifier)?;
     Ok((bridge_replay, claim_replay))
+}
+
+/// ERASED-NOTE recovery (loop catch, 2026-08-12 cycle 2): a note CREATED and
+/// CONSUMED within the same block window is ERASED from block output notes, so
+/// the Phase-1.5 block walk never sees its body and — after `--reset-miden-store`
+/// — the client store has no record either. The result was a silent
+/// ClaimEvent loss on restore: 160 -> 159 logs, the missing one a CLAIM consumed
+/// during a quiet post-restore window where the worker's note was ntx-consumed in
+/// the block it was born (under load, creation and consumption straddle blocks,
+/// which is why 56 sibling claims survived and no single-cycle drill ever hit it).
+/// This is the cantina13/#18 erasure gap materializing in restore.
+///
+/// The recovery mirrors the projector's fast-consume fix: the bridge's
+/// `sync_transactions` inputs still carry the NOTE HEADER for unauthenticated
+/// (fast-consumed) inputs, and the node's `get_notes_by_id` DOES serve erased
+/// note bodies. So: collect every input-header NoteId the scan did not resolve,
+/// fetch the bodies, and slot CLAIM/B2AGG shapes into the replay maps — the
+/// existing `(block, tx_order, input pos)` join then places them exactly where
+/// live emitted them. Provenance is intact: these notes were consumed by OUR
+/// bridge (they are its transaction inputs — the MA#3 consumer trust root), and
+/// the per-note gates still run at projection time.
+///
+/// A GER-shaped erased note cannot be routed through this path (the GER replay
+/// consumes client-store records, not scan bodies) — it is counted and WARNED
+/// loudly instead of silently lost; none has been observed yet (73/73 GERs
+/// survived every drill), and the drill's injected-GER set assertion would catch
+/// one. A note the node returns as PRIVATE (no body) is likewise counted+warned:
+/// nothing can rebuild a body that was never public.
+async fn recover_erased_bridge_inputs(
+    rpc: &dyn miden_client::rpc::NodeRpcClient,
+    bridge_id: AccountId,
+    txs: &[miden_client::rpc::domain::transaction::TransactionRecord],
+    by_id: &mut std::collections::HashMap<NoteId, RecoveredBridgeBody>,
+    id_by_nullifier: &mut std::collections::HashMap<Nullifier, NoteId>,
+    claims_by_id: &mut std::collections::HashMap<NoteId, RecoveredClaimBody>,
+    claim_id_by_nullifier: &mut std::collections::HashMap<Nullifier, NoteId>,
+) -> anyhow::Result<()> {
+    use miden_client::rpc::domain::note::FetchedNote;
+
+    let mut missing: Vec<NoteId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, _, tx) in ordered_account_transactions(txs, bridge_id)? {
+        for input in tx.transaction_header.input_notes().iter() {
+            if let Some(header) = input.header() {
+                let id = header.id();
+                if !by_id.contains_key(&id) && !claims_by_id.contains_key(&id) && seen.insert(id) {
+                    missing.push(id);
+                }
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let fetched = rpc
+        .get_notes_by_id(&missing)
+        .await
+        .map_err(|e| anyhow::anyhow!("restore: fetch erased bridge-input notes: {e}"))?;
+    let claim_root = miden_base_agglayer::ClaimNote::script().root();
+    let ger_root = UpdateGerNote::script_root();
+    let (mut claims, mut b2aggs, mut gers, mut opaque) = (0usize, 0usize, 0usize, 0usize);
+    let mut returned = std::collections::HashSet::new();
+    for fetched_note in fetched {
+        returned.insert(fetched_note.id());
+        let FetchedNote::Public(note, _) = fetched_note else {
+            opaque += 1;
+            continue;
+        };
+        let id = note.id();
+        let nullifier = note.nullifier();
+        let attachments = note.attachments().clone();
+        let metadata = *note.metadata();
+        let details: NoteDetails = note.into();
+        if details.script().root() == claim_root {
+            claims_by_id.entry(id).or_insert(RecoveredClaimBody {
+                details,
+                metadata,
+                attachments,
+            });
+            claim_id_by_nullifier.entry(nullifier).or_insert(id);
+            claims += 1;
+        } else if is_b2agg_note(&details) {
+            by_id.entry(id).or_insert(RecoveredBridgeBody {
+                details,
+                attachments,
+            });
+            id_by_nullifier.entry(nullifier).or_insert(id);
+            b2aggs += 1;
+        } else if details.script().root() == ger_root {
+            gers += 1;
+        }
+    }
+    let unreturned = missing.iter().filter(|id| !returned.contains(id)).count();
+    ::metrics::counter!("restore_erased_claims_recovered_total").increment(claims as u64);
+    ::metrics::counter!("restore_erased_b2agg_recovered_total").increment(b2aggs as u64);
+    tracing::info!(
+        candidates = missing.len(),
+        claims,
+        b2aggs,
+        "restore: recovered erased (same-block-consumed) bridge-input note bodies \
+         from input headers"
+    );
+    if gers > 0 || opaque > 0 || unreturned > 0 {
+        ::metrics::counter!("restore_erased_notes_unrecovered_total")
+            .increment((gers + opaque + unreturned) as u64);
+        tracing::warn!(
+            ger_shaped = gers,
+            private_or_bodyless = opaque,
+            unreturned,
+            "restore: erased bridge-input notes that CANNOT be routed through the \
+             claim/B2AGG replay — a GER-shaped one would surface in the drill's \
+             injected-GER assertion; investigate before trusting this restore"
+        );
+    }
+    Ok(())
 }
 
 fn build_bridge_replay(
