@@ -165,13 +165,19 @@ pgq() { docker exec "$PG_CONTAINER" psql -U agglayer -d agglayer_store -tAc "$1"
 # `topics` is a BYTEA[]; array_to_string over its hex encoding gives a stable,
 # order-preserving rendering (topic order is semantic: topic0 is the event
 # signature, topics 1..n the indexed args).
+# The stored `log_index` column is the proxy's INTERNAL emission counter, and within a
+# block the interleave of the GER-writer and projector paths is a wall-clock race — so
+# internal counters can legitimately differ across a faithful restore. The SERVED
+# `logIndex` is now a canonical per-block rank (Ethereum semantics; see
+# `log_synthesis::assign_canonical_block_indices`), asserted by the eth_getLogs
+# comparison below. SQL digests therefore compare CONTENT ONLY, ordered by content.
 log_digest() { # $1 = topic0 hex prefix
     pgq "SELECT md5(coalesce(string_agg(
-           transaction_hash || ':' || log_index || ':' || block_number || ':' ||
+           transaction_hash || ':' || block_number || ':' ||
            encode(block_hash,'hex') || ':' || address || ':' ||
            array_to_string(topics, ',') || ':' ||
            transaction_index::text || ':' || removed::text || ':' || data,
-           '|' ORDER BY transaction_hash, log_index), '')) \
+           '|' ORDER BY block_number, array_to_string(topics, ','), data), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '$1%'"
 }
 # GER / UpdateHashChain content digest — deliberately EXCLUDES transaction_hash
@@ -209,12 +215,15 @@ uhc_content_digest() {
 # tells you WHICH FIELD. Written before the drop and after the restore so a
 # mismatch prints an exact per-field diff instead of two opaque md5s.
 dump_rows() { # $1 = topic0 prefix, $2 = output file
-    pgq "SELECT log_index || ' | blk=' || block_number || ' | txh=' || transaction_hash
+    # No internal log_index: it is not served and can differ across a faithful
+    # restore (see log_digest's comment). Content-ordered so the pre/post diff
+    # aligns row-for-row.
+    pgq "SELECT 'blk=' || block_number || ' | txh=' || transaction_hash
          || ' | txi=' || transaction_index || ' | rm=' || removed
          || ' | bh=' || encode(block_hash,'hex') || ' | addr=' || address
          || ' | topics=' || array_to_string(topics, ',') || ' | data=' || data
          FROM synthetic_logs WHERE topics[1] LIKE '$1%'
-         ORDER BY block_number, log_index" > "$2" 2>/dev/null
+         ORDER BY block_number, array_to_string(topics, ','), data" > "$2" 2>/dev/null
 }
 
 # ClaimEvent digest — every field EXCEPT transaction_hash.
@@ -251,10 +260,10 @@ dump_rows() { # $1 = topic0 prefix, $2 = output file
 # on the same run — nothing is loosened where identity is actually provable.
 claim_content_digest() {
     pgq "SELECT md5(coalesce(string_agg(
-           log_index || ':' || block_number || ':' || encode(block_hash,'hex') || ':' ||
+           block_number || ':' || encode(block_hash,'hex') || ':' ||
            address || ':' || array_to_string(topics, ',') || ':' ||
            transaction_index::text || ':' || removed::text || ':' || data,
-           '|' ORDER BY block_number, log_index), '')) \
+           '|' ORDER BY block_number, data), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'"
 }
 # CONSUMER-LEVEL capture: what an actual client sees via eth_getLogs, not what our

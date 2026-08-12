@@ -20,6 +20,58 @@ pub const UPDATE_HASH_CHAIN_VALUE_TOPIC: &str =
 /// L2 GlobalExitRoot contract address (receives GER updates from aggoracle)
 pub const L2_GLOBAL_EXIT_ROOT_ADDRESS: &str = "0xa40D5f56745a118D0906a34E69aeC8C0Db1cB8fA";
 
+/// Canonical within-block ordering rank for the served (Ethereum-standard)
+/// `logIndex` — see [`assign_canonical_block_indices`].
+///
+/// Semantic order: a GER becomes available (UpdateHashChain), claims that
+/// consume GERs land (ClaimEvent), exits leave (BridgeEvent). Any FIXED rule
+/// would satisfy the identity argument; this one also never orders a claim
+/// before the GER-availability event it depends on within a block.
+pub fn canonical_kind_rank(topic0: Option<&str>) -> u8 {
+    match topic0.map(str::to_lowercase).as_deref() {
+        Some(t) if t == UPDATE_HASH_CHAIN_VALUE_TOPIC => 0,
+        Some(t) if t == CLAIM_EVENT_TOPIC => 1,
+        Some(t) if t == BRIDGE_EVENT_TOPIC => 2,
+        _ => 3,
+    }
+}
+
+/// Assign the SERVED `logIndex` for one block's complete log set: dense from 0,
+/// Ethereum-standard, in canonical order `(kind_rank, internal emission seq)`.
+///
+/// # Why the served index is canonical, not the stored emission sequence
+///
+/// The stored `log_index` column is a GLOBAL emission counter, and within a
+/// block the relative order of an UpdateHashChain (emitted by the GER writer
+/// when the `insert_ger` eth-tx confirms) and a BridgeEvent (emitted by the
+/// projector when it seals the block) is a WALL-CLOCK RACE — not derivable
+/// from any on-chain state, and therefore impossible for `--restore` to
+/// reproduce (measured live-baseline eth_getLogs diffs: 2 swapped pairs / 79
+/// logs; the attempted re-derivation in bbece50 made it worse and was
+/// reverted in feb812f). Serving a canonical per-block order instead makes
+/// restore identity hold BY CONSTRUCTION: if the per-block log CONTENT
+/// matches — which the recovery drill verifies — the served indices match.
+///
+/// Within one kind the emission sequence IS deterministic on both paths (the
+/// projector walks blocks in order; the GER writer is a single sequential
+/// worker; restore replays in the same per-kind order — verified by two
+/// live-baseline runs where all within-kind content compared identical), so
+/// `(kind_rank, internal seq)` is stable across live and restore.
+///
+/// The input MUST be the block's COMPLETE log set: Ethereum's `logIndex` is
+/// the log's absolute position in its block, so a filtered query still
+/// reports the unfiltered position.
+pub fn assign_canonical_block_indices(block_logs: &mut [SyntheticLog]) {
+    block_logs.sort_by(|a, b| {
+        let ka = canonical_kind_rank(a.topics.first().map(String::as_str));
+        let kb = canonical_kind_rank(b.topics.first().map(String::as_str));
+        ka.cmp(&kb).then(a.log_index.cmp(&b.log_index))
+    });
+    for (i, log) in block_logs.iter_mut().enumerate() {
+        log.log_index = i as u64;
+    }
+}
+
 /// Synthetic log entry for eth_getLogs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyntheticLog {

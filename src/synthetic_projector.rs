@@ -2397,8 +2397,14 @@ mod tests {
 
     /// (i) A Miden block with a bridge-consumed B2AGG note + a CLAIM note + a
     /// GER note projects THREE synthetic logs into the SAME synthetic block
-    /// (Miden-1:1: synthetic block N == Miden block N), in the deterministic
-    /// `(consumed_tx_order, note_id)` order, with sequential log indices.
+    /// (Miden-1:1: synthetic block N == Miden block N), SERVED with dense
+    /// per-block `logIndex` in the CANONICAL kind order (UpdateHashChain,
+    /// ClaimEvent, BridgeEvent — `log_synthesis::canonical_kind_rank`),
+    /// regardless of emission/consumption order. Emission order within a block
+    /// is partly a wall-clock race (GER writer vs projector tick), so serving a
+    /// canonical order is what makes `--restore` reproduce identical indices
+    /// by construction — the projection order below (B2AGG, CLAIM, GER by
+    /// tx_order) deliberately DIFFERS from the served order to pin that.
     #[tokio::test]
     async fn projects_three_derivations_into_one_miden_block() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
@@ -2437,23 +2443,81 @@ mod tests {
             vec![0, 1, 2],
         );
 
-        // Deterministic order matches the consumed_tx_order we set: B2AGG(0)@1,
-        // CLAIM(1)@2, GER(2)@3. Identify each by its distinctive tx-hash shape.
+        // SERVED order is canonical kind order — NOT the projection order
+        // (which was B2AGG(0), CLAIM(1), GER(2) by tx_order). Identify each by
+        // its distinctive tx-hash / topic shape.
         let b2agg_id = hex::encode(n_b2agg.details_commitment().as_bytes());
         let claim_id = hex::encode(n_claim.details_commitment().as_bytes());
         assert_eq!(
-            logs[0].transaction_hash,
-            crate::bridge_out::derive_bridge_out_tx_hash(&b2agg_id),
-            "first log must be the B2AGG bridge-out (tx_order 0)"
+            logs[0].topics[0],
+            crate::log_synthesis::UPDATE_HASH_CHAIN_VALUE_TOPIC,
+            "served index 0 must be the UpdateHashChain (canonical rank 0)"
         );
         assert_eq!(
             logs[1].transaction_hash,
             derive_manual_claim_tx_hash(&claim_id),
-            "second log must be the CLAIM (tx_order 1)"
+            "served index 1 must be the CLAIM (canonical rank 1)"
         );
-        assert!(
-            logs[2].transaction_hash.starts_with("0x"),
-            "third log must be the GER (tx_order 2)"
+        assert_eq!(
+            logs[2].transaction_hash,
+            crate::bridge_out::derive_bridge_out_tx_hash(&b2agg_id),
+            "served index 2 must be the B2AGG bridge-out (canonical rank 2)"
+        );
+    }
+
+    /// The two properties that make the served `logIndex` Ethereum-standard:
+    ///
+    /// (a) ABSOLUTE under filters — a topic-filtered `eth_getLogs` still reports
+    ///     each log's position within its block's COMPLETE log set. aggkit stores
+    ///     this as `block_pos` and it flows into agglayer certificates, so a
+    ///     filtered bridgesync query and an unfiltered one must agree.
+    /// (b) Receipt/getLogs agreement — `get_logs_for_tx` (the receipt path)
+    ///     serves the same index as `get_logs` for the same log.
+    #[tokio::test]
+    async fn served_log_index_is_absolute_under_filters_and_in_receipts() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+
+        let n_b2agg = b2agg_note(5, Some(0));
+        let n_claim = claim_note(5, Some(1));
+        let (n_ger, ger_meta) = ger_note(5, Some(2), 0x11);
+        let notes = vec![n_ger.clone(), n_claim.clone(), n_b2agg.clone()];
+        let output_metadata = HashMap::from([ger_meta]);
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        projector
+            .project_notes(&notes, &output_metadata, 5, None, &HashMap::new())
+            .await
+            .unwrap();
+
+        // (a) Filter down to ONLY BridgeEvents: one log back, and its index is
+        // still 2 — its absolute position in the block (after UHC=0, CLAIM=1) —
+        // NOT 0 (its position within the filtered result).
+        let filter = LogFilter {
+            from_block: Some("0x0".into()),
+            to_block: Some("0x5".into()),
+            topics: Some(vec![Some(crate::log_synthesis::TopicFilter::Single(
+                crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_string(),
+            ))]),
+            ..Default::default()
+        };
+        let bridge_only = store.get_logs(&filter, 5).await.unwrap();
+        assert_eq!(bridge_only.len(), 1, "one BridgeEvent in the block");
+        assert_eq!(
+            bridge_only[0].log_index, 2,
+            "filtered query must report the ABSOLUTE per-block index (2), not \
+             the position within the filtered result (0)"
+        );
+
+        // (b) The receipt path serves the identical index for the same log.
+        let receipt_logs = store
+            .get_logs_for_tx(&bridge_only[0].transaction_hash)
+            .await
+            .unwrap();
+        assert_eq!(receipt_logs.len(), 1);
+        assert_eq!(
+            receipt_logs[0].log_index, bridge_only[0].log_index,
+            "receipt logIndex must equal the eth_getLogs logIndex"
         );
     }
 

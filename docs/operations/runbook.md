@@ -253,6 +253,22 @@ consumer-visible field of every log is reproduced exactly — `block_number`,
 stable, because it is derived from the note commitment on both the live and the
 restore path.
 
+**`logIndex` semantics (Ethereum-standard, restore-stable by construction).**
+The served `logIndex` is the log's position within its block, dense from 0 —
+standard Ethereum semantics — assigned in a canonical per-block order
+(`UpdateHashChain`, then `ClaimEvent`, then `BridgeEvent`; within a kind,
+emission order). It is NOT the store's internal emission counter: within a
+block, the interleave of the GER writer and the projector is a wall-clock race
+that no restore can replay (measured: 2 swapped pairs / 79 logs; re-deriving it
+from note-consumption order made things worse and was reverted). Because the
+canonical order is a pure function of each block's log *content*, a faithful
+restore serves bit-identical `logIndex` values without needing to reproduce the
+race. A filtered `eth_getLogs` still reports each log's absolute in-block
+position, and receipts agree with `eth_getLogs`. The internal
+`synthetic_logs.log_index` column keeps the global emission sequence and may
+legitimately differ across a restore — never compare it across stores; compare
+the served view.
+
 **`ClaimEvent.transaction_hash` is the exception, and operators must expect it to
 change.** A claim's tx hash has two possible sources:
 
