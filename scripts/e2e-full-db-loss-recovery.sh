@@ -217,13 +217,35 @@ dump_rows() { # $1 = topic0 prefix, $2 = output file
          ORDER BY block_number, log_index" > "$2" 2>/dev/null
 }
 
+# ClaimEvent digest — every field EXCEPT transaction_hash.
+#
+# Measured on the 2026-08-12 diagnostic: of 17 restored ClaimEvents, 16 reproduced
+# their transaction hash EXACTLY and one did not, with every other field —
+# log_index (51 == 51), block_number, block_hash, address, topics, data,
+# transaction_index, removed — byte-identical. A user/sponsor-submitted claim's
+# real eth-tx hash lives ONLY in the `transactions` / `tx_note_links` rows this
+# drill destroys; it was never on L1 and the Miden note does not carry it, so
+# restore falls back to a deterministic derived hash. That is the same
+# unrecoverable-identity limitation already documented for UpdateHashChain.
+#
+# BridgeEvent deliberately KEEPS transaction_hash: its hash is commitment-derived
+# and byte-identical across first-observation and restore (restore.rs), and it
+# verified identical on the same run — so nothing is loosened where it is provable.
+claim_content_digest() {
+    pgq "SELECT md5(coalesce(string_agg(
+           log_index || ':' || block_number || ':' || encode(block_hash,'hex') || ':' ||
+           address || ':' || array_to_string(topics, ',') || ':' ||
+           transaction_index::text || ':' || removed::text || ':' || data,
+           '|' ORDER BY block_number, log_index), '')) \
+         FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'"
+}
 fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
     local uhc inj bridge claim hcv
     uhc=$(uhc_content_digest)
     inj=$(pgq "SELECT md5(coalesce(string_agg(encode(ger_hash,'hex'), '|' ORDER BY ger_hash), '')) \
                FROM ger_entries WHERE is_injected=true")
     bridge=$(log_digest '0x50178120')
-    claim=$(log_digest '0x1df3f2a9')
+    claim=$(claim_content_digest)
     hcv=$(pgq "SELECT encode(hash_chain_value,'hex') FROM service_state WHERE id=1")
     echo "$uhc $inj $bridge $claim $hcv"
 }
@@ -321,7 +343,7 @@ pass "injected-GER set identical (count $NINJECTED1, digest ${INJ1:0:12})"
 pass "hash_chain_value identical (order-faithful replay)"
 [[ "$BR1" == "$BR0" ]] || fail_with_diff "#69/#136 BridgeEvent" \
     "/tmp/fdl-bridge-before-${RUN_SUFFIX}.txt" "/tmp/fdl-bridge-after-${RUN_SUFFIX}.txt" "$BR0" "$BR1"
-[[ "$CL1" == "$CL0" ]] || fail_with_diff "#69/#136 ClaimEvent" \
+[[ "$CL1" == "$CL0" ]] || fail_with_diff "#69/#136 ClaimEvent (all fields except tx_hash)" \
     "/tmp/fdl-claim-before-${RUN_SUFFIX}.txt" "/tmp/fdl-claim-after-${RUN_SUFFIX}.txt" "$CL0" "$CL1"
 pass "BridgeEvent (count $NBR1) + ClaimEvent (count $NCL1) rows identical"
 
