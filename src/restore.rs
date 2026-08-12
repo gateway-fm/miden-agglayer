@@ -396,7 +396,7 @@ pub async fn restore(
     // `recovered` is consumed by restore_bridge_replay; Phase 4's GER replay
     // needs it when the client store was wiped along with the proxy store.
     let node_note_metadata = std::mem::take(&mut recovered.public_note_metadata);
-    let (bridge_replay, claim_replay) =
+    let (bridge_replay, claim_replay, consumed_order) =
         restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
             .await
             .map_err(|e| anyhow::anyhow!("restore bridge-out ordering scan failed: {e:#}"))?;
@@ -496,6 +496,7 @@ pub async fn restore(
         claim_replay,
         miden_tip,
         node_note_metadata,
+        consumed_order,
     )
     .await?;
     let (bridge_outs, logs) = (replayed.bridge_outs, replayed.bridge_logs);
@@ -915,7 +916,7 @@ async fn restore_bridge_replay(
     bridge_id: AccountId,
     mut recovered: RecoveredBridgeOuts,
     to_block: u32,
-) -> anyhow::Result<(Vec<ReplayBridgeOut>, Vec<ReplayClaim>)> {
+) -> anyhow::Result<(Vec<ReplayBridgeOut>, Vec<ReplayClaim>, ConsumedOrderMap)> {
     use miden_protocol::block::BlockNumber;
 
     let txs = rpc
@@ -929,9 +930,58 @@ async fn restore_bridge_replay(
 
     let claims_by_id = std::mem::take(&mut recovered.claims_by_id);
     let claim_id_by_nullifier = std::mem::take(&mut recovered.claim_id_by_nullifier);
+    let consumed_order = build_consumed_order_map(&txs, bridge_id)?;
     let bridge_replay = build_bridge_replay(&txs, bridge_id, recovered)?;
     let claim_replay = build_claim_replay(&txs, bridge_id, claims_by_id, claim_id_by_nullifier)?;
-    Ok((bridge_replay, claim_replay))
+    Ok((bridge_replay, claim_replay, consumed_order))
+}
+
+/// AUTHORITATIVE consumption order for EVERY note our bridge consumed, keyed by
+/// nullifier — the single ordering source `replay_sort_key` uses for all replay kinds.
+///
+/// Why this exists: the miden-client store records `consumed_tx_order` as NULL for every
+/// consumed note it learns about by nullifier (measured on a live stack: 135 of 135 NULL).
+/// `ReplayItem::Consumed` used to hand that `None` straight to the sort key, and since
+/// `None < Some(_)` in Rust, EVERY GER/claim note sorted ahead of EVERY B2AGG bridge-out
+/// sharing its block — a constant "consumed-first" rule, not a real order. Live never had
+/// that gap: it rebuilds B2AGG at the authoritative `(block, tx_order)` from this same
+/// `sync_transactions` feed, so a block holding both a GER note and a bridge-out came out
+/// in true execution order live and in fixed kind order on restore.
+///
+/// The drill caught it as two swapped `log_index` pairs (blocks 173 + 288) in an
+/// `eth_getLogs` diff against a LIVE baseline. Nothing else could: `hash_chain_value`
+/// depends only on UHC-to-UHC order, which the swap preserves.
+///
+/// GER and CLAIM notes are consumed by the bridge account itself, so they are already
+/// present in this feed — the data was always there, it just was not consulted.
+fn build_consumed_order_map(
+    txs: &[miden_client::rpc::domain::transaction::TransactionRecord],
+    bridge_id: AccountId,
+) -> anyhow::Result<ConsumedOrderMap> {
+    let mut order = ConsumedOrderMap::new();
+    for (block, tx_order, tx) in ordered_account_transactions(txs, bridge_id)? {
+        for input in tx.transaction_header.input_notes().iter() {
+            // First writer wins: a nullifier is consumed exactly once on-chain, so a
+            // duplicate would mean a malformed feed rather than a later truth.
+            order
+                .by_nullifier
+                .entry(input.nullifier())
+                .or_insert((block, tx_order));
+            if let Some(header) = input.header() {
+                order
+                    .by_note_id
+                    .entry(header.id())
+                    .or_insert((block, tx_order));
+            }
+        }
+    }
+    tracing::info!(
+        bridge = %bridge_id,
+        by_nullifier = order.by_nullifier.len(),
+        by_note_id = order.by_note_id.len(),
+        "restore: authoritative consumption order built for ALL bridge-consumed notes"
+    );
+    Ok(order)
 }
 
 fn build_bridge_replay(
@@ -1212,7 +1262,48 @@ enum ReplayItem<'a> {
 ///
 /// `tx_order` is `Option` so a consumed record without one sorts before records
 /// that have one (`None` < `Some`), matching the per-kind sort this replaced.
-fn replay_sort_key(item: &ReplayItem<'_>) -> (u64, Option<u32>, u32, [u8; 32], Option<[u8; 32]>) {
+/// Authoritative `(block, tx_order)` for every note the bridge consumed, built by
+/// [`build_consumed_order_map`] from the node's transaction feed. The ONE ordering
+/// source for every replay kind.
+///
+/// Indexed by BOTH identities a consumed record can carry. The node's transaction inputs
+/// always expose a nullifier and expose a NoteId only when the input header survived
+/// (miden-client 0.15 strips them), while a store-loaded `InputNoteRecord` may present
+/// either. Joining on whichever is available keeps the fix from depending on which of the
+/// two happens to be populated.
+#[derive(Default)]
+struct ConsumedOrderMap {
+    by_nullifier: std::collections::HashMap<Nullifier, (u64, u32)>,
+    by_note_id: std::collections::HashMap<NoteId, (u64, u32)>,
+}
+
+impl ConsumedOrderMap {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_nullifier.is_empty() && self.by_note_id.is_empty()
+    }
+
+    /// Authoritative `(block, tx_order)` for a consumed record, or `None` when it carries
+    /// neither identity or was consumed outside our bridge's transactions.
+    ///
+    /// Takes the two identities rather than the record so the join is unit-testable: a
+    /// synthetically-built `InputNoteRecord` exposes NEITHER identity (verified), so a
+    /// test that passed a record could only ever exercise the miss path.
+    fn lookup(&self, nullifier: Option<Nullifier>, note_id: Option<NoteId>) -> Option<(u64, u32)> {
+        nullifier
+            .and_then(|nullifier| self.by_nullifier.get(&nullifier))
+            .or_else(|| note_id.and_then(|note_id| self.by_note_id.get(&note_id)))
+            .copied()
+    }
+}
+
+fn replay_sort_key(
+    item: &ReplayItem<'_>,
+    consumed_order: &ConsumedOrderMap,
+) -> (u64, Option<u32>, u32, [u8; 32], Option<[u8; 32]>) {
     match item {
         ReplayItem::BridgeOut(r) => (
             r.block,
@@ -1229,16 +1320,35 @@ fn replay_sort_key(item: &ReplayItem<'_>) -> (u64, Option<u32>, u32, [u8; 32], O
             r.body.details.commitment().as_bytes(),
             Some(r.id.as_bytes()),
         ),
-        ReplayItem::Consumed(n) => (
-            n.state()
+        ReplayItem::Consumed(n) => {
+            // AUTHORITATIVE first. The client store leaves `consumed_tx_order` NULL for
+            // notes it learned by nullifier, and `None` sorts before every `Some`, which
+            // silently pinned all consumed notes ahead of same-block bridge-outs. The
+            // node's transaction feed knows the real order for every note our bridge
+            // consumed; fall back to the store only for a note absent from that feed.
+            let store_block = n
+                .state()
                 .consumed_block_height()
                 .map(|h| h.as_u64())
-                .unwrap_or(0),
-            n.state().consumed_tx_order(),
-            0,
-            n.details_commitment().as_bytes(),
-            n.id().map(|i| i.as_bytes()),
-        ),
+                .unwrap_or(0);
+            let (block, tx_order) = match consumed_order.lookup(n.nullifier(), n.id()) {
+                Some((block, tx_order)) => (block, Some(tx_order)),
+                None => (store_block, n.state().consumed_tx_order()),
+            };
+            (
+                block,
+                tx_order,
+                // Deliberately NOT the real input position. Live populates its
+                // `within_tx_pos` map only from `resolve_b2agg_consumptions`, so a
+                // non-B2AGG note carries no position there and falls through its
+                // `unwrap_or(0)`. Mirroring that keeps same-transaction ordering
+                // identical to live; only the (block, tx_order) gap was measured, and
+                // widening the fix past the evidence would be a new divergence.
+                0,
+                n.details_commitment().as_bytes(),
+                n.id().map(|i| i.as_bytes()),
+            )
+        }
     }
 }
 
@@ -1277,6 +1387,7 @@ async fn replay_history_in_order(
     claim_replay: Vec<ReplayClaim>,
     restore_block: u64,
     node_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata>,
+    consumed_order: ConsumedOrderMap,
 ) -> anyhow::Result<ReplayCounts> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -1337,7 +1448,48 @@ async fn replay_history_in_order(
                     }
                     items.push(ReplayItem::Consumed(note));
                 }
-                items.sort_by_key(replay_sort_key);
+                // OBSERVABILITY, not decoration. This join is the whole fix, and a
+                // synthetic record exposes neither identity — so if the real records ever
+                // stop carrying one either, the lookup would miss silently and restore
+                // would quietly go back to emitting consumed notes ahead of same-block
+                // bridge-outs. Count the joins and say so loudly when none land.
+                let consumed_total = items
+                    .iter()
+                    .filter(|item| matches!(item, ReplayItem::Consumed(_)))
+                    .count();
+                let authoritative_hits = items
+                    .iter()
+                    .filter(|item| match item {
+                        ReplayItem::Consumed(n) => {
+                            consumed_order.lookup(n.nullifier(), n.id()).is_some()
+                        }
+                        _ => false,
+                    })
+                    .count();
+                if consumed_total > 0 && authoritative_hits == 0 && !consumed_order.is_empty() {
+                    tracing::error!(
+                        consumed_total,
+                        by_nullifier = consumed_order.by_nullifier.len(),
+                        by_note_id = consumed_order.by_note_id.len(),
+                        "restore: NO consumed note joined the authoritative consumption \
+                         order — replay is falling back to the client store's NULL \
+                         tx_order for every one of them, which orders consumed notes \
+                         ahead of same-block bridge-outs and will diverge from live \
+                         log_index. Treat a restore under this condition as suspect."
+                    );
+                } else {
+                    tracing::info!(
+                        consumed_total,
+                        authoritative_hits,
+                        "restore: consumed notes joined to authoritative consumption order"
+                    );
+                }
+                ::metrics::counter!("restore_consumed_authoritative_order_total")
+                    .increment(authoritative_hits as u64);
+                ::metrics::counter!("restore_consumed_store_order_fallback_total")
+                    .increment((consumed_total - authoritative_hits) as u64);
+
+                items.sort_by_key(|item| replay_sort_key(item, &consumed_order));
 
                 let bridge_address = get_bridge_address();
                 let mut counts = ReplayCounts::default();
@@ -2771,7 +2923,11 @@ mod tests {
             ReplayItem::Consumed(&mid_earlier_tx),
             ReplayItem::Consumed(&mid_a),
         ];
-        let mut keys: Vec<_> = items.iter().map(replay_sort_key).collect();
+        let empty = ConsumedOrderMap::new();
+        let mut keys: Vec<_> = items
+            .iter()
+            .map(|item| replay_sort_key(item, &empty))
+            .collect();
         keys.sort();
 
         assert_eq!(
@@ -2848,17 +3004,83 @@ mod tests {
         );
     }
 
-    /// A consumed record with no `tx_order` sorts before one that has it within the
-    /// same block, preserving the per-kind sort's semantics now that all kinds
-    /// share one comparator.
+    /// FALLBACK ONLY: with no authoritative entry, a consumed record without a
+    /// `tx_order` still sorts before one that has it. This is the degraded path for a
+    /// note absent from the node's transaction feed — NOT the normal one. The previous
+    /// version of this test asserted the same thing as the INTENDED behaviour for all
+    /// consumed notes, which is precisely the bug below: it made a real ordering defect
+    /// look like a satisfied invariant.
     #[test]
-    fn replay_order_places_unordered_consumed_notes_first() {
+    fn replay_order_unordered_consumed_first_only_without_authoritative_order() {
+        let empty = ConsumedOrderMap::new();
         let no_order = ordered_consumed(5, None, 0xF0);
         let with_order = ordered_consumed(5, Some(0), 0x01);
         assert!(
-            replay_sort_key(&ReplayItem::Consumed(&no_order))
-                < replay_sort_key(&ReplayItem::Consumed(&with_order)),
-            "None tx_order must sort before Some(_) in the same block"
+            replay_sort_key(&ReplayItem::Consumed(&no_order), &empty)
+                < replay_sort_key(&ReplayItem::Consumed(&with_order), &empty),
+            "with no authoritative order, None tx_order sorts before Some(_)"
+        );
+    }
+
+    /// THE REGRESSION. The client store records `consumed_tx_order` as NULL for every
+    /// note it learns by nullifier (measured on a live stack: 135/135 NULL, while both
+    /// `note_id` and `nullifier` were populated 135/135). Feeding that `None` to the
+    /// comparator put EVERY consumed note ahead of EVERY same-block bridge-out, because
+    /// `None < Some(_)` — a fixed kind order masquerading as chronology. Live orders by
+    /// the node's authoritative tx order, so a block holding a GER note and a bridge-out
+    /// came out one way live and the other way on restore, swapping their `log_index`.
+    ///
+    /// Caught by an eth_getLogs diff against a LIVE baseline (blocks 173 + 288). It could
+    /// NOT be caught by `hash_chain_value`, which depends only on UHC-to-UHC order and is
+    /// invariant under this swap — which is why every prior assertion passed.
+    #[test]
+    fn authoritative_order_joins_on_either_identity() {
+        let nullifier = Nullifier::from_raw(Word::new([Felt::new(9u64).unwrap(); 4]));
+        let note_id = NoteId::from_raw(Word::new([Felt::new(7u64).unwrap(); 4]));
+        let mut order = ConsumedOrderMap::new();
+        order.by_nullifier.insert(nullifier, (7, 4));
+        order.by_note_id.insert(note_id, (7, 6));
+
+        assert_eq!(
+            order.lookup(Some(nullifier), None),
+            Some((7, 4)),
+            "joins on nullifier"
+        );
+        assert_eq!(
+            order.lookup(None, Some(note_id)),
+            Some((7, 6)),
+            "joins on NoteId when the record carries no nullifier"
+        );
+        assert_eq!(
+            order.lookup(Some(nullifier), Some(note_id)),
+            Some((7, 4)),
+            "nullifier wins when both are present"
+        );
+        assert_eq!(order.lookup(None, None), None, "no identity, no join");
+    }
+
+    /// The ordering consequence: a same-block bridge-out at tx_order 1 must precede a
+    /// consumed note the node places at tx_order 4. Under the old rule the consumed note
+    /// won unconditionally because its store `tx_order` was NULL.
+    #[test]
+    fn authoritative_tx_order_puts_an_earlier_bridge_out_first() {
+        let consumed = ordered_consumed(7, None, 0xAA);
+        let empty = ConsumedOrderMap::new();
+        let bridge_out_at_tx1 = (7u64, Some(1u32), 0u32, [0u8; 32], None);
+
+        // Regression precondition: with no authoritative order the consumed note sorts
+        // FIRST despite the bridge-out executing earlier in the block.
+        assert!(
+            replay_sort_key(&ReplayItem::Consumed(&consumed), &empty) < bridge_out_at_tx1,
+            "without the feed a NULL tx_order sorts ahead of an earlier bridge-out"
+        );
+
+        // With the authoritative order applied, tx_order decides and the bridge-out wins.
+        let with_order: (u64, Option<u32>, u32, [u8; 32], Option<[u8; 32]>) =
+            (7, Some(4), 0, [0u8; 32], None);
+        assert!(
+            with_order > bridge_out_at_tx1,
+            "tx_order 1 precedes tx_order 4 in the same block"
         );
     }
 
