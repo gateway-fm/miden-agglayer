@@ -248,6 +248,16 @@ struct RecoveredBridgeOuts {
     /// GER ledger (UHC logs + is_injected) silently loses history. Fail-closed
     /// holds: only notes the NODE returned as Public contribute.
     public_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata>,
+    /// GER-note CREATION order, keyed by details commitment: the position of each
+    /// MA#28-accepted UpdateGerNote in the chronological block walk (1-based; 0 =
+    /// absent). This is live's hash-chain FOLD order, recoverably: the GER writer
+    /// is a strictly sequential worker (create -> consume -> commit, then the next
+    /// job), so the order notes were CREATED on-chain equals the order their
+    /// UpdateHashChain events folded into `hash_chain_value`. Consumption order is
+    /// NOT that signal — two GERs consumed in one block can consume in either
+    /// order (bbece50 tried consumption tx order and re-chained history; reverted
+    /// in feb812f). Creation order is the one the chain fold actually follows.
+    ger_creation_seq: std::collections::HashMap<[u8; 32], u32>,
 }
 
 struct ReplayBridgeOut {
@@ -396,6 +406,8 @@ pub async fn restore(
     // `recovered` is consumed by restore_bridge_replay; Phase 4's GER replay
     // needs it when the client store was wiped along with the proxy store.
     let node_note_metadata = std::mem::take(&mut recovered.public_note_metadata);
+    // The fold-order signal for Phase 4's GER replay (same take-not-clone reason).
+    let ger_creation_seq = std::mem::take(&mut recovered.ger_creation_seq);
     let (bridge_replay, claim_replay) =
         restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
             .await
@@ -496,6 +508,7 @@ pub async fn restore(
         claim_replay,
         miden_tip,
         node_note_metadata,
+        ger_creation_seq,
     )
     .await?;
     let (bridge_outs, logs) = (replayed.bridge_outs, replayed.bridge_logs);
@@ -770,6 +783,10 @@ async fn scan_bridge_out_bodies(
         std::collections::HashMap::new();
     let mut ambiguous_ger_meta: std::collections::HashSet<[u8; 32]> =
         std::collections::HashSet::new();
+    // 1-based so 0 can mean "absent" in the replay sort tuple.
+    let mut ger_creation_seq: std::collections::HashMap<[u8; 32], u32> =
+        std::collections::HashMap::new();
+    let mut next_ger_creation_seq: u32 = 1;
     let mut scanned = 0usize;
     for b in 0..=to_block {
         let block = rpc
@@ -832,6 +849,19 @@ async fn scan_bridge_out_bodies(
                             details.commitment().as_bytes(),
                             metadata,
                         );
+                        // Same gate, same walk: the block scan visits blocks 0..=tip in
+                        // order and a block's output notes in canonical order, so this
+                        // counter IS the sequential writer's creation order — live's
+                        // hash-chain fold order. First-wins on the (effectively
+                        // unreachable) same-details collision, mirroring the metadata
+                        // map's idempotent branch.
+                        ger_creation_seq
+                            .entry(details.commitment().as_bytes())
+                            .or_insert_with(|| {
+                                let seq = next_ger_creation_seq;
+                                next_ger_creation_seq += 1;
+                                seq
+                            });
                     }
                     if is_b2agg_note(&details) {
                         if by_id
@@ -903,6 +933,7 @@ async fn scan_bridge_out_bodies(
         claim_id_by_nullifier,
         claims_by_id,
         public_note_metadata,
+        ger_creation_seq,
     })
 }
 
@@ -1212,13 +1243,32 @@ enum ReplayItem<'a> {
 ///
 /// `tx_order` is `Option` so a consumed record without one sorts before records
 /// that have one (`None` < `Some`), matching the per-kind sort this replaced.
-fn replay_sort_key(item: &ReplayItem<'_>) -> (u64, Option<u32>, u32, [u8; 32], Option<[u8; 32]>) {
+///
+/// # The GER creation-seq tiebreak (`ger_creation_seq`)
+///
+/// Two GER notes consumed in ONE block must replay in live's hash-chain FOLD
+/// order, or every later UpdateHashChain re-chains (measured: a single flipped
+/// pair cascaded into 28 differing eth_getLogs lines). Fold order is the
+/// sequential GER writer's order, which equals the notes' on-chain CREATION
+/// order — captured by the Phase-1.5 block walk (`RecoveredBridgeOuts::
+/// ger_creation_seq`), NOT their consumption tx order (bbece50's mistake,
+/// reverted in feb812f: consumption order within a block is a race and
+/// re-chained history). The seq is 1-based; 0 = not a gated GER note, which
+/// leaves the pre-existing commitment tiebreak in charge for every other kind.
+/// `(block, tx_order, within_tx_pos, ger_creation_seq, details_commitment, note_id)`.
+type ReplaySortKey = (u64, Option<u32>, u32, u32, [u8; 32], Option<[u8; 32]>);
+
+fn replay_sort_key(
+    item: &ReplayItem<'_>,
+    ger_creation_seq: &std::collections::HashMap<[u8; 32], u32>,
+) -> ReplaySortKey {
     match item {
         ReplayItem::BridgeOut(r) => (
             r.block,
             Some(r.tx_order),
             // The only kind live knows an input position for.
             r.within_tx_pos,
+            0,
             r.body.details.commitment().as_bytes(),
             Some(r.id.as_bytes()),
         ),
@@ -1226,19 +1276,24 @@ fn replay_sort_key(item: &ReplayItem<'_>) -> (u64, Option<u32>, u32, [u8; 32], O
             r.block,
             Some(r.tx_order),
             0,
+            0,
             r.body.details.commitment().as_bytes(),
             Some(r.id.as_bytes()),
         ),
-        ReplayItem::Consumed(n) => (
-            n.state()
-                .consumed_block_height()
-                .map(|h| h.as_u64())
-                .unwrap_or(0),
-            n.state().consumed_tx_order(),
-            0,
-            n.details_commitment().as_bytes(),
-            n.id().map(|i| i.as_bytes()),
-        ),
+        ReplayItem::Consumed(n) => {
+            let commitment = n.details_commitment().as_bytes();
+            (
+                n.state()
+                    .consumed_block_height()
+                    .map(|h| h.as_u64())
+                    .unwrap_or(0),
+                n.state().consumed_tx_order(),
+                0,
+                ger_creation_seq.get(&commitment).copied().unwrap_or(0),
+                commitment,
+                n.id().map(|i| i.as_bytes()),
+            )
+        }
     }
 }
 
@@ -1277,6 +1332,7 @@ async fn replay_history_in_order(
     claim_replay: Vec<ReplayClaim>,
     restore_block: u64,
     node_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata>,
+    ger_creation_seq: std::collections::HashMap<[u8; 32], u32>,
 ) -> anyhow::Result<ReplayCounts> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
@@ -1337,7 +1393,7 @@ async fn replay_history_in_order(
                     }
                     items.push(ReplayItem::Consumed(note));
                 }
-                items.sort_by_key(replay_sort_key);
+                items.sort_by_key(|item| replay_sort_key(item, &ger_creation_seq));
 
                 let bridge_address = get_bridge_address();
                 let mut counts = ReplayCounts::default();
@@ -2771,7 +2827,11 @@ mod tests {
             ReplayItem::Consumed(&mid_earlier_tx),
             ReplayItem::Consumed(&mid_a),
         ];
-        let mut keys: Vec<_> = items.iter().map(replay_sort_key).collect();
+        let no_gers = std::collections::HashMap::new();
+        let mut keys: Vec<_> = items
+            .iter()
+            .map(|item| replay_sort_key(item, &no_gers))
+            .collect();
         keys.sort();
 
         assert_eq!(
@@ -2779,7 +2839,7 @@ mod tests {
             "earliest BLOCK first — block outranks everything"
         );
         assert_eq!(
-            (keys[1].0, keys[1].1, keys[1].3),
+            (keys[1].0, keys[1].1, keys[1].4),
             (97, Some(1), mid_earlier_tx.details_commitment().as_bytes()),
             "within a block, lower tx_order first"
         );
@@ -2790,11 +2850,11 @@ mod tests {
         );
         let (lo, hi) = if c_a < c_b { (c_a, c_b) } else { (c_b, c_a) };
         assert_eq!(
-            (keys[2].0, keys[2].1, keys[2].3),
+            (keys[2].0, keys[2].1, keys[2].4),
             (97, Some(3), lo),
             "same (block, tx_order): commitment breaks the tie"
         );
-        assert_eq!((keys[3].0, keys[3].1, keys[3].3), (97, Some(3), hi));
+        assert_eq!((keys[3].0, keys[3].1, keys[3].4), (97, Some(3), hi));
         assert_eq!(
             keys[4].0, 432,
             "latest block LAST — under the old kind-major replay this B2AGG-shaped \
@@ -2848,6 +2908,46 @@ mod tests {
         );
     }
 
+    /// THE 28-LINE CASCADE (live-baseline drill, 2026-08-12): two GER notes
+    /// consumed in ONE block replayed in commitment order while live folded them
+    /// in the sequential writer's (creation) order — one flipped pair re-chained
+    /// every later UpdateHashChain. The fix: `ger_creation_seq` (captured by the
+    /// Phase-1.5 block walk) outranks the commitment tiebreak, so replay folds in
+    /// creation order. Deliberately NOT consumption tx order — that was bbece50's
+    /// mistake (reverted): consumption order within a block is a race.
+    #[test]
+    fn same_block_gers_replay_in_creation_order_not_commitment_order() {
+        let a = ordered_consumed(50, None, 0x01);
+        let b = ordered_consumed(50, None, 0x02);
+        let (first_by_commitment, second_by_commitment) =
+            if a.details_commitment().as_bytes() < b.details_commitment().as_bytes() {
+                (&a, &b)
+            } else {
+                (&b, &a)
+            };
+
+        // Creation order INVERTS commitment order: the commitment-larger note was
+        // created first.
+        let mut creation = std::collections::HashMap::new();
+        creation.insert(second_by_commitment.details_commitment().as_bytes(), 1u32);
+        creation.insert(first_by_commitment.details_commitment().as_bytes(), 2u32);
+
+        let key_first = replay_sort_key(&ReplayItem::Consumed(second_by_commitment), &creation);
+        let key_second = replay_sort_key(&ReplayItem::Consumed(first_by_commitment), &creation);
+        assert!(
+            key_first < key_second,
+            "creation order must outrank the commitment tiebreak for GER notes"
+        );
+
+        // Without the map (non-GER notes), the commitment tiebreak still decides.
+        let empty = std::collections::HashMap::new();
+        assert!(
+            replay_sort_key(&ReplayItem::Consumed(first_by_commitment), &empty)
+                < replay_sort_key(&ReplayItem::Consumed(second_by_commitment), &empty),
+            "absent from the creation map, commitment order is unchanged"
+        );
+    }
+
     /// A consumed record with no `tx_order` sorts before one that has it within the
     /// same block, preserving the per-kind sort's semantics now that all kinds
     /// share one comparator.
@@ -2856,8 +2956,13 @@ mod tests {
         let no_order = ordered_consumed(5, None, 0xF0);
         let with_order = ordered_consumed(5, Some(0), 0x01);
         assert!(
-            replay_sort_key(&ReplayItem::Consumed(&no_order))
-                < replay_sort_key(&ReplayItem::Consumed(&with_order)),
+            replay_sort_key(
+                &ReplayItem::Consumed(&no_order),
+                &std::collections::HashMap::new()
+            ) < replay_sort_key(
+                &ReplayItem::Consumed(&with_order),
+                &std::collections::HashMap::new()
+            ),
             "None tx_order must sort before Some(_) in the same block"
         );
     }
