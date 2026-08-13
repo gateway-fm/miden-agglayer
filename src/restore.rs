@@ -1437,13 +1437,19 @@ impl BlockProjection<'_> {
 /// Rebuild the client-store record a NODE-RECOVERED bridge-out would have —
 /// the SAME shape the live reconciler writes — so the shared per-block unit
 /// projects it identically to a record that survived in the store.
-fn record_for_bridge_replay(replay: &ReplayBridgeOut) -> InputNoteRecord {
+fn record_for_bridge_replay(replay: &ReplayBridgeOut, bridge_id: AccountId) -> InputNoteRecord {
     use miden_client::store::InputNoteState;
     use miden_client::store::input_note_states::ConsumedExternalNoteState;
     use miden_protocol::block::BlockNumber;
     let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
         nullifier_block_height: BlockNumber::from(replay.block as u32),
-        consumer_account: None,
+        // Finding #56: the consumer IS our bridge — these bodies were joined to
+        // the bridge's own transaction inputs. The live reconciler records
+        // Some(bridge_id) for exactly this reason; a None here makes the MA#3
+        // consumer gate SKIP the note and silently un-emit every replayed
+        // BridgeEvent (regressed once in the tier-2 conversion, caught by
+        // e2e-cantina13-metadata-recovery's recovered-leaf wait within hours).
+        consumer_account: Some(bridge_id),
         // The reconciler durably records the consuming tx order for B2AGG —
         // mirror it, so `projection_order` keys this exactly like live.
         consumed_tx_order: Some(replay.tx_order),
@@ -1575,7 +1581,7 @@ async fn replay_history_in_order(
                     by_block
                         .entry(replay.block)
                         .or_default()
-                        .push((Some(replay.id), record_for_bridge_replay(replay)));
+                        .push((Some(replay.id), record_for_bridge_replay(replay, bridge_id)));
                 }
                 for replay in &claim_replay {
                     by_block
@@ -3075,6 +3081,41 @@ mod tests {
         assert!(
             record.metadata().is_some(),
             "converted claims must retain metadata for the provenance gates"
+        );
+        assert_eq!(
+            record.consumer_account(),
+            Some(id(TEST_TARGET_BRIDGE)),
+            "converted claims must carry the bridge as consumer (MA#3 trust root)"
+        );
+
+        // A converted BRIDGE-OUT record mirrors live B2AGG records: the
+        // reconciler-recorded Some(tx_order) AND Some(bridge) consumer. The
+        // consumer pin is finding #56's regression guard — a None here makes
+        // the MA#3 gate silently un-emit EVERY replayed BridgeEvent (measured
+        // live: e2e-cantina13's recovered leaf never emitted, projector then
+        // frontier-halts on the reserved-unemitted leaf).
+        let bridge_out = ReplayBridgeOut {
+            id: miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                [miden_protocol::Felt::new(0x52u64).unwrap(); 4],
+            )),
+            body: RecoveredBridgeBody {
+                details: ordered_consumed(60, None, 0x03).details().clone(),
+                attachments: NoteAttachments::default(),
+            },
+            block: 60,
+            tx_order: 4,
+            within_tx_pos: 1,
+        };
+        let bridge_record = record_for_bridge_replay(&bridge_out, id(TEST_TARGET_BRIDGE));
+        assert_eq!(
+            bridge_record.consumer_account(),
+            Some(id(TEST_TARGET_BRIDGE)),
+            "finding #56 pin: converted bridge-outs must carry the bridge as consumer"
+        );
+        assert_eq!(
+            bridge_record.state().consumed_tx_order(),
+            Some(4),
+            "converted bridge-outs keep the reconciler-recorded tx order"
         );
 
         // Same-block consumed pair still ties on commitment, matching live.
