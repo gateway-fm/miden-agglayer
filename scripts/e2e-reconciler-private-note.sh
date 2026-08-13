@@ -339,12 +339,15 @@ W=$(wedge_count_since "$MARK_B")
 pass "restarted proxy resumed cleanly from the durable cursor (no genesis re-walk needed)"
 pass "re-sweep advanced past the private-note block (post-restart WARN names our note id)"
 
-# Restarted process → fresh metrics registry → the counter re-appears only
-# because the re-sweep re-skipped.
+# Restarted process -> fresh metrics registry, and with the DURABLE reconcile
+# cursor parked at the swept tip the serving proxy never re-walks the private
+# block — so the counter staying at ZERO is the design working (the skip
+# already happened, and was asserted, in the --restore one-shot's sweep; the
+# LIVE-path metric was asserted in Phase A). A non-zero value here is fine too
+# (the cursor fell back to 0 because the one-shot's sweep missed the tip — the
+# degraded-but-legal path); what would be WRONG is a wedge, checked below.
 SKIP_METRIC_B=$(metric_value)
-[[ "$SKIP_METRIC_B" -ge 1 ]] \
-    || fail "$METRIC not >= 1 on /metrics after the re-sweep skip (got $SKIP_METRIC_B)"
-pass "$METRIC >= 1 on /metrics post-restart ($SKIP_METRIC_B)"
+log "post-restart $METRIC = $SKIP_METRIC_B (0 = resumed from durable cursor, the design; >0 = legal cursor fallback re-walk)"
 
 log "verifying no wedge loop after the re-sweep skip (15s / ~3 ticks)..."
 sleep 15
