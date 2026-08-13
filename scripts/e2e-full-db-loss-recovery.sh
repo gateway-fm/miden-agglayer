@@ -497,8 +497,32 @@ NTX_NOW=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || t
 pass "zero new poison-note kernel asserts ($NTX_NOW)"
 
 CNT=$(cast call "$L1_BRIDGE_ADDRESS" 'depositCount()(uint256)' --rpc-url "$L1_RPC")
-DEST="0x00000000000000000000000000$(printf '%014x' "$RUN_SUFFIX")"
-say "liveness: bridgeAsset cnt=$CNT dest=$DEST"
+# REAL, MAPPABLE destination — finding #103. The old synthetic dest
+# ("0x…<run-suffix>") never embedded a valid Miden account id, so every
+# liveness claim took the RD-860 unresolvable-destination SHORT-CIRCUIT: the
+# proxy accepts the tx and emits a NOTE-LESS ClaimEvent that exists only in
+# Postgres — unrecoverable by any restore (Miden holds no trace of it). That
+# planted one guaranteed-lost event per drill and was the true cause of every
+# "#101" loss (the erased-note theory was wrong). Embed the SERVICE account id
+# (always exists, C5 zero-pad-resolvable on any stack) so the claim MINTS to a
+# real account and its ClaimEvent rides a real consumed note.
+SVC_BECH32=$(docker exec "$PROXY_CONTAINER"     sh -c 'grep "^service" /var/lib/miden-agglayer-service/bridge_accounts.toml'     | grep -o '"[a-z0-9]*"' | tr -d '"')
+SVC_HEX=$(python3 - "$SVC_BECH32" <<'PYEOF'
+import sys
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_, data = sys.argv[1].rsplit("1", 1)
+vals = [CHARSET.index(c) for c in data][:-6]
+acc = bits = 0; out = []
+for v in vals:
+    acc = (acc << 5) | v; bits += 5
+    while bits >= 8:
+        bits -= 8; out.append((acc >> bits) & 0xFF)
+print(bytes(out[1:]).hex())  # drop the 1-byte bech32 payload prefix
+PYEOF
+)
+[[ ${#SVC_HEX} -eq 30 ]] || fail "liveness dest: decoded service id is not 15 bytes ('$SVC_HEX')"
+DEST="0x00000000${SVC_HEX:0:16}${SVC_HEX:16:14}00"
+say "liveness: bridgeAsset cnt=$CNT dest=$DEST (embeds service account $SVC_BECH32)"
 cast send --rpc-url "$L1_RPC" --private-key "$SIGNER_KEY" "$L1_BRIDGE_ADDRESS" \
   'bridgeAsset(uint32,address,uint256,address,bool,bytes)' \
   1 "$DEST" "$DEPOSIT_WEI" 0x0000000000000000000000000000000000000000 true 0x \
