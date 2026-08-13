@@ -1590,6 +1590,20 @@ async fn replay_history_in_order(
                         .push((Some(replay.id), record_for_claim_replay(replay, bridge_id)));
                 }
                 for note in consumed_notes {
+                    // B2AGG notes are covered AUTHORITATIVELY by `bridge_replay`
+                    // (the bridge-tx join, with real tx order + input positions,
+                    // completeness enforced by the LET-cardinality gate). The
+                    // client store's own copy of a consumed B2AGG carries NULL
+                    // tx order, so feeding it here both duplicates the note and
+                    // — with two B2AGGs in one block — trips the shared unit's
+                    // sibling fail-closed gate ("2 B2AGG siblings, transaction
+                    // None"; measured at block 6129). The pre-unification
+                    // dispatch excluded B2AGG shapes from this arm implicitly
+                    // (its claim/GER projections self-filter on script root);
+                    // the unified dispatch requires the exclusion to be explicit.
+                    if is_b2agg_note(note.details()) {
+                        continue;
+                    }
                     let block = note_consumed_block(&note, restore_block);
                     // The background client can sync past the fixed restore
                     // snapshot; leave newer notes to the live projector.
