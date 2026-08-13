@@ -54,10 +54,6 @@ use crate::bridge_out::{
 use crate::miden_client::{
     MidenClientLib, SyncListener, ensure_complete_note_response, ordered_account_transactions,
 };
-use crate::restore::{
-    B2AggRestoreOutcome, ClaimProjectOutcome, GerProjectOutcome, project_b2agg_note,
-    project_claim_note, project_ger_note,
-};
 use crate::store::Store;
 use crate::writer_worker::DecodedWriteCall;
 use alloy::primitives::TxHash;
@@ -1250,139 +1246,43 @@ impl SyntheticProjector {
         block_notes: &[(Option<NoteId>, &InputNoteRecord)],
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
-        mut client: Option<&mut MidenClientLib>,
+        client: Option<&mut MidenClientLib>,
         within_tx_pos: &HashMap<NoteId, u32>,
     ) -> anyhow::Result<usize> {
-        let mut notes: Vec<(Option<NoteId>, &InputNoteRecord)> = block_notes.to_vec();
-
-        // Same-transaction B2AGG siblings must carry the input position from the
-        // authoritative transaction header. Without it their LET order is unknowable.
-        let mut ties: HashMap<Option<u32>, (usize, bool)> = HashMap::new();
-        for (id, note) in &notes {
-            if is_b2agg_note(note.details()) {
-                let entry = ties
-                    .entry(note.state().consumed_tx_order())
-                    .or_insert((0, true));
-                entry.0 += 1;
-                entry.1 &= id.is_some_and(|id| within_tx_pos.contains_key(&id));
-            }
-        }
-        if let Some((order, (siblings, _))) = ties
-            .into_iter()
-            .find(|(_, (siblings, resolved))| *siblings > 1 && !resolved)
-        {
-            ::metrics::counter!("bridge_within_tx_order_unresolved_total").increment(1);
-            anyhow::bail!(
-                "projector: {siblings} B2AGG siblings at block {miden_block}, transaction \
-                 {order:?}, lack authoritative within-tx input order"
-            );
-        }
-
-        // Per-block execution order — THE canonical ORDER-stage comparator
-        // (`projection_order::ProjectionOrder`), shared byte-for-byte with the
-        // restore replay. Do not inline a comparator here; drift between the
-        // live and replay copies re-chained history three times (see the
-        // module docs of `projection_order`).
-        notes.sort_by_key(|(id, note)| {
-            crate::projection_order::ProjectionOrder::for_record(
-                miden_block,
-                *id,
-                note,
-                within_tx_pos,
-            )
-            .key()
-        });
-
-        let bridge_address = get_bridge_address();
-
-        // Miden-1:1 numbering: synthetic block N == Miden block N. Every synthetic
-        // log for this Miden block is written AT block `miden_block`; the tip is
-        // advanced exactly ONCE, after the whole block (below). The projector is
-        // the SOLE advancer of `latest_block_number` — nothing else may touch it.
+        // The order + dispatch live in the SHARED per-block unit
+        // (`restore::BlockProjection`) — the same code `--restore` replays
+        // through, so live emission and restored emission cannot diverge.
+        // This wrapper keeps only the live-tick concerns: block metadata
+        // lookup, the emitted-frontier gate, and the seal.
         let block_hash = self.block_state.get_block_hash(miden_block);
         let timestamp = self.block_state.get_block_timestamp(miden_block);
-
-        let mut logs = 0usize;
-        for (note_id, note) in notes {
-            if is_b2agg_note(note.details()) {
-                let note_id = note_id.ok_or_else(|| {
-                    anyhow::anyhow!("B2AGG projection requires an authoritative NoteId")
-                })?;
-                if project_b2agg_note(
-                    &self.store,
-                    note,
-                    note_id,
-                    self.bridge_id,
-                    self.local_network_id,
-                    miden_block,
-                    block_hash,
-                    bridge_address,
-                    // Cantina #13 recovery context: the live client + the projector's
-                    // per-network RPC map, so legacy/empty-metadata ERC-20 bridge-outs
-                    // recover against their actual origin chain (finding #62).
-                    client.as_deref_mut(),
-                    &self.network_rpcs,
-                )
-                .await?
-                    == B2AggRestoreOutcome::Emitted
-                {
-                    logs += 1;
-                }
-                continue;
-            }
-
-            if project_claim_note(
-                &self.store,
-                note,
-                output_metadata,
-                self.expected_claim_sender,
-                self.bridge_id,
-                miden_block,
-                block_hash,
-                bridge_address,
-            )
-            .await?
-                == ClaimProjectOutcome::Emitted
-            {
-                logs += 1;
-                continue;
-            }
-
-            if project_ger_note(
-                &self.store,
-                note,
-                output_metadata,
-                self.expected_ger_sender,
-                self.bridge_id,
-                miden_block,
-                block_hash,
-                timestamp,
-            )
-            .await?
-                == GerProjectOutcome::Emitted
-            {
-                logs += 1;
-                continue;
-            }
+        let counts = crate::restore::BlockProjection {
+            store: &self.store,
+            bridge_id: self.bridge_id,
+            local_network_id: self.local_network_id,
+            expected_claim_sender: self.expected_claim_sender,
+            expected_ger_sender: self.expected_ger_sender,
+            bridge_address: get_bridge_address(),
+            network_rpcs: &self.network_rpcs,
         }
+        .project_block(
+            miden_block,
+            block_hash,
+            timestamp,
+            block_notes,
+            output_metadata,
+            client,
+            within_tx_pos,
+        )
+        .await?;
+        let logs = counts.bridge_outs + counts.claims + counts.gers;
 
         // #66 — emitted-frontier gate, enforced AT EMIT TIME (after this block's notes are
         // projected, BEFORE the block seals) rather than only at tick-start. A reserved-but-
         // unemitted LET leaf here is a getLogs `depositCount` gap; aggkit's L2 bridgesync
         // requires contiguous deposit indices and HALTS ("state is inconsistent") on a gap,
         // wedging every later Miden certificate. Fail-closed: refuse to seal past it so aggkit
-        // sees a contiguous prefix and WAITS. This placement fixes two modes of the old
-        // tick-start-only gate:
-        //   * WITHIN-TICK gap (part 2): the block used to seal WITH the gap exposed, and only
-        //     the NEXT tick's gate caught it — a window where aggkit could scan the gap. The
-        //     check now runs before THIS seal, so a poison leaf never seals.
-        //   * CRASH-after-reserve (part 1): a leaf reserved-but-unemitted by a crash between
-        //     reserve and emit was re-projected by the note loop ABOVE (reserve is idempotent;
-        //     the emit now completes), so it is already emitted here and the gate passes — an
-        //     automatic self-heal instead of the old permanent halt (which fired at tick-start
-        //     BEFORE the re-projection that would have healed it).
-        // A genuinely unrecoverable leaf (unrecoverable metadata / quarantined / self-target)
-        // is still unemitted here and HALTS fail-closed.
+        // sees a contiguous prefix and WAITS. See the shared unit's docs for what moved where.
         if let Some((idx, note)) = self.store.first_unemitted_reservation().await? {
             ::metrics::counter!("bridge_unemitted_reservation_halt_total").increment(1);
             anyhow::bail!(

@@ -497,17 +497,12 @@ pub async fn restore(
         node_note_metadata,
     )
     .await?;
-    let (bridge_outs, logs) = (replayed.bridge_outs, replayed.bridge_logs);
-    let (claims, claim_logs) = (replayed.claims, replayed.claim_logs);
-    let node_claims = replayed.node_claims;
-    let (gers, ger_logs) = (replayed.gers, replayed.ger_logs);
-    total_logs += logs + claim_logs + node_claims + ger_logs;
+    let (bridge_outs, claims, gers) = (replayed.bridge_outs, replayed.claims, replayed.gers);
+    total_logs += bridge_outs + claims + gers;
     tracing::info!(
-        "Phase 2 complete: {bridge_outs} bridge-outs ({logs} logs), {claims} store claims \
-         ({claim_logs} logs), {node_claims} node-scanned claims, {gers} GERs ({ger_logs} logs) \
-         — emitted in one chronological order"
+        "Phase 2 complete: {bridge_outs} bridge-outs, {claims} claims, {gers} GERs — \
+         emitted through the SHARED per-block projection unit in canonical order"
     );
-    let claims = claims + node_claims;
 
     let accounted = store.get_accounted_deposit_count().await?;
     if accounted != let_leaves {
@@ -1289,69 +1284,198 @@ async fn restore_faucet_identities(
 #[derive(Debug, Default)]
 pub(crate) struct ReplayCounts {
     pub bridge_outs: usize,
-    pub bridge_logs: usize,
     pub claims: usize,
-    pub claim_logs: usize,
-    pub node_claims: usize,
     pub gers: usize,
-    pub ger_logs: usize,
 }
 
-/// One unit of restored history, tagged by where it came from. All three
-/// sources carry the same canonical ordering coordinates, which is what makes a
-/// single merged sort possible.
-enum ReplayItem<'a> {
-    /// B2AGG bridge-out: node-scanned body joined to the bridge transaction feed.
-    BridgeOut(ReplayBridgeOut),
-    /// CLAIM recovered by the node scan (finding #69) — survives a wiped client store.
-    NodeClaim(ReplayClaim),
-    /// A consumed note from the client store. CLAIM- and GER-shaped notes both
-    /// arrive here; each projection self-filters on script root, so at most one
-    /// of them emits for a given note.
-    Consumed(&'a InputNoteRecord),
+/// The shared per-block EMIT stage — the one dispatch loop for synthetic-event
+/// projection, used verbatim by the LIVE projector tick
+/// (`SyntheticProjector::project_block_notes`) and the `--restore` replay.
+/// Ordering inside is the shared `projection_order` comparator; there is no
+/// second copy of either the sort or the dispatch anywhere.
+///
+/// Sealing (tip advance) and the emitted-frontier gate stay OUTSIDE this unit:
+/// they are live-tick concerns (the projector seals block-by-block; restore
+/// finalizes cursors once at the end).
+pub(crate) struct BlockProjection<'a> {
+    pub store: &'a Arc<dyn Store>,
+    pub bridge_id: AccountId,
+    pub local_network_id: u32,
+    pub expected_claim_sender: AccountId,
+    pub expected_ger_sender: AccountId,
+    pub bridge_address: &'a str,
+    pub network_rpcs: &'a crate::metadata_recovery::NetworkRpcMap,
 }
 
-impl ReplayItem<'_> {
-    /// This item's position in the canonical emission order — THE shared
-    /// `projection_order::ProjectionOrder`, the same comparator the live
-    /// projector sorts by. Each arm supplies exactly what the live client
-    /// store records for that note kind (see the `consumed_tx_order` docs in
-    /// `projection_order`): B2AGG carries its reconciler-recorded transaction
-    /// order and input position; claims and every other consumed note carry
-    /// `None`/`0`, because that is what live records and therefore how live
-    /// ordered them. "Improving" an arm past its live record is precisely the
-    /// drift this shared type exists to forbid.
-    fn order(&self) -> crate::projection_order::ProjectionOrder {
-        use crate::projection_order::ProjectionOrder;
-        match self {
-            ReplayItem::BridgeOut(r) => ProjectionOrder {
-                block: r.block,
-                consumed_tx_order: Some(r.tx_order),
-                within_tx_pos: r.within_tx_pos,
-                details_commitment: r.body.details.commitment().as_bytes(),
-                note_id: Some(r.id.as_bytes()),
-            },
-            ReplayItem::NodeClaim(r) => ProjectionOrder {
-                block: r.block,
-                // Live claim records carry NO tx order (store NULL) — mirror it.
-                consumed_tx_order: None,
-                within_tx_pos: 0,
-                details_commitment: r.body.details.commitment().as_bytes(),
-                note_id: Some(r.id.as_bytes()),
-            },
-            ReplayItem::Consumed(n) => ProjectionOrder {
-                block: n
-                    .state()
-                    .consumed_block_height()
-                    .map(|h| h.as_u64())
-                    .unwrap_or(0),
-                consumed_tx_order: n.state().consumed_tx_order(),
-                within_tx_pos: 0,
-                details_commitment: n.details_commitment().as_bytes(),
-                note_id: n.id().map(|i| i.as_bytes()),
-            },
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct BlockProjectionCounts {
+    pub bridge_outs: usize,
+    pub claims: usize,
+    pub gers: usize,
+}
+
+impl BlockProjection<'_> {
+    /// Project every note of ONE Miden block, in canonical order.
+    ///
+    /// `block_notes` need not be pre-sorted: the ordering happens HERE, through
+    /// `projection_order::ProjectionOrder` — putting the sort inside the unit is
+    /// what makes it impossible for a caller to emit in a divergent order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn project_block(
+        &self,
+        miden_block: u64,
+        block_hash: [u8; 32],
+        timestamp: u64,
+        block_notes: &[(Option<NoteId>, &InputNoteRecord)],
+        output_metadata: &std::collections::HashMap<[u8; 32], NoteMetadata>,
+        mut client: Option<&mut MidenClientLib>,
+        within_tx_pos: &std::collections::HashMap<NoteId, u32>,
+    ) -> anyhow::Result<BlockProjectionCounts> {
+        let mut notes: Vec<(Option<NoteId>, &InputNoteRecord)> = block_notes.to_vec();
+
+        // Same-transaction B2AGG siblings must carry the input position from the
+        // authoritative transaction header. Without it their LET order is
+        // unknowable — fail closed rather than guess.
+        let mut ties: std::collections::HashMap<Option<u32>, (usize, bool)> =
+            std::collections::HashMap::new();
+        for (id, note) in &notes {
+            if is_b2agg_note(note.details()) {
+                let entry = ties
+                    .entry(note.state().consumed_tx_order())
+                    .or_insert((0, true));
+                entry.0 += 1;
+                entry.1 &= id.is_some_and(|id| within_tx_pos.contains_key(&id));
+            }
         }
+        if let Some((order, (siblings, _))) = ties
+            .into_iter()
+            .find(|(_, (siblings, resolved))| *siblings > 1 && !resolved)
+        {
+            ::metrics::counter!("bridge_within_tx_order_unresolved_total").increment(1);
+            anyhow::bail!(
+                "projector: {siblings} B2AGG siblings at block {miden_block}, transaction \
+                 {order:?}, lack authoritative within-tx input order"
+            );
+        }
+
+        // THE canonical ORDER stage (see `projection_order` for the drift
+        // history this shared sort ended).
+        notes.sort_by_key(|(id, note)| {
+            crate::projection_order::ProjectionOrder::for_record(
+                miden_block,
+                *id,
+                note,
+                within_tx_pos,
+            )
+            .key()
+        });
+
+        let mut counts = BlockProjectionCounts::default();
+        for (note_id, note) in notes {
+            if is_b2agg_note(note.details()) {
+                let note_id = note_id.ok_or_else(|| {
+                    anyhow::anyhow!("B2AGG projection requires an authoritative NoteId")
+                })?;
+                if project_b2agg_note(
+                    self.store,
+                    note,
+                    note_id,
+                    self.bridge_id,
+                    self.local_network_id,
+                    miden_block,
+                    block_hash,
+                    self.bridge_address,
+                    client.as_deref_mut(),
+                    self.network_rpcs,
+                )
+                .await?
+                    == B2AggRestoreOutcome::Emitted
+                {
+                    counts.bridge_outs += 1;
+                }
+                continue;
+            }
+
+            if project_claim_note(
+                self.store,
+                note,
+                output_metadata,
+                self.expected_claim_sender,
+                self.bridge_id,
+                miden_block,
+                block_hash,
+                self.bridge_address,
+            )
+            .await?
+                == ClaimProjectOutcome::Emitted
+            {
+                counts.claims += 1;
+                continue;
+            }
+
+            if project_ger_note(
+                self.store,
+                note,
+                output_metadata,
+                self.expected_ger_sender,
+                self.bridge_id,
+                miden_block,
+                block_hash,
+                timestamp,
+            )
+            .await?
+                == GerProjectOutcome::Emitted
+            {
+                counts.gers += 1;
+                continue;
+            }
+        }
+        Ok(counts)
     }
+}
+
+/// Rebuild the client-store record a NODE-RECOVERED bridge-out would have —
+/// the SAME shape the live reconciler writes — so the shared per-block unit
+/// projects it identically to a record that survived in the store.
+fn record_for_bridge_replay(replay: &ReplayBridgeOut) -> InputNoteRecord {
+    use miden_client::store::InputNoteState;
+    use miden_client::store::input_note_states::ConsumedExternalNoteState;
+    use miden_protocol::block::BlockNumber;
+    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+        nullifier_block_height: BlockNumber::from(replay.block as u32),
+        consumer_account: None,
+        // The reconciler durably records the consuming tx order for B2AGG —
+        // mirror it, so `projection_order` keys this exactly like live.
+        consumed_tx_order: Some(replay.tx_order),
+        metadata: None,
+    });
+    InputNoteRecord::new(
+        replay.body.details.clone(),
+        replay.body.attachments.clone(),
+        None,
+        state,
+    )
+}
+
+/// Rebuild the record a NODE-RECOVERED claim would have. Live claim records
+/// carry NO tx order (store NULL) and DO carry their metadata + consumer — the
+/// exact inputs `project_claim_note` reads.
+fn record_for_claim_replay(replay: &ReplayClaim, bridge_id: AccountId) -> InputNoteRecord {
+    use miden_client::store::InputNoteState;
+    use miden_client::store::input_note_states::ConsumedExternalNoteState;
+    use miden_protocol::block::BlockNumber;
+    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+        nullifier_block_height: BlockNumber::from(replay.block as u32),
+        consumer_account: Some(bridge_id),
+        consumed_tx_order: None,
+        metadata: Some(replay.body.metadata),
+    });
+    InputNoteRecord::new(
+        replay.body.details.clone(),
+        replay.body.attachments.clone(),
+        None,
+        state,
+    )
 }
 
 /// Replay ALL restored history in ONE chronologically-ordered pass.
@@ -1408,10 +1532,6 @@ async fn replay_history_in_order(
     miden_client
         .with(move |client| {
             Box::new(async move {
-                use miden_client::store::InputNoteState;
-                use miden_client::store::input_note_states::ConsumedExternalNoteState;
-                use miden_protocol::block::BlockNumber;
-
                 // ── ONE fetch of the consumed feed, shared by CLAIM + GER ──────
                 let consumed_notes = client
                     .get_input_notes(NoteFilter::Consumed)
@@ -1435,131 +1555,73 @@ async fn replay_history_in_order(
                     own_output_metadata.entry(*k).or_insert(*v);
                 }
 
-                // ── ONE merged, chronologically ordered work list ───────────────
-                let mut items: Vec<ReplayItem<'_>> = Vec::with_capacity(
-                    bridge_replay.len() + claim_replay.len() + consumed_notes.len(),
-                );
-                items.extend(bridge_replay.into_iter().map(ReplayItem::BridgeOut));
-                items.extend(claim_replay.into_iter().map(ReplayItem::NodeClaim));
-                for note in &consumed_notes {
+                // ── ONE work list, projected through the SHARED per-block unit ──
+                //
+                // Node-recovered bridge-outs and claims are first converted into
+                // the exact client-store record shape the live reconciler would
+                // have written (`record_for_*_replay`), so from here on there is
+                // ONE input shape, ONE ordering comparator and ONE dispatch —
+                // the same `BlockProjection` the live tick runs. Restored
+                // emission cannot diverge from live emission because it IS the
+                // live emission code.
+                let mut within_tx_pos: std::collections::HashMap<NoteId, u32> =
+                    std::collections::HashMap::new();
+                let mut by_block: std::collections::BTreeMap<
+                    u64,
+                    Vec<(Option<NoteId>, InputNoteRecord)>,
+                > = std::collections::BTreeMap::new();
+                for replay in &bridge_replay {
+                    within_tx_pos.insert(replay.id, replay.within_tx_pos);
+                    by_block
+                        .entry(replay.block)
+                        .or_default()
+                        .push((Some(replay.id), record_for_bridge_replay(replay)));
+                }
+                for replay in &claim_replay {
+                    by_block
+                        .entry(replay.block)
+                        .or_default()
+                        .push((Some(replay.id), record_for_claim_replay(replay, bridge_id)));
+                }
+                for note in consumed_notes {
+                    let block = note_consumed_block(&note, restore_block);
                     // The background client can sync past the fixed restore
                     // snapshot; leave newer notes to the live projector.
-                    if note_consumed_block(note, restore_block) > restore_block {
+                    if block > restore_block {
                         continue;
                     }
-                    items.push(ReplayItem::Consumed(note));
+                    let id = note.id();
+                    by_block.entry(block).or_default().push((id, note));
                 }
-                items.sort_by_key(|item| item.order().key());
 
                 let bridge_address = get_bridge_address();
+                let projection = BlockProjection {
+                    store: &store_clone,
+                    bridge_id,
+                    local_network_id,
+                    expected_claim_sender,
+                    expected_ger_sender,
+                    bridge_address,
+                    network_rpcs: &network_rpcs,
+                };
                 let mut counts = ReplayCounts::default();
-
-                for item in items {
-                    match item {
-                        ReplayItem::BridgeOut(replay) => {
-                            let state =
-                                InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
-                                    nullifier_block_height: BlockNumber::from(replay.block as u32),
-                                    consumer_account: Some(bridge_id),
-                                    consumed_tx_order: Some(replay.tx_order),
-                                    metadata: None,
-                                });
-                            let note = InputNoteRecord::new(
-                                replay.body.details,
-                                replay.body.attachments,
-                                None,
-                                state,
-                            );
-                            let block_hash = block_state_clone.get_block_hash(replay.block);
-                            if project_b2agg_note(
-                                &store_clone,
-                                &note,
-                                replay.id,
-                                bridge_id,
-                                local_network_id,
-                                replay.block,
-                                block_hash,
-                                bridge_address,
-                                Some(&mut *client),
-                                &network_rpcs,
-                            )
-                            .await?
-                                == B2AggRestoreOutcome::Emitted
-                            {
-                                counts.bridge_outs += 1;
-                                counts.bridge_logs += 1;
-                            }
-                        }
-                        ReplayItem::NodeClaim(replay) => {
-                            let note_id_str =
-                                hex::encode(replay.body.details.commitment().as_bytes());
-                            let block_hash = block_state_clone.get_block_hash(replay.block);
-                            tracing::debug!(
-                                target: "restore::claims",
-                                note = %replay.id,
-                                block = replay.block,
-                                "restore: replaying node-scanned CLAIM (finding #69)"
-                            );
-                            if project_claim_parts(
-                                &store_clone,
-                                note_id_str,
-                                &replay.body.details,
-                                Some(&replay.body.metadata),
-                                Some(bridge_id),
-                                &replay.body.attachments,
-                                expected_claim_sender,
-                                bridge_id,
-                                replay.block,
-                                block_hash,
-                                bridge_address,
-                            )
-                            .await?
-                                == ClaimProjectOutcome::Emitted
-                            {
-                                counts.node_claims += 1;
-                            }
-                        }
-                        ReplayItem::Consumed(note) => {
-                            let blk = note_consumed_block(note, restore_block);
-                            let block_hash = block_state_clone.get_block_hash(blk);
-                            let timestamp = block_state_clone.get_block_timestamp(blk);
-                            // Both derivations self-filter on script root, so at
-                            // most one of them emits — and running them adjacently
-                            // keeps this note's position in the global order exact.
-                            if project_claim_note(
-                                &store_clone,
-                                note,
-                                &own_output_metadata,
-                                expected_claim_sender,
-                                bridge_id,
-                                blk,
-                                block_hash,
-                                bridge_address,
-                            )
-                            .await?
-                                == ClaimProjectOutcome::Emitted
-                            {
-                                counts.claims += 1;
-                                counts.claim_logs += 1;
-                            }
-                            if project_ger_note(
-                                &store_clone,
-                                note,
-                                &own_output_metadata,
-                                expected_ger_sender,
-                                bridge_id,
-                                blk,
-                                block_hash,
-                                timestamp,
-                            )
-                            .await?
-                                == GerProjectOutcome::Emitted
-                            {
-                                counts.gers += 1;
-                                counts.ger_logs += 1;
-                            }
-                        }
-                    }
+                for (block, group) in &by_block {
+                    let refs: Vec<(Option<NoteId>, &InputNoteRecord)> =
+                        group.iter().map(|(id, note)| (*id, note)).collect();
+                    let block_counts = projection
+                        .project_block(
+                            *block,
+                            block_state_clone.get_block_hash(*block),
+                            block_state_clone.get_block_timestamp(*block),
+                            &refs,
+                            &own_output_metadata,
+                            Some(&mut *client),
+                            &within_tx_pos,
+                        )
+                        .await?;
+                    counts.bridge_outs += block_counts.bridge_outs;
+                    counts.claims += block_counts.claims;
+                    counts.gers += block_counts.gers;
                 }
 
                 *result_inner.lock().unwrap() = counts;
@@ -2824,6 +2886,24 @@ mod tests {
 
     /// Build a consumed record with an exact (block, tx_order) and a commitment
     /// that varies with `seed`, so ordering can be asserted precisely.
+    /// Key a consumed record exactly as the unified replay does: through the
+    /// SHARED `ProjectionOrder::for_record` — the same call the live projector
+    /// makes inside `BlockProjection::project_block`.
+    fn consumed_key(note: &InputNoteRecord) -> crate::projection_order::ProjectionOrderKey {
+        let block = note
+            .state()
+            .consumed_block_height()
+            .map(|h| h.as_u64())
+            .unwrap_or(0);
+        crate::projection_order::ProjectionOrder::for_record(
+            block,
+            note.id(),
+            note,
+            &std::collections::HashMap::new(),
+        )
+        .key()
+    }
+
     fn ordered_consumed(block: u32, tx_order: Option<u32>, seed: u8) -> InputNoteRecord {
         use miden_base_agglayer::B2AggNote;
         use miden_client::store::InputNoteState;
@@ -2876,14 +2956,10 @@ mod tests {
         let mid_b = ordered_consumed(97, Some(3), 0x33);
         let mid_earlier_tx = ordered_consumed(97, Some(1), 0xFF);
 
-        let items = [
-            ReplayItem::Consumed(&late),
-            ReplayItem::Consumed(&mid_b),
-            ReplayItem::Consumed(&early),
-            ReplayItem::Consumed(&mid_earlier_tx),
-            ReplayItem::Consumed(&mid_a),
-        ];
-        let mut keys: Vec<_> = items.iter().map(|item| item.order().key()).collect();
+        let mut keys: Vec<_> = [&late, &mid_b, &early, &mid_earlier_tx, &mid_a]
+            .into_iter()
+            .map(consumed_key)
+            .collect();
         keys.sort();
 
         assert_eq!(
@@ -2960,29 +3036,48 @@ mod tests {
         );
     }
 
-    /// LIVE/REPLAY EQUIVALENCE — the property that would have caught every
-    /// comparator drift (#100, bbece50, d724baa): a consumed record keyed
-    /// through the LIVE projector shape (`ProjectionOrder::for_record`) and
-    /// through its replay item (`ReplayItem::order`) MUST produce the
-    /// identical key. If these ever diverge again, restored history re-chains.
+    /// CONVERSION FIDELITY — the property that would have caught every
+    /// comparator drift (#100, bbece50, d724baa): a node-recovered replay,
+    /// converted to its client-store record shape, must key EXACTLY as the
+    /// live-written record would. The replay now flows through the SAME
+    /// `ProjectionOrder::for_record` + `BlockProjection` as the live tick, so
+    /// what remains to pin is the conversion inputs.
     #[test]
-    fn replay_key_equals_live_projector_key_for_consumed_records() {
-        let note = ordered_consumed(97, Some(3), 0x2A);
-        let within: std::collections::HashMap<miden_client::note::NoteId, u32> =
-            std::collections::HashMap::new();
-
-        let live_key =
-            crate::projection_order::ProjectionOrder::for_record(97, note.id(), &note, &within)
-                .key();
-        let replay_key = ReplayItem::Consumed(&note).order().key();
+    fn replay_conversions_key_exactly_like_live_records() {
+        // A converted CLAIM record mirrors live claim records: NO tx order.
+        let (metadata, attachments) = make_metadata(id(TEST_SENDER_MANAGER), None);
+        let claim = ReplayClaim {
+            id: miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                [miden_protocol::Felt::new(0x51u64).unwrap(); 4],
+            )),
+            body: RecoveredClaimBody {
+                details: ordered_consumed(50, None, 0x01).details().clone(),
+                metadata,
+                attachments,
+            },
+            block: 50,
+        };
+        let record = record_for_claim_replay(&claim, id(TEST_TARGET_BRIDGE));
+        let key = crate::projection_order::ProjectionOrder::for_record(
+            claim.block,
+            Some(claim.id),
+            &record,
+            &std::collections::HashMap::new(),
+        )
+        .key();
         assert_eq!(
-            live_key, replay_key,
-            "the replay MUST key consumed records exactly as the live projector does"
+            (key.0, key.1, key.2),
+            (50, None, 0),
+            "converted claims carry (None, 0) — live claim records store no tx \
+             order; bbece50's consumption order and d724baa's creation order \
+             would both fail this pin"
+        );
+        assert!(
+            record.metadata().is_some(),
+            "converted claims must retain metadata for the provenance gates"
         );
 
-        // Same-block pair: the shared comparator ties on details commitment —
-        // the #102-class regression pin at the replay level. (bbece50's
-        // consumption order and d724baa's creation order would both fail here.)
+        // Same-block consumed pair still ties on commitment, matching live.
         let a = ordered_consumed(50, None, 0x01);
         let b = ordered_consumed(50, None, 0x02);
         let (lo, hi) = if a.details_commitment().as_bytes() < b.details_commitment().as_bytes() {
@@ -2991,7 +3086,7 @@ mod tests {
             (&b, &a)
         };
         assert!(
-            ReplayItem::Consumed(lo).order().key() < ReplayItem::Consumed(hi).order().key(),
+            consumed_key(lo) < consumed_key(hi),
             "same-block ties break on commitment, matching live"
         );
     }
@@ -3004,8 +3099,7 @@ mod tests {
         let no_order = ordered_consumed(5, None, 0xF0);
         let with_order = ordered_consumed(5, Some(0), 0x01);
         assert!(
-            ReplayItem::Consumed(&no_order).order().key()
-                < ReplayItem::Consumed(&with_order).order().key(),
+            consumed_key(&no_order) < consumed_key(&with_order),
             "None tx_order must sort before Some(_) in the same block"
         );
     }
