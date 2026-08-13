@@ -871,9 +871,10 @@ impl Store for PgStore {
         let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
 
         // Served-`logIndex` canonical rank params ($1..$3): the kind order of
-        // `log_synthesis::canonical_kind_rank`, mirrored in SQL. See that function
-        // for why the served index is canonical per block rather than the stored
-        // global emission counter (restore-identity by construction).
+        // `log_synthesis::canonical_kind_rank` + the CLAIM content tiebreak of
+        // `assign_canonical_block_indices`, mirrored in SQL (claims order by
+        // DATA — the unique global index — because the calldata backfill can
+        // emit same-block claims in either order; see that function's docs).
         params.push(Box::new(UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()));
         params.push(Box::new(
             crate::log_synthesis::CLAIM_EVENT_TOPIC.to_lowercase(),
@@ -950,6 +951,7 @@ impl Store for PgStore {
                      ORDER BY CASE lower(topics[1])
                                   WHEN $1 THEN 0 WHEN $2 THEN 1 WHEN $3 THEN 2
                                   ELSE 3 END,
+                              CASE WHEN lower(topics[1]) = $2 THEN data ELSE '' END,
                               log_index
                  ) - 1) AS served_log_index
                  FROM synthetic_logs
@@ -1012,6 +1014,7 @@ impl Store for PgStore {
                          ORDER BY CASE lower(topics[1])
                                       WHEN $2 THEN 0 WHEN $3 THEN 1 WHEN $4 THEN 2
                                       ELSE 3 END,
+                                  CASE WHEN lower(topics[1]) = $3 THEN data ELSE '' END,
                                   log_index
                      ) - 1) AS served_log_index
                      FROM synthetic_logs

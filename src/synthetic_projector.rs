@@ -2356,6 +2356,56 @@ mod tests {
         );
     }
 
+    /// Same-block CLAIM pairs serve in CONTENT (global-index) order, NOT
+    /// emission order — the backfill can emit them in either order (measured:
+    /// block 4608's gi-78/79 pair swapped across restore before this rule).
+    #[tokio::test]
+    async fn same_block_claim_pair_serves_in_global_index_order() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        // Emit the HIGHER gi first (internal counters 0,1) — content order must win.
+        for (gi_byte, tx) in [(0x4Fu8, "0xclaim-late"), (0x4Eu8, "0xclaim-early")] {
+            let mut gi = [0u8; 32];
+            gi[15] = 1;
+            gi[31] = gi_byte;
+            store
+                .commit_manual_claim_event_atomic(
+                    format!("0xnote-{gi_byte:02x}"),
+                    "0xbridge",
+                    9,
+                    [0u8; 32],
+                    tx,
+                    gi,
+                    0,
+                    &[0u8; 20],
+                    &[0u8; 20],
+                    1000,
+                )
+                .await
+                .unwrap();
+        }
+        let filter = LogFilter {
+            from_block: Some("0x0".into()),
+            to_block: Some("0x9".into()),
+            ..Default::default()
+        };
+        let logs = store.get_logs(&filter, 9).await.unwrap();
+        let claims: Vec<_> = logs
+            .iter()
+            .filter(|l| l.topics[0] == crate::log_synthesis::CLAIM_EVENT_TOPIC)
+            .collect();
+        assert_eq!(claims.len(), 2);
+        assert!(
+            claims[0].data < claims[1].data,
+            "same-block claims must serve in DATA (global-index) order: {} !< {}",
+            claims[0].data,
+            claims[1].data
+        );
+        assert!(
+            claims[0].log_index < claims[1].log_index,
+            "served indices follow the content order"
+        );
+    }
+
     /// The two properties that make the served `logIndex` Ethereum-standard:
     ///
     /// (a) ABSOLUTE under filters — a topic-filtered `eth_getLogs` still reports

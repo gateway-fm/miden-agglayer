@@ -65,11 +65,32 @@ pub fn assign_canonical_block_indices(block_logs: &mut [SyntheticLog]) {
     block_logs.sort_by(|a, b| {
         let ka = canonical_kind_rank(a.topics.first().map(String::as_str));
         let kb = canonical_kind_rank(b.topics.first().map(String::as_str));
-        ka.cmp(&kb).then(a.log_index.cmp(&b.log_index))
+        ka.cmp(&kb)
+            .then_with(|| claim_within_kind_key(a).cmp(&claim_within_kind_key(b)))
+            .then(a.log_index.cmp(&b.log_index))
     });
     for (i, log) in block_logs.iter_mut().enumerate() {
         log.log_index = i as u64;
     }
+}
+
+/// Within-kind tiebreak for CLAIM events: the event DATA (whose first word is
+/// the unique global index) — a pure function of CONTENT, identical across the
+/// live tick, the per-tick calldata backfill, and the restore replay.
+///
+/// Why claims cannot use the emission counter like the other kinds: a
+/// ClaimEvent can be emitted by the per-tick BACKFILL
+/// (`backfill_synthetic_claim_calldata`, the crash-window/old-build healer)
+/// whose iteration order is feed order, not the canonical comparator — so two
+/// claims sharing a consumption block can be emitted in either order live,
+/// and the replay's canonical order then legitimately differs (measured
+/// 2026-08-13: block 4608's gi-78/gi-79 pair swapped across restore). Content
+/// ordering makes that race unobservable. UpdateHashChain deliberately KEEPS
+/// the emission counter (its order IS the hash-chain fold, which the replay
+/// reproduces exactly); BridgeEvents keep it too (both paths emit in LET
+/// order by construction).
+fn claim_within_kind_key(log: &SyntheticLog) -> Option<&str> {
+    (log.topics.first().map(String::as_str) == Some(CLAIM_EVENT_TOPIC)).then_some(log.data.as_str())
 }
 
 /// Synthetic log entry for eth_getLogs
