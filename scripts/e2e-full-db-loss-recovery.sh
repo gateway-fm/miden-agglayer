@@ -408,6 +408,17 @@ docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
 RESTORE_EXIT=$?
 set -e
 say "restore one-shot exit=$RESTORE_EXIT (log: $RESTORE_LOG)"
+if [[ "$RESTORE_EXIT" -ne 0 ]]; then
+    # Do not strand the stack: a failed one-shot must not leave the serving
+    # proxy STOPPED (it wedged the whole loop once — every later phase/cycle
+    # then failed in seconds on "container not running"). Bring the proxy back
+    # up on the partial store: post-unification the live projector IS the
+    # restore pipeline, so it self-heals by catching up from the cursors the
+    # one-shot left behind.
+    tail -20 "$RESTORE_LOG" >&2 || true
+    docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" up -d miden-agglayer >/dev/null 2>&1 || true
+    fail "reset+restore one-shot exited $RESTORE_EXIT (proxy restarted on the partial store)"
+fi
 [[ "$RESTORE_EXIT" -eq 0 ]] || { tail -15 "$RESTORE_LOG" | tee -a "$EVIDENCE"; fail "restore one-shot failed"; }
 grep -q "reset_miden_store" "$RESTORE_LOG" || fail "reset_miden_store marker missing — client store was NOT wiped"
 GER_RESTORED=$(grep -c "rebuilt GER from consumed UpdateGerNote" "$RESTORE_LOG" || true)
