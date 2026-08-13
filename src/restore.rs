@@ -271,12 +271,11 @@ struct ReplayBridgeOut {
 struct ReplayClaim {
     id: NoteId,
     body: RecoveredClaimBody,
+    /// Consumption block — the ONLY ordering datum a claim carries. The
+    /// consuming transaction's order and input position are deliberately NOT
+    /// captured: live claim records store neither (NULL tx_order), and the
+    /// shared `projection_order` key mirrors the live record exactly.
     block: u64,
-    tx_order: u32,
-    /// Input position, captured for parity with [`ReplayBridgeOut`]. NOTE: the
-    /// ordering key deliberately does NOT use it — see `replay_sort_key`.
-    #[allow(dead_code)]
-    within_tx_pos: u32,
 }
 
 /// Run the full restore algorithm.
@@ -1116,9 +1115,8 @@ fn build_claim_replay(
     claim_id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
 ) -> anyhow::Result<Vec<ReplayClaim>> {
     let mut replay = Vec::new();
-    for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
-        for (within_tx_pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
-            let within_tx_pos = within_tx_pos as u32;
+    for (block, _order, tx) in ordered_account_transactions(txs, bridge_id)? {
+        for input in tx.transaction_header.input_notes().iter() {
             let id = input
                 .header()
                 .map(|header| header.id())
@@ -1132,13 +1130,9 @@ fn build_claim_replay(
             {
                 anyhow::bail!("restore: CLAIM NoteId {id} body/transaction commitment mismatch");
             }
-            replay.push(ReplayClaim {
-                id,
-                body,
-                block,
-                tx_order: order,
-                within_tx_pos,
-            });
+            // Only the consumption BLOCK is kept: live claim records carry no
+            // tx order (see ReplayClaim's docs / `projection_order`).
+            replay.push(ReplayClaim { id, body, block });
         }
     }
     tracing::info!(
@@ -4291,9 +4285,9 @@ mod tests {
         assert_eq!(replay.len(), 1, "the consumed claim must join exactly once");
         assert_eq!(replay[0].id, note_id);
         assert_eq!(
-            (replay[0].block, replay[0].tx_order),
-            (11, 0),
-            "claim must carry the consuming bridge tx's (block, tx_order)"
+            replay[0].block, 11,
+            "claim must carry the consuming bridge tx's BLOCK — and only the \
+             block; live claim records store no tx order (`projection_order`)"
         );
     }
 
