@@ -2976,9 +2976,31 @@ mod tests {
         let mid_b = ordered_consumed(97, Some(3), 0x33);
         let mid_earlier_tx = ordered_consumed(97, Some(1), 0xFF);
 
-        let mut keys: Vec<_> = [&late, &mid_b, &early, &mid_earlier_tx, &mid_a]
-            .into_iter()
-            .map(consumed_key)
+        // tx_order participates only for MAPPED notes (chain-derived B2AGG
+        // order — drift #4), so give every record an id + map entry, exactly
+        // like the live reconciler / replay tx scan do.
+        let records = [&late, &mid_b, &early, &mid_earlier_tx, &mid_a];
+        let ids: Vec<miden_client::note::NoteId> = (0u64..records.len() as u64)
+            .map(|i| {
+                miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                    [miden_protocol::Felt::new(0x60 + i).unwrap(); 4],
+                ))
+            })
+            .collect();
+        let map: std::collections::HashMap<miden_client::note::NoteId, u32> =
+            ids.iter().map(|id| (*id, 0u32)).collect();
+        let mut keys: Vec<_> = records
+            .iter()
+            .zip(&ids)
+            .map(|(note, id)| {
+                let block = note
+                    .state()
+                    .consumed_block_height()
+                    .map(|h| h.as_u64())
+                    .unwrap_or(0);
+                crate::projection_order::ProjectionOrder::for_record(block, Some(*id), note, &map)
+                    .key()
+            })
             .collect();
         keys.sort();
 
@@ -3146,16 +3168,54 @@ mod tests {
         );
     }
 
-    /// A consumed record with no `tx_order` sorts before one that has it within the
-    /// same block, preserving the per-kind sort's semantics now that all kinds
-    /// share one comparator.
+    /// Drift #4 pin (the block-15125 GER-pair flip): a LOCAL consuming-tx order
+    /// on an UNMAPPED record must never reach the ordering key. The proxy
+    /// consumes `UpdateGerNote`s with local transactions, so the live store
+    /// records `Some(order)` — knowledge no replay can rebuild after DB loss.
+    /// Unmapped records therefore key `(None, 0, commitment, ...)` on BOTH
+    /// paths, and a same-block pair orders by details commitment regardless of
+    /// confirmation order. For MAPPED notes (chain-derived B2AGG order) the
+    /// `None`-before-`Some` precedence still holds.
     #[test]
-    fn replay_order_places_unordered_consumed_notes_first() {
-        let no_order = ordered_consumed(5, None, 0xF0);
-        let with_order = ordered_consumed(5, Some(0), 0x01);
+    fn local_tx_order_never_orders_unmapped_notes() {
+        // Confirmation order (tx 0 vs tx 1) is deliberately the INVERSE of the
+        // commitment order: under the pre-fix key the 0xF0 record would jump
+        // the queue — the exact 15125 failure shape.
+        let first_confirmed = ordered_consumed(5, Some(0), 0xF0);
+        let second_confirmed = ordered_consumed(5, Some(1), 0x01);
+        let kf = consumed_key(&first_confirmed);
+        let ks = consumed_key(&second_confirmed);
+        assert_eq!(
+            (kf.1, kf.2),
+            (None, 0),
+            "unmapped local tx order leaked into the durable ordering key"
+        );
+        let (c_first, c_second) = (
+            first_confirmed.details_commitment().as_bytes(),
+            second_confirmed.details_commitment().as_bytes(),
+        );
         assert!(
-            consumed_key(&no_order) < consumed_key(&with_order),
-            "None tx_order must sort before Some(_) in the same block"
+            (c_second < c_first) == (ks < kf),
+            "unmapped same-block pair must order by details commitment alone"
+        );
+
+        // Mapped (chain-derived) order still applies, None sorting first.
+        let id = miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+            [miden_protocol::Felt::new(0x70u64).unwrap(); 4],
+        ));
+        let map: std::collections::HashMap<miden_client::note::NoteId, u32> =
+            [(id, 0u32)].into_iter().collect();
+        let mapped_key = crate::projection_order::ProjectionOrder::for_record(
+            5,
+            Some(id),
+            &second_confirmed,
+            &map,
+        )
+        .key();
+        assert_eq!(mapped_key.1, Some(1), "mapped notes keep the derived order");
+        assert!(
+            consumed_key(&ordered_consumed(5, None, 0xF0)) < mapped_key,
+            "None tx_order still sorts before mapped Some(_) in the same block"
         );
     }
 

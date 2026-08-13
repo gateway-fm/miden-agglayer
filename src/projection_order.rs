@@ -16,7 +16,13 @@
 //!   * a consumption-tx-order tiebreak (bbece50, reverted): flipped a same-block
 //!     GER pair and re-chained 72 lines of history;
 //!   * a creation-order tiebreak (d724baa, deleted by this module): flipped a
-//!     same-block GER pair at block 2750 and re-chained 28 lines.
+//!     same-block GER pair at block 2750 and re-chained 28 lines;
+//!   * honoring the client store's LOCAL-tx `consumed_tx_order` (drift #4,
+//!     fixed in `for_record`): the proxy consumes `UpdateGerNote`s with local
+//!     transactions, so live keys carried `Some(order)` that no replay can
+//!     rebuild after DB loss — a same-block GER pair whose confirmation order
+//!     disagreed with the details order flipped on restore at block 15125 and
+//!     re-chained 32 lines.
 //!
 //! An `UpdateHashChain` log carries the rolling `hash_chain_value` in its
 //! topics, so ONE misordered same-block pair re-chains every subsequent GER
@@ -28,13 +34,17 @@
 //!
 //! `(block, consumed_tx_order, within_tx_pos, details_commitment, note_id)`
 //!
-//! * `consumed_tx_order` — the per-block transaction order **as the live client
-//!   store records it**: `Some(order)` for B2AGG notes (the reconciler resolves
-//!   and durably records their consuming transaction), `None` for every other
-//!   kind (the store keeps NULL for notes consumed externally — measured
-//!   135/135 on a live stack). A replay source MUST mirror the live record, not
-//!   "improve" on it: replaying claims at their true `Some(order)` while live
-//!   emitted them from `None`-order records is exactly how history diverges.
+//! * `consumed_tx_order` — the per-block consuming-transaction order, honored
+//!   ONLY where it is derivable from chain data: B2AGG notes (the reconciler
+//!   resolves and durably records their consuming transaction live; the bridge
+//!   transaction scan rebuilds it in replay), gated by presence in the
+//!   `within_tx_pos` map. Every other kind keys `None` — including notes whose
+//!   live store record carries `Some(order)` from a LOCAL proxy transaction
+//!   (see `for_record`): local knowledge does not survive DB loss, and any key
+//!   input that replay cannot rebuild WILL diverge. Symmetrically, a replay
+//!   source must not "improve" on live's `None` (replaying claims at their true
+//!   node-side order while live emitted from `None`-order records diverges the
+//!   same way).
 //! * `within_tx_pos` — the input position inside the consuming transaction,
 //!   known live only for B2AGG (from `resolve_b2agg_consumptions`); `0` for
 //!   everything else.
@@ -78,19 +88,34 @@ impl ProjectionOrder {
     /// shape, and the replay's `Consumed` source. `within_tx_pos` is looked up
     /// by NoteId (populated only for B2AGG), mirroring
     /// `SyntheticProjector::project_block_notes`.
+    ///
+    /// `consumed_tx_order` is honored ONLY for notes present in the
+    /// `within_tx_pos` map — i.e. notes whose consuming-transaction order was
+    /// derived from CHAIN data (B2AGG, resolved live by the reconciler and in
+    /// replay by the bridge transaction scan). For every other note the client
+    /// store's `consumed_tx_order` is clamped to `None`: a note the proxy
+    /// consumed with a LOCAL transaction (an `UpdateGerNote` under the
+    /// synchronous-consume path) carries `Some(order)` in the live store, but
+    /// that knowledge lives only in the client store and cannot be rebuilt
+    /// after a DB loss — drift incident #4: a same-block GER pair whose local
+    /// confirmation order disagreed with the details-commitment order flipped
+    /// on restore at block 15125 and re-chained 32 lines of UHC history.
+    /// Durable order must be derivable from chain data alone.
     pub fn for_record(
         block: u64,
         note_id: Option<NoteId>,
         note: &InputNoteRecord,
         within_tx_pos: &std::collections::HashMap<NoteId, u32>,
     ) -> Self {
+        let mapped_pos = note_id.and_then(|id| within_tx_pos.get(&id)).copied();
         Self {
             block,
-            consumed_tx_order: note.state().consumed_tx_order(),
-            within_tx_pos: note_id
-                .and_then(|id| within_tx_pos.get(&id))
-                .copied()
-                .unwrap_or(0),
+            consumed_tx_order: if mapped_pos.is_some() {
+                note.state().consumed_tx_order()
+            } else {
+                None
+            },
+            within_tx_pos: mapped_pos.unwrap_or(0),
             details_commitment: note.details_commitment().as_bytes(),
             note_id: note_id.map(|id| id.as_bytes()),
         }
