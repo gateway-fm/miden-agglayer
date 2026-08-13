@@ -204,10 +204,16 @@ log_digest() { # $1 = topic0 hex prefix
 # state all included, so an indexed-event regression cannot slip through) minus
 # exactly the two unrecoverable fields documented above.
 uhc_content_digest() {
+    # ORDER BY must discriminate SAME-BLOCK rows or string_agg order is
+    # UNSPECIFIED and the digest is nondeterministic across runs. UHC `data` is
+    # always '0x' (everything lives in topics), so ordering by (block, data)
+    # produced a FALSE-POSITIVE "content differs" with EQUAL counts (loop cycle
+    # 5, 2026-08-13: getLogs byte-identical, digest mismatch). Order by topics —
+    # the ger+chain values — which is total for UHC rows.
     pgq "SELECT md5(coalesce(string_agg(
            block_number || ':' || encode(block_hash,'hex') || ':' || address || ':' ||
            array_to_string(topics, ',') || ':' || removed::text || ':' || data,
-           '|' ORDER BY block_number, data), '')) \
+           '|' ORDER BY block_number, array_to_string(topics, ',')), '')) \
          FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'"
 }
 
