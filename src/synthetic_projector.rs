@@ -1278,28 +1278,19 @@ impl SyntheticProjector {
             );
         }
 
-        // Per-block execution order, then the input position for B2AGG siblings.
-        notes.sort_by(|(ida, a), (idb, b)| {
-            a.state()
-                .consumed_tx_order()
-                .cmp(&b.state().consumed_tx_order())
-                .then_with(|| {
-                    let pa = ida
-                        .and_then(|i| within_tx_pos.get(&i))
-                        .copied()
-                        .unwrap_or(0);
-                    let pb = idb
-                        .and_then(|i| within_tx_pos.get(&i))
-                        .copied()
-                        .unwrap_or(0);
-                    pa.cmp(&pb)
-                })
-                .then_with(|| {
-                    a.details_commitment()
-                        .as_bytes()
-                        .cmp(&b.details_commitment().as_bytes())
-                })
-                .then_with(|| ida.map(|i| i.as_bytes()).cmp(&idb.map(|i| i.as_bytes())))
+        // Per-block execution order — THE canonical ORDER-stage comparator
+        // (`projection_order::ProjectionOrder`), shared byte-for-byte with the
+        // restore replay. Do not inline a comparator here; drift between the
+        // live and replay copies re-chained history three times (see the
+        // module docs of `projection_order`).
+        notes.sort_by_key(|(id, note)| {
+            crate::projection_order::ProjectionOrder::for_record(
+                miden_block,
+                *id,
+                note,
+                within_tx_pos,
+            )
+            .key()
         });
 
         let bridge_address = get_bridge_address();
@@ -1545,19 +1536,19 @@ impl SyntheticProjector {
         let mut auth_b2agg = self
             .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut within_tx_pos)
             .await?;
-        auth_b2agg.sort_by(|(id_a, note_a), (id_b, note_b)| {
-            note_a
-                .state()
-                .consumed_block_height()
-                .cmp(&note_b.state().consumed_block_height())
-                .then_with(|| {
-                    note_a
-                        .state()
-                        .consumed_tx_order()
-                        .cmp(&note_b.state().consumed_tx_order())
-                })
-                .then_with(|| within_tx_pos.get(id_a).cmp(&within_tx_pos.get(id_b)))
-                .then_with(|| id_a.as_bytes().cmp(&id_b.as_bytes()))
+        // Same canonical comparator as every other projection sort (see
+        // `projection_order`); the id here is always known (authoritative feed).
+        auth_b2agg.sort_by_key(|(id, note)| {
+            crate::projection_order::ProjectionOrder::for_record(
+                note.state()
+                    .consumed_block_height()
+                    .map(|h| h.as_u64())
+                    .unwrap_or(0),
+                Some(*id),
+                note,
+                &within_tx_pos,
+            )
+            .key()
         });
         for (id, rec) in &auth_b2agg {
             if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
