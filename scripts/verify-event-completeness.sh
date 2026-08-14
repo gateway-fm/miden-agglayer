@@ -36,8 +36,17 @@ TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"
 
 TMP="$(mktemp -d)"
 # The client-store snapshot below briefly PAUSES the proxy; the trap guarantees
-# unpause on every exit path (an accidentally-left-paused proxy is an outage).
-cleanup() { docker unpause "$AGGLAYER_CONTAINER" >/dev/null 2>&1 || true; rm -rf "$TMP"; }
+# unpause on every exit path (an accidentally-left-paused proxy is an outage) —
+# but ONLY for a pause THIS script acquired (CPAUSED=1): unconditionally
+# unpausing would remove someone else's intentional pause (review 0814e nit).
+CPAUSED=0
+cleanup() {
+    if [ "${CPAUSED:-0}" = "1" ]; then
+        docker unpause "$AGGLAYER_CONTAINER" >/dev/null 2>&1 || true
+        CPAUSED=0
+    fi
+    rm -rf "$TMP"
+}
 trap cleanup EXIT
 
 # 1. Canonical script roots from the same crates the proxy is built from.
@@ -153,14 +162,27 @@ sleep "${SETTLE_MARGIN_SECS:-20}"
 #    may run rollback-journal OR wal mode). PAUSE the proxy for the copy
 #    window (~1s), copy main + every sidecar, then unpause — the EXIT trap
 #    guarantees unpause on every failure path too.
-CPAUSED=0
-docker pause "$AGGLAYER_CONTAINER" >/dev/null 2>&1 && CPAUSED=1
+SNAP_CONSISTENT=0
+if docker pause "$AGGLAYER_CONTAINER" >/dev/null 2>&1; then
+    CPAUSED=1
+    SNAP_CONSISTENT=1
+fi
 for side in "" "-wal" "-shm" "-journal"; do
     docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3$side" \
         "$TMP/client.sqlite3$side" 2>/dev/null || rm -f "$TMP/client.sqlite3$side"
 done
-[ "$CPAUSED" = "1" ] && docker unpause "$AGGLAYER_CONTAINER" >/dev/null 2>&1
-if [ "$CPAUSED" != "1" ]; then
+if [ "$CPAUSED" = "1" ]; then
+    # The normal-path unpause must SUCCEED — continuing into RPC verification
+    # against a still-paused proxy judges a frozen server. Abort loudly (the
+    # EXIT trap retries the unpause once more on the way out).
+    if docker unpause "$AGGLAYER_CONTAINER" >/dev/null 2>&1; then
+        CPAUSED=0
+    else
+        echo "FAIL: could not unpause $AGGLAYER_CONTAINER after the client snapshot — refusing to verify against a paused proxy"
+        exit 1
+    fi
+fi
+if [ "$SNAP_CONSISTENT" != "1" ]; then
     # Could not pause => the copy is not point-in-time; drop it so the lib
     # fails closed (UNRESOLVED-RECLAIM) instead of judging on a torn snapshot.
     echo "WARN: could not pause $AGGLAYER_CONTAINER for a consistent client snapshot — identity checks will fail closed"
