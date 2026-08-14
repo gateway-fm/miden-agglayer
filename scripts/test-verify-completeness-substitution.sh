@@ -74,15 +74,23 @@ for _, note_id, nf, _, consumer, block, faucet in NOTES:
 c.commit()
 
 # Proxy client store fixture: note_id -> details_commitment (the runtime key).
+# PRIMARY fixture: BLOB columns — the pinned 0.16 miden-client schema
+# (review 0814e). A TEXT '0x…' variant is also exercised below: the lib's
+# join stays encoding-agnostic and BOTH encodings are covered.
 cdb = f"{tmp}/client.sqlite3"
 cc = sqlite3.connect(cdb)
-# TEXT '0x…' columns — the miden-client encoding the review cites; the lib's
-# join must be encoding-agnostic (BLOB fixtures passed before, TEXT must too).
-cc.execute("CREATE TABLE input_notes (note_id TEXT, details_commitment TEXT)")
+cc.execute("CREATE TABLE input_notes (note_id BLOB, details_commitment BLOB)")
 for _, note_id, _, commit, _, _, _ in NOTES:
     cc.execute("INSERT INTO input_notes VALUES (?,?)",
-               ("0x" + note_id.lower(), "0x" + commit.lower()))
+               (bytes.fromhex(note_id), bytes.fromhex(commit)))
 cc.commit()
+cdb_text = f"{tmp}/client-text.sqlite3"
+ct = sqlite3.connect(cdb_text)
+ct.execute("CREATE TABLE input_notes (note_id TEXT, details_commitment TEXT)")
+for _, note_id, _, commit, _, _, _ in NOTES:
+    ct.execute("INSERT INTO input_notes VALUES (?,?)",
+               ("0x" + note_id.lower(), "0x" + commit.lower()))
+ct.commit()
 
 
 def runtime_hash(commit_hex):
@@ -127,15 +135,23 @@ srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 rpc = f"http://127.0.0.1:{srv.server_address[1]}"
 
-run = subprocess.run(
-    ["python3", lib, db, rpc, "0x" + BRIDGE.lower(), "0x" + B2AGG_ROOT.lower(),
-     "0x" + CLAIM_ROOT.lower(), "0x" + GER_ROOT.lower(), "0",
-     DEF_FAUCET.lower(), f"{tmp}/unclaimable", cdb],
-    capture_output=True, text=True)
+def run_verifier(client_db):
+    return subprocess.run(
+        ["python3", lib, db, rpc, "0x" + BRIDGE.lower(), "0x" + B2AGG_ROOT.lower(),
+         "0x" + CLAIM_ROOT.lower(), "0x" + GER_ROOT.lower(), "0",
+         DEF_FAUCET.lower(), f"{tmp}/unclaimable", client_db],
+        capture_output=True, text=True)
+
+
+run = run_verifier(cdb)
 out = run.stdout
 print(out)
 
 failures = []
+# The TEXT-store variant must reach the identical identity-level verdict.
+run_text = run_verifier(cdb_text)
+if run_text.returncode == 0 or "FORBIDDEN" not in run_text.stdout:
+    failures.append("TEXT-encoded client store did not reproduce the identity verdict")
 if run.returncode == 0:
     failures.append("verifier PASSED the substitutions (the exact false green)")
 if "FORBIDDEN" not in out:

@@ -60,6 +60,9 @@ if [[ "$FORCE" != "1" ]]; then
         exit 2
     fi
     log "lost-in-transit wedge: tx ${tx:0:18}… x$cnt/60s, unknown to proxy"
+    # The standalone path knows the exact wedged tx — make it the default for
+    # the exact-outcome health probe below (review 0814e).
+    WEDGE_TX="${WEDGE_TX:-$tx}"
 fi
 
 # ── the heal: preserve EVERYTHING except the poisoned monitor DB ─────────────
@@ -200,12 +203,13 @@ CRASH_MARKERS=$(printf '%s' "$RECENT" | grep -ciE "panic|fatal error|level=fatal
 # not read as health. PROGRESS_PATTERN requires actual component work.
 WEDGE_MATCHES=0
 [ -n "${WEDGE_PATTERN:-}" ] && WEDGE_MATCHES=$(printf '%s' "$RECENT" | grep -cE "$WEDGE_PATTERN" || true)
-# Exact wedge-state check (review 0814d): the caller knows the EXACT lost tx
-# hash — its reappearance in fresh logs proves the wedge did NOT clear, however
-# quiet the generic pattern is. Absence of the exact hash is the equivalent
-# exact wedge-state proof the settle window can give.
+# Exact wedge-state check (review 0814e): the exact tx counts against health
+# ONLY when paired with the wedge error — AggKit success logs legitimately
+# mention the submitted tx id, so a bare-substring match would reject the
+# successful path.
 WEDGE_TX_MATCHES=0
-[ -n "${WEDGE_TX:-}" ] && WEDGE_TX_MATCHES=$(printf '%s' "$RECENT" | grep -cF "$WEDGE_TX" || true)
+[ -n "${WEDGE_TX:-}" ] && WEDGE_TX_MATCHES=$(printf '%s' "$RECENT" | grep -F "$WEDGE_TX" \
+    | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
 PROGRESS_MATCHES=$(printf '%s' "$RECENT" | grep -ciE "${PROGRESS_PATTERN:-level=info|INFO}" || true)
 fail_health() {
     KEEP_STAGE=1
@@ -224,7 +228,33 @@ fail_health() {
 [ "${WEDGE_MATCHES:-0}" -eq 0 ] \
     || fail_health "$SVC still logs the wedge signature ($WEDGE_MATCHES match(es) of WEDGE_PATTERN) — the heal did not clear it"
 [ "${WEDGE_TX_MATCHES:-0}" -eq 0 ] \
-    || fail_health "$SVC still logs the EXACT lost tx ${WEDGE_TX:-} ($WEDGE_TX_MATCHES match(es)) — the wedge re-formed"
+    || fail_health "$SVC still pairs the EXACT lost tx ${WEDGE_TX:-} with the wedge error ($WEDGE_TX_MATCHES match(es)) — the wedge re-formed"
+# POSITIVE exact outcome (review 0814e): a quiet window is not success — the
+# heal exists so the resent tx gets durably admitted by the proxy. Require the
+# success-specific transition: the proxy's transactions table knows WEDGE_TX
+# within HEAL_CONFIRM_TIMEOUT, or the wedge-paired error reappears (fail).
+if [ -n "${WEDGE_TX:-}" ]; then
+    CONFIRM_TIMEOUT="${HEAL_CONFIRM_TIMEOUT:-120}"
+    waited=0
+    confirmed=0
+    while [ "$waited" -lt "$CONFIRM_TIMEOUT" ]; do
+        known=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
+            "SELECT count(*) FROM transactions WHERE tx_hash='$WEDGE_TX'" 2>/dev/null || echo "")
+        if [ "${known:-0}" != "" ] && [ "${known:-0}" -gt 0 ] 2>/dev/null; then
+            confirmed=1
+            break
+        fi
+        rewedged=$(docker logs --since 10s "$C" 2>&1 | grep -F "$WEDGE_TX" \
+            | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
+        [ "${rewedged:-0}" -eq 0 ] \
+            || fail_health "$SVC re-wedged on the exact tx ${WEDGE_TX} while waiting for durable admission"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    [ "$confirmed" -eq 1 ] \
+        || fail_health "the proxy never durably admitted the resent tx ${WEDGE_TX} within ${CONFIRM_TIMEOUT}s — no positive proof the wedge cleared"
+    log "positive exact outcome: proxy durably admitted ${WEDGE_TX:0:18}… after ${waited}s"
+fi
 [ "${PROGRESS_MATCHES:-0}" -gt 0 ] \
     || fail_health "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"

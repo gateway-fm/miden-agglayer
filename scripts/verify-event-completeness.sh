@@ -34,7 +34,11 @@ PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-
 ALLOW_LATE="${ALLOW_LATE:-0}"
 TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
+# The client-store snapshot below briefly PAUSES the proxy; the trap guarantees
+# unpause on every exit path (an accidentally-left-paused proxy is an outage).
+cleanup() { docker unpause "$AGGLAYER_CONTAINER" >/dev/null 2>&1 || true; rm -rf "$TMP"; }
+trap cleanup EXIT
 
 # 1. Canonical script roots from the same crates the proxy is built from.
 [[ -x "$TOOL_BIN" ]] || { echo "FAIL: $TOOL_BIN not built (cargo build --bin bridge-out-tool)"; exit 1; }
@@ -144,15 +148,24 @@ sleep "${SETTLE_MARGIN_SECS:-20}"
 #    (project_b2agg_note), so identity-level checks need the commitment, not
 #    the NoteId. Unavailable snapshot => the lib fails closed (reclaims stay
 #    EXPECTED, deferred slots unmatchable).
-#    WAL-aware (review 0814d): recent note imports live in the -wal until
-#    checkpointed; a main-file-only copy loses the newest mappings and the
-#    fail-closed path then flags them UNRESOLVED. Copy main + wal + shm.
-docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3" "$TMP/client.sqlite3" 2>/dev/null \
-    || rm -f "$TMP/client.sqlite3"
-docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3-wal" "$TMP/client.sqlite3-wal" 2>/dev/null \
-    || rm -f "$TMP/client.sqlite3-wal"
-docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3-shm" "$TMP/client.sqlite3-shm" 2>/dev/null \
-    || rm -f "$TMP/client.sqlite3-shm"
+#    POINT-IN-TIME snapshot (review 0814e): sequential file copies of a live
+#    SQLite are not consistent — a write/checkpoint can interleave (the store
+#    may run rollback-journal OR wal mode). PAUSE the proxy for the copy
+#    window (~1s), copy main + every sidecar, then unpause — the EXIT trap
+#    guarantees unpause on every failure path too.
+CPAUSED=0
+docker pause "$AGGLAYER_CONTAINER" >/dev/null 2>&1 && CPAUSED=1
+for side in "" "-wal" "-shm" "-journal"; do
+    docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3$side" \
+        "$TMP/client.sqlite3$side" 2>/dev/null || rm -f "$TMP/client.sqlite3$side"
+done
+[ "$CPAUSED" = "1" ] && docker unpause "$AGGLAYER_CONTAINER" >/dev/null 2>&1
+if [ "$CPAUSED" != "1" ]; then
+    # Could not pause => the copy is not point-in-time; drop it so the lib
+    # fails closed (UNRESOLVED-RECLAIM) instead of judging on a torn snapshot.
+    echo "WARN: could not pause $AGGLAYER_CONTAINER for a consistent client snapshot — identity checks will fail closed"
+    rm -f "$TMP/client.sqlite3" "$TMP/client.sqlite3-wal" "$TMP/client.sqlite3-shm" "$TMP/client.sqlite3-journal"
+fi
 export TOOL_BIN
 python3 "$SCRIPT_DIR/lib-verify-completeness.py" \
     "$TMP/node.sqlite3" "$L2_RPC" "$BRIDGE_ID" "$B2AGG_ROOT" "$CLAIM_ROOT" "$GER_ROOT" \
