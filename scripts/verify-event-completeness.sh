@@ -203,10 +203,36 @@ print(f"consistency cut: node snapshot tip = block {cut}")
 print(f"{'TYPE':<22} {'notes':>6} {'logs':>6} {'exact':>6} {'late':>5} {'missing':>8} {'defer':>6} {'unclaim':>8} {'extra':>6}  verdict")
 print("-" * 96)
 for name, (topic, root) in TOPICS.items():
+    # Release-gate hardening (review 0814): resolve each note's canonical
+    # consumer BEFORE building the expected set. A bridge-targeted note consumed
+    # by a NON-bridge transaction (sender reclaim of a timed-out bridge-out)
+    # must not be EXPECTED — so if the proxy wrongly emits an event for it, the
+    # log has nothing to satisfy and surfaces as surplus/extra instead of
+    # silently matching. An UNRESOLVED consumer stays expected (fail-closed).
     rows = list(n.execute(
-        "SELECT consumed_at FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
+        "SELECT consumed_at, hex(note_id) i, hex(nullifier) nf FROM notes "
+        "WHERE script_root=? AND consumed_at IS NOT NULL "
         "AND consumed_at<=? AND hex(target_account_id)=?",
         (bytes.fromhex(root[2:]), cut, bridge_hex)))
+    reclaimed_ct = 0
+    if name == "B2AGG->BridgeEvent":
+        expected_rows = []
+        for r in rows:
+            consumer = None
+            if r["nf"]:
+                tx = n.execute(
+                    "SELECT hex(account_id) acct FROM transactions "
+                    "WHERE block_num=? AND hex(input_notes) LIKE '%' || ? || '%'",
+                    (r["consumed_at"], r["nf"])).fetchone()
+                consumer = tx["acct"] if tx else None
+            if consumer is not None and consumer != bridge_hex:
+                reclaimed_ct += 1
+                print(f"    RECLAIMED (consumed by 0x{consumer.lower()}, not the bridge — "
+                      f"no deposit/event expected; an emitted log for it would count as extra): "
+                      f"note 0x{r['i'].lower()} consumed_at={r['consumed_at']}")
+            else:
+                expected_rows.append(r)
+        rows = expected_rows
     note_blocks = Counter(r["consumed_at"] for r in rows)
     logs = get_logs(topic)
     all_logs_count = sum(1 for l in logs if int(l["blockNumber"], 16) <= cut)
@@ -257,42 +283,23 @@ for name, (topic, root) in TOPICS.items():
     # the proxy's refused set is DEFERRED (expected on the live path; recovery is via
     # --restore), not missing. Only unexplained absences remain in `missing`.
     deferred = 0
-    reclaimed = 0
     if missing > 0:
         unmatched = note_blocks - log_blocks
         det = list(n.execute(
-            "SELECT hex(note_id) i, consumed_at b, hex(assets) a, hex(nullifier) nf FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
+            "SELECT hex(note_id) i, consumed_at b, hex(assets) a FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
             "AND hex(target_account_id)=? ORDER BY consumed_at", (bytes.fromhex(root[2:]), bridge_hex)))
         for r in det:
             if unmatched.get(r["b"], 0) > 0:
                 # asset faucet id: 15 bytes after the 2-byte assets prefix
                 fauc = (r["a"] or "")[4:34].lower()
-                # A bridge-targeted note consumed by a NON-bridge transaction
-                # (e.g. the sender reclaiming a timed-out bridge-out) inserts no
-                # LET leaf and must never produce an event — on the live path or
-                # in restore. Resolve the consuming tx by nullifier membership
-                # in its input_notes and exempt only proven non-bridge cases.
-                consumer = None
-                if r["nf"]:
-                    tx = n.execute(
-                        "SELECT hex(account_id) acct FROM transactions "
-                        "WHERE block_num=? AND hex(input_notes) LIKE '%' || ? || '%'",
-                        (r["b"], r["nf"])).fetchone()
-                    consumer = tx["acct"] if tx else None
-                if (consumer is not None and consumer != bridge_hex
-                        and deferred + reclaimed < missing):
-                    reclaimed += 1
-                    unmatched[r["b"]] -= 1
-                    print(f"    RECLAIMED (consumed by 0x{consumer.lower()}, not the bridge — "
-                          f"no deposit/event expected): note 0x{r['i'].lower()} consumed_at={r['b']}")
-                elif fauc and fauc in deferred_faucets and deferred + reclaimed < missing:
+                if fauc and fauc in deferred_faucets and deferred < missing:
                     deferred += 1
                     unmatched[r["b"]] -= 1
                     print(f"    DEFERRED (deliberate emit refusal, recovery via --restore): "
                           f"note 0x{r['i'].lower()} consumed_at={r['b']} faucet={fauc}")
                 else:
                     print(f"    MISSING candidate: note 0x{r['i'].lower()} consumed_at={r['b']}")
-        missing -= deferred + reclaimed
+        missing -= deferred
     total_notes += n_notes
     total_logs += all_logs_count
     ok = (missing == 0 and extra == 0 and unclaim_missing == 0

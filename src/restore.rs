@@ -512,6 +512,8 @@ pub async fn restore(
         );
     }
 
+    verify_emitted_frontier(store).await?;
+
     // Phase 4: cursor finalization (factored into a helper so the reconcile-
     // cursor reset is unit-testable — see `finalize_restore_cursors`).
     finalize_restore_cursors(store, miden_tip, Some(swept_to)).await?;
@@ -544,6 +546,26 @@ pub async fn restore(
 /// imported note — the genesis re-sweep IS the healing pass that re-discovers
 /// externally-created network notes, and it must not be skipped by a stale
 /// persisted cursor.
+/// Review 0814 (blocking): `accounted == let_leaves` proves every leaf is
+/// RESERVED, not EMITTED — `project_b2agg_note` has post-reservation `Skipped`
+/// paths (unparsable / no asset / unknown faucet / oversize / self-target).
+/// Finalizing over a skipped leaf would ship the exact permanent
+/// `depositCount` gap the live emitted-frontier gate refuses to seal past.
+/// Same gate, same fail-closed posture, run after replay and BEFORE cursor
+/// finalization: the one-shot fails and the operator repairs the leaf's
+/// metadata (registry backfill) before re-running `--restore`.
+pub(crate) async fn verify_emitted_frontier(store: &Arc<dyn Store>) -> anyhow::Result<()> {
+    if let Some((idx, note)) = store.first_unemitted_reservation().await? {
+        anyhow::bail!(
+            "restore: note {note} (LET index {idx}) is reserved but its BridgeEvent was \
+             never emitted (quarantined / unrecoverable metadata); refusing to finalize \
+             a store with a depositCount gap — repair the leaf's metadata and re-run \
+             `--restore`"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn finalize_restore_cursors(
     store: &Arc<dyn Store>,
     miden_tip: u64,
@@ -958,12 +980,13 @@ async fn restore_bridge_replay(
 /// bridge (they are its transaction inputs — the MA#3 consumer trust root), and
 /// the per-note gates still run at projection time.
 ///
-/// A GER-shaped erased note cannot be routed through this path (the GER replay
-/// consumes client-store records, not scan bodies) — it is counted and WARNED
-/// loudly instead of silently lost; none has been observed yet (73/73 GERs
-/// survived every drill), and the drill's injected-GER set assertion would catch
-/// one. A note the node returns as PRIVATE (no body) is likewise counted+warned:
-/// nothing can rebuild a body that was never public.
+/// A GER-shaped erased note routes through the same channel (review 0814): the
+/// internal-replay join is shape-agnostic and the per-block unit dispatches by
+/// shape, so the body reaches `project_ger_note` with its metadata (MA#28
+/// sender gate) — its `UpdateHashChain` / `is_injected` / chain contribution
+/// are replayed instead of silently lost. A note the node returns as PRIVATE
+/// (no body) or does not return at all FAILS the restore: nothing can rebuild
+/// a body that was never public, and finalizing would silently drop events.
 async fn recover_erased_bridge_inputs(
     rpc: &dyn miden_client::rpc::NodeRpcClient,
     bridge_id: AccountId,
@@ -1026,29 +1049,42 @@ async fn recover_erased_bridge_inputs(
             id_by_nullifier.entry(nullifier).or_insert(id);
             b2aggs += 1;
         } else if details.script().root() == ger_root {
+            // Review 0814 (blocking): an erased same-block `UpdateGerNote` used
+            // to be counted + warned while restore finalized WITHOUT its
+            // `UpdateHashChain` / `is_injected` / rolling-chain contribution.
+            // Route it through the same internal-replay channel as claims:
+            // `build_claim_replay` joins bodies to bridge-tx inputs
+            // shape-agnostically, and the per-block unit dispatches by shape,
+            // so this body reaches `project_ger_note` at its true block with
+            // metadata (the MA#28 sender gate) intact.
+            claims_by_id.entry(id).or_insert(RecoveredClaimBody {
+                details,
+                metadata,
+                attachments,
+            });
+            claim_id_by_nullifier.entry(nullifier).or_insert(id);
             gers += 1;
         }
     }
     let unreturned = missing.iter().filter(|id| !returned.contains(id)).count();
     ::metrics::counter!("restore_erased_claims_recovered_total").increment(claims as u64);
     ::metrics::counter!("restore_erased_b2agg_recovered_total").increment(b2aggs as u64);
+    ::metrics::counter!("restore_erased_gers_recovered_total").increment(gers as u64);
     tracing::info!(
         candidates = missing.len(),
         claims,
         b2aggs,
+        gers,
         "restore: recovered erased (same-block-consumed) bridge-input note bodies \
          from input headers"
     );
-    if gers > 0 || opaque > 0 || unreturned > 0 {
+    if opaque > 0 || unreturned > 0 {
         ::metrics::counter!("restore_erased_notes_unrecovered_total")
-            .increment((gers + opaque + unreturned) as u64);
-        tracing::warn!(
-            ger_shaped = gers,
-            private_or_bodyless = opaque,
-            unreturned,
-            "restore: erased bridge-input notes that CANNOT be routed through the \
-             claim/B2AGG replay — a GER-shaped one would surface in the drill's \
-             injected-GER assertion; investigate before trusting this restore"
+            .increment((opaque + unreturned) as u64);
+        anyhow::bail!(
+            "restore: {opaque} private/bodyless + {unreturned} unreturned erased \
+             bridge-input note(s) cannot be rebuilt from chain data — finalizing \
+             would silently drop their events; investigate before re-running --restore"
         );
     }
     Ok(())
@@ -3216,6 +3252,78 @@ mod tests {
         assert!(
             consumed_key(&ordered_consumed(5, None, 0xF0)) < mapped_key,
             "None tx_order still sorts before mapped Some(_) in the same block"
+        );
+    }
+
+    /// Review 0814 (blocking): a leaf can be RESERVED (satisfying the
+    /// `accounted == let_leaves` cardinality check) yet never EMITTED — the
+    /// post-reservation `Skipped` paths in `project_b2agg_note`. Restore must
+    /// FAIL before cursor finalization instead of shipping a permanent
+    /// `depositCount` gap.
+    #[tokio::test]
+    async fn restore_refuses_to_finalize_over_reserved_but_unemitted_leaf() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        verify_emitted_frontier(&store)
+            .await
+            .expect("a store with no reservations passes the frontier gate");
+
+        // Reserve without emitting — exactly the state a quarantined /
+        // unrecoverable-metadata leaf leaves behind after replay.
+        store.reserve_deposit_index("0xdeadbeef").await.unwrap();
+        let err = verify_emitted_frontier(&store)
+            .await
+            .expect_err("a reserved-but-unemitted leaf must fail the one-shot");
+        assert!(
+            err.to_string().contains("never emitted"),
+            "the failure names the poison leaf: {err}"
+        );
+    }
+
+    /// Review 0814 (blocking): an ERASED same-block `UpdateGerNote` (created +
+    /// consumed in one block window, both stores wiped) is recovered by the
+    /// input-header fetch and routed through the CLAIM replay channel. The
+    /// conversion must yield a record `project_ger_note` actually EMITS from —
+    /// UpdateHashChain + `is_injected` + chain contribution restored, not
+    /// warned away.
+    #[tokio::test]
+    async fn erased_ger_body_routes_through_claim_replay_and_emits() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (note, (_key, metadata), ger_bytes) = ma28_consumed_external_ger_note(0x6B);
+
+        let replay = ReplayClaim {
+            id: miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                [miden_protocol::Felt::new(0x6Bu64).unwrap(); 4],
+            )),
+            body: RecoveredClaimBody {
+                details: note.details().clone(),
+                metadata,
+                attachments: note.attachments().clone(),
+            },
+            block: 7,
+        };
+        let record = record_for_claim_replay(&replay, id(TEST_TARGET_BRIDGE));
+
+        let outcome = project_ger_note(
+            &store,
+            &record,
+            &std::collections::HashMap::new(), // no output-record fallback needed: metadata rides the record
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            7,
+            [7u8; 32],
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            GerProjectOutcome::Emitted,
+            "an erased-GER body routed through the claim-replay conversion must EMIT"
+        );
+        assert!(
+            store.is_ger_injected(&ger_bytes).await.unwrap(),
+            "the recovered GER is marked injected (chain contribution restored)"
         );
     }
 

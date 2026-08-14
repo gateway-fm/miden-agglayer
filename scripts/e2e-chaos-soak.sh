@@ -122,7 +122,14 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
       seen[$tx]=1
       total=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1)
       total=${total:-0}
-      [ "$total" -lt 6 ] || continue  # heal budget: past this it's a hard failure, not flakiness
+      # Heal budget: past this it's a hard failure, not flakiness — and it must
+      # reach the final VERDICT (review 0814), not vanish in a skipped iteration.
+      if [ "$total" -ge 6 ]; then
+        grep -q 'WATCHDOG-BUDGET-EXHAUSTED' "$WATCHDOG_HEALS_FILE" \
+          || echo "$(date +%H:%M:%S) WATCHDOG-BUDGET-EXHAUSTED: $total heals consumed and wedges persist" \
+               | tee -a "$WATCHDOG_HEALS_FILE"
+        continue
+      fi
       svc=aggkit; [ "$AK" = "${PROJECT}-aggkit-l2b-1" ] && svc=aggkit-l2b
       # PR#164 #8: PRESERVE-HEAL instead of a blind force-recreate. The old
       # recreate wiped the whole container fs to clear one poisoned file,
@@ -142,7 +149,10 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
             | tee -a "$WATCHDOG_HEALS_FILE"
       else
         rc=$?
-        echo "$(date +%H:%M:%S) WATCHDOG-FAILED: preserve-heal of $svc returned rc=$rc (tx $tx) — NOT counted as a heal"
+        # Persisted into the ledger (review 0814): a failed heal must veto the
+        # verdict, not just scroll past in the watchdog log.
+        echo "$(date +%H:%M:%S) WATCHDOG-FAILED: preserve-heal of $svc returned rc=$rc (tx $tx) — NOT counted as a heal" \
+            | tee -a "$WATCHDOG_HEALS_FILE"
       fi
     done
   done
@@ -185,11 +195,31 @@ say "garbo attempts vs fired: private=${GARBO_PRIVATE_ATTEMPTS:-?}/${GARBO_PRIVA
 
 # ── 4. post-chaos heal ───────────────────────────────────────────────────────
 say "=== post-chaos settle (${POST_CHAOS_SETTLE}s heal window) ==="
+# Review 0814: failure to regain proxy health must feed the VERDICT — the old
+# loop broke on healthy but fell through silently on timeout.
+PROXY_HEALTHY=0
 for _ in $(seq 1 30); do
-    docker inspect "$AGGLAYER_CONTAINER" --format '{{.State.Health.Status}}' 2>/dev/null | grep -q healthy && break
+    if docker inspect "$AGGLAYER_CONTAINER" --format '{{.State.Health.Status}}' 2>/dev/null | grep -q healthy; then
+        PROXY_HEALTHY=1; break
+    fi
     sleep 5
 done
+[[ "$PROXY_HEALTHY" == "1" ]] || say "WARN: proxy did NOT report healthy within 150s post-chaos (feeds verdict)"
 sleep "$POST_CHAOS_SETTLE"
+
+# ── 4b. post-chaos FRESH two-way liveness (review 0814) ──────────────────────
+# The storm-phase load may have completed BEFORE the last fault, and the log
+# verifier reads state that can predate the recovery — neither proves the stack
+# works AFTER the faults. Require one fresh deposit + one fresh withdrawal to
+# complete post-chaos before the soak may PASS.
+say "=== (pre-verdict) fresh two-way post-chaos operation (1 L1->Miden + 1 Miden->L1) ==="
+POSTOP_RC=1
+if N_L1_FWD=1 N_L1_BACK=1 L2L2_FWD=0 L2L2_BACK=0 MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" \
+    COMPOSE_PROJECT_NAME="$PROJECT" timeout 1800 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" \
+    >/tmp/chaos-postop.out 2>&1; then
+    POSTOP_RC=0
+fi
+say "post-chaos fresh op rc=$POSTOP_RC $(grep -aE 'OVERALL RELIABILITY' /tmp/chaos-postop.out | tail -1 | cut -c1-80)"
 
 # ── 5a. LEGITIMATE completeness (the primary verdict) ────────────────────────
 say "=== (a) verify-event-completeness (legit traffic) ==="
@@ -329,10 +359,19 @@ GARBO_VERDICT_OK=0
 # enabled garbo class fired (private always; foreign only when GARBO_FOREIGN=1).
 CHAOS_OK=0
 chaos_fired_ok "${FAULTS_DONE:-0}" "${GARBO_PRIVATE_FIRED:-0}" "${GARBO_FOREIGN:-1}" "${GARBO_FOREIGN_FIRED:-0}" && CHAOS_OK=1
+# (d) POST-CHAOS liveness (review 0814): a heal that failed, an exhausted heal
+# budget, a proxy that never regained health, or a fresh post-chaos op that did
+# not land — each independently vetoes PASS. All are persisted signals, so a
+# fault landing after the storm-phase load completed can no longer false-green.
+WATCHDOG_FAILED=$(grep -c 'WATCHDOG-FAILED' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); WATCHDOG_FAILED=${WATCHDOG_FAILED:-0}
+BUDGET_EXHAUSTED=$(grep -c 'WATCHDOG-BUDGET-EXHAUSTED' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); BUDGET_EXHAUSTED=${BUDGET_EXHAUSTED:-0}
+POSTLIVE_OK=0
+[[ "$WATCHDOG_FAILED" == "0" && "$BUDGET_EXHAUSTED" == "0" && "${PROXY_HEALTHY:-0}" == "1" && "${POSTOP_RC:-1}" == "0" ]] && POSTLIVE_OK=1
 say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC store=$([[ ${STORE_OK:-0} == 1 ]] && echo CLEAN || echo DROP) locks=$LOCKS loadtest_rc=$LT_RC allow_late=$ALLOW_LATE)"
 say "    (b) GARBO containment:  $([[ $GARBO_VERDICT_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK private_leak=$PRIVATE_LEAK)"
 say "    (c) CHAOS actually fired: $([[ $CHAOS_OK == 1 ]] && echo PASS || echo FAIL)  (faults=${FAULTS_DONE:-0} private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
-if [[ "$LEGIT_OK" == "1" && "$GARBO_VERDICT_OK" == "1" && "$CHAOS_OK" == "1" ]]; then
+say "    (d) POST-CHAOS liveness: $([[ $POSTLIVE_OK == 1 ]] && echo PASS || echo FAIL)  (heal_fails=$WATCHDOG_FAILED budget_exhausted=$BUDGET_EXHAUSTED proxy_healthy=${PROXY_HEALTHY:-0} fresh_op_rc=${POSTOP_RC:-1})"
+if [[ "$LEGIT_OK" == "1" && "$GARBO_VERDICT_OK" == "1" && "$CHAOS_OK" == "1" && "$POSTLIVE_OK" == "1" ]]; then
     if [[ "$ALLOW_LATE" == "0" ]]; then
         say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"
     else

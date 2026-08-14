@@ -96,31 +96,42 @@ if [[ "$STORE_URL" == *host=* ]]; then
 else
     STORE_HOST="$(printf '%s' "$STORE_URL" | sed -E 's#^[a-zA-Z+]+://##; s#^[^@]*@##; s#[:/].*$##')"
 fi
-# The proxy addresses postgres by its compose SERVICE name; accept that as well as
-# the container name (`<project>-<service>-1`).
+# The proxy addresses postgres by its compose SERVICE name; accept that or the
+# container name (`<project>-<service>-1`) — and NOTHING else. Review 0814:
+# `localhost`/`127.0.0.1` are NOT acceptable proof — in this topology localhost
+# is the proxy container itself, not $PG_CONTAINER, so accepting it would let
+# the drill destroy a database the proxy under test does not use.
 PG_SERVICE="${PG_CONTAINER#"$PROJECT-"}"; PG_SERVICE="${PG_SERVICE%-1}"
-if [[ -z "$STORE_HOST" ]]; then
+# The DB NAME must also be confirmed before `DROP DATABASE agglayer_store`:
+# libpq keyword form carries `dbname=`, URL form carries it as the path.
+if [[ "$STORE_URL" == *dbname=* ]]; then
+    STORE_DB="$(sed -E 's/.*(^|[[:space:]])dbname=([^[:space:]]+).*/\2/' <<<"$STORE_URL")"
+else
+    STORE_DB="$(printf '%s' "$STORE_URL" | sed -E 's#^[a-zA-Z+]+://[^/]*##; s#^/##; s#[?].*$##')"
+fi
+if [[ -z "$STORE_HOST" || -z "$STORE_DB" ]]; then
     if [[ "${ALLOW_UNVERIFIED_PG_TARGET:-0}" == "1" ]]; then
-        echo "WARN: proxy store URL unparsable; proceeding because ALLOW_UNVERIFIED_PG_TARGET=1"
+        echo "WARN: proxy store URL host/dbname unparsable; proceeding because ALLOW_UNVERIFIED_PG_TARGET=1"
     else
-        echo "FATAL: could not parse the proxy's store URL from $PROXY_CONTAINER env, so the"
-        echo "       DROP DATABASE target cannot be confirmed. Refusing to destroy a database"
-        echo "       chosen by name convention alone. Set ALLOW_UNVERIFIED_PG_TARGET=1 to override."
+        echo "FATAL: could not parse the proxy's store host+dbname from $PROXY_CONTAINER env"
+        echo "       (host='$STORE_HOST' dbname='$STORE_DB'), so the DROP DATABASE target cannot"
+        echo "       be confirmed. Refusing to destroy a database chosen by name convention"
+        echo "       alone. Set ALLOW_UNVERIFIED_PG_TARGET=1 to override."
         exit 1
     fi
-elif [[ "$STORE_HOST" != "$PG_CONTAINER" && "$STORE_HOST" != "$PG_SERVICE" \
-        && "$STORE_HOST" != "agglayer-postgres" \
-        && "$STORE_HOST" != "localhost" && "$STORE_HOST" != "127.0.0.1" ]]; then
+elif [[ "$STORE_HOST" != "$PG_CONTAINER" && "$STORE_HOST" != "$PG_SERVICE" ]] \
+        || [[ "$STORE_DB" != "agglayer_store" ]]; then
     if [[ "${ALLOW_UNVERIFIED_PG_TARGET:-0}" == "1" ]]; then
-        echo "WARN: proxy store host '$STORE_HOST' != '$PG_CONTAINER'; proceeding (ALLOW_UNVERIFIED_PG_TARGET=1)"
+        echo "WARN: proxy store target '$STORE_HOST/$STORE_DB' != '$PG_SERVICE/agglayer_store'; proceeding (ALLOW_UNVERIFIED_PG_TARGET=1)"
     else
-        echo "FATAL: the proxy's store host is '$STORE_HOST', which is NOT the container this"
-        echo "       script would DROP ($PG_CONTAINER). Refusing to destroy a database the"
-        echo "       proxy under test does not use. Set ALLOW_UNVERIFIED_PG_TARGET=1 to override."
+        echo "FATAL: the proxy's store target is '$STORE_HOST' db '$STORE_DB', which is NOT the"
+        echo "       exact database this script would DROP ($PG_SERVICE / agglayer_store)."
+        echo "       Refusing to destroy a database the proxy under test does not use."
+        echo "       Set ALLOW_UNVERIFIED_PG_TARGET=1 to override."
         exit 1
     fi
 else
-    echo "verified: proxy store host '$STORE_HOST' matches the drop target $PG_CONTAINER"
+    echo "verified: proxy store target '$STORE_HOST' db '$STORE_DB' matches the drop target $PG_CONTAINER/agglayer_store"
 fi
 
 COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
@@ -409,15 +420,20 @@ RESTORE_EXIT=$?
 set -e
 say "restore one-shot exit=$RESTORE_EXIT (log: $RESTORE_LOG)"
 if [[ "$RESTORE_EXIT" -ne 0 ]]; then
-    # Do not strand the stack: a failed one-shot must not leave the serving
-    # proxy STOPPED (it wedged the whole loop once — every later phase/cycle
-    # then failed in seconds on "container not running"). Bring the proxy back
-    # up on the partial store: post-unification the live projector IS the
-    # restore pipeline, so it self-heals by catching up from the cursors the
-    # one-shot left behind.
+    # Review 0814 (blocking): a failed one-shot must NOT restart the serving
+    # proxy on a partial store. Live discovery/cursors are not yet the restore
+    # pipeline (#167), `/health` does not prove projector/reconcile catch-up,
+    # so a restarted proxy can SERVE incomplete history — and because
+    # `nonce_ledger_rebuilt` was never finalized, the next drill would mislabel
+    # the reconstructed store as a fresh live baseline. Leave the proxy STOPPED
+    # and fail with the repair path.
     tail -20 "$RESTORE_LOG" >&2 || true
-    docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" up -d miden-agglayer >/dev/null 2>&1 || true
-    fail "reset+restore one-shot exited $RESTORE_EXIT (proxy restarted on the partial store)"
+    echo "REPAIR: the proxy is left STOPPED on a partial store (serving it would expose" >&2
+    echo "        incomplete history). Fix the cause shown above, then re-run the one-shot:" >&2
+    echo "          docker compose <files> run --rm --no-deps miden-agglayer <live-cmd> \\" >&2
+    echo "              --reset-miden-store --restore" >&2
+    echo "        (idempotent; safe to repeat). Start the proxy ONLY after it exits 0." >&2
+    fail "reset+restore one-shot exited $RESTORE_EXIT (proxy left stopped; repair + re-run --restore)"
 fi
 [[ "$RESTORE_EXIT" -eq 0 ]] || { tail -15 "$RESTORE_LOG" | tee -a "$EVIDENCE"; fail "restore one-shot failed"; }
 grep -q "reset_miden_store" "$RESTORE_LOG" || fail "reset_miden_store marker missing — client store was NOT wiped"
