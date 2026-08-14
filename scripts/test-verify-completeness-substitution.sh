@@ -76,10 +76,12 @@ c.commit()
 # Proxy client store fixture: note_id -> details_commitment (the runtime key).
 cdb = f"{tmp}/client.sqlite3"
 cc = sqlite3.connect(cdb)
-cc.execute("CREATE TABLE input_notes (note_id BLOB, details_commitment BLOB)")
+# TEXT '0x…' columns — the miden-client encoding the review cites; the lib's
+# join must be encoding-agnostic (BLOB fixtures passed before, TEXT must too).
+cc.execute("CREATE TABLE input_notes (note_id TEXT, details_commitment TEXT)")
 for _, note_id, _, commit, _, _, _ in NOTES:
     cc.execute("INSERT INTO input_notes VALUES (?,?)",
-               (bytes.fromhex(note_id), bytes.fromhex(commit)))
+               ("0x" + note_id.lower(), "0x" + commit.lower()))
 cc.commit()
 
 
@@ -153,4 +155,24 @@ if failures:
     sys.exit(1)
 print("SUBSTITUTION REGRESSION PASS: forbidden reclaim flagged, both legit misses surfaced, "
       "deferred substitution not absorbed")
+
+# ── missing/incomplete client snapshot (review 0814d) ────────────────────────
+run2 = subprocess.run(
+    ["python3", lib, db, rpc, "0x" + BRIDGE.lower(), "0x" + B2AGG_ROOT.lower(),
+     "0x" + CLAIM_ROOT.lower(), "0x" + GER_ROOT.lower(), "0",
+     DEF_FAUCET.lower(), f"{tmp}/unclaimable", f"{tmp}/does-not-exist.sqlite3"],
+    capture_output=True, text=True)
+out2 = run2.stdout
+failures = []
+if run2.returncode == 0:
+    failures.append("verifier PASSED with an unresolvable reclaim (missing client snapshot)")
+if "UNRESOLVED-RECLAIM" not in out2:
+    failures.append("no explicit UNRESOLVED-RECLAIM failure for the missing snapshot")
+if failures:
+    print(out2)
+    print("MISSING-SNAPSHOT REGRESSION FAIL:")
+    for f in failures:
+        print("  -", f)
+    sys.exit(1)
+print("MISSING-SNAPSHOT REGRESSION PASS: unresolvable reclaim fails the verifier explicitly")
 PY

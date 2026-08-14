@@ -144,8 +144,15 @@ sleep "${SETTLE_MARGIN_SECS:-20}"
 #    (project_b2agg_note), so identity-level checks need the commitment, not
 #    the NoteId. Unavailable snapshot => the lib fails closed (reclaims stay
 #    EXPECTED, deferred slots unmatchable).
+#    WAL-aware (review 0814d): recent note imports live in the -wal until
+#    checkpointed; a main-file-only copy loses the newest mappings and the
+#    fail-closed path then flags them UNRESOLVED. Copy main + wal + shm.
 docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3" "$TMP/client.sqlite3" 2>/dev/null \
     || rm -f "$TMP/client.sqlite3"
+docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3-wal" "$TMP/client.sqlite3-wal" 2>/dev/null \
+    || rm -f "$TMP/client.sqlite3-wal"
+docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3-shm" "$TMP/client.sqlite3-shm" 2>/dev/null \
+    || rm -f "$TMP/client.sqlite3-shm"
 export TOOL_BIN
 python3 "$SCRIPT_DIR/lib-verify-completeness.py" \
     "$TMP/node.sqlite3" "$L2_RPC" "$BRIDGE_ID" "$B2AGG_ROOT" "$CLAIM_ROOT" "$GER_ROOT" \

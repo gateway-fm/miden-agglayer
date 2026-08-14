@@ -526,36 +526,17 @@ pub async fn admin_register_native_faucet(
     // idempotently.
     match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
         BridgeBinding::OriginBoundToOther(other) => {
-            // Review 0814c: with NO local origin row, returning Ok(other)
-            // reported success while the registry stayed MISSING the
-            // authoritative binding — exactly the anomaly the registry
-            // reconciler halts on after its grace window. Rebuild the row
-            // from the ON-CHAIN faucet's own authoritative metadata (never
-            // the caller's params — those describe the REQUESTED faucet,
-            // a different account), then verify the persisted binding.
-            tracing::info!(
-                origin_network,
-                existing_faucet_id = %other.to_hex(),
-                requested_faucet_id = %faucet_id.to_hex(),
-                "admin_registerNativeFaucet: origin already bound on the bridge to a different \
-                 faucet — rebuilding its registry row authoritatively, emitting no rebinding note"
-            );
-            let auth_other = read_authoritative_faucet_metadata(&state, other).await?;
-            let resolved_other = ResolvedNativeMetadata {
-                name: auth_other.name.clone(),
-                symbol: auth_other.symbol.clone(),
-                decimals: auth_other.decimals,
-            };
-            persist_and_verify_native_row(
-                &state,
-                other,
-                origin_address,
-                origin_network,
-                scale,
-                &resolved_other,
-            )
-            .await?;
-            return Ok(other.to_hex());
+            // Review 0814d: NEVER auto-adopt. An on-chain faucet the registry
+            // does not know is exactly the FaucetRegistryReconciler SECURITY
+            // TRIPWIRE (possible external use of the admin key) — only a
+            // verified `--restore` is sanctioned to import it, and this
+            // authenticated call asked for a DIFFERENT faucet anyway.
+            // Fail before any mutation, naming the authoritative binding so
+            // the operator can explicitly retry for it or run restore.
+            return Err(anyhow::anyhow!(
+                "{}",
+                unknown_onchain_binding_error(other, faucet_id, origin_address, origin_network)
+            ));
         }
         BridgeBinding::FaucetBoundToDifferentOrigin(bound) => {
             anyhow::bail!(
@@ -703,6 +684,31 @@ async fn register_native_validated(
          verified)"
     );
     Ok(id_hex)
+}
+
+/// Review 0814d — the fail-closed message for an origin bound ON-CHAIN to a
+/// faucet the registry does not know. Pure so the endpoint branch is pinned by
+/// a unit test: auto-adopting here would launder the FaucetRegistryReconciler
+/// security tripwire (unknown bridge faucet = possible external admin-key use;
+/// only verified `--restore` may import it).
+fn unknown_onchain_binding_error(
+    onchain_faucet: AccountId,
+    requested_faucet: AccountId,
+    origin_address: [u8; 20],
+    origin_network: u32,
+) -> String {
+    format!(
+        "admin_registerNativeFaucet: origin 0x{} (network {origin_network}) is already bound \
+         ON-CHAIN to faucet {}, which the local registry does not record — and this call \
+         requested faucet {}. An unknown on-chain binding is the registry security tripwire \
+         (possible external admin-key use); refusing to adopt it implicitly. Either retry \
+         explicitly for faucet {} after operator review, or run the verified `--restore` \
+         recovery to import on-chain state. No note emitted, no state changed.",
+        hex::encode(origin_address),
+        onchain_faucet.to_hex(),
+        requested_faucet.to_hex(),
+        onchain_faucet.to_hex(),
+    )
 }
 
 /// Read a deployed faucet account's AUTHORITATIVE metadata (import on demand +
@@ -1017,6 +1023,33 @@ mod tests {
             row.faucet_id, faucet_a,
             "stale conflict must not clobber the row"
         );
+    }
+
+    /// Review 0814d — the no-local-row OriginBoundToOther branch must FAIL
+    /// (never adopt): the message names the authoritative on-chain faucet, the
+    /// requested faucet, and the sanctioned recovery paths.
+    #[test]
+    fn unknown_onchain_binding_is_rejected_not_adopted() {
+        let onchain = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let requested = AccountId::from_hex("0xac0000000000dd110000ee000000ad").unwrap();
+        let msg = unknown_onchain_binding_error(onchain, requested, [0xDE; 20], 1);
+        assert!(
+            msg.contains(&onchain.to_hex()),
+            "names the on-chain binding"
+        );
+        assert!(
+            msg.contains(&requested.to_hex()),
+            "names the requested faucet"
+        );
+        assert!(
+            msg.contains("security tripwire"),
+            "cites the tripwire policy"
+        );
+        assert!(
+            msg.contains("--restore"),
+            "points at the sanctioned recovery"
+        );
+        assert!(msg.contains("No note emitted"), "asserts no mutation");
     }
 
     fn native_params(name: Option<&str>) -> RegisterNativeFaucetParams {

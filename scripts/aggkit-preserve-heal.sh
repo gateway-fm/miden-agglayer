@@ -145,12 +145,25 @@ if ! DIFF_OUT=$(diff -r "$B/stage" "$B/readback" 2>&1); then
     docker stop "$C" >/dev/null 2>&1 || true
     exit 1
 fi
-# Ownership/mode manifest (review 0814c): content equality does not prove the
-# service can OPEN its DBs — --archive round-trips uid/gid/mode through tar,
-# so compare the stat manifest of stage vs read-back; any drift means the
-# restore landed with ownership the aggkit runtime user cannot use.
-stat_manifest() { (cd "$1" && find . -type f -printf '%U:%G:%m %p\n' | sort); }
-if ! OWN_DIFF=$(diff <(stat_manifest "$B/stage") <(stat_manifest "$B/readback") 2>&1); then
+# Ownership/mode manifest (review 0814c/d): content equality does not prove the
+# service can OPEN its DBs — --archive round-trips uid/gid/mode through tar, so
+# compare stat manifests (directories AND files, numeric uid:gid:mode) of stage
+# vs read-back. Manifests are materialized to files with CHECKED rcs — a failed
+# producer inside process substitution is invisible, so none is used.
+stat_manifest() { (cd "$1" && find . \( -type f -o -type d \) -printf '%y %U:%G:%m %p\n' | LC_ALL=C sort); }
+if ! stat_manifest "$B/stage" > "$B/manifest.stage"; then
+    KEEP_STAGE=1
+    log "FATAL: cannot build the staged ownership manifest — stopping $SVC; staging dir retained."
+    docker stop "$C" >/dev/null 2>&1 || true
+    exit 1
+fi
+if ! stat_manifest "$B/readback" > "$B/manifest.readback"; then
+    KEEP_STAGE=1
+    log "FATAL: cannot build the read-back ownership manifest — stopping $SVC; staging dir retained."
+    docker stop "$C" >/dev/null 2>&1 || true
+    exit 1
+fi
+if ! OWN_DIFF=$(diff "$B/manifest.stage" "$B/manifest.readback" 2>&1); then
     KEEP_STAGE=1
     log "FATAL: restored ownership/modes differ from the staged manifest:"
     echo "$OWN_DIFF" | head -10 | while IFS= read -r l; do log "       $l"; done
@@ -187,6 +200,12 @@ CRASH_MARKERS=$(printf '%s' "$RECENT" | grep -ciE "panic|fatal error|level=fatal
 # not read as health. PROGRESS_PATTERN requires actual component work.
 WEDGE_MATCHES=0
 [ -n "${WEDGE_PATTERN:-}" ] && WEDGE_MATCHES=$(printf '%s' "$RECENT" | grep -cE "$WEDGE_PATTERN" || true)
+# Exact wedge-state check (review 0814d): the caller knows the EXACT lost tx
+# hash — its reappearance in fresh logs proves the wedge did NOT clear, however
+# quiet the generic pattern is. Absence of the exact hash is the equivalent
+# exact wedge-state proof the settle window can give.
+WEDGE_TX_MATCHES=0
+[ -n "${WEDGE_TX:-}" ] && WEDGE_TX_MATCHES=$(printf '%s' "$RECENT" | grep -cF "$WEDGE_TX" || true)
 PROGRESS_MATCHES=$(printf '%s' "$RECENT" | grep -ciE "${PROGRESS_PATTERN:-level=info|INFO}" || true)
 fail_health() {
     KEEP_STAGE=1
@@ -204,6 +223,8 @@ fail_health() {
     || fail_health "$SVC logs show $CRASH_MARKERS fatal/panic marker(s) in the settle window"
 [ "${WEDGE_MATCHES:-0}" -eq 0 ] \
     || fail_health "$SVC still logs the wedge signature ($WEDGE_MATCHES match(es) of WEDGE_PATTERN) — the heal did not clear it"
+[ "${WEDGE_TX_MATCHES:-0}" -eq 0 ] \
+    || fail_health "$SVC still logs the EXACT lost tx ${WEDGE_TX:-} ($WEDGE_TX_MATCHES match(es)) — the wedge re-formed"
 [ "${PROGRESS_MATCHES:-0}" -gt 0 ] \
     || fail_health "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"

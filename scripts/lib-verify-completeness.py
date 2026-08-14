@@ -32,15 +32,29 @@ if client_db and os.path.exists(client_db):
     _client = sqlite3.connect(client_db)
 
 
+def _norm_hex(v):
+    """BLOB or TEXT ('0x…'/bare) column value -> bare lowercase hex, or None."""
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).hex()
+    v = str(v).lower()
+    return v[2:] if v.startswith("0x") else v
+
+
 def commitment_for(note_id_hex):
     """Bare lowercase hex details_commitment for a NoteId, from the proxy's
-    client store. None when unresolvable (fail-closed at the caller)."""
+    client store. Encoding-agnostic (review 0814d): miden-client versions have
+    stored these columns as BLOB or as TEXT '0x…' — match either, normalize
+    either. None when unresolvable (fail-closed at the caller)."""
     if _client is None:
         return None
+    want = note_id_hex.lower()
     row = _client.execute(
-        "SELECT lower(hex(details_commitment)) FROM input_notes WHERE upper(hex(note_id))=?",
-        (note_id_hex.upper(),)).fetchone()
-    return row[0] if row and row[0] else None
+        "SELECT details_commitment FROM input_notes "
+        "WHERE lower(hex(note_id))=? OR lower(note_id)=? OR lower(note_id)=?",
+        (want, want, "0x" + want)).fetchone()
+    return _norm_hex(row[0]) if row else None
 
 TOPICS = {
     "B2AGG->BridgeEvent":  ("0x501781209a1f8899323b96b4ef08b168df93e0a90c673d1e4cce39366cb62f9b", b2agg_root),
@@ -143,6 +157,7 @@ for name, (topic, root) in TOPICS.items():
         (bytes.fromhex(root[2:]), cut, bridge_hex)))
     reclaimed_ids = []
     forbidden = set()
+    unresolved_reclaims = 0
     if name == "B2AGG->BridgeEvent":
         expected_rows = []
         for r in rows:
@@ -167,22 +182,25 @@ for name, (topic, root) in TOPICS.items():
         # A reclaim whose commitment or hash cannot be resolved stays EXPECTED
         # (fail-closed: it surfaces as MISSING, never absorbs a wrong log).
         reclaim_commits = {}
-        unresolved = []
         for i in reclaimed_ids:
             commit = commitment_for(i)
             if commit is None:
-                unresolved.append(i)
+                unresolved_reclaims += 1
             else:
                 reclaim_commits[i] = commit
         derived = derive_tx_hashes(sorted(set(reclaim_commits.values())))
         if derived is None:
-            unresolved.extend(reclaim_commits)
+            unresolved_reclaims += len(reclaim_commits)
             reclaim_commits = {}
             derived = {}
-        if unresolved:
-            print(f"    WARN: {len(unresolved)} reclaim(s) unresolvable to a runtime tx hash — kept EXPECTED (fail-closed)")
-            keep = set(unresolved)
-            expected_rows.extend(r for r in rows if r["i"] in keep)
+        if unresolved_reclaims:
+            # Review 0814d: re-adding an unresolved reclaim to EXPECTED lets
+            # its own wrongly-emitted BridgeEvent satisfy that synthetic
+            # expectation — a fail-open disguised as fail-closed. An identity
+            # the verifier cannot resolve is an EXPLICIT verifier failure.
+            print(f"    UNRESOLVED-RECLAIM: {unresolved_reclaims} reclaimed note(s) have no "
+                  f"resolvable runtime tx hash (client-store snapshot missing/stale or "
+                  f"derivation failed) — the verifier cannot certify this run")
         forbidden = {derived[c] for c in reclaim_commits.values()}
         rows = expected_rows
     note_blocks = Counter(r["consumed_at"] for r in rows)
@@ -284,6 +302,7 @@ for name, (topic, root) in TOPICS.items():
     total_notes += n_notes
     total_logs += all_logs_count
     ok = (missing == 0 and extra == 0 and unclaim_missing == 0 and forbidden_ct == 0
+          and (name != "B2AGG->BridgeEvent" or unresolved_reclaims == 0)
           and (late == 0 or allow_late == "1"))
     overall_fail |= not ok
     unclaim_col = f"{unclaim_exact}/{unclaim_exact + unclaim_missing}" if name == "CLAIM->ClaimEvent" else "-"
