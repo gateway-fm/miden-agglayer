@@ -473,27 +473,6 @@ pub async fn admin_register_native_faucet(
         }
     }
 
-    // Review 0814 — the SYMMETRIC pre-mutation conflict, mirrored from the
-    // public path: the requested faucet may already exist locally under a
-    // DIFFERENT origin. Without this check the bridge preflight (keyed on the
-    // ORIGIN) can be Unbound, the irreversible ConfigAggBridgeNote is emitted,
-    // and only then the faucet_id primary-key conflict fails persistence —
-    // after the bridge already mutated.
-    if let Some(by_id) = state.store.get_faucet_by_id(faucet_id).await?
-        && (by_id.origin_address != origin_address || by_id.origin_network != origin_network)
-    {
-        anyhow::bail!(
-            "admin_registerNativeFaucet: faucet {} is already registered locally with a \
-             different origin identity (0x{} network {}), which this call would not update. \
-             Registering it for origin 0x{} would split the registry from the bridge. No note \
-             emitted, no state changed.",
-            faucet_id.to_hex(),
-            hex::encode(by_id.origin_address),
-            by_id.origin_network,
-            hex::encode(origin_address),
-        );
-    }
-
     // #149 — read the deployed faucet account's AUTHORITATIVE metadata BEFORE any
     // state change. The persisted + emitted metadata-hash preimage
     // (`abi.encode(name, symbol, decimals)`) must be reconstructable from chain
@@ -572,6 +551,27 @@ pub async fn admin_register_native_faucet(
         params.decimals,
         &authoritative,
     )?;
+
+    // Review 0814 — the SYMMETRIC pre-mutation conflict, mirrored from the
+    // public path: the requested faucet may already exist locally under a
+    // DIFFERENT origin. Without this check the bridge preflight (keyed on the
+    // ORIGIN) can be Unbound, the irreversible ConfigAggBridgeNote is emitted,
+    // and only then the faucet_id primary-key conflict fails persistence —
+    // after the bridge already mutated.
+    if let Some(by_id) = state.store.get_faucet_by_id(faucet_id).await?
+        && (by_id.origin_address != origin_address || by_id.origin_network != origin_network)
+    {
+        anyhow::bail!(
+            "admin_registerNativeFaucet: faucet {} is already registered locally with a \
+             different origin identity (0x{} network {}), which this call would not update. \
+             Registering it for origin 0x{} would split the registry from the bridge. No note \
+             emitted, no state changed.",
+            faucet_id.to_hex(),
+            hex::encode(by_id.origin_address),
+            by_id.origin_network,
+            hex::encode(origin_address),
+        );
+    }
 
     // Authoritative on-chain preflight UNDER THE LOCK, after validation and before
     // any note is emitted (same guarantee as the public path). The local registry
