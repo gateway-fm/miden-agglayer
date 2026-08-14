@@ -98,24 +98,16 @@ fault_kill_prover() {
 fault_restart_proxy() {
     if docker restart -t 2 "$PROXY" >/dev/null 2>&1; then
         log "FAULT restart-proxy — crash the proxy mid-flight (injected; tests cursor persist + late-sweep heal)"
-        # Runbook pairing (aggkit 0.8.3-rc1 limitation): a proxy restart can lose
-        # an aggoracle GER send IN TRANSIT — aggkit's ephemeral monitoring DB
-        # marks it sent, the proxy never admitted it, and aggkit's deterministic
-        # tx-ID dedup blocks any re-send forever (GER injection freezes; nothing
-        # proxy-side can re-drive a tx it never received). Production runbook =
-        # reset aggkit's monitor DB after proxy restarts; the seeder applies the
-        # same pairing: force-recreate the aggkits (no data volume -> fresh fs ->
-        # clean monitor DB -> chain-nonce refetch + GER re-send). docker restart
-        # would NOT work here: it preserves the container fs and the poisoned DB.
-        for _svc in aggkit aggkit-l2b; do
-            docker inspect "${PROJECT}-${_svc}-1" >/dev/null 2>&1 || continue
-            COMPOSE_PROJECT_NAME="$PROJECT" docker compose \
-                -f docker-compose.e2e.yml -f docker-compose.l2l2.yml \
-                --env-file fixtures/.env up -d --no-deps --force-recreate "$_svc" \
-                >/dev/null 2>&1 \
-                && log "HEAL  reset-aggkit-db — force-recreated ${_svc} (runbook pairing for restart-proxy)" \
-                || log "SKIP  reset-aggkit-db (${_svc} force-recreate failed)"
-        done
+        # Runbook pairing RETIRED (PR#164): the old blind force-recreate here
+        # DESTROYED sync state + cert lineage to clear one poisoned file —
+        # recreating aggkit-l2b on an aged stack cold-resyncs into anvil's
+        # 256-state wall (#87) and permanently halts bridgesync. The seeder only
+        # injects faults; recovery of the lost-in-transit wedge this can cause is
+        # the VERSIONED, self-contained scripts/aggkit-preserve-heal.sh (wipes
+        # ONLY ethtxmanager-aggoracle.sqlite; keeps cert lineage + sync cursors),
+        # run as a standing watchdog by the repo chaos orchestrator
+        # (e2e-chaos-soak.sh) — no external/scratchpad component required.
+        log "NOTE  restart-proxy: any lost-tx wedge is healed by scripts/aggkit-preserve-heal.sh (run by e2e-chaos-soak.sh)"
     else
         log "SKIP restart-proxy (docker restart $PROXY failed — not injected)"
     fi

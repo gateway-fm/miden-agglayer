@@ -145,6 +145,7 @@ fn bucket_method_label(method: &str) -> &'static str {
         "zkevm_getExitRootsByGER" => "zkevm_getExitRootsByGER",
         "admin_registerFaucet" => "admin_registerFaucet",
         "admin_registerNativeFaucet" => "admin_registerNativeFaucet",
+        "miden_registerNativeFaucet" => "miden_registerNativeFaucet",
         "admin_listFaucets" => "admin_listFaucets",
         // Anything else → "other". Includes typos and method-name-fuzzing
         // attacks. We still log the actual method via tracing for debugging.
@@ -696,6 +697,24 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 request.parse_params()?;
             let result =
                 crate::service_admin::admin_register_native_faucet(service, params.0).await;
+            json_rpc_response_from_result(
+                result,
+                answer_id,
+                ServiceErrorCode::AdminRegisterNativeFaucet,
+            )
+        }
+
+        // #154 — PERMISSIONLESS. Deliberately NOT prefixed `admin_`, so the
+        // admin-auth gate above does not apply. Everything it acts on is derived
+        // (origin identity from the faucet id, metadata from the deployed
+        // account); it accepts no caller-chosen values, and the bridge account
+        // stays admin-controlled — the proxy's SERVICE account submits the same
+        // ConfigAggBridgeNote the admin path uses.
+        "miden_registerNativeFaucet" => {
+            let params: (crate::service_admin::RegisterNativeFaucetPublicParams,) =
+                request.parse_params()?;
+            let result =
+                crate::service_admin::miden_register_native_faucet(service, params.0).await;
             json_rpc_response_from_result(
                 result,
                 answer_id,

@@ -184,6 +184,8 @@ pub struct InMemoryStore {
     // `service_state.reconcile_cursor` column (migration 010). See
     // Store::get_reconcile_cursor.
     reconcile_cursor: RwLock<u64>,
+    /// #90 — set by restore when it rebuilt the store and left `nonces` empty.
+    nonce_ledger_rebuilt: RwLock<bool>,
 
     // Cursor of the one configured L1 evidence scan. PostgreSQL stores this in
     // the legacy `finalized_scan_cursor` column for upgrade-safe provenance.
@@ -268,6 +270,7 @@ impl InMemoryStore {
             fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
+            nonce_ledger_rebuilt: RwLock::new(false),
             l1_evidence_cursor: RwLock::new(0),
             l1_evidence_policy: RwLock::new(None),
             tx_note_links: RwLock::new(HashMap::new()),
@@ -456,6 +459,29 @@ impl Store for InMemoryStore {
     async fn set_reconcile_cursor(&self, block: u64) -> anyhow::Result<()> {
         *self.reconcile_cursor.write() = block;
         Ok(())
+    }
+
+    // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
+
+    async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
+        Ok(*self.nonce_ledger_rebuilt.read())
+    }
+
+    async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
+        *self.nonce_ledger_rebuilt.write() = rebuilt;
+        Ok(())
+    }
+
+    async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
+        let key = addr.to_lowercase();
+        // One lock for the check + insert, matching the postgres insert-if-absent
+        // atomicity so a concurrent pair cannot both seed.
+        let mut nonces = self.nonces.write();
+        if nonces.contains_key(&key) {
+            return Ok(false);
+        }
+        nonces.insert(key, nonce);
+        Ok(true)
     }
 
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
@@ -905,9 +931,17 @@ impl Store for InMemoryStore {
             (from..=to).filter_map(|b| logs_by_block.get(&b)).collect()
         };
         for logs in candidate_logs {
-            for log in logs {
-                if filter.matches(log, current_block) {
-                    result.push(log.clone());
+            // Canonical served `logIndex` (see `log_synthesis::
+            // assign_canonical_block_indices`): computed over the block's
+            // COMPLETE log set BEFORE filtering, because Ethereum's `logIndex`
+            // is the log's absolute position in its block and a filtered query
+            // must still report the unfiltered position. Mirrors PgStore's
+            // ranked subquery exactly.
+            let mut canonical = logs.clone();
+            crate::log_synthesis::assign_canonical_block_indices(&mut canonical);
+            for log in canonical {
+                if filter.matches(&log, current_block) {
+                    result.push(log);
                     // OOM backstop only — NOT a normal cap.
                     if result.len() > super::GETLOGS_SAFETY_CEILING {
                         return Err(super::getlogs_row_cap_error(from, to));
@@ -916,11 +950,11 @@ impl Store for InMemoryStore {
             }
         }
         // eth_getLogs ordering contract: results MUST be ordered by
-        // (block_number, log_index), matching PgStore's `ORDER BY block_number,
-        // log_index`. The range path already yields this (ascending blocks; within
-        // a block, insertion order == log_index order), but the block_hash path
-        // scans `HashMap::values()` in ARBITRARY order — so sort unconditionally to
-        // pin the contract for both paths.
+        // (block_number, served log_index), matching PgStore's
+        // `ORDER BY block_number, served_log_index`. The block_hash path scans
+        // `HashMap::values()` in ARBITRARY order — sort unconditionally to pin
+        // the contract for both paths. `log_index` here is already the canonical
+        // per-block value assigned above.
         result.sort_by_key(|l| (l.block_number, l.log_index));
         Ok(result)
     }
@@ -928,8 +962,8 @@ impl Store for InMemoryStore {
     async fn get_logs_for_tx(&self, tx_hash: &str) -> anyhow::Result<Vec<SyntheticLog>> {
         let key = tx_hash.to_lowercase();
         let map = self.logs_by_tx.read();
-        let result = map.get(&key).cloned().unwrap_or_default();
-        if result.is_empty() {
+        let tx_logs = map.get(&key).cloned().unwrap_or_default();
+        if tx_logs.is_empty() {
             let stored_keys: Vec<&String> = map.keys().collect();
             tracing::debug!(
                 lookup_key = %key,
@@ -937,7 +971,32 @@ impl Store for InMemoryStore {
                 stored_keys = ?stored_keys.iter().take(10).collect::<Vec<_>>(),
                 "Store: get_logs_for_tx miss"
             );
+            return Ok(tx_logs);
         }
+        // Serve the same canonical per-block `logIndex` as `get_logs`: recompute
+        // each touched block's rank from its COMPLETE log set, then keep this
+        // tx's logs. Falls back to the raw per-tx rows only if a block's full
+        // set is missing (never the case for the real insert paths, which write
+        // both maps atomically).
+        let by_block = self.logs_by_block.read();
+        let blocks: std::collections::BTreeSet<u64> =
+            tx_logs.iter().map(|l| l.block_number).collect();
+        let mut result = Vec::new();
+        for block in blocks {
+            match by_block.get(&block) {
+                Some(full) => {
+                    let mut canonical = full.clone();
+                    crate::log_synthesis::assign_canonical_block_indices(&mut canonical);
+                    result.extend(
+                        canonical
+                            .into_iter()
+                            .filter(|l| l.transaction_hash.to_lowercase() == key),
+                    );
+                }
+                None => result.extend(tx_logs.iter().filter(|l| l.block_number == block).cloned()),
+            }
+        }
+        result.sort_by_key(|l| (l.block_number, l.log_index));
         Ok(result)
     }
 

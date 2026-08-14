@@ -57,6 +57,20 @@ OUT_UNITS="${OUT_UNITS:-100000}"            # units bridged out Miden->dest (the
 # chain. For L1 the return (dest->Miden) deposit is network_id=0 and is indexed by
 # the MIDEN bridge-service (which indexes L1); for L2B it is network_id=2 indexed by
 # the L2B service. The bridge contract is at the same address on all three chains.
+# ── Registration mode: REGISTER_MODE=admin (default) | permissionless ─────────
+# admin: the proxy admin registers the native faucet with an OPERATOR-CHOSEN
+#   origin_token_address (admin_registerNativeFaucet). Exercises the #149 metadata
+#   validation legs (1c/1d), which are admin-path-only.
+# permissionless: register through the PUBLIC miden_registerNativeFaucet (#154) —
+#   NO admin key — and take the DERIVED origin identity from the RPC response.
+#   This makes the full Miden->dest->Miden round-trip (both directions + return
+#   claim) run against the origin the permissionless path derives, proving the
+#   registered faucet is actually usable end-to-end (PR#164 #5), not just that the
+#   RPC/DB behave. The #149 admin-metadata legs are skipped (no caller metadata).
+REGISTER_MODE="${REGISTER_MODE:-admin}"
+[[ "$REGISTER_MODE" == "admin" || "$REGISTER_MODE" == "permissionless" ]] \
+    || fail "REGISTER_MODE must be 'admin' or 'permissionless' (got '$REGISTER_MODE')"
+
 DEST="${DEST:-l2b}"
 if [[ "$DEST" == "l1" ]]; then
     DEST_NET=0;                  DEST_RPC="$L1_RPC"
@@ -68,6 +82,7 @@ fi
 
 log "======================================================================"
 log "  MIDEN-ORIGINATED TOKEN (native lock/unlock): Miden -> $DEST_LABEL -> Miden"
+log "  registration = $REGISTER_MODE ($([[ "$REGISTER_MODE" == permissionless ]] && echo 'public miden_registerNativeFaucet, DERIVED origin' || echo 'admin_registerNativeFaucet, operator-chosen origin'))"
 log "  proxy network id (origin for native) = $MIDEN_NETWORK_ID (configured, not hardcoded)"
 log "  destination = $DEST_LABEL (net=$DEST_NET, rpc=$DEST_RPC)"
 log "======================================================================"
@@ -100,17 +115,36 @@ NATIVE_FAUCET_ID=$(awk '/faucet-id:/{print $NF}' "$_nf_log")
 rm -f "$_nf_log"
 pass "external party deployed native faucet: $NATIVE_FAUCET_ID + minted $MINT_UNITS MDN"
 
-step "1b. Proxy (bridge ADMIN) allowlists the faucet as native (is_native=true, origin_network=$MIDEN_NETWORK_ID)"
-# Only the proxy (bridge admin = service account) can register. admin_registerNativeFaucet
-# takes the EXTERNALLY-deployed faucet_id + its chosen origin_address and sends the
-# admin ConfigAggBridgeNote (is_native=true, origin_network = the CONFIGURED net id).
-REG_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
-  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
-  \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$NATIVE_ORIGIN_ADDR\",
-    \"symbol\":\"MDN\",\"decimals\":8}]}" 2>/dev/null) \
-  || fail "admin_registerNativeFaucet unreachable — check the proxy is up on $L2_RPC and ADMIN_API_KEY is valid"
-echo "$REG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if 'result' in d else 1)" \
-  || fail "admin_registerNativeFaucet failed: $REG_JSON"
+if [[ "$REGISTER_MODE" == "permissionless" ]]; then
+  step "1b. PERMISSIONLESS: register via public miden_registerNativeFaucet (NO admin key); origin is DERIVED"
+  # #154: anyone can register an already-deployed native faucet with no admin key.
+  # The origin identity is DERIVED (EthEmbeddedAccountId of the faucet id), not
+  # operator-chosen, so we ADOPT whatever the RPC returns and drive the rest of the
+  # round-trip against it — proving the derived origin is actually bridgeable.
+  REG_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -d "{
+    \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"miden_registerNativeFaucet\",
+    \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\"}]}" 2>/dev/null) \
+    || fail "miden_registerNativeFaucet unreachable WITHOUT an admin key — the method is not permissionless"
+  echo "$REG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if 'result' in d else 1)" \
+    || fail "miden_registerNativeFaucet failed: $REG_JSON"
+  DERIVED=$(echo "$REG_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin)['result'].get('origin_token_address',''))")
+  [[ "$DERIVED" =~ ^0x[0-9a-f]{40}$ ]] || fail "no derived origin address in the response: $REG_JSON"
+  # Everything downstream keys on NATIVE_ORIGIN_ADDR — repoint it at the DERIVED origin.
+  NATIVE_ORIGIN_ADDR="$DERIVED"
+  log "  derived origin identity: $NATIVE_ORIGIN_ADDR (a pure function of the faucet id)"
+else
+  step "1b. Proxy (bridge ADMIN) allowlists the faucet as native (is_native=true, origin_network=$MIDEN_NETWORK_ID)"
+  # Only the proxy (bridge admin = service account) can register. admin_registerNativeFaucet
+  # takes the EXTERNALLY-deployed faucet_id + its chosen origin_address and sends the
+  # admin ConfigAggBridgeNote (is_native=true, origin_network = the CONFIGURED net id).
+  REG_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" -d "{
+    \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_registerNativeFaucet\",
+    \"params\":[{\"faucet_id\":\"$NATIVE_FAUCET_ID\",\"origin_token_address\":\"$NATIVE_ORIGIN_ADDR\",
+      \"symbol\":\"MDN\",\"decimals\":8}]}" 2>/dev/null) \
+    || fail "admin_registerNativeFaucet unreachable — check the proxy is up on $L2_RPC and ADMIN_API_KEY is valid"
+  echo "$REG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if 'result' in d else 1)" \
+    || fail "admin_registerNativeFaucet failed: $REG_JSON"
+fi
 # The proxy records origin_network == its OWN configured network id (is_native is
 # derived from origin_network == service.network_id — no separate column).
 # admin_registerNativeFaucet is ASYNC: the RPC returns `result` before the on-chain
@@ -126,6 +160,7 @@ done
   || fail "native faucet origin_network='$NATIVE_NET', expected $MIDEN_NETWORK_ID (proxy must record the CONFIGURED net id)"
 pass "proxy allowlisted native faucet on the bridge (origin_network=$MIDEN_NETWORK_ID)"
 
+if [[ "$REGISTER_MODE" == "admin" ]]; then
 # ── 1c. #149 — registration validates against the deployed faucet account ─────
 # The deployed MDN faucet is authoritative (symbol=MDN, decimals=8). A registration
 # whose metadata DIFFERS from the faucet account must be REJECTED before any state
@@ -230,6 +265,9 @@ pass "#149: custom name '$CUSTOM_NAME' (!= symbol '$CUSTOM_SYMBOL') adopted + pr
 # restore-survival assertion in e2e-cantina13-metadata-recovery.sh reuses (its
 # coordinated proxy + bridge-service drop+restore proves the row survives). The
 # destructive in-script restore leg was removed per the PR #150 re-review.
+else
+  log "  (REGISTER_MODE=permissionless — skipping admin-only #149 metadata-validation legs 1c/1d)"
+fi
 
 # ── 2. Bridge OUT Miden -> L2B (bridge locks the native asset) ────────────────
 step "2. Bridge out $OUT_UNITS native MDN Miden -> $DEST_LABEL (bridge LOCKS; proxy emits originNetwork=$MIDEN_NETWORK_ID)"
@@ -337,5 +375,5 @@ WRAPPED_SUPPLY=$(cast call "$WRAPPED_L2B" "totalSupply()(uint256)" --rpc-url "$D
 pass "NET-ZERO: native holder = $NATIVE_BAL units; wrapped $DEST_LABEL supply = 0"
 
 log "======================================================================"
-log "  MIDEN-ORIGINATED ROUND-TRIP PASS — native lock/unlock, exact-block, net-zero"
+log "  MIDEN-ORIGINATED ROUND-TRIP PASS ($REGISTER_MODE registration) — native lock/unlock, exact-block, net-zero"
 log "======================================================================"

@@ -95,6 +95,15 @@ struct Args {
     #[arg(long)]
     print_script_roots: bool,
 
+    /// Derive the synthetic bridge-out transaction hashes for the given
+    /// 0x-hex NoteIds (repeatable) — the EXACT hash the proxy serves a
+    /// BridgeEvent under (`bridge_out::derive_bridge_out_tx_hash`). Ground
+    /// truth for external verifiers: a RECLAIMED note's derived hash appearing
+    /// in eth_getLogs is a wrongly-emitted event (review 0814). Prints
+    /// `<note_id> <tx_hash>` per line and exits. Pure print — no node/store.
+    #[arg(long = "derive-bridge-out-tx-hash", num_args = 1..)]
+    derive_bridge_out_tx_hash: Vec<String>,
+
     /// Injection mode for the reconciler private-note e2e (0.15.5 hotfix):
     /// create + submit a PRIVATE P2ID note from the isolated wallet to itself
     /// (zero assets) with the DEFAULT note tag (0) — the same tag-0 family the
@@ -432,6 +441,16 @@ async fn main() -> anyhow::Result<()> {
             "ger=0x{}",
             hex::encode(miden_base_agglayer::UpdateGerNote::script_root().as_bytes())
         );
+        return Ok(());
+    }
+
+    if !args.derive_bridge_out_tx_hash.is_empty() {
+        for id in &args.derive_bridge_out_tx_hash {
+            println!(
+                "{id} {}",
+                miden_agglayer_service::bridge_out::derive_bridge_out_tx_hash(id)
+            );
+        }
         return Ok(());
     }
 

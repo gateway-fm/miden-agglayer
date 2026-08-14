@@ -215,28 +215,6 @@ fn note_consumed_block(note: &InputNoteRecord, fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
-/// Deterministically order the locally sourced CLAIM/GER records by consumed block,
-/// transaction order and details commitment. B2AGG restore uses the authoritative
-/// transaction-input order in `restore_bridge_replay` instead.
-fn sort_consumed_for_projection(notes: &mut [&InputNoteRecord]) {
-    notes.sort_by(|a, b| {
-        a.state()
-            .consumed_block_height()
-            .map(|h| h.as_u64())
-            .cmp(&b.state().consumed_block_height().map(|h| h.as_u64()))
-            .then_with(|| {
-                a.state()
-                    .consumed_tx_order()
-                    .cmp(&b.state().consumed_tx_order())
-            })
-            .then_with(|| {
-                a.details_commitment()
-                    .as_bytes()
-                    .cmp(&b.details_commitment().as_bytes())
-            })
-    });
-}
-
 struct RecoveredBridgeBody {
     details: NoteDetails,
     attachments: NoteAttachments,
@@ -260,6 +238,16 @@ struct RecoveredBridgeOuts {
     /// Finding #69 — CLAIM bodies collected by the same block walk.
     claim_id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
     claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody>,
+    /// #88 — node-authoritative metadata for EVERY public note seen by the
+    /// block walk, keyed by details commitment (the client store's
+    /// `details_commitment()` key). The MA#28 provenance source that survives
+    /// a FULL drop-restore: with the miden-client store wiped alongside the
+    /// proxy store, consumed records are metadata-less (`ConsumedExternal`)
+    /// and the own-output-record fallback is empty — without this map every
+    /// historical UpdateGerNote is skipped as MissingMetadata and the restored
+    /// GER ledger (UHC logs + is_injected) silently loses history. Fail-closed
+    /// holds: only notes the NODE returned as Public contribute.
+    public_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata>,
 }
 
 struct ReplayBridgeOut {
@@ -267,6 +255,11 @@ struct ReplayBridgeOut {
     body: RecoveredBridgeBody,
     block: u64,
     tx_order: u32,
+    /// Position of this note among its consuming transaction's inputs — the
+    /// authoritative within-transaction order the live projector uses to break
+    /// same-transaction B2AGG sibling ties (`within_tx_pos`). Without it, two
+    /// siblings in one transaction have an unknowable relative order.
+    within_tx_pos: u32,
 }
 
 /// Finding #69 — a bridge-consumed CLAIM joined to its consuming bridge
@@ -278,8 +271,11 @@ struct ReplayBridgeOut {
 struct ReplayClaim {
     id: NoteId,
     body: RecoveredClaimBody,
+    /// Consumption block — the ONLY ordering datum a claim carries. The
+    /// consuming transaction's order and input position are deliberately NOT
+    /// captured: live claim records store neither (NULL tx_order), and the
+    /// shared `projection_order` key mirrors the live record exactly.
     block: u64,
-    tx_order: u32,
 }
 
 /// Run the full restore algorithm.
@@ -337,6 +333,36 @@ pub async fn restore(
     let (miden_tip, let_leaves) = sync_miden_snapshot(miden_client, accounts.bridge.0).await?;
     tracing::info!("Phase 1 complete: miden tip {miden_tip}, LET leaves {let_leaves}");
 
+    // Phase 1.1: HEALING SWEEP — recovery performs the genesis note re-sweep
+    // ITSELF, before any phase that reads the client store's consumed feed.
+    //
+    // The canonical recovery invocation is `--reset-miden-store --restore`, which
+    // empties the miden-client store. Phases 2/2.5/3 replay from that store's
+    // CONSUMED feed. Historically the heal was deferred to the serving proxy's
+    // reconciler ("the genesis sweep IS the healing pass"), but Phase 4 parks the
+    // projector cursor at the tip — so notes the sweep imports AFTERWARDS are
+    // never projected. The GER replay (Phase 3), whose only source is that feed,
+    // therefore rebuilt NOTHING on a full-DB-loss recovery: UpdateHashChain went
+    // 40 -> 0 and is_injected 40 -> 0, permanently, which then lets aggoracle
+    // re-inject already-registered GERs (immortal poison notes, #86).
+    //
+    // Ordering it here makes recovery self-sufficient: the sweep that PRODUCES
+    // the consumed feed runs before every replay that CONSUMES it, and the
+    // post-restore sweep becomes a cheap no-op instead of a load-bearing (but
+    // too-late) dependency — which also removes the duplicated full block walk.
+    let swept_to = sweep_notes_for_recovery(
+        store,
+        miden_client,
+        accounts,
+        local_network_id,
+        block_state,
+        network_rpcs.clone(),
+        node_url,
+        api_key,
+        miden_tip,
+    )
+    .await?;
+
     let mut total_logs = 0usize;
 
     // Recover full public B2AGG bodies and join them directly to the bridge transaction
@@ -350,13 +376,25 @@ pub async fn restore(
         scan_tip,
         "Phase 1.5: scanning bridge-out notes from the node..."
     );
-    let recovered = scan_bridge_out_bodies(&*rpc, accounts.bridge.0, scan_tip)
-        .await
-        .map_err(|e| anyhow::anyhow!("restore bridge-out body scan failed: {e:#}"))?;
+    // MA#28 sender for the GER-metadata provenance gate — same ger_manager /
+    // service fallback `restore_gers` and `submit_update_ger_note` resolve.
+    let expected_ger_sender = accounts
+        .ger_manager
+        .as_ref()
+        .map(|a| a.0)
+        .unwrap_or(accounts.service.0);
+    let mut recovered =
+        scan_bridge_out_bodies(&*rpc, accounts.bridge.0, expected_ger_sender, scan_tip)
+            .await
+            .map_err(|e| anyhow::anyhow!("restore bridge-out body scan failed: {e:#}"))?;
     tracing::info!(
         "Phase 1.5 complete: found {} B2AGG note(s)",
         recovered.by_id.len()
     );
+    // #88 — take (not clone) the node-authoritative GER metadata map out before
+    // `recovered` is consumed by restore_bridge_replay; Phase 4's GER replay
+    // needs it when the client store was wiped along with the proxy store.
+    let node_note_metadata = std::mem::take(&mut recovered.public_note_metadata);
     let (bridge_replay, claim_replay) =
         restore_bridge_replay(&*rpc, accounts.bridge.0, recovered, scan_tip)
             .await
@@ -435,71 +473,36 @@ pub async fn restore(
         "Phase 1.7 complete: {faucet_identities_rebuilt} faucet identity row(s) rebuilt"
     );
 
-    // Phase 2: Scan miden consumed B2AGG notes
-    tracing::info!("Phase 2: scanning miden consumed B2AGG notes...");
-    let (bridge_outs, logs) = restore_bridge_outs(
+    // ── Phase 2: ONE chronologically-ordered replay of ALL history ───────────
+    //
+    // Formerly Phases 2 / 2.5 / 2.6 / 3 — a pass per note KIND, each internally
+    // sorted but sequential overall, and each opening its own client session.
+    // That re-numbered `log_index` (one global counter) and diverged
+    // `hash_chain_value` (a fold in emission order) on every recovery, because
+    // the live projector walks BLOCK-major while restore walked KIND-major.
+    // `replay_history_in_order` implements the design doc's single
+    // `{B2AGG, INTERNAL} -> ORDER -> EMIT` stage, so restored history is emitted
+    // in exactly the order the live projector would have emitted it.
+    tracing::info!("Phase 2: replaying ALL history in one chronological pass...");
+    let replayed = replay_history_in_order(
         store,
         miden_client,
-        accounts.bridge.0,
+        accounts,
         local_network_id,
         block_state,
         &network_rpcs,
         bridge_replay,
-    )
-    .await?;
-    total_logs += logs;
-    tracing::info!("Phase 2 complete: {bridge_outs} bridge-outs, {logs} logs");
-
-    // Phase 2.5: Scan miden consumed CLAIM notes — Cantina MA#27
-    //
-    // The live `ClaimWatcher::on_post_sync` (claim_watcher.rs) is the only
-    // path that synthesises a `ClaimEvent` log when the primary
-    // `eth_sendRawTransaction` flow didn't write one (crash recovery + any
-    // CLAIM consumed by a tracked account through a non-RPC path).
-    // `restore()` previously skipped this entirely, so after a fresh DB
-    // (e.g. `--reset-miden-store --restore`) every pre-existing claim was
-    // dropped on the floor — bridge-service never saw the synthetic event
-    // and the L1 deposit stayed `claimed=false` forever, blocking the next
-    // aggsender certificate. Replay using the same primitives the live
-    // watcher uses so the synthetic logs are byte-identical (same tx-hash
-    // derivation, same `commit_manual_claim_event_atomic` store path).
-    tracing::info!("Phase 2.5: scanning miden consumed CLAIM notes (MA#27)...");
-    let (claims, claim_logs) =
-        restore_claims(store, miden_client, accounts, block_state, miden_tip).await?;
-    total_logs += claim_logs;
-    tracing::info!("Phase 2.5 complete: {claims} claims, {claim_logs} logs");
-
-    // Phase 2.6: Replay node-scanned bridge-consumed CLAIM notes — finding #69
-    //
-    // Phase 2.5's source is the local miden-client store, which
-    // `--reset-miden-store` wipes — so a from-scratch recovery restored ZERO
-    // historical claims, and aggkit's aggsender could never resolve its last
-    // settled certificate's "last imported bridge exit" to a block ("no claim
-    // found for bridge exit hash …") → Miden-side certificate settlement dead
-    // after a full recovery. This phase replays the SAME claims from the node
-    // scan (Phase 1.5) joined to the bridge's consuming transactions, at their
-    // original consumption blocks. The shared `project_claim_parts` dedups make
-    // 2.5 + 2.6 idempotent in either order. Deliberately CLAIMS ONLY — the
-    // historical GER/UpdateHashChain view still resets by design.
-    tracing::info!("Phase 2.6: replaying node-scanned CLAIM notes (finding #69)...");
-    let node_claims = restore_claims_from_node(
-        store,
-        block_state,
         claim_replay,
-        accounts.service.0,
-        accounts.bridge.0,
+        miden_tip,
+        node_note_metadata,
     )
     .await?;
-    total_logs += node_claims;
-    tracing::info!("Phase 2.6 complete: {node_claims} claims from node scan");
-    let claims = claims + node_claims;
-
-    // Phase 3: Scan consumed UpdateGerNote notes on Miden
-    tracing::info!("Phase 3: scanning consumed UpdateGerNote notes on Miden...");
-    let (gers, ger_logs) =
-        restore_gers(store, miden_client, accounts, block_state, miden_tip).await?;
-    total_logs += ger_logs;
-    tracing::info!("Phase 3 complete: {gers} GERs, {ger_logs} logs");
+    let (bridge_outs, claims, gers) = (replayed.bridge_outs, replayed.claims, replayed.gers);
+    total_logs += bridge_outs + claims + gers;
+    tracing::info!(
+        "Phase 2 complete: {bridge_outs} bridge-outs, {claims} claims, {gers} GERs — \
+         emitted through the SHARED per-block projection unit in canonical order"
+    );
 
     let accounted = store.get_accounted_deposit_count().await?;
     if accounted != let_leaves {
@@ -509,9 +512,11 @@ pub async fn restore(
         );
     }
 
+    verify_emitted_frontier(store).await?;
+
     // Phase 4: cursor finalization (factored into a helper so the reconcile-
     // cursor reset is unit-testable — see `finalize_restore_cursors`).
-    finalize_restore_cursors(store, miden_tip).await?;
+    finalize_restore_cursors(store, miden_tip, Some(swept_to)).await?;
 
     // Phase 5: Verify
     tracing::info!("Phase 5: verification");
@@ -541,19 +546,148 @@ pub async fn restore(
 /// imported note — the genesis re-sweep IS the healing pass that re-discovers
 /// externally-created network notes, and it must not be skipped by a stale
 /// persisted cursor.
+/// Review 0814 (blocking): `accounted == let_leaves` proves every leaf is
+/// RESERVED, not EMITTED — `project_b2agg_note` has post-reservation `Skipped`
+/// paths (unparsable / no asset / unknown faucet / oversize / self-target).
+/// Finalizing over a skipped leaf would ship the exact permanent
+/// `depositCount` gap the live emitted-frontier gate refuses to seal past.
+/// Same gate, same fail-closed posture, run after replay and BEFORE cursor
+/// finalization: the one-shot fails and the operator repairs the leaf's
+/// metadata (registry backfill) before re-running `--restore`.
+pub(crate) async fn verify_emitted_frontier(store: &Arc<dyn Store>) -> anyhow::Result<()> {
+    if let Some((idx, note)) = store.first_unemitted_reservation().await? {
+        anyhow::bail!(
+            "restore: note {note} (LET index {idx}) is reserved but its BridgeEvent was \
+             never emitted (quarantined / unrecoverable metadata); refusing to finalize \
+             a store with a depositCount gap — repair the leaf's metadata and re-run \
+             `--restore`"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn finalize_restore_cursors(
     store: &Arc<dyn Store>,
     miden_tip: u64,
+    swept_to: Option<u64>,
 ) -> anyhow::Result<()> {
     store.set_latest_block_number(miden_tip).await?;
     store.set_projector_cursor(miden_tip).await?;
     tracing::info!("Phase 4: synthetic tip + projector cursor set to Miden tip {miden_tip}");
-    store.set_reconcile_cursor(0).await?;
-    tracing::info!(
-        "reconcile cursor reset — full-history re-sweep will run (restore rebuilds the miden \
-         store; the genesis sweep is the healing pass that re-discovers external notes)"
+
+    // #90 — the `nonces` table has NO chain source, so a rebuilt store starts with
+    // an EMPTY nonce ledger while CONTINUING signers (aggkit's aggoracle/aggsender
+    // wallets) keep submitting from where they left off. Without this marker the
+    // admission path sees `expected 0` vs `tx.nonce N`, parks the tx in the
+    // future-nonce queue, and waits for a nonce that can never be submitted — on
+    // the 2026-08-11 gate the GER injector spun 34,287 times in ~30min and
+    // injection never resumed. Record that the ledger was rebuilt so admission can
+    // adopt each signer's first observed nonce as its baseline instead of
+    // demanding 0.
+    store.set_nonce_ledger_rebuilt(true).await?;
+    tracing::warn!(
+        "Phase 4: nonce ledger is EMPTY after restore — flagged for first-contact \
+         bootstrap (#90); ordinary R4 ordering resumes per signer once seeded"
     );
+
+    // Recovery now performs the healing sweep ITSELF (Phase 1.1), before the
+    // replay phases that depend on it. When that sweep reached the tip there is
+    // nothing left to re-discover, so leaving the cursor there avoids a second
+    // full-history block walk on the next boot (the old behaviour: restore
+    // walked every block, then the serving proxy walked them all again — and,
+    // because the projector cursor is parked at the tip above, that second walk
+    // could not project anything anyway).
+    //
+    // Fail-safe: if the sweep did NOT reach the tip, fall back to the historical
+    // reset-to-genesis so the serving proxy still attempts the heal.
+    match swept_to {
+        Some(t) if t >= miden_tip => {
+            store.set_reconcile_cursor(t).await?;
+            tracing::info!(
+                swept_to = t,
+                "reconcile cursor left at the swept tip — recovery already ran the healing \
+                 sweep (Phase 1.1); no redundant genesis re-walk on the next boot"
+            );
+        }
+        other => {
+            store.set_reconcile_cursor(0).await?;
+            tracing::warn!(
+                swept_to = ?other,
+                "reconcile cursor reset to genesis — recovery's healing sweep did not reach the \
+                 tip, so the serving proxy must re-sweep"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Phase 1.1 — run the note-visibility sweep from GENESIS to `miden_tip` inside
+/// recovery, so every later replay phase reads a COMPLETE consumed-note feed.
+///
+/// Returns the block the sweep reached (== `miden_tip` on success). Any failure
+/// propagates: a partial feed would make the GER hash-chain replay silently lose
+/// history, which is precisely the failure this exists to prevent.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_notes_for_recovery(
+    store: &Arc<dyn Store>,
+    miden_client: &MidenClient,
+    accounts: &AccountsConfig,
+    local_network_id: u32,
+    block_state: &Arc<BlockState>,
+    network_rpcs: crate::metadata_recovery::NetworkRpcMap,
+    node_url: &str,
+    api_key: Option<&str>,
+    miden_tip: u64,
+) -> anyhow::Result<u64> {
+    // Start at genesis: the client store was just wiped, so a stale persisted
+    // cursor must not skip the heal. Set BEFORE constructing the projector —
+    // `SyntheticProjector::new` loads the cursor once, in `new()`.
+    store.set_reconcile_cursor(0).await?;
+    let projector = Arc::new(
+        crate::synthetic_projector::SyntheticProjector::new(
+            store.clone(),
+            block_state.clone(),
+            accounts,
+            local_network_id,
+            network_rpcs,
+            node_url.to_string(),
+            api_key.map(str::to_string),
+        )
+        .await?,
+    );
+    tracing::info!(
+        miden_tip,
+        "Phase 1.1: recovery healing sweep — importing notes from genesis before any replay..."
+    );
+    let reached = Arc::new(std::sync::Mutex::new(None::<u64>));
+    let reached_inner = reached.clone();
+    let projector_inner = projector.clone();
+    miden_client
+        .with(move |client| {
+            Box::new(async move {
+                let to = projector_inner
+                    .sweep_notes_to_completion(client, miden_tip)
+                    .await?;
+                // The sweep imports notes; a final sync resolves their
+                // consumption (nullifier check) so the consumed feed the replay
+                // phases read is actually populated, not merely "known".
+                client.sync_state().await?;
+                *reached_inner.lock().unwrap() = Some(to);
+                Ok(())
+            })
+        })
+        .await?;
+    let reached = reached
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Phase 1.1: healing sweep produced no result"))?;
+    tracing::info!(
+        swept_to = reached,
+        miden_tip,
+        "Phase 1.1 complete: consumed-note feed healed to the Miden tip"
+    );
+    Ok(reached)
 }
 
 /// Phase 1: sync miden and return the current MIDEN tip (sync height) — the
@@ -592,19 +726,66 @@ async fn sync_miden_snapshot(
 
 /// Scans every block in a fixed snapshot and retains public B2AGG bodies by unique NoteId.
 /// Any incomplete RPC response aborts restore; a partial identity set is unsafe to replay.
+/// #88 / PR#164 — merge one GER-shaped node note's metadata into the restore
+/// map, ambiguity-safe. Details commitment excludes metadata, so if two
+/// GER-shaped notes share details but carry DIFFERENT metadata we drop the key
+/// into `ambiguous` and never serve it again — the replay then fails closed
+/// rather than joining a GER to a last-writer's provenance. Identical
+/// metadata for the same key is idempotent. Pure + unit-tested.
+fn record_ger_node_metadata(
+    map: &mut std::collections::HashMap<[u8; 32], NoteMetadata>,
+    ambiguous: &mut std::collections::HashSet<[u8; 32]>,
+    key: [u8; 32],
+    metadata: NoteMetadata,
+) {
+    if ambiguous.contains(&key) {
+        return;
+    }
+    match map.get(&key) {
+        Some(existing) if *existing != metadata => {
+            map.remove(&key);
+            ambiguous.insert(key);
+            ::metrics::counter!("restore_ger_meta_ambiguous_total").increment(1);
+        }
+        Some(_) => {}
+        None => {
+            map.insert(key, metadata);
+        }
+    }
+}
+
 async fn scan_bridge_out_bodies(
     rpc: &dyn miden_client::rpc::NodeRpcClient,
     bridge_id: AccountId,
+    // #164 re-review — the MA#28 sender the GER-metadata candidates must carry.
+    // Gating candidates on provenance AT SCAN TIME is what makes the join
+    // un-griefable; see `record_ger_node_metadata`.
+    expected_ger_sender: AccountId,
     to_block: u32,
 ) -> anyhow::Result<RecoveredBridgeOuts> {
     use miden_client::rpc::domain::note::FetchedNote;
     use miden_protocol::block::BlockNumber;
     let claim_root = miden_base_agglayer::ClaimNote::script().root();
+    let ger_root = UpdateGerNote::script_root();
     let mut by_id = std::collections::HashMap::new();
     let mut id_by_nullifier = std::collections::HashMap::new();
     let mut claims_by_id: std::collections::HashMap<NoteId, RecoveredClaimBody> =
         std::collections::HashMap::new();
     let mut claim_id_by_nullifier = std::collections::HashMap::new();
+    // #88 / PR#164: node-authoritative GER metadata for the restore replay,
+    // keyed by details commitment. Restricted to GER-shaped notes (bounds
+    // memory to the GER count, not total chain traffic) and ambiguity-safe:
+    // details commitment excludes metadata, so if two public GER-shaped notes
+    // share details but carry DIFFERENT metadata (different sender), we drop
+    // the key into `ambiguous` and never serve it — the replay then fails
+    // closed (MissingMetadata) rather than joining a GER to a last-writer's
+    // provenance. A legit GER note has a random serial, so a genuine collision
+    // is effectively unreachable; this is correctness-by-construction, not a
+    // hot path.
+    let mut public_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> =
+        std::collections::HashMap::new();
+    let mut ambiguous_ger_meta: std::collections::HashSet<[u8; 32]> =
+        std::collections::HashSet::new();
     let mut scanned = 0usize;
     for b in 0..=to_block {
         let block = rpc
@@ -630,6 +811,44 @@ async fn scan_bridge_out_bodies(
                     // mint-proof provenance path needs post `--reset-miden-store`.
                     let metadata = *note.metadata();
                     let details: NoteDetails = note.into();
+                    // #88 / PR#164: retain node-authoritative metadata ONLY for
+                    // GER-shaped notes (bounds memory), and fail closed on a
+                    // details-commitment collision that carries different
+                    // metadata instead of last-write-wins.
+                    // #164 re-review — GER-shaped is NOT enough. Anyone can publish a
+                    // note with the SAME details as a legitimate UpdateGerNote (details
+                    // are public and exclude metadata) but their own sender. Both would
+                    // land under one details-commitment key, the ambiguity guard would
+                    // fail closed, and the GENUINE entry would be dropped — a griefing
+                    // DoS that silently deletes GER history on every later restore.
+                    //
+                    // Gate candidates on MA#28 PROVENANCE here, using the very predicate
+                    // that decides acceptance later (`classify_ger_note`). A clone cannot
+                    // forge `metadata.sender`: it is stamped by the account that executed
+                    // the minting transaction, so only the real ger_manager's notes are
+                    // recorded and an impostor never enters the map. Two notes that both
+                    // pass this gate with identical details necessarily share sender and
+                    // attachment, so their metadata is equal and the idempotent branch
+                    // handles them — ambiguity then means a genuine protocol anomaly,
+                    // which is exactly when failing closed is right.
+                    if details.script().root() == ger_root
+                        && matches!(
+                            classify_ger_note(
+                                Some(&metadata),
+                                &attachments,
+                                expected_ger_sender,
+                                bridge_id,
+                            ),
+                            GerNoteVerdict::Accept
+                        )
+                    {
+                        record_ger_node_metadata(
+                            &mut public_note_metadata,
+                            &mut ambiguous_ger_meta,
+                            details.commitment().as_bytes(),
+                            metadata,
+                        );
+                    }
                     if is_b2agg_note(&details) {
                         if by_id
                             .insert(
@@ -699,6 +918,7 @@ async fn scan_bridge_out_bodies(
         by_id,
         claim_id_by_nullifier,
         claims_by_id,
+        public_note_metadata,
     })
 }
 
@@ -723,11 +943,151 @@ async fn restore_bridge_replay(
         .await
         .map_err(|e| anyhow::anyhow!("restore: sync bridge transactions 0..{to_block}: {e}"))?;
 
-    let claims_by_id = std::mem::take(&mut recovered.claims_by_id);
-    let claim_id_by_nullifier = std::mem::take(&mut recovered.claim_id_by_nullifier);
+    let mut claims_by_id = std::mem::take(&mut recovered.claims_by_id);
+    let mut claim_id_by_nullifier = std::mem::take(&mut recovered.claim_id_by_nullifier);
+    recover_erased_bridge_inputs(
+        rpc,
+        bridge_id,
+        &txs,
+        &mut recovered.by_id,
+        &mut recovered.id_by_nullifier,
+        &mut claims_by_id,
+        &mut claim_id_by_nullifier,
+    )
+    .await?;
     let bridge_replay = build_bridge_replay(&txs, bridge_id, recovered)?;
     let claim_replay = build_claim_replay(&txs, bridge_id, claims_by_id, claim_id_by_nullifier)?;
     Ok((bridge_replay, claim_replay))
+}
+
+/// ERASED-NOTE recovery (loop catch, 2026-08-12 cycle 2): a note CREATED and
+/// CONSUMED within the same block window is ERASED from block output notes, so
+/// the Phase-1.5 block walk never sees its body and — after `--reset-miden-store`
+/// — the client store has no record either. The result was a silent
+/// ClaimEvent loss on restore: 160 -> 159 logs, the missing one a CLAIM consumed
+/// during a quiet post-restore window where the worker's note was ntx-consumed in
+/// the block it was born (under load, creation and consumption straddle blocks,
+/// which is why 56 sibling claims survived and no single-cycle drill ever hit it).
+/// This is the cantina13/#18 erasure gap materializing in restore.
+///
+/// The recovery mirrors the projector's fast-consume fix: the bridge's
+/// `sync_transactions` inputs still carry the NOTE HEADER for unauthenticated
+/// (fast-consumed) inputs, and the node's `get_notes_by_id` DOES serve erased
+/// note bodies. So: collect every input-header NoteId the scan did not resolve,
+/// fetch the bodies, and slot CLAIM/B2AGG shapes into the replay maps — the
+/// existing `(block, tx_order, input pos)` join then places them exactly where
+/// live emitted them. Provenance is intact: these notes were consumed by OUR
+/// bridge (they are its transaction inputs — the MA#3 consumer trust root), and
+/// the per-note gates still run at projection time.
+///
+/// A GER-shaped erased note routes through the same channel (review 0814): the
+/// internal-replay join is shape-agnostic and the per-block unit dispatches by
+/// shape, so the body reaches `project_ger_note` with its metadata (MA#28
+/// sender gate) — its `UpdateHashChain` / `is_injected` / chain contribution
+/// are replayed instead of silently lost. A note the node returns as PRIVATE
+/// (no body) or does not return at all FAILS the restore: nothing can rebuild
+/// a body that was never public, and finalizing would silently drop events.
+async fn recover_erased_bridge_inputs(
+    rpc: &dyn miden_client::rpc::NodeRpcClient,
+    bridge_id: AccountId,
+    txs: &[miden_client::rpc::domain::transaction::TransactionRecord],
+    by_id: &mut std::collections::HashMap<NoteId, RecoveredBridgeBody>,
+    id_by_nullifier: &mut std::collections::HashMap<Nullifier, NoteId>,
+    claims_by_id: &mut std::collections::HashMap<NoteId, RecoveredClaimBody>,
+    claim_id_by_nullifier: &mut std::collections::HashMap<Nullifier, NoteId>,
+) -> anyhow::Result<()> {
+    use miden_client::rpc::domain::note::FetchedNote;
+
+    let mut missing: Vec<NoteId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, _, tx) in ordered_account_transactions(txs, bridge_id)? {
+        for input in tx.transaction_header.input_notes().iter() {
+            if let Some(header) = input.header() {
+                let id = header.id();
+                if !by_id.contains_key(&id) && !claims_by_id.contains_key(&id) && seen.insert(id) {
+                    missing.push(id);
+                }
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let fetched = rpc
+        .get_notes_by_id(&missing)
+        .await
+        .map_err(|e| anyhow::anyhow!("restore: fetch erased bridge-input notes: {e}"))?;
+    let claim_root = miden_base_agglayer::ClaimNote::script().root();
+    let ger_root = UpdateGerNote::script_root();
+    let (mut claims, mut b2aggs, mut gers, mut opaque) = (0usize, 0usize, 0usize, 0usize);
+    let mut returned = std::collections::HashSet::new();
+    for fetched_note in fetched {
+        returned.insert(fetched_note.id());
+        let FetchedNote::Public(note, _) = fetched_note else {
+            opaque += 1;
+            continue;
+        };
+        let id = note.id();
+        let nullifier = note.nullifier();
+        let attachments = note.attachments().clone();
+        let metadata = *note.metadata();
+        let details: NoteDetails = note.into();
+        if details.script().root() == claim_root {
+            claims_by_id.entry(id).or_insert(RecoveredClaimBody {
+                details,
+                metadata,
+                attachments,
+            });
+            claim_id_by_nullifier.entry(nullifier).or_insert(id);
+            claims += 1;
+        } else if is_b2agg_note(&details) {
+            by_id.entry(id).or_insert(RecoveredBridgeBody {
+                details,
+                attachments,
+            });
+            id_by_nullifier.entry(nullifier).or_insert(id);
+            b2aggs += 1;
+        } else if details.script().root() == ger_root {
+            // Review 0814 (blocking): an erased same-block `UpdateGerNote` used
+            // to be counted + warned while restore finalized WITHOUT its
+            // `UpdateHashChain` / `is_injected` / rolling-chain contribution.
+            // Route it through the same internal-replay channel as claims:
+            // `build_claim_replay` joins bodies to bridge-tx inputs
+            // shape-agnostically, and the per-block unit dispatches by shape,
+            // so this body reaches `project_ger_note` at its true block with
+            // metadata (the MA#28 sender gate) intact.
+            claims_by_id.entry(id).or_insert(RecoveredClaimBody {
+                details,
+                metadata,
+                attachments,
+            });
+            claim_id_by_nullifier.entry(nullifier).or_insert(id);
+            gers += 1;
+        }
+    }
+    let unreturned = missing.iter().filter(|id| !returned.contains(id)).count();
+    ::metrics::counter!("restore_erased_claims_recovered_total").increment(claims as u64);
+    ::metrics::counter!("restore_erased_b2agg_recovered_total").increment(b2aggs as u64);
+    ::metrics::counter!("restore_erased_gers_recovered_total").increment(gers as u64);
+    tracing::info!(
+        candidates = missing.len(),
+        claims,
+        b2aggs,
+        gers,
+        "restore: recovered erased (same-block-consumed) bridge-input note bodies \
+         from input headers"
+    );
+    if opaque > 0 || unreturned > 0 {
+        ::metrics::counter!("restore_erased_notes_unrecovered_total")
+            .increment((opaque + unreturned) as u64);
+        anyhow::bail!(
+            "restore: {opaque} private/bodyless + {unreturned} unreturned erased \
+             bridge-input note(s) cannot be rebuilt from chain data — finalizing \
+             would silently drop their events; investigate before re-running --restore"
+        );
+    }
+    Ok(())
 }
 
 fn build_bridge_replay(
@@ -742,7 +1102,8 @@ fn build_bridge_replay(
     } = recovered;
     let mut replay = Vec::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
-        for input in tx.transaction_header.input_notes().iter() {
+        for (within_tx_pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
+            let within_tx_pos = within_tx_pos as u32;
             let id = input
                 .header()
                 .map(|header| header.id())
@@ -761,6 +1122,7 @@ fn build_bridge_replay(
                 body,
                 block,
                 tx_order: order,
+                within_tx_pos,
             });
         }
     }
@@ -784,7 +1146,7 @@ fn build_claim_replay(
     claim_id_by_nullifier: std::collections::HashMap<Nullifier, NoteId>,
 ) -> anyhow::Result<Vec<ReplayClaim>> {
     let mut replay = Vec::new();
-    for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
+    for (block, _order, tx) in ordered_account_transactions(txs, bridge_id)? {
         for input in tx.transaction_header.input_notes().iter() {
             let id = input
                 .header()
@@ -799,12 +1161,9 @@ fn build_claim_replay(
             {
                 anyhow::bail!("restore: CLAIM NoteId {id} body/transaction commitment mismatch");
             }
-            replay.push(ReplayClaim {
-                id,
-                body,
-                block,
-                tx_order: order,
-            });
+            // Only the consumption BLOCK is kept: live claim records carry no
+            // tx order (see ReplayClaim's docs / `projection_order`).
+            replay.push(ReplayClaim { id, body, block });
         }
     }
     tracing::info!(
@@ -956,76 +1315,378 @@ async fn restore_faucet_identities(
     Ok(n)
 }
 
+/// Tallies from the merged replay, kept per-kind so the phase-level log lines
+/// (and the restore summary) stay unchanged for operators.
+#[derive(Debug, Default)]
+pub(crate) struct ReplayCounts {
+    pub bridge_outs: usize,
+    pub claims: usize,
+    pub gers: usize,
+}
+
+/// The shared per-block EMIT stage — the one dispatch loop for synthetic-event
+/// projection, used verbatim by the LIVE projector tick
+/// (`SyntheticProjector::project_block_notes`) and the `--restore` replay.
+/// Ordering inside is the shared `projection_order` comparator; there is no
+/// second copy of either the sort or the dispatch anywhere.
+///
+/// Sealing (tip advance) and the emitted-frontier gate stay OUTSIDE this unit:
+/// they are live-tick concerns (the projector seals block-by-block; restore
+/// finalizes cursors once at the end).
+pub(crate) struct BlockProjection<'a> {
+    pub store: &'a Arc<dyn Store>,
+    pub bridge_id: AccountId,
+    pub local_network_id: u32,
+    pub expected_claim_sender: AccountId,
+    pub expected_ger_sender: AccountId,
+    pub bridge_address: &'a str,
+    pub network_rpcs: &'a crate::metadata_recovery::NetworkRpcMap,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct BlockProjectionCounts {
+    pub bridge_outs: usize,
+    pub claims: usize,
+    pub gers: usize,
+}
+
+impl BlockProjection<'_> {
+    /// Project every note of ONE Miden block, in canonical order.
+    ///
+    /// `block_notes` need not be pre-sorted: the ordering happens HERE, through
+    /// `projection_order::ProjectionOrder` — putting the sort inside the unit is
+    /// what makes it impossible for a caller to emit in a divergent order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn project_block(
+        &self,
+        miden_block: u64,
+        block_hash: [u8; 32],
+        timestamp: u64,
+        block_notes: &[(Option<NoteId>, &InputNoteRecord)],
+        output_metadata: &std::collections::HashMap<[u8; 32], NoteMetadata>,
+        mut client: Option<&mut MidenClientLib>,
+        within_tx_pos: &std::collections::HashMap<NoteId, u32>,
+    ) -> anyhow::Result<BlockProjectionCounts> {
+        let mut notes: Vec<(Option<NoteId>, &InputNoteRecord)> = block_notes.to_vec();
+
+        // Same-transaction B2AGG siblings must carry the input position from the
+        // authoritative transaction header. Without it their LET order is
+        // unknowable — fail closed rather than guess.
+        let mut ties: std::collections::HashMap<Option<u32>, (usize, bool)> =
+            std::collections::HashMap::new();
+        for (id, note) in &notes {
+            if is_b2agg_note(note.details()) {
+                let entry = ties
+                    .entry(note.state().consumed_tx_order())
+                    .or_insert((0, true));
+                entry.0 += 1;
+                entry.1 &= id.is_some_and(|id| within_tx_pos.contains_key(&id));
+            }
+        }
+        if let Some((order, (siblings, _))) = ties
+            .into_iter()
+            .find(|(_, (siblings, resolved))| *siblings > 1 && !resolved)
+        {
+            ::metrics::counter!("bridge_within_tx_order_unresolved_total").increment(1);
+            anyhow::bail!(
+                "projector: {siblings} B2AGG siblings at block {miden_block}, transaction \
+                 {order:?}, lack authoritative within-tx input order"
+            );
+        }
+
+        // THE canonical ORDER stage (see `projection_order` for the drift
+        // history this shared sort ended).
+        notes.sort_by_key(|(id, note)| {
+            crate::projection_order::ProjectionOrder::for_record(
+                miden_block,
+                *id,
+                note,
+                within_tx_pos,
+            )
+            .key()
+        });
+
+        let mut counts = BlockProjectionCounts::default();
+        for (note_id, note) in notes {
+            if is_b2agg_note(note.details()) {
+                let note_id = note_id.ok_or_else(|| {
+                    anyhow::anyhow!("B2AGG projection requires an authoritative NoteId")
+                })?;
+                if project_b2agg_note(
+                    self.store,
+                    note,
+                    note_id,
+                    self.bridge_id,
+                    self.local_network_id,
+                    miden_block,
+                    block_hash,
+                    self.bridge_address,
+                    client.as_deref_mut(),
+                    self.network_rpcs,
+                )
+                .await?
+                    == B2AggRestoreOutcome::Emitted
+                {
+                    counts.bridge_outs += 1;
+                }
+                continue;
+            }
+
+            if project_claim_note(
+                self.store,
+                note,
+                output_metadata,
+                self.expected_claim_sender,
+                self.bridge_id,
+                miden_block,
+                block_hash,
+                self.bridge_address,
+            )
+            .await?
+                == ClaimProjectOutcome::Emitted
+            {
+                counts.claims += 1;
+                continue;
+            }
+
+            if project_ger_note(
+                self.store,
+                note,
+                output_metadata,
+                self.expected_ger_sender,
+                self.bridge_id,
+                miden_block,
+                block_hash,
+                timestamp,
+            )
+            .await?
+                == GerProjectOutcome::Emitted
+            {
+                counts.gers += 1;
+                continue;
+            }
+        }
+        Ok(counts)
+    }
+}
+
+/// Rebuild the client-store record a NODE-RECOVERED bridge-out would have —
+/// the SAME shape the live reconciler writes — so the shared per-block unit
+/// projects it identically to a record that survived in the store.
+fn record_for_bridge_replay(replay: &ReplayBridgeOut, bridge_id: AccountId) -> InputNoteRecord {
+    use miden_client::store::InputNoteState;
+    use miden_client::store::input_note_states::ConsumedExternalNoteState;
+    use miden_protocol::block::BlockNumber;
+    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+        nullifier_block_height: BlockNumber::from(replay.block as u32),
+        // Finding #56: the consumer IS our bridge — these bodies were joined to
+        // the bridge's own transaction inputs. The live reconciler records
+        // Some(bridge_id) for exactly this reason; a None here makes the MA#3
+        // consumer gate SKIP the note and silently un-emit every replayed
+        // BridgeEvent (regressed once in the tier-2 conversion, caught by
+        // e2e-cantina13-metadata-recovery's recovered-leaf wait within hours).
+        consumer_account: Some(bridge_id),
+        // The reconciler durably records the consuming tx order for B2AGG —
+        // mirror it, so `projection_order` keys this exactly like live.
+        consumed_tx_order: Some(replay.tx_order),
+        metadata: None,
+    });
+    InputNoteRecord::new(
+        replay.body.details.clone(),
+        replay.body.attachments.clone(),
+        None,
+        state,
+    )
+}
+
+/// Rebuild the record a NODE-RECOVERED claim would have. Live claim records
+/// carry NO tx order (store NULL) and DO carry their metadata + consumer — the
+/// exact inputs `project_claim_note` reads.
+fn record_for_claim_replay(replay: &ReplayClaim, bridge_id: AccountId) -> InputNoteRecord {
+    use miden_client::store::InputNoteState;
+    use miden_client::store::input_note_states::ConsumedExternalNoteState;
+    use miden_protocol::block::BlockNumber;
+    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+        nullifier_block_height: BlockNumber::from(replay.block as u32),
+        consumer_account: Some(bridge_id),
+        consumed_tx_order: None,
+        metadata: Some(replay.body.metadata),
+    });
+    InputNoteRecord::new(
+        replay.body.details.clone(),
+        replay.body.attachments.clone(),
+        None,
+        state,
+    )
+}
+
+/// Replay ALL restored history in ONE chronologically-ordered pass.
+///
+/// # Why this is a single pass
+///
+/// `docs/design/UNIFIED-PROJECTOR.md` specifies `{B2AGG, INTERNAL} -> ORDER ->
+/// EMIT`: one ordering stage that every source feeds, then the shared `project_*`
+/// derivations. Restore implemented the shared DERIVATIONS but not the shared
+/// ORDER — it ran a phase per KIND (every B2AGG, then every CLAIM, then every
+/// GER), each internally sorted but sequential overall. The live projector walks
+/// BLOCK-major (`by_block`), so the two disagreed on emission order.
+///
+/// That is not cosmetic. Both observable consequences are consumer-visible:
+///   * `log_index` comes from one GLOBAL counter, so phase-major replay renumbers
+///     EVERY synthetic log after a recovery (measured: 15 BridgeEvents occupying
+///     indices 0..14 while spanning blocks 97..432).
+///   * `hash_chain_value` is a fold in EMISSION order, so with several GERs in one
+///     block the restored chain diverged from the live one even though the GER set
+///     and per-block content matched exactly — and aggkit consumes that chain.
+///
+/// Each phase previously opened its OWN `miden_client` session and re-fetched the
+/// same consumed feed, which is what forced the kind-major split. This runs every
+/// source through one session, one sort, one emit loop — so a restored log stream
+/// is indistinguishable from the live one.
 #[allow(clippy::too_many_arguments)]
-async fn restore_bridge_outs(
+async fn replay_history_in_order(
     store: &Arc<dyn Store>,
     miden_client: &MidenClient,
-    bridge_id: AccountId,
+    accounts: &AccountsConfig,
     local_network_id: u32,
     block_state: &Arc<BlockState>,
     network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
     bridge_replay: Vec<ReplayBridgeOut>,
-) -> anyhow::Result<(usize, usize)> {
+    claim_replay: Vec<ReplayClaim>,
+    restore_block: u64,
+    node_note_metadata: std::collections::HashMap<[u8; 32], NoteMetadata>,
+) -> anyhow::Result<ReplayCounts> {
     let store_clone = store.clone();
     let block_state_clone = block_state.clone();
-    // Owned clone moved into the `with(...)` closure; per-bridge-out RPC selection
-    // is keyed on the resolved faucet origin_network (finding #62).
     let network_rpcs = network_rpcs.clone();
-    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+    let bridge_id = accounts.bridge.0;
+    let expected_claim_sender = accounts.service.0;
+    // MA#28 — same ger_manager/service fallback `submit_update_ger_note` resolves.
+    let expected_ger_sender = accounts
+        .ger_manager
+        .as_ref()
+        .map(|a| a.0)
+        .unwrap_or(accounts.service.0);
+
+    let result = Arc::new(std::sync::Mutex::new(ReplayCounts::default()));
     let result_inner = result.clone();
 
     miden_client
         .with(move |client| {
             Box::new(async move {
-                use miden_client::store::InputNoteState;
-                use miden_client::store::input_note_states::ConsumedExternalNoteState;
-                use miden_protocol::block::BlockNumber;
-                let bridge_address = get_bridge_address();
-                let mut count = 0usize;
-                let mut logs = 0usize;
-                for replay in bridge_replay {
-                    let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
-                        nullifier_block_height: BlockNumber::from(replay.block as u32),
-                        consumer_account: Some(bridge_id),
-                        consumed_tx_order: Some(replay.tx_order),
-                        // 0.16: metadata is retained through consumption when known;
-                        // restore replays from bare details (none available).
-                        metadata: None,
-                    });
-                    let note = InputNoteRecord::new(
-                        replay.body.details,
-                        replay.body.attachments,
-                        None,
-                        state,
-                    );
-                    let block_hash = block_state_clone.get_block_hash(replay.block);
-                    let outcome = project_b2agg_note(
-                        &store_clone,
-                        &note,
-                        replay.id,
-                        bridge_id,
-                        local_network_id,
-                        replay.block,
-                        block_hash,
-                        bridge_address,
-                        Some(&mut *client),
-                        &network_rpcs,
-                    )
-                    .await?;
-                    if outcome == B2AggRestoreOutcome::Emitted {
-                        count += 1;
-                        logs += 1;
-                    }
+                // ── ONE fetch of the consumed feed, shared by CLAIM + GER ──────
+                let consumed_notes = client
+                    .get_input_notes(NoteFilter::Consumed)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+                // Our own minted output records carry the metadata that the
+                // metadata-less `ConsumedExternal` state drops (the MA#28 fallback
+                // shared by the CLAIM and GER provenance gates).
+                let mut own_output_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> =
+                    client
+                        .get_output_notes(NoteFilter::All)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
+                        .into_iter()
+                        .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
+                        .collect();
+                // #88 — a full drop-restore wipes the client store too, so merge the
+                // NODE-scanned metadata UNDER our own records (own records win).
+                // Only provenance-gated GER candidates are in that map (#164).
+                for (k, v) in &node_note_metadata {
+                    own_output_metadata.entry(*k).or_insert(*v);
                 }
 
-                *result_inner.lock().unwrap() = (count, logs);
+                // ── ONE work list, projected through the SHARED per-block unit ──
+                //
+                // Node-recovered bridge-outs and claims are first converted into
+                // the exact client-store record shape the live reconciler would
+                // have written (`record_for_*_replay`), so from here on there is
+                // ONE input shape, ONE ordering comparator and ONE dispatch —
+                // the same `BlockProjection` the live tick runs. Restored
+                // emission cannot diverge from live emission because it IS the
+                // live emission code.
+                let mut within_tx_pos: std::collections::HashMap<NoteId, u32> =
+                    std::collections::HashMap::new();
+                let mut by_block: std::collections::BTreeMap<
+                    u64,
+                    Vec<(Option<NoteId>, InputNoteRecord)>,
+                > = std::collections::BTreeMap::new();
+                for replay in &bridge_replay {
+                    within_tx_pos.insert(replay.id, replay.within_tx_pos);
+                    by_block
+                        .entry(replay.block)
+                        .or_default()
+                        .push((Some(replay.id), record_for_bridge_replay(replay, bridge_id)));
+                }
+                for replay in &claim_replay {
+                    by_block
+                        .entry(replay.block)
+                        .or_default()
+                        .push((Some(replay.id), record_for_claim_replay(replay, bridge_id)));
+                }
+                for note in consumed_notes {
+                    // B2AGG notes are covered AUTHORITATIVELY by `bridge_replay`
+                    // (the bridge-tx join, with real tx order + input positions,
+                    // completeness enforced by the LET-cardinality gate). The
+                    // client store's own copy of a consumed B2AGG carries NULL
+                    // tx order, so feeding it here both duplicates the note and
+                    // — with two B2AGGs in one block — trips the shared unit's
+                    // sibling fail-closed gate ("2 B2AGG siblings, transaction
+                    // None"; measured at block 6129). The pre-unification
+                    // dispatch excluded B2AGG shapes from this arm implicitly
+                    // (its claim/GER projections self-filter on script root);
+                    // the unified dispatch requires the exclusion to be explicit.
+                    if is_b2agg_note(note.details()) {
+                        continue;
+                    }
+                    let block = note_consumed_block(&note, restore_block);
+                    // The background client can sync past the fixed restore
+                    // snapshot; leave newer notes to the live projector.
+                    if block > restore_block {
+                        continue;
+                    }
+                    let id = note.id();
+                    by_block.entry(block).or_default().push((id, note));
+                }
+
+                let bridge_address = get_bridge_address();
+                let projection = BlockProjection {
+                    store: &store_clone,
+                    bridge_id,
+                    local_network_id,
+                    expected_claim_sender,
+                    expected_ger_sender,
+                    bridge_address,
+                    network_rpcs: &network_rpcs,
+                };
+                let mut counts = ReplayCounts::default();
+                for (block, group) in &by_block {
+                    let refs: Vec<(Option<NoteId>, &InputNoteRecord)> =
+                        group.iter().map(|(id, note)| (*id, note)).collect();
+                    let block_counts = projection
+                        .project_block(
+                            *block,
+                            block_state_clone.get_block_hash(*block),
+                            block_state_clone.get_block_timestamp(*block),
+                            &refs,
+                            &own_output_metadata,
+                            Some(&mut *client),
+                            &within_tx_pos,
+                        )
+                        .await?;
+                    counts.bridge_outs += block_counts.bridge_outs;
+                    counts.claims += block_counts.claims;
+                    counts.gers += block_counts.gers;
+                }
+
+                *result_inner.lock().unwrap() = counts;
                 Ok(())
             })
         })
         .await?;
 
-    let (count, logs) = *result.lock().unwrap();
-    Ok((count, logs))
+    Ok(std::mem::take(&mut *result.lock().unwrap()))
 }
 
 /// Outcome of attempting to rebuild one consumed B2AGG note during restore.
@@ -1964,158 +2625,6 @@ pub(crate) async fn project_claim_parts(
     Ok(ClaimProjectOutcome::Emitted)
 }
 
-/// Phase 2.5: scan miden consumed CLAIM notes and replay any missing
-/// synthetic `ClaimEvent` log via [`Store::commit_manual_claim_event_atomic`].
-///
-/// Mirrors the live [`SyntheticProjector`](crate::synthetic_projector) — same
-/// script-root filter, same storage decoder, same dedup predicates, same
-/// atomic commit primitive — but runs offline as a restore phase instead of
-/// inside the live sync loop. The synthetic tx_hash uses the shared
-/// `derive_manual_claim_tx_hash` helper so re-running restore (or running
-/// live after restore) lands on a byte-identical hash and the bridge-service
-/// deduplicates correctly.
-///
-/// Returns `(claims_processed, logs_created)`.
-async fn restore_claims(
-    store: &Arc<dyn Store>,
-    miden_client: &MidenClient,
-    accounts: &AccountsConfig,
-    block_state: &Arc<BlockState>,
-    restore_block: u64,
-) -> anyhow::Result<(usize, usize)> {
-    let store_clone = store.clone();
-    let block_state_clone = block_state.clone();
-    // Claim provenance gate: `create_claim` mints every CLAIM from the
-    // service account, targeting the bridge; the bridge is also the sole
-    // legitimate consumer. See `classify_claim_note`.
-    let expected_sender = accounts.service.0;
-    let bridge_id = accounts.bridge.0;
-
-    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
-    let result_inner = result.clone();
-
-    miden_client
-        .with(move |client| {
-            Box::new(async move {
-                let consumed_notes = client
-                    .get_input_notes(NoteFilter::Consumed)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
-
-                // MA#28-style provenance fallback (same as `restore_gers`):
-                // protocol 0.15's `ConsumedExternal` state carries no metadata,
-                // but we MINTED our own CLAIM notes, so our output-note records
-                // retain the full metadata permanently. A claim-shaped note we
-                // did not mint has no output record and no bridge-consumer
-                // attribution → skipped as Foreign (fail-closed).
-                let own_output_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> = client
-                    .get_output_notes(NoteFilter::All)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
-                    .into_iter()
-                    .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
-                    .collect();
-
-                let bridge_address = get_bridge_address();
-                let mut claim_count = 0usize;
-                let mut log_count = 0usize;
-
-                // Miden-1:1: replay each CLAIM at its OWN Miden consumption block,
-                // in deterministic (block, tx_order, details commitment) order
-                // (deterministic across runs + parity with the live projector).
-                let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sort_consumed_for_projection(&mut sorted_notes);
-
-                for note in sorted_notes {
-                    let blk = note_consumed_block(note, restore_block);
-                    // The background client may sync past the fixed restore snapshot while
-                    // listeners are paused. Leave newer notes for the live projector.
-                    if blk > restore_block {
-                        continue;
-                    }
-                    let block_hash = block_state_clone.get_block_hash(blk);
-                    // Per-note CLAIM derivation lives in `project_claim_note` so
-                    // the live cursor-driven projector and this recovery phase
-                    // share one implementation.
-                    if project_claim_note(
-                        &store_clone,
-                        note,
-                        &own_output_metadata,
-                        expected_sender,
-                        bridge_id,
-                        blk,
-                        block_hash,
-                        bridge_address,
-                    )
-                    .await?
-                        == ClaimProjectOutcome::Emitted
-                    {
-                        claim_count += 1;
-                        log_count += 1;
-                    }
-                }
-
-                *result_inner.lock().unwrap() = (claim_count, log_count);
-                Ok(())
-            })
-        })
-        .await?;
-
-    let (count, logs) = *result.lock().unwrap();
-    Ok((count, logs))
-}
-
-/// Phase 2.6 (finding #69): replay bridge-consumed CLAIM notes recovered by the
-/// NODE scan — the source that survives `--reset-miden-store`, unlike Phase
-/// 2.5's client-store records. Each claim is projected at its original
-/// consumption block via [`project_claim_parts`]; `consumer_account` is our
-/// bridge by construction (the `sync_transactions` join proved the bridge
-/// consumed it — the MA#3 trust root), and the node's public metadata provides
-/// the MA#28 mint-proof fallback. Returns the number of ClaimEvents emitted
-/// (each is also one synthetic log).
-async fn restore_claims_from_node(
-    store: &Arc<dyn Store>,
-    block_state: &Arc<BlockState>,
-    mut claim_replay: Vec<ReplayClaim>,
-    expected_sender: AccountId,
-    bridge_id: AccountId,
-) -> anyhow::Result<usize> {
-    // The join already yields execution order; keep it deterministic even if a
-    // future refactor changes the producer.
-    claim_replay.sort_by_key(|item| (item.block, item.tx_order));
-    let bridge_address = get_bridge_address();
-    let mut emitted = 0usize;
-    for replay in claim_replay {
-        let note_id_str = hex::encode(replay.body.details.commitment().as_bytes());
-        let block_hash = block_state.get_block_hash(replay.block);
-        tracing::debug!(
-            target: "restore::claims",
-            note = %replay.id,
-            block = replay.block,
-            "restore: replaying node-scanned CLAIM (finding #69)"
-        );
-        if project_claim_parts(
-            store,
-            note_id_str,
-            &replay.body.details,
-            Some(&replay.body.metadata),
-            Some(bridge_id),
-            &replay.body.attachments,
-            expected_sender,
-            bridge_id,
-            replay.block,
-            block_hash,
-            bridge_address,
-        )
-        .await?
-            == ClaimProjectOutcome::Emitted
-        {
-            emitted += 1;
-        }
-    }
-    Ok(emitted)
-}
-
 /// Outcome of projecting one consumed note through the GER derivation.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GerProjectOutcome {
@@ -2290,118 +2799,6 @@ pub(crate) async fn project_ger_note(
     Ok(GerProjectOutcome::Emitted)
 }
 
-/// Phase 3: scan consumed UpdateGerNote notes to rebuild GER state.
-///
-/// Cantina MA#28 — also asserts that the consumed note was minted by the
-/// `ger_manager` (or, for legacy deployments without a dedicated manager,
-/// the `service` account) and targeted the bridge account. Without these
-/// checks a note that happens to share the `UpdateGerNote` script root —
-/// possibly minted by some other account, possibly targeting some other
-/// recipient — would have been replayed as an injected GER, mutating
-/// `ger_entries` / `hash_chain_value` based on data the proxy did not
-/// authorise.
-async fn restore_gers(
-    store: &Arc<dyn Store>,
-    miden_client: &MidenClient,
-    accounts: &AccountsConfig,
-    block_state: &Arc<BlockState>,
-    restore_block: u64,
-) -> anyhow::Result<(usize, usize)> {
-    let store_clone = store.clone();
-    let block_state_clone = block_state.clone();
-    // MA#28 — same fallback as `submit_update_ger_note` in `src/ger.rs`:
-    // legacy deployments without a dedicated `ger_manager` mint
-    // UpdateGerNotes from the `service` account. Use the same resolution
-    // here so notes minted before the dedicated manager was introduced
-    // still verify against the active configuration.
-    let expected_sender = accounts
-        .ger_manager
-        .as_ref()
-        .map(|a| a.0)
-        .unwrap_or(accounts.service.0);
-    let expected_target = accounts.bridge.0;
-
-    let result = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
-    let result_inner = result.clone();
-
-    miden_client
-        .with(move |client| {
-            Box::new(async move {
-                let consumed_notes = client
-                    .get_input_notes(NoteFilter::Consumed)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
-
-                // Protocol 0.15: notes consumed by the bridge land in the client
-                // store as `ConsumedExternal`, a state that carries NO metadata —
-                // so `note.metadata()` is `None` for every sanctioned GER note and
-                // the MA#28 sender check below would skip all of them, restoring
-                // zero GERs. The proxy MINTED those notes itself, and the client
-                // store's output-note records retain the full metadata
-                // permanently. Recover the sender from our own output records,
-                // keyed by the details commitment. This is fail-closed and
-                // strictly stronger than the plain sender check: a GER-shaped
-                // note we did not mint has no output record, stays metadata-less,
-                // and is skipped as MissingMetadata — exactly the MA#28 posture.
-                let own_output_metadata: std::collections::HashMap<[u8; 32], NoteMetadata> = client
-                    .get_output_notes(NoteFilter::All)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
-                    .into_iter()
-                    .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
-                    .collect();
-
-                let mut ger_count = 0usize;
-                let mut log_count = 0usize;
-
-                // The GER hash chain is ORDER-SENSITIVE (each value mixes into a
-                // rolling Keccak), so restore MUST replay in the projector's exact
-                // (block, tx_order, details commitment) order — otherwise the restored chain
-                // diverges from a fresh live projection (and from aggkit's view).
-                // Each GER is also emitted at its OWN Miden consumption block
-                // (Miden-1:1), with that block's hash + timestamp.
-                let mut sorted_notes: Vec<&_> = consumed_notes.iter().collect();
-                sort_consumed_for_projection(&mut sorted_notes);
-
-                for note in sorted_notes {
-                    let blk = note_consumed_block(note, restore_block);
-                    if blk > restore_block {
-                        continue;
-                    }
-                    let block_hash = block_state_clone.get_block_hash(blk);
-                    let timestamp = block_state_clone.get_block_timestamp(blk);
-                    // Per-note GER derivation (MA#28 provenance + hash-chain
-                    // replay) lives in `project_ger_note` so the live
-                    // cursor-driven projector and this recovery phase share one
-                    // implementation.
-                    if project_ger_note(
-                        &store_clone,
-                        note,
-                        &own_output_metadata,
-                        expected_sender,
-                        expected_target,
-                        blk,
-                        block_hash,
-                        timestamp,
-                    )
-                    .await?
-                        == GerProjectOutcome::Emitted
-                    {
-                        ger_count += 1;
-                        log_count += 1;
-                    }
-                }
-
-                *result_inner.lock().unwrap() = (ger_count, log_count);
-                Ok(())
-            })
-        })
-        .await?;
-
-    let (count, logs) = *result.lock().unwrap();
-    Ok((count, logs))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2432,6 +2829,502 @@ mod tests {
 
     fn id(hex: &str) -> AccountId {
         AccountId::from_hex(hex).expect("hex must decode")
+    }
+
+    // PR#164 blocker #1 — the node-metadata join must fail closed on a
+    // details-commitment collision that carries different provenance, never
+    // last-write-wins.
+    #[test]
+    fn ger_node_metadata_is_ambiguity_safe() {
+        let (manager_meta, _) = make_metadata(id(TEST_SENDER_MANAGER), None);
+        let (attacker_meta, _) = make_metadata(id(TEST_SENDER_ATTACKER), None);
+        assert_ne!(manager_meta, attacker_meta);
+        let key = [0x11u8; 32];
+
+        let mut map = std::collections::HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+
+        // First writer lands.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
+        assert_eq!(map.get(&key), Some(&manager_meta));
+
+        // Idempotent: identical metadata for the same key is a no-op.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
+        assert_eq!(map.get(&key), Some(&manager_meta));
+
+        // A DIFFERENT metadata for the same key poisons the key: removed +
+        // marked ambiguous, so the replay serves nothing (fail closed), NOT the
+        // attacker's provenance and NOT the original last-write-wins.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, attacker_meta);
+        assert!(!map.contains_key(&key), "ambiguous key must not be served");
+        assert!(ambiguous.contains(&key));
+
+        // Once ambiguous, even a later "correct" write stays out — we can no
+        // longer trust which is authentic.
+        record_ger_node_metadata(&mut map, &mut ambiguous, key, manager_meta);
+        assert!(!map.contains_key(&key));
+
+        // NOTE: the poisoning above is only reachable for candidates that ALREADY
+        // passed the MA#28 provenance gate in `scan_bridge_out_bodies` — see
+        // `ger_metadata_clone_cannot_evict_the_genuine_entry`, which pins that an
+        // impostor never reaches this map in the first place.
+        //
+        // (assertions continue below)
+
+        // A distinct key is unaffected.
+        let key2 = [0x22u8; 32];
+        record_ger_node_metadata(&mut map, &mut ambiguous, key2, manager_meta);
+        assert_eq!(map.get(&key2), Some(&manager_meta));
+    }
+
+    /// #164 re-review (griefing DoS) — details are PUBLIC and exclude metadata, so
+    /// anyone can publish a note whose details match a legitimate UpdateGerNote but
+    /// whose sender is their own. Keyed on details-commitment alone, that clone
+    /// collides with the genuine entry, trips the ambiguity guard, and DELETES the
+    /// real GER's provenance — recovery then loses that GER forever, on demand, for
+    /// free. This is not a hash collision; it is a chosen-input attack.
+    ///
+    /// The defence is to gate candidates on MA#28 provenance BEFORE they are
+    /// recorded, using the same `classify_ger_note` predicate that governs
+    /// acceptance. `metadata.sender` is stamped by the account that executed the
+    /// minting transaction and cannot be forged, so the impostor is rejected at the
+    /// scan and never reaches the map — the genuine entry survives intact.
+    #[test]
+    fn ger_metadata_clone_cannot_evict_the_genuine_entry() {
+        let manager = id(TEST_SENDER_MANAGER);
+        let bridge = id(TEST_TARGET_BRIDGE);
+        let attacker = id(TEST_SENDER_ATTACKER);
+
+        let (genuine_meta, genuine_attachments) = make_metadata(manager, Some(bridge));
+        let (clone_meta, clone_attachments) = make_metadata(attacker, Some(bridge));
+
+        // The gate the scan applies, verbatim.
+        let accepts = |meta: &NoteMetadata, att: &NoteAttachments| {
+            matches!(
+                classify_ger_note(Some(meta), att, manager, bridge),
+                GerNoteVerdict::Accept
+            )
+        };
+
+        assert!(
+            accepts(&genuine_meta, &genuine_attachments),
+            "the real ger_manager's note must be recorded as a candidate"
+        );
+        assert!(
+            !accepts(&clone_meta, &clone_attachments),
+            "a same-details clone from another sender must be REJECTED at scan time — \
+             otherwise it poisons the key and evicts the genuine entry"
+        );
+
+        // End to end over the map: only the accepted candidate is ever recorded, so
+        // the genuine provenance is still served after the clone is observed.
+        let mut map = std::collections::HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        let key = [0x42u8; 32];
+        for (meta, att) in [
+            (genuine_meta, genuine_attachments),
+            (clone_meta, clone_attachments),
+        ] {
+            if accepts(&meta, &att) {
+                record_ger_node_metadata(&mut map, &mut ambiguous, key, meta);
+            }
+        }
+        assert!(
+            !ambiguous.contains(&key),
+            "an impostor must not be able to mark a genuine GER key ambiguous"
+        );
+        assert_eq!(
+            map.get(&key).map(|m| m.sender()),
+            Some(manager),
+            "the genuine ger_manager provenance must survive the clone attempt"
+        );
+    }
+
+    /// Build a consumed record with an exact (block, tx_order) and a commitment
+    /// that varies with `seed`, so ordering can be asserted precisely.
+    /// Key a consumed record exactly as the unified replay does: through the
+    /// SHARED `ProjectionOrder::for_record` — the same call the live projector
+    /// makes inside `BlockProjection::project_block`.
+    fn consumed_key(note: &InputNoteRecord) -> crate::projection_order::ProjectionOrderKey {
+        let block = note
+            .state()
+            .consumed_block_height()
+            .map(|h| h.as_u64())
+            .unwrap_or(0);
+        crate::projection_order::ProjectionOrder::for_record(
+            block,
+            note.id(),
+            note,
+            &std::collections::HashMap::new(),
+        )
+        .key()
+    }
+
+    fn ordered_consumed(block: u32, tx_order: Option<u32>, seed: u8) -> InputNoteRecord {
+        use miden_base_agglayer::B2AggNote;
+        use miden_client::store::InputNoteState;
+        use miden_client::store::input_note_states::ConsumedExternalNoteState;
+        use miden_protocol::block::BlockNumber;
+        use miden_protocol::note::{NoteAssets, NoteRecipient, NoteStorage};
+        use miden_protocol::{Felt, Word};
+
+        let storage = NoteStorage::new(vec![Felt::from(0u32); 6]).unwrap();
+        // Vary the serial so each record gets a distinct details commitment.
+        let serial = Word::from([
+            Felt::from(seed as u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+            Felt::from(0u32),
+        ]);
+        let recipient = NoteRecipient::new(serial, B2AggNote::script(), storage);
+        let details = NoteDetails::new(NoteAssets::new(vec![]).unwrap(), recipient);
+        let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
+            nullifier_block_height: BlockNumber::from(block),
+            consumer_account: None,
+            consumed_tx_order: tx_order,
+            metadata: None,
+        });
+        InputNoteRecord::new(details, NoteAttachments::default(), None, state)
+    }
+
+    /// The ordering contract the merged replay exists to honour: emission order is
+    /// BLOCK-major, exactly as the live projector walks notes and as
+    /// `docs/design/UNIFIED-PROJECTOR.md` specifies (`{B2AGG, INTERNAL} -> ORDER ->
+    /// EMIT` — ONE ordering stage fed by every source).
+    ///
+    /// Restore used to run a pass per note KIND, so every B2AGG was emitted before
+    /// any CLAIM or GER regardless of block. Two consumer-visible consequences
+    /// followed, both measured on the 2026-08-11 recovery gate:
+    ///   * `log_index` (ONE global counter) was renumbered for every synthetic log
+    ///     — 15 BridgeEvents held indices 0..14 while spanning blocks 97..432.
+    ///   * `hash_chain_value` is a fold in EMISSION order, so with several GERs in
+    ///     one block the restored chain diverged from the live one even though the
+    ///     GER set and per-block content matched exactly — and aggkit reads it.
+    ///
+    /// Every kind now maps to ONE key tuple compared by ONE comparator, so kind
+    /// cannot outrank block by construction. This pins the extraction and the
+    /// resulting order.
+    #[test]
+    fn replay_order_is_block_major_then_tx_order_then_commitment() {
+        let late = ordered_consumed(432, Some(0), 0x11);
+        let early = ordered_consumed(10, Some(7), 0xEE);
+        let mid_a = ordered_consumed(97, Some(3), 0x22);
+        let mid_b = ordered_consumed(97, Some(3), 0x33);
+        let mid_earlier_tx = ordered_consumed(97, Some(1), 0xFF);
+
+        // tx_order participates only for MAPPED notes (chain-derived B2AGG
+        // order — drift #4), so give every record an id + map entry, exactly
+        // like the live reconciler / replay tx scan do.
+        let records = [&late, &mid_b, &early, &mid_earlier_tx, &mid_a];
+        let ids: Vec<miden_client::note::NoteId> = (0u64..records.len() as u64)
+            .map(|i| {
+                miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                    [miden_protocol::Felt::new(0x60 + i).unwrap(); 4],
+                ))
+            })
+            .collect();
+        let map: std::collections::HashMap<miden_client::note::NoteId, u32> =
+            ids.iter().map(|id| (*id, 0u32)).collect();
+        let mut keys: Vec<_> = records
+            .iter()
+            .zip(&ids)
+            .map(|(note, id)| {
+                let block = note
+                    .state()
+                    .consumed_block_height()
+                    .map(|h| h.as_u64())
+                    .unwrap_or(0);
+                crate::projection_order::ProjectionOrder::for_record(block, Some(*id), note, &map)
+                    .key()
+            })
+            .collect();
+        keys.sort();
+
+        assert_eq!(
+            keys[0].0, 10,
+            "earliest BLOCK first — block outranks everything"
+        );
+        assert_eq!(
+            (keys[1].0, keys[1].1, keys[1].3),
+            (97, Some(1), mid_earlier_tx.details_commitment().as_bytes()),
+            "within a block, lower tx_order first"
+        );
+        // The two same-slot records break the tie by details commitment, in that order.
+        let (c_a, c_b) = (
+            mid_a.details_commitment().as_bytes(),
+            mid_b.details_commitment().as_bytes(),
+        );
+        let (lo, hi) = if c_a < c_b { (c_a, c_b) } else { (c_b, c_a) };
+        assert_eq!(
+            (keys[2].0, keys[2].1, keys[2].3),
+            (97, Some(3), lo),
+            "same (block, tx_order): commitment breaks the tie"
+        );
+        assert_eq!((keys[3].0, keys[3].1, keys[3].3), (97, Some(3), hi));
+        assert_eq!(
+            keys[4].0, 432,
+            "latest block LAST — under the old kind-major replay this B2AGG-shaped \
+             record would have been emitted first regardless of its block"
+        );
+    }
+
+    /// The case that motivated carrying `within_tx_pos`: TWO B2AGG siblings in ONE
+    /// transaction. Their relative order is decided by the authoritative input
+    /// position, NOT by details commitment — so the sibling with the LOWER input
+    /// position must sort first even when its commitment is larger.
+    ///
+    /// Before this, restore fell straight through to the commitment tiebreak and
+    /// could emit same-transaction siblings in the opposite order to live. Because
+    /// an UpdateHashChain log carries the rolling chain value in its topics, one
+    /// such inversion re-chains every subsequent log — which is exactly what the
+    /// full-DB-loss content digest caught.
+    #[test]
+    fn replay_order_uses_input_position_for_same_tx_b2agg_siblings() {
+        // Same block + same tx_order; commitment order is deliberately the INVERSE
+        // of the input-position order, so only `within_tx_pos` can decide.
+        let a = ordered_consumed(50, Some(2), 0xFF); // larger commitment seed
+        let b = ordered_consumed(50, Some(2), 0x01); // smaller commitment seed
+
+        let key = |block, tx, pos: u32, n: &InputNoteRecord| {
+            (
+                block,
+                Some(tx),
+                pos,
+                n.details_commitment().as_bytes(),
+                None::<[u8; 32]>,
+            )
+        };
+        // `a` is input 0, `b` is input 1 — position must win over commitment.
+        let ka = key(50u64, 2u32, 0, &a);
+        let kb = key(50u64, 2u32, 1, &b);
+        assert!(
+            ka < kb,
+            "input position must outrank the commitment tiebreak for same-transaction \
+             siblings — otherwise restore can invert live's order and re-chain every \
+             following UpdateHashChain log"
+        );
+
+        // Sanity: with positions EQUAL (the non-B2AGG case, both 0) the commitment
+        // tiebreak still applies, so ordering stays deterministic.
+        let ka0 = key(50u64, 2u32, 0, &a);
+        let kb0 = key(50u64, 2u32, 0, &b);
+        assert!(
+            kb0 < ka0,
+            "with no authoritative position, the commitment breaks the tie deterministically"
+        );
+    }
+
+    /// CONVERSION FIDELITY — the property that would have caught every
+    /// comparator drift (#100, bbece50, d724baa): a node-recovered replay,
+    /// converted to its client-store record shape, must key EXACTLY as the
+    /// live-written record would. The replay now flows through the SAME
+    /// `ProjectionOrder::for_record` + `BlockProjection` as the live tick, so
+    /// what remains to pin is the conversion inputs.
+    #[test]
+    fn replay_conversions_key_exactly_like_live_records() {
+        // A converted CLAIM record mirrors live claim records: NO tx order.
+        let (metadata, attachments) = make_metadata(id(TEST_SENDER_MANAGER), None);
+        let claim = ReplayClaim {
+            id: miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                [miden_protocol::Felt::new(0x51u64).unwrap(); 4],
+            )),
+            body: RecoveredClaimBody {
+                details: ordered_consumed(50, None, 0x01).details().clone(),
+                metadata,
+                attachments,
+            },
+            block: 50,
+        };
+        let record = record_for_claim_replay(&claim, id(TEST_TARGET_BRIDGE));
+        let key = crate::projection_order::ProjectionOrder::for_record(
+            claim.block,
+            Some(claim.id),
+            &record,
+            &std::collections::HashMap::new(),
+        )
+        .key();
+        assert_eq!(
+            (key.0, key.1, key.2),
+            (50, None, 0),
+            "converted claims carry (None, 0) — live claim records store no tx \
+             order; bbece50's consumption order and d724baa's creation order \
+             would both fail this pin"
+        );
+        assert!(
+            record.metadata().is_some(),
+            "converted claims must retain metadata for the provenance gates"
+        );
+        assert_eq!(
+            record.consumer_account(),
+            Some(id(TEST_TARGET_BRIDGE)),
+            "converted claims must carry the bridge as consumer (MA#3 trust root)"
+        );
+
+        // A converted BRIDGE-OUT record mirrors live B2AGG records: the
+        // reconciler-recorded Some(tx_order) AND Some(bridge) consumer. The
+        // consumer pin is finding #56's regression guard — a None here makes
+        // the MA#3 gate silently un-emit EVERY replayed BridgeEvent (measured
+        // live: e2e-cantina13's recovered leaf never emitted, projector then
+        // frontier-halts on the reserved-unemitted leaf).
+        let bridge_out = ReplayBridgeOut {
+            id: miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                [miden_protocol::Felt::new(0x52u64).unwrap(); 4],
+            )),
+            body: RecoveredBridgeBody {
+                details: ordered_consumed(60, None, 0x03).details().clone(),
+                attachments: NoteAttachments::default(),
+            },
+            block: 60,
+            tx_order: 4,
+            within_tx_pos: 1,
+        };
+        let bridge_record = record_for_bridge_replay(&bridge_out, id(TEST_TARGET_BRIDGE));
+        assert_eq!(
+            bridge_record.consumer_account(),
+            Some(id(TEST_TARGET_BRIDGE)),
+            "finding #56 pin: converted bridge-outs must carry the bridge as consumer"
+        );
+        assert_eq!(
+            bridge_record.state().consumed_tx_order(),
+            Some(4),
+            "converted bridge-outs keep the reconciler-recorded tx order"
+        );
+
+        // Same-block consumed pair still ties on commitment, matching live.
+        let a = ordered_consumed(50, None, 0x01);
+        let b = ordered_consumed(50, None, 0x02);
+        let (lo, hi) = if a.details_commitment().as_bytes() < b.details_commitment().as_bytes() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+        assert!(
+            consumed_key(lo) < consumed_key(hi),
+            "same-block ties break on commitment, matching live"
+        );
+    }
+
+    /// Drift #4 pin (the block-15125 GER-pair flip): a LOCAL consuming-tx order
+    /// on an UNMAPPED record must never reach the ordering key. The proxy
+    /// consumes `UpdateGerNote`s with local transactions, so the live store
+    /// records `Some(order)` — knowledge no replay can rebuild after DB loss.
+    /// Unmapped records therefore key `(None, 0, commitment, ...)` on BOTH
+    /// paths, and a same-block pair orders by details commitment regardless of
+    /// confirmation order. For MAPPED notes (chain-derived B2AGG order) the
+    /// `None`-before-`Some` precedence still holds.
+    #[test]
+    fn local_tx_order_never_orders_unmapped_notes() {
+        // Confirmation order (tx 0 vs tx 1) is deliberately the INVERSE of the
+        // commitment order: under the pre-fix key the 0xF0 record would jump
+        // the queue — the exact 15125 failure shape.
+        let first_confirmed = ordered_consumed(5, Some(0), 0xF0);
+        let second_confirmed = ordered_consumed(5, Some(1), 0x01);
+        let kf = consumed_key(&first_confirmed);
+        let ks = consumed_key(&second_confirmed);
+        assert_eq!(
+            (kf.1, kf.2),
+            (None, 0),
+            "unmapped local tx order leaked into the durable ordering key"
+        );
+        let (c_first, c_second) = (
+            first_confirmed.details_commitment().as_bytes(),
+            second_confirmed.details_commitment().as_bytes(),
+        );
+        assert!(
+            (c_second < c_first) == (ks < kf),
+            "unmapped same-block pair must order by details commitment alone"
+        );
+
+        // Mapped (chain-derived) order still applies, None sorting first.
+        let id = miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+            [miden_protocol::Felt::new(0x70u64).unwrap(); 4],
+        ));
+        let map: std::collections::HashMap<miden_client::note::NoteId, u32> =
+            [(id, 0u32)].into_iter().collect();
+        let mapped_key = crate::projection_order::ProjectionOrder::for_record(
+            5,
+            Some(id),
+            &second_confirmed,
+            &map,
+        )
+        .key();
+        assert_eq!(mapped_key.1, Some(1), "mapped notes keep the derived order");
+        assert!(
+            consumed_key(&ordered_consumed(5, None, 0xF0)) < mapped_key,
+            "None tx_order still sorts before mapped Some(_) in the same block"
+        );
+    }
+
+    /// Review 0814 (blocking): a leaf can be RESERVED (satisfying the
+    /// `accounted == let_leaves` cardinality check) yet never EMITTED — the
+    /// post-reservation `Skipped` paths in `project_b2agg_note`. Restore must
+    /// FAIL before cursor finalization instead of shipping a permanent
+    /// `depositCount` gap.
+    #[tokio::test]
+    async fn restore_refuses_to_finalize_over_reserved_but_unemitted_leaf() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        verify_emitted_frontier(&store)
+            .await
+            .expect("a store with no reservations passes the frontier gate");
+
+        // Reserve without emitting — exactly the state a quarantined /
+        // unrecoverable-metadata leaf leaves behind after replay.
+        store.reserve_deposit_index("0xdeadbeef").await.unwrap();
+        let err = verify_emitted_frontier(&store)
+            .await
+            .expect_err("a reserved-but-unemitted leaf must fail the one-shot");
+        assert!(
+            err.to_string().contains("never emitted"),
+            "the failure names the poison leaf: {err}"
+        );
+    }
+
+    /// Review 0814 (blocking): an ERASED same-block `UpdateGerNote` (created +
+    /// consumed in one block window, both stores wiped) is recovered by the
+    /// input-header fetch and routed through the CLAIM replay channel. The
+    /// conversion must yield a record `project_ger_note` actually EMITS from —
+    /// UpdateHashChain + `is_injected` + chain contribution restored, not
+    /// warned away.
+    #[tokio::test]
+    async fn erased_ger_body_routes_through_claim_replay_and_emits() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let (note, (_key, metadata), ger_bytes) = ma28_consumed_external_ger_note(0x6B);
+
+        let replay = ReplayClaim {
+            id: miden_client::note::NoteId::from_raw(miden_protocol::Word::new(
+                [miden_protocol::Felt::new(0x6Bu64).unwrap(); 4],
+            )),
+            body: RecoveredClaimBody {
+                details: note.details().clone(),
+                metadata,
+                attachments: note.attachments().clone(),
+            },
+            block: 7,
+        };
+        let record = record_for_claim_replay(&replay, id(TEST_TARGET_BRIDGE));
+
+        let outcome = project_ger_note(
+            &store,
+            &record,
+            &std::collections::HashMap::new(), // no output-record fallback needed: metadata rides the record
+            id(TEST_SENDER_MANAGER),
+            id(TEST_TARGET_BRIDGE),
+            7,
+            [7u8; 32],
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            GerProjectOutcome::Emitted,
+            "an erased-GER body routed through the claim-replay conversion must EMIT"
+        );
+        assert!(
+            store.is_ger_injected(&ger_bytes).await.unwrap(),
+            "the recovered GER is marked injected (chain contribution restored)"
+        );
     }
 
     fn make_metadata(
@@ -2728,12 +3621,14 @@ mod tests {
 
     /// Regression lock for the prod restart-resync incident: a restore run
     /// rebuilds the miden store, so the client has forgotten every imported
-    /// note — the genesis re-sweep IS the healing pass. `restore`'s Phase 4
-    /// (`finalize_restore_cursors`) must therefore reset the persisted
-    /// note-reconciler sweep cursor to 0, even when a previous deployment
-    /// left it deep in history — while the projector cursor jumps to the tip.
+    /// note. Recovery now runs that healing sweep ITSELF (Phase 1.1), before the
+    /// replay phases that read the consumed feed. When the sweep reached the tip
+    /// there is nothing left to re-discover, so Phase 4 leaves the reconcile
+    /// cursor AT the swept tip — the next boot must not re-walk all of history
+    /// (it could not project anything anyway: the projector cursor is parked at
+    /// the tip, which is exactly how the GER history used to be lost).
     #[tokio::test]
-    async fn restore_resets_reconcile_cursor_to_genesis() {
+    async fn restore_leaves_reconcile_cursor_at_swept_tip() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
 
         // Simulate a long-running pre-restore deployment: both cursors deep
@@ -2741,13 +3636,16 @@ mod tests {
         store.set_reconcile_cursor(123_456).await.unwrap();
         store.set_projector_cursor(100_000).await.unwrap();
 
-        // Phase 4 of restore() — the exact code path the real restore runs.
-        finalize_restore_cursors(&store, 130_000).await.unwrap();
+        // Phase 4 of restore() — the exact code path the real restore runs,
+        // with Phase 1.1's healing sweep having reached the tip.
+        finalize_restore_cursors(&store, 130_000, Some(130_000))
+            .await
+            .unwrap();
 
         assert_eq!(
             store.get_reconcile_cursor().await.unwrap(),
-            0,
-            "restore must reset the reconcile cursor to genesis (full-history heal sweep)"
+            130_000,
+            "recovery already swept to the tip — the next boot must not redo the full walk"
         );
         assert_eq!(
             store.get_projector_cursor().await.unwrap(),
@@ -2755,6 +3653,28 @@ mod tests {
             "projector cursor resumes at the Miden tip (restore already replayed history)"
         );
         assert_eq!(store.get_latest_block_number().await.unwrap(), 130_000);
+    }
+
+    /// Fail-safe half of the contract above: if recovery's healing sweep did NOT
+    /// reach the tip (never ran, or stopped short), the reconcile cursor must
+    /// fall back to genesis so the serving proxy still attempts the heal. Parking
+    /// it at a short tip would strand the un-swept range forever.
+    #[tokio::test]
+    async fn restore_resets_reconcile_cursor_when_heal_incomplete() {
+        for swept in [None, Some(129_999u64)] {
+            let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+            store.set_reconcile_cursor(123_456).await.unwrap();
+
+            finalize_restore_cursors(&store, 130_000, swept)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store.get_reconcile_cursor().await.unwrap(),
+                0,
+                "an incomplete heal ({swept:?} vs tip 130000) must fall back to a genesis re-sweep"
+            );
+        }
     }
 
     /// `(faucet_id, bridge_id, sender_id)` — valid protocol-0.15 ids. The faucet
@@ -3682,9 +4602,9 @@ mod tests {
         assert_eq!(replay.len(), 1, "the consumed claim must join exactly once");
         assert_eq!(replay[0].id, note_id);
         assert_eq!(
-            (replay[0].block, replay[0].tx_order),
-            (11, 0),
-            "claim must carry the consuming bridge tx's (block, tx_order)"
+            replay[0].block, 11,
+            "claim must carry the consuming bridge tx's BLOCK — and only the \
+             block; live claim records store no tx order (`projection_order`)"
         );
     }
 

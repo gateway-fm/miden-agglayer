@@ -27,6 +27,7 @@ pub mod metrics;
 pub mod miden_client;
 pub mod mint_target_monitor;
 pub mod orphan_recovery;
+pub mod projection_order;
 pub mod proxy_keystore;
 pub mod recovery;
 pub mod remote_signer;

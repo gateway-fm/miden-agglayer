@@ -298,16 +298,97 @@ pub async fn register_faucet_in_bridge(
         std::time::Duration::from_secs(1),
     )
     .await?;
-    if committed {
-        tracing::info!("register faucet tx {txn_id} committed");
-        // Extra wait for NTX builder to process the config note
-        for _ in 0..5 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            client.sync_state().await?;
+    // PR#164: fail-closed on a non-committed config tx. Returning Ok here let the
+    // caller persist a durable registry row for a bridge route that never
+    // landed — future registrations then short-circuit as `already_registered`
+    // while the bridge has no config note (durable DB/bridge disagreement).
+    // A timeout is recoverable: the note carries a finite expiration, so the
+    // caller (or a retry) can re-drive; we must NOT record success until the
+    // exact config tx is observed committed.
+    if !committed {
+        anyhow::bail!(
+            "register {faucet_name} faucet: config tx {txn_id} not observed committed within 20s; \
+             no registry row written — retry once the network catches up"
+        );
+    }
+    tracing::info!("register faucet tx {txn_id} committed");
+
+    // PR#164 re-review, AMENDED after the 2026-08-12 crash-loop incident.
+    //
+    // Committing the SERVICE transaction proves the ConfigAggBridgeNote is
+    // irrevocably ON-CHAIN: the NTX builder WILL consume it into
+    // `faucet_metadata_map` (the note's finite expiration is the only out). The
+    // commit is therefore the POINT OF NO RETURN, and what follows must reflect
+    // that:
+    //
+    // The previous revision gated success on observing the binding within
+    // BRIDGE_BINDING_POLL_ATTEMPTS seconds and BAILED on timeout ("no registry
+    // row written; retry"). Under N=30 load that verification starved (the poll
+    // runs inside the single writer worker whose queue was 51s deep) and the bail
+    // ABANDONED a committed registration: on-chain binding present, local
+    // `faucet_registry` row absent — exactly the split-brain the
+    // faucet-registry reconciler treats as a compromised admin key. Measured
+    // outcome: the SECURITY TRIPWIRE halted the proxy fail-closed, docker
+    // restarted it into the same state, and the proxy crash-looped 40+ times
+    // until a --restore. Worse, the retrying claim found no local row and
+    // deployed a SECOND faucet for the same origin (observed 6x), multiplying
+    // the orphans.
+    //
+    // So: after commit, the binding poll is best-effort OBSERVABILITY, not a
+    // success gate. On timeout we WARN + count and return Ok so the caller
+    // persists the local row for the committed registration — which is what
+    // keeps the reconciler's unknown-faucet tripwire meaningful (every faucet
+    // WE registered has a row; an unknown one is genuinely foreign). The
+    // narrow committed-but-expired-unconsumed case leaves a row whose binding
+    // never activates: the registration path's chain-check + re-drive
+    // (`faucet_registry_stale_row_redriven_total`) owns that heal, and the
+    // pre-commit bail above still protects the "nothing on-chain" case.
+    let mut bound = false;
+    for _ in 0..BRIDGE_BINDING_POLL_ATTEMPTS {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        client.sync_state().await?;
+        let Some(bridge) = client.get_account(bridge_id).await.ok().flatten() else {
+            continue;
+        };
+        if let Some(conv) =
+            crate::metadata_recovery::read_faucet_conversion_metadata(bridge.storage(), faucet_id)
+            && EthAddress::new(conv.origin_address) == *origin_token_address
+            && conv.origin_network == origin_network
+        {
+            bound = true;
+            break;
         }
+    }
+    if bound {
+        tracing::info!(
+            "bridge binding confirmed for faucet {faucet_id} (origin_network {origin_network}) — \
+             route is active"
+        );
+    } else {
+        ::metrics::counter!("faucet_binding_unverified_total").increment(1);
+        tracing::warn!(
+            faucet = %AccountIdBech32(faucet_id),
+            origin_network,
+            tx = %txn_id,
+            "register {faucet_name} faucet: config tx COMMITTED but the binding was not \
+             observed in faucet_metadata_map within {BRIDGE_BINDING_POLL_ATTEMPTS}s (NTX \
+             backlogged?). Proceeding to persist the local row — the registration is \
+             on-chain and irrevocable; abandoning it here manufactures the reconciler's \
+             unknown-faucet split-brain (2026-08-12 crash loop). The chain-check re-drive \
+             heals a binding that never activates."
+        );
     }
     Ok(())
 }
+
+/// Seconds to wait for the BRIDGE to consume a ConfigAggBridgeNote and publish
+/// the `faucet_metadata_map` binding. Since the incident amendment in
+/// `register_faucet_in_bridge` this is OBSERVABILITY only (timeout = warn +
+/// metric, never a bail), and the poll runs INSIDE the single writer worker —
+/// every second here stalls every queued job (measured: 51s queue waits fed the
+/// very congestion that starved the old 30s success gate). Keep it short; the
+/// reconciler + chain-check re-drive own eventual verification.
+const BRIDGE_BINDING_POLL_ATTEMPTS: usize = 10;
 
 /// Maximum decimals a local Miden faucet may declare. Mirrors
 /// [`miden_standards::account::faucets::FungibleFaucet::MAX_DECIMALS`], which the

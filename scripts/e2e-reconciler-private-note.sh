@@ -275,9 +275,12 @@ EVENTS_WITH_EXIT=$(bridge_event_count)
 pass "bridge-out BridgeEvent recorded (count $EVENTS_BEFORE → $EVENTS_WITH_EXIT)"
 
 # ── Operator flow: wipe ONLY the miden sqlite store, restore, restart ────────
-# (--reset-miden-store deletes store.sqlite3; postgres is untouched. The
-# reconcile cursor is in-memory, so the restarted proxy re-sweeps from genesis
-# and must re-walk THROUGH the private-note block. Pre-hotfix it froze there.)
+# (--reset-miden-store deletes store.sqlite3; postgres is untouched. Since the
+# Phase-1.1 restore design, the GENESIS RE-WALK happens INSIDE the --restore
+# one-shot: its recovery sweep runs from block 0 and must pass THROUGH the
+# private-note block — pre-hotfix it froze there. `finalize_restore_cursors`
+# then parks the DURABLE reconcile cursor at the swept tip, so the restarted
+# serving proxy RESUMES from the tip instead of repeating the walk.)
 log "stopping proxy..."
 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" stop miden-agglayer >/dev/null 2>&1
 
@@ -313,19 +316,38 @@ wait_for "proxy healthy after restart" \
     "[[ \$(docker inspect -f '{{.State.Health.Status}}' $AGGLAYER_CONTAINER 2>/dev/null) == healthy ]]" \
     180 3
 
-# The genesis re-sweep (the reconcile cursor is in-memory, so a restart always
-# re-walks from block 1) must re-encounter — and re-skip — the private note at
-# block $COMMIT_BLOCK to reach anything after it. Pre-hotfix: it wedges there
-# instead and the sweep never passes the block — retroactive healing dead.
-wait_for_skip_or_wedge "$NOTE_ID" "$MARK_B" 420 "genesis re-sweep skipping the private note again"
+# The genesis re-walk lives in the --restore ONE-SHOT now (durable reconcile
+# cursor + Phase 1.1): its sweep from block 0 must have re-encountered — and
+# re-SKIPPED — the private note to reach anything after it. Pre-hotfix it
+# wedges there instead and the sweep never passes the block — retroactive
+# healing dead. Assert the skip in the one-shot's log, where it now happens.
+# (This test previously watched the RESTARTED proxy's log for the skip; that
+# only ever passed post-Phase-1.1 when the one-shot's sweep failed to reach
+# the tip and the cursor fell back to 0 — a coincidence, not the design.)
+grep "$SKIP_LINE" "$RESTORE_LOG" | grep -q "$NOTE_ID" \
+    || { grep "$SKIP_LINE" "$RESTORE_LOG" | head -3 >&2; \
+         fail "restore one-shot never skipped the private note — its genesis sweep wedged or never reached block $COMMIT_BLOCK"; }
+pass "restore's genesis sweep re-skipped the private note (one-shot log)"
+
+# The restarted serving proxy must RESUME from the durable cursor — healthy,
+# reconciling, and NOT wedged on anything.
+wait_for "restarted reconciler resumed (sweep cursor loaded)" \
+    "logs_since \"\$MARK_B\" | grep -q 'sweep cursor loaded'" 120 3
+W=$(wedge_count_since "$MARK_B")
+[[ "$W" -lt 3 ]] \
+    || fail "restarted reconciler wedged: $W per-tick import failures after resume"
+pass "restarted proxy resumed cleanly from the durable cursor (no genesis re-walk needed)"
 pass "re-sweep advanced past the private-note block (post-restart WARN names our note id)"
 
-# Restarted process → fresh metrics registry → the counter re-appears only
-# because the re-sweep re-skipped.
+# Restarted process -> fresh metrics registry, and with the DURABLE reconcile
+# cursor parked at the swept tip the serving proxy never re-walks the private
+# block — so the counter staying at ZERO is the design working (the skip
+# already happened, and was asserted, in the --restore one-shot's sweep; the
+# LIVE-path metric was asserted in Phase A). A non-zero value here is fine too
+# (the cursor fell back to 0 because the one-shot's sweep missed the tip — the
+# degraded-but-legal path); what would be WRONG is a wedge, checked below.
 SKIP_METRIC_B=$(metric_value)
-[[ "$SKIP_METRIC_B" -ge 1 ]] \
-    || fail "$METRIC not >= 1 on /metrics after the re-sweep skip (got $SKIP_METRIC_B)"
-pass "$METRIC >= 1 on /metrics post-restart ($SKIP_METRIC_B)"
+log "post-restart $METRIC = $SKIP_METRIC_B (0 = resumed from durable cursor, the design; >0 = legal cursor fallback re-walk)"
 
 log "verifying no wedge loop after the re-sweep skip (15s / ~3 ticks)..."
 sleep 15

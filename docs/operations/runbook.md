@@ -42,6 +42,21 @@ an advisory lock before the pool opens. A previously applied file whose
 checksum differs aborts startup. Do not use a parallel migration init
 container, edit an applied migration, or mark one applied manually.
 
+### Rate-limit sizing vs the claim pipeline
+
+The per-IP rate limit (`RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST`, default
+500/500) MUST be sized above your claimtxman/aggkit burst rate. Measured on the
+N=30 loadtest: the stack's own infrastructure generates 400-1000 rate-limited
+requests per run at the default. The failure mode is not throttling — it is a
+PERMANENT wedge: claimtxman pre-assigns nonces to monitored claim txs and never
+re-nonces one it drops, so a 429-exhausted tx leaves a nonce gap that the R4
+anti-replay ledger then rejects everything behind (observed: `tx.nonce = 86-89,
+expected 11`, L1→L2 autoclaims stalled indefinitely). If autoclaims stall and
+the proxy log shows rate-limit hits alongside `nonce mismatch` errors from the
+claimtxman address, raise the limit for the infra network — the wedged
+claimtxman txs themselves need their sqlite state cleared (recreate the
+container) to re-nonce.
+
 ### Private listener and authentication
 
 The listener defaults to `0.0.0.0:8546`. Bind to an IP address on loopback or a
@@ -243,6 +258,67 @@ every restore phase, counts, cursor/tip, faucet identities, quarantines, and a
 complete log fingerprint before starting the normal service. `--restore`
 replays synthetic events during this offline reconstruction; the
 `SyntheticProjector` remains the sole producer in normal live operation.
+
+### What a restore preserves — and the one field it cannot
+
+A restore reconstructs synthetic history from authoritative Miden state. Every
+consumer-visible field of every log is reproduced exactly — `block_number`,
+`log_index`, `block_hash`, `address`, `topics`, `data`, `transaction_index`,
+`removed` — as is `hash_chain_value`. `BridgeEvent.transaction_hash` is likewise
+stable, because it is derived from the note commitment on both the live and the
+restore path.
+
+**`logIndex` semantics (Ethereum-standard, restore-stable by construction).**
+The served `logIndex` is the log's position within its block, dense from 0 —
+standard Ethereum semantics — assigned in a canonical per-block order
+(`UpdateHashChain`, then `ClaimEvent`, then `BridgeEvent`; within a kind,
+emission order). It is NOT the store's internal emission counter: within a
+block, the interleave of the GER writer and the projector is a wall-clock race
+that no restore can replay (measured: 2 swapped pairs / 79 logs; re-deriving it
+from note-consumption order made things worse and was reverted). Because the
+canonical order is a pure function of each block's log *content*, a faithful
+restore serves bit-identical `logIndex` values without needing to reproduce the
+race. A filtered `eth_getLogs` still reports each log's absolute in-block
+position, and receipts agree with `eth_getLogs`. The internal
+`synthetic_logs.log_index` column keeps the global emission sequence and may
+legitimately differ across a restore — never compare it across stores; compare
+the served view.
+
+**`ClaimEvent.transaction_hash` is the exception, and operators must expect it to
+change.** A claim's tx hash has two possible sources:
+
+| source | table | survives full DB loss? |
+| --- | --- | --- |
+| `observed_tx_hash` | `note_handoff` | no — lives only in Postgres |
+| `get_tx_for_note` | `tx_note_links` | no — lives only in Postgres |
+| `derive_manual_claim_tx_hash(note_commitment)` | — (deterministic keccak) | yes |
+
+A claim that rode a real eth-tx (the `publish_claim` path) recorded that hash only
+in Postgres — it was never written to L1 and the Miden note does not carry it. So
+after a full DB loss the restore falls back to the derived hash. The rule:
+
+> A claim's `transaction_hash` is rewritten real → derived on its **first**
+> restore, and is a bit-exact no-op on every restore afterwards.
+
+On a first restore of a production store this affects **every** claim that was
+submitted through `publish_claim`, not a rare edge case.
+
+**This is not data loss.** The log itself is intact and still fetchable by
+`(block, log_index)`, and #136/#67 guarantee the full `claimAsset` calldata stays
+servable under whichever hash carries the event — which is why aggkit continues to
+settle across the rewrite. aggkit resolves through the note, so it is unaffected.
+
+**Operator implication:** an external consumer that cached a claim's
+`transaction_hash` before the restore will not find that hash afterwards. Consumers
+that key on `(block_number, log_index)` or on the claim's global index are
+unaffected. If you run such a consumer, re-index it from the restored logs rather
+than reconciling by tx hash.
+
+`scripts/e2e-full-db-loss-recovery.sh` asserts exactly this boundary: it compares
+`eth_getLogs` before and after at the JSON-RPC level and fails if **anything other
+than** `transaction_hash` differs. It also refuses to run against a store that is
+itself restore output (`service_state.nonce_ledger_rebuilt = true`), because such a
+run would only measure idempotence, not fidelity.
 
 ### Full Miden sqlite reset plus restore
 

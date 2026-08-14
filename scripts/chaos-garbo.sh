@@ -40,6 +40,9 @@ GARBO_SUMMARY="${GARBO_SUMMARY:-/tmp/chaos-garbo-summary.env}"
 GARBO_FOREIGN="${GARBO_FOREIGN:-1}"     # fire the (heavy) foreign-claim class once
 FOREIGN_NETWORK_ID="${FOREIGN_NETWORK_ID:-3}"   # an id our stack does NOT serve (1=Miden,2=L2B)
 SEED="${GARBO_SEED:-$$}"; RANDOM=$SEED
+# Set before the EXIT trap is registered: write_summary reads $STATE, and under
+# `set -u` an early exit would otherwise die on an unset variable.
+STATE="${GARBO_STATE_DIR:-/tmp/chaos-garbo-state}"
 
 B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/chaos-garbo}"
 GARBO_WALLET_STORE="$B2AGG_STORE_DIR"
@@ -144,13 +147,16 @@ setup_garbo() {
 garbo_private_note() {
     B2AGG_STORE_DIR="$GARBO_WALLET_STORE"
     local out note_id
-    PRIVATE_ATTEMPTS=$((PRIVATE_ATTEMPTS + 1))
+    PRIVATE_ATTEMPTS=$((PRIVATE_ATTEMPTS + 1)); echo x >> "$STATE/private_attempts"
     out=$(iso_tool --send-private-note --wallet-id "$WALLET_ID" 2>&1) || {
         glog "GARBO private-note: send FAILED (transient?) — $(echo "$out" | tail -1)"; return 1; }
     note_id=$(echo "$out" | grep '\[private-note\] note-id:' | awk '{print $NF}')
     PRIVATE_FIRED=$((PRIVATE_FIRED + 1))
     # PR#145: record the id so the soak can assert its ABSENCE from the proxy
     # store directly (a leak persists rows before it is ever served).
+    # Written to $STATE too: the classes run as background workers now, so an
+    # in-memory counter would die with the subshell and the summary would be 0.
+    echo "${note_id#0x}" >> "$STATE/private_fired"
     [[ -n "$note_id" ]] && PRIVATE_NOTE_IDS="$PRIVATE_NOTE_IDS ${note_id#0x}"
     glog "GARBO private-note #$PRIVATE_FIRED id=${note_id:-?} — EXPECT: reconciler skips (synthetic_reconciler_private_skipped_total++), NEVER projected as a BridgeEvent/ClaimEvent"
 }
@@ -158,7 +164,7 @@ garbo_private_note() {
 # ── class: foreign-deployment claim (provenance gate) ────────────────────────
 garbo_foreign_claim() {
     B2AGG_STORE_DIR="$FOREIGN_STORE"
-    FOREIGN_ATTEMPTS=$((FOREIGN_ATTEMPTS + 1))
+    FOREIGN_ATTEMPTS=$((FOREIGN_ATTEMPTS + 1)); echo x >> "$STATE/foreign_attempts"
     _iso_wipe_store; mkdir -p "$B2AGG_STORE_DIR/tmp"
     local fb_out fs fg fbid ffaucet
     fb_out=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" 2>&1) || {
@@ -199,52 +205,139 @@ garbo_foreign_claim() {
     fgi=$(echo "$fc_out" | grep "global-index:" | awk '{print $NF}')
     [[ -n "$fgi" ]] || { glog "GARBO foreign-claim: could not parse foreign global index"; return 1; }
     FOREIGN_FIRED=$((FOREIGN_FIRED + 1))
+    echo "${fgi#0x}" >> "$STATE/foreign_fired"     # survives the background worker
     FOREIGN_GIS="$FOREIGN_GIS ${fgi#0x}"
     glog "GARBO foreign-claim #$FOREIGN_FIRED bridge=$fbid net=$FOREIGN_NETWORK_ID gi=$fgi — EXPECT: our proxy skips it (claim_event_foreign_skipped_total++), ZERO synthetic_logs ClaimEvent rows for gi ${fgi#0x}"
     B2AGG_STORE_DIR="$GARBO_WALLET_STORE"
 }
 
+# Counters come from $STATE, never from memory: both classes run as background
+# workers, so a variable incremented inside one would be lost when its subshell
+# exits and the summary would silently report 0 fired.
+nlines() { grep -c . "$1" 2>/dev/null || echo 0; }
 write_summary() {
+    local pf pa ff fa pids gis
+    pf=$(nlines "$STATE/private_fired"); pa=$(nlines "$STATE/private_attempts")
+    ff=$(nlines "$STATE/foreign_fired");  fa=$(nlines "$STATE/foreign_attempts")
+    pids=$(tr '\n' ' ' < "$STATE/private_fired" 2>/dev/null | xargs || true)
+    gis=$(tr '\n' ' ' < "$STATE/foreign_fired" 2>/dev/null | xargs || true)
     {
         echo "# chaos-garbo summary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "GARBO_PRIVATE_FIRED=$PRIVATE_FIRED"
-        echo "GARBO_FOREIGN_FIRED=$FOREIGN_FIRED"
-        echo "GARBO_FOREIGN_GIS=\"$(echo $FOREIGN_GIS | xargs)\""
-        echo "GARBO_PRIVATE_ATTEMPTS=$PRIVATE_ATTEMPTS"
-        echo "GARBO_FOREIGN_ATTEMPTS=$FOREIGN_ATTEMPTS"
-        echo "GARBO_PRIVATE_NOTE_IDS=\"$(echo $PRIVATE_NOTE_IDS | xargs)\""
+        echo "GARBO_PRIVATE_FIRED=$pf"
+        echo "GARBO_FOREIGN_FIRED=$ff"
+        echo "GARBO_FOREIGN_GIS=\"$gis\""
+        echo "GARBO_PRIVATE_ATTEMPTS=$pa"
+        echo "GARBO_FOREIGN_ATTEMPTS=$fa"
+        echo "GARBO_PRIVATE_NOTE_IDS=\"$pids\""
+        # Each class is independently guaranteed. A class that fired 0 times
+        # cannot assert its containment — that is NO-RUN for that class, never a
+        # containment PASS.
+        [ "$pf" -ge 1 ] && echo "GARBO_PRIVATE_GUARANTEE=met" || echo "GARBO_PRIVATE_GUARANTEE=missed"
+        [ "$ff" -ge 1 ] && echo "GARBO_FOREIGN_GUARANTEE=met" || echo "GARBO_FOREIGN_GUARANTEE=missed"
     } > "$GARBO_SUMMARY"
-    glog "summary -> $GARBO_SUMMARY (private=$PRIVATE_FIRED foreign=$FOREIGN_FIRED)"
+    glog "summary -> $GARBO_SUMMARY (private=$pf/$pa foreign=$ff/$fa)"
 }
-trap write_summary EXIT
+# PR#164 re-review — stopping the PARENT must stop the WORKERS. The soak kills
+# only this script's PID; with a summary-only EXIT trap the private/foreign
+# workers survived as orphans and kept injecting garbage traffic for up to their
+# full duration (900s) — straight through the post-chaos settle window and the
+# completeness verdict that is supposed to run on a QUIET stack. Any "extra"
+# events they produced would be attributed to the product.
+#
+# So: forward termination to both children, REAP them, and only then write the
+# summary — the summary must describe a stopped system, not a running one.
+stop_workers() {
+    local pid
+    for pid in "${PRIV_PID:-}" "${FOR_PID:-}"; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${PRIV_PID:-}" "${FOR_PID:-}"; do
+        [ -n "$pid" ] || continue
+        wait "$pid" 2>/dev/null || true
+    done
+}
+on_exit() { stop_workers; write_summary; }
+trap on_exit EXIT
+# Terminating signals run the EXIT trap via explicit exit, so a `kill` from the
+# soak reaps the workers instead of orphaning them.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+rm -rf "$STATE"; mkdir -p "$STATE"
 
 : > "$GARBO_LOG"
 glog "=== chaos-garbo start (dur=${GARBO_DURATION}s seed=$SEED foreign=$GARBO_FOREIGN net=$FOREIGN_NETWORK_ID) ==="
-if ! setup_garbo; then
-    glog "setup incomplete — will retry setup inside the fire window (#41)"
-fi
 
+# ── #41: BOTH classes are guaranteed, because they now run CONCURRENTLY ──────
+# Running them in sequence means whichever goes first can starve the other, and
+# both orderings were observed doing exactly that:
+#   foreign-first (original): foreign 13/0 -> private 0/0 | 4/0 -> 0/0 | 2/1 -> 0/0
+#   private-first (f79443c) : private 1/1  -> foreign 0    (wallet funding blocked
+#                             foreign for the whole window)
+# They are independent — private needs the funded garbo wallet, foreign builds
+# its own foreign deployment and needs nothing from it — so there is no reason
+# to serialise. Each worker retries its own class until it lands, on its own
+# deadline, and neither can block the other.
+#
+# The deadlines may outlast GARBO_DURATION on purpose: a proxy or chain that is
+# down for the whole nominal window would otherwise expire it and report 0 fired.
+# garbo runs alongside a far longer loadtest, so trying past the nominal window
+# costs nothing and beats a run that cannot assert containment.
+GARBO_PRIVATE_GUARANTEE_TIMEOUT="${GARBO_PRIVATE_GUARANTEE_TIMEOUT:-900}"
+GARBO_FOREIGN_GUARANTEE_TIMEOUT="${GARBO_FOREIGN_GUARANTEE_TIMEOUT:-900}"
 START=$(date +%s)
-# Fire the heavy foreign-claim class ONCE early (it needs several minutes).
-# #41: retried until it actually lands (or the window closes) — a one-shot
-# attempt during a proxy restart used to end the run with foreign=0.
-if [[ "$GARBO_FOREIGN" == "1" ]]; then
-    retry_until_landed garbo_foreign_claim \
-        || glog "GARBO foreign-claim: window closed before it landed (attempts=$FOREIGN_ATTEMPTS)"
-fi
-# Then spam private / tag-0 notes at random intervals for the rest of the window.
-# #41: each slot retries the SAME note until it lands; a run that got wallet
-# setup interrupted retries setup here instead of firing nothing forever.
-while [ $(( $(date +%s) - START )) -lt "$GARBO_DURATION" ]; do
-    gap=$(( GARBO_MIN_GAP + RANDOM % (GARBO_MAX_GAP - GARBO_MIN_GAP + 1) ))
-    sleep "$gap"
-    [ $(( $(date +%s) - START )) -ge "$GARBO_DURATION" ] && break
+deadline_remaining() { echo $(( $1 - $(date +%s) )); }
+
+private_worker() {
+    local dl=$(( $(date +%s) + GARBO_PRIVATE_GUARANTEE_TIMEOUT ))
+    # setup (wallet + L1->L2 funding) is retried here, NOT before the window:
+    # a funding attempt that fails takes ~5min, and doing it up front used to
+    # block the foreign class behind it.
+    while [ "$(deadline_remaining $dl)" -gt 0 ]; do
+        [[ -n "${WALLET_ID:-}" && -n "${GARBO_FAUCET_ETH:-}" ]] && break
+        proxy_ready && setup_garbo && break
+        glog "GARBO[private] wallet not ready — retry in 10s ($(deadline_remaining $dl)s left)"
+        sleep 10
+    done
     if [[ -z "${WALLET_ID:-}" ]]; then
-        wait_proxy_ready && setup_garbo || glog "GARBO setup retry failed — will retry next slot"
-        continue
+        glog "GARBO[private] GUARANTEE MISSED: wallet never usable in ${GARBO_PRIVATE_GUARANTEE_TIMEOUT}s"; return 1
     fi
-    retry_until_landed garbo_private_note || break
-done
-glog "=== chaos-garbo done: private=$PRIVATE_FIRED foreign=$FOREIGN_FIRED ==="
-glog "garbo attempts vs fired: private=$PRIVATE_ATTEMPTS/$PRIVATE_FIRED foreign=$FOREIGN_ATTEMPTS/$FOREIGN_FIRED"
+    # guaranteed first fire
+    local fired=0
+    while [ "$(deadline_remaining $dl)" -gt 0 ]; do
+        if proxy_ready && garbo_private_note; then fired=1; break; fi
+        glog "GARBO[private] did not land — retry in 10s ($(deadline_remaining $dl)s left)"
+        sleep 10
+    done
+    [ "$fired" = 1 ] || { glog "GARBO[private] GUARANTEE MISSED: never landed in ${GARBO_PRIVATE_GUARANTEE_TIMEOUT}s"; return 1; }
+    glog "GARBO[private] GUARANTEE MET"
+    # then keep spamming tag-0 notes for the remainder of the nominal window
+    while [ $(( $(date +%s) - START )) -lt "$GARBO_DURATION" ]; do
+        sleep $(( GARBO_MIN_GAP + RANDOM % (GARBO_MAX_GAP - GARBO_MIN_GAP + 1) ))
+        [ $(( $(date +%s) - START )) -ge "$GARBO_DURATION" ] && break
+        proxy_ready && garbo_private_note
+    done
+}
+
+foreign_worker() {
+    [[ "$GARBO_FOREIGN" == "1" ]] || return 0
+    local dl=$(( $(date +%s) + GARBO_FOREIGN_GUARANTEE_TIMEOUT ))
+    while [ "$(deadline_remaining $dl)" -gt 0 ]; do
+        if proxy_ready && garbo_foreign_claim; then glog "GARBO[foreign] GUARANTEE MET"; return 0; fi
+        glog "GARBO[foreign] did not land — retry in 10s ($(deadline_remaining $dl)s left)"
+        sleep 10
+    done
+    glog "GARBO[foreign] GUARANTEE MISSED: never landed in ${GARBO_FOREIGN_GUARANTEE_TIMEOUT}s"
+    return 1
+}
+
+private_worker & PRIV_PID=$!
+foreign_worker & FOR_PID=$!
+wait "$PRIV_PID" 2>/dev/null
+wait "$FOR_PID"  2>/dev/null
+PF=$(nlines "$STATE/private_fired"); FF=$(nlines "$STATE/foreign_fired")
+PA=$(nlines "$STATE/private_attempts"); FA=$(nlines "$STATE/foreign_attempts")
+glog "=== chaos-garbo done: private=$PF foreign=$FF ==="
+glog "garbo attempts vs fired: private=$PA/$PF foreign=$FA/$FF"
 # EXIT trap writes the summary.

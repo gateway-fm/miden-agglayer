@@ -1,0 +1,25 @@
+-- Finding #90 — a full-DB-loss restore rebuilds the store from chain state, but
+-- the `nonces` table has NO chain source: the expected nonce for a signer is
+-- proxy-local bookkeeping of L2 transactions this proxy accepted. After the drop
+-- every row is gone, so `nonce_get` reports 0 while a CONTINUING signer (aggkit's
+-- aggoracle/aggsender wallets) submits from wherever it left off.
+--
+-- The result is a permanent wedge, measured on the 2026-08-11 recovery gate: the
+-- GER-injector signer sat at `expected_nonce=0, tx_nonce=21` for 34,287 retries in
+-- ~30 minutes (~19/s), parked in the future-nonce queue waiting for a nonce that
+-- can never be submitted. GER injection — and therefore the whole certificate
+-- pipeline — never resumes.
+--
+-- Parking a nonce gap is CORRECT while live (the missing tx is in flight and will
+-- arrive). It is fatal only when the ledger was WIPED, because then the gap is an
+-- artifact of recovery rather than of ordering. The request path cannot tell those
+-- apart from an absent row alone, so restore records the fact explicitly here and
+-- the admission path consults it.
+--
+-- Set by `restore()` Phase 4; consulted only when a signer has NO ledger row at
+-- all. Once that signer is bootstrapped its row exists and ordinary R4 ordering
+-- and replay protection apply again, so the flag's blast radius is exactly
+-- first-contact-per-signer after a rebuild. A fresh deployment never sets it, so
+-- default admission behaviour is unchanged.
+ALTER TABLE service_state
+    ADD COLUMN IF NOT EXISTS nonce_ledger_rebuilt BOOLEAN NOT NULL DEFAULT false;

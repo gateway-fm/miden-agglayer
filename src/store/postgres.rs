@@ -238,6 +238,46 @@ impl Store for PgStore {
         Ok(())
     }
 
+    // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
+
+    async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT nonce_ledger_rebuilt FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(row.get::<_, bool>(0))
+    }
+
+    async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET nonce_ledger_rebuilt = $1, updated_at = now() WHERE id = 1",
+                &[&rebuilt],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        // Insert-if-absent: atomic and idempotent across replicas — exactly one
+        // caller seeds the baseline, everyone else sees 0 rows affected and falls
+        // through to the ordinary R4 path against the now-existing row.
+        let affected = client
+            .execute(
+                "INSERT INTO nonces (address, nonce) VALUES ($1, $2)
+                 ON CONFLICT (address) DO NOTHING",
+                &[&key, &(nonce as i64)],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         // O(1) read of the durable repair-backlog set (migration 019), seeded once
@@ -816,6 +856,13 @@ impl Store for PgStore {
         let to_block = filter.to_block_number(current_block);
 
         // ── Build the SAFE-SUPERSET WHERE (numbered params in push order) ──
+        // Two cond sets: `block_conds` go INSIDE the ranked subquery (they only
+        // narrow which blocks are scanned and never remove a log from a scanned
+        // block, so the per-block ROW_NUMBER stays absolute), while address/topic
+        // predicates go OUTSIDE it (they remove individual logs, and Ethereum's
+        // `logIndex` is the log's position in the block's COMPLETE log set — a
+        // filtered query must still report the unfiltered position).
+        let mut block_conds: Vec<String> = Vec::new();
         let mut conds: Vec<String> = Vec::new();
         // `+ Send`: this Vec is held across the `query_raw(...).await` below, so the
         // async fn's future must be `Send` (async_trait Store contract). A bare
@@ -823,13 +870,26 @@ impl Store for PgStore {
         // `&(dyn ToSql + Sync)` that `query_raw` expects.
         let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
 
+        // Served-`logIndex` canonical rank params ($1..$3): the kind order of
+        // `log_synthesis::canonical_kind_rank` + the CLAIM content tiebreak of
+        // `assign_canonical_block_indices`, mirrored in SQL (claims order by
+        // DATA — the unique global index — because the calldata backfill can
+        // emit same-block claims in either order; see that function's docs).
+        params.push(Box::new(UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase()));
+        params.push(Box::new(
+            crate::log_synthesis::CLAIM_EVENT_TOPIC.to_lowercase(),
+        ));
+        params.push(Box::new(
+            crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_lowercase(),
+        ));
+
         // Block predicate. When block_hash is set, `matches()` keys on the hash
         // string and IGNORES the range, so we mirror it as an EXACT string
         // comparison — `encode()` yields lowercase hex, so no decode is needed
         // and malformed input compares identically to `matches()`.
         if let Some(bh) = filter.block_hash.as_ref() {
             params.push(Box::new(bh.to_lowercase()));
-            conds.push(format!(
+            block_conds.push(format!(
                 "('0x' || encode(block_hash, 'hex')) = ${}",
                 params.len()
             ));
@@ -848,7 +908,7 @@ impl Store for PgStore {
             let p_from = params.len();
             params.push(Box::new(to));
             let p_to = params.len();
-            conds.push(format!(
+            block_conds.push(format!(
                 "block_number >= ${p_from} AND block_number <= ${p_to}"
             ));
         }
@@ -875,12 +935,31 @@ impl Store for PgStore {
             conds.push(format!("lower(topics[1]) = ANY(${p_t0})"));
         }
 
-        let sql = format!(
-            "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
-             FROM synthetic_logs
-             WHERE {}
-             ORDER BY block_number, log_index",
+        // Rank INSIDE the block-narrowed subquery so `served_log_index` is the
+        // log's absolute position in its block's complete, canonically-ordered
+        // log set; filter individual logs OUTSIDE it.
+        let outer = if conds.is_empty() {
+            "TRUE".to_string()
+        } else {
             conds.join(" AND ")
+        };
+        let sql = format!(
+            "SELECT served_log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
+             FROM (
+                 SELECT *, (ROW_NUMBER() OVER (
+                     PARTITION BY block_number
+                     ORDER BY CASE lower(topics[1])
+                                  WHEN $1 THEN 0 WHEN $2 THEN 1 WHEN $3 THEN 2
+                                  ELSE 3 END,
+                              CASE WHEN lower(topics[1]) = $2 THEN data ELSE '' END,
+                              log_index
+                 ) - 1) AS served_log_index
+                 FROM synthetic_logs
+                 WHERE {}
+             ) ranked
+             WHERE {outer}
+             ORDER BY block_number, served_log_index",
+            block_conds.join(" AND ")
         );
 
         // Stream incrementally over a portal. The pooled connection is held for
@@ -923,13 +1002,35 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let key = tx_hash.to_lowercase();
 
+        // Serve the same canonical per-block `logIndex` as `get_logs` — a receipt's
+        // logs and an `eth_getLogs` result must agree on every log's index. The
+        // subquery ranks over the COMPLETE log set of every block the tx touches.
         let rows = client
             .query(
-                "SELECT log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
-                 FROM synthetic_logs
+                "SELECT served_log_index, address, topics, data, block_number, block_hash, transaction_hash, transaction_index, removed
+                 FROM (
+                     SELECT *, (ROW_NUMBER() OVER (
+                         PARTITION BY block_number
+                         ORDER BY CASE lower(topics[1])
+                                      WHEN $2 THEN 0 WHEN $3 THEN 1 WHEN $4 THEN 2
+                                      ELSE 3 END,
+                                  CASE WHEN lower(topics[1]) = $3 THEN data ELSE '' END,
+                                  log_index
+                     ) - 1) AS served_log_index
+                     FROM synthetic_logs
+                     WHERE block_number IN (
+                         SELECT block_number FROM synthetic_logs
+                         WHERE lower(transaction_hash) = $1
+                     )
+                 ) ranked
                  WHERE lower(transaction_hash) = $1
-                 ORDER BY log_index",
-                &[&key],
+                 ORDER BY block_number, served_log_index",
+                &[
+                    &key,
+                    &UPDATE_HASH_CHAIN_VALUE_TOPIC.to_lowercase(),
+                    &crate::log_synthesis::CLAIM_EVENT_TOPIC.to_lowercase(),
+                    &crate::log_synthesis::BRIDGE_EVENT_TOPIC.to_lowercase(),
+                ],
             )
             .await
             ?;

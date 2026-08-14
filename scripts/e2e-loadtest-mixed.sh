@@ -374,7 +374,29 @@ if [[ "$(cat "$CNT_DIR/clash")" == "submitted" ]]; then
         if [[ -n "$f0" && -n "$f2" && "$f0" != "$f2" ]]; then
             echo "distinct" > "$CNT_DIR/clash"; mix "clash: DISTINCT faucets net0=$f0 net2=$f2"
         else echo "collision" > "$CNT_DIR/clash"; mix "clash: COLLISION net0=$f0 net2=$f2"; fi
-    else echo "faucets-incomplete" > "$CNT_DIR/clash"; mix "clash: two faucet rows never appeared"; fi
+    else
+        # #99 SELF-DIAGNOSIS: say WHICH leg is missing and what state it reached, so the
+        # next occurrence is diagnosable from the log alone instead of needing a re-run.
+        echo "faucets-incomplete" > "$CNT_DIR/clash"
+        d0=$(pgq "SELECT count(*) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}' AND origin_network=0;")
+        d2=$(pgq "SELECT count(*) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}' AND origin_network=${L2B_NETWORK_ID};")
+        dall=$(pgq "SELECT count(*) FROM faucet_registry WHERE encode(origin_address,'hex')='${COL_HEX}';")
+        mix "clash: two faucet rows never appeared — net0_rows=$d0 net2_rows=$d2 total=$dall"
+        if [[ "$d0" == "0" ]]; then
+            mix "clash-diag: the NET-0 (L1->Miden AUTO-claim) row is missing — suspect \
+autoclaim lag/failure on the L1 leg, not the client-submitted L2B leg"
+        fi
+        if [[ "$d2" == "0" ]]; then
+            mix "clash-diag: the NET-2 (L2B->Miden client-submitted) row is missing — \
+suspect the proxy resolved this claim onto the existing net-0 faucet (provenance bug) \
+or the claim never reached worker_handle_claim_asset"
+            mix "clash-diag: net-2 ClaimEvent rows for gi ${cgi:-<none>}: $(claim_event_rows "${cgi:-0}")"
+        fi
+        # Both legs' faucet rows for this address, whatever they are.
+        pgq "SELECT origin_network || ' => ' || lower(faucet_id) FROM faucet_registry \
+             WHERE encode(origin_address,'hex')='${COL_HEX}' ORDER BY origin_network;" \
+          | while read -r r; do [[ -n "$r" ]] && mix "clash-diag: registry row $r"; done
+    fi
 fi
 
 # back: client-submit claimAsset on L2B for every ready Miden->L2B MOP deposit, then

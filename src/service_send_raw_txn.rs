@@ -299,6 +299,74 @@ async fn accept_and_revert_landed_claim(
     Ok(())
 }
 
+/// #90 (re-review) — how long after a store rebuild the first-contact nonce
+/// bootstrap stays available, in seconds. Bounded so "recovery mode" cannot linger
+/// indefinitely: the marker applied to EVERY previously-unseen signer for the life
+/// of the deployment, which is far broader than the continuing wallets it exists
+/// for. A continuing aggkit wallet submits within seconds of coming back, so a
+/// short window is ample.
+fn recovery_bootstrap_window() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("NONCE_RECOVERY_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800),
+    )
+}
+
+/// When this process first observed the rebuild marker. The window is measured
+/// from first observation rather than persisted, so no extra migration is needed
+/// and a restart cannot silently extend recovery mode indefinitely.
+static RECOVERY_MODE_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Lowest nonce observed per signer while recovery mode is active. The baseline is
+/// taken from this MINIMUM, never from whichever request arrived first.
+static RECOVERY_MIN_NONCE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn note_recovery_nonce(signer: &str, nonce: u64) {
+    let mut m = RECOVERY_MIN_NONCE.lock().unwrap();
+    m.entry(signer.to_string())
+        .and_modify(|lowest| {
+            if nonce < *lowest {
+                *lowest = nonce;
+            }
+        })
+        .or_insert(nonce);
+}
+
+fn lowest_recovery_nonce(signer: &str) -> Option<u64> {
+    RECOVERY_MIN_NONCE.lock().unwrap().get(signer).copied()
+}
+
+/// Is the post-rebuild nonce bootstrap currently permitted?
+///
+/// True only while the durable rebuild marker is set AND this process has been
+/// observing it for less than [`recovery_bootstrap_window`]. Once the window
+/// lapses the marker is CLEARED durably, so recovery mode ends on its own instead
+/// of applying to every future unseen signer forever.
+async fn recovery_bootstrap_active(service: &ServiceState) -> anyhow::Result<bool> {
+    if !service.store.is_nonce_ledger_rebuilt().await? {
+        return Ok(false);
+    }
+    let since = *RECOVERY_MODE_SINCE.get_or_init(std::time::Instant::now);
+    if since.elapsed() < recovery_bootstrap_window() {
+        return Ok(true);
+    }
+    // Window lapsed — retire recovery mode durably and permanently.
+    service.store.set_nonce_ledger_rebuilt(false).await?;
+    RECOVERY_MIN_NONCE.lock().unwrap().clear();
+    ::metrics::counter!("rpc_nonce_recovery_mode_expired_total").increment(1);
+    tracing::info!(
+        target: "rpc::nonce_repair",
+        window_secs = recovery_bootstrap_window().as_secs(),
+        "#90: post-rebuild nonce recovery window elapsed — bootstrap disabled; ordinary \
+         R4 admission applies to every signer from here on"
+    );
+    Ok(false)
+}
+
 /// #55 BLOCKER C/D — idempotent crash-gap nonce repair via store-level CAS.
 ///
 /// On the accept path the durable receipt write and the nonce advance are
@@ -1374,7 +1442,35 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce
         // only on success and never compared the incoming `tx.nonce` against
         // the expected next value. That allowed replay and skipped sequencing.
-        let expected_nonce = service.store.nonce_get(&signer_str).await?;
+        // #90 — a full-DB-loss restore rebuilds the store from chain state, but the
+        // nonce ledger has NO chain source: it is proxy-local bookkeeping of the L2
+        // transactions this proxy accepted. Every row is therefore gone, while a
+        // CONTINUING signer keeps submitting from where it left off. `nonce_get`
+        // reports 0, the tx looks like a future nonce, and it parks in the queue
+        // waiting for nonces 0..N-1 that can never be submitted — a PERMANENT wedge
+        // (measured: GER injector at `expected=0, got=21`, 34,287 retries in ~30min,
+        // ~19/s, injection dead).
+        //
+        // Parking a gap is correct while LIVE — the missing tx is in flight. It is
+        // only fatal when the ledger was WIPED, and an absent row alone cannot tell
+        // those apart. So restore sets a durable marker, and here — only for a
+        // signer with NO row at all, on a store flagged as rebuilt — we adopt the
+        // first observed nonce as that signer's baseline.
+        //
+        // Safety: this cannot enable replay of a LOWER nonce (seeding high makes
+        // every lower nonce stale, which R4 still rejects), and from the seed
+        // onward ordinary R4 sequencing applies. Double-EFFECTS remain prevented by
+        // the domain-level idempotency that DOES survive a restore
+        // (`is_ger_injected`, `claimed_indices` / `is_note_processed`).
+        // Recovery mode is TIME-SCOPED and self-clearing (see
+        // `recovery_bootstrap_active`), and while it is active we only RECORD each
+        // observed nonce here. Seeding is deliberately deferred until the ordering
+        // window below is exhausted, so an in-flight LOWER nonce still wins.
+        let recovery_bootstrap = recovery_bootstrap_active(&service).await?;
+        if recovery_bootstrap && tx_nonce > 0 {
+            note_recovery_nonce(&signer_str, tx_nonce);
+        }
+        let mut expected_nonce = service.store.nonce_get(&signer_str).await?;
         let durable_frontier = service.store.pending_nonce_frontier(&signer_str).await?;
         if let Some(lower_nonce) = durable_frontier.lowest_unlinked
             && lower_nonce < tx_nonce
@@ -1394,6 +1490,49 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         let can_wait_for_future_nonce = service.writer_handle.is_some()
             && tx_nonce > expected_nonce
             && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
+
+        // #90 (re-review) — seed the baseline ONLY once the future-nonce ordering
+        // window is exhausted, and seed with the LOWEST nonce observed for this
+        // signer during that window, never with whichever request happened to
+        // arrive first.
+        //
+        // Seeding on first arrival was wrong twice over: HTTP/retry ordering can
+        // deliver N+1 before a still-pending N, which would seed N+1 and strand N
+        // as permanently stale; and doing it above bypassed the very ordering
+        // protection sitting right here. Deferring to window-exhaustion gives a
+        // genuinely in-flight lower nonce the FULL window to arrive and win, and
+        // taking the minimum means the request that seeds need not be the one that
+        // is finally admitted — with baseline N seeded, the N request matches and
+        // proceeds while N+1 simply retries into its normal sequential slot.
+        if recovery_bootstrap
+            && tx_nonce > 0
+            && !can_wait_for_future_nonce
+            && tx_nonce != expected_nonce
+        {
+            let baseline = lowest_recovery_nonce(&signer_str).unwrap_or(tx_nonce);
+            if service
+                .store
+                .nonce_bootstrap_if_absent(&signer_str, baseline)
+                .await?
+            {
+                ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
+                tracing::warn!(
+                    target: "rpc::nonce_repair",
+                    signer = %signer_str,
+                    adopted_nonce = baseline,
+                    observed_nonce = tx_nonce,
+                    "#90: no nonce ledger entry for this signer after a store rebuild — \
+                     adopting the LOWEST nonce observed during the ordering window as the \
+                     baseline so a continuing wallet can resume; R4 sequencing applies from \
+                     here on"
+                );
+                // Re-read: the seed may have been a LOWER nonce than this request,
+                // in which case this one correctly waits its turn.
+                expected_nonce = service.store.nonce_get(&signer_str).await?;
+            }
+        }
+        let can_wait_for_future_nonce = can_wait_for_future_nonce && tx_nonce > expected_nonce;
+
         let nonce_action = if tx_nonce == expected_nonce || durable_resume_nonce {
             "accept"
         } else if can_wait_for_future_nonce {
@@ -2600,6 +2739,173 @@ mod tests {
         assert!(
             msg.contains("missing chain_id") || msg.contains("EIP-155"),
             "unexpected: {msg}"
+        );
+    }
+
+    /// #90 — the wedge itself, as a regression. On a store whose ledger was
+    /// REBUILT by restore, a continuing signer's first tx (nonce 21, no ledger
+    /// row) must be ADMITTED by adopting 21 as the baseline. Pre-fix this parked
+    /// in the future-nonce queue forever waiting for nonce 0 — the GER injector
+    /// spun 34,287 times in ~30min and injection never resumed.
+    #[tokio::test]
+    async fn finding90_rebuilt_ledger_bootstraps_continuing_signer() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xAAu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 21);
+        let signer_str = format!("{signer:#x}");
+
+        // Must not hang in the future-nonce queue and must not reject.
+        let _ = service_send_raw_txn(service.clone(), input_hex).await;
+
+        // The baseline was adopted, so the NEXT expected nonce is 22 — ordinary R4
+        // sequencing resumes from the seed rather than from 0.
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            22,
+            "a continuing signer must resume at its own nonce after a ledger rebuild"
+        );
+    }
+
+    /// #90 fail-safe: WITHOUT the rebuild marker (an ordinary live deployment) a
+    /// nonce gap must still be treated as a gap — parked/rejected, never adopted.
+    /// Otherwise the future-nonce queue's whole purpose (wait for the in-flight
+    /// lower nonce) would be defeated and out-of-order admission allowed.
+    #[tokio::test]
+    async fn finding90_live_ledger_does_not_bootstrap_a_gap() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        // No marker set — this is a normal running deployment.
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xBBu8; 32]),
+        }
+        .abi_encode();
+        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 21);
+        let signer_str = format!("{signer:#x}");
+
+        let _ = service_send_raw_txn(service.clone(), input_hex).await;
+
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "a live deployment must NOT adopt a future nonce — the gap is real and the \
+             missing tx is expected to arrive"
+        );
+    }
+
+    /// `RECOVERY_MIN_NONCE` / `RECOVERY_MODE_SINCE` are process-wide statics, and the
+    /// window-expiry path CLEARS the min-nonce map. Tests that touch either must not
+    /// run concurrently or one will wipe the other's observations mid-assertion.
+    static NONCE_RECOVERY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #90 (re-review) — ORDERING: `N+1` may reach the proxy before a still-pending
+    /// `N` (HTTP reordering, a retry, concurrent submitters). Seeding from whichever
+    /// request arrived FIRST would adopt `N+1` and strand `N` as permanently stale —
+    /// silently dropping a transaction the wallet believes is live.
+    ///
+    /// The baseline is therefore taken from the LOWEST nonce observed during the
+    /// ordering window, not the first. Here `22` is observed before `21`, and the
+    /// seeded baseline must still be `21`.
+    #[tokio::test]
+    async fn finding90_seeds_lowest_observed_nonce_not_first_arrival() {
+        let addr = "0x00000000000000000000000000000000000000bb";
+        // Scope the guard to the SYNCHRONOUS section touching the shared statics:
+        // holding a std Mutex across an await is a clippy error and a real deadlock
+        // hazard. The window-expiry path clears this map, so the two tests that use
+        // it must not interleave here.
+        let baseline = {
+            let _guard = NONCE_RECOVERY_TEST_GUARD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Observed out of order: the higher nonce arrives first.
+            note_recovery_nonce(addr, 22);
+            note_recovery_nonce(addr, 21);
+            let lowest = lowest_recovery_nonce(addr);
+            assert_eq!(
+                lowest,
+                Some(21),
+                "the baseline must track the LOWEST nonce seen in the window, so an \
+                 out-of-order N+1 cannot strand the pending N"
+            );
+            lowest.expect("min tracked under the guard")
+        };
+
+        // And seeding uses that minimum, so the N request matches and proceeds
+        // while N+1 simply waits its turn.
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        assert!(
+            store
+                .nonce_bootstrap_if_absent(addr, baseline)
+                .await
+                .unwrap(),
+            "first seed wins"
+        );
+        assert_eq!(
+            store.nonce_get(addr).await.unwrap(),
+            21,
+            "the ledger must resume at the lowest outstanding nonce, not at N+1"
+        );
+    }
+
+    /// #90 (re-review) — recovery mode must not be a permanent global amnesty. It is
+    /// time-scoped from first observation and CLEARS the durable marker when the
+    /// window lapses, so it cannot keep applying to every previously-unseen signer
+    /// for the life of the deployment.
+    #[tokio::test]
+    async fn finding90_recovery_mode_is_scoped_and_self_clearing() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+
+        // A zero-length window means the very first check retires recovery mode.
+        // The guard covers only the shared-static mutation (see the sibling test):
+        // a std Mutex must not be held across an await.
+        {
+            let _guard = NONCE_RECOVERY_TEST_GUARD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
+        }
+        let active = recovery_bootstrap_active(&service).await.unwrap();
+        unsafe { std::env::remove_var("NONCE_RECOVERY_WINDOW_SECS") };
+
+        assert!(!active, "an elapsed window must not permit bootstrap");
+        assert!(
+            !store.is_nonce_ledger_rebuilt().await.unwrap(),
+            "the durable marker must be CLEARED once the window lapses — recovery mode \
+             must not apply indefinitely to every future unseen signer"
+        );
+    }
+
+    /// #90 — bootstrapping is first-contact ONLY. Once a signer has a row, the
+    /// marker must not let a later out-of-order nonce re-seed it (that would
+    /// reopen the replay/ordering hole R4 exists to close).
+    #[tokio::test]
+    async fn finding90_bootstrap_is_first_contact_only() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        let addr = "0x00000000000000000000000000000000000000aa";
+
+        assert!(
+            store.nonce_bootstrap_if_absent(addr, 21).await.unwrap(),
+            "first contact seeds the baseline"
+        );
+        assert!(
+            !store.nonce_bootstrap_if_absent(addr, 99).await.unwrap(),
+            "a second attempt must be a no-op — the row already exists"
+        );
+        assert_eq!(
+            store.nonce_get(addr).await.unwrap(),
+            21,
+            "the original baseline must survive; a later nonce cannot re-seed it"
         );
     }
 
