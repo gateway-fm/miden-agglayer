@@ -77,6 +77,10 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	bash -n scripts/release-acceptance.sh
 	bash -n scripts/release-acceptance-guards.test.sh
 	bash scripts/release-acceptance-guards.test.sh
+	bash -n scripts/verify-event-completeness.sh
+	bash -n scripts/test-verify-completeness-substitution.sh
+	python3 -m py_compile scripts/lib-verify-completeness.py
+	TOOL_BIN=target/release/bridge-out-tool bash scripts/test-verify-completeness-substitution.sh
 
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)

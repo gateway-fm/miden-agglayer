@@ -52,3 +52,5 @@ fixtures/l2b/gas_token.env
 anvil-l2b-watch.log
 fixtures/web3signer-keys/
 fixtures/web3signer-keys.env
+__pycache__/
+*.pyc

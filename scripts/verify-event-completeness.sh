@@ -139,7 +139,14 @@ sleep "${SETTLE_MARGIN_SECS:-20}"
 # 4. Cross-check — the counting core lives in lib-verify-completeness.py so
 #    the same-block substitution regression can drive the EXACT production
 #    logic against fixtures (review 0814).
+#    The PROXY CLIENT store supplies note_id -> details_commitment: runtime
+#    BridgeEvent tx hashes derive from bare hex(details_commitment)
+#    (project_b2agg_note), so identity-level checks need the commitment, not
+#    the NoteId. Unavailable snapshot => the lib fails closed (reclaims stay
+#    EXPECTED, deferred slots unmatchable).
+docker cp "$AGGLAYER_CONTAINER:/var/lib/miden-agglayer-service/store.sqlite3" "$TMP/client.sqlite3" 2>/dev/null \
+    || rm -f "$TMP/client.sqlite3"
 export TOOL_BIN
 python3 "$SCRIPT_DIR/lib-verify-completeness.py" \
     "$TMP/node.sqlite3" "$L2_RPC" "$BRIDGE_ID" "$B2AGG_ROOT" "$CLAIM_ROOT" "$GER_ROOT" \
-    "$ALLOW_LATE" "$DEFERRED_FAUCETS" "$TMP/unclaimable-claims"
+    "$ALLOW_LATE" "$DEFERRED_FAUCETS" "$TMP/unclaimable-claims" "$TMP/client.sqlite3"

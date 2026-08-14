@@ -20,8 +20,27 @@ db, rpc, bridge_id, b2agg_root, claim_root, ger_root, allow_late = sys.argv[1:8]
 # unrecoverable registry rows). Lower-case hex, no 0x.
 deferred_faucets = set((sys.argv[8] if len(sys.argv) > 8 else "").lower().split())
 unclaimable_file = sys.argv[9]
+# Proxy client store (note_id -> details_commitment). Runtime BridgeEvent tx
+# hashes derive from bare hex(details_commitment) (project_b2agg_note), so the
+# identity checks below need the commitment. Missing/unreadable => fail closed.
+client_db = sys.argv[10] if len(sys.argv) > 10 else ""
 bridge_hex = bridge_id[2:].upper()
 tool_bin = os.environ.get("TOOL_BIN", "")
+
+_client = None
+if client_db and os.path.exists(client_db):
+    _client = sqlite3.connect(client_db)
+
+
+def commitment_for(note_id_hex):
+    """Bare lowercase hex details_commitment for a NoteId, from the proxy's
+    client store. None when unresolvable (fail-closed at the caller)."""
+    if _client is None:
+        return None
+    row = _client.execute(
+        "SELECT lower(hex(details_commitment)) FROM input_notes WHERE upper(hex(note_id))=?",
+        (note_id_hex.upper(),)).fetchone()
+    return row[0] if row and row[0] else None
 
 TOPICS = {
     "B2AGG->BridgeEvent":  ("0x501781209a1f8899323b96b4ef08b168df93e0a90c673d1e4cce39366cb62f9b", b2agg_root),
@@ -41,33 +60,34 @@ def rpc_call(method, params):
     return resp["result"]
 
 
-def derive_forbidden_hashes(note_ids_hex):
-    """The EXACT synthetic tx hash the proxy would serve a BridgeEvent under,
-    from the shipped derivation (bridge-out-tool wraps
-    bridge_out::derive_bridge_out_tx_hash). Both key forms are derived: the
-    modern NoteId key (`0x…`, lowercase) and the legacy commitment-hex key.
-    Fail-closed: if the tool cannot derive, the caller keeps the notes
-    EXPECTED instead of exempting them blind."""
-    if not note_ids_hex or not tool_bin:
-        return None if note_ids_hex else set()
-    keys = []
-    for i in note_ids_hex:
-        keys.append("0x" + i.lower())
-        keys.append(i.lower())
+def derive_tx_hashes(keys):
+    """key -> the EXACT synthetic tx hash the proxy serves a BridgeEvent under,
+    via the shipped derivation (bridge-out-tool wraps
+    bridge_out::derive_bridge_out_tx_hash). Runtime keys are BARE lowercase
+    hex(details_commitment) (project_b2agg_note). Fail-closed: any tool failure
+    or INCOMPLETE output (fewer lines than keys) returns None and the caller
+    must not exempt anything."""
+    if not keys:
+        return {}
+    if not tool_bin:
+        return None
     try:
         out = subprocess.run(
             [tool_bin, "--store-dir", "/tmp", "--node-url", "http://x",
              "--derive-bridge-out-tx-hash", *keys],
             capture_output=True, text=True, timeout=60, check=True).stdout
     except Exception as e:  # noqa: BLE001 — any tool failure must fail closed
-        print(f"    WARN: forbidden-hash derivation failed ({e}) — reclaims stay EXPECTED (fail-closed)")
+        print(f"    WARN: tx-hash derivation failed ({e}) — fail-closed")
         return None
-    hashes = set()
+    mapping = {}
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 2:
-            hashes.add(parts[1].lower())
-    return hashes
+            mapping[parts[0]] = parts[1].lower()
+    if len(mapping) != len(set(keys)):
+        print(f"    WARN: tx-hash derivation INCOMPLETE ({len(mapping)}/{len(set(keys))}) — fail-closed")
+        return None
+    return mapping
 
 
 tip = int(rpc_call("eth_blockNumber", []), 16)
@@ -142,17 +162,33 @@ for name, (topic, root) in TOPICS.items():
         # Counter(block) alone cannot see SAME-BLOCK SUBSTITUTION: one missing
         # legit note + one wrongly-emitted reclaimed note in the same block
         # cancel out count-wise. Derive each reclaim's canonical synthetic tx
-        # hash and HARD-FAIL on any served log carrying it — identity-level,
-        # not count-level. If derivation is unavailable the reclaims stay
-        # EXPECTED (fail-closed: they then surface as MISSING, never absorb).
-        forbidden = derive_forbidden_hashes(reclaimed_ids)
-        if forbidden is None:
-            forbidden = set()  # derivation unavailable: every row stays expected
-        else:
-            rows = expected_rows
+        # hash — from its DETAILS COMMITMENT, the exact runtime key
+        # (project_b2agg_note) — and HARD-FAIL on any served log carrying it.
+        # A reclaim whose commitment or hash cannot be resolved stays EXPECTED
+        # (fail-closed: it surfaces as MISSING, never absorbs a wrong log).
+        reclaim_commits = {}
+        unresolved = []
+        for i in reclaimed_ids:
+            commit = commitment_for(i)
+            if commit is None:
+                unresolved.append(i)
+            else:
+                reclaim_commits[i] = commit
+        derived = derive_tx_hashes(sorted(set(reclaim_commits.values())))
+        if derived is None:
+            unresolved.extend(reclaim_commits)
+            reclaim_commits = {}
+            derived = {}
+        if unresolved:
+            print(f"    WARN: {len(unresolved)} reclaim(s) unresolvable to a runtime tx hash — kept EXPECTED (fail-closed)")
+            keep = set(unresolved)
+            expected_rows.extend(r for r in rows if r["i"] in keep)
+        forbidden = {derived[c] for c in reclaim_commits.values()}
+        rows = expected_rows
     note_blocks = Counter(r["consumed_at"] for r in rows)
     expected_ids = {r["i"] for r in rows}
     logs = get_logs(topic)
+    served_tx_hashes = {l["transactionHash"].lower() for l in logs}
     all_logs_count = sum(1 for l in logs if int(l["blockNumber"], 16) <= cut)
     forbidden_ct = 0
     if name == "B2AGG->BridgeEvent" and forbidden:
@@ -218,13 +254,26 @@ for name, (topic, root) in TOPICS.items():
             "SELECT hex(note_id) i, consumed_at b, hex(assets) a FROM notes WHERE script_root=? AND consumed_at IS NOT NULL "
             "AND consumed_at<=? AND hex(target_account_id)=? ORDER BY consumed_at",
             (bytes.fromhex(root[2:]), cut, bridge_hex)))
+        det_commits = {r["i"]: commitment_for(r["i"]) for r in det if r["i"] in expected_ids}
+        det_hashes = derive_tx_hashes(sorted({c for c in det_commits.values() if c}))
         for r in det:
             if r["i"] not in expected_ids:
+                continue
+            # Identity gate (review 0814c): a candidate whose RUNTIME tx hash is
+            # served is EMITTED — it is neither missing nor deferrable, so it
+            # must not soak up a missing/deferred slot that belongs to another
+            # note in the same block (the deferred-substitution false green).
+            # Unresolvable commitment/hash => fail-closed: the note cannot be
+            # DEFERRED (only reported MISSING).
+            commit = det_commits.get(r["i"])
+            r_hash = det_hashes.get(commit) if (det_hashes and commit) else None
+            if name == "B2AGG->BridgeEvent" and r_hash is not None and r_hash in served_tx_hashes:
                 continue
             if unmatched.get(r["b"], 0) > 0:
                 # asset faucet id: 15 bytes after the 2-byte assets prefix
                 fauc = (r["a"] or "")[4:34].lower()
-                if fauc and fauc in deferred_faucets and deferred < missing:
+                identity_ok = name != "B2AGG->BridgeEvent" or r_hash is not None
+                if fauc and fauc in deferred_faucets and identity_ok and deferred < missing:
                     deferred += 1
                     unmatched[r["b"]] -= 1
                     print(f"    DEFERRED (deliberate emit refusal, recovery via --restore): "

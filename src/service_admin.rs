@@ -482,61 +482,7 @@ pub async fn admin_register_native_faucet(
     // params — otherwise the hash is unrecoverable and its poison leaf halts
     // restore. `with()` returning before this populates the slot (or erroring) is
     // fail-closed: we bail before touching the bridge or the registry.
-    let authoritative = Arc::new(std::sync::Mutex::new(None::<AuthoritativeFaucetMetadata>));
-    let authoritative_read = authoritative.clone();
-    state
-        .miden_client
-        .with(move |client| {
-            Box::new(async move {
-                // Native faucets are externally deployed and NOT in
-                // bridge_accounts.toml, so import them on demand before reading.
-                if client.get_account(faucet_id).await.ok().flatten().is_none()
-                    && let Err(e) = client.import_account_by_id(faucet_id).await
-                {
-                    anyhow::bail!(
-                        "admin_registerNativeFaucet: cannot import faucet account \
-                         {faucet_id} from node: {e}"
-                    );
-                }
-                let faucet_account = client
-                    .get_account(faucet_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("get_account({faucet_id}): {e}"))?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "admin_registerNativeFaucet: faucet account {faucet_id} not \
-                             found after import"
-                        )
-                    })?;
-                // Both supported kinds expose the standard FungibleFaucet metadata, but
-                // admin_registerNativeFaucet is for operator-owned NATIVE faucets only.
-                // Guard against an operator accidentally reclassifying an already-deployed
-                // AggLayer-owned (bridge mint/burn) faucet as native (PR #150 review).
-                let (kind, faucet) = faucet_ops::classify_faucet_account(&faucet_account)?;
-                if kind != faucet_ops::FaucetKind::NativeFungible {
-                    anyhow::bail!(
-                        "admin_registerNativeFaucet: faucet account {faucet_id} is an \
-                         AggLayer-owned (bridge mint/burn) faucet, not an operator-owned \
-                         native FungibleFaucet — refusing to register it as native; no \
-                         registry row written"
-                    );
-                }
-                *authoritative_read.lock().unwrap() = Some(AuthoritativeFaucetMetadata {
-                    name: faucet.token_name().as_str().to_string(),
-                    symbol: faucet.symbol().to_string(),
-                    decimals: faucet.decimals(),
-                });
-                Ok(())
-            })
-        })
-        .await?;
-    let authoritative = authoritative.lock().unwrap().take().ok_or_else(|| {
-        anyhow::anyhow!(
-            "admin_registerNativeFaucet: could not read faucet account {faucet_id} \
-             metadata (no authoritative token name/symbol/decimals); refusing to register \
-             — no registry row written"
-        )
-    })?;
+    let authoritative = read_authoritative_faucet_metadata(&state, faucet_id).await?;
 
     // #149 — validate the REQUESTED metadata against the AUTHORITATIVE faucet
     // account BEFORE the idempotency preflight. A caller supplying wrong metadata
@@ -580,13 +526,35 @@ pub async fn admin_register_native_faucet(
     // idempotently.
     match preflight_bridge_binding(&state, faucet_id, origin_address, origin_network).await? {
         BridgeBinding::OriginBoundToOther(other) => {
+            // Review 0814c: with NO local origin row, returning Ok(other)
+            // reported success while the registry stayed MISSING the
+            // authoritative binding — exactly the anomaly the registry
+            // reconciler halts on after its grace window. Rebuild the row
+            // from the ON-CHAIN faucet's own authoritative metadata (never
+            // the caller's params — those describe the REQUESTED faucet,
+            // a different account), then verify the persisted binding.
             tracing::info!(
                 origin_network,
                 existing_faucet_id = %other.to_hex(),
                 requested_faucet_id = %faucet_id.to_hex(),
                 "admin_registerNativeFaucet: origin already bound on the bridge to a different \
-                 faucet — returning the existing binding, emitting no rebinding note"
+                 faucet — rebuilding its registry row authoritatively, emitting no rebinding note"
             );
+            let auth_other = read_authoritative_faucet_metadata(&state, other).await?;
+            let resolved_other = ResolvedNativeMetadata {
+                name: auth_other.name.clone(),
+                symbol: auth_other.symbol.clone(),
+                decimals: auth_other.decimals,
+            };
+            persist_and_verify_native_row(
+                &state,
+                other,
+                origin_address,
+                origin_network,
+                scale,
+                &resolved_other,
+            )
+            .await?;
             return Ok(other.to_hex());
         }
         BridgeBinding::FaucetBoundToDifferentOrigin(bound) => {
@@ -735,6 +703,73 @@ async fn register_native_validated(
          verified)"
     );
     Ok(id_hex)
+}
+
+/// Read a deployed faucet account's AUTHORITATIVE metadata (import on demand +
+/// classify as native). Shared by registration (reads the REQUESTED faucet)
+/// and the OriginBoundToOther reconcile (reads the ON-CHAIN faucet, review
+/// 0814c). Fail-closed: any read/classify failure aborts before any state
+/// change.
+async fn read_authoritative_faucet_metadata(
+    state: &ServiceState,
+    faucet_id: AccountId,
+) -> anyhow::Result<AuthoritativeFaucetMetadata> {
+    let slot = Arc::new(std::sync::Mutex::new(None::<AuthoritativeFaucetMetadata>));
+    let slot_write = slot.clone();
+    state
+        .miden_client
+        .with(move |client| {
+            Box::new(async move {
+                // Native faucets are externally deployed and NOT in
+                // bridge_accounts.toml, so import them on demand before reading.
+                if client.get_account(faucet_id).await.ok().flatten().is_none()
+                    && let Err(e) = client.import_account_by_id(faucet_id).await
+                {
+                    anyhow::bail!(
+                        "admin_registerNativeFaucet: cannot import faucet account \
+                         {faucet_id} from node: {e}"
+                    );
+                }
+                let faucet_account = client
+                    .get_account(faucet_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_account({faucet_id}): {e}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "admin_registerNativeFaucet: faucet account {faucet_id} not \
+                             found after import"
+                        )
+                    })?;
+                // Both supported kinds expose the standard FungibleFaucet metadata, but
+                // admin_registerNativeFaucet is for operator-owned NATIVE faucets only.
+                // Guard against an operator accidentally reclassifying an already-deployed
+                // AggLayer-owned (bridge mint/burn) faucet as native (PR #150 review).
+                let (kind, faucet) = faucet_ops::classify_faucet_account(&faucet_account)?;
+                if kind != faucet_ops::FaucetKind::NativeFungible {
+                    anyhow::bail!(
+                        "admin_registerNativeFaucet: faucet account {faucet_id} is an \
+                         AggLayer-owned (bridge mint/burn) faucet, not an operator-owned \
+                         native FungibleFaucet — refusing to register it as native; no \
+                         registry row written"
+                    );
+                }
+                *slot_write.lock().unwrap() = Some(AuthoritativeFaucetMetadata {
+                    name: faucet.token_name().as_str().to_string(),
+                    symbol: faucet.symbol().to_string(),
+                    decimals: faucet.decimals(),
+                });
+                Ok(())
+            })
+        })
+        .await?;
+    let out = slot.lock().unwrap().take().ok_or_else(|| {
+        anyhow::anyhow!(
+            "admin_registerNativeFaucet: could not read faucet account {faucet_id} \
+             metadata (no authoritative token name/symbol/decimals); refusing to register \
+             — no registry row written"
+        )
+    })?;
+    Ok(out)
 }
 
 /// Guarded registry persist + read-back verification for a native faucet row —
@@ -931,6 +966,57 @@ mod tests {
         let resolved = resolve_native_faucet_metadata(Some("Wrapped Midnight"), "MDN", 8, &auth)
             .expect("matching custom name succeeds");
         assert_eq!(resolved.name, "Wrapped Midnight");
+    }
+
+    /// Review 0814c — the guarded persist + read-back both reconcile arms
+    /// (AlreadyBound, OriginBoundToOther) rely on: a clean origin persists and
+    /// verifies; a STALE row for a DIFFERENT faucet holding the origin makes
+    /// the guarded upsert a no-op and MUST surface as a hard error, never
+    /// success over split state.
+    #[tokio::test]
+    async fn persist_and_verify_native_row_ok_then_stale_conflict() {
+        let service = create_test_service();
+        let faucet_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let faucet_b = AccountId::from_hex("0xac0000000000dd110000ee000000ad").unwrap();
+        let origin = [0xDEu8; 20];
+        let resolved = ResolvedNativeMetadata {
+            name: "MDN".into(),
+            symbol: "MDN".into(),
+            decimals: 8,
+        };
+
+        // Clean insert: persists and read-back verifies.
+        persist_and_verify_native_row(&service, faucet_a, origin, 1, 0, &resolved)
+            .await
+            .expect("clean persist verifies");
+        let row = service
+            .store
+            .get_faucet_by_origin(&origin, 1)
+            .await
+            .unwrap()
+            .expect("row persisted");
+        assert_eq!(row.faucet_id, faucet_a);
+
+        // Stale conflict: faucet B cannot claim the origin held by A — the
+        // guarded upsert affects no rows and the read-back must hard-error.
+        let err = persist_and_verify_native_row(&service, faucet_b, origin, 1, 0, &resolved)
+            .await
+            .expect_err("stale row must surface, not report success");
+        assert!(
+            err.to_string().contains("stale row holds this origin"),
+            "unexpected error: {err}"
+        );
+        // The registry still records A — no silent overwrite happened.
+        let row = service
+            .store
+            .get_faucet_by_origin(&origin, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.faucet_id, faucet_a,
+            "stale conflict must not clobber the row"
+        );
     }
 
     fn native_params(name: Option<&str>) -> RegisterNativeFaucetParams {

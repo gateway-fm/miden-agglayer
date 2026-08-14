@@ -98,7 +98,17 @@ docker cp --archive "$C:/tmp/." "$B/stage" >/dev/null 2>&1 || {
     log "       stopped-but-intact; restart it with: docker start $C"
     exit 1
 }
-rm -f "$B/stage/$POISON" "$B/stage/$POISON-wal" "$B/stage/$POISON-shm"
+# Checked deletion (review 0814c): --archive preserves ownership, so an rm
+# can fail (EPERM) and a poison copy would then be RESTORED into the fresh
+# container — the heal would reinstall the wedge it exists to clear. Delete
+# with verification and assert absence before anything is restored.
+for pf in "$POISON" "$POISON-wal" "$POISON-shm"; do
+    rm -f "$B/stage/$pf" || true
+    [ ! -e "$B/stage/$pf" ] || {
+        log "FATAL: cannot delete staged poison file $pf — refusing to restore a copy of the wedge."
+        exit 1
+    }
+done
 # The critical, unrecoverable-if-lost members must actually be in the manifest.
 for f in aggsender.sqlite bridgel2sync.sqlite; do
     [ -f "$B/stage/$f" ] || {
@@ -135,11 +145,29 @@ if ! DIFF_OUT=$(diff -r "$B/stage" "$B/readback" 2>&1); then
     docker stop "$C" >/dev/null 2>&1 || true
     exit 1
 fi
+# Ownership/mode manifest (review 0814c): content equality does not prove the
+# service can OPEN its DBs — --archive round-trips uid/gid/mode through tar,
+# so compare the stat manifest of stage vs read-back; any drift means the
+# restore landed with ownership the aggkit runtime user cannot use.
+stat_manifest() { (cd "$1" && find . -type f -printf '%U:%G:%m %p\n' | sort); }
+if ! OWN_DIFF=$(diff <(stat_manifest "$B/stage") <(stat_manifest "$B/readback") 2>&1); then
+    KEEP_STAGE=1
+    log "FATAL: restored ownership/modes differ from the staged manifest:"
+    echo "$OWN_DIFF" | head -10 | while IFS= read -r l; do log "       $l"; done
+    log "       Stopping $SVC; staging dir retained."
+    docker stop "$C" >/dev/null 2>&1 || true
+    exit 1
+fi
 
 BASE_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 0)
 COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
     start "$SVC" >/dev/null 2>&1 \
-    || { KEEP_STAGE=1; log "FATAL: start failed — staging dir retained"; exit 1; }
+    || {
+        KEEP_STAGE=1
+        log "FATAL: start failed — stopping any partially-started $SVC; staging dir retained"
+        docker stop "$C" >/dev/null 2>&1 || true
+        exit 1
+    }
 
 # Health gate (review 0814): a heal that starts a crash-looping service is not
 # a heal. After a settle window the container must be RUNNING with NO restart
@@ -153,6 +181,13 @@ NOW_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 99
 RECENT=$(docker logs --since 25s "$C" 2>&1 || true)
 RECENT_LINES=$(printf '%s' "$RECENT" | grep -c . || true)
 CRASH_MARKERS=$(printf '%s' "$RECENT" | grep -ciE "panic|fatal error|level=fatal|FATAL" || true)
+# Wedge-specific probe (review 0814c): the caller passes the signature that
+# triggered the heal (chaos watchdog: the monitoring-DB loop). Fresh logs
+# still matching it mean the wedge did NOT clear — retry/error chatter must
+# not read as health. PROGRESS_PATTERN requires actual component work.
+WEDGE_MATCHES=0
+[ -n "${WEDGE_PATTERN:-}" ] && WEDGE_MATCHES=$(printf '%s' "$RECENT" | grep -cE "$WEDGE_PATTERN" || true)
+PROGRESS_MATCHES=$(printf '%s' "$RECENT" | grep -ciE "${PROGRESS_PATTERN:-level=info|INFO}" || true)
 fail_health() {
     KEEP_STAGE=1
     log "FATAL: $1 — stopping $SVC; staging dir retained."
@@ -167,5 +202,9 @@ fail_health() {
     || fail_health "$SVC produced no log output in the settle window (no proof the process works)"
 [ "${CRASH_MARKERS:-0}" -eq 0 ] \
     || fail_health "$SVC logs show $CRASH_MARKERS fatal/panic marker(s) in the settle window"
+[ "${WEDGE_MATCHES:-0}" -eq 0 ] \
+    || fail_health "$SVC still logs the wedge signature ($WEDGE_MATCHES match(es) of WEDGE_PATTERN) — the heal did not clear it"
+[ "${PROGRESS_MATCHES:-0}" -gt 0 ] \
+    || fail_health "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"
 exit 0
