@@ -144,7 +144,8 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
       # successful intervention. Log the attempt separately from the outcome, and
       # only the OUTCOME feeds the counted ledger.
       echo "$(date +%H:%M:%S) WATCHDOG-ATTEMPT: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — preserve-healing $svc"
-      if PROJECT="$PROJECT" FORCE=1 "$SCRIPT_DIR/aggkit-preserve-heal.sh" "$svc" >/dev/null 2>&1; then
+      if PROJECT="$PROJECT" FORCE=1 WEDGE_PATTERN='already exists in monitoring DB' \
+          "$SCRIPT_DIR/aggkit-preserve-heal.sh" "$svc" >/dev/null 2>&1; then
         echo "$(date +%H:%M:%S) WATCHDOG: preserve-heal of $svc SUCCEEDED (tx $tx)" \
             | tee -a "$WATCHDOG_HEALS_FILE"
       else
