@@ -78,10 +78,20 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-docker stop "$C" >/dev/null 2>&1
+# Review 0814: the stop must be CONFIRMED before snapshotting — copying live
+# SQLite (mid-write WAL) and then destroying the source ships a corrupt-only
+# copy of the state.
+docker stop "$C" >/dev/null 2>&1 || true
+STOP_STATE=$(docker inspect -f '{{.State.Status}}' "$C" 2>/dev/null || echo gone)
+[ "$STOP_STATE" = "exited" ] || {
+    log "FATAL: $C did not stop (state: $STOP_STATE) — refusing to snapshot a live DB."
+    exit 1
+}
 
 POISON=ethtxmanager-aggoracle.sqlite
-docker cp "$C:/tmp/." "$B/stage" >/dev/null 2>&1 || {
+# --archive: preserve UID/GID — the pinned aggkit image runs as a non-root
+# user, and a root-owned restore would leave its own DBs unwritable.
+docker cp --archive "$C:/tmp/." "$B/stage" >/dev/null 2>&1 || {
     log "FATAL: could not stage the aggkit state dir from $C."
     log "       Refusing to force-recreate: that would destroy the only copy of the"
     log "       cert lineage (#89) / bridgesync cursors (#87). Container left"
@@ -106,49 +116,56 @@ COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_
 
 # ── RESTORE the manifest, VERIFY it round-trips, then require health ─────────
 # From here on the original state exists only in $B — every failure path keeps it.
-docker cp "$B/stage/." "$C:/tmp/" >/dev/null 2>&1 \
+# --archive both ways: the copy back must land with the ORIGINAL UID/GID (the
+# aggkit image runs as a non-root user; a root-owned restore is unwritable by
+# the service — a "successful" heal that is not one).
+docker cp --archive "$B/stage/." "$C:/tmp/" >/dev/null 2>&1 \
     || { KEEP_STAGE=1; log "FATAL: restore copy into the recreated container failed — staging dir retained"; exit 1; }
-# Verify the restore round-trips: read the state dir back and require every
-# staged file to be present (the recreated container may lack a shell —
-# distroless — so verification goes through docker cp, not exec).
-docker cp "$C:/tmp/." "$B/readback" >/dev/null 2>&1 \
+# Verify the restore round-trips by CONTENT, not existence (review 0814): read
+# the state dir back and require byte-identical files (the recreated container
+# may lack a shell — distroless — so verification goes through docker cp + a
+# host-side recursive diff, which compares contents).
+docker cp --archive "$C:/tmp/." "$B/readback" >/dev/null 2>&1 \
     || { KEEP_STAGE=1; log "FATAL: cannot read back the restored state dir — staging dir retained"; exit 1; }
-unrestored=$(cd "$B/stage" && find . -type f | while read -r f; do
-    [ -f "$B/readback/$f" ] || echo "$f"
-done)
-if [ -n "$unrestored" ]; then
+if ! DIFF_OUT=$(diff -r "$B/stage" "$B/readback" 2>&1); then
     KEEP_STAGE=1
-    log "FATAL: restored state is INCOMPLETE — missing: $(echo "$unrestored" | tr '\n' ' ')"
-    log "       NOT starting $SVC — a half-restored state directory would diverge silently."
+    log "FATAL: restored state differs from the staged manifest — NOT healthy to start:"
+    echo "$DIFF_OUT" | head -10 | while IFS= read -r l; do log "       $l"; done
+    log "       Stopping $SVC (a diverging half-restore must not run); staging dir retained."
+    docker stop "$C" >/dev/null 2>&1 || true
     exit 1
 fi
 
+BASE_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 0)
 COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
     start "$SVC" >/dev/null 2>&1 \
     || { KEEP_STAGE=1; log "FATAL: start failed — staging dir retained"; exit 1; }
 
-# Health gate: a heal that starts a crash-looping service is not a heal. The
-# container must still be RUNNING (not restarted) after a settle window, and
-# must be producing fresh log output (proof the process is alive and working,
-# usable even on distroless images with no shell).
+# Health gate (review 0814): a heal that starts a crash-looping service is not
+# a heal. After a settle window the container must be RUNNING with NO restart
+# growth, producing fresh log output, and that output must not be a crash loop
+# (fatal/panic markers). On any failed validation the recreated service is
+# STOPPED — a diverging instance must not keep serving.
 HEAL_T0=$(date +%s)
 sleep 25
-STATE=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}} {{.RestartCount}}' "$C" 2>/dev/null || echo "gone")
-RECENT_LOGS=$(docker logs --since "$((25))s" "$C" 2>&1 | head -5 | wc -l)
-case "$STATE" in
-    "running false"*)
-        if [ "$RECENT_LOGS" -eq 0 ]; then
-            KEEP_STAGE=1
-            log "FATAL: $SVC is running but produced no log output in the settle window —"
-            log "       cannot confirm the process is healthy; staging dir retained."
-            exit 1
-        fi
-        ;;
-    *)
-        KEEP_STAGE=1
-        log "FATAL: $SVC is not stably running after the heal (state: $STATE) — staging dir retained"
-        exit 1
-        ;;
-esac
-log "preserve-healed (manifest=$manifest_count files restored+verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s)"
+STATE=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}}' "$C" 2>/dev/null || echo "gone")
+NOW_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 999)
+RECENT=$(docker logs --since 25s "$C" 2>&1 || true)
+RECENT_LINES=$(printf '%s' "$RECENT" | grep -c . || true)
+CRASH_MARKERS=$(printf '%s' "$RECENT" | grep -ciE "panic|fatal error|level=fatal|FATAL" || true)
+fail_health() {
+    KEEP_STAGE=1
+    log "FATAL: $1 — stopping $SVC; staging dir retained."
+    docker stop "$C" >/dev/null 2>&1 || true
+    exit 1
+}
+[ "$STATE" = "running false" ] \
+    || fail_health "$SVC is not stably running after the heal (state: $STATE)"
+[ "$NOW_RESTARTS" -le "$BASE_RESTARTS" ] \
+    || fail_health "$SVC restarted during the settle window ($BASE_RESTARTS -> $NOW_RESTARTS restarts)"
+[ "${RECENT_LINES:-0}" -gt 0 ] \
+    || fail_health "$SVC produced no log output in the settle window (no proof the process works)"
+[ "${CRASH_MARKERS:-0}" -eq 0 ] \
+    || fail_health "$SVC logs show $CRASH_MARKERS fatal/panic marker(s) in the settle window"
+log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"
 exit 0

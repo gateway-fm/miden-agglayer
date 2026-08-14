@@ -453,16 +453,45 @@ pub async fn admin_register_native_faucet(
                 );
             }
             BridgeBinding::OriginBoundToOther(other) => {
-                tracing::info!(
-                    origin_network,
-                    on_chain_faucet_id = %other.to_hex(),
-                    "admin_registerNativeFaucet: origin is bound on-chain to {} — returning the \
-                     authoritative binding, not the local row",
-                    other.to_hex()
+                // Review 0814: returning Ok(other) here previously reported
+                // success while the LOCAL row kept pointing at the stale
+                // faucet — a registry/bridge split presented as a route. There
+                // is no safe automatic repair (the authoritative faucet's row
+                // needs its own metadata read + guarded persist, which the
+                // stale row blocks) — fail loudly instead.
+                anyhow::bail!(
+                    "admin_registerNativeFaucet: origin 0x{} (network {origin_network}) is bound \
+                     ON-CHAIN to faucet {} while the local registry row records faucet {} — a \
+                     stale/split registry state this call cannot safely repair. Remove/repair \
+                     the local row (the bridge binding is the authority), then retry. No note \
+                     emitted, no state changed.",
+                    hex::encode(origin_address),
+                    other.to_hex(),
+                    existing.faucet_id.to_hex(),
                 );
-                return Ok(other.to_hex());
             }
         }
+    }
+
+    // Review 0814 — the SYMMETRIC pre-mutation conflict, mirrored from the
+    // public path: the requested faucet may already exist locally under a
+    // DIFFERENT origin. Without this check the bridge preflight (keyed on the
+    // ORIGIN) can be Unbound, the irreversible ConfigAggBridgeNote is emitted,
+    // and only then the faucet_id primary-key conflict fails persistence —
+    // after the bridge already mutated.
+    if let Some(by_id) = state.store.get_faucet_by_id(faucet_id).await?
+        && (by_id.origin_address != origin_address || by_id.origin_network != origin_network)
+    {
+        anyhow::bail!(
+            "admin_registerNativeFaucet: faucet {} is already registered locally with a \
+             different origin identity (0x{} network {}), which this call would not update. \
+             Registering it for origin 0x{} would split the registry from the bridge. No note \
+             emitted, no state changed.",
+            faucet_id.to_hex(),
+            hex::encode(by_id.origin_address),
+            by_id.origin_network,
+            hex::encode(origin_address),
+        );
     }
 
     // #149 — read the deployed faucet account's AUTHORITATIVE metadata BEFORE any

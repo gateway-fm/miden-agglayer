@@ -364,7 +364,11 @@ whose consumer-level comparison cannot be made (set PROXY_RPC)"
 fi
 say "before: counts UHC=$NUHC0 injected=$NINJECTED0 Bridge=$NBR0 Claim=$NCL0  hash_chain=${HCV0:0:16}…"
 say "before: digests uhc=${UHC0:0:12} inj=${INJ0:0:12} bridge=${BR0:0:12} claim=${CL0:0:12}"
-[[ "$NUHC0" -ge 1 && "$NINJECTED0" -ge 1 ]] || fail "fixture too thin (UHC=$NUHC0 inj=$NINJECTED0) — run traffic first"
+# Review 0814 (blocking): all FOUR event families must be present in the
+# fixture, or the Bridge/Claim equality assertions later pass VACUOUSLY and the
+# advertised full event-fidelity recovery is green without testing either path.
+[[ "$NUHC0" -ge 1 && "$NINJECTED0" -ge 1 && "$NBR0" -ge 1 && "$NCL0" -ge 1 ]] \
+    || fail "fixture too thin (UHC=$NUHC0 inj=$NINJECTED0 Bridge=$NBR0 Claim=$NCL0) — every family must be >=1; run traffic first"
 
 # BASELINE PROVENANCE — the drill is only meaningful if the "before" state was built
 # LIVE. If this store is itself the output of an earlier restore, every value has
