@@ -628,6 +628,12 @@ sponsor_nonce() {
 # deterministic resubmission still requires the receipt path explicitly.
 DEDUP_METRIC="claim_landed_dedup_reverted_total"
 ESTIMATE_ALREADY_CLAIMED_METRIC="rpc_estimate_gas_already_claimed_total"
+# Third valid window (first observed on node-0.16.0-rc.1, run 2026-08-17): the
+# sponsor's duplicate arrives while the user's winning claim is SUBMITTED but
+# not yet LANDED (claim lock held, no ClaimEvent) — rc.1 proving stretches this
+# window to ~30s. The duplicate is accepted at RPC and fails in the writer with
+# a status-0 receipt, counted by claim_inflight_dedup_total.
+INFLIGHT_DEDUP_METRIC="claim_inflight_dedup_total"
 metric_value() { # <metric-name>
     local body
     body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
@@ -830,16 +836,26 @@ verify_sponsor_recovers_automatically() {
     # race leg below separately pins the sendRaw status-0/no-log contract.
     dedup_after=$(metric_value "$DEDUP_METRIC")
     estimate_after=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+    inflight_after=$(metric_value "$INFLIGHT_DEDUP_METRIC")
     log "$DEDUP_METRIC: baseline=$DEDUP_BEFORE now=$dedup_after"
     log "$ESTIMATE_ALREADY_CLAIMED_METRIC: baseline=$ESTIMATE_ALREADY_CLAIMED_BEFORE now=$estimate_after"
+    log "$INFLIGHT_DEDUP_METRIC: baseline=$INFLIGHT_DEDUP_BEFORE now=$inflight_after"
     if [[ "$dedup_after" -gt "$DEDUP_BEFORE" ]]; then
         pass "$DEDUP_METRIC incremented ($DEDUP_BEFORE → $dedup_after): signed duplicate received status-0/no-log reconciliation"
     elif [[ "$estimate_after" -gt "$ESTIMATE_ALREADY_CLAIMED_BEFORE" ]]; then
         proxy_is_claimed "$LEG1_GI" \
             || fail "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented but isClaimed for exact front-run gi=$LEG1_GI is not true"
         pass "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented ($ESTIMATE_ALREADY_CLAIMED_BEFORE → $estimate_after) and isClaimed(gi=$LEG1_GI)=true: AggKit reconciled before submission"
+    elif [[ "$inflight_after" -gt "$INFLIGHT_DEDUP_BEFORE" ]]; then
+        # The duplicate collided INSIDE the winner's proving window. Positive
+        # proof mirrors the other paths: the front-run gi must still have
+        # landed exactly once (isClaimed true; the single-ClaimEvent assertion
+        # above already pinned the winner).
+        proxy_is_claimed "$LEG1_GI" \
+            || fail "$INFLIGHT_DEDUP_METRIC incremented but isClaimed for exact front-run gi=$LEG1_GI is not true"
+        pass "$INFLIGHT_DEDUP_METRIC incremented ($INFLIGHT_DEDUP_BEFORE → $inflight_after) and isClaimed(gi=$LEG1_GI)=true: sponsor duplicate reconciled inside the in-flight window (status-0 writer receipt)"
     else
-        fail "neither already-claimed reconciliation metric incremented: sendRaw $DEDUP_BEFORE→$dedup_after, estimateGas $ESTIMATE_ALREADY_CLAIMED_BEFORE→$estimate_after"
+        fail "no already-claimed reconciliation metric incremented: sendRaw $DEDUP_BEFORE→$dedup_after, estimateGas $ESTIMATE_ALREADY_CLAIMED_BEFORE→$estimate_after, inflight $INFLIGHT_DEDUP_BEFORE→$inflight_after"
     fi
 }
 
@@ -850,8 +866,10 @@ verify_sponsor_recovers_automatically() {
 # front-run so the inter-leg assertion can prove which path healed AggKit.
 DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
 ESTIMATE_ALREADY_CLAIMED_BEFORE=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+INFLIGHT_DEDUP_BEFORE=$(metric_value "$INFLIGHT_DEDUP_METRIC")
 log "baseline $DEDUP_METRIC = $DEDUP_BEFORE"
 log "baseline $ESTIMATE_ALREADY_CLAIMED_METRIC = $ESTIMATE_ALREADY_CLAIMED_BEFORE"
+log "baseline $INFLIGHT_DEDUP_METRIC = $INFLIGHT_DEDUP_BEFORE"
 
 step "Leg 1 — deposit L1→L2, then the USER claims it manually"
 

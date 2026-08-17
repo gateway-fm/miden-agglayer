@@ -484,6 +484,13 @@ pub(crate) async fn worker_handle_claim_asset(
         // runs after durable admission, the outer sync/worker path records status 0;
         // a same-hash rebroadcast then deduplicates to that terminal receipt.
         ClaimLockOutcome::InFlight => {
+            // Third dedup window (rc.1 made it wide enough to observe in e2e:
+            // ~30s of proving between the winner's accept and its ClaimEvent):
+            // the duplicate arrives while the winner is submitted-but-not-landed.
+            // The outcome is the same status-0 receipt as the landed path, but
+            // through the writer failure path — count it so the reconciliation
+            // is provable from /metrics, not from receipt error strings.
+            ::metrics::counter!("claim_inflight_dedup_total").increment(1);
             anyhow::bail!(
                 "claim already submitted for global_index {}",
                 params.globalIndex

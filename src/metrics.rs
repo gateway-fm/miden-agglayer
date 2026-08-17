@@ -80,6 +80,16 @@ pub fn init_metrics() {
          claim front-running, not a bug."
     );
     describe_counter!(
+        "claim_inflight_dedup_total",
+        "#55 third dedup window: a claimAsset arrived for a globalIndex whose winning claim was \
+         SUBMITTED but had not LANDED yet (claim lock held, no ClaimEvent, within TTL) — the \
+         duplicate was accepted at RPC and failed in the writer with a status-0 receipt, \
+         consuming the submitter's nonce. Distinct from claim_landed_dedup_reverted_total \
+         (duplicate arriving after the ClaimEvent exists). Nonzero means a sponsor/user \
+         cross-claim raced inside the proving window; a steady climb means heavy \
+         front-running, not a bug."
+    );
+    describe_counter!(
         "rpc_nonce_repaired_after_commit_gap_total",
         "#55 BLOCKER-2 crash-gap repair: on a same-hash rebroadcast, the signer's expected \
          nonce was still equal to the known tx's nonce — meaning the tx's durable receipt was \
