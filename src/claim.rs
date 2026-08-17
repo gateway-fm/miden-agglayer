@@ -894,6 +894,11 @@ async fn publish_claim_internal(
     // `MidenClient::with` slot for every queued write.
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![claim_note])
+        // rc.4: the fee manager FPIs into the note's network TARGET (the
+        // bridge) — declare it so the fetch is pinned to the reference block.
+        .foreign_accounts([crate::miden_client::network_target_foreign_account(
+            accounts.bridge.0,
+        )?])
         // Bound the creating tx's inclusion window (see
         // `submission_note_expiration_delta`) so a prepared-but-unconfirmed claim
         // handoff can be declared dead and re-driven by recovery rather than
@@ -904,9 +909,20 @@ async fn publish_claim_internal(
     // Execute and check the output notes before submission. `ExecutedTransaction` still
     // produces `RawOutputNote::{Full, Partial}`, but the proven transaction now produces
     // `OutputNote::{Public, Private}` — 0.14.x renamed the final-form variants.
-    let tx_result = client
+    let tx_result = match client
         .execute_transaction(accounts.service.0, txn_request)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // Stale tracked bridge record (the fee-manager FPI target) —
+            // force-refresh so the claim watcher's retry converges. See
+            // `heal_bridge_after_executor_failure`.
+            crate::miden_client::heal_bridge_after_executor_failure(client, accounts.bridge.0, &e)
+                .await;
+            return Err(e.into());
+        }
+    };
     let exec_tx = tx_result.executed_transaction();
     let expiration_block = exec_tx.expiration_block_num().as_u64();
     for (i, note) in exec_tx.output_notes().iter().enumerate() {

@@ -289,13 +289,29 @@ pub async fn register_faucet_in_bridge(
 
     let txn = TransactionRequestBuilder::new()
         .own_output_notes(vec![note])
+        // rc.4: the fee manager FPIs into the note's network TARGET (the
+        // bridge) — declare it so the fetch is pinned to the reference block.
+        .foreign_accounts([crate::miden_client::network_target_foreign_account(
+            bridge_id,
+        )?])
         .build()?;
 
-    let txn_id = crate::metrics::meter_proof(
+    let txn_id = match crate::metrics::meter_proof(
         crate::metrics::ProofKind::Faucet,
         crate::miden_client::submit_new_transaction(client, service_id, txn),
     )
-    .await?;
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            // Stale tracked bridge record (the fee-manager FPI target) —
+            // force-refresh so the registration retry converges. See
+            // `heal_bridge_after_executor_failure`.
+            crate::miden_client::heal_bridge_after_executor_failure_anyhow(client, bridge_id, &e)
+                .await;
+            return Err(e);
+        }
+    };
     tracing::info!(
         "registered {} faucet in bridge with txn_id {txn_id}",
         faucet_name,

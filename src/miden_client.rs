@@ -64,6 +64,124 @@ pub fn is_read_only() -> bool {
     READ_ONLY.load(Ordering::Acquire)
 }
 
+/// rc.4 fee-manager FPI pinning (rc.1 migration): creating a note with a
+/// `NetworkAccountTarget` attachment makes the standards fee manager execute
+/// `estimate_note_fee` as a FOREIGN PROCEDURE against the TARGET network
+/// account (miden-standards `asm/standards/fees/mod.masm`). If the target is
+/// not declared on the request, miden-client lazily loads it DURING execution
+/// — unpinned to the transaction's reference block — so any target-state
+/// change between sync and execution fails the kernel's
+/// `validate_active_foreign_account` with "commitment of the foreign account
+/// in the advice provider does not match the commitment in the account tree".
+/// Declaring the target upfront makes the client fetch its state pinned at
+/// the reference block. Every bridge-targeted note creation must pass this.
+///
+/// Pinning alone is NOT sufficient: for an account the proxy TRACKS (the
+/// bridge lives in our store), the client serves the foreign-account inputs
+/// from the LOCAL record, and a diverged record (live-observed after an
+/// `admin_registerNativeFaucet` import flow: 341- and 409-consecutive
+/// identical GER-insert failures on two independent stacks) is not reconciled
+/// by `sync_state`. That is what [`heal_stale_foreign_account`] exists for.
+pub(crate) fn network_target_foreign_account(
+    target: miden_protocol::account::AccountId,
+) -> anyhow::Result<miden_client::transaction::ForeignAccount> {
+    miden_client::transaction::ForeignAccount::public(
+        target,
+        miden_client::rpc::domain::account::AccountStorageRequirements::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("declaring network target {target} as a foreign account: {e:?}"))
+}
+
+/// Kernel err_msg of `validate_active_foreign_account` (miden-protocol rc.4
+/// `asm/kernels/transaction-core/src/account.masm`,
+/// `ERR_FOREIGN_ACCOUNT_INVALID_COMMITMENT`). The generated Rust constant is
+/// gated behind miden-protocol's `testing` feature, so we rebuild the SAME
+/// `MasmError` from the canonical message: `MasmError::code()` derives the
+/// felt error CODE exactly the way the kernel build does, and
+/// `matches_execution_error` compares the typed `err_code` (plus `err_msg`
+/// when present) — no string scanning of rendered errors.
+const STALE_FOREIGN_ACCOUNT_KERNEL_MSG: &str = "commitment of the foreign account in the advice \
+                                                provider does not match the commitment in the \
+                                                account tree";
+
+fn stale_foreign_account_masm_error() -> &'static miden_protocol::errors::MasmError {
+    static ERR: std::sync::OnceLock<miden_protocol::errors::MasmError> = std::sync::OnceLock::new();
+    ERR.get_or_init(|| {
+        miden_protocol::errors::MasmError::from_static_str(STALE_FOREIGN_ACCOUNT_KERNEL_MSG)
+    })
+}
+
+/// Typed check: is this client error the kernel's foreign-account staleness
+/// assertion?
+///
+/// `ClientError::TransactionExecutorError`'s Display is just "transaction
+/// execution failed" — thiserror does not chain sources into Display — so a
+/// rendered-string match can NEVER fire on it (live-observed: a `{e:#}` match
+/// stayed dead across 341 wedged retries). Match the typed chain instead.
+pub(crate) fn is_stale_foreign_account_error(e: &miden_client::ClientError) -> bool {
+    let miden_client::ClientError::TransactionExecutorError(
+        miden_tx::TransactionExecutorError::TransactionProgramExecutionFailed(exec),
+    ) = e
+    else {
+        return false;
+    };
+    stale_foreign_account_masm_error().matches_execution_error(exec)
+}
+
+/// Force-refresh the tracked BRIDGE record from the node after a
+/// transaction-executor failure, BEFORE the caller's retry.
+///
+/// Every bridge-targeted note creation FPIs into the bridge (see
+/// [`network_target_foreign_account`]), and the client serves those
+/// foreign-account inputs from our tracked copy. Once that copy diverges from
+/// the chain's account tree, plain `sync_state` does not reconcile it, so
+/// without this the writer retries fail identically forever (live-observed
+/// wedges of 341 and 409 consecutive GER-insert failures).
+///
+/// The refresh runs for ANY executor failure — it is idempotent and cheap, so
+/// convergence does not depend on error classification; the typed
+/// stale-foreign-account check only labels telemetry. The caller still
+/// surfaces the original error.
+pub(crate) async fn heal_bridge_after_executor_failure(
+    client: &mut MidenClientLib,
+    bridge_id: miden_protocol::account::AccountId,
+    e: &miden_client::ClientError,
+) {
+    if !matches!(e, miden_client::ClientError::TransactionExecutorError(_)) {
+        return;
+    }
+    let stale_foreign = is_stale_foreign_account_error(e);
+    if stale_foreign {
+        metrics::counter!("stale_foreign_account_heals_total").increment(1);
+    }
+    match client.import_account_by_id(bridge_id).await {
+        Ok(()) => tracing::info!(
+            bridge = %bridge_id.to_hex(),
+            stale_foreign,
+            "bridge account force-refreshed after executor failure"
+        ),
+        Err(refresh) => tracing::warn!(
+            error = ?refresh,
+            bridge = %bridge_id.to_hex(),
+            stale_foreign,
+            "bridge force-refresh after executor failure failed"
+        ),
+    }
+}
+
+/// [`heal_bridge_after_executor_failure`] for call sites whose error is
+/// already anyhow-wrapped (e.g. the `submit_new_transaction` chokepoint).
+/// A non-`ClientError` (or non-executor) failure is a no-op.
+pub(crate) async fn heal_bridge_after_executor_failure_anyhow(
+    client: &mut MidenClientLib,
+    bridge_id: miden_protocol::account::AccountId,
+    e: &anyhow::Error,
+) {
+    if let Some(client_err) = e.downcast_ref::<miden_client::ClientError>() {
+        heal_bridge_after_executor_failure(client, bridge_id, client_err).await;
+    }
+}
+
 /// Refuse the mutation when read-only mode is active.
 ///
 /// Increments `readonly_submissions_refused_total` and ERROR-logs so a
@@ -1276,5 +1394,85 @@ mod tests {
             1,
             "once restore releases the guard, on_post_sync dispatch resumes"
         );
+    }
+
+    /// Builds the EXACT error shape the live wedge produced: the kernel's
+    /// `validate_active_foreign_account` assertion surfacing as
+    /// `ClientError::TransactionExecutorError(TransactionProgramExecutionFailed(
+    /// OperationError::FailedAssertion { err_code, err_msg }))`.
+    fn kernel_stale_foreign_account_error() -> miden_client::ClientError {
+        use miden_processor::operation::OperationError;
+        let exec = miden_processor::ExecutionError::OperationError {
+            label: miden_assembly::debuginfo::SourceSpan::default(),
+            source_file: None,
+            err: OperationError::FailedAssertion {
+                err_code: stale_foreign_account_masm_error().code(),
+                err_msg: Some(STALE_FOREIGN_ACCOUNT_KERNEL_MSG.into()),
+            },
+        };
+        miden_tx::TransactionExecutorError::TransactionProgramExecutionFailed(exec).into()
+    }
+
+    /// Regression for the rc.1 GER-insert wedge: the staleness heal originally
+    /// detected the kernel assertion by matching the error's rendered DISPLAY,
+    /// but `ClientError::TransactionExecutorError`'s Display is just
+    /// "transaction execution failed" (thiserror does not chain sources into
+    /// Display), so the heal NEVER fired and the writer retried the same stale
+    /// bridge record forever (341/341 then 409+ consecutive live failures).
+    /// The detector must inspect the TYPED chain and compare the kernel error
+    /// CODE.
+    #[test]
+    fn stale_foreign_account_detector_is_typed_not_display() {
+        // The derived kernel error code must equal the code observed on the
+        // live wedge (err_code in the r1 evidence log). If the canonical
+        // message string ever drifts from the kernel's, this catches it.
+        assert_eq!(
+            stale_foreign_account_masm_error().code().as_canonical_u64(),
+            16249416635580848901,
+            "derived ERR_FOREIGN_ACCOUNT_INVALID_COMMITMENT code no longer matches the \
+             live-observed kernel err_code — update STALE_FOREIGN_ACCOUNT_KERNEL_MSG to the \
+             kernel's current message"
+        );
+
+        let e = kernel_stale_foreign_account_error();
+
+        // The pre-fix Display-based match is provably dead on this error type —
+        // pinned so the wedge class cannot be reintroduced via a "simpler"
+        // string match.
+        assert!(
+            !format!("{e:#}").contains("foreign account"),
+            "ClientError Display unexpectedly renders the nested kernel message"
+        );
+        assert!(
+            is_stale_foreign_account_error(&e),
+            "the typed detector must fire on the kernel staleness assertion"
+        );
+
+        // A different kernel assertion (different err_code) must NOT classify
+        // as the stale-foreign-account case.
+        use miden_processor::operation::OperationError;
+        let other_exec = miden_processor::ExecutionError::OperationError {
+            label: miden_assembly::debuginfo::SourceSpan::default(),
+            source_file: None,
+            err: OperationError::FailedAssertion {
+                err_code: miden_protocol::errors::MasmError::from_static_str(
+                    "some other kernel assertion",
+                )
+                .code(),
+                err_msg: Some("some other kernel assertion".into()),
+            },
+        };
+        let other: miden_client::ClientError =
+            miden_tx::TransactionExecutorError::TransactionProgramExecutionFailed(other_exec)
+                .into();
+        assert!(!is_stale_foreign_account_error(&other));
+
+        // Non-execution executor failures must not classify either.
+        let unrelated: miden_client::ClientError =
+            miden_tx::TransactionExecutorError::AccountUpdateCommitment(
+                "note script with root 0xabc not found",
+            )
+            .into();
+        assert!(!is_stale_foreign_account_error(&unrelated));
     }
 }

@@ -30,6 +30,12 @@ name = "bridge-autoclaim"
 path = "src/bin/bridge_autoclaim.rs"
 
 [dev-dependencies]
+# Constructs the REAL kernel-assertion error shape
+# (ExecutionError::OperationError → OperationError::FailedAssertion) for the
+# stale-foreign-account detector regression — the type is not re-exported by
+# miden-tx/miden-client. Version-locked by cargo to the same 0.29 build the
+# rc.4 protocol stack resolves.
+miden-processor = { version = "0.29" }
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
 # upstream in rc.1).
