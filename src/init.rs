@@ -6,7 +6,7 @@ use crate::miden_client::MidenClientLib;
 use crate::proxy_keystore::ProxyKeystore;
 use crate::remote_signer::SignerRole;
 use anyhow::Context;
-use miden_base_agglayer::{MetadataHash, create_bridge_account};
+use miden_base_agglayer::{AggLayerBridge, BridgeRoles, MetadataHash};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::Keystore;
 use miden_client::transaction::TransactionRequestBuilder;
@@ -158,13 +158,31 @@ async fn add_bridge(
     // or claims fail destination-network checks on both ends. 0.16 also split
     // the GER-manager role into injector + remover; we assign both roles to
     // the same ger_manager account (mirrors the upstream rust-sdk reference).
-    let account = create_bridge_account(
+    // rc.4: role-based bridge creation. The service account administers the
+    // bridge (RBAC ADMIN) and holds the faucet-manager role; the GER manager
+    // holds both injector and remover (mirrors the pre-rc single-manager
+    // deployment; role membership is ADMIN-changeable at runtime now). The
+    // account also carries the mandatory fee components — zero fees against
+    // the chain's real fee faucet.
+    let fee_faucet_id = crate::fee_policy::fee_faucet_id_from_chain(client).await?;
+    let roles = BridgeRoles::new(
+        std::collections::BTreeSet::from([service_id]),
+        std::collections::BTreeSet::from([ger_manager_id]),
+        std::collections::BTreeSet::from([ger_manager_id]),
+    )
+    .map_err(|e| anyhow::anyhow!("bridge role construction failed: {e}"))?;
+    let account = AggLayerBridge::account_builder(
         client.rng().draw_word(),
         service_id,
-        ger_manager_id,
-        ger_manager_id,
+        roles,
         network_id,
-    );
+        crate::fee_policy::zero_fee_policy_manager_for(
+            AggLayerBridge::allowed_notes(),
+            fee_faucet_id,
+        ),
+    )
+    .build()
+    .map_err(|e| anyhow::anyhow!("bridge account build failed: {e}"))?;
     client.add_account(&account, false).await?;
 
     deploy_account(client, account.id(), "bridge").await?;
@@ -231,7 +249,7 @@ async fn add_wallet(
     let account = Account::builder(client.rng().draw_word().into())
         .account_type(AccountType::Public)
         .with_component(BasicWallet)
-        .with_auth_component(auth_component)
+        .with_component(auth_component)
         .build()?;
     // Remote custody: remember which signer key signs for this account. Local
     // custody keeps its own index in the filesystem keystore, so this is a no-op.

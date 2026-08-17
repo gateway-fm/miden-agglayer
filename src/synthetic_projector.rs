@@ -1697,10 +1697,17 @@ pub(crate) fn bridge_consumed_nullifiers(
 ) -> anyhow::Result<HashMap<Nullifier, ConsumedRef>> {
     let mut out = HashMap::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
+        // rc.1: the wire decoder strips input-note headers and instead returns
+        // explicit (nullifier -> note_id) refs per transaction for public
+        // inputs. Headers are still honoured when present (fixtures / a future
+        // decoder that retains them); refs are the production identity source.
+        let tx_refs: HashMap<Nullifier, miden_protocol::note::NoteId> =
+            tx.trusted_consumed_note_refs().collect();
         for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
-            // Future/fixed clients may retain this protocol header. v0.15 strips it, and the
-            // projector falls back to the durable nullifier-to-NoteId join.
-            let note_id = input.header().map(|h| h.id());
+            let note_id = input
+                .header()
+                .map(|h| h.id())
+                .or_else(|| tx_refs.get(&input.nullifier()).copied());
             out.insert(
                 input.nullifier(),
                 ConsumedRef {
@@ -1737,8 +1744,8 @@ mod tests {
     use crate::log_synthesis::{LogFilter, SyntheticLog};
     use crate::store::memory::InMemoryStore;
     use miden_base_agglayer::{
-        B2AggNote, ClaimNote, ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex,
-        LeafData, MetadataHash, ProofData, SmtNode, UpdateGerNote,
+        B2AggNote, ClaimNote, ClaimNoteStorage, ExitRoot, GlobalIndex, LeafData, MetadataHash,
+        ProofData, SmtNode, UpdateGerNote,
     };
     use miden_client::store::InputNoteState;
     use miden_client::store::input_note_states::{ConsumedExternalNoteState, ExpectedNoteState};
@@ -1751,6 +1758,7 @@ mod tests {
         NoteAssets, NoteAttachment, NoteAttachments, NoteDetails, NoteHeader, NoteId, NoteMetadata,
         NoteRecipient, NoteStorage, NoteType, PartialNoteMetadata,
     };
+    use miden_standards::interop::eth::{EthAddress, EthAmount};
     use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
     use std::sync::Arc as StdArc;
 
@@ -2869,7 +2877,6 @@ mod tests {
     #[test]
     fn bridge_consumed_nullifiers_gates_non_bridge_txs() {
         use miden_protocol::note::Nullifier;
-        use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
 
         fn nf(byte: u64) -> Nullifier {
             Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
@@ -2877,30 +2884,26 @@ mod tests {
         fn tx(
             account: AccountId,
             block: u32,
-            commitments: Vec<InputNoteCommitment>,
+            nullifiers: Vec<Nullifier>,
+            refs: Vec<(Nullifier, miden_protocol::note::NoteId)>,
             initial: Word,
             final_state: Word,
         ) -> TransactionRecord {
-            TransactionRecord {
-                block_num: BlockNumber::from(block),
-                transaction_header: TransactionHeader::new(
-                    account,
-                    initial,
-                    final_state,
-                    InputNotes::new(commitments).unwrap(),
-                    vec![],
-                ),
-                output_notes: vec![],
-                erased_output_notes: vec![],
-            }
+            crate::test_helpers::test_tx_record(
+                block,
+                account,
+                initial,
+                final_state,
+                nullifiers,
+                refs,
+            )
         }
 
         let (a, b, c) = (nf(1), nf(2), nf(3));
-        // The pinned miden-client decoder produces headerless commitments even when the
-        // network transaction used an unauthenticated note.
-        let auth = |n: Nullifier| InputNoteCommitment::from(n);
-        // Preserve support for a corrected decoder that retains the protocol headers. Two
-        // same-details siblings prove that input position, not a hash tie-break, is retained.
+        // rc.1 wire shape: every input commitment is headerless; public input
+        // identities arrive as explicit per-tx (nullifier -> note_id) refs.
+        // Two same-details siblings prove that input position, not a hash
+        // tie-break, is retained.
         let details_commitment = b2agg_note(5, Some(0)).details_commitment();
         let metadata_a = NoteMetadata::new(
             PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
@@ -2914,8 +2917,6 @@ mod tests {
         let header_b = NoteHeader::new(details_commitment, metadata_b);
         let expected_a = header_a.id();
         let expected_b = header_b.id();
-        let unauth_a = InputNoteCommitment::from_parts_unchecked(nf(4), Some(header_a));
-        let unauth_b = InputNoteCommitment::from_parts_unchecked(nf(5), Some(header_b));
         let state = |byte: u64| Word::new([Felt::new(byte).unwrap(); 4]);
 
         // Deliberately reverse the bridge transactions in the RPC response. Their state
@@ -2924,13 +2925,14 @@ mod tests {
             tx(
                 aid(BRIDGE),
                 9,
-                vec![unauth_a, unauth_b],
+                vec![nf(4), nf(5)],
+                vec![(nf(4), expected_a), (nf(5), expected_b)],
                 state(12),
                 state(13),
             ),
-            tx(aid(SERVICE), 9, vec![auth(b)], state(20), state(21)),
-            tx(aid(BRIDGE), 9, vec![auth(a)], state(10), state(11)),
-            tx(aid(BRIDGE), 9, vec![auth(c)], state(11), state(12)),
+            tx(aid(SERVICE), 9, vec![b], vec![], state(20), state(21)),
+            tx(aid(BRIDGE), 9, vec![a], vec![], state(10), state(11)),
+            tx(aid(BRIDGE), 9, vec![c], vec![], state(11), state(12)),
         ];
         let map = bridge_consumed_nullifiers(&txs, aid(BRIDGE)).unwrap();
         assert_eq!(
@@ -2979,8 +2981,8 @@ mod tests {
         );
 
         let disconnected = vec![
-            tx(aid(BRIDGE), 9, vec![auth(a)], state(30), state(31)),
-            tx(aid(BRIDGE), 9, vec![auth(c)], state(40), state(41)),
+            tx(aid(BRIDGE), 9, vec![a], vec![], state(30), state(31)),
+            tx(aid(BRIDGE), 9, vec![c], vec![], state(40), state(41)),
         ];
         assert!(
             bridge_consumed_nullifiers(&disconnected, aid(BRIDGE)).is_err(),

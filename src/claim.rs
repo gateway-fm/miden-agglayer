@@ -4,14 +4,14 @@ use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::{FaucetEntry, Store};
 use alloy::primitives::{BlockNumber, Bytes, FixedBytes};
 use miden_base_agglayer::{
-    ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
-    ProofData, SmtNode,
+    ClaimNoteStorage, ExitRoot, GlobalIndex, LeafData, MetadataHash, ProofData, SmtNode,
 };
 use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::note::Note;
 use miden_protocol::transaction::TransactionId;
+use miden_standards::interop::eth::{EthAddress, EthAmount};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
@@ -723,7 +723,7 @@ fn scale_claim_amount(
         })?;
     let scale = u32::from(scale_byte);
     amount
-        .scale_to_token_amount(scale)
+        .scale_to_asset_amount(scale)
         .map_err(|e| anyhow::anyhow!("claim amount is not representable on Miden: {e}"))
 }
 
@@ -796,7 +796,7 @@ pub fn claim_storage_from_call(
     };
     let miden_claim_amount = leaf_data
         .amount
-        .scale_to_token_amount(scale_exp)
+        .scale_to_asset_amount(scale_exp)
         .map_err(|e| anyhow::anyhow!("claim amount is not representable on Miden: {e}"))?;
     Ok(ClaimNoteStorage {
         proof_data,
@@ -1844,7 +1844,7 @@ mod tests {
         /// `verify_u256_to_native_amount_conversion` advertises a 2^128 outer gate
         /// but the inner verifier algebra only succeeds for x < ~2^123; values in
         /// [2^123, 2^128) panic later with `ERR_UNDERFLOW`. Aggkit's scaling path
-        /// goes through `EthAmount::scale_to_token_amount` which enforces the
+        /// goes through `EthAmount::scale_to_asset_amount` which enforces the
         /// real protocol cap (`FungibleAsset::MAX_AMOUNT = 2^63 - 2^31`), so any
         /// amount that falls in the upstream gap is rejected here BEFORE we
         /// build a CLAIM note that would panic on Miden. This test pins that
@@ -2090,7 +2090,7 @@ mod tests {
             MAX_ORIGIN_DECIMALS, MAX_SCALING_FACTOR, MIDEN_DECIMALS, parse_token_metadata,
         };
         use alloy::primitives::{Address, Bytes, U256};
-        use miden_base_agglayer::{EthAmount, EthAmountError};
+        use miden_standards::interop::eth::{EthAmount, EthAmountError};
 
         fn eth_amount(wei: U256) -> EthAmount {
             EthAmount::new(wei.to_be_bytes::<32>())
@@ -2114,7 +2114,7 @@ mod tests {
 
         /// Documents the boundary the bug crossed: a 27-decimal token routes at
         /// `scale = 27 - min(27, 8) = 19`, which the shared scale gate
-        /// (`EthAmount::scale_to_token_amount`) rejects. Under the audit-aligned
+        /// (`EthAmount::scale_to_asset_amount`) rejects. Under the audit-aligned
         /// fix such a token is refused up-front (27 > 26) instead of persisting an
         /// unclaimable route.
         #[test]
@@ -2124,7 +2124,7 @@ mod tests {
             let service_scale = 27u32 - u32::from(MIDEN_DECIMALS); // 27 - min(27,8) = 19
             assert_eq!(service_scale, 19);
             assert!(matches!(
-                amount.scale_to_token_amount(service_scale),
+                amount.scale_to_asset_amount(service_scale),
                 Err(EthAmountError::ScaleTooLarge)
             ));
         }
@@ -2179,7 +2179,7 @@ mod tests {
                 // (d <= 26) and 10^8 fits FungibleAsset::MAX_AMOUNT.
                 let wei = U256::from(10u64).pow(U256::from(u64::from(d)));
                 let token = eth_amount(wei)
-                    .scale_to_token_amount(u32::from(scale))
+                    .scale_to_asset_amount(u32::from(scale))
                     .unwrap_or_else(|e| {
                         panic!("d={d}: scale {scale} rejected by EthAmount gate: {e}")
                     });

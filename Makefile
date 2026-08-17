@@ -205,7 +205,7 @@ MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
 # node/client boundary with no Cargo.lock-alignment hack. fixtures/patches/0001
 # is not applied (the node-store callback-vault-key bug is fixed upstream), and
 # the AggLayer network id is a runtime storage slot again, so no vendor patch.
-MIDEN_NODE_GIT_REF := v0.16.0-alpha.2
+MIDEN_NODE_GIT_REF := v0.16.0-rc.1
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 

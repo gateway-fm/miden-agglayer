@@ -22,3 +22,22 @@ jobs:
       - run: cargo check --workspace --features postgres --profile=release
       - run: make test-unit
       - run: make test-scripts
+
+  # Deliberately RED while the temporary miden-agglayer vendor patch exists:
+  # rc.4 demoted read_let_num_leaves/is_ger_registered to testing-only and the
+  # Miden team has been asked to restore them. This keeps the rc1-migration PR
+  # unmergeable until upstream ships the restored API (then vendor/ + the
+  # [patch.crates-io] entry are removed and this gate turns green).
+  upstream-api-gate:
+    name: "BLOCKED: waiting on upstream miden-agglayer API restore"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: fail while the temporary vendor patch is present
+        run: |
+          if [ -d vendor/miden-agglayer-0.16.0-rc.4 ] || grep -q '^\[patch.crates-io\]' Cargo.toml; then
+            echo "::error::This branch vendors miden-agglayer rc.4 to un-gate read_let_num_leaves/is_ger_registered (demoted to testing-only upstream)."
+            echo "::error::The Miden team has been asked to restore these as public API. Remove vendor/ + the [patch.crates-io] entry once a release ships them, and this gate turns green."
+            exit 1
+          fi
+          echo "no vendor patch present — upstream API restored, gate green"

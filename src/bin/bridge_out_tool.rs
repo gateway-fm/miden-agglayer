@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
-use miden_base_agglayer::{B2AggNote, EthAddress};
+use miden_base_agglayer::B2AggNote;
 use miden_client::ClientError;
 use miden_client::RemoteTransactionProver;
 use miden_client::asset::{Asset, FungibleAsset};
@@ -23,6 +23,7 @@ use miden_client::note::NoteAssets;
 use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
+use miden_standards::interop::eth::EthAddress;
 
 #[derive(Parser)]
 #[command(version, about = "Create and submit a B2AGG bridge-out note")]
@@ -641,7 +642,7 @@ async fn main() -> anyhow::Result<()> {
         use miden_agglayer_service::miden_client::{
             submit_new_transaction, wait_for_transaction_commit,
         };
-        use miden_base_agglayer::{MetadataHash, create_bridge_account};
+        use miden_base_agglayer::{AggLayerBridge, BridgeRoles, MetadataHash};
         use miden_client::crypto::FeltRng;
 
         println!(
@@ -669,16 +670,30 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e:?}"))?;
 
-        // Foreign bridge (mirrors init.rs::add_bridge). 0.16.0-alpha.5: the
-        // network id is a per-bridge storage slot set at creation, and the GER
-        // role is split injector/remover — same account fills both here.
-        let bridge = create_bridge_account(
+        // Foreign bridge (mirrors init.rs::add_bridge). rc.4: role-based
+        // creation — the foreign service is ADMIN + faucet manager, the
+        // foreign ger_manager fills both injector and remover; zero fees
+        // against the chain's real fee faucet.
+        let fee_faucet_id =
+            miden_agglayer_service::fee_policy::fee_faucet_id_from_chain(&client).await?;
+        let roles = BridgeRoles::new(
+            std::collections::BTreeSet::from([service.id()]),
+            std::collections::BTreeSet::from([ger_manager.id()]),
+            std::collections::BTreeSet::from([ger_manager.id()]),
+        )
+        .map_err(|e| anyhow!("foreign bridge role construction failed: {e}"))?;
+        let bridge = AggLayerBridge::account_builder(
             client.rng().draw_word(),
             service.id(),
-            ger_manager.id(),
-            ger_manager.id(),
+            roles,
             args.foreign_network_id,
-        );
+            miden_agglayer_service::fee_policy::zero_fee_policy_manager_for(
+                AggLayerBridge::allowed_notes(),
+                fee_faucet_id,
+            ),
+        )
+        .build()
+        .map_err(|e| anyhow!("foreign bridge account build failed: {e}"))?;
         client
             .add_account(&bridge, false)
             .await
@@ -800,7 +815,7 @@ async fn main() -> anyhow::Result<()> {
             .account_type(AccountType::Public)
             .with_component(faucet_component)
             .with_components(policy_manager)
-            .with_auth_component(auth_component)
+            .with_component(auth_component)
             .build_with_schema_commitment()
             .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
         if let Some(key_pair) = key_pair.as_ref() {

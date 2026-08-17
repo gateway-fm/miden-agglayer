@@ -97,14 +97,19 @@ pub fn is_recoverable_account_error(err: &anyhow::Error) -> bool {
 }
 
 fn rpc_error_is_incorrect_initial_commitment(rpc_err: &RpcError) -> bool {
+    // 0.16.0-rc.1 collapsed the granular AddTransaction variants (the old
+    // `IncorrectAccountInitialCommitment`) into `StateConflict { message }` —
+    // the node now reports the stale-initial-commitment rejection as a state
+    // conflict whose message names the commitment mismatch. Match the variant
+    // and require the commitment marker in the message so an unrelated state
+    // conflict (e.g. nullifier already spent) does not trigger account heal.
     rpc_err
         .endpoint_error()
         .map(|endpoint_err| {
             matches!(
                 endpoint_err,
-                EndpointError::AddTransaction(
-                    AddTransactionError::IncorrectAccountInitialCommitment,
-                )
+                EndpointError::AddTransaction(AddTransactionError::StateConflict { message })
+                    if message.to_lowercase().contains("commitment")
             )
         })
         .unwrap_or(false)
@@ -240,8 +245,9 @@ mod tests {
     #[test]
     fn typed_downcast_catches_incorrect_initial_commitment() {
         use miden_client::rpc::{GrpcError, RpcEndpoint};
-        let endpoint_err =
-            EndpointError::AddTransaction(AddTransactionError::IncorrectAccountInitialCommitment);
+        let endpoint_err = EndpointError::AddTransaction(AddTransactionError::StateConflict {
+            message: "incorrect account initial commitment".into(),
+        });
         let rpc_err = RpcError::RequestError {
             endpoint: RpcEndpoint::SubmitProvenTx,
             error_kind: GrpcError::InvalidArgument,
