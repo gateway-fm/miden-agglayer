@@ -30,12 +30,6 @@ name = "bridge-autoclaim"
 path = "src/bin/bridge_autoclaim.rs"
 
 [dev-dependencies]
-# Constructs the REAL kernel-assertion error shape
-# (ExecutionError::OperationError → OperationError::FailedAssertion) for the
-# stale-foreign-account detector regression — the type is not re-exported by
-# miden-tx/miden-client. Version-locked by cargo to the same 0.29 build the
-# rc.4 protocol stack resolves.
-miden-processor = { version = "0.29" }
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
 # upstream in rc.1).
@@ -182,6 +176,15 @@ miden-tx = { default-features = false, version = "=0.16.0-rc.4" }
 
 miden-assembly = { default-features = false, version = "0.29" }
 miden-core = { default-features = false, version = "0.29" }
+# Typed inspection of the kernel's foreign-account staleness assertion
+# (ExecutionError::OperationError → OperationError::FailedAssertion) — the
+# type sits inside miden-tx's executor error but is not re-exported by
+# miden-tx/miden-client, and the generated kernel error constants are gated
+# behind miden-protocol's `testing` feature. Already in the tree via miden-tx;
+# cargo unifies this to the same 0.29 build.
+miden-processor = { default-features = false, features = [
+  "std",
+], version = "0.29" }
 
 # miden-client 0.16.0-alpha.1 — released from 0xMiden/rust-sdk (tag
 # v0.16.0-alpha.1, ref 0f89705c). Requires protocol ^0.16.0-alpha.4, matching

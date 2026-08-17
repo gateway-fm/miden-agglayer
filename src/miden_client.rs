@@ -94,21 +94,20 @@ pub(crate) fn network_target_foreign_account(
 
 /// Kernel err_msg of `validate_active_foreign_account` (miden-protocol rc.4
 /// `asm/kernels/transaction-core/src/account.masm`,
-/// `ERR_FOREIGN_ACCOUNT_INVALID_COMMITMENT`). The generated Rust constant is
-/// gated behind miden-protocol's `testing` feature, so we rebuild the SAME
-/// `MasmError` from the canonical message: `MasmError::code()` derives the
-/// felt error CODE exactly the way the kernel build does, and
-/// `matches_execution_error` compares the typed `err_code` (plus `err_msg`
-/// when present) — no string scanning of rendered errors.
+/// `ERR_FOREIGN_ACCOUNT_INVALID_COMMITMENT`). The generated Rust constant
+/// (`errors::tx_kernel`) and the `MasmError` wrapper are both gated behind
+/// miden-protocol's `testing` feature, so we derive the SAME felt error CODE
+/// from the canonical message via the public `error_code_from_msg` — exactly
+/// the derivation the kernel build uses — and compare the typed `err_code`.
+/// No string scanning of rendered errors. (Upstream ask: export the kernel
+/// error constants without the `testing` gate.)
 const STALE_FOREIGN_ACCOUNT_KERNEL_MSG: &str = "commitment of the foreign account in the advice \
                                                 provider does not match the commitment in the \
                                                 account tree";
 
-fn stale_foreign_account_masm_error() -> &'static miden_protocol::errors::MasmError {
-    static ERR: std::sync::OnceLock<miden_protocol::errors::MasmError> = std::sync::OnceLock::new();
-    ERR.get_or_init(|| {
-        miden_protocol::errors::MasmError::from_static_str(STALE_FOREIGN_ACCOUNT_KERNEL_MSG)
-    })
+pub(crate) fn stale_foreign_account_err_code() -> miden_protocol::Felt {
+    static CODE: std::sync::OnceLock<miden_protocol::Felt> = std::sync::OnceLock::new();
+    *CODE.get_or_init(|| miden_core::mast::error_code_from_msg(STALE_FOREIGN_ACCOUNT_KERNEL_MSG))
 }
 
 /// Typed check: is this client error the kernel's foreign-account staleness
@@ -117,15 +116,30 @@ fn stale_foreign_account_masm_error() -> &'static miden_protocol::errors::MasmEr
 /// `ClientError::TransactionExecutorError`'s Display is just "transaction
 /// execution failed" — thiserror does not chain sources into Display — so a
 /// rendered-string match can NEVER fire on it (live-observed: a `{e:#}` match
-/// stayed dead across 341 wedged retries). Match the typed chain instead.
+/// stayed dead across 341 wedged retries). Match the typed chain instead;
+/// same semantics as `MasmError::matches_execution_error` (which is
+/// testing-gated upstream): code equality, plus message equality when the
+/// error carries one.
 pub(crate) fn is_stale_foreign_account_error(e: &miden_client::ClientError) -> bool {
     let miden_client::ClientError::TransactionExecutorError(
-        miden_tx::TransactionExecutorError::TransactionProgramExecutionFailed(exec),
+        miden_tx::TransactionExecutorError::TransactionProgramExecutionFailed(
+            miden_processor::ExecutionError::OperationError {
+                err:
+                    miden_processor::operation::OperationError::FailedAssertion { err_code, err_msg },
+                ..
+            },
+        ),
     ) = e
     else {
         return false;
     };
-    stale_foreign_account_masm_error().matches_execution_error(exec)
+    if *err_code != stale_foreign_account_err_code() {
+        return false;
+    }
+    match err_msg {
+        Some(msg) => msg.as_ref() == STALE_FOREIGN_ACCOUNT_KERNEL_MSG,
+        None => true,
+    }
 }
 
 /// Force-refresh the tracked BRIDGE record from the node after a
@@ -1406,7 +1420,7 @@ mod tests {
             label: miden_assembly::debuginfo::SourceSpan::default(),
             source_file: None,
             err: OperationError::FailedAssertion {
-                err_code: stale_foreign_account_masm_error().code(),
+                err_code: stale_foreign_account_err_code(),
                 err_msg: Some(STALE_FOREIGN_ACCOUNT_KERNEL_MSG.into()),
             },
         };
@@ -1427,7 +1441,7 @@ mod tests {
         // live wedge (err_code in the r1 evidence log). If the canonical
         // message string ever drifts from the kernel's, this catches it.
         assert_eq!(
-            stale_foreign_account_masm_error().code().as_canonical_u64(),
+            stale_foreign_account_err_code().as_canonical_u64(),
             16249416635580848901,
             "derived ERR_FOREIGN_ACCOUNT_INVALID_COMMITMENT code no longer matches the \
              live-observed kernel err_code — update STALE_FOREIGN_ACCOUNT_KERNEL_MSG to the \
@@ -1455,10 +1469,7 @@ mod tests {
             label: miden_assembly::debuginfo::SourceSpan::default(),
             source_file: None,
             err: OperationError::FailedAssertion {
-                err_code: miden_protocol::errors::MasmError::from_static_str(
-                    "some other kernel assertion",
-                )
-                .code(),
+                err_code: miden_core::mast::error_code_from_msg("some other kernel assertion"),
                 err_msg: Some("some other kernel assertion".into()),
             },
         };
