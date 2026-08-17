@@ -215,3 +215,16 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 # CI carries an `upstream-api-gate` job that stays RED while this patch exists.
 [patch.crates-io]
 miden-agglayer = { path = "vendor/miden-agglayer-0.16.0-rc.4" }
+# TEMPORARY vendor patch — miden-client rc.1's foreign-account fetch uses a
+# `VaultFetch::IfChangedFrom(local_root)` delta optimization, but the
+# reconstruction path (`account_proof_into_inputs`) rebuilds the vault from
+# the returned asset list unconditionally, so an "unchanged" (omitted) vault
+# reconstructs as EMPTY and the kernel rejects the foreign account with a
+# commitment mismatch — permanently wedging every bridge-targeted transaction
+# (GER injection, claim publish, faucet config) once the bridge vault holds
+# its first locked native asset. The vendored copy is byte-identical to the
+# crates.io release except that fetch forces `VaultFetch::Always` (see the
+# VENDOR PATCH comment in vendor/miden-client-0.16.0-rc.1/src/transaction/
+# mod.rs). Remove this patch AND the vendor copy when upstream fixes the
+# unchanged-vault reconstruction.
+miden-client = { path = "vendor/miden-client-0.16.0-rc.1" }

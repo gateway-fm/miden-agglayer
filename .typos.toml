@@ -1,6 +1,8 @@
 # Config file for typos. For more information, see: https://github.com/crate-ci/typos
 [files]
-extend-exclude = ["*.lock", "dist", "target", "fixtures"]
+# vendor/ holds byte-(near-)identical copies of upstream crates (see
+# [patch.crates-io] in Cargo.toml) — their prose is upstream's to spell.
+extend-exclude = ["*.lock", "dist", "target", "fixtures", "vendor"]
 
 [default.extend-words]
 # Test fixture for constant_time_eq() — `abd` is intentionally a one-byte
