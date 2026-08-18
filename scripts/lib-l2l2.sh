@@ -250,8 +250,27 @@ submit_back_claim() {
     local target_rpc="${9:-$L2B_RPC}"
     local tries="${BACK_CLAIM_TRIES:-30}" interval="${BACK_CLAIM_INTERVAL:-15}"
     local attempt pj mer rer smtL smtR out txh
+    local l1ger_500s=0 body api_code
     for attempt in $(seq 1 "$tries"); do
-        pj=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
+        # FINDING #111: `curl -sf` collapsed the service's HTTP-500 code=2
+        # ("l1GER not found in the Storage" — the L1-GER index is behind the
+        # L2-GER view, the claimtxman-starvation signature) into "proof not
+        # ready yet", so the whole 450s retry budget silently masked a wedged
+        # bridge-service as slow certs (cycles 1-2). Classify by the API's
+        # NUMERIC code field (no error-string matching) and fail FAST after 4
+        # consecutive occurrences with the real cause.
+        body=$(curl -s "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
+        api_code=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('code',''))" 2>/dev/null || true)
+        if [[ "$api_code" == "2" ]]; then
+            l1ger_500s=$((l1ger_500s + 1))
+            if (( l1ger_500s >= 4 )); then
+                echo "FATAL-CAUSE: bridge-service /merkle-proof deposit_cnt=$cnt returned API code=2 (l1GER missing from its storage) ${l1ger_500s}x consecutively — L1-GER index is behind its own L2-GER view (claimtxman nonce-divergence starvation, FINDING #111). This is a bridge-service wedge, NOT slow certs. Heal: scripts/bridge-claimtxman-heal.sh" >&2
+                return 2
+            fi
+            sleep "$interval"; continue
+        fi
+        l1ger_500s=0
+        pj=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); import sys as s; s.exit(1) if 'proof' not in d else print(json.dumps(d))" 2>/dev/null || true)
         if [[ -n "$pj" ]]; then
             mer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])" 2>/dev/null || true)
             rer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])" 2>/dev/null || true)
@@ -670,6 +689,33 @@ _pf_sync_lag() {
     fi
 }
 
+# FINDING #111 — the sync.status 'synced' flag is the synchronizer's own
+# self-report, refreshed only when its (possibly starved) iteration runs, so it
+# reads synced=true THROUGH the claimtxman-starvation wedge (_pf_sync_lag
+# false-PASSed at cycle-1's chaos preflight while the L1-GER index was 2700
+# blocks behind). This probe checks the harmful state DIRECTLY: an L2-observed
+# GER (network_id=1 row) older than the 2 newest with NO matching L1 row means
+# /merkle-proof is already 500ing for every net-1 deposit — Miden->L2B claims
+# are impossible regardless of what sync.status claims.
+_pf_l1ger_consistency() {
+    local pg="${1:-${COMPOSE_PROJECT_NAME}-postgres-1}"
+    local orphans
+    orphans=$( ( set +o pipefail; docker exec "$pg" psql -U bridge_user -d bridge_db -tAX -c "
+        SELECT count(*) FROM sync.exit_root l2
+        LEFT JOIN sync.exit_root l1
+          ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
+        WHERE l2.network_id=1 AND l1.id IS NULL
+          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)" \
+        2>/dev/null ) | tr -d '[:space:]' )
+    if [[ -z "$orphans" ]]; then
+        _pf_pass "bridge-service L1-GER consistency: exit_root table not readable yet (fresh stack) — vacuous"
+    elif [[ "$orphans" -eq 0 ]]; then
+        _pf_pass "bridge-service L1-GER consistency: every settled L2-GER has its L1 row (proofs servable)"
+    else
+        _pf_fail "bridge-service L1-GER INCONSISTENT: $orphans L2-observed GER(s) have no L1 row — /merkle-proof will 500 (code=2) for net-1 deposits; claimtxman starvation (#111). Heal: scripts/bridge-claimtxman-heal.sh"
+    fi
+}
+
 l2l2_validate_stack() {
     _PF_FAILS=0
     step "PREFLIGHT: validating l2l2 stack (project=$COMPOSE_PROJECT_NAME)"
@@ -744,6 +790,7 @@ l2l2_validate_stack() {
     # net 0/1 on the base bridge_db (postgres); net 2 on the isolated L2B bridge_db (postgres-l2b)
     _pf_sync_lag 0 "$L1_RPC"  "L1 (Miden svc)"  "${COMPOSE_PROJECT_NAME}-postgres-1"
     _pf_sync_lag 2 "$L2B_RPC" "L2B (L2B svc)"   "${COMPOSE_PROJECT_NAME}-postgres-l2b-1"
+    _pf_l1ger_consistency "${COMPOSE_PROJECT_NAME}-postgres-1"
 
     # (e) aggkit-l2b aggoracle alive — GER injection into L2B GER. A quiet stack
     # legitimately has no RECENT inject (aggoracle only fires on a new L1 GER), so

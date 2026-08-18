@@ -521,6 +521,21 @@ pass "BridgeEvent (count $NBR1) + ClaimEvent (count $NCL1) rows identical"
 
 # ── Phase 4: no poison minted, pipeline alive ────────────────────────────────
 step "Phase 4 — no ERR_GER_ALREADY_REGISTERED poison; pipeline processes NEW traffic"
+
+# FINDING #111 (loop cycles 1-3, 2026-08-18): the restore COMPACTS the
+# ClaimTxManager sponsor's chain nonce (live ~177 -> restored 66 observed), but
+# the bridge-service claimtxman allocates nonces from its own monitored-tx
+# history — every post-restore claim it creates is R4-rejected forever and the
+# retry storm starves the shared synchronizer loop, so the L1-GER index falls
+# behind unboundedly and /merkle-proof 500s (code=2 l1GER-not-found) for every
+# net-1 deposit. Same class as the aggkit ethtxmanager wipe: any component
+# holding nonces across a restore must be re-based. FORCE=1 — post-restore the
+# stranded state is deterministic, no detection needed.
+if [[ -x "$SCRIPT_DIR/bridge-claimtxman-heal.sh" ]]; then
+    PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 L1_RPC="$L1_RPC" \
+        "$SCRIPT_DIR/bridge-claimtxman-heal.sh" 2>&1 | tee -a "$EVIDENCE" \
+        || say "WARN: claimtxman heal unconfirmed — L2->L2 back-claims may stay blocked (#111)"
+fi
 sleep 45   # window for aggoracle to (wrongly) re-inject + ntx to (wrongly) assert
 NTX_NOW=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
 [[ "$NTX_NOW" -le "$NTX_MARK" ]] \
