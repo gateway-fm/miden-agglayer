@@ -211,7 +211,12 @@ E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MID
 
 # L2<->L2 overlay (task #25): base stack + the second-rollup overlay. The
 # generated configs it mounts must be produced by `make gen-l2b-configs` first.
-L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env
+# WITH_WEB3SIGNER=1 adds the remote-custody overlay to every l2l2 compose
+# invocation (up/registration/down all inherit it). The caller must provision
+# keys (scripts/gen-web3signer-keys.sh) and export fixtures/web3signer-keys.env
+# BEFORE `make e2e-l2l2-up` — the overlay interpolates AGGLAYER_SIGNER_KEYS.
+WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer.yml,)
+L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) --env-file fixtures/.env
 
 .PHONY: miden-node-image-coords
 miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
