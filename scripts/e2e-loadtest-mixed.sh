@@ -492,7 +492,8 @@ log "    address clash               = $CLASH (want: distinct)"
 log "    event-completeness rc       = $VC_RC (0 = PASS; 'skip' = caller verifies)"
 log "    proxy store-locks           = $LOCKS"
 if mixed_ops_ok "$FWD_OK" "$FWD_SUB" "$BACK_OK" "$BACK_SUB" "$CLASH" \
-        "$LT_RC" "${SKIP_L1_LOAD:-0}" "$VC_RC" "${LOCKS:-1}"; then
+        "$LT_RC" "${SKIP_L1_LOAD:-0}" "$VC_RC" "${LOCKS:-1}" \
+        "${L2L2_FWD:-5}" "${L2L2_BACK:-5}"; then
     log "  >>> MIXED LOADTEST PASS — all 4 directions landed + clash distinct <<<"
     log "======================================================================"
     exit 0
