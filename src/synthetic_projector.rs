@@ -694,31 +694,40 @@ impl SyntheticProjector {
             // Caught-up fast path: a single (near-tip) window is fetched inline
             // — identical behavior and cost to the historical per-tick sweep.
             let backoff_budget = reconcile_backpressure_budget_secs();
-            let mut results: Vec<(u64, u64, anyhow::Result<Vec<NoteId>>)> =
-                if let [(from, to)] = windows[..] {
-                    vec![(from, to, fetch_window_with_backoff(fetcher, from, to, backoff_budget).await)]
-                } else {
-                    // Bounded concurrency (#112): chunks of
-                    // RECONCILE_WINDOW_CONCURRENCY instead of every window at
-                    // once — the unbounded fan-out is what tripped the node's
-                    // limiter on grown chains.
-                    let mut out = Vec::with_capacity(windows.len());
-                    for chunk in windows.chunks(reconcile_window_concurrency()) {
-                        let mut set = tokio::task::JoinSet::new();
-                        for &(from, to) in chunk {
-                            let fetcher = Arc::clone(fetcher);
-                            set.spawn(async move {
-                                (from, to, fetch_window_with_backoff(&fetcher, from, to, backoff_budget).await)
-                            });
-                        }
-                        while let Some(joined) = set.join_next().await {
-                            out.push(joined.map_err(|e| {
-                                anyhow::anyhow!("reconcile window-fetch task panicked: {e}")
-                            })?);
-                        }
+            let mut results: Vec<(u64, u64, anyhow::Result<Vec<NoteId>>)> = if let [(from, to)] =
+                windows[..]
+            {
+                vec![(
+                    from,
+                    to,
+                    fetch_window_with_backoff(fetcher, from, to, backoff_budget).await,
+                )]
+            } else {
+                // Bounded concurrency (#112): chunks of
+                // RECONCILE_WINDOW_CONCURRENCY instead of every window at
+                // once — the unbounded fan-out is what tripped the node's
+                // limiter on grown chains.
+                let mut out = Vec::with_capacity(windows.len());
+                for chunk in windows.chunks(reconcile_window_concurrency()) {
+                    let mut set = tokio::task::JoinSet::new();
+                    for &(from, to) in chunk {
+                        let fetcher = Arc::clone(fetcher);
+                        set.spawn(async move {
+                            (
+                                from,
+                                to,
+                                fetch_window_with_backoff(&fetcher, from, to, backoff_budget).await,
+                            )
+                        });
                     }
-                    out
-                };
+                    while let Some(joined) = set.join_next().await {
+                        out.push(joined.map_err(|e| {
+                            anyhow::anyhow!("reconcile window-fetch task panicked: {e}")
+                        })?);
+                    }
+                }
+                out
+            };
             results.sort_unstable_by_key(|(from, _, _)| *from);
             for (from, to, fetched) in results {
                 let candidates = fetched.map_err(|e| {
@@ -1854,8 +1863,9 @@ mod tests {
             endpoint_error: None,
             source: None,
         };
-        let wrapped: anyhow::Error =
-            Err::<(), _>(backpressure).context("sync_notes(1..1000)").unwrap_err();
+        let wrapped: anyhow::Error = Err::<(), _>(backpressure)
+            .context("sync_notes(1..1000)")
+            .unwrap_err();
         assert!(super::is_node_backpressure(&wrapped));
 
         let not_backpressure = miden_client::rpc::RpcError::RequestError {
@@ -1864,8 +1874,9 @@ mod tests {
             endpoint_error: None,
             source: None,
         };
-        let wrapped: anyhow::Error =
-            Err::<(), _>(not_backpressure).context("sync_notes(1..1000)").unwrap_err();
+        let wrapped: anyhow::Error = Err::<(), _>(not_backpressure)
+            .context("sync_notes(1..1000)")
+            .unwrap_err();
         assert!(!super::is_node_backpressure(&wrapped));
 
         // A STRINGIFIED rendering of the same error must NOT classify — this
@@ -1901,23 +1912,27 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        let fetcher: Arc<dyn super::ReconcileFetcher> =
-            Arc::new(FlakyFetcher { fails_remaining: Mutex::new(2) });
+        let fetcher: Arc<dyn super::ReconcileFetcher> = Arc::new(FlakyFetcher {
+            fails_remaining: Mutex::new(2),
+        });
         // 2 failures at 2s + 4s backoff fit a 300s budget; the paused clock
         // auto-advances through the sleeps, so this pins the RETRY behavior
         // (previously: first typed backpressure error was fatal to the
         // one-shot restore) without real waiting.
         let out = super::fetch_window_with_backoff(&fetcher, 1, 1000, 300).await;
-        assert!(out.is_ok(), "backoff must ride out transient backpressure: {out:?}");
+        assert!(
+            out.is_ok(),
+            "backoff must ride out transient backpressure: {out:?}"
+        );
 
         // Budget exhaustion still propagates the typed error (fail-closed).
-        let fetcher: Arc<dyn super::ReconcileFetcher> =
-            Arc::new(FlakyFetcher { fails_remaining: Mutex::new(u32::MAX) });
+        let fetcher: Arc<dyn super::ReconcileFetcher> = Arc::new(FlakyFetcher {
+            fails_remaining: Mutex::new(u32::MAX),
+        });
         let out = super::fetch_window_with_backoff(&fetcher, 1, 1000, 1).await;
         assert!(out.is_err(), "an exhausted backoff budget must fail closed");
         assert!(super::is_node_backpressure(&out.unwrap_err()));
     }
-
 
     use super::*;
     use crate::accounts_config::{AccountIdBech32, AccountsConfig};
