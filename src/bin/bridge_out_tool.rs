@@ -121,7 +121,7 @@ struct Args {
     /// on-chain (polling sync), up to this many seconds. 0 disables the wait
     /// (legacy behaviour: 5 blind sync cycles). Load tests MUST wait: pacing on
     /// tx acceptance alone floods the bridge with in-flight consumptions.
-    #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 180)]
+    #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 360)]
     wait_consumed_secs: u64,
 
     /// Foreign-deployment provision mode (claim-provenance e2e): stand up a
@@ -1213,10 +1213,18 @@ async fn main() -> anyhow::Result<()> {
     // surfaces as "transaction proving failed". Proving happens BEFORE node
     // submission, so retrying is clean. If the node accepts the tx and only the
     // local store update fails, never resubmit; retry the attached store update.
-    const SUBMIT_ATTEMPTS: u32 = 4;
+    // Retry budget for the SUBMISSION phase only (pre-acceptance, so a retry
+    // can never double-bridge). Default 6 with exponential backoff 5..60s —
+    // shared-prover backpressure on a busy stack outlives the old fixed
+    // 4x10s budget (loop cycle-4 back#3, 2026-08-18).
+    let submit_attempts: u32 = std::env::var("B2AGG_SUBMIT_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(6);
     let mut tx_id = None;
     let mut submitted_note_id = None;
-    for attempt in 1..=SUBMIT_ATTEMPTS {
+    for attempt in 1..=submit_attempts {
         // Sync right before each attempt to minimize the window where the
         // service's background sync loop can change our shared SQLite state.
         sync_with_retry(&mut client, "bridge-out pre-submit").await?;
@@ -1238,7 +1246,7 @@ async fn main() -> anyhow::Result<()> {
             .build()
             .map_err(|e| anyhow!("tx request build failed: {e}"))?;
 
-        println!("[bridge-out] submitting transaction (attempt {attempt}/{SUBMIT_ATTEMPTS})...");
+        println!("[bridge-out] submitting transaction (attempt {attempt}/{submit_attempts})...");
         match miden_agglayer_service::metrics::meter_proof(
             miden_agglayer_service::metrics::ProofKind::BridgeOut,
             client.submit_new_transaction(wallet_id, tx_request),
@@ -1263,7 +1271,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 let pending_update = *pending_update;
                 let mut last_reapply_err = None;
-                for recovery_attempt in 1..=SUBMIT_ATTEMPTS {
+                for recovery_attempt in 1..=submit_attempts {
                     match client
                         .apply_transaction_update(pending_update.clone())
                         .await
@@ -1278,10 +1286,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(reapply_err) => {
                             eprintln!(
-                                "[bridge-out] recovery apply attempt {recovery_attempt}/{SUBMIT_ATTEMPTS} failed for transaction {accepted_tx}: {reapply_err:#}"
+                                "[bridge-out] recovery apply attempt {recovery_attempt}/{submit_attempts} failed for transaction {accepted_tx}: {reapply_err:#}"
                             );
                             last_reapply_err = Some(reapply_err);
-                            if recovery_attempt < SUBMIT_ATTEMPTS {
+                            if recovery_attempt < submit_attempts {
                                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                             }
                         }
@@ -1293,21 +1301,27 @@ async fn main() -> anyhow::Result<()> {
                 let last_reapply_err = last_reapply_err
                     .map(|err| format!("{err:#}"))
                     .unwrap_or_else(|| "unknown recovery error".to_string());
-                return Err(anyhow!(
-                    "submit accepted transaction {accepted_tx} at block {submission_height}, but local store recovery failed after {SUBMIT_ATTEMPTS} attempts: {last_reapply_err}"
-                ));
-            }
-            Err(e) if attempt < SUBMIT_ATTEMPTS => {
+                // The transaction IS on chain — a caller re-running the tool
+                // would create a SECOND B2AGG note (double-bridge). Exit 4 =
+                // "submitted, do not retry" (script contract; exit 3 = safe).
                 eprintln!(
-                    "[bridge-out] submit attempt {attempt} failed: {e:?}; retrying in 10s \
-                     (prover backpressure is the common cause)"
+                    "[bridge-out] SUBMITTED-NOT-SETTLED tx={accepted_tx}: local store recovery failed after {submit_attempts} attempts: {last_reapply_err}"
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                std::process::exit(4);
+            }
+            Err(e) if attempt < submit_attempts => {
+                let delay = (5u64 << (attempt - 1)).min(60);
+                eprintln!(
+                    "[bridge-out] submit attempt {attempt}/{submit_attempts} failed: {e:?}; \
+                     retrying in {delay}s (prover backpressure is the common cause)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             }
             Err(e) => {
-                return Err(anyhow!(
-                    "submit failed after {SUBMIT_ATTEMPTS} attempts: {e}"
-                ));
+                // Nothing was accepted on chain — a whole-op retry is SAFE.
+                // Exit 3 = "failed pre-submission, retryable" (script contract).
+                eprintln!("[bridge-out] submit failed after {submit_attempts} attempts: {e}");
+                std::process::exit(3);
             }
         }
     }
@@ -1342,10 +1356,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if !consumed {
-            return Err(anyhow!(
-                "B2AGG note {note_id} not consumed within {}s",
+            // The note EXISTS on chain and may still be consumed later — a
+            // caller re-running the tool would bridge a second amount. Emit a
+            // parseable marker and exit 4 ("submitted, do not retry"); the
+            // caller decides whether to keep waiting on the deposit downstream.
+            eprintln!(
+                "[bridge-out] PENDING-CONSUMPTION note={note_id} tx={tx_id}: not consumed within {}s",
                 args.wait_consumed_secs
-            ));
+            );
+            std::process::exit(4);
         }
         println!("[bridge-out] B2AGG consumed");
     } else {
