@@ -13,12 +13,12 @@
 # found" for EVERY net-1 deposit — all Miden->L2B claims become impossible
 # while ready_for_claim still reads true.
 #
-# THE HEAL: stop the bridge-service, delete the stranded status='created'
-# monitored txs (they are unsendable; the DEPOSITS remain and claimtxman
-# re-detects + re-creates them with a chain-derived nonce once its table no
-# longer poisons allocation), start the service, and require the positive
+# THE HEAL: stop the bridge-service, wipe the monitored-tx tables (fully
+# re-derivable: the DEPOSITS remain and claimtxman re-detects unclaimed ready
+# deposits and re-creates claims; checkIfClaimed re-confirms landed ones; the
+# RESTART also clears the in-memory NonceCache LRU whose ratchet is the actual
+# allocator poison — see nonce_cache.go GetNextNonce), start the service, and require the positive
 # outcome: the L1 sync cursor must ADVANCE within the confirm window.
-# 'confirmed' rows are history and are kept.
 #
 # Usage: PROJECT=<compose-project> ./scripts/bridge-claimtxman-heal.sh
 #   FORCE=1        heal without the wedge precheck (drill epilogue uses this:
@@ -41,7 +41,7 @@ docker inspect "$SVC_C" >/dev/null 2>&1 || { log "container $SVC_C not found"; e
 stranded=$(psql_b "SELECT count(*) FROM sync.monitored_txs WHERE status='created'" | tr -d '[:space:]')
 if [[ "$FORCE" != "1" ]]; then
     # Wedge signature: stranded created rows AND fresh nonce-mismatch sends.
-    mismatches=$(docker logs --since 120s "$SVC_C" 2>&1 | grep -c "nonce mismatch for" || true)
+    mismatches=$(docker logs --since 120s "$SVC_C" 2>&1 | grep -cE "nonce too low|nonce too high|nonce mismatch for" || true)
     if [[ "${stranded:-0}" -eq 0 || "${mismatches:-0}" -eq 0 ]]; then
         log "no stranded-nonce wedge (created=${stranded:-0} fresh_mismatches=${mismatches:-0}) — nothing to heal"
         exit 0
@@ -56,7 +56,13 @@ l1_cursor_before=$(psql_b "SELECT coalesce(max(block_num),0) FROM sync.block WHE
 docker stop "$SVC_C" >/dev/null 2>&1
 [[ "$(docker inspect -f '{{.State.Status}}' "$SVC_C" 2>/dev/null)" == "exited" ]] \
     || { log "FATAL: $SVC_C did not stop"; exit 1; }
-deleted=$(psql_b "DELETE FROM sync.monitored_txs WHERE status='created' RETURNING 1" | grep -c 1 || true)
+# Whole-table wipe (maintainer decision 2026-08-18): monitored txs are fully
+# re-derivable — sync.deposit + on-chain isClaimed/ClaimEvents are the source
+# of truth, and claimtxman's checkIfClaimed re-confirms landed claims. Keeping
+# 'confirmed' rows adds nothing and a partial wipe leaves more ways to be
+# inconsistent. The group table goes with it.
+deleted=$(psql_b "DELETE FROM sync.monitored_txs RETURNING 1" | grep -c 1 || true)
+psql_b "DELETE FROM sync.monitored_txs_group" >/dev/null || true
 docker start "$SVC_C" >/dev/null 2>&1 || { log "FATAL: $SVC_C did not start"; exit 1; }
 log "deleted ${deleted:-0} stranded row(s); service restarted"
 

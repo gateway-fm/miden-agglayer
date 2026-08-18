@@ -712,7 +712,7 @@ sponsor_probe_round() {
         PROBE_VERDICT="advancing"; return 0
     fi
     rejections=$(printf '%s\n' "$window" \
-        | grep -cE "nonce mismatch for $SPONSOR_ADDR_LC|claim already submitted for global_index" || true)
+        | grep -cE "nonce too (low|high).*guard for $SPONSOR_ADDR_LC|nonce mismatch for $SPONSOR_ADDR_LC|claim already submitted for global_index" || true)
     if [[ "${rejections:-0}" -eq 0 ]]; then
         PROBE_VERDICT="transient"; return 0
     fi
@@ -826,7 +826,7 @@ verify_sponsor_recovers_automatically() {
     sleep 15
     fresh_mismatch=$(docker logs --tail 8000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
         | awk -v ts="$settle_ts" '$1 >= ts' \
-        | grep -cE "nonce mismatch for $SPONSOR_ADDR_LC" || true)
+        | grep -cE "nonce too (low|high).*guard for $SPONSOR_ADDR_LC|nonce mismatch for $SPONSOR_ADDR_LC" || true)
     log "sponsor nonce: before-settle=$nonce_a after-settle=$nonce_b; fresh nonce-mismatch lines since settle=$fresh_mismatch"
     [[ "${fresh_mismatch:-0}" -eq 0 ]] \
         || fail "sponsor STILL emitting nonce-mismatch spam ($fresh_mismatch lines in ~15s after a settle) — permanent wedge NOT healed (#55 regression)"

@@ -1392,8 +1392,11 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             let expected_before_preflight = service.store.nonce_get(&signer_str).await?;
             if tx_nonce < expected_before_preflight {
                 ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+                // #111 — geth-faithful wording; see the main R4 site for why
+                // this exact prefix is a parsed contract (claimtxman
+                // isNonceError). Pinned by the same test.
                 anyhow::bail!(
-                    "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_before_preflight}; this guards against replay and out-of-order submission (R4)"
+                    "nonce too low: next nonce {expected_before_preflight}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
                 );
             }
         }
@@ -1580,8 +1583,23 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         }
 
         ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+        // #111 — the rejection message is a PARSED CONTRACT, not prose. The
+        // zkevm-bridge-service claimtxman classifies send errors with
+        // isNonceError (substring match on "nonce too low" / "invalid nonce" /
+        // "txnonce") and only then clears its in-memory nonce cache and
+        // re-derives from the chain (ReviewMonitoredTx). Our previous
+        // "nonce mismatch for ..." wording matched NONE of those, so the
+        // claimtxman's built-in self-heal was dead against this proxy and a
+        // stale-nonce claim retried forever (the cycle-1/2 L1-GER starvation).
+        // Mirror geth's wording exactly; the R4 rationale rides behind it.
+        // Pinned by tests::r4_nonce_rejections_match_claimtxman_is_nonce_error.
+        if tx_nonce < expected_nonce {
+            anyhow::bail!(
+                "nonce too low: next nonce {expected_nonce}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
+            );
+        }
         anyhow::bail!(
-            "nonce mismatch for {signer_str}: tx.nonce = {tx_nonce}, expected {expected_nonce}; this guards against replay and out-of-order submission (R4)"
+            "nonce too high: next nonce {expected_nonce}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
         );
     };
 
@@ -2938,8 +2956,46 @@ mod tests {
             .expect_err("stale nonce must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("nonce mismatch"),
+            msg.contains("nonce too low"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    /// #111 error-format contract: the zkevm-bridge-service claimtxman
+    /// (claimtxman/monitortxs.go @2e87f97) classifies send failures with
+    ///   isNonceError(err) = contains("nonce too low") || contains("invalid
+    ///   nonce") || contains("txnonce")   [lower-cased]
+    /// and ONLY a match clears its in-memory nonce cache + re-derives from the
+    /// chain. Mirror the predicate VERBATIM and pin both R4 rejection strings:
+    /// the past-nonce form MUST match (that is the self-heal trigger), and the
+    /// future-nonce form provably does NOT (upstream's predicate omits "nonce
+    /// too high", and its ReviewMonitoredTx only ever raises a nonce) — which
+    /// is exactly why bridge-claimtxman-heal.sh wipes the monitored-tx table
+    /// after a restore instead of relying on self-heal for compacted nonces.
+    #[test]
+    fn r4_nonce_rejections_match_claimtxman_is_nonce_error() {
+        fn is_nonce_error_mirror(msg: &str) -> bool {
+            let s = msg.to_lowercase();
+            s.contains("nonce too low") || s.contains("invalid nonce") || s.contains("txnonce")
+        }
+        let signer = "0x635243a11b41072264df6c9186e3f473402f94e9";
+        let past = format!(
+            "nonce too low: next nonce {}, tx nonce {} (R4 replay / out-of-order guard for {signer})",
+            66, 51
+        );
+        let future = format!(
+            "nonce too high: next nonce {}, tx nonce {} (R4 replay / out-of-order guard for {signer})",
+            66, 151
+        );
+        assert!(
+            is_nonce_error_mirror(&past),
+            "past-nonce R4 rejection must trigger claimtxman's isNonceError self-heal: {past}"
+        );
+        assert!(
+            !is_nonce_error_mirror(&future),
+            "future-nonce form intentionally does NOT match (upstream gap; the \
+             restore heal covers it) — if this starts matching, re-evaluate \
+             whether the monitored-tx wipe is still required: {future}"
         );
     }
 
@@ -3911,7 +3967,7 @@ mod tests {
             "S's next claim at nonce 1 must be accepted (NO wedge): {res_y:?}"
         );
         assert!(
-            !format!("{:?}", res_y).contains("nonce mismatch"),
+            !format!("{:?}", res_y).contains("nonce too low"),
             "the sequence must not produce a nonce-mismatch wedge"
         );
         assert_eq!(
@@ -4001,8 +4057,8 @@ mod tests {
                 "a stale-nonce landed claim must be rejected by R4, not accept-and-reverted",
             );
         assert!(
-            err.to_string().contains("nonce mismatch"),
-            "must be the R4 nonce-mismatch rejection, not an accept: {err:#}"
+            err.to_string().contains("nonce too low"),
+            "must be the R4 nonce-too-low rejection, not an accept: {err:#}"
         );
         // No receipt was written (it was rejected, not accept-and-reverted).
         assert!(
