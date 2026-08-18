@@ -123,9 +123,15 @@ done
 manifest_count=$(find "$B/stage" -type f | wc -l)
 log "staged manifest: $manifest_count file(s) (whole state dir minus $POISON)"
 
+# `up --no-start` (not `create`): compose v2.40 rejects `create --no-deps`
+# ("unknown flag"), so this line failed unconditionally AFTER the container was
+# stopped — the chaos watchdog's heal left aggkit down (2026-08-18 cycle-1
+# chaos NOT-GREEN, verdict d). `up --no-start --no-deps --force-recreate` is
+# the supported spelling of create-without-starting-deps. Keep the output: a
+# silently-discarded recreate error is what hid this.
 COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
-    create --force-recreate --no-deps "$SVC" >/dev/null 2>&1 \
-    || { KEEP_STAGE=1; log "FATAL: recreate failed — staging dir retained"; exit 1; }
+    up --no-start --no-deps --force-recreate "$SVC" >"$B/recreate.log" 2>&1 \
+    || { KEEP_STAGE=1; log "FATAL: recreate failed — staging dir retained; see $B/recreate.log"; exit 1; }
 
 # ── RESTORE the manifest, VERIFY it round-trips, then require health ─────────
 # From here on the original state exists only in $B — every failure path keeps it.
@@ -225,8 +231,16 @@ fail_health() {
     || fail_health "$SVC produced no log output in the settle window (no proof the process works)"
 [ "${CRASH_MARKERS:-0}" -eq 0 ] \
     || fail_health "$SVC logs show $CRASH_MARKERS fatal/panic marker(s) in the settle window"
-[ "${WEDGE_MATCHES:-0}" -eq 0 ] \
-    || fail_health "$SVC still logs the wedge signature ($WEDGE_MATCHES match(es) of WEDGE_PATTERN) — the heal did not clear it"
+# Bare-pattern gate ONLY when no exact tx is known (2026-08-18 cycle-1 live
+# false-positive): 'already exists in monitoring DB' is aggoracle's NORMAL
+# per-tick dedup line for its CURRENT healthy pending injection — after a wipe
+# the fresh replacement tx (a NEW id, the pending GER moved on while aggkit was
+# down) legitimately produces it. With WEDGE_TX known, the exact-pair check and
+# the positive-outcome wait below are the real verification.
+if [ -z "${WEDGE_TX:-}" ]; then
+    [ "${WEDGE_MATCHES:-0}" -eq 0 ] \
+        || fail_health "$SVC still logs the wedge signature ($WEDGE_MATCHES match(es) of WEDGE_PATTERN) — the heal did not clear it"
+fi
 [ "${WEDGE_TX_MATCHES:-0}" -eq 0 ] \
     || fail_health "$SVC still pairs the EXACT lost tx ${WEDGE_TX:-} with the wedge error ($WEDGE_TX_MATCHES match(es)) — the wedge re-formed"
 # POSITIVE exact outcome (review 0814e): a quiet window is not success — the
@@ -234,12 +248,34 @@ fail_health() {
 # success-specific transition: the proxy's transactions table knows WEDGE_TX
 # within HEAL_CONFIRM_TIMEOUT, or the wedge-paired error reappears (fail).
 if [ -n "${WEDGE_TX:-}" ]; then
+    # The resent injection keeps WEDGE_TX's deterministic id ONLY if the same
+    # GER is still the one being injected. If newer GERs superseded it while
+    # the service was wedged/down, the post-wipe replacement is a NEW id
+    # (2026-08-18 cycle-1: wedged 0xe30cf8… replaced by fresh 0x89edca…) and
+    # WEDGE_TX will never reach the proxy — so the positive proof is: the
+    # CURRENT pending injection (fresh-log id, falling back to WEDGE_TX) gets
+    # durably admitted. Re-wedge on the exact old id still fails immediately.
+    TARGET_TX=$(printf '%s' "$RECENT" \
+        | grep -aE "${WEDGE_PATTERN:-already exists in monitoring DB}" \
+        | grep -aoE 'ID: 0x[0-9a-fA-F]{64}' | tail -1 | cut -d' ' -f2)
+    # No pending injection in the settle window at all (the wiped record was
+    # not re-added — the L2 target is already current, tonight's second live
+    # shape): there is nothing to await. Waiting on the ORIGINAL id here is
+    # provably wrong — a superseded injection never resends it — so pass on
+    # the negative gates and defer positive proof to live traffic (the loop's
+    # next N=30 leg hard-fails if GER injection is actually broken).
+    if [ -z "$TARGET_TX" ]; then
+        log "no pending injection observed post-heal (wedge-pair absent, service stable) — positive admission proof deferred to live traffic"
+    fi
+    [ -z "$TARGET_TX" ] || [ "$TARGET_TX" = "$WEDGE_TX" ] \
+        || log "pending injection superseded the wedged id: waiting on ${TARGET_TX:0:18}… (was ${WEDGE_TX:0:18}…)"
     CONFIRM_TIMEOUT="${HEAL_CONFIRM_TIMEOUT:-120}"
     waited=0
     confirmed=0
-    while [ "$waited" -lt "$CONFIRM_TIMEOUT" ]; do
+    [ -n "$TARGET_TX" ] || confirmed=1   # deferred: negative gates already passed
+    while [ "$confirmed" -eq 0 ] && [ "$waited" -lt "$CONFIRM_TIMEOUT" ]; do
         known=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
-            "SELECT count(*) FROM transactions WHERE tx_hash='$WEDGE_TX'" 2>/dev/null || echo "")
+            "SELECT count(*) FROM transactions WHERE tx_hash='$TARGET_TX'" 2>/dev/null || echo "")
         if [ "${known:-0}" != "" ] && [ "${known:-0}" -gt 0 ] 2>/dev/null; then
             confirmed=1
             break
@@ -252,8 +288,9 @@ if [ -n "${WEDGE_TX:-}" ]; then
         waited=$((waited + 5))
     done
     [ "$confirmed" -eq 1 ] \
-        || fail_health "the proxy never durably admitted the resent tx ${WEDGE_TX} within ${CONFIRM_TIMEOUT}s — no positive proof the wedge cleared"
-    log "positive exact outcome: proxy durably admitted ${WEDGE_TX:0:18}… after ${waited}s"
+        || fail_health "the proxy never durably admitted the resent tx ${TARGET_TX} within ${CONFIRM_TIMEOUT}s — no positive proof the wedge cleared"
+    [ -z "$TARGET_TX" ] \
+        || log "positive exact outcome: proxy durably admitted ${TARGET_TX:0:18}… after ${waited}s"
 fi
 [ "${PROGRESS_MATCHES:-0}" -gt 0 ] \
     || fail_health "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"
