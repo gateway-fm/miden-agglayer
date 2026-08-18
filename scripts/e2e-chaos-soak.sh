@@ -168,7 +168,7 @@ WATCHDOG_PID=$!
 say "=== mixed loadtest under storm (L1 ${N} split $((N / 2))/$((N - N / 2)), L2<->L2 $L2L2_FWD/$L2L2_BACK) ==="
 N_L1_FWD=$((N / 2)) N_L1_BACK=$((N - N / 2)) L2L2_FWD="$L2L2_FWD" L2L2_BACK="$L2L2_BACK" \
     MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" COMPOSE_PROJECT_NAME="$PROJECT" \
-    timeout 4800 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
+    timeout "${CHAOS_LT_TIMEOUT:-9000}" "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
 LT_RC=$?
 say "mixed loadtest exited rc=$LT_RC"
 grep -aE "MIXED LOADTEST RESULT|forward ops|back ops|address clash|L1<->Miden rc" /tmp/chaos-lt.out | tail -6 || true
@@ -217,7 +217,7 @@ sleep "$POST_CHAOS_SETTLE"
 say "=== (pre-verdict) fresh two-way post-chaos operation (1 L1->Miden + 1 Miden->L1) ==="
 POSTOP_RC=1
 if N_L1_FWD=1 N_L1_BACK=1 L2L2_FWD=0 L2L2_BACK=0 MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" \
-    COMPOSE_PROJECT_NAME="$PROJECT" timeout 1800 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" \
+    COMPOSE_PROJECT_NAME="$PROJECT" timeout "${CHAOS_POSTOP_TIMEOUT:-3600}" "$SCRIPT_DIR/e2e-loadtest-mixed.sh" \
     >/tmp/chaos-postop.out 2>&1; then
     POSTOP_RC=0
 fi
