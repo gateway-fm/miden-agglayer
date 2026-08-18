@@ -223,6 +223,18 @@ fail_health() {
     docker stop "$C" >/dev/null 2>&1 || true
     exit 1
 }
+# Post-restore soft failure (2026-08-18 cycle-2 chaos, heal attempt 3): once
+# the restore is content-verified and the service is RUNNING, an unproven or
+# re-forming wedge must not stop it — attempt 3 cleared the wedge but its
+# 120s admission confirm overlapped an active chaos prover-kill, timed out,
+# and fail_health then STOPPED a healthy aggkit, manufacturing the verdict-d
+# outage. Leave the service up (a re-wedge just fires the watchdog again),
+# return rc=1 so the caller does NOT count a confirmed heal.
+fail_soft() {
+    KEEP_STAGE=1
+    log "UNCONFIRMED: $1 — leaving $SVC RUNNING (soft-fail; not counted as a heal); staging dir retained."
+    exit 1
+}
 [ "$STATE" = "running false" ] \
     || fail_health "$SVC is not stably running after the heal (state: $STATE)"
 [ "$NOW_RESTARTS" -le "$BASE_RESTARTS" ] \
@@ -239,10 +251,10 @@ fail_health() {
 # the positive-outcome wait below are the real verification.
 if [ -z "${WEDGE_TX:-}" ]; then
     [ "${WEDGE_MATCHES:-0}" -eq 0 ] \
-        || fail_health "$SVC still logs the wedge signature ($WEDGE_MATCHES match(es) of WEDGE_PATTERN) — the heal did not clear it"
+        || fail_soft "$SVC still logs the wedge signature ($WEDGE_MATCHES match(es) of WEDGE_PATTERN) — the heal did not clear it"
 fi
 [ "${WEDGE_TX_MATCHES:-0}" -eq 0 ] \
-    || fail_health "$SVC still pairs the EXACT lost tx ${WEDGE_TX:-} with the wedge error ($WEDGE_TX_MATCHES match(es)) — the wedge re-formed"
+    || fail_soft "$SVC still pairs the EXACT lost tx ${WEDGE_TX:-} with the wedge error ($WEDGE_TX_MATCHES match(es)) — the wedge re-formed"
 # POSITIVE exact outcome (review 0814e): a quiet window is not success — the
 # heal exists so the resent tx gets durably admitted by the proxy. Require the
 # success-specific transition: the proxy's transactions table knows WEDGE_TX
@@ -283,16 +295,16 @@ if [ -n "${WEDGE_TX:-}" ]; then
         rewedged=$(docker logs --since 10s "$C" 2>&1 | grep -F "$WEDGE_TX" \
             | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
         [ "${rewedged:-0}" -eq 0 ] \
-            || fail_health "$SVC re-wedged on the exact tx ${WEDGE_TX} while waiting for durable admission"
+            || fail_soft "$SVC re-wedged on the exact tx ${WEDGE_TX} while waiting for durable admission"
         sleep 5
         waited=$((waited + 5))
     done
     [ "$confirmed" -eq 1 ] \
-        || fail_health "the proxy never durably admitted the resent tx ${TARGET_TX} within ${CONFIRM_TIMEOUT}s — no positive proof the wedge cleared"
+        || fail_soft "the proxy never durably admitted the resent tx ${TARGET_TX} within ${CONFIRM_TIMEOUT}s — no positive proof the wedge cleared"
     [ -z "$TARGET_TX" ] \
         || log "positive exact outcome: proxy durably admitted ${TARGET_TX:0:18}… after ${waited}s"
 fi
 [ "${PROGRESS_MATCHES:-0}" -gt 0 ] \
-    || fail_health "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"
+    || fail_soft "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"
 exit 0
