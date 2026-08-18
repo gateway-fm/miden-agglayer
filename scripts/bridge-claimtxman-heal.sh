@@ -66,9 +66,15 @@ psql_b "DELETE FROM sync.monitored_txs_group" >/dev/null || true
 docker start "$SVC_C" >/dev/null 2>&1 || { log "FATAL: $SVC_C did not start"; exit 1; }
 log "deleted ${deleted:-0} stranded row(s); service restarted"
 
-# Positive outcome: the previously starved L1 syncer must ADVANCE. (The
-# sync.status 'synced' flag is the starved component's own stale self-report —
-# see the cycle-1/2 false PASS — so require cursor movement, not the flag.)
+# Positive outcome, two accepted shapes. sync.status 'synced' is the starved
+# component's own stale self-report (cycle-1/2 false PASS) so it is never
+# consulted; but sync.block records only EVENT-BEARING blocks, so on a quiet
+# stack (e.g. right after a drill — 2026-08-18 08:46 live false-negative) the
+# cursor legitimately does not move. Success is therefore EITHER:
+#   (a) the cursor advanced (the starved-syncer recovery shape), OR
+#   (b) the harmful state is provably absent: every settled L2-observed GER
+#       has its L1 row (join orphans == 0, allowing the 2 newest to lag) AND
+#       no fresh nonce-error sends — the healthy-quiet shape.
 deadline=$(( $(date +%s) + ${HEAL_CONFIRM_TIMEOUT:-180} ))
 while :; do
     cur=$(psql_b "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0" | tr -d '[:space:]')
@@ -76,8 +82,21 @@ while :; do
         log "positive outcome: L1 sync cursor advanced ${l1_cursor_before} -> ${cur}"
         exit 0
     fi
+    orphans=$(psql_b "
+        SELECT count(*) FROM sync.exit_root l2
+        LEFT JOIN sync.exit_root l1
+          ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
+        WHERE l2.network_id=1 AND l1.id IS NULL
+          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)" \
+        | tr -d '[:space:]')
+    fresh_err=$(docker logs --since 60s "$SVC_C" 2>&1 \
+        | grep -cE "nonce too low|nonce too high|nonce mismatch for" || true)
+    if [[ "${orphans:-1}" == "0" && "${fresh_err:-1}" -eq 0 ]]; then
+        log "positive outcome: L1-GER join consistent (0 orphans) and no fresh nonce errors (quiet-stack shape; cursor ${l1_cursor_before} unchanged is event-sparse, not starvation)"
+        exit 0
+    fi
     [[ $(date +%s) -ge $deadline ]] && break
     sleep 5
 done
-log "UNCONFIRMED: L1 sync cursor did not advance within ${HEAL_CONFIRM_TIMEOUT:-180}s (service left RUNNING)"
+log "UNCONFIRMED: neither cursor advance nor a consistent quiet state within ${HEAL_CONFIRM_TIMEOUT:-180}s (service left RUNNING; orphans=${orphans:-?} fresh_nonce_errs=${fresh_err:-?})"
 exit 1
