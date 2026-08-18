@@ -139,17 +139,109 @@ pub(crate) trait ReconcileFetcher: Send + Sync {
 /// underlying tonic client takes `&self`, clones its multiplexed HTTP/2
 /// channel per call and is `Send + Sync`, so a single `Arc` handle is safe to
 /// share across the concurrent window-fetch tasks.
+/// True iff the error chain contains the node's TYPED backpressure signal
+/// (`RpcError::RequestError` with `GrpcError::ResourceExhausted` or
+/// `Unavailable` — the same pair miden-client's own retry layer treats as
+/// retryable). No string matching (maintainer rule / #110).
+fn is_node_backpressure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<miden_client::rpc::RpcError>()
+            .is_some_and(|r| {
+                matches!(
+                    r,
+                    miden_client::rpc::RpcError::RequestError {
+                        error_kind: miden_client::rpc::GrpcError::ResourceExhausted
+                            | miden_client::rpc::GrpcError::Unavailable,
+                        ..
+                    }
+                )
+            })
+    })
+}
+
+/// FINDING #112: a full-store restore of a grown chain (~5k blocks observed)
+/// drives enough back-to-back `sync_notes` windows that the node's gRPC
+/// limiter rejects the burst; miden-client's internal retry (4 x ~100ms) is
+/// far too short against a sustained limiter, and the one-shot restore has no
+/// "next tick" — a transient 429 became a fatal exit + operator rerun. Ride
+/// out TYPED backpressure with real exponential backoff (2s doubling to 60s)
+/// within `budget_secs`; every other error propagates unchanged so the
+/// low-water-mark abort semantics stay exact.
+async fn fetch_window_with_backoff(
+    fetcher: &Arc<dyn ReconcileFetcher>,
+    from: u64,
+    to: u64,
+    budget_secs: u64,
+) -> anyhow::Result<Vec<NoteId>> {
+    let start = Instant::now();
+    let mut delay_secs = 2u64;
+    loop {
+        match fetcher.sync_note_ids(from, to).await {
+            Ok(v) => return Ok(v),
+            Err(e)
+                if is_node_backpressure(&e)
+                    && start.elapsed().as_secs() + delay_secs <= budget_secs =>
+            {
+                tracing::warn!(
+                    from,
+                    to,
+                    delay_secs,
+                    budget_secs,
+                    error = %e,
+                    "node backpressure on reconcile window (typed \
+                     ResourceExhausted/Unavailable) — backing off"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                delay_secs = (delay_secs * 2).min(60);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Reconcile-window fetch tuning. Concurrency default 3: the previous
+/// spawn-every-window behavior multiplied the per-window pagination rate into
+/// exactly the burst that trips the node limiter (#112); bounded concurrency
+/// plus backoff keeps catch-up fast on healthy nodes and polite under
+/// pressure.
+fn reconcile_window_concurrency() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RECONCILE_WINDOW_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n >= 1)
+            .unwrap_or(3)
+    })
+}
+
+fn reconcile_backpressure_budget_secs() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RECONCILE_BACKPRESSURE_BUDGET_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300)
+    })
+}
+
 struct RpcReconcileFetcher(Arc<dyn NodeRpcClient>);
 
 #[async_trait::async_trait]
 impl ReconcileFetcher for RpcReconcileFetcher {
     async fn sync_note_ids(&self, from: u64, to: u64) -> anyhow::Result<Vec<NoteId>> {
         let tags: BTreeSet<NoteTag> = BTreeSet::from([NoteTag::from(0u32)]);
-        let blocks = self
-            .0
-            .sync_notes((from as u32).into(), (to as u32).into(), &tags)
-            .await
-            .map_err(|e| anyhow::anyhow!("sync_notes({from}..{to}): {e}"))?;
+        // anyhow::Context (not a formatted map_err): the typed RpcError must
+        // survive in the source chain — is_node_backpressure() downcasts it
+        // (FINDING #112; stringifying here made typed classification
+        // impossible, the #110 anti-pattern).
+        let blocks = {
+            use anyhow::Context as _;
+            self.0
+                .sync_notes((from as u32).into(), (to as u32).into(), &tags)
+                .await
+                .with_context(|| format!("sync_notes({from}..{to})"))?
+        };
         Ok(blocks
             .iter()
             .flat_map(|b| b.notes.keys().copied())
@@ -601,20 +693,29 @@ impl SyntheticProjector {
             }
             // Caught-up fast path: a single (near-tip) window is fetched inline
             // — identical behavior and cost to the historical per-tick sweep.
+            let backoff_budget = reconcile_backpressure_budget_secs();
             let mut results: Vec<(u64, u64, anyhow::Result<Vec<NoteId>>)> =
                 if let [(from, to)] = windows[..] {
-                    vec![(from, to, fetcher.sync_note_ids(from, to).await)]
+                    vec![(from, to, fetch_window_with_backoff(fetcher, from, to, backoff_budget).await)]
                 } else {
-                    let mut set = tokio::task::JoinSet::new();
-                    for (from, to) in windows {
-                        let fetcher = Arc::clone(fetcher);
-                        set.spawn(async move { (from, to, fetcher.sync_note_ids(from, to).await) });
-                    }
-                    let mut out = Vec::with_capacity(set.len());
-                    while let Some(joined) = set.join_next().await {
-                        out.push(joined.map_err(|e| {
-                            anyhow::anyhow!("reconcile window-fetch task panicked: {e}")
-                        })?);
+                    // Bounded concurrency (#112): chunks of
+                    // RECONCILE_WINDOW_CONCURRENCY instead of every window at
+                    // once — the unbounded fan-out is what tripped the node's
+                    // limiter on grown chains.
+                    let mut out = Vec::with_capacity(windows.len());
+                    for chunk in windows.chunks(reconcile_window_concurrency()) {
+                        let mut set = tokio::task::JoinSet::new();
+                        for &(from, to) in chunk {
+                            let fetcher = Arc::clone(fetcher);
+                            set.spawn(async move {
+                                (from, to, fetch_window_with_backoff(&fetcher, from, to, backoff_budget).await)
+                            });
+                        }
+                        while let Some(joined) = set.join_next().await {
+                            out.push(joined.map_err(|e| {
+                                anyhow::anyhow!("reconcile window-fetch task panicked: {e}")
+                            })?);
+                        }
                     }
                     out
                 };
@@ -1738,6 +1839,86 @@ impl SyncListener for SyntheticProjector {
 
 #[cfg(test)]
 mod tests {
+    // ── FINDING #112: typed node-backpressure classification + backoff ──────
+    // The classifier must fire ONLY on the client's typed
+    // ResourceExhausted/Unavailable request errors (mirroring miden-client's
+    // own is_retryable), never on other errors, and it must survive an anyhow
+    // context wrap (the fetcher uses .with_context — a formatted map_err
+    // would break the downcast, the exact #110 anti-pattern this replaces).
+    #[test]
+    fn node_backpressure_is_typed_and_survives_context() {
+        use anyhow::Context as _;
+        let backpressure = miden_client::rpc::RpcError::RequestError {
+            endpoint: miden_client::rpc::RpcEndpoint::SyncNotes,
+            error_kind: miden_client::rpc::GrpcError::ResourceExhausted,
+            endpoint_error: None,
+            source: None,
+        };
+        let wrapped: anyhow::Error =
+            Err::<(), _>(backpressure).context("sync_notes(1..1000)").unwrap_err();
+        assert!(super::is_node_backpressure(&wrapped));
+
+        let not_backpressure = miden_client::rpc::RpcError::RequestError {
+            endpoint: miden_client::rpc::RpcEndpoint::SyncNotes,
+            error_kind: miden_client::rpc::GrpcError::NotFound,
+            endpoint_error: None,
+            source: None,
+        };
+        let wrapped: anyhow::Error =
+            Err::<(), _>(not_backpressure).context("sync_notes(1..1000)").unwrap_err();
+        assert!(!super::is_node_backpressure(&wrapped));
+
+        // A STRINGIFIED rendering of the same error must NOT classify — this
+        // pins that classification is typed, not textual.
+        let stringified = anyhow::anyhow!(
+            "sync_notes(1..1000): request was rate-limited or the node's resources are exhausted"
+        );
+        assert!(!super::is_node_backpressure(&stringified));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn window_backoff_rides_out_backpressure_then_succeeds() {
+        use std::sync::{Arc, Mutex};
+        struct FlakyFetcher {
+            fails_remaining: Mutex<u32>,
+        }
+        #[async_trait::async_trait]
+        impl super::ReconcileFetcher for FlakyFetcher {
+            async fn sync_note_ids(&self, _f: u64, _t: u64) -> anyhow::Result<Vec<super::NoteId>> {
+                use anyhow::Context as _;
+                let mut left = self.fails_remaining.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err::<(), _>(miden_client::rpc::RpcError::RequestError {
+                        endpoint: miden_client::rpc::RpcEndpoint::SyncNotes,
+                        error_kind: miden_client::rpc::GrpcError::ResourceExhausted,
+                        endpoint_error: None,
+                        source: None,
+                    })
+                    .context("sync_notes(1..1000)")
+                    .map(|()| Vec::new());
+                }
+                Ok(Vec::new())
+            }
+        }
+        let fetcher: Arc<dyn super::ReconcileFetcher> =
+            Arc::new(FlakyFetcher { fails_remaining: Mutex::new(2) });
+        // 2 failures at 2s + 4s backoff fit a 300s budget; the paused clock
+        // auto-advances through the sleeps, so this pins the RETRY behavior
+        // (previously: first typed backpressure error was fatal to the
+        // one-shot restore) without real waiting.
+        let out = super::fetch_window_with_backoff(&fetcher, 1, 1000, 300).await;
+        assert!(out.is_ok(), "backoff must ride out transient backpressure: {out:?}");
+
+        // Budget exhaustion still propagates the typed error (fail-closed).
+        let fetcher: Arc<dyn super::ReconcileFetcher> =
+            Arc::new(FlakyFetcher { fails_remaining: Mutex::new(u32::MAX) });
+        let out = super::fetch_window_with_backoff(&fetcher, 1, 1000, 1).await;
+        assert!(out.is_err(), "an exhausted backoff budget must fail closed");
+        assert!(super::is_node_backpressure(&out.unwrap_err()));
+    }
+
+
     use super::*;
     use crate::accounts_config::{AccountIdBech32, AccountsConfig};
     use crate::claim_watcher::derive_manual_claim_tx_hash;
