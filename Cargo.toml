@@ -167,12 +167,12 @@ futures-util = { version = "0.3", optional = true }
 # miden-assembly/core 0.25.x; keep these in lockstep with the deployed
 # miden-node v0.16.0-alpha.x release and tighten to an exact patch if a root
 # mismatch resurfaces during the e2e regression.
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.16.0-rc.4" }
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.16.0-rc.6" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "=0.16.0-rc.4" }
-miden-standards = { default-features = false, version = "=0.16.0-rc.4" }
-miden-tx = { default-features = false, version = "=0.16.0-rc.4" }
+], version = "=0.16.0-rc.6" }
+miden-standards = { default-features = false, version = "=0.16.0-rc.6" }
+miden-tx = { default-features = false, version = "=0.16.0-rc.6" }
 
 miden-assembly = { default-features = false, version = "0.29" }
 miden-core = { default-features = false, version = "0.29" }
@@ -205,16 +205,12 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 # network_id)`), so no MASM patch is needed and the vendor crate was removed.
 # The deployment's network id is now passed explicitly at genesis/init time.
 
-# TEMPORARY vendor patch — 0.16.0-rc.4 demoted `AggLayerBridge::read_let_num_leaves`
-# and `AggLayerBridge::is_ger_registered` to a testing-only impl, but the proxy
-# uses both in production (the LET cardinality gate and the applied-GER check).
-# The vendored copy is byte-identical to the crates.io release except those two
-# functions (plus the private assert helpers they call) moved out of the
-# `#[cfg(feature = "testing")]` block. The Miden team has been asked to restore
-# them as public API — remove this patch AND vendor/ when a release ships them.
-# CI carries an `upstream-api-gate` job that stays RED while this patch exists.
+# RESOLVED (rc.6, verified 2026-08-18): upstream restored
+# `AggLayerBridge::read_let_num_leaves` + `is_ger_registered` as public API in
+# the ungated impl — the vendored miden-agglayer patch is gone. The
+# `upstream-api-gate` CI job stays RED while the miden-client vendor below
+# remains.
 [patch.crates-io]
-miden-agglayer = { path = "vendor/miden-agglayer-0.16.0-rc.4" }
 # TEMPORARY vendor patch — miden-client rc.1's foreign-account fetch uses a
 # `VaultFetch::IfChangedFrom(local_root)` delta optimization, but the
 # reconstruction path (`account_proof_into_inputs`) rebuilds the vault from
