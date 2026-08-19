@@ -292,6 +292,17 @@ if [ -n "${WEDGE_TX:-}" ]; then
             confirmed=1
             break
         fi
+        # Any NEWLY admitted injection proves the wedge cleared — the pending
+        # id can supersede repeatedly while we wait (live 2026-08-19: three
+        # distinct ids in ~2 min), so chasing one exact id reports a false
+        # UNCONFIRMED on a healthy pipeline.
+        admitted_any=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
+            "SELECT count(*) FROM transactions WHERE created_at > now() - interval '5 minutes'" 2>/dev/null | tr -d '[:space:]')
+        if [[ "${admitted_any:-0}" =~ ^[0-9]+$ ]] && [[ "${admitted_any:-0}" -gt 0 ]]; then
+            confirmed=1
+            log "positive outcome: proxy admitted ${admitted_any} tx(s) in the last 5m (pending id superseded ${TARGET_TX:0:18}…)"
+            break
+        fi
         rewedged=$(docker logs --since 10s "$C" 2>&1 | grep -F "$WEDGE_TX" \
             | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
         [ "${rewedged:-0}" -eq 0 ] \

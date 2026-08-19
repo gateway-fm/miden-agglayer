@@ -436,7 +436,12 @@ if [[ "$RESTORE_EXIT" -ne 0 ]]; then
     echo "        incomplete history). Fix the cause shown above, then re-run the one-shot:" >&2
     echo "          docker compose <files> run --rm --no-deps miden-agglayer <live-cmd> \\" >&2
     echo "              --reset-miden-store --restore" >&2
-    echo "        (idempotent; safe to repeat). Start the proxy ONLY after it exits 0." >&2
+    echo "        (idempotent; safe to repeat). Start the proxy ONLY after it exits 0.
+        THEN re-base every tx-holder that survived the restore, or the pipeline
+        stays frozen even though the proxy is healthy (#90 proxy ledger is done
+        by the restore itself; the other two are NOT):
+          scripts/bridge-claimtxman-heal.sh          # bridge-service claimtxman (#111)
+          scripts/aggkit-preserve-heal.sh aggkit     # aggoracle ethtxmanager (#113)" >&2
     fail "reset+restore one-shot exited $RESTORE_EXIT (proxy left stopped; repair + re-run --restore)"
 fi
 [[ "$RESTORE_EXIT" -eq 0 ]] || { tail -15 "$RESTORE_LOG" | tee -a "$EVIDENCE"; fail "restore one-shot failed"; }
@@ -535,6 +540,22 @@ if [[ -x "$SCRIPT_DIR/bridge-claimtxman-heal.sh" ]]; then
     PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 L1_RPC="$L1_RPC" \
         "$SCRIPT_DIR/bridge-claimtxman-heal.sh" 2>&1 | tee -a "$EVIDENCE" \
         || say "WARN: claimtxman heal unconfirmed — L2->L2 back-claims may stay blocked (#111)"
+fi
+
+# FINDING #113 (drill-caught 2026-08-19, RELEASE-REQUIRED): the restore heals
+# the proxy nonce ledger (#90) and the bridge-service claimtxman (#111) — but
+# NOT aggkit's aggoracle ethtxmanager. Any GER-inject tx in flight when the
+# store is dropped is lost in transit: aggkit's monitoring DB still holds it,
+# its deterministic-ID dedup refuses to re-send, and GER INJECTION FREEZES
+# PERMANENTLY (observed: proxy received ZERO txs for 5+ min, aggoracle looping
+# "already exists in monitoring DB" on a tx the proxy had never seen; Phase 4
+# then fails with "no NEW GER injected+consumed"). Healed live by wiping ONLY
+# ethtxmanager-aggoracle.sqlite, after which injections resumed immediately.
+# Every tx-holder that survives a restore must be re-based — this is the third.
+if [[ -x "$SCRIPT_DIR/aggkit-preserve-heal.sh" ]]; then
+    PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 \
+        "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit 2>&1 | tee -a "$EVIDENCE" \
+        || say "WARN: aggkit aggoracle heal unconfirmed — GER injection may stay frozen (#113)"
 fi
 sleep 45   # window for aggoracle to (wrongly) re-inject + ntx to (wrongly) assert
 NTX_NOW=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
