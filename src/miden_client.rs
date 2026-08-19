@@ -1052,7 +1052,26 @@ pub async fn wait_for_transaction_commit(
         // Retry sync on connection errors (up to 3 retries per poll attempt)
         let mut sync_ok = false;
         for retry in 0..3u32 {
-            match client.sync_state().await {
+            // FINDING #106: this full `sync_state` is the growth term behind
+            // claim latency at depth. Measured indirectly (writer-job duration
+            // 57.6s -> 13.5s for the SAME job kind when a restore shrank the
+            // client store 71 MB -> 29 MB), but never timed directly — so time
+            // it. Operators watching a long-lived deployment need this number:
+            // it is what turns a nominally-20s commit wait into 40s+ and, via
+            // the serialized claim queue, caps end-to-end delivery throughput.
+            let sync_started = std::time::Instant::now();
+            let sync_result = client.sync_state().await;
+            let sync_elapsed = sync_started.elapsed();
+            ::metrics::histogram!("miden_sync_state_duration_seconds")
+                .record(sync_elapsed.as_secs_f64());
+            if sync_elapsed >= std::time::Duration::from_secs(2) {
+                tracing::warn!(
+                    sync_secs = sync_elapsed.as_secs_f64(),
+                    "miden-client sync_state is slow — commit waits and claim \
+                     throughput scale with this (client store growth, #106)"
+                );
+            }
+            match sync_result {
                 Ok(_) => {
                     sync_ok = true;
                     break;

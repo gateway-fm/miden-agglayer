@@ -218,6 +218,17 @@ pub fn init_metrics() {
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
     describe_histogram!("rpc_request_duration_seconds", "JSON-RPC request duration");
+    describe_histogram!(
+        "miden_sync_state_duration_seconds",
+        "#106 — duration of a single miden-client sync_state() call on the \
+         commit-wait hot path. This is the growth term behind claim latency: \
+         the client store accumulates with history, each sync gets more \
+         expensive, every publish waits on several of them, and because claims \
+         are nonce-serialized the per-claim cost becomes the delivery-throughput \
+         ceiling. Measured 13.5s vs 57.6s writer-job time for the same job kind \
+         at 29 MB vs 71 MB of client store. A steady climb here predicts the \
+         'deposits stop being claimed fast enough' symptom before users see it."
+    );
     describe_counter!(
         "miden_client_build_errors_total",
         "Failed attempts to build Miden client connection"
