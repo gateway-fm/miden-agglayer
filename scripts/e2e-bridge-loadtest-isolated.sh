@@ -90,7 +90,16 @@ APPROVE_HUGE="115792089237316195423570985008687907853269984665640564039457584007
 
 # Settle polling.
 SETTLE_STALL="${SETTLE_STALL:-300}"   # stop polling after this many s with no new claims
-SETTLE_CAP="${SETTLE_CAP:-1800}"      # absolute backstop (30 min)
+# Absolute backstop ONLY — the real "settled" signal is SETTLE_STALL (no new
+# claims for N seconds, timer reset by every claim). Raised 1800 -> 7200
+# (2026-08-19): on a deep chain (40k blocks) claims kept LANDING steadily but
+# the 30-min cap cut the poll short and the run was scored 60% delivered —
+# while every one of those deposits was in fact claimed shortly after (live
+# end-state check: 340/340 Miden-destined deposits claimed, 0 outstanding).
+# A cap hit is now a genuine pathology (2h of trickle), not a slow-but-healthy
+# pipeline; the loop reports WHICH terminator fired so the distinction is
+# never silent again.
+SETTLE_CAP="${SETTLE_CAP:-7200}"      # absolute backstop (2 h)
 SETTLE_INTERVAL="${SETTLE_INTERVAL:-10}"
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
@@ -571,7 +580,7 @@ total_claimed_delta() {
 }
 
 r "Settle: polling bridge-service until claims stall (${SETTLE_STALL}s) or cap ${SETTLE_CAP}s..."
-last=-1; stalled=0; elapsed=0
+last=-1; stalled=0; elapsed=0; SETTLE_END_REASON=stall
 while :; do
     cur=$(total_claimed_delta)
     if [[ "$cur" != "$last" ]]; then
@@ -580,8 +589,16 @@ while :; do
     else
         stalled=$((stalled + SETTLE_INTERVAL))
     fi
-    [[ $stalled -ge $SETTLE_STALL ]] && { r "  settle: no new claims for ${SETTLE_STALL}s — done"; break; }
-    [[ $elapsed -ge $SETTLE_CAP ]]   && { r "  settle: hit ${SETTLE_CAP}s cap — done"; break; }
+    [[ $stalled -ge $SETTLE_STALL ]] && { SETTLE_END_REASON=stall; r "  settle: no new claims for ${SETTLE_STALL}s — done"; break; }
+    if [[ $elapsed -ge $SETTLE_CAP ]]; then
+        SETTLE_END_REASON=cap
+        r "  settle: hit ${SETTLE_CAP}s cap — STOPPING WHILE CLAIMS MAY STILL BE LANDING"
+        r "  WARN: last progress was ${stalled}s ago (< ${SETTLE_STALL}s stall window), so the"
+        r "        delivery numbers below UNDERSTATE what the pipeline eventually delivers."
+        r "        Treat this as a claim-LATENCY finding, not a delivery failure: re-check the"
+        r "        bridge-service for these deposits before concluding anything was lost."
+        break
+    fi
     sleep "$SETTLE_INTERVAL"; elapsed=$((elapsed + SETTLE_INTERVAL))
 done
 
@@ -693,6 +710,16 @@ if [[ "${STRICT_OPS:-0}" == "1" ]]; then
     else
         OPS_RC=1
         r "strict-ops verdict: FAIL — sub L1=$TOT_SUB_L1/$PLAN_L1 L2=$TOT_SUB_L2/$PLAN_L2 fail=$TOT_FAIL_L1/$TOT_FAIL_L2 claimed=$G_CLM/$G_SUB (incomplete L1 workload)"
+        # Name the CAUSE, not just the shortfall: a cap-terminated settle means
+        # the pipeline was still delivering when we stopped looking (claim
+        # LATENCY), which is a different finding from claims that never land.
+        if [[ "${SETTLE_END_REASON:-stall}" == "cap" ]]; then
+            r "  CAUSE: settle stopped at the ${SETTLE_CAP}s backstop while claims were still landing —"
+            r "         this is claim LATENCY at depth (#106), NOT lost deliveries. Re-check the"
+            r "         bridge-service end-state before treating any deposit as undelivered."
+        else
+            r "  CAUSE: claims STALLED for ${SETTLE_STALL}s with $((G_SUB - G_CLM)) still undelivered — a real delivery stop, not latency."
+        fi
     fi
 fi
 exit $(( LOCK_COUNT > 0 ? 1 : (VERIFY_RC != 0 ? VERIFY_RC : OPS_RC) ))
