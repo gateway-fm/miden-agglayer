@@ -261,6 +261,21 @@ services:
     # second build (the Rust auto-claimer ships in the same image).
     image: miden-agglayer-e2e:latest
     restart: on-failure
+    # FINDING #114: Docker's default nofile soft limit is 1024, which this
+    # proxy exhausts after ~18h of continuous operation — it holds a postgres
+    # pool, a node gRPC channel, an L1 HTTP provider, the signer connection,
+    # AND the inbound keep-alives of every component that polls it every 1-2s
+    # (aggoracle, claimtxman, autoclaim, harness). On exhaustion axum logs
+    # "accept error: Too many open files", /metrics stops responding, and the
+    # L1 evidence indexer can no longer open outbound connections — while the
+    # container still reports State.Status=running, so a naive liveness check
+    # misses it entirely. Observed live: 1014 of 1024 FDs were sockets, 1138
+    # ESTABLISHED. Production deployments need the same floor; this is a
+    # mitigation, not the fix (inbound connections should also be reaped).
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
       - "127.0.0.1:8546:8546"
     env_file:
