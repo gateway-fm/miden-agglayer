@@ -153,6 +153,58 @@ impl L1InfoTreeIndexer {
     /// Errors during polling are logged and the loop continues; we never want a
     /// transient L1 RPC blip to take down the whole service. Permanent failure
     /// (e.g. malformed contract address) returns Err synchronously.
+    /// Bring the L1 evidence index up to the current head SYNCHRONOUSLY,
+    /// then return the block it reached.
+    ///
+    /// FINDING #113: a full-DB-loss restore drops the store that holds this
+    /// index, so after `--restore` the proxy previously started with NO L1
+    /// evidence and rebuilt it lazily in the background ticker. During that
+    /// catch-up window the proxy is serving but not READY: the audit-H6 guard
+    /// correctly refuses to inject any GER it has not yet observed on L1, and
+    /// aggkit's ethtxmanager turns that transient refusal into a PERMANENT
+    /// stop (its deterministic-ID dedup never re-sends). Measured live: the
+    /// refusal fired at 23:07:18 and this index caught up at 23:07:21 — three
+    /// seconds too late, and GER injection stayed frozen until manual
+    /// intervention.
+    ///
+    /// Running the catch-up as part of the restore closes that window: when
+    /// the one-shot exits 0, the evidence needed to accept injections is
+    /// already present, so the operator's next step (start the proxy) yields
+    /// a proxy that is correct immediately rather than eventually.
+    pub async fn catch_up_to_head(&self) -> anyhow::Result<u64> {
+        let provider = ProviderBuilder::new().connect_http(
+            self.rpc_url
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid L1 RPC URL '{}': {}", self.rpc_url, e))?,
+        );
+        let head = self.scan_head(&provider).await?;
+        let stored = self.store.get_l1_evidence_cursor().await.unwrap_or(0);
+        let mut last_processed = self.initial_cursor(stored, head);
+        tracing::info!(
+            start_block = last_processed,
+            stored_cursor = stored,
+            l1_head = head,
+            evidence_tag = %self.evidence_tag.describe(),
+            "L1InfoTreeIndexer: synchronous catch-up starting (restore readiness, #113)"
+        );
+        // Re-read the head each pass: a long backfill can lag a live chain,
+        // and "ready" must mean caught up to a head observed AFTER the last
+        // batch, not the head we saw when we started.
+        loop {
+            let head = self.scan_head(&provider).await?;
+            if last_processed >= head {
+                tracing::info!(
+                    last_processed,
+                    l1_head = head,
+                    "L1InfoTreeIndexer: synchronous catch-up complete — L1 evidence is current"
+                );
+                return Ok(last_processed);
+            }
+            self.poll_to_head(&provider, &mut last_processed, head)
+                .await?;
+        }
+    }
+
     pub fn spawn(self) -> anyhow::Result<oneshot::Sender<()>> {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 

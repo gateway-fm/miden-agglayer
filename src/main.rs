@@ -1095,6 +1095,66 @@ async fn main() -> anyhow::Result<()> {
             result.logs_created,
         );
 
+        // FINDING #113 — READINESS, not just data. The store we just rebuilt
+        // also holds the L1 evidence index that audit-H6 consults before
+        // accepting a GER injection. Leaving it empty meant the operator's
+        // next step (start the proxy) produced a process that SERVES while
+        // still blind to L1: H6 correctly refused every injection until the
+        // background indexer caught up, and aggkit's ethtxmanager turned that
+        // transient refusal into a permanent GER-injection freeze via its
+        // deterministic-ID dedup (measured: refusal at 23:07:18, evidence
+        // arrived 23:07:21 — three seconds too late, frozen until a manual
+        // heal). Catch up synchronously HERE so `--restore` exits only when
+        // the proxy would be correct immediately on boot.
+        //
+        // Non-fatal by design: the restore itself succeeded and its data is
+        // durable. A catch-up failure (unreachable L1, bad address) must not
+        // discard that work — it degrades to the old lazy behaviour and says
+        // so loudly, which is strictly better than failing a completed
+        // restore.
+        if let (Some(l1_rpc_url), Some(ger_addr_str)) =
+            (command.l1_rpc_url.clone(), command.ger_l1_address.clone())
+        {
+            match ger_addr_str.parse::<alloy::primitives::Address>() {
+                Ok(ger_addr) => {
+                    let mut indexer =
+                        miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
+                            l1_rpc_url,
+                            ger_addr,
+                            store.clone(),
+                        )
+                        .with_evidence_tag(l1_evidence_tag);
+                    if let Some(from_block) = command.l1_indexer_from_block {
+                        indexer = indexer.with_from_block_override(from_block);
+                    }
+                    match indexer.catch_up_to_head().await {
+                        Ok(block) => tracing::info!(
+                            l1_evidence_block = block,
+                            "restore: L1 evidence index caught up — GER injections will be \
+                             accepted immediately on the next boot (#113)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "restore: L1 evidence catch-up FAILED — the restore data is intact, \
+                             but the proxy will start blind to L1 and audit-H6 will refuse GER \
+                             injections until the background indexer catches up. Expect an \
+                             aggkit GER-injection freeze (#113); heal with \
+                             scripts/aggkit-preserve-heal.sh once the scan is current."
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    address = %ger_addr_str,
+                    "restore: unparsable GER L1 address — skipping L1 evidence catch-up (#113)"
+                ),
+            }
+        } else {
+            tracing::info!(
+                "restore: no L1 RPC / GER address configured — skipping L1 evidence catch-up"
+            );
+        }
+
         client.shutdown()?;
         return Ok(());
     }
