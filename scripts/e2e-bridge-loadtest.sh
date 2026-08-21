@@ -637,6 +637,12 @@ VERDICT_RC=0
 if [[ "${G_SUB:-0}" -eq 0 ]]; then
     r "VERDICT: FAIL — zero bridges were submitted; every completeness statement above is vacuous"
     VERDICT_RC=1
+elif [[ "${G_FAIL:-0}" -gt 0 && "${LOADTEST_ALLOW_UNDELIVERED:-0}" != "1" ]]; then
+    # Claimed==submitted says nothing about operations that never got as far as
+    # being submitted. A 250-op run with 249 submission failures and one
+    # successful op satisfies claimed==submitted perfectly — and is a disaster.
+    r "VERDICT: FAIL — $G_FAIL operation(s) FAILED before/at submission (only $G_SUB reached the bridge)"
+    VERDICT_RC=1
 elif [[ "${G_CLM:-0}" -lt "${G_SUB:-0}" ]]; then
     if [[ "${LOADTEST_ALLOW_UNDELIVERED:-0}" == "1" ]]; then
         r "VERDICT: undelivered bridges present ($G_CLM/$G_SUB claimed) but LOADTEST_ALLOW_UNDELIVERED=1 — reporting success as instructed"
@@ -645,6 +651,6 @@ elif [[ "${G_CLM:-0}" -lt "${G_SUB:-0}" ]]; then
         VERDICT_RC=1
     fi
 else
-    r "VERDICT: PASS — all $G_SUB submitted bridge(s) were claimed"
+    r "VERDICT: PASS — all $G_SUB submitted bridge(s) were claimed, ${G_FAIL:-0} operational failure(s)"
 fi
 exit "$VERDICT_RC"

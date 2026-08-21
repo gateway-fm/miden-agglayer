@@ -578,11 +578,21 @@ fi
 # injection for the heal to await, and this drill proves the injection pipeline
 # itself a few lines below (the NINJECTED1 -> INJ2 gate). The heal must still
 # fail on every NEGATIVE signal — crash loop, re-wedge, restore mismatch.
-if ! PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 HEAL_ALLOW_DEFERRED_PROOF=1 \
-        "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >>"$EVIDENCE" 2>&1; then
-    tail -20 "$EVIDENCE" || true
-    fail "aggkit aggoracle heal FAILED (#113) — GER injection would stay frozen"
-fi
+PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 HEAL_ALLOW_DEFERRED_PROOF=1 \
+    "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >>"$EVIDENCE" 2>&1
+HEAL_RC=$?
+# rc 3 = "restored and running, but the healer observed no injection to prove
+# the pipeline with". That is the expected outcome on a quiet stack and is why
+# this drill passes HEAL_ALLOW_DEFERRED_PROOF=1 — the NINJECTED1 -> INJ2 gate
+# below is the proof. Any OTHER non-zero rc is a real heal failure.
+case "$HEAL_RC" in
+    0) say "aggkit aggoracle heal confirmed an injection" ;;
+    3) say "aggkit aggoracle heal restored the service but observed no injection — this drill proves the pipeline itself below" ;;
+    *)
+        tail -20 "$EVIDENCE" || true
+        fail "aggkit aggoracle heal FAILED (#113, rc=$HEAL_RC) — GER injection would stay frozen"
+        ;;
+esac
 sleep 45   # window for aggoracle to (wrongly) re-inject + ntx to (wrongly) assert
 NTX_NOW=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
 [[ "$NTX_NOW" -le "$NTX_MARK" ]] \

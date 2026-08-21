@@ -70,6 +70,14 @@ nok "l1: target shortfall L2->L1 (sub < plan) fails"       l1_ops_ok 15 15 12 15
 nok "l1: explicit submission failure fails"                l1_ops_ok 15 15 15 15 1 0 30 30
 nok "l1: submitted-but-unclaimed work fails"               l1_ops_ok 15 15 15 15 0 0 28 30
 nok "l1: empty/unset counters fail closed"                 l1_ops_ok "" "" "" "" "" "" "" ""
+# NUMERIC zero is a different shape from the empty string, and it is the one a
+# real all-failed run produces: every equality in the predicate holds trivially
+# when nothing was planned, submitted, failed or claimed, so this returned OK
+# and a run that did NO WORK certified itself. The empty-string case above
+# fails closed for an unrelated reason and never covered this.
+nok "l1: all-zero (no work planned or done) fails closed"  l1_ops_ok 0 0 0 0 0 0 0 0
+nok "l1: plan present but nothing submitted fails closed"  l1_ops_ok 0 15 0 15 0 0 0 0
+ok  "l1: single-direction plan (L2 legs disabled) passes"  l1_ops_ok 15 15 0 0 0 0 15 15
 
 echo "──────────────────────────────────────────────"
 if [[ "$FAILS" == "0" ]]; then

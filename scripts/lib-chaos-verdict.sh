@@ -66,6 +66,14 @@ chaos_verdict() {
 l1_ops_ok() {
     local sub_l1="$1" plan_l1="$2" sub_l2="$3" plan_l2="$4" \
           fail_l1="$5" fail_l2="$6" g_clm="$7" g_sub="$8"
+    # AN ALL-ZERO RUN IS NOT A PASS. Every equality below holds trivially when
+    # nothing was planned, submitted, failed or claimed, so `l1_ops_ok 0 0 0 0
+    # 0 0 0 0` returned success — a run that did NO WORK certified itself, and
+    # every completeness check downstream is vacuous over its empty feed. The
+    # existing tests covered empty STRINGS, which fail closed for a different
+    # reason, and so never caught the numeric-zero shape.
+    [[ "${plan_l1:-0}" -gt 0 || "${plan_l2:-0}" -gt 0 ]] || return 1
+    [[ "${g_sub:-0}" -gt 0 ]] || return 1
     [[ "${sub_l1:-0}" == "${plan_l1:--1}" ]] || return 1
     [[ "${sub_l2:-0}" == "${plan_l2:--1}" ]] || return 1
     [[ "${fail_l1:-1}" == "0" && "${fail_l2:-1}" == "0" ]] || return 1

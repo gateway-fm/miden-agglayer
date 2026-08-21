@@ -97,8 +97,14 @@ psql_die() {
 # "txnonce"), plus the "nonce mismatch for" line its sender emits; they are the
 # strings that component both produces and reacts to. If it ever grows a
 # structured signal, switch to it.
+# Prints the count, or FAILS (non-zero) if the log could not be read at all.
+# `docker logs | grep -c || true` turned an unreadable log into the string "0",
+# which the quiet-state check reads as "no nonce errors" — a dead container and
+# a healthy one produce the identical answer.
 nonce_error_lines() {
-    docker logs --since "${1}s" "$SVC_C" 2>&1 \
+    local out
+    out=$(docker logs --since "${1}s" "$SVC_C" 2>&1) || return 1
+    printf '%s' "$out" \
         | grep -cE "nonce too low|nonce too high|invalid nonce|txnonce|nonce mismatch for" \
         || true
 }
@@ -130,7 +136,10 @@ flock -n 9 || { log "another claimtxman heal is already running for project $PRO
 psql_die stranded "SELECT count(*) FROM sync.monitored_txs WHERE status='created'"
 if [[ "$FORCE" != "1" ]]; then
     # Wedge signature: stranded created rows AND fresh nonce-mismatch sends.
-    mismatches=$(nonce_error_lines 120)
+    if ! mismatches=$(nonce_error_lines 120); then
+        log "FATAL: cannot read $SVC_C logs for the wedge precheck"
+        exit 1
+    fi
     if [[ "${stranded:-0}" -eq 0 || "${mismatches:-0}" -eq 0 ]]; then
         log "no stranded-nonce wedge (created=${stranded:-0} fresh_mismatches=${mismatches:-0}) — nothing to heal"
         exit 0
@@ -183,27 +192,37 @@ log "cleared ${stranded:-0} stranded created tx(s); both monitored-tx tables ver
 #       no fresh nonce-error sends — the healthy-quiet shape.
 deadline=$(( $(date +%s) + ${HEAL_CONFIRM_TIMEOUT:-180} ))
 while :; do
+    # Liveness FIRST, for BOTH success shapes. A cursor that advanced while the
+    # container has since exited is not a healed service, and this branch used
+    # to exit 0 without ever looking.
+    svc_state=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}}' "$SVC_C" 2>/dev/null || echo "gone")
+    if [[ "$svc_state" != "running false" ]]; then
+        log "FATAL: $SVC_C is not stably running after the heal (state: $svc_state)"
+        exit 1
+    fi
     psql_die cur "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0"
     if [[ "${cur:-0}" -gt "${l1_cursor_before:-0}" ]]; then
-        log "positive outcome: L1 sync cursor advanced ${l1_cursor_before} -> ${cur}"
+        log "positive outcome: L1 sync cursor advanced ${l1_cursor_before} -> ${cur} (service stably running)"
         exit 0
     fi
+    # Population guard: the query excludes the newest 2 network-1 rows as
+    # "still settling", so with <= 2 rows EVERY row is excluded and the count
+    # is 0 no matter how broken things are. Below that size there is no verdict
+    # to give, so the quiet-state shape must not be claimed.
+    psql_die n_l2_rows "SELECT count(*) FROM sync.exit_root WHERE network_id=1"
     psql_die orphans "
         SELECT count(*) FROM sync.exit_root l2
         LEFT JOIN sync.exit_root l1
           ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
         WHERE l2.network_id=1 AND l1.id IS NULL
           AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)"
-    fresh_err=$(nonce_error_lines 60)
-    # "No fresh nonce errors" is also what a container that EXITED produces, so
-    # the quiet-state shape must first establish that the service is actually
-    # running — otherwise a heal that killed bridge-service reports success.
-    svc_state=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}}' "$SVC_C" 2>/dev/null || echo "gone")
-    if [[ "$svc_state" != "running false" ]]; then
-        log "FATAL: $SVC_C is not stably running after the heal (state: $svc_state)"
+    if ! fresh_err=$(nonce_error_lines 60); then
+        log "FATAL: cannot read $SVC_C logs to check for nonce errors — refusing to infer a quiet, healthy state from an unreadable log"
         exit 1
     fi
-    if [[ "$orphans" -eq 0 && "$fresh_err" -eq 0 ]]; then
+    if [[ "$n_l2_rows" -le 2 ]]; then
+        log "quiet-state shape unavailable: only $n_l2_rows network-1 exit_root row(s), all inside the settling grace — cannot conclude consistency from this"
+    elif [[ "$orphans" -eq 0 && "$fresh_err" -eq 0 ]]; then
         log "positive outcome: L1-GER join consistent (0 orphans) and no fresh nonce errors (quiet-stack shape; cursor ${l1_cursor_before} unchanged is event-sparse, not starvation)"
         exit 0
     fi

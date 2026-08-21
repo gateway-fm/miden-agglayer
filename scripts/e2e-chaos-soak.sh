@@ -215,6 +215,11 @@ say "=== stopping injectors + restoring all faults ==="
 kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
 kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
 kill "$WATCHDOG_PID" 2>/dev/null || true; wait "$WATCHDOG_PID" 2>/dev/null || true
+# CLEAR the PID variables now that these children are reaped. The EXIT trap
+# runs on the SUCCESS path too, and a reaped PID can already have been reused
+# by an unrelated process on this shared host — signalling it would be someone
+# else's outage caused by our cleanup.
+SEEDER_PID=""; GARBO_PID=""; WATCHDOG_PID=""
 WATCHDOG_HEALS=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); WATCHDOG_HEALS=${WATCHDOG_HEALS:-0}
 # belt-and-suspenders restore in case a trap raced (correct container names)
 docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
@@ -267,7 +272,12 @@ for svc in miden-agglayer aggkit bridge-service miden-node ntx-builder; do
         POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
     fi
 done
-for svc in aggkit-l2b bridge-service-l2b; do
+# EVERY service l2l2_ensure_stack can bring back must be in this snapshot,
+# not just the ones checked in the final verdict: anything it repairs while
+# unobserved is a fault the storm caused and the harness silently undid.
+# (lib-l2l2.sh brings up anvil-l2b, aggkit-l2b, agglayer, bridge-service,
+# postgres-l2b and bridge-service-l2b.)
+for svc in aggkit-l2b bridge-service-l2b anvil-l2b postgres-l2b agglayer; do
     if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
         st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null)
         [[ "$st" == "running" ]] || POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"

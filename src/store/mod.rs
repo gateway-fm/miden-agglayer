@@ -452,7 +452,15 @@ pub trait Store: Send + Sync + 'static {
     /// because the policy that produced it cannot be inferred safely. A
     /// persistent implementation may bootstrap `latest` from its legacy latest
     /// cursor; safe/finalized must never inherit that cursor.
-    async fn bind_l1_evidence_policy(&self, _policy: &str) -> anyhow::Result<()> {
+    /// `strict` = strict-H6 corroboration is enabled. It matters because the
+    /// `latest` binding INHERITS the legacy pre-policy scan cursor: convenient
+    /// on a lenient upgrade (no events skipped over the restart), but under
+    /// strict H6 it hands the database a non-zero evidence cursor for rows that
+    /// were never verified under the new policy — which then satisfies the
+    /// fresh-database backfill invariant and skips the backfill those rows
+    /// need. Under strict the cursor must stay 0 so the operator is forced to
+    /// choose an explicit `--l1-indexer-from-block`.
+    async fn bind_l1_evidence_policy(&self, _policy: &str, _strict: bool) -> anyhow::Result<()> {
         anyhow::bail!("store does not support persistent L1 evidence-policy binding")
     }
 
@@ -519,8 +527,12 @@ pub trait Store: Send + Sync + 'static {
     /// rows say "observed on L1" without saying WHICH L1, so the same database
     /// pointed at a different chain, a re-genesised devnet, or a redeployed GER
     /// manager would keep accepting historic rows as corroboration for roots
-    /// that never existed there. Returns `(chain_id, ger_address, evidence_tag)`.
-    async fn get_l1_evidence_source(&self) -> anyhow::Result<Option<(u64, String, String)>> {
+    /// that never existed there.
+    ///
+    /// Returns `(chain_id, genesis_hash, ger_address, evidence_tag)`.
+    async fn get_l1_evidence_source(
+        &self,
+    ) -> anyhow::Result<Option<(u64, String, String, String)>> {
         Ok(None)
     }
 
@@ -529,6 +541,7 @@ pub trait Store: Send + Sync + 'static {
     async fn set_l1_evidence_source(
         &self,
         _chain_id: u64,
+        _genesis_hash: &str,
         _ger_address: &str,
         _evidence_tag: &str,
     ) -> anyhow::Result<()> {

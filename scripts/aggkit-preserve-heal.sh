@@ -243,6 +243,18 @@ BASE_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 0
 # failed"). The container was already created with the correct config by the
 # recreate above, so a plain start needs no dependency graph — and this heal's
 # job is to restore THIS service, not to require a healthy stack.
+# Baseline for the POSITIVE proof below, captured BEFORE the service starts.
+# Taking it after the restart (as it was) lets a legitimate injection that
+# lands in the first moments be swallowed INTO the baseline, after which the
+# healer reports "no new injections" on a stack that healed perfectly.
+# `is_injected` rows are written exclusively by the GER injection path, so —
+# unlike a bare transactions count — concurrent bridge/claim load cannot
+# manufacture this signal.
+PRE_INJECTED=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
+    "SELECT count(*) FROM ger_entries WHERE is_injected" 2>/dev/null | tr -d '[:space:]')
+[[ "${PRE_INJECTED:-}" =~ ^[0-9]+$ ]] || PRE_INJECTED=""
+log "pre-start injected-GER baseline: ${PRE_INJECTED:-<unreadable>}"
+
 docker start "$C" >/dev/null 2>&1 \
     || {
         KEEP_STAGE=1
@@ -257,15 +269,6 @@ docker start "$C" >/dev/null 2>&1 \
 # (fatal/panic markers). On any failed validation the recreated service is
 # STOPPED — a diverging instance must not keep serving.
 HEAL_T0=$(date +%s)
-# Baselines for the POSITIVE proof below, captured BEFORE the service comes
-# back: "an injection landed after the heal" is only meaningful against a
-# before-count. `is_injected` GER rows are written exclusively by the GER
-# injection path, so — unlike a bare transactions count — bridge/claim load
-# running concurrently cannot manufacture this signal.
-HEAL_SINCE_SQL="now() - interval '$(( $(date +%s) - HEAL_T0 + 30 )) seconds'"
-PRE_INJECTED=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
-    "SELECT count(*) FROM ger_entries WHERE is_injected" 2>/dev/null | tr -d '[:space:]')
-[[ "${PRE_INJECTED:-}" =~ ^[0-9]+$ ]] || PRE_INJECTED=""
 sleep 25
 STATE=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}}' "$C" 2>/dev/null || echo "gone")
 NOW_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 999)
@@ -368,6 +371,7 @@ if true; then
     if [ -z "$PRE_INJECTED" ]; then
         if [ "${HEAL_ALLOW_DEFERRED_PROOF:-0}" = "1" ]; then
             log "WARNING: injection baseline unreadable and HEAL_ALLOW_DEFERRED_PROOF=1 — ending UNPROVEN; the caller must prove the pipeline itself"
+            PROOF_DEFERRED=1
         else
             fail_soft "could not read the ger_entries injection baseline — refusing to report a heal as confirmed on unreadable state"
         fi
@@ -413,6 +417,7 @@ if true; then
             # Quiet stack with nothing to inject: the caller has said it will
             # prove liveness itself (the drill's own post-heal GER leg).
             log "no injection observed within ${CONFIRM_TIMEOUT}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
+            PROOF_DEFERRED=1
         else
             fail_soft "no GER injection was admitted within ${CONFIRM_TIMEOUT}s (target ${TARGET_TX:-<none pending>}, injected count still ${PRE_INJECTED:-?}) — no positive proof the injection pipeline recovered"
         fi
@@ -429,5 +434,13 @@ fi
 # cursors) in /tmp forever: unbounded disk growth and sensitive state kept
 # around with no owner.
 KEEP_STAGE=0
+if [ "${PROOF_DEFERRED:-0}" = "1" ]; then
+    # The negative gates all passed and the state was restored, but NOTHING
+    # proved the injection pipeline actually resumed — the caller asked to
+    # prove that itself. Say so, and exit with a DISTINCT code so a future
+    # caller cannot read this as a confirmed heal by checking `rc == 0`.
+    log "preserve-healed but UNPROVEN (manifest=$manifest_count files restored+content-verified, $POISON wiped, service running with restarts stable at $NOW_RESTARTS; NO injection observed — the caller must prove the pipeline)"
+    exit 3
+fi
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"
 exit 0

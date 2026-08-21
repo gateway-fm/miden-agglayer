@@ -250,6 +250,12 @@ enum ReconcilePatience {
 impl ReconcilePatience {
     /// Seconds a single window fetch may spend backing off, given the time left
     /// in the current tick.
+    ///
+    /// Zero is a legitimate answer and means "attempt the fetch, but do not
+    /// sleep between retries" — NOT "skip the work". Sub-second tick budgets
+    /// (RECONCILE_TICK_BUDGET_MS below 1000, which the config accepts) floor to
+    /// zero here, and treating that as exhausted made a backlogged live
+    /// reconciler do nothing at all, forever.
     fn window_backoff_secs(self, remaining_tick: Duration) -> u64 {
         match self {
             Self::Recovery => reconcile_backpressure_budget_secs(),
@@ -758,13 +764,21 @@ impl SyntheticProjector {
                     // only what is still left of it, so the inner backoff can
                     // never turn a 2s tick into (chunks x 2s) of a blocked
                     // client loop.
-                    let chunk_budget = patience
-                        .window_backoff_secs(deadline.saturating_duration_since(Instant::now()));
-                    if chunk_budget == 0 && patience == ReconcilePatience::LiveTick {
-                        // Tick budget exhausted: the remaining windows are
-                        // re-planned on the next tick behind the same
-                        // low-water-mark cursor, so stopping here loses
-                        // nothing and keeps the client available.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let chunk_budget = patience.window_backoff_secs(remaining);
+                    // Stop only when the DEADLINE has actually passed. Testing
+                    // `chunk_budget == 0` instead conflated "no time left" with
+                    // "less than a second left": any sub-second
+                    // RECONCILE_TICK_BUDGET_MS floors the backoff allowance to
+                    // zero, and a backlogged live reconciler then skipped every
+                    // chunk on every tick and never made progress again.
+                    if remaining.is_zero()
+                        && patience == ReconcilePatience::LiveTick
+                        && !out.is_empty()
+                    {
+                        // Something was fetched this tick; the rest is
+                        // re-planned next tick behind the same low-water-mark
+                        // cursor, so stopping here loses nothing.
                         break;
                     }
                     let mut set = tokio::task::JoinSet::new();
@@ -2463,6 +2477,42 @@ mod tests {
             store.get_reconcile_cursor().await.unwrap(),
             2_000,
             "multiple windows must advance the persisted cursor to the tip in ONE tick"
+        );
+    }
+
+    /// A sub-second live tick budget must still make progress.
+    ///
+    /// `RECONCILE_TICK_BUDGET_MS` accepts values below 1000, and the live
+    /// backoff allowance is expressed in whole seconds — so it floors to zero.
+    /// Treating that zero as "budget exhausted" made a backlogged live
+    /// reconciler skip every chunk on every tick and never catch up again. The
+    /// zero-budget test that already existed runs in Recovery mode, so it could
+    /// not see this.
+    #[tokio::test]
+    async fn sub_second_live_tick_still_advances_the_cursor() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state)
+            .await
+            // 8 windows planned, 200 blocks each, and a 500ms tick: less than
+            // one second, so the live backoff allowance is 0.
+            .with_reconcile_tuning(200, 8, Duration::from_millis(500));
+
+        let fetcher = FakeFetcher::new(None);
+        let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
+        projector
+            .reconcile_notes_with(None, None, &f, 2_000, ReconcilePatience::LiveTick)
+            .await
+            .expect("a sub-second tick is a short budget, not a broken one");
+
+        assert!(
+            !fetcher.calls().is_empty(),
+            "the live tick fetched NOTHING under a sub-second budget — the reconciler would never \
+             catch up"
+        );
+        assert!(
+            store.get_reconcile_cursor().await.unwrap() > 0,
+            "a sub-second live tick must still advance the persisted cursor"
         );
     }
 

@@ -119,7 +119,7 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn bind_l1_evidence_policy(&self, policy: &str) -> anyhow::Result<()> {
+    async fn bind_l1_evidence_policy(&self, policy: &str, strict: bool) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         let row = tx
@@ -157,11 +157,21 @@ impl Store for PgStore {
                 "L1 evidence state exists without an evidence policy; reset/rebuild L1 evidence before serving"
             );
         }
-        if policy == "latest" {
+        if policy == "latest" && !strict {
             // Migration 005 already persisted the old sole latest-scan cursor
             // in `last_processed`. Preserve that progress on upgrade so events
             // emitted during the restart are not skipped. Safe/finalized must
             // never inherit a latest frontier.
+            //
+            // NOT under strict H6 (round-3 review #16). Inheriting hands the
+            // database a NON-ZERO evidence cursor describing rows that were
+            // scanned before the policy existed and still carry
+            // finalized_verified = false. `check_h6_backfill_invariant` then
+            // sees a "real" cursor, skips the fresh-database backfill demand,
+            // and those legacy rows are never corroborated — they are simply
+            // scanned past. Leaving the cursor at 0 forces the operator to name
+            // an explicit --l1-indexer-from-block, which is the whole point of
+            // that invariant.
             tx.execute(
                 "UPDATE l1_indexer_state \
                  SET evidence_tag = $1, finalized_scan_cursor = $2, updated_at = now() \
@@ -240,11 +250,14 @@ impl Store for PgStore {
 
     // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
 
-    async fn get_l1_evidence_source(&self) -> anyhow::Result<Option<(u64, String, String)>> {
+    async fn get_l1_evidence_source(
+        &self,
+    ) -> anyhow::Result<Option<(u64, String, String, String)>> {
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT chain_id, ger_address, evidence_tag FROM l1_evidence_source WHERE id = 1",
+                "SELECT chain_id, genesis_hash, ger_address, evidence_tag \
+                 FROM l1_evidence_source WHERE id = 1",
                 &[],
             )
             .await?;
@@ -253,6 +266,7 @@ impl Store for PgStore {
                 r.get::<_, i64>(0) as u64,
                 r.get::<_, String>(1),
                 r.get::<_, String>(2),
+                r.get::<_, String>(3),
             )
         }))
     }
@@ -260,17 +274,25 @@ impl Store for PgStore {
     async fn set_l1_evidence_source(
         &self,
         chain_id: u64,
+        genesis_hash: &str,
         ger_address: &str,
         evidence_tag: &str,
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
-                "INSERT INTO l1_evidence_source (id, chain_id, ger_address, evidence_tag) \
-                 VALUES (1, $1, $2, $3) \
+                "INSERT INTO l1_evidence_source \
+                     (id, chain_id, genesis_hash, ger_address, evidence_tag) \
+                 VALUES (1, $1, $2, $3, $4) \
                  ON CONFLICT (id) DO UPDATE SET chain_id = EXCLUDED.chain_id, \
+                     genesis_hash = EXCLUDED.genesis_hash, \
                      ger_address = EXCLUDED.ger_address, evidence_tag = EXCLUDED.evidence_tag",
-                &[&(chain_id as i64), &ger_address, &evidence_tag],
+                &[
+                    &(chain_id as i64),
+                    &genesis_hash,
+                    &ger_address,
+                    &evidence_tag,
+                ],
             )
             .await?;
         Ok(())

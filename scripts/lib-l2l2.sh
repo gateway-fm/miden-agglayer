@@ -568,10 +568,24 @@ nudge_until() {
 CREATE_AGGCHAIN_TOPIC="0x144e3f9b5c63682a3bb7e9ad31e99c043890d3d540cd79dcebc3b5bdfba94c9b"
 _PF_FAILS=0
 _pf_pass() { echo -e "  ${GREEN}PASS${NC} $*"; }
-# NO VERDICT — the check could not reach a conclusion. Deliberately NOT a pass:
-# a preflight that cannot decide must not print PASS, because "it printed PASS"
-# is what every later reader takes as proof.
-_pf_undecided() { echo -e "  ${YELLOW:-}NO-VERDICT${NC} $*"; }
+# NO VERDICT — the check could not reach a conclusion.
+#
+# It counts as a FAILURE. Printing NO-VERDICT while letting the preflight go on
+# to announce "PREFLIGHT PASSED" is the same false green as printing PASS
+# directly: the only thing downstream reads is the overall verdict. A preflight
+# that cannot decide has not established the property the caller is about to
+# rely on, so it must stop the caller.
+#
+# PF_ALLOW_UNDECIDED=1 downgrades it to a warning for exploratory runs; it must
+# never be set in a gate.
+_pf_undecided() {
+    if [[ "${PF_ALLOW_UNDECIDED:-0}" == "1" ]]; then
+        echo -e "  ${YELLOW:-}NO-VERDICT${NC} $* [PF_ALLOW_UNDECIDED=1 — not counted]"
+    else
+        echo -e "  ${RED}NO-VERDICT (counted as FAIL)${NC} $*"
+        _PF_FAILS=$((_PF_FAILS + 1))
+    fi
+}
 _pf_fail() { echo -e "  ${RED}FAIL${NC} $*"; _PF_FAILS=$((_PF_FAILS + 1)); }
 
 # _pf_log_has <container> <ere-pattern> <tail-lines> <desc> — assert a pattern

@@ -561,7 +561,7 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn bind_l1_evidence_policy(&self, policy: &str) -> anyhow::Result<()> {
+    async fn bind_l1_evidence_policy(&self, policy: &str, _strict: bool) -> anyhow::Result<()> {
         let mut bound = self.l1_evidence_policy.write();
         match bound.as_deref() {
             Some(existing) if existing == policy => return Ok(()),
@@ -2428,11 +2428,17 @@ mod tests {
     #[tokio::test]
     async fn l1_evidence_policy_binding_is_immutable() {
         let store = InMemoryStore::new();
-        store.bind_l1_evidence_policy("finalized").await.unwrap();
-        store.bind_l1_evidence_policy("finalized").await.unwrap();
+        store
+            .bind_l1_evidence_policy("finalized", false)
+            .await
+            .unwrap();
+        store
+            .bind_l1_evidence_policy("finalized", false)
+            .await
+            .unwrap();
 
         let err = store
-            .bind_l1_evidence_policy("safe")
+            .bind_l1_evidence_policy("safe", false)
             .await
             .expect_err("a database policy change must fail closed");
         assert!(format!("{err:#}").contains("bound to `finalized`"));
@@ -2448,7 +2454,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .bind_l1_evidence_policy("finalized")
+            .bind_l1_evidence_policy("finalized", false)
             .await
             .expect_err("untagged verification evidence is ambiguous");
         assert!(format!("{err:#}").contains("without an evidence policy"));
