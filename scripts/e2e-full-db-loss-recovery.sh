@@ -578,9 +578,16 @@ fi
 # injection for the heal to await, and this drill proves the injection pipeline
 # itself a few lines below (the NINJECTED1 -> INJ2 gate). The heal must still
 # fail on every NEGATIVE signal — crash loop, re-wedge, restore mismatch.
-PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 HEAL_ALLOW_DEFERRED_PROOF=1 \
-    "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >>"$EVIDENCE" 2>&1
-HEAL_RC=$?
+# `set -e` is active: a bare invocation that exits 3 aborts the WHOLE script
+# before `$?` is ever read, so the exit-3 contract below would never run — the
+# same shape as the psql subshell bug. `if ...; then ... else HEAL_RC=$?; fi`
+# is the form that survives it.
+if PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 HEAL_ALLOW_DEFERRED_PROOF=1 \
+        "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >>"$EVIDENCE" 2>&1; then
+    HEAL_RC=0
+else
+    HEAL_RC=$?
+fi
 # rc 3 = "restored and running, but the healer observed no injection to prove
 # the pipeline with". That is the expected outcome on a quiet stack and is why
 # this drill passes HEAL_ALLOW_DEFERRED_PROOF=1 — the NINJECTED1 -> INJ2 gate

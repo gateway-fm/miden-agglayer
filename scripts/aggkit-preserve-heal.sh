@@ -18,7 +18,14 @@
 # -> start. The monitor DB is cleared; cert lineage + sync cursors survive.
 #
 # Usage: PROJECT=<compose-project> ./scripts/aggkit-preserve-heal.sh <aggkit|aggkit-l2b>
-# Returns 0 on heal, 2 if there is no wedge to heal (no-op), 1 on error.
+# Exit codes:
+#   0  healed, and an injection was observed proving the pipeline resumed
+#   1  error / unconfirmed (see the log line; the service is left as described)
+#   2  no wedge to heal (no-op precheck)
+#   3  healed and running, but NO injection was observed to prove it — only
+#      possible with HEAL_ALLOW_DEFERRED_PROOF=1, which asserts the CALLER will
+#      prove the pipeline itself. Callers must treat 3 as distinct from both 0
+#      and 1; `set -e` callers must use `if ...; then rc=0; else rc=$?; fi`.
 set -uo pipefail
 
 SVC="${1:?usage: aggkit-preserve-heal.sh <aggkit|aggkit-l2b>}"

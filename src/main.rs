@@ -606,12 +606,21 @@ async fn verify_l1_evidence_source(
     // "Already holds evidence" = a non-zero cursor or any indexed GER row.
     // Either means this database's corroboration predates the identity table,
     // so adopting it must be an explicit operator act rather than TOFU.
+    // "Already holds evidence" must mean ROWS as well as a cursor. The cursor
+    // write is best-effort and happens AFTER the rows are durable, so
+    // cursor == 0 with corroborated rows present is reachable — and checking
+    // only the cursor would silently TOFU-bind that store to whatever source
+    // is configured now.
     let cursor = store
         .get_l1_evidence_cursor()
         .await
         .context("reading the L1 evidence cursor to decide whether adoption is implicit")?;
+    let indexed_rows = store
+        .count_l1_indexed_gers()
+        .await
+        .context("counting indexed GER evidence to decide whether adoption is implicit")?;
     let adopt = std::env::var("L1_EVIDENCE_ADOPT_EXISTING").as_deref() == Ok("1");
-    let has_existing_evidence = cursor > 0 && !adopt;
+    let has_existing_evidence = (cursor > 0 || indexed_rows > 0) && !adopt;
     if adopt {
         tracing::warn!(
             "L1_EVIDENCE_ADOPT_EXISTING=1 — recording the current L1 identity for evidence that \
@@ -1412,6 +1421,27 @@ async fn main() -> anyhow::Result<()> {
             .get_l1_evidence_cursor()
             .await
             .context("loading the persisted L1 evidence cursor")?;
+        // An INHERITED cursor is a position, not evidence (migration 024): the
+        // rows below it were scanned before the evidence policy existed and are
+        // still unverified. Treat it as 0 here so the invariant demands the
+        // explicit backfill those rows need. Suppressing the inheritance itself
+        // was not sufficient — the binder returns early when the policy tag
+        // already matches, so a lenient boot could inherit first and a later
+        // strict boot never re-evaluate.
+        let cursor_inherited = store.is_l1_cursor_inherited().await.context(
+            "checking whether the L1 evidence cursor was inherited from the legacy scan",
+        )?;
+        let persisted_cursor = if cursor_inherited {
+            tracing::warn!(
+                inherited_cursor = persisted_cursor,
+                "the L1 evidence cursor was inherited from the pre-policy scan; treating it as \
+                 EMPTY for the strict backfill invariant because the rows below it were never \
+                 corroborated under this policy"
+            );
+            0
+        } else {
+            persisted_cursor
+        };
         if let Err(reason) = check_h6_backfill_invariant(
             command.reject_unverified_ger,
             command.require_hardening,

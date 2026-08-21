@@ -675,10 +675,16 @@ async fn test_pgstore_l1_evidence_cursor_roundtrip() {
 #[ignore = "requires a dedicated fresh PostgreSQL database"]
 async fn test_pgstore_l1_evidence_policy_binding_is_immutable() {
     let store = pg_store().await.expect("DATABASE_URL must be set");
-    store.bind_l1_evidence_policy("finalized").await.unwrap();
-    store.bind_l1_evidence_policy("finalized").await.unwrap();
+    store
+        .bind_l1_evidence_policy("finalized", false)
+        .await
+        .unwrap();
+    store
+        .bind_l1_evidence_policy("finalized", false)
+        .await
+        .unwrap();
     let err = store
-        .bind_l1_evidence_policy("safe")
+        .bind_l1_evidence_policy("safe", false)
         .await
         .expect_err("a PostgreSQL evidence policy change must fail closed");
     assert!(format!("{err:#}").contains("bound to `finalized`"));
@@ -707,7 +713,7 @@ async fn test_pgstore_untagged_evidence_state_is_rejected() {
 
     let store = PgStore::new(&db_url).await.expect("create PgStore");
     let err = store
-        .bind_l1_evidence_policy("finalized")
+        .bind_l1_evidence_policy("finalized", false)
         .await
         .expect_err("untagged evidence progress must fail closed");
     assert!(format!("{err:#}").contains("without an evidence policy"));

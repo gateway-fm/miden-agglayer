@@ -20,11 +20,6 @@ CREATE TABLE IF NOT EXISTS l1_evidence_source (
     id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     -- eth_chainId of the L1 the evidence was scanned from.
     chain_id        BIGINT      NOT NULL,
-    -- Hash of block 0. A chain id alone cannot see a RE-GENESISED devnet that
-    -- kept its id and redeployed the GER manager to the same deterministic
-    -- address — which is exactly what resetting this project's e2e stack
-    -- produces. The genesis hash is the immutable checkpoint that does.
-    genesis_hash    TEXT        NOT NULL DEFAULT '',
     -- GER manager contract, lowercase 0x-prefixed hex (normalised by the
     -- caller so a checksum-case change is not read as a different contract).
     ger_address     TEXT        NOT NULL,

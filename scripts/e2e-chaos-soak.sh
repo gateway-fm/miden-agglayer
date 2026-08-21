@@ -146,7 +146,19 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
   declare -A seen
   while true; do
     sleep 30
-    for AK in "${PROJECT}-aggkit-1" "${PROJECT}-aggkit-l2b-1"; do
+    # ONLY the base aggkit is watched here. aggkit-l2b submits its GER
+    # injections to anvil-l2b (fixtures/aggkit-l2b-config.toml), NOT to this
+    # proxy — so the "unknown to the proxy" probe below is trivially true for
+    # every healthy L2B transaction, and the preserve-healer it would call
+    # likewise reads the BASE proxy database. Watching aggkit-l2b through the
+    # base proxy's transactions table therefore produced a heal decision from
+    # evidence about a different chain entirely, and let unrelated base GER
+    # activity satisfy an L2B "recovery" proof.
+    #
+    # Wiring an L2B-aware watchdog needs an L2B-side admission probe; until
+    # then, not watching it is the honest option — a silent wrong answer is
+    # worse than a missing one. Tracked as the L2B watchdog follow-up.
+    for AK in "${PROJECT}-aggkit-1"; do
       docker inspect "$AK" >/dev/null 2>&1 || continue
       loops=$(docker logs "$AK" --since 60s 2>&1 | grep -c 'already exists in monitoring DB' || true)
       [ "${loops:-0}" -ge 10 ] || continue
@@ -277,10 +289,25 @@ done
 # unobserved is a fault the storm caused and the harness silently undid.
 # (lib-l2l2.sh brings up anvil-l2b, aggkit-l2b, agglayer, bridge-service,
 # postgres-l2b and bridge-service-l2b.)
-for svc in aggkit-l2b bridge-service-l2b anvil-l2b postgres-l2b agglayer; do
+# `l2l2_ensure_stack` runs `docker compose up` WITHOUT --no-deps, so it can
+# also restart anything those services depend on (anvil, postgres, tx-prover,
+# agglayer-postgres). Any of those repaired while unobserved is a storm-caused
+# fault the harness silently undid, so they belong in the snapshot too.
+for svc in aggkit-l2b bridge-service-l2b anvil-l2b postgres-l2b agglayer \
+           anvil postgres tx-prover agglayer-postgres; do
     if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
-        st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null)
-        [[ "$st" == "running" ]] || POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"
+        # Status AND health: `docker compose up` force-recreates a
+        # running-but-UNHEALTHY container, so recording only "running" lets the
+        # harness repair a service the storm broke and still be credited with
+        # self-recovery.
+        read -r st health < <(docker inspect \
+            -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+            "${PROJECT}-${svc}-1" 2>/dev/null)
+        if [[ "$st" != "running" ]]; then
+            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"
+        elif [[ "$health" == "unhealthy" ]]; then
+            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=running-but-unhealthy"
+        fi
     elif [[ "$_L2B_OVERLAY" == "1" ]]; then
         POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
     fi

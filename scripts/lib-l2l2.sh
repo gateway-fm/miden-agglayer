@@ -743,8 +743,45 @@ _pf_l1ger_consistency() {
     fi
     # Genuinely-empty bootstrap vs a dead indexer: with zero net-1 rows there is
     # nothing to join, but that is only benign if the L1 side is being indexed.
+    # SMALL POPULATION: evaluate it, do not shrug at it. Declaring "undecided"
+    # here (now a failure) turned a quiet, perfectly consistent stack with one
+    # or two GERs into a permanent red — the grace window exists to tolerate
+    # rows that are still settling, not to refuse to look at small stacks.
+    # So check those rows DIRECTLY without the newest-N exclusion, and only
+    # report undecided if they are genuinely unmatched AND still fresh enough
+    # to be settling.
     if [[ "$n_l2" -gt 0 && "$n_l2" -le "$PF_GER_GRACE_ROWS" ]]; then
-        _pf_undecided "bridge-service L1-GER consistency: only $n_l2 network-1 row(s) — all inside the newest-$PF_GER_GRACE_ROWS settling grace, so this check has NO verdict yet (not a pass)"
+        local small_orphans
+        if ! small_orphans=$(docker exec "$pg" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX -c "
+            SELECT count(*) FROM sync.exit_root l2
+            LEFT JOIN sync.exit_root l1
+              ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
+            WHERE l2.network_id=1 AND l1.id IS NULL" 2>&1); then
+            _pf_fail "bridge-service L1-GER consistency: small-population query FAILED — psql: ${small_orphans//$'\n'/ }"
+            return
+        fi
+        small_orphans=$(printf '%s' "$small_orphans" | tr -d '[:space:]')
+        if [[ "$small_orphans" == "0" ]]; then
+            _pf_pass "bridge-service L1-GER consistency: all $n_l2 network-1 GER(s) have their L1 row (small but complete)"
+        else
+            # Unmatched AND inside the settling window: genuinely too early to
+            # judge. Retry briefly before saying so, since this is the state a
+            # stack passes through seconds after its first GER.
+            local waited=0
+            while [[ "$small_orphans" != "0" && $waited -lt ${PF_GER_SETTLE_SECS:-60} ]]; do
+                sleep 5; waited=$((waited + 5))
+                small_orphans=$(docker exec "$pg" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX -c "
+                    SELECT count(*) FROM sync.exit_root l2
+                    LEFT JOIN sync.exit_root l1
+                      ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
+                    WHERE l2.network_id=1 AND l1.id IS NULL" 2>/dev/null | tr -d '[:space:]')
+            done
+            if [[ "$small_orphans" == "0" ]]; then
+                _pf_pass "bridge-service L1-GER consistency: all $n_l2 network-1 GER(s) matched after ${waited}s of settling"
+            else
+                _pf_fail "bridge-service L1-GER INCONSISTENT: $small_orphans of $n_l2 network-1 GER(s) still have no L1 row after ${waited}s — /merkle-proof will 500 (code=2) for net-1 deposits (#111). Heal: scripts/bridge-claimtxman-heal.sh"
+            fi
+        fi
         return
     fi
     if [[ "$n_l2" -eq 0 ]]; then

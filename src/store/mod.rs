@@ -521,6 +521,28 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// How many GER rows carry indexed L1 evidence (resolved exit roots)?
+    ///
+    /// Used to decide whether a store already holds corroboration that predates
+    /// the recorded evidence SOURCE. The cursor alone is not enough: rows are
+    /// durable before the (best-effort) cursor write, so a store can hold real
+    /// evidence with cursor still 0.
+    async fn count_l1_indexed_gers(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Was the selected-policy evidence cursor INHERITED from the pre-policy
+    /// `latest` scan rather than produced by a policy scan?
+    ///
+    /// An inherited cursor is a position, not evidence: the rows below it were
+    /// scanned before the policy existed and still carry
+    /// `finalized_verified = false`. Strict H6 must therefore treat it as no
+    /// cursor at all, or the fresh-database backfill invariant waives the
+    /// explicit `--l1-indexer-from-block` those rows need. See migration 024.
+    async fn is_l1_cursor_inherited(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// The L1 this store's GER corroboration was gathered from, if recorded.
     ///
     /// Audit-H6 evidence is only meaningful relative to a source: `ger_entries`

@@ -157,6 +157,12 @@ impl Store for PgStore {
                 "L1 evidence state exists without an evidence policy; reset/rebuild L1 evidence before serving"
             );
         }
+        // `strict` still suppresses the inheritance on a first strict binding —
+        // but that alone was not enough, because the same-tag early return
+        // above means a LENIENT boot can inherit first and a later STRICT boot
+        // never re-evaluates. So the provenance is recorded too (migration
+        // 024) and the startup invariant treats an inherited cursor as no
+        // cursor, which is correct in every ordering.
         if policy == "latest" && !strict {
             // Migration 005 already persisted the old sole latest-scan cursor
             // in `last_processed`. Preserve that progress on upgrade so events
@@ -174,7 +180,8 @@ impl Store for PgStore {
             // that invariant.
             tx.execute(
                 "UPDATE l1_indexer_state \
-                 SET evidence_tag = $1, finalized_scan_cursor = $2, updated_at = now() \
+                 SET evidence_tag = $1, finalized_scan_cursor = $2, \
+                     cursor_inherited_from_legacy = ($2 <> 0), updated_at = now() \
                  WHERE id = 1",
                 &[&policy, &legacy_latest_cursor],
             )
@@ -249,6 +256,29 @@ impl Store for PgStore {
     }
 
     // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
+
+    async fn count_l1_indexed_gers(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM ger_entries \
+                 WHERE mainnet_exit_root IS NOT NULL OR rollup_exit_root IS NOT NULL",
+                &[],
+            )
+            .await?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
+    async fn is_l1_cursor_inherited(&self) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT cursor_inherited_from_legacy FROM l1_indexer_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+    }
 
     async fn get_l1_evidence_source(
         &self,
