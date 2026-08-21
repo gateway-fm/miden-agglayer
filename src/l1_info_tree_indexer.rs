@@ -42,13 +42,64 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
+use anyhow::Context as _;
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 
 use crate::store::Store;
+
+/// Per-RPC ceiling inside the synchronous catch-up. The alloy HTTP provider
+/// has no default timeout, so without this a hung L1 endpoint stalls a startup
+/// path forever — indistinguishable from a crashed process.
+const CATCH_UP_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum head re-samples before the catch-up gives up as NOT-converged. A
+/// chain producing blocks faster than we scan them must terminate with an
+/// honest verdict rather than chase the head indefinitely.
+const CATCH_UP_MAX_PASSES: u32 = 64;
+
+/// Result of a bounded synchronous catch-up.
+///
+/// `converged` is the readiness signal callers act on: only `true` means the
+/// evidence index reached an L1 head observed AFTER the last durable write, so
+/// audit-H6 will corroborate any GER at or below it. Everything else — budget
+/// exhausted, pass cap hit, no frontier configured — is a partial index, which
+/// strict callers must treat as NOT ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchUp {
+    /// Last L1 block whose evidence is durably indexed.
+    pub last_processed: u64,
+    /// L1 head as of the final sample.
+    pub head: u64,
+    /// `last_processed >= head` at a head sampled after the final write.
+    pub converged: bool,
+    /// Nothing was scanned or persisted: empty cursor and no configured
+    /// frontier (see `catch_up_to_head`).
+    pub skipped_no_frontier: bool,
+    /// Head re-samples performed (diagnostics).
+    pub passes: u32,
+}
+
+impl CatchUp {
+    fn not_converged(last_processed: u64, head: u64, passes: u32) -> Self {
+        Self {
+            last_processed,
+            head,
+            converged: false,
+            skipped_no_frontier: false,
+            passes,
+        }
+    }
+
+    /// Blocks still unscanned at the moment we stopped.
+    pub fn lag(&self) -> u64 {
+        self.head.saturating_sub(self.last_processed)
+    }
+}
 
 alloy_core::sol! {
     /// Standard PolygonZkEVMGlobalExitRootV2 event (current contracts).
@@ -171,38 +222,135 @@ impl L1InfoTreeIndexer {
     /// the one-shot exits 0, the evidence needed to accept injections is
     /// already present, so the operator's next step (start the proxy) yields
     /// a proxy that is correct immediately rather than eventually.
-    pub async fn catch_up_to_head(&self) -> anyhow::Result<u64> {
+    pub async fn catch_up_to_head(&self, budget: Duration) -> anyhow::Result<CatchUp> {
+        let started = Instant::now();
         let provider = ProviderBuilder::new().connect_http(
             self.rpc_url
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid L1 RPC URL '{}': {}", self.rpc_url, e))?,
         );
-        let head = self.scan_head(&provider).await?;
-        let stored = self.store.get_l1_evidence_cursor().await.unwrap_or(0);
-        let mut last_processed = self.initial_cursor(stored, head);
+
+        // A cursor-read failure is NOT "no cursor". Collapsing it to 0 would
+        // silently restart the scan at the L1 head and abandon every block of
+        // evidence below it, so propagate instead.
+        let stored = self
+            .store
+            .get_l1_evidence_cursor()
+            .await
+            .context("loading the persisted L1 evidence cursor for the synchronous catch-up")?;
+
+        // No frontier to scan FROM: an empty cursor with no operator
+        // `--l1-indexer-from-block` means "fresh deployment, start at the
+        // current head" (see `initial_cursor`). Scanning under that policy is
+        // not a catch-up at all — worse, if a block lands between our two head
+        // reads we would index that ONE block and persist a non-zero cursor,
+        // which makes the startup backfill invariant (`check_h6_backfill_invariant`,
+        // main.rs) read as "this database has a real evidence index" when in
+        // fact everything below it was never scanned. Do nothing, persist
+        // nothing, and report it so strict callers stay fail-closed.
+        if self.from_block_override.is_none() && stored == 0 {
+            tracing::info!(
+                evidence_tag = %self.evidence_tag.describe(),
+                "L1InfoTreeIndexer: no evidence frontier (empty cursor, no --l1-indexer-from-block) \
+                 — skipping synchronous catch-up rather than persisting a head cursor that would \
+                 hide the unscanned history below it"
+            );
+            return Ok(CatchUp {
+                last_processed: 0,
+                head: 0,
+                converged: false,
+                skipped_no_frontier: true,
+                passes: 0,
+            });
+        }
+
+        let head0 = self.scan_head_bounded(&provider).await?;
+        let mut last_processed = self.initial_cursor(stored, head0);
+        let mut head = head0;
         tracing::info!(
             start_block = last_processed,
             stored_cursor = stored,
             l1_head = head,
+            budget_secs = budget.as_secs(),
             evidence_tag = %self.evidence_tag.describe(),
-            "L1InfoTreeIndexer: synchronous catch-up starting (restore readiness, #113)"
+            "L1InfoTreeIndexer: synchronous catch-up starting (restore/startup readiness, #113)"
         );
-        // Re-read the head each pass: a long backfill can lag a live chain,
-        // and "ready" must mean caught up to a head observed AFTER the last
-        // batch, not the head we saw when we started.
+
+        // Termination is guaranteed three ways, because this runs on a startup
+        // path where a hang is indistinguishable from a dead process:
+        //   * every RPC is wrapped in `CATCH_UP_RPC_TIMEOUT`;
+        //   * the whole loop is bounded by `budget`;
+        //   * `CATCH_UP_MAX_PASSES` caps head re-sampling, so a chain that
+        //     produces blocks faster than we can scan them exits as
+        //     NOT-converged instead of chasing the head forever.
+        // Re-sampling the head at all (rather than freezing the first sample)
+        // is deliberate: "ready" must mean caught up to a head observed AFTER
+        // the last batch we wrote.
+        let mut passes = 0u32;
         loop {
-            let head = self.scan_head(&provider).await?;
-            if last_processed >= head {
+            while last_processed < head {
+                if started.elapsed() >= budget {
+                    return Ok(CatchUp::not_converged(last_processed, head, passes));
+                }
+                let before = last_processed;
+                timeout(
+                    CATCH_UP_RPC_TIMEOUT,
+                    self.poll_to_head(&provider, &mut last_processed, head),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "L1 evidence scan of blocks {}..={head} timed out after {}s",
+                        before + 1,
+                        CATCH_UP_RPC_TIMEOUT.as_secs()
+                    )
+                })??;
+                // `poll_to_head` advances the cursor only after the batch is
+                // durably written, so a successful call that did not advance
+                // means we would spin on the same window forever.
+                anyhow::ensure!(
+                    last_processed > before,
+                    "L1 evidence scan made no progress at block {before} (head {head}) — \
+                     refusing to spin"
+                );
+            }
+
+            passes += 1;
+            if started.elapsed() >= budget || passes >= CATCH_UP_MAX_PASSES {
+                return Ok(CatchUp::not_converged(last_processed, head, passes));
+            }
+
+            let new_head = self.scan_head_bounded(&provider).await?;
+            if new_head <= last_processed {
                 tracing::info!(
                     last_processed,
-                    l1_head = head,
+                    l1_head = new_head,
+                    passes,
+                    elapsed_secs = started.elapsed().as_secs(),
                     "L1InfoTreeIndexer: synchronous catch-up complete — L1 evidence is current"
                 );
-                return Ok(last_processed);
+                return Ok(CatchUp {
+                    last_processed,
+                    head: new_head,
+                    converged: true,
+                    skipped_no_frontier: false,
+                    passes,
+                });
             }
-            self.poll_to_head(&provider, &mut last_processed, head)
-                .await?;
+            head = new_head;
         }
+    }
+
+    async fn scan_head_bounded<P: Provider>(&self, provider: &P) -> anyhow::Result<u64> {
+        timeout(CATCH_UP_RPC_TIMEOUT, self.scan_head(provider))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "reading the L1 `{}` head timed out after {}s",
+                    self.evidence_tag.describe(),
+                    CATCH_UP_RPC_TIMEOUT.as_secs()
+                )
+            })?
     }
 
     pub fn spawn(self) -> anyhow::Result<oneshot::Sender<()>> {
@@ -687,5 +835,77 @@ mod tests {
         assert_eq!(finalized.initial_cursor(0, 20_000_000), 12_344);
         assert_eq!(safe.initial_cursor(77, 100), 77);
         assert_eq!(latest.initial_cursor(0, 100), 100);
+    }
+
+    /// An empty cursor with no configured frontier means "fresh deployment,
+    /// start at head" — there is nothing to catch UP to, and scanning anyway
+    /// risks persisting a head cursor that makes an unscanned history look
+    /// like a real evidence index to `check_h6_backfill_invariant`.
+    ///
+    /// The RPC URL below is unroutable on purpose: reaching the network at all
+    /// would fail the test, which is exactly the assertion — the frontier check
+    /// must happen BEFORE any L1 call.
+    #[tokio::test]
+    async fn catch_up_skips_and_persists_nothing_without_a_frontier() {
+        let store = Arc::new(InMemoryStore::new());
+        let indexer = test_indexer(store.clone() as Arc<dyn Store>);
+
+        let outcome = indexer
+            .catch_up_to_head(Duration::from_secs(30))
+            .await
+            .expect("a missing frontier is a configuration state, not an error");
+
+        assert!(outcome.skipped_no_frontier, "must report the skip");
+        assert!(
+            !outcome.converged,
+            "a skipped catch-up is NOT readiness — strict callers must fail closed on it"
+        );
+        assert_eq!(outcome.passes, 0, "no scan passes may run");
+        assert_eq!(
+            store.get_l1_evidence_cursor().await.unwrap(),
+            0,
+            "the cursor must stay 0 so the startup backfill invariant still sees a fresh database"
+        );
+    }
+
+    /// A cursor READ failure must propagate. Collapsing it to 0 would resume the
+    /// scan at the L1 head and abandon every block of evidence below it, while
+    /// reporting success.
+    #[tokio::test]
+    async fn catch_up_propagates_cursor_read_failure() {
+        let store = Arc::new(InMemoryStore::new());
+        store.fail_l1_evidence_cursor_reads(true);
+        let indexer =
+            test_indexer(store.clone() as Arc<dyn Store>).with_from_block_override(1_000);
+
+        let err = indexer
+            .catch_up_to_head(Duration::from_secs(30))
+            .await
+            .expect_err("an unreadable cursor must not be treated as an empty cursor");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("L1 evidence cursor"),
+            "the error must name what failed, got: {report}"
+        );
+    }
+
+    /// Readiness semantics: only `converged` means "H6 can corroborate roots up
+    /// to `head`". Budget/pass exhaustion is a partial index and must never be
+    /// mistaken for readiness.
+    #[test]
+    fn not_converged_reports_the_lag() {
+        let partial = CatchUp::not_converged(1_000, 1_250, 7);
+        assert!(!partial.converged);
+        assert!(!partial.skipped_no_frontier);
+        assert_eq!(partial.lag(), 250);
+
+        let ready = CatchUp {
+            last_processed: 1_250,
+            head: 1_250,
+            converged: true,
+            skipped_no_frontier: false,
+            passes: 2,
+        };
+        assert_eq!(ready.lag(), 0);
     }
 }
