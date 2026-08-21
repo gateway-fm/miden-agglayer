@@ -423,7 +423,10 @@ if true; then
                 # as proving no injection was pending.
                 log "no exact injection target was extracted from the post-heal log window (no wait performed) and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
             else
-                log "no injection observed within ${waited}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
+                # The wait watched for ONE thing: the exact TARGET_TX becoming
+                # durably admitted. Another injection may well have landed in
+                # that window — this code never looked. Say what was checked.
+                log "the exact target ${TARGET_TX:0:18}… was not confirmed within ${waited}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
             fi
             PROOF_DEFERRED=1
         else
@@ -457,7 +460,7 @@ if [ "${PROOF_DEFERRED:-0}" = "1" ]; then
     # proved the injection pipeline actually resumed — the caller asked to
     # prove that itself. Say so, and exit with a DISTINCT code so a future
     # caller cannot read this as a confirmed heal by checking `rc == 0`.
-    log "preserve-healed but UNPROVEN (manifest=$manifest_count files restored+content-verified, $POISON wiped, service running with restarts stable at $NOW_RESTARTS; no injection was CONFIRMED here — the caller must prove the pipeline)"
+    log "preserve-healed but UNPROVEN (manifest=$manifest_count files restored+content-verified, $POISON wiped, service running with restarts stable at $NOW_RESTARTS; no EXACT injection was confirmed here — the caller must prove the pipeline)"
     exit 3
 fi
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"
