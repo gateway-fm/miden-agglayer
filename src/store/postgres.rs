@@ -119,7 +119,7 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn bind_l1_evidence_policy(&self, policy: &str, strict: bool) -> anyhow::Result<()> {
+    async fn bind_l1_evidence_policy(&self, policy: &str) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         let row = tx
@@ -157,31 +157,25 @@ impl Store for PgStore {
                 "L1 evidence state exists without an evidence policy; reset/rebuild L1 evidence before serving"
             );
         }
-        // `strict` still suppresses the inheritance on a first strict binding —
-        // but that alone was not enough, because the same-tag early return
-        // above means a LENIENT boot can inherit first and a later STRICT boot
-        // never re-evaluates. So the provenance is recorded too (migration
-        // 024) and the startup invariant treats an inherited cursor as no
-        // cursor, which is correct in every ordering.
-        if policy == "latest" && !strict {
+        if policy == "latest" {
             // Migration 005 already persisted the old sole latest-scan cursor
             // in `last_processed`. Preserve that progress on upgrade so events
             // emitted during the restart are not skipped. Safe/finalized must
             // never inherit a latest frontier.
             //
-            // NOT under strict H6 (round-3 review #16). Inheriting hands the
-            // database a NON-ZERO evidence cursor describing rows that were
-            // scanned before the policy existed and still carry
-            // finalized_verified = false. `check_h6_backfill_invariant` then
-            // sees a "real" cursor, skips the fresh-database backfill demand,
-            // and those legacy rows are never corroborated — they are simply
-            // scanned past. Leaving the cursor at 0 forces the operator to name
-            // an explicit --l1-indexer-from-block, which is the whole point of
-            // that invariant.
+            //
+            // KNOWN GAP, filed as a follow-up (see docs): under strict H6 this
+            // inheritance hands the database a NON-ZERO evidence cursor for
+            // rows scanned before the policy existed, which satisfies
+            // `check_h6_backfill_invariant` and skips the backfill those rows
+            // need. Fixing it correctly needs durable cursor PROVENANCE (was
+            // this position inherited, or actually scanned?) plus a retirement
+            // transition once a real backfill has covered the prefix — a state
+            // machine with its own upgrade tests, not a flag. Deliberately not
+            // attempted inside this rc-migration PR.
             tx.execute(
                 "UPDATE l1_indexer_state \
-                 SET evidence_tag = $1, finalized_scan_cursor = $2, \
-                     cursor_inherited_from_legacy = ($2 <> 0), updated_at = now() \
+                 SET evidence_tag = $1, finalized_scan_cursor = $2, updated_at = now() \
                  WHERE id = 1",
                 &[&policy, &legacy_latest_cursor],
             )
@@ -256,77 +250,6 @@ impl Store for PgStore {
     }
 
     // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
-
-    async fn count_l1_indexed_gers(&self) -> anyhow::Result<u64> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_one(
-                "SELECT count(*) FROM ger_entries \
-                 WHERE mainnet_exit_root IS NOT NULL OR rollup_exit_root IS NOT NULL",
-                &[],
-            )
-            .await?;
-        Ok(row.get::<_, i64>(0) as u64)
-    }
-
-    async fn is_l1_cursor_inherited(&self) -> anyhow::Result<bool> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT cursor_inherited_from_legacy FROM l1_indexer_state WHERE id = 1",
-                &[],
-            )
-            .await?;
-        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
-    }
-
-    async fn get_l1_evidence_source(
-        &self,
-    ) -> anyhow::Result<Option<(u64, String, String, String)>> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT chain_id, genesis_hash, ger_address, evidence_tag \
-                 FROM l1_evidence_source WHERE id = 1",
-                &[],
-            )
-            .await?;
-        Ok(row.map(|r| {
-            (
-                r.get::<_, i64>(0) as u64,
-                r.get::<_, String>(1),
-                r.get::<_, String>(2),
-                r.get::<_, String>(3),
-            )
-        }))
-    }
-
-    async fn set_l1_evidence_source(
-        &self,
-        chain_id: u64,
-        genesis_hash: &str,
-        ger_address: &str,
-        evidence_tag: &str,
-    ) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO l1_evidence_source \
-                     (id, chain_id, genesis_hash, ger_address, evidence_tag) \
-                 VALUES (1, $1, $2, $3, $4) \
-                 ON CONFLICT (id) DO UPDATE SET chain_id = EXCLUDED.chain_id, \
-                     genesis_hash = EXCLUDED.genesis_hash, \
-                     ger_address = EXCLUDED.ger_address, evidence_tag = EXCLUDED.evidence_tag",
-                &[
-                    &(chain_id as i64),
-                    &genesis_hash,
-                    &ger_address,
-                    &evidence_tag,
-                ],
-            )
-            .await?;
-        Ok(())
-    }
 
     async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;

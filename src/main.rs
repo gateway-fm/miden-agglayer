@@ -543,193 +543,6 @@ fn l1_evidence_catch_up_budget() -> std::time::Duration {
 /// A mismatch is a refusal: continuing would serve corroboration that means
 /// nothing, and the operator's intent (new chain vs wrong config) cannot be
 /// guessed from here.
-/// Resolve this process's L1 identity and apply [`check_l1_evidence_source`].
-///
-/// Shared by the RESTORE one-shot and the serving path. Restore must run it
-/// FIRST: it performs an L1 catch-up that writes evidence rows and advances the
-/// cursor, so checking only on the serving path afterwards would let a database
-/// bound to source A be contaminated with source-B evidence before anything
-/// noticed (round-3 review #6).
-/// Takes the two relevant fields by value rather than `&Command`, because by
-/// this point other (non-Copy) command fields have already been moved out.
-async fn verify_l1_evidence_source(
-    store: &std::sync::Arc<dyn miden_agglayer_service::store::Store>,
-    l1_rpc_url: Option<String>,
-    ger_address: Option<String>,
-    l1_evidence_tag: miden_agglayer_service::ger::EvidenceTag,
-) -> anyhow::Result<()> {
-    let (Some(l1_rpc_url), Some(ger_addr_str)) = (l1_rpc_url, ger_address) else {
-        return Ok(());
-    };
-    let Ok(ger_addr) = ger_addr_str.parse::<alloy::primitives::Address>() else {
-        // An unparsable address is reported (and, under strict, fatal) by the
-        // dedicated checks; nothing to bind here.
-        return Ok(());
-    };
-    let provider = alloy::providers::ProviderBuilder::new().connect_http(
-        l1_rpc_url
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid L1 RPC URL '{l1_rpc_url}': {e}"))?,
-    );
-    use alloy::providers::Provider as _;
-
-    // BOUNDED. The alloy HTTP provider has no default deadline, so an
-    // unreachable-but-accepting endpoint would hang startup forever — and this
-    // now runs on the restore path too.
-    const IDENTITY_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    let chain_id = tokio::time::timeout(IDENTITY_RPC_TIMEOUT, provider.get_chain_id())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "reading eth_chainId from {l1_rpc_url} timed out after {}s while identifying the \
-                 L1 evidence source",
-                IDENTITY_RPC_TIMEOUT.as_secs()
-            )
-        })?
-        .context("reading eth_chainId to identify the L1 evidence source")?;
-    let genesis = tokio::time::timeout(
-        IDENTITY_RPC_TIMEOUT,
-        provider.get_block_by_number(alloy::eips::BlockNumberOrTag::Number(0)),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "reading L1 block 0 from {l1_rpc_url} timed out after {}s while identifying the L1 \
-             evidence source",
-            IDENTITY_RPC_TIMEOUT.as_secs()
-        )
-    })?
-    .context("reading L1 block 0 to identify the L1 evidence source")?
-    .ok_or_else(|| anyhow::anyhow!("L1 block 0 is unavailable; cannot identify the chain"))?;
-    let genesis_hash = format!("{:?}", genesis.header.hash).to_lowercase();
-
-    // "Already holds evidence" = a non-zero cursor or any indexed GER row.
-    // Either means this database's corroboration predates the identity table,
-    // so adopting it must be an explicit operator act rather than TOFU.
-    // "Already holds evidence" must mean ROWS as well as a cursor. The cursor
-    // write is best-effort and happens AFTER the rows are durable, so
-    // cursor == 0 with corroborated rows present is reachable — and checking
-    // only the cursor would silently TOFU-bind that store to whatever source
-    // is configured now.
-    let cursor = store
-        .get_l1_evidence_cursor()
-        .await
-        .context("reading the L1 evidence cursor to decide whether adoption is implicit")?;
-    let indexed_rows = store
-        .count_l1_indexed_gers()
-        .await
-        .context("counting indexed GER evidence to decide whether adoption is implicit")?;
-    let adopt = std::env::var("L1_EVIDENCE_ADOPT_EXISTING").as_deref() == Ok("1");
-    let has_existing_evidence = (cursor > 0 || indexed_rows > 0) && !adopt;
-    if adopt {
-        tracing::warn!(
-            "L1_EVIDENCE_ADOPT_EXISTING=1 — recording the current L1 identity for evidence that \
-             predates the identity record. This asserts that the existing rows came from THIS \
-             chain and contract."
-        );
-    }
-
-    check_l1_evidence_source(
-        store,
-        chain_id,
-        &genesis_hash,
-        ger_addr,
-        l1_evidence_tag.describe(),
-        has_existing_evidence,
-    )
-    .await
-}
-
-async fn check_l1_evidence_source(
-    store: &std::sync::Arc<dyn miden_agglayer_service::store::Store>,
-    chain_id: u64,
-    genesis_hash: &str,
-    ger_address: alloy::primitives::Address,
-    evidence_tag: &str,
-    has_existing_evidence: bool,
-) -> anyhow::Result<()> {
-    // Normalised so a checksum-case difference is not read as a different
-    // contract. The genesis hash is what distinguishes a RE-GENESISED devnet
-    // that kept its chain id and redeployed the GER manager to the same
-    // deterministic address — the case a (chain_id, address) pair alone cannot
-    // see, and the one this environment produces every time the stack is reset.
-    let ger = format!("{ger_address:?}").to_lowercase();
-    let identity =
-        format!("chain_id={chain_id} genesis={genesis_hash} ger={ger} tag={evidence_tag}");
-    match store
-        .get_l1_evidence_source()
-        .await
-        .context("reading the recorded L1 evidence source")?
-    {
-        None if has_existing_evidence => {
-            // TRUST-ON-FIRST-USE IS NOT SAFE HERE. An upgraded database already
-            // holds evidence gathered before this table existed; blessing it
-            // with whatever configuration happens to be set on the first
-            // post-upgrade boot would launder a misconfiguration into
-            // "verified" provenance. Make the operator assert it.
-            anyhow::bail!(
-                "this store already holds L1 evidence (cursor and/or ger_entries rows) but has no \
-                 recorded evidence SOURCE, which is the state an upgrade leaves behind. Recording \
-                 the current configuration ({identity}) would silently bless pre-existing evidence \
-                 as belonging to it. If this configuration is genuinely the source that evidence \
-                 came from, set L1_EVIDENCE_ADOPT_EXISTING=1 for one boot to record it; if it is \
-                 not, start from an empty store so the index is rebuilt."
-            );
-        }
-        None => {
-            store
-                .set_l1_evidence_source(chain_id, genesis_hash, &ger, evidence_tag)
-                .await
-                .context("recording the L1 evidence source")?;
-            tracing::info!(
-                chain_id,
-                genesis = %genesis_hash,
-                ger_address = %ger,
-                evidence_tag,
-                "recorded the L1 evidence source for this store"
-            );
-        }
-        Some((stored_chain, stored_genesis, stored_ger, stored_tag)) => {
-            // An empty stored genesis is a row written before that column
-            // existed; compare what it actually recorded rather than reading
-            // the gap as a mismatch, and record the genesis on this boot.
-            let genesis_matches = stored_genesis.is_empty() || stored_genesis == genesis_hash;
-            if stored_chain != chain_id
-                || !genesis_matches
-                || stored_ger != ger
-                || stored_tag != evidence_tag
-            {
-                anyhow::bail!(
-                    "L1 EVIDENCE SOURCE MISMATCH — this store's GER corroboration was gathered \
-                     from chain_id={stored_chain} genesis={stored_genesis} ger={stored_ger} \
-                     tag={stored_tag}, but this process is configured for chain_id={chain_id} \
-                     genesis={genesis_hash} ger={ger} tag={evidence_tag}. \
-                     Every persisted `ger_entries` row and the evidence cursor describe the OLD \
-                     source, so serving now would corroborate roots against evidence from a \
-                     different chain/contract. If this is a deliberate re-point, start from an \
-                     empty store (or drop the evidence state) so the index is rebuilt against \
-                     the new source."
-                );
-            }
-            if stored_genesis.is_empty() {
-                // Backfill the checkpoint on the first boot that can compute it.
-                store
-                    .set_l1_evidence_source(chain_id, genesis_hash, &ger, evidence_tag)
-                    .await
-                    .context("recording the genesis checkpoint for the L1 evidence source")?;
-            }
-            tracing::info!(
-                chain_id,
-                genesis = %genesis_hash,
-                ger_address = %ger,
-                evidence_tag,
-                "L1 evidence source matches the recorded identity"
-            );
-        }
-    }
-    Ok(())
-}
-
 fn check_h6_backfill_invariant(
     reject_unverified_ger: bool,
     require_hardening: bool,
@@ -1071,10 +884,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     store
-        .bind_l1_evidence_policy(
-            l1_evidence_tag.describe(),
-            command.reject_unverified_ger || command.require_hardening,
-        )
+        .bind_l1_evidence_policy(l1_evidence_tag.describe())
         .await
         .context("binding persisted L1 evidence to the configured policy")?;
 
@@ -1316,19 +1126,6 @@ async fn main() -> anyhow::Result<()> {
             result.logs_created,
         );
 
-        // Bind the evidence to its L1 BEFORE the catch-up below writes any
-        // (round-3 review #6): restore performs a full L1 scan that inserts
-        // ger_entries rows and advances the cursor, so a store bound to source
-        // A would otherwise be contaminated with source-B evidence and only
-        // discover it on the next serving boot — after the damage.
-        verify_l1_evidence_source(
-            &store,
-            command.l1_rpc_url.clone(),
-            command.ger_l1_address.clone(),
-            l1_evidence_tag,
-        )
-        .await?;
-
         // FINDING #113 — READINESS, not just data. The store we just rebuilt
         // also holds the L1 evidence index that audit-H6 consults before
         // accepting a GER injection. Leaving it empty meant the operator's
@@ -1421,27 +1218,6 @@ async fn main() -> anyhow::Result<()> {
             .get_l1_evidence_cursor()
             .await
             .context("loading the persisted L1 evidence cursor")?;
-        // An INHERITED cursor is a position, not evidence (migration 024): the
-        // rows below it were scanned before the evidence policy existed and are
-        // still unverified. Treat it as 0 here so the invariant demands the
-        // explicit backfill those rows need. Suppressing the inheritance itself
-        // was not sufficient — the binder returns early when the policy tag
-        // already matches, so a lenient boot could inherit first and a later
-        // strict boot never re-evaluate.
-        let cursor_inherited = store.is_l1_cursor_inherited().await.context(
-            "checking whether the L1 evidence cursor was inherited from the legacy scan",
-        )?;
-        let persisted_cursor = if cursor_inherited {
-            tracing::warn!(
-                inherited_cursor = persisted_cursor,
-                "the L1 evidence cursor was inherited from the pre-policy scan; treating it as \
-                 EMPTY for the strict backfill invariant because the rows below it were never \
-                 corroborated under this policy"
-            );
-            0
-        } else {
-            persisted_cursor
-        };
         if let Err(reason) = check_h6_backfill_invariant(
             command.reject_unverified_ger,
             command.require_hardening,
@@ -1450,18 +1226,6 @@ async fn main() -> anyhow::Result<()> {
         ) {
             anyhow::bail!("{reason}");
         }
-
-        // Bind that evidence to the L1 it came from (round-2 review #6). Runs
-        // whenever an L1 + GER contract are configured — corroboration is just
-        // as source-specific in lenient mode, and recording the identity early
-        // means a later switch to strict mode has something to compare.
-        verify_l1_evidence_source(
-            &store,
-            command.l1_rpc_url.clone(),
-            command.ger_l1_address.clone(),
-            l1_evidence_tag,
-        )
-        .await?;
     }
 
     let mut state = ServiceState::new(

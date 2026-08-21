@@ -294,19 +294,42 @@ done
 # agglayer-postgres). Any of those repaired while unobserved is a storm-caused
 # fault the harness silently undid, so they belong in the snapshot too.
 for svc in aggkit-l2b bridge-service-l2b anvil-l2b postgres-l2b agglayer \
-           anvil postgres tx-prover agglayer-postgres; do
+           anvil postgres tx-prover agglayer-postgres validator; do
     if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
         # Status AND health: `docker compose up` force-recreates a
         # running-but-UNHEALTHY container, so recording only "running" lets the
         # harness repair a service the storm broke and still be credited with
         # self-recovery.
-        read -r st health < <(docker inspect \
+        insp=$(docker inspect \
             -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-            "${PROJECT}-${svc}-1" 2>/dev/null)
-        if [[ "$st" != "running" ]]; then
-            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"
-        elif [[ "$health" == "unhealthy" ]]; then
-            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=running-but-unhealthy"
+            "${PROJECT}-${svc}-1" 2>/dev/null) || insp=""
+        if [[ -z "$insp" ]]; then
+            # Typed evidence, not an empty string: an inspect race must be
+            # readable in the verdict line rather than rendering as "svc=".
+            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=INSPECT-FAILED"
+        else
+            read -r st health <<<"$insp"
+            case "$st:$health" in
+                running:healthy|running:none)
+                    # `none` = this service defines no healthcheck (aggkit-l2b,
+                    # bridge-service-l2b, agglayer, tx-prover). "Running" is all
+                    # docker can tell us, so it is all we can assert here — the
+                    # functional post-op below is what actually proves those
+                    # services work, and it now exercises both L2<->L2
+                    # directions precisely because this signal is weak.
+                    ;;
+                running:starting)
+                    # Still inside its start period: not yet evidence of health,
+                    # and the harness is about to repair it either way.
+                    POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=health-starting"
+                    ;;
+                running:*)
+                    POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=running-but-${health}"
+                    ;;
+                *)
+                    POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"
+                    ;;
+            esac
         fi
     elif [[ "$_L2B_OVERLAY" == "1" ]]; then
         POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"

@@ -452,15 +452,7 @@ pub trait Store: Send + Sync + 'static {
     /// because the policy that produced it cannot be inferred safely. A
     /// persistent implementation may bootstrap `latest` from its legacy latest
     /// cursor; safe/finalized must never inherit that cursor.
-    /// `strict` = strict-H6 corroboration is enabled. It matters because the
-    /// `latest` binding INHERITS the legacy pre-policy scan cursor: convenient
-    /// on a lenient upgrade (no events skipped over the restart), but under
-    /// strict H6 it hands the database a non-zero evidence cursor for rows that
-    /// were never verified under the new policy — which then satisfies the
-    /// fresh-database backfill invariant and skips the backfill those rows
-    /// need. Under strict the cursor must stay 0 so the operator is forced to
-    /// choose an explicit `--l1-indexer-from-block`.
-    async fn bind_l1_evidence_policy(&self, _policy: &str, _strict: bool) -> anyhow::Result<()> {
+    async fn bind_l1_evidence_policy(&self, _policy: &str) -> anyhow::Result<()> {
         anyhow::bail!("store does not support persistent L1 evidence-policy binding")
     }
 
@@ -521,54 +513,6 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
-    /// How many GER rows carry indexed L1 evidence (resolved exit roots)?
-    ///
-    /// Used to decide whether a store already holds corroboration that predates
-    /// the recorded evidence SOURCE. The cursor alone is not enough: rows are
-    /// durable before the (best-effort) cursor write, so a store can hold real
-    /// evidence with cursor still 0.
-    async fn count_l1_indexed_gers(&self) -> anyhow::Result<u64> {
-        Ok(0)
-    }
-
-    /// Was the selected-policy evidence cursor INHERITED from the pre-policy
-    /// `latest` scan rather than produced by a policy scan?
-    ///
-    /// An inherited cursor is a position, not evidence: the rows below it were
-    /// scanned before the policy existed and still carry
-    /// `finalized_verified = false`. Strict H6 must therefore treat it as no
-    /// cursor at all, or the fresh-database backfill invariant waives the
-    /// explicit `--l1-indexer-from-block` those rows need. See migration 024.
-    async fn is_l1_cursor_inherited(&self) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    /// The L1 this store's GER corroboration was gathered from, if recorded.
-    ///
-    /// Audit-H6 evidence is only meaningful relative to a source: `ger_entries`
-    /// rows say "observed on L1" without saying WHICH L1, so the same database
-    /// pointed at a different chain, a re-genesised devnet, or a redeployed GER
-    /// manager would keep accepting historic rows as corroboration for roots
-    /// that never existed there.
-    ///
-    /// Returns `(chain_id, genesis_hash, ger_address, evidence_tag)`.
-    async fn get_l1_evidence_source(
-        &self,
-    ) -> anyhow::Result<Option<(u64, String, String, String)>> {
-        Ok(None)
-    }
-
-    /// Record the evidence source on first use. Idempotent: writing the same
-    /// identity again is a no-op, and callers compare before writing.
-    async fn set_l1_evidence_source(
-        &self,
-        _chain_id: u64,
-        _genesis_hash: &str,
-        _ger_address: &str,
-        _evidence_tag: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
     /// #90 — seed a signer's nonce baseline iff it has NO row yet. Insert-if-absent,
     /// so it is atomic and idempotent across replicas: exactly one caller seeds and
     /// every later call is a no-op. Returns `true` iff this call created the row.
