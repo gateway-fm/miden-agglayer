@@ -611,7 +611,11 @@ fi
 # below is the proof. Any OTHER non-zero rc is a real heal failure.
 case "$HEAL_RC" in
     0) say "aggkit aggoracle heal confirmed an injection" ;;
-    3) say "aggkit aggoracle heal restored the service but confirmed no EXACT injection (it watches one target; it does not observe all injections) — this drill proves the pipeline itself below" ;;
+    # "did not confirm" — NOT "confirmed no". Failing to observe an injection is
+    # not evidence that none occurred, and exit 3 also covers the path where
+    # NO target was extracted and no wait ran at all, so "watches one target"
+    # would be wrong there too.
+    3) say "aggkit aggoracle heal restored the service but did not confirm an exact injection (it checks at most one extracted target; it does not observe all injections) — this drill proves the pipeline itself below" ;;
     *)
         tail -20 "$EVIDENCE" || true
         fail "aggkit aggoracle heal FAILED (#113, rc=$HEAL_RC) — GER injection would stay frozen"
