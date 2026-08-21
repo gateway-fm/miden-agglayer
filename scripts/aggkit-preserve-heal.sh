@@ -40,7 +40,35 @@ COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
 
 log() { echo "[$(date '+%H:%M:%S')] preserve-heal($SVC): $*"; }
 
+# Only the two aggkit services are healable by this script; it force-recreates
+# the container it is given, so an arbitrary compose service name here would
+# destroy something else entirely.
+case "$SVC" in
+    aggkit|aggkit-l2b) ;;
+    *) log "FATAL: '$SVC' is not a healable service (expected: aggkit | aggkit-l2b)"; exit 1 ;;
+esac
+
 docker inspect "$C" >/dev/null 2>&1 || { log "container $C not found"; exit 1; }
+
+# The destructive targets come from environment variables — verify each one
+# actually belongs to the compose project we were told to heal before stopping
+# or recreating anything.
+for c in "$C" "$PG"; do
+    docker inspect "$c" >/dev/null 2>&1 || { log "FATAL: container $c not found"; exit 1; }
+    owner=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c" 2>/dev/null)
+    [[ "$owner" == "$PROJECT" ]] || {
+        log "FATAL: refusing to touch $c — it belongs to compose project '${owner:-<none>}', not '$PROJECT'."
+        exit 1
+    }
+done
+
+# One heal at a time per project+service. The chaos watchdog, the recovery
+# drill and a manual run can all fire at once; a second run entering while the
+# first is between "stop" and "restore" would recreate the container out from
+# under it and restore an older snapshot over newer state.
+LOCK="/tmp/.aggkit-preserve-heal.$PROJECT.$SVC.lock"
+exec 9>"$LOCK"
+flock -n 9 || { log "another preserve-heal is already running for $PROJECT/$SVC (lock: $LOCK) — refusing to run concurrently"; exit 1; }
 
 # ── wedge detection: SAME inject-tx ID repeating AND unknown to the proxy ─────
 if [[ "$FORCE" != "1" ]]; then
@@ -81,6 +109,16 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+# A signal must never be quieter than an error. Without explicit INT/TERM
+# handling bash runs the EXIT trap on the default signal action anyway, but
+# NOT with a non-zero-ish state we can distinguish — so pin the retention here
+# too: once we are past the destructive step, any interruption must keep $B.
+# Before it, there is nothing to keep and the temp dir is still cleaned up.
+on_signal() {
+    log "interrupted by signal — staging dir retention is KEEP_STAGE=$KEEP_STAGE"
+    exit 130
+}
+trap on_signal INT TERM
 # Review 0814: the stop must be CONFIRMED before snapshotting — copying live
 # SQLite (mid-write WAL) and then destroying the source ships a corrupt-only
 # copy of the state.
@@ -129,9 +167,16 @@ log "staged manifest: $manifest_count file(s) (whole state dir minus $POISON)"
 # chaos NOT-GREEN, verdict d). `up --no-start --no-deps --force-recreate` is
 # the supported spelling of create-without-starting-deps. Keep the output: a
 # silently-discarded recreate error is what hid this.
+# Arm the retention BEFORE the destructive step, not only on its error paths.
+# From the instant --force-recreate starts, $B holds the ONLY copy of the
+# certificate lineage and bridge-sync cursors. A SIGTERM/SIGINT in that window
+# (runner timeout, Ctrl-C, watchdog kill) fires the EXIT trap with KEEP_STAGE=0
+# and `rm -rf $B` destroys unrecoverable state — setting it on the `||` branch
+# covers a FAILED recreate but not a KILLED one.
+KEEP_STAGE=1
 COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
     up --no-start --no-deps --force-recreate "$SVC" >"$B/recreate.log" 2>&1 \
-    || { KEEP_STAGE=1; log "FATAL: recreate failed — staging dir retained; see $B/recreate.log"; exit 1; }
+    || { log "FATAL: recreate failed — staging dir retained; see $B/recreate.log"; exit 1; }
 
 # ── RESTORE the manifest, VERIFY it round-trips, then require health ─────────
 # From here on the original state exists only in $B — every failure path keeps it.
@@ -207,6 +252,15 @@ docker start "$C" >/dev/null 2>&1 \
 # (fatal/panic markers). On any failed validation the recreated service is
 # STOPPED — a diverging instance must not keep serving.
 HEAL_T0=$(date +%s)
+# Baselines for the POSITIVE proof below, captured BEFORE the service comes
+# back: "an injection landed after the heal" is only meaningful against a
+# before-count. `is_injected` GER rows are written exclusively by the GER
+# injection path, so — unlike a bare transactions count — bridge/claim load
+# running concurrently cannot manufacture this signal.
+HEAL_SINCE_SQL="now() - interval '$(( $(date +%s) - HEAL_T0 + 30 )) seconds'"
+PRE_INJECTED=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
+    "SELECT count(*) FROM ger_entries WHERE is_injected" 2>/dev/null | tr -d '[:space:]')
+[[ "${PRE_INJECTED:-}" =~ ^[0-9]+$ ]] || PRE_INJECTED=""
 sleep 25
 STATE=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}}' "$C" 2>/dev/null || echo "gone")
 NOW_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 999)
@@ -269,7 +323,11 @@ fi
 # heal exists so the resent tx gets durably admitted by the proxy. Require the
 # success-specific transition: the proxy's transactions table knows WEDGE_TX
 # within HEAL_CONFIRM_TIMEOUT, or the wedge-paired error reappears (fail).
-if [ -n "${WEDGE_TX:-}" ]; then
+# The proof runs whether or not a WEDGE_TX was supplied. Gating the whole
+# block on WEDGE_TX meant the FORCE=1 caller (full-DB-loss recovery) got NO
+# functional verification at all — it passed on "container is up and printing
+# INFO lines", which a dead aggoracle also does.
+if true; then
     # The resent injection keeps WEDGE_TX's deterministic id ONLY if the same
     # GER is still the one being injected. If newer GERs superseded it while
     # the service was wedged/down, the post-wipe replacement is a NEW id
@@ -294,7 +352,14 @@ if [ -n "${WEDGE_TX:-}" ]; then
     CONFIRM_TIMEOUT="${HEAL_CONFIRM_TIMEOUT:-120}"
     waited=0
     confirmed=0
-    [ -n "$TARGET_TX" ] || confirmed=1   # deferred: negative gates already passed
+    # With no pending injection to await, the only remaining positive signal is
+    # the injection counter advancing. Waiting for it is still worthwhile (that
+    # is the pipeline we healed); only give up on proof if the caller has
+    # explicitly accepted a deferred verdict.
+    if [ -z "$TARGET_TX" ] && [ -z "$PRE_INJECTED" ]; then
+        confirmed=1   # cannot query the baseline at all — deferred, and said so
+        log "WARNING: no injection baseline available — positive proof DEFERRED to live traffic"
+    fi
     while [ "$confirmed" -eq 0 ] && [ "$waited" -lt "$CONFIRM_TIMEOUT" ]; do
         known=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
             "SELECT count(*) FROM transactions WHERE tx_hash='$TARGET_TX'" 2>/dev/null || echo "")
@@ -302,16 +367,25 @@ if [ -n "${WEDGE_TX:-}" ]; then
             confirmed=1
             break
         fi
-        # Any NEWLY admitted injection proves the wedge cleared — the pending
-        # id can supersede repeatedly while we wait (live 2026-08-19: three
-        # distinct ids in ~2 min), so chasing one exact id reports a false
-        # UNCONFIRMED on a healthy pipeline.
-        admitted_any=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
-            "SELECT count(*) FROM transactions WHERE created_at > now() - interval '5 minutes'" 2>/dev/null | tr -d '[:space:]')
-        if [[ "${admitted_any:-0}" =~ ^[0-9]+$ ]] && [[ "${admitted_any:-0}" -gt 0 ]]; then
-            confirmed=1
-            log "positive outcome: proxy admitted ${admitted_any} tx(s) in the last 5m (pending id superseded ${TARGET_TX:0:18}…)"
-            break
+        # Any NEWLY injected GER proves the wedge cleared — the pending id can
+        # supersede repeatedly while we wait (live 2026-08-19: three distinct
+        # ids in ~2 min), so chasing one exact id reports a false UNCONFIRMED on
+        # a healthy pipeline.
+        #
+        # This must be scoped to the GER INJECTION pipeline, which is what the
+        # heal repairs. The previous form counted ANY transaction admitted in
+        # the last 5 minutes — under this repo's own soak that is satisfied by
+        # concurrent bridge/claim load, so a permanently dead aggoracle
+        # certified itself as healed. `ger_entries.is_injected` grows only when
+        # an injection is actually admitted.
+        if [ -n "$PRE_INJECTED" ]; then
+            now_injected=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
+                "SELECT count(*) FROM ger_entries WHERE is_injected" 2>/dev/null | tr -d '[:space:]')
+            if [[ "${now_injected:-}" =~ ^[0-9]+$ ]] && [ "$now_injected" -gt "$PRE_INJECTED" ]; then
+                confirmed=1
+                log "positive outcome: GER injections advanced ${PRE_INJECTED} -> ${now_injected} after the heal (pending id superseded ${TARGET_TX:0:18}…)"
+                break
+            fi
         fi
         rewedged=$(docker logs --since 10s "$C" 2>&1 | grep -F "$WEDGE_TX" \
             | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
@@ -320,8 +394,15 @@ if [ -n "${WEDGE_TX:-}" ]; then
         sleep 5
         waited=$((waited + 5))
     done
-    [ "$confirmed" -eq 1 ] \
-        || fail_soft "the proxy never durably admitted the resent tx ${TARGET_TX} within ${CONFIRM_TIMEOUT}s — no positive proof the wedge cleared"
+    if [ "$confirmed" -ne 1 ]; then
+        if [ -z "$TARGET_TX" ] && [ "${HEAL_ALLOW_DEFERRED_PROOF:-0}" = "1" ]; then
+            # Quiet stack with nothing to inject: the caller has said it will
+            # prove liveness itself (the drill's own post-heal GER leg).
+            log "no injection observed within ${CONFIRM_TIMEOUT}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
+        else
+            fail_soft "no GER injection was admitted within ${CONFIRM_TIMEOUT}s (target ${TARGET_TX:-<none pending>}, injected count still ${PRE_INJECTED:-?}) — no positive proof the injection pipeline recovered"
+        fi
+    fi
     [ -z "$TARGET_TX" ] \
         || log "positive exact outcome: proxy durably admitted ${TARGET_TX:0:18}… after ${waited}s"
 fi

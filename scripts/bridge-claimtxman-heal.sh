@@ -34,14 +34,84 @@ FORCE="${FORCE:-0}"
 L1_RPC="${L1_RPC:-http://localhost:8545}"
 
 log() { echo "[$(date '+%H:%M:%S')] claimtxman-heal: $*"; }
-psql_b() { docker exec "$PG_C" psql -U bridge_user -d bridge_db -tAX -c "$1" 2>/dev/null; }
+
+# FAIL-CLOSED SQL. The old helper sent stderr to /dev/null with no
+# ON_ERROR_STOP, so a broken query, a wrong database or an unreachable
+# container all returned the empty string — which `${x:-0}` then turned into a
+# legitimate-looking zero. That made the wedge precheck read "0 stranded rows,
+# nothing to heal" and exit 0 on an error, and made the post-heal checks pass
+# on unreadable state. Now: errors abort the statement, stderr is captured, and
+# a failed query is a failed query.
+PSQL_ERR=""
+psql_b() {
+    local out rc
+    out=$(docker exec "$PG_C" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX -c "$1" 2>&1)
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        PSQL_ERR="$out"
+        return $rc
+    fi
+    PSQL_ERR=""
+    printf '%s' "$out"
+}
+# Numeric-or-die: every count this script branches on must be a number that
+# actually came back from the database.
+psql_num() {
+    local v
+    v=$(psql_b "$1" | tr -d '[:space:]') || {
+        log "FATAL: query failed: $1"
+        log "       psql said: ${PSQL_ERR:-<no output>}"
+        exit 1
+    }
+    [[ "$v" =~ ^[0-9]+$ ]] || {
+        log "FATAL: query did not return a number (got '${v}'): $1"
+        exit 1
+    }
+    printf '%s' "$v"
+}
+
+# STRING MATCHING — deliberate, and the only option here. The subject is
+# zkevm-bridge-service, a separate Go process: it exposes no typed error, no
+# metric and no table column for "this send was rejected on nonce", so its log
+# is the only channel. The patterns are quoted from its own classifier,
+# `isNonceError` in claimtxman (matches "nonce too low" / "invalid nonce" /
+# "txnonce"), plus the "nonce mismatch for" line its sender emits; they are the
+# strings that component both produces and reacts to. If it ever grows a
+# structured signal, switch to it.
+nonce_error_lines() {
+    docker logs --since "${1}s" "$SVC_C" 2>&1 \
+        | grep -cE "nonce too low|nonce too high|invalid nonce|txnonce|nonce mismatch for" \
+        || true
+}
 
 docker inspect "$SVC_C" >/dev/null 2>&1 || { log "container $SVC_C not found"; exit 1; }
+docker inspect "$PG_C" >/dev/null 2>&1 || { log "postgres container $PG_C not found"; exit 1; }
 
-stranded=$(psql_b "SELECT count(*) FROM sync.monitored_txs WHERE status='created'" | tr -d '[:space:]')
+# This script STOPS a service and DELETES rows, with both targets coming from
+# environment variables. Verify each one actually belongs to the compose
+# project we were told to heal before touching it — a stale/typo'd PROJECT or
+# PG_CONTAINER would otherwise stop one stack's bridge-service while wiping a
+# different stack's tables.
+for c in "$SVC_C" "$PG_C"; do
+    owner=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$c" 2>/dev/null)
+    [[ "$owner" == "$PROJECT" ]] || {
+        log "FATAL: refusing to touch $c — it belongs to compose project '${owner:-<none>}', not '$PROJECT'."
+        log "       Set PROJECT/PG_CONTAINER to the stack you actually mean to heal."
+        exit 1
+    }
+done
+
+# One heal at a time per project. The chaos watchdog, the recovery drill and a
+# manual run can all decide to heal at once; concurrent runs would delete rows
+# the other just let the service recreate, or restart it mid-wipe.
+LOCK="/tmp/.claimtxman-heal.$PROJECT.lock"
+exec 9>"$LOCK"
+flock -n 9 || { log "another claimtxman heal is already running for project $PROJECT (lock: $LOCK) — refusing to run concurrently"; exit 1; }
+
+stranded=$(psql_num "SELECT count(*) FROM sync.monitored_txs WHERE status='created'")
 if [[ "$FORCE" != "1" ]]; then
     # Wedge signature: stranded created rows AND fresh nonce-mismatch sends.
-    mismatches=$(docker logs --since 120s "$SVC_C" 2>&1 | grep -cE "nonce too low|nonce too high|nonce mismatch for" || true)
+    mismatches=$(nonce_error_lines 120)
     if [[ "${stranded:-0}" -eq 0 || "${mismatches:-0}" -eq 0 ]]; then
         log "no stranded-nonce wedge (created=${stranded:-0} fresh_mismatches=${mismatches:-0}) — nothing to heal"
         exit 0
@@ -51,7 +121,7 @@ else
     log "FORCE=1 (post-restore): clearing ${stranded:-0} created monitored tx(s) unconditionally"
 fi
 
-l1_cursor_before=$(psql_b "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0" | tr -d '[:space:]')
+l1_cursor_before=$(psql_num "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0")
 
 docker stop "$SVC_C" >/dev/null 2>&1
 [[ "$(docker inspect -f '{{.State.Status}}' "$SVC_C" 2>/dev/null)" == "exited" ]] \
@@ -61,10 +131,27 @@ docker stop "$SVC_C" >/dev/null 2>&1
 # of truth, and claimtxman's checkIfClaimed re-confirms landed claims. Keeping
 # 'confirmed' rows adds nothing and a partial wipe leaves more ways to be
 # inconsistent. The group table goes with it.
-deleted=$(psql_b "DELETE FROM sync.monitored_txs RETURNING 1" | grep -c 1 || true)
-psql_b "DELETE FROM sync.monitored_txs_group" >/dev/null || true
+# ONE transaction, FK-safe order (group rows reference monitored txs), aborting
+# on the first error. The previous form ran two independent statements with
+# their failures swallowed by `|| true`, so a half-wipe — or no wipe at all —
+# restarted the service and reported success.
+DEL_OUT=$(docker exec "$PG_C" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX \
+    -c "BEGIN; DELETE FROM sync.monitored_txs_group; DELETE FROM sync.monitored_txs; COMMIT;" 2>&1) || {
+    log "FATAL: the monitored-tx wipe FAILED and was rolled back: $DEL_OUT"
+    log "       $SVC_C is left STOPPED; start it with: docker start $SVC_C"
+    exit 1
+}
+# Prove the wipe before restarting: restarting on top of surviving rows
+# recreates the exact divergence this heal exists to clear.
+for t in sync.monitored_txs sync.monitored_txs_group; do
+    left=$(psql_num "SELECT count(*) FROM $t")
+    [[ "$left" -eq 0 ]] || {
+        log "FATAL: $t still has $left row(s) after the wipe — refusing to restart into a partially-cleared state"
+        exit 1
+    }
+done
 docker start "$SVC_C" >/dev/null 2>&1 || { log "FATAL: $SVC_C did not start"; exit 1; }
-log "deleted ${deleted:-0} stranded row(s); service restarted"
+log "cleared ${stranded:-0} stranded created tx(s); both monitored-tx tables verified empty; service restarted"
 
 # Positive outcome, two accepted shapes. sync.status 'synced' is the starved
 # component's own stale self-report (cycle-1/2 false PASS) so it is never
@@ -77,21 +164,19 @@ log "deleted ${deleted:-0} stranded row(s); service restarted"
 #       no fresh nonce-error sends — the healthy-quiet shape.
 deadline=$(( $(date +%s) + ${HEAL_CONFIRM_TIMEOUT:-180} ))
 while :; do
-    cur=$(psql_b "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0" | tr -d '[:space:]')
+    cur=$(psql_num "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0")
     if [[ "${cur:-0}" -gt "${l1_cursor_before:-0}" ]]; then
         log "positive outcome: L1 sync cursor advanced ${l1_cursor_before} -> ${cur}"
         exit 0
     fi
-    orphans=$(psql_b "
+    orphans=$(psql_num "
         SELECT count(*) FROM sync.exit_root l2
         LEFT JOIN sync.exit_root l1
           ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
         WHERE l2.network_id=1 AND l1.id IS NULL
-          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)" \
-        | tr -d '[:space:]')
-    fresh_err=$(docker logs --since 60s "$SVC_C" 2>&1 \
-        | grep -cE "nonce too low|nonce too high|nonce mismatch for" || true)
-    if [[ "${orphans:-1}" == "0" && "${fresh_err:-1}" -eq 0 ]]; then
+          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)")
+    fresh_err=$(nonce_error_lines 60)
+    if [[ "$orphans" -eq 0 && "$fresh_err" -eq 0 ]]; then
         log "positive outcome: L1-GER join consistent (0 orphans) and no fresh nonce errors (quiet-stack shape; cursor ${l1_cursor_before} unchanged is event-sparse, not starvation)"
         exit 0
     fi

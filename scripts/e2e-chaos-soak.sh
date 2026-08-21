@@ -214,9 +214,27 @@ sleep "$POST_CHAOS_SETTLE"
 # verifier reads state that can predate the recovery — neither proves the stack
 # works AFTER the faults. Require one fresh deposit + one fresh withdrawal to
 # complete post-chaos before the soak may PASS.
-say "=== (pre-verdict) fresh two-way post-chaos operation (1 L1->Miden + 1 Miden->L1) ==="
+# Snapshot service state BEFORE the post-op: the loadtest calls
+# l2l2_ensure_stack, which brings missing services back UP. Checking
+# services-running only after that would credit the harness's own repair to the
+# system under test.
+POST_STORM_DOWN=""
+for svc in miden-agglayer aggkit bridge-service miden-node ntx-builder aggkit-l2b bridge-service-l2b; do
+    if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
+        st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null)
+        [[ "$st" == "running" ]] || POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"
+    fi
+done
+say "=== (pre-verdict) fresh post-chaos operation (1 L1->Miden + 1 Miden->L1 + 1 Miden->L2B) ==="
+say "    post-storm service state before any harness repair: ${POST_STORM_DOWN:-all running}"
+# L2L2_FWD=1: the Miden->L2B direction MUST be exercised after the last fault.
+# Without it the probe proved only the L1 legs, so an aggkit-l2b aggoracle left
+# frozen by the storm passed every gate — and the L2B path is exactly what
+# chaos breaks most often (#41/#87). L2L2_BACK stays 0: the back leg needs a
+# seeded clash the probe cannot set up post-hoc, and its health is asserted
+# structurally by the preflight instead (net-2 sync freshness).
 POSTOP_RC=1
-if N_L1_FWD=1 N_L1_BACK=1 L2L2_FWD=0 L2L2_BACK=0 MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" \
+if N_L1_FWD=1 N_L1_BACK=1 L2L2_FWD=1 L2L2_BACK=0 MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" \
     COMPOSE_PROJECT_NAME="$PROJECT" timeout "${CHAOS_POSTOP_TIMEOUT:-3600}" "$SCRIPT_DIR/e2e-loadtest-mixed.sh" \
     >/tmp/chaos-postop.out 2>&1; then
     POSTOP_RC=0
@@ -379,10 +397,18 @@ for svc in miden-agglayer aggkit bridge-service miden-node ntx-builder; do
     st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null || echo missing)
     [[ "$st" == "running" ]] || SERVICES_DOWN="$SERVICES_DOWN ${svc}=${st}"
 done
+# The L2B services are REQUIRED, not optional, whenever this stack runs the
+# l2l2 overlay — `docker inspect` failing means the container is GONE, which
+# the old `if` treated as "not applicable" and skipped. A destroyed aggkit-l2b
+# is the loudest possible failure, not an absent one.
+L2B_STACK=0
+[[ -f "$REPO/docker-compose.l2l2.yml" ]] && L2B_STACK=1
 for svc in aggkit-l2b bridge-service-l2b; do
     if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
         st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null)
         [[ "$st" == "running" ]] || SERVICES_DOWN="$SERVICES_DOWN ${svc}=${st}"
+    elif [[ "$L2B_STACK" == "1" ]]; then
+        SERVICES_DOWN="$SERVICES_DOWN ${svc}=MISSING"
     fi
 done
 POSTLIVE_OK=0
@@ -390,7 +416,7 @@ POSTLIVE_OK=0
 say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC store=$([[ ${STORE_OK:-0} == 1 ]] && echo CLEAN || echo DROP) locks=$LOCKS loadtest_rc=$LT_RC allow_late=$ALLOW_LATE)"
 say "    (b) GARBO containment:  $([[ $GARBO_VERDICT_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK private_leak=$PRIVATE_LEAK)"
 say "    (c) CHAOS actually fired: $([[ $CHAOS_OK == 1 ]] && echo PASS || echo FAIL)  (faults=${FAULTS_DONE:-0} private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
-say "    (d) POST-CHAOS liveness: $([[ $POSTLIVE_OK == 1 ]] && echo PASS || echo FAIL)  (services_down='${SERVICES_DOWN:-none}' proxy_healthy=${PROXY_HEALTHY:-0} fresh_op_rc=${POSTOP_RC:-1}; telemetry: heal_softfails=$WATCHDOG_FAILED budget_exhausted=$BUDGET_EXHAUSTED)"
+say "    (d) POST-CHAOS liveness: $([[ $POSTLIVE_OK == 1 ]] && echo PASS || echo FAIL)  (services_down='${SERVICES_DOWN:-none}' proxy_healthy=${PROXY_HEALTHY:-0} fresh_op_rc=${POSTOP_RC:-1} [incl. Miden->L2B]; post-storm_before_repair='${POST_STORM_DOWN:-all running}'; telemetry: heal_softfails=$WATCHDOG_FAILED budget_exhausted=$BUDGET_EXHAUSTED)"
 if [[ "$LEGIT_OK" == "1" && "$GARBO_VERDICT_OK" == "1" && "$CHAOS_OK" == "1" && "$POSTLIVE_OK" == "1" ]]; then
     if [[ "$ALLOW_LATE" == "0" ]]; then
         say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"

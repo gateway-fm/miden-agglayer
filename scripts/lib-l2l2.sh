@@ -699,16 +699,47 @@ _pf_sync_lag() {
 # are impossible regardless of what sync.status claims.
 _pf_l1ger_consistency() {
     local pg="${1:-${COMPOSE_PROJECT_NAME}-postgres-1}"
-    local orphans
-    orphans=$( ( set +o pipefail; docker exec "$pg" psql -U bridge_user -d bridge_db -tAX -c "
+    local orphans counts n_l1 n_l2 err
+
+    # FAIL CLOSED on an unreadable table. The previous form sent stderr to
+    # /dev/null and treated the resulting empty string as "fresh stack —
+    # vacuous PASS", so a wrong container, a missing schema or a dead postgres
+    # all printed "proofs servable" having verified nothing at all.
+    if ! counts=$(docker exec "$pg" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX -c "
+        SELECT count(*) FILTER (WHERE network_id=0) || '|' || count(*) FILTER (WHERE network_id=1)
+        FROM sync.exit_root" 2>&1); then
+        _pf_fail "bridge-service L1-GER consistency: CANNOT READ sync.exit_root in $pg — refusing to report the check as passed. psql: ${counts//$'\n'/ }"
+        return
+    fi
+    counts=$(printf '%s' "$counts" | tr -d '[:space:]')
+    n_l1="${counts%%|*}"; n_l2="${counts##*|}"
+    if [[ ! "$n_l1" =~ ^[0-9]+$ || ! "$n_l2" =~ ^[0-9]+$ ]]; then
+        _pf_fail "bridge-service L1-GER consistency: unexpected exit_root count response '$counts'"
+        return
+    fi
+    # Genuinely-empty bootstrap vs a dead indexer: with zero net-1 rows there is
+    # nothing to join, but that is only benign if the L1 side is being indexed.
+    if [[ "$n_l2" -eq 0 ]]; then
+        if [[ "$n_l1" -gt 0 ]]; then
+            _pf_pass "bridge-service L1-GER consistency: no L2-observed GERs yet (L1 side indexing, $n_l1 row(s)) — nothing to join"
+        else
+            _pf_fail "bridge-service L1-GER consistency: sync.exit_root is EMPTY for BOTH networks — the synchronizer has indexed nothing; this is a dead indexer, not a fresh stack"
+        fi
+        return
+    fi
+
+    if ! orphans=$(docker exec "$pg" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX -c "
         SELECT count(*) FROM sync.exit_root l2
         LEFT JOIN sync.exit_root l1
           ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
         WHERE l2.network_id=1 AND l1.id IS NULL
-          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)" \
-        2>/dev/null ) | tr -d '[:space:]' )
-    if [[ -z "$orphans" ]]; then
-        _pf_pass "bridge-service L1-GER consistency: exit_root table not readable yet (fresh stack) — vacuous"
+          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)" 2>&1); then
+        _pf_fail "bridge-service L1-GER consistency: the orphan query FAILED — psql: ${orphans//$'\n'/ }"
+        return
+    fi
+    orphans=$(printf '%s' "$orphans" | tr -d '[:space:]')
+    if [[ ! "$orphans" =~ ^[0-9]+$ ]]; then
+        _pf_fail "bridge-service L1-GER consistency: orphan query returned '$orphans', not a count"
     elif [[ "$orphans" -eq 0 ]]; then
         _pf_pass "bridge-service L1-GER consistency: every settled L2-GER has its L1 row (proofs servable)"
     else
@@ -789,6 +820,10 @@ l2l2_validate_stack() {
     _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-l2b-1" "L2B bridge-service"
     # net 0/1 on the base bridge_db (postgres); net 2 on the isolated L2B bridge_db (postgres-l2b)
     _pf_sync_lag 0 "$L1_RPC"  "L1 (Miden svc)"  "${COMPOSE_PROJECT_NAME}-postgres-1"
+    # Network 1 (Miden, via the proxy's synthetic RPC) was the one network never
+    # checked: a stalled net-1 synchronizer leaves Miden->anywhere deposits
+    # never reaching ready_for_claim while nets 0 and 2 look perfectly healthy.
+    _pf_sync_lag 1 "$L2_RPC"  "Miden (Miden svc)" "${COMPOSE_PROJECT_NAME}-postgres-1"
     _pf_sync_lag 2 "$L2B_RPC" "L2B (L2B svc)"   "${COMPOSE_PROJECT_NAME}-postgres-l2b-1"
     _pf_l1ger_consistency "${COMPOSE_PROJECT_NAME}-postgres-1"
 

@@ -876,6 +876,17 @@ step "Leg 1 — deposit L1→L2, then the USER claims it manually"
 LEG1_GI=""; LEG1_TX=""
 for attempt in $(seq 1 "$MAX_LEG1_ATTEMPTS"); do
     log "Leg 1 attempt $attempt/$MAX_LEG1_ATTEMPTS"
+    # RE-BASELINE per attempt. These are process-wide counters and the
+    # assertion below attributes their growth to the attempt that produced
+    # LEG1_GI — but a baseline taken once, before the loop, also captures every
+    # EARLIER attempt's increments. A failed attempt 1 could therefore satisfy
+    # the proof for attempt 2, whose gi is the one isClaimed() then confirms:
+    # two unrelated facts reported as one causal chain. Re-reading here makes
+    # the delta belong to the winning attempt.
+    DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
+    ESTIMATE_ALREADY_CLAIMED_BEFORE=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+    INFLIGHT_DEDUP_BEFORE=$(metric_value "$INFLIGHT_DEDUP_METRIC")
+    log "attempt $attempt baselines: sendRaw=$DEDUP_BEFORE estimateGas=$ESTIMATE_ALREADY_CLAIMED_BEFORE inflight=$INFLIGHT_DEDUP_BEFORE"
     do_l1_deposit
     pass "L1 deposit sent (tx $L1_DEP_TX → deposit_cnt $L1_DEP_CNT)"
     fetch_deposit_json "$L1_DEP_CNT" 300

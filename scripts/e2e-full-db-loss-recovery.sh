@@ -536,10 +536,17 @@ step "Phase 4 — no ERR_GER_ALREADY_REGISTERED poison; pipeline processes NEW t
 # net-1 deposit. Same class as the aggkit ethtxmanager wipe: any component
 # holding nonces across a restore must be re-based. FORCE=1 — post-restore the
 # stranded state is deterministic, no detection needed.
-if [[ -x "$SCRIPT_DIR/bridge-claimtxman-heal.sh" ]]; then
-    PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 L1_RPC="$L1_RPC" \
-        "$SCRIPT_DIR/bridge-claimtxman-heal.sh" 2>&1 | tee -a "$EVIDENCE" \
-        || say "WARN: claimtxman heal unconfirmed — L2->L2 back-claims may stay blocked (#111)"
+# The heal is RELEASE-REQUIRED, so its failure is the drill's failure. It used
+# to be advisory (missing script → skipped, non-zero → a WARN), which meant the
+# drill could print FULL DB LOSS RECOVERY while claimtxman was still
+# nonce-wedged and every post-restore claim was being R4-rejected. `pipefail` is
+# set, but `| tee` would otherwise mask the exit status, so capture it directly.
+[[ -x "$SCRIPT_DIR/bridge-claimtxman-heal.sh" ]] \
+    || fail "bridge-claimtxman-heal.sh is missing/not executable — the #111 heal is required after a full DB loss"
+if ! PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 L1_RPC="$L1_RPC" \
+        "$SCRIPT_DIR/bridge-claimtxman-heal.sh" >>"$EVIDENCE" 2>&1; then
+    tail -20 "$EVIDENCE" || true
+    fail "claimtxman heal FAILED (#111) — post-restore claims would be R4-rejected and the L1-GER index starved"
 fi
 
 # FINDING #113 (drill-caught 2026-08-19, RELEASE-REQUIRED): the restore heals
@@ -552,10 +559,16 @@ fi
 # then fails with "no NEW GER injected+consumed"). Healed live by wiping ONLY
 # ethtxmanager-aggoracle.sqlite, after which injections resumed immediately.
 # Every tx-holder that survives a restore must be re-based — this is the third.
-if [[ -x "$SCRIPT_DIR/aggkit-preserve-heal.sh" ]]; then
-    PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 \
-        "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit 2>&1 | tee -a "$EVIDENCE" \
-        || say "WARN: aggkit aggoracle heal unconfirmed — GER injection may stay frozen (#113)"
+[[ -x "$SCRIPT_DIR/aggkit-preserve-heal.sh" ]] \
+    || fail "aggkit-preserve-heal.sh is missing/not executable — the #113 heal is required after a full DB loss"
+# HEAL_ALLOW_DEFERRED_PROOF=1: on a quiet stack there may be no pending
+# injection for the heal to await, and this drill proves the injection pipeline
+# itself a few lines below (the NINJECTED1 -> INJ2 gate). The heal must still
+# fail on every NEGATIVE signal — crash loop, re-wedge, restore mismatch.
+if ! PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 HEAL_ALLOW_DEFERRED_PROOF=1 \
+        "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >>"$EVIDENCE" 2>&1; then
+    tail -20 "$EVIDENCE" || true
+    fail "aggkit aggoracle heal FAILED (#113) — GER injection would stay frozen"
 fi
 sleep 45   # window for aggoracle to (wrongly) re-inject + ntx to (wrongly) assert
 NTX_NOW=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
@@ -595,15 +608,31 @@ cast send --rpc-url "$L1_RPC" --private-key "$SIGNER_KEY" "$L1_BRIDGE_ADDRESS" \
   1 "$DEST" "$DEPOSIT_WEI" 0x0000000000000000000000000000000000000000 true 0x \
   --value "$DEPOSIT_WEI" >/dev/null
 
+# Assert on THIS deposit, by its exact index. `$DEST` is derived from the
+# service account, so it is the SAME destination in every drill on a
+# compounding stack: "any of the latest 25 deposits is ready_for_claim" was
+# satisfied by deposits from previous cycles (and by concurrent soak traffic),
+# i.e. it could pass with the post-restore pipeline completely dead. `$CNT` was
+# read from depositCount() immediately BEFORE the bridgeAsset call, so it is
+# this deposit's own deposit_cnt.
 deadline=$((SECONDS + 300))
 while :; do
-    READY=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=25&offset=0" 2>/dev/null \
-        | python3 -c "import json,sys; ds=json.load(sys.stdin).get('deposits',[]); print(any(d.get('ready_for_claim') for d in ds))" 2>/dev/null || echo err)
+    READY=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+        | CNT="$CNT" python3 -c "
+import json, os, sys
+want = int(os.environ['CNT'])
+ds = json.load(sys.stdin).get('deposits', [])
+mine = [d for d in ds if int(d.get('deposit_cnt', -1)) == want]
+if not mine:
+    print('absent')
+else:
+    print('True' if mine[0].get('ready_for_claim') else 'notready')
+" 2>/dev/null || echo err)
     [[ "$READY" == "True" ]] && break
-    (( SECONDS >= deadline )) && fail "post-restore deposit never ready_for_claim in 300s — pipeline dead after restore"
+    (( SECONDS >= deadline )) && fail "post-restore deposit_cnt=$CNT to $DEST never became ready_for_claim in 300s (last state: $READY) — pipeline dead after restore"
     sleep 5
 done
-pass "post-restore deposit ready_for_claim"
+pass "post-restore deposit_cnt=$CNT ready_for_claim (exact deposit, not any-of-the-page)"
 
 # PR#164 re-review — compare COUNT to COUNT. `INJ1` is the injected-set MD5 from
 # `fingerprint()`, not a number: `[[ "$INJ2" -gt "$INJ1" ]]` compared an integer to
