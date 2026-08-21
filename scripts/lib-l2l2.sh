@@ -767,7 +767,7 @@ _pf_l1ger_readable() {
         # indexer" reading was a population veto this check has no basis to
         # make; whether the synchronizer is alive is asserted separately by the
         # freshness and sync-lag checks.
-        _pf_pass "bridge-service exit_root readable and empty on both networks (no GER events yet — the synchronizer's liveness is asserted by the freshness/lag checks)"
+        _pf_pass "bridge-service exit_root readable and empty on both networks (zero indexed rows; this check does not establish WHY — the synchronizer's liveness is asserted by the freshness/lag checks)"
     else
         _pf_pass "bridge-service exit_root readable (L1 $n_l1 / L2 $n_l2 rows). NOTE: proof-serving consistency is NOT asserted here — see docs/development/followups-h6-evidence-provenance.md"
     fi

@@ -49,83 +49,62 @@ log() { echo "[$(date '+%H:%M:%S')] claimtxman-heal: $*"; }
 # nothing to heal" and exit 0 on an error, and made the post-heal checks pass
 # on unreadable state. Now: errors abort the statement, stderr is captured, and
 # a failed query is a failed query.
-PSQL_ERR=""
+# FAIL-CLOSED SQL, with diagnostics that survive.
+#
+# Two earlier attempts lost the evidence on a path that DELETES state: the
+# error text was set inside a `$( )`/pipeline SUBSHELL and discarded, and a
+# temp-file hop then swallowed the log lines and returned success on an
+# unchecked read. The fix is to stop routing diagnostics through stdout at all:
+# VALUES go to stdout (so `v=$(psql_num ...)` captures them), DIAGNOSTICS go to
+# stderr (so nothing can capture them by accident and they always reach the
+# operator).
+logerr() { echo "[$(date '+%H:%M:%S')] claimtxman-heal: $*" >&2; }
+
+# Prints the query result on stdout; on failure prints psql's own error on
+# stderr and returns non-zero.
 psql_b() {
-    local out rc
-    out=$(docker exec "$PG_C" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX -c "$1" 2>&1)
-    rc=$?
+    local out rc=0
+    out=$(docker exec "$PG_C" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=1 -tAX -c "$1" 2>&1) || rc=$?
     if [[ $rc -ne 0 ]]; then
-        PSQL_ERR="$out"
+        logerr "FATAL: query failed (rc=$rc): $1"
+        logerr "       psql said: ${out//$'\n'/ }"
         return $rc
     fi
-    PSQL_ERR=""
     printf '%s' "$out"
 }
-# Numeric-or-die: every count this script branches on must be a number that
-# actually came back from the database.
-#
-# The exit status is the contract, NOT an `exit` inside the function: callers
-# use `x=$(psql_num ...)`, which runs the function in a SUBSHELL, so an `exit`
-# there kills only the substitution and the script sails on with an empty
-# value — the exact fail-open shape this helper exists to prevent (and the
-# script has no `set -e` to catch it). Every call site must therefore be
-# written `x=$(psql_num ...) || exit 1`, which `psql_die` enforces below.
+
+# Numeric-or-die. Value on stdout, diagnostics on stderr, non-zero on failure.
 psql_num() {
-    local v raw
-    # NOT `psql_b ... | tr`: a pipeline runs psql_b in a SUBSHELL, so the
-    # PSQL_ERR it sets is discarded and the operator is told only that
-    # something failed. Capture first, strip second.
-    raw=$(psql_b "$1") || {
-        log "FATAL: query failed: $1"
-        log "       psql said: ${PSQL_ERR:-<no output>}"
-        return 1
-    }
+    local raw v rc=0
+    raw=$(psql_b "$1") || return $?
     v=$(printf '%s' "$raw" | tr -d '[:space:]')
-    [[ "$v" =~ ^[0-9]+$ ]] || {
-        log "FATAL: query did not return a number (got '${v}'): $1"
-        return 1
-    }
+    if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+        logerr "FATAL: query did not return a number (got '${v}'): $1"
+        return 64
+    fi
     printf '%s' "$v"
+    return $rc
 }
 
-# Assign-or-abort. Usage: psql_die VAR "SELECT ..."
-# Runs the query in THIS shell's context for the abort decision, so a failure
-# really does stop the script.
+# Assign-or-abort: `psql_die VAR "SELECT ..."`.
+#
+# `x=$(psql_num ...)` alone is not enough — call sites must abort the REAL
+# shell, and this script has no `set -e`, so an `exit` inside the function
+# would only kill the substitution. The value is captured here and the status
+# checked explicitly; diagnostics already went to stderr, so nothing is hidden
+# by the substitution.
 psql_die() {
     local __var="$1" __sql="$2" __val __rc=0
-    # psql_num's diagnostics go to STDOUT via log(), and `$( )` would swallow
-    # them along with the value — leaving the operator with a bare "aborting"
-    # and no failing query or PostgreSQL error. Send the value to a temp file so
-    # the diagnostics stay on the terminal.
-    local __tmp; __tmp=$(mktemp)
-    psql_num "$__sql" > "$__tmp" || __rc=$?
+    __val=$(psql_num "$__sql") || __rc=$?
     if [[ $__rc -ne 0 ]]; then
-        rm -f "$__tmp"
-        log "       aborting: this script deletes state and must never proceed on unreadable data"
+        logerr "       aborting: this script deletes state and must never proceed on unreadable data"
         exit 1
     fi
-    __val=$(cat "$__tmp"); rm -f "$__tmp"
+    if [[ ! "$__val" =~ ^[0-9]+$ ]]; then
+        logerr "FATAL: internal: psql_num returned success with a non-numeric value '${__val}'"
+        exit 1
+    fi
     printf -v "$__var" '%s' "$__val"
-}
-
-# STRING MATCHING — deliberate, and the only option here. The subject is
-# zkevm-bridge-service, a separate Go process: it exposes no typed error, no
-# metric and no table column for "this send was rejected on nonce", so its log
-# is the only channel. The patterns are quoted from its own classifier,
-# `isNonceError` in claimtxman (matches "nonce too low" / "invalid nonce" /
-# "txnonce"), plus the "nonce mismatch for" line its sender emits; they are the
-# strings that component both produces and reacts to. If it ever grows a
-# structured signal, switch to it.
-# Prints the count, or FAILS (non-zero) if the log could not be read at all.
-# `docker logs | grep -c || true` turned an unreadable log into the string "0",
-# which the quiet-state check reads as "no nonce errors" — a dead container and
-# a healthy one produce the identical answer.
-nonce_error_lines() {
-    local out
-    out=$(docker logs --since "${1}s" "$SVC_C" 2>&1) || return 1
-    printf '%s' "$out" \
-        | grep -cE "nonce too low|nonce too high|invalid nonce|txnonce|nonce mismatch for" \
-        || true
 }
 
 docker inspect "$SVC_C" >/dev/null 2>&1 || { log "container $SVC_C not found"; exit 1; }

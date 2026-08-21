@@ -412,17 +412,19 @@ if true; then
             # Quiet stack with nothing to inject: the caller has said it will
             # prove liveness itself (the drill's own post-heal GER leg).
             if [ "${NO_TARGET:-0}" = "1" ]; then
-                # No wait happened — there was nothing to wait FOR. Reporting
-                # "within ${CONFIRM_TIMEOUT}s" here would describe a
-                # confirmation window that never ran.
-                log "no pending injection existed to confirm against (no wait performed) and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
+                # No wait happened — there was no exact target to wait FOR.
+                # Reporting "within ${CONFIRM_TIMEOUT}s" would describe a
+                # confirmation window that never ran; and this says NO TARGET
+                # WAS EXTRACTED from the 25s log window, which is not the same
+                # as proving no injection was pending.
+                log "no exact injection target was extracted from the post-heal log window (no wait performed) and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
             else
                 log "no injection observed within ${waited}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
             fi
             PROOF_DEFERRED=1
         else
             if [ "${NO_TARGET:-0}" = "1" ]; then
-                fail_soft "no pending injection existed to confirm against (no wait performed) — no positive proof the injection pipeline recovered"
+                fail_soft "no exact injection target was extracted from the post-heal log window (no wait performed) — no positive proof the injection pipeline recovered"
             else
                 fail_soft "the exact target ${TARGET_TX} was not durably admitted within ${waited}s — no positive proof the injection pipeline recovered"
             fi

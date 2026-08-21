@@ -744,10 +744,20 @@ print(next((str(d.get('global_index','')) for d in ds
             if str(d.get('tx_hash','')).lower() == want and int(d.get('network_id', -1)) == 0), ''))
 " 2>/dev/null || echo "")
 [[ -n "$CLAIM_GI" ]] || fail "could not read the global index of our deposit (tx $LIVE_TX) to verify the claim was not a note-less short-circuit"
-UNCLAIMABLE=$(pgq "SELECT count(*) FROM unclaimable_claims WHERE global_index = '$(printf '0x%x' "$CLAIM_GI" 2>/dev/null || echo "$CLAIM_GI")' OR global_index = '$CLAIM_GI'")
+# global_index is a U256 and routinely exceeds 64 bits (a Miden-destined
+# deposit starts at 2^64). `printf '0x%x'` CLAMPS those to 0xffffffffffffffff
+# and still exits 0 — with only a warning on stderr — so the hex form never
+# matched the stored value and this gate silently passed every time, which is
+# precisely the false "money moved" it exists to prevent. Convert with
+# arbitrary precision, and refuse to guess if the value is not a plain decimal.
+[[ "$CLAIM_GI" =~ ^[0-9]+$ ]] \
+    || fail "global index '$CLAIM_GI' is not a decimal integer — cannot verify the claim against unclaimable_claims"
+CLAIM_GI_HEX=$(python3 -c 'import sys; print(hex(int(sys.argv[1])))' "$CLAIM_GI") \
+    || fail "could not convert global index '$CLAIM_GI' to hex"
+UNCLAIMABLE=$(pgq "SELECT count(*) FROM unclaimable_claims WHERE global_index IN ('$CLAIM_GI_HEX', '$CLAIM_GI')")
 [[ "$UNCLAIMABLE" == "0" ]] \
     || fail "our deposit (gi=$CLAIM_GI) has a claim tx ($CLAIM_TX) but is recorded in unclaimable_claims — that is the RD-860 note-less short-circuit: an event was emitted and NO asset moved (#103)"
-pass "post-restore claim SETTLED for our deposit: claim_tx=$CLAIM_TX, gi=$CLAIM_GI, no unclaimable_claims row (a real claim, not a note-less short-circuit)"
+pass "post-restore claim SETTLED for our deposit: claim_tx=$CLAIM_TX, gi=$CLAIM_GI ($CLAIM_GI_HEX), no unclaimable_claims row (a real claim, not a note-less short-circuit)"
 
 # PR#164 re-review — compare COUNT to COUNT. `INJ1` is the injected-set MD5 from
 # `fingerprint()`, not a number: `[[ "$INJ2" -gt "$INJ1" ]]` compared an integer to
