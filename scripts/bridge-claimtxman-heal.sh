@@ -107,6 +107,28 @@ psql_die() {
     printf -v "$__var" '%s' "$__val"
 }
 
+# STRING MATCHING — deliberate, documented, and the only channel available.
+# The subject is zkevm-bridge-service, a separate Go process: it exposes no
+# typed error, no metric and no table column for "this send was rejected on
+# nonce", so its log is the only signal. The patterns are quoted from that
+# component's OWN classifier (`isNonceError` in claimtxman: "nonce too low" /
+# "invalid nonce" / "txnonce") plus the "nonce mismatch for" line its sender
+# emits — the strings it both produces and reacts to. Used ONLY to decide
+# whether a wedge exists in the non-FORCE precheck; it is never used to certify
+# a heal as successful (that shape was removed). Restore a typed signal here if
+# upstream ever grows one.
+#
+# Prints the count on stdout; FAILS (non-zero) if the log could not be read at
+# all, because "0 errors" and "cannot read the log" are the same string
+# otherwise — and a dead container produces both.
+nonce_error_lines() {
+    local out
+    out=$(docker logs --since "${1}s" "$SVC_C" 2>&1) || return 1
+    printf '%s' "$out" \
+        | grep -cE "nonce too low|nonce too high|invalid nonce|txnonce|nonce mismatch for" \
+        || true
+}
+
 docker inspect "$SVC_C" >/dev/null 2>&1 || { log "container $SVC_C not found"; exit 1; }
 docker inspect "$PG_C" >/dev/null 2>&1 || { log "postgres container $PG_C not found"; exit 1; }
 

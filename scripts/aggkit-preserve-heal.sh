@@ -366,7 +366,11 @@ if true; then
     # the negative gates and defer positive proof to live traffic (the loop's
     # next N=30 leg hard-fails if GER injection is actually broken).
     if [ -z "$TARGET_TX" ]; then
-        log "no pending injection observed post-heal (wedge-pair absent, service stable) — positive admission proof deferred to live traffic"
+        # States what was OBSERVED: the wedge-paired log line carried no
+        # extractable injection id in this window. That is not the same as
+        # proving no injection was pending, and the rest of this script's
+        # evidence must not read as though it were.
+        log "no exact injection id could be extracted from the post-heal log window (wedge-pair absent, service stable) — positive admission proof deferred to live traffic"
     fi
     [ -z "$TARGET_TX" ] || [ "$TARGET_TX" = "$WEDGE_TX" ] \
         || log "pending injection superseded the wedged id: waiting on ${TARGET_TX:0:18}… (was ${WEDGE_TX:0:18}…)"
@@ -453,7 +457,7 @@ if [ "${PROOF_DEFERRED:-0}" = "1" ]; then
     # proved the injection pipeline actually resumed — the caller asked to
     # prove that itself. Say so, and exit with a DISTINCT code so a future
     # caller cannot read this as a confirmed heal by checking `rc == 0`.
-    log "preserve-healed but UNPROVEN (manifest=$manifest_count files restored+content-verified, $POISON wiped, service running with restarts stable at $NOW_RESTARTS; NO injection observed — the caller must prove the pipeline)"
+    log "preserve-healed but UNPROVEN (manifest=$manifest_count files restored+content-verified, $POISON wiped, service running with restarts stable at $NOW_RESTARTS; no injection was CONFIRMED here — the caller must prove the pipeline)"
     exit 3
 fi
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"
