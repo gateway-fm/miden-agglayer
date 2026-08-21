@@ -530,19 +530,6 @@ fn l1_evidence_catch_up_budget() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Round-2 review #6 — bind persisted GER corroboration to the L1 it came from.
-///
-/// `ger_entries` rows and the evidence cursor record that a root was OBSERVED,
-/// never on which chain. Repoint the same database at a different L1, a
-/// re-genesised devnet, or a redeployed GER manager and every historic row is
-/// still consulted as corroboration — so under strict H6 a GER could be
-/// admitted on evidence gathered somewhere else entirely, which is precisely
-/// what H6 exists to prevent.
-///
-/// First boot with an L1 configured records the identity; later boots compare.
-/// A mismatch is a refusal: continuing would serve corroboration that means
-/// nothing, and the operator's intent (new chain vs wrong config) cannot be
-/// guessed from here.
 fn check_h6_backfill_invariant(
     reject_unverified_ger: bool,
     require_hardening: bool,
@@ -1126,82 +1113,31 @@ async fn main() -> anyhow::Result<()> {
             result.logs_created,
         );
 
-        // FINDING #113 — READINESS, not just data. The store we just rebuilt
-        // also holds the L1 evidence index that audit-H6 consults before
-        // accepting a GER injection. Leaving it empty meant the operator's
-        // next step (start the proxy) produced a process that SERVES while
-        // still blind to L1: H6 correctly refused every injection until the
-        // background indexer caught up, and aggkit's ethtxmanager turned that
-        // transient refusal into a permanent GER-injection freeze via its
-        // deterministic-ID dedup (measured: refusal at 23:07:18, evidence
-        // arrived 23:07:21 — three seconds too late, frozen until a manual
-        // heal). Catch up synchronously HERE so `--restore` exits only when
-        // the proxy would be correct immediately on boot.
+        // FINDING #113 is enforced on the SERVING path, not here.
         //
-        // Non-fatal by design: the restore itself succeeded and its data is
-        // durable. A catch-up failure (unreachable L1, bad address) must not
-        // discard that work — it degrades to the old lazy behaviour and says
-        // so loudly, which is strictly better than failing a completed
-        // restore.
-        if let (Some(l1_rpc_url), Some(ger_addr_str)) =
-            (command.l1_rpc_url.clone(), command.ger_l1_address.clone())
-        {
-            match ger_addr_str.parse::<alloy::primitives::Address>() {
-                Ok(ger_addr) => {
-                    let mut indexer =
-                        miden_agglayer_service::l1_info_tree_indexer::L1InfoTreeIndexer::new(
-                            l1_rpc_url,
-                            ger_addr,
-                            store.clone(),
-                        )
-                        .with_evidence_tag(l1_evidence_tag);
-                    if let Some(from_block) = command.l1_indexer_from_block {
-                        indexer = indexer.with_from_block_override(from_block);
-                    }
-                    match indexer
-                        .catch_up_to_head(l1_evidence_catch_up_budget())
-                        .await
-                    {
-                        Ok(outcome) if outcome.converged => tracing::info!(
-                            l1_evidence_block = outcome.last_processed,
-                            passes = outcome.passes,
-                            "restore: L1 evidence index caught up — GER injections will be \
-                             accepted immediately on the next boot (#113)"
-                        ),
-                        Ok(outcome) if outcome.skipped_no_frontier => tracing::info!(
-                            "restore: no L1 evidence frontier configured (empty cursor, no \
-                             --l1-indexer-from-block) — nothing to catch up. Under strict H6 the \
-                             next boot will refuse to start until --l1-indexer-from-block is set."
-                        ),
-                        Ok(outcome) => tracing::warn!(
-                            l1_evidence_block = outcome.last_processed,
-                            l1_head = outcome.head,
-                            lag_blocks = outcome.lag(),
-                            passes = outcome.passes,
-                            "restore: L1 evidence catch-up did NOT converge within its budget — \
-                             the restore data is intact and the index is partial. The next boot \
-                             completes it (strict H6 waits for it before serving)."
-                        ),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "restore: L1 evidence catch-up FAILED — the restore data is intact, \
-                             but the index is incomplete. Under strict H6 the next boot blocks on \
-                             the same catch-up before serving, so this degrades startup latency \
-                             rather than correctness (#113)."
-                        ),
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    address = %ger_addr_str,
-                    "restore: unparsable GER L1 address — skipping L1 evidence catch-up (#113)"
-                ),
-            }
-        } else {
-            tracing::info!(
-                "restore: no L1 RPC / GER address configured — skipping L1 evidence catch-up"
-            );
-        }
+        // An earlier version of this fix ran the L1 evidence catch-up at the end
+        // of the restore one-shot so the proxy would boot already-ready. That is
+        // a latency optimisation, and it came at a cost base does not pay: the
+        // catch-up WRITES evidence (set_ger_exit_roots marks rows verified) and
+        // advances the shared cursor. Base's restore never touches the evidence
+        // index, so a restore accidentally pointed at the wrong L1 leaves the
+        // index correctable; with the writer here it does not — B-evidence is
+        // already durable and strict-H6-authorizing before the operator can fix
+        // the configuration.
+        //
+        // Binding evidence to its source would make the writer safe, but that
+        // needs a provenance state machine of its own (see
+        // docs/development/followups-h6-evidence-provenance.md). Until then the
+        // honest trade is to keep restore out of the evidence business
+        // entirely: the strict-H6 readiness barrier on the serving path already
+        // runs the same bounded catch-up BEFORE binding the listener, so the
+        // window #113 identified (serving while blind to L1) stays closed. The
+        // only difference is that the catch-up happens on the next boot instead
+        // of at the end of this one.
+        tracing::info!(
+            "restore: complete. L1 evidence catch-up runs on the next boot — under strict H6 the \
+             serving path blocks on it before accepting traffic (#113)."
+        );
 
         client.shutdown()?;
         return Ok(());

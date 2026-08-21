@@ -44,6 +44,11 @@ Requirements for a correct fix:
 * Schema changes go in a NEW migration. The migrator rejects a changed checksum
   for an already-applied migration, so editing one in place bricks any database
   that ran the earlier version.
+* **Migration names `023` and `024` are BURNED.** Intermediate commits of this
+  branch applied files under both names, and those databases still carry the
+  applied-migration rows. Start at `025`, and have the migration tolerate
+  schema objects left behind by the reverted attempt (`l1_evidence_source`, and
+  a `cursor_inherited_from_legacy` column on `l1_indexer_state`).
 
 ## 2. The `latest` policy binding inherits an unverified cursor
 

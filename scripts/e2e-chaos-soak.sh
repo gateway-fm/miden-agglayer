@@ -275,14 +275,32 @@ sleep "$POST_CHAOS_SETTLE"
 POST_STORM_DOWN=""
 _L2B_OVERLAY=0
 [[ -f "$REPO/docker-compose.l2l2.yml" ]] && _L2B_OVERLAY=1
-for svc in miden-agglayer aggkit bridge-service miden-node ntx-builder; do
-    if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
-        st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null)
-        [[ "$st" == "running" ]] || POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"
-    else
-        # A container that is GONE is the loudest failure, not an absent one.
-        POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
+# One snapshot rule for every service. The core loop used to be status-only
+# with a second inspect call (so a race rendered `svc=` instead of typed
+# evidence) and ignored the proxy's own healthcheck.
+_snapshot_service() {   # <service>  -> appends to POST_STORM_DOWN when not OK
+    local svc="$1" insp st health
+    if ! docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
+        [[ "$2" == "required" ]] && POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
+        return
     fi
+    insp=$(docker inspect \
+        -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        "${PROJECT}-${svc}-1" 2>/dev/null) || insp=""
+    if [[ -z "$insp" ]]; then
+        POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=INSPECT-FAILED"
+        return
+    fi
+    read -r st health <<<"$insp"
+    case "$st:$health" in
+        running:healthy|running:none) ;;
+        running:starting) POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=health-starting" ;;
+        running:*)        POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=running-but-${health}" ;;
+        *)                POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}" ;;
+    esac
+}
+for svc in miden-agglayer aggkit bridge-service miden-node ntx-builder; do
+    _snapshot_service "$svc" required
 done
 # EVERY service l2l2_ensure_stack can bring back must be in this snapshot,
 # not just the ones checked in the final verdict: anything it repairs while
@@ -295,45 +313,10 @@ done
 # fault the harness silently undid, so they belong in the snapshot too.
 for svc in aggkit-l2b bridge-service-l2b anvil-l2b postgres-l2b agglayer \
            anvil postgres tx-prover agglayer-postgres validator; do
-    if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
-        # Status AND health: `docker compose up` force-recreates a
-        # running-but-UNHEALTHY container, so recording only "running" lets the
-        # harness repair a service the storm broke and still be credited with
-        # self-recovery.
-        insp=$(docker inspect \
-            -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-            "${PROJECT}-${svc}-1" 2>/dev/null) || insp=""
-        if [[ -z "$insp" ]]; then
-            # Typed evidence, not an empty string: an inspect race must be
-            # readable in the verdict line rather than rendering as "svc=".
-            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=INSPECT-FAILED"
-        else
-            read -r st health <<<"$insp"
-            case "$st:$health" in
-                running:healthy|running:none)
-                    # `none` = this service defines no healthcheck (aggkit-l2b,
-                    # bridge-service-l2b, agglayer, tx-prover). "Running" is all
-                    # docker can tell us, so it is all we can assert here — the
-                    # functional post-op below is what actually proves those
-                    # services work, and it now exercises both L2<->L2
-                    # directions precisely because this signal is weak.
-                    ;;
-                running:starting)
-                    # Still inside its start period: not yet evidence of health,
-                    # and the harness is about to repair it either way.
-                    POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=health-starting"
-                    ;;
-                running:*)
-                    POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=running-but-${health}"
-                    ;;
-                *)
-                    POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}"
-                    ;;
-            esac
-        fi
-    elif [[ "$_L2B_OVERLAY" == "1" ]]; then
-        POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
-    fi
+    # Required only when the l2l2 overlay is in play; otherwise absence is
+    # simply "this stack does not run it".
+    if [[ "$_L2B_OVERLAY" == "1" ]]; then _snapshot_service "$svc" required
+    else _snapshot_service "$svc" optional; fi
 done
 say "=== (pre-verdict) fresh post-chaos operation (L1<->Miden + BOTH L2<->L2 directions) ==="
 say "    post-storm service state before any harness repair: ${POST_STORM_DOWN:-all running}"
