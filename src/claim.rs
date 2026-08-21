@@ -1200,9 +1200,15 @@ pub(crate) async fn publish_claim(
                 .await?
                 .is_some()
             {
+                // Same reasoning as the GER path: not rebuilding the note is
+                // right, but returning without reimporting leaves the stale
+                // local commitment that caused the rejection, so every retry
+                // fails identically. Reimport touches only local account state.
+                crate::account_recovery::reimport_known_accounts(client, &accounts.0).await;
                 tracing::error!(
                     eth_tx = %txn_hash, error = %err,
-                    "claim outcome is ambiguous after durable handoff; refusing to build a second note"
+                    "claim outcome is ambiguous after durable handoff; refusing to build a second \
+                     note (accounts reimported so the retry sees fresh state)"
                 );
                 return Err(err);
             }

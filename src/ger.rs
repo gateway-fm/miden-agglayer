@@ -415,9 +415,40 @@ pub async fn insert_ger(
                     .await?
                     .is_some()
                 {
+                    // Refusing to rebuild the note is correct — after the
+                    // durable handoff a second UpdateGerNote risks the #86
+                    // poison-note class. But returning here WITHOUT healing the
+                    // account left the actual cause in place: the local
+                    // commitment stays stale, so aggkit's retry (and every
+                    // retry after it) hits the identical rejection and GER
+                    // injection wedges on a condition whose cure we declined to
+                    // apply. Reimport is side-effect-free with respect to the
+                    // note — it only refreshes local account state — so it is
+                    // safe on the ambiguous path and makes the NEXT attempt the
+                    // one that succeeds.
+                    let ger_manager_id = accounts
+                        .0
+                        .ger_manager
+                        .as_ref()
+                        .map(|a| a.0)
+                        .unwrap_or(accounts.0.service.0);
+                    if let Err(heal_err) = crate::account_recovery::reimport_account(
+                        miden_client,
+                        ger_manager_id,
+                        "ger_manager",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %txn_hash, error = %heal_err,
+                            "GER submission: account reimport after an ambiguous handoff failed; \
+                             the next attempt will retry the heal"
+                        );
+                    }
                     tracing::error!(
                         %txn_hash, error = %err,
-                        "GER submission outcome is ambiguous after durable handoff; refusing to rebuild a second note"
+                        "GER submission outcome is ambiguous after durable handoff; refusing to \
+                         rebuild a second note (account reimported so the retry sees fresh state)"
                     );
                     return Err(err);
                 }
