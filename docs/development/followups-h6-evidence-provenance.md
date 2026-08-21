@@ -30,8 +30,11 @@ Requirements for a correct fix:
 * Persist a source fingerprint that includes an immutable chain checkpoint (the
   genesis block hash — chain id and contract address alone cannot see a
   re-genesis), the GER manager address, and the confirmation tag.
-* Verify it BEFORE any path that writes evidence, including the `--restore`
-  one-shot, which performs a full L1 scan.
+* Verify it BEFORE any path that writes evidence. Today the only such path is
+  the serving-side indexer (its startup barrier and its ticker): the
+  restore-time catch-up was REMOVED precisely because it wrote L1-derived
+  evidence without a source check, which base never does. If this work
+  reintroduces a restore-time scan, the source check must come first.
 * A database that already holds evidence but has no recorded source is the
   UPGRADE state. Recording the current configuration there is trust-on-first-use
   over data that predates the record: it must require an explicit operator

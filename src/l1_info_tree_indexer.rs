@@ -231,10 +231,14 @@ impl L1InfoTreeIndexer {
     /// seconds too late, and GER injection stayed frozen until manual
     /// intervention.
     ///
-    /// Running the catch-up as part of the restore closes that window: when
-    /// the one-shot exits 0, the evidence needed to accept injections is
-    /// already present, so the operator's next step (start the proxy) yields
-    /// a proxy that is correct immediately rather than eventually.
+    /// The window is closed on the SERVING path: under strict H6 startup runs
+    /// this catch-up as a readiness barrier before binding the listener, so the
+    /// proxy never serves while blind to L1. An earlier version also ran it at
+    /// the end of `--restore`, which was only a latency optimisation and cost
+    /// base parity — restore would then WRITE L1-derived evidence, which base
+    /// never does, so a wrongly pointed restore could contaminate a retained
+    /// database irreversibly. See
+    /// docs/development/followups-h6-evidence-provenance.md.
     pub async fn catch_up_to_head(&self, budget: Duration) -> anyhow::Result<CatchUp> {
         let started = Instant::now();
         let provider = ProviderBuilder::new().connect_http(

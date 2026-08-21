@@ -512,11 +512,10 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
 /// evaluated only after the store exists (well past the point where non-Copy
 /// command fields such as `miden_store_dir` have already been moved out), so the
 /// whole struct can no longer be borrowed.
-/// Wall-clock ceiling for a synchronous L1 evidence catch-up (restore one-shot
-/// and the strict-H6 startup readiness barrier).
+/// Wall-clock ceiling for the synchronous L1 evidence catch-up that the
+/// strict-H6 startup readiness barrier performs.
 ///
-/// Default 300s covers a normal boot (cursor already current: a couple of RPCs)
-/// and a restore on a test/devnet chain. A production backfill over millions of
+/// Default 300s covers a normal boot (cursor already current: a couple of RPCs). A production backfill over millions of
 /// L1 blocks needs a larger value — it is deliberately an explicit operator
 /// decision rather than an unbounded wait, because on a startup path an
 /// unbounded wait is indistinguishable from a hung process.

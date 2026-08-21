@@ -279,16 +279,21 @@ _L2B_OVERLAY=0
 # with a second inspect call (so a race rendered `svc=` instead of typed
 # evidence) and ignored the proxy's own healthcheck.
 _snapshot_service() {   # <service>  -> appends to POST_STORM_DOWN when not OK
-    local svc="$1" insp st health
-    if ! docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
-        [[ "$2" == "required" ]] && POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
-        return
-    fi
+    local svc="$1" insp err st health
+    # ONE inspect. Two calls meant the first failure was labelled MISSING
+    # whatever the cause — absence, a daemon hiccup, permissions — so a
+    # transient docker error read as "the storm destroyed this container".
+    # Distinguish by the error text docker itself uses for absence.
     insp=$(docker inspect \
         -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-        "${PROJECT}-${svc}-1" 2>/dev/null) || insp=""
-    if [[ -z "$insp" ]]; then
-        POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=INSPECT-FAILED"
+        "${PROJECT}-${svc}-1" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        err="$insp"
+        if [[ "$err" == *"No such object"* || "$err" == *"no such container"* ]]; then
+            [[ "$2" == "required" ]] && POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
+        else
+            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=INSPECT-FAILED"
+        fi
         return
     fi
     read -r st health <<<"$insp"
