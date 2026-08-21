@@ -56,8 +56,26 @@ log() { echo "[$(date '+%H:%M:%S')] preserve-heal($SVC): $*"; }
 # the container it is given, so an arbitrary compose service name here would
 # destroy something else entirely.
 case "$SVC" in
-    aggkit|aggkit-l2b) ;;
-    *) log "FATAL: '$SVC' is not a healable service (expected: aggkit | aggkit-l2b)"; exit 1 ;;
+    aggkit) ;;
+    aggkit-l2b)
+        # REFUSED, deliberately. Everything this script uses to decide and to
+        # PROVE a heal is wired to the BASE proxy: the wedge precheck and the
+        # positive-admission probe both read `$PROJECT-agglayer-postgres-1`,
+        # and the injected-GER counter it falls back to counts base injections.
+        # aggkit-l2b submits to anvil-l2b instead, so against it every healthy
+        # transaction is "unknown to the proxy" by construction AND unrelated
+        # base activity can certify a dead L2B aggoracle — a false positive
+        # where the honest answer is "this tool cannot tell".
+        #
+        # Supporting it needs an L2B-side admission probe and an L2B database
+        # handle; filed in docs/development/followups-h6-evidence-provenance.md.
+        log "REFUSED: this healer's wedge detection and positive proof both read the BASE proxy"
+        log "         database, while aggkit-l2b submits to anvil-l2b. Healing it from here would"
+        log "         decide and certify from the wrong chain. Restore L2B coverage by adding an"
+        log "         L2B-side admission probe (see docs/development/followups-h6-evidence-provenance.md)."
+        exit 1
+        ;;
+    *) log "FATAL: '$SVC' is not a healable service (expected: aggkit)"; exit 1 ;;
 esac
 
 docker inspect "$C" >/dev/null 2>&1 || { log "container $C not found"; exit 1; }
@@ -387,7 +405,7 @@ if true; then
         known=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
             "SELECT count(*) FROM transactions WHERE tx_hash='$TARGET_TX'" 2>/dev/null || echo "")
         if [ "${known:-0}" != "" ] && [ "${known:-0}" -gt 0 ] 2>/dev/null; then
-            confirmed=1
+            confirmed=1; CONFIRMED_BY=exact
             break
         fi
         # Any NEWLY injected GER proves the wedge cleared — the pending id can
@@ -405,7 +423,7 @@ if true; then
             now_injected=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
                 "SELECT count(*) FROM ger_entries WHERE is_injected" 2>/dev/null | tr -d '[:space:]')
             if [[ "${now_injected:-}" =~ ^[0-9]+$ ]] && [ "$now_injected" -gt "$PRE_INJECTED" ]; then
-                confirmed=1
+                confirmed=1; CONFIRMED_BY=counter
                 log "positive outcome: GER injections advanced ${PRE_INJECTED} -> ${now_injected} after the heal (pending id superseded ${TARGET_TX:0:18}…)"
                 break
             fi
@@ -429,8 +447,16 @@ if true; then
             fail_soft "no GER injection was admitted within ${CONFIRM_TIMEOUT}s (target ${TARGET_TX:-<none pending>}, injected count still ${PRE_INJECTED:-?}) — no positive proof the injection pipeline recovered"
         fi
     fi
-    [ -z "$TARGET_TX" ] \
-        || log "positive exact outcome: proxy durably admitted ${TARGET_TX:0:18}… after ${waited}s"
+    # Only claim the EXACT transaction when the exact-transaction check is what
+    # confirmed it. When the injected-GER counter fallback fired, a DIFFERENT
+    # (superseding) GER advanced it — saying "the proxy durably admitted
+    # TARGET_TX" there is simply false, and this file's log lines are read as
+    # evidence.
+    if [ "${CONFIRMED_BY:-}" = "exact" ] && [ -n "$TARGET_TX" ]; then
+        log "positive exact outcome: proxy durably admitted ${TARGET_TX:0:18}… after ${waited}s"
+    elif [ "${CONFIRMED_BY:-}" = "counter" ]; then
+        log "positive outcome: GER injections advanced after the heal (a superseding injection, not necessarily ${TARGET_TX:0:18}…)"
+    fi
 fi
 [ "${PROGRESS_MATCHES:-0}" -gt 0 ] \
     || fail_soft "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"

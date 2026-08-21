@@ -1259,9 +1259,11 @@ async fn main() -> anyhow::Result<()> {
                 // Catch up synchronously BEFORE serving, and refuse to serve if
                 // we cannot. Cost on a healthy boot is a couple of RPCs (the
                 // cursor is already current); the expensive case is exactly the
-                // one where serving early would be wrong. The restore one-shot
-                // runs the same catch-up, so a restored database normally
-                // arrives here already converged.
+                // one where serving early would be wrong. This is the ONLY
+                // place the catch-up runs: `--restore` deliberately defers it
+                // to the next boot rather than writing L1-derived evidence
+                // itself (see the restore path and
+                // docs/development/followups-h6-evidence-provenance.md).
                 let mut barrier_reached: Option<u64> = None;
                 if strict_h6 {
                     let budget = l1_evidence_catch_up_budget();

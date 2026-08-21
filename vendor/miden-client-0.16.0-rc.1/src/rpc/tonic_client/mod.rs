@@ -448,12 +448,33 @@ impl NodeRpcClient for GrpcClient {
             sealed_transaction_inputs: Some(sealed_transaction_inputs.into()),
         };
 
-        let api_response = self
-            .call_with_retry(RpcEndpoint::SubmitProvenTx, |mut rpc_api| {
-                let request = request.clone();
-                Box::pin(async move { rpc_api.submit_proven_tx(request).await })
-            })
-            .await?;
+        // VENDOR PATCH (miden-agglayer): submitting a proven transaction is NOT
+        // IDEMPOTENT, so it must not be auto-retried.
+        //
+        // `call_with_retry` transparently re-sends on Unavailable /
+        // ResourceExhausted. For a submission that is fatal in a way the caller
+        // cannot see: attempt 1 is ACCEPTED by the node but its response is lost
+        // as Unavailable, the client silently re-sends, and the node rejects the
+        // duplicate with a typed StateConflict. The caller then sees a
+        // deterministic "the node refused it" error and reasonably concludes
+        // nothing landed — so a bridge-out tool builds a fresh note and bridges
+        // the amount a SECOND time. The transport-retry history that would have
+        // revealed the ambiguity is discarded inside this function.
+        //
+        // Retrying transport failures is the caller's decision here, because
+        // only the caller can reconcile "did it land?" (see
+        // `submit_is_indeterminate` + the on-chain note probe in
+        // src/bin/bridge_out_tool.rs). Every OTHER endpoint keeps its retries:
+        // they are reads, and re-reading is free.
+        let rpc_api = self.ensure_connected().await?;
+        let api_response = {
+            let request = request.clone();
+            let mut rpc_api = rpc_api;
+            rpc_api
+                .submit_proven_tx(request)
+                .await
+                .map_err(|status| self.rpc_error_from_status(RpcEndpoint::SubmitProvenTx, status))?
+        };
 
         Ok(BlockNumber::from(api_response.into_inner().block_num))
     }

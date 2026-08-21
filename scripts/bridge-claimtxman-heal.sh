@@ -24,7 +24,13 @@
 #   FORCE=1        heal without the wedge precheck (drill epilogue uses this:
 #                  post-restore the stranded-nonce state is deterministic)
 #   PG_CONTAINER   override postgres container (default $PROJECT-postgres-1)
-# Returns 0 on heal (or clean no-op with FORCE=0), 1 on error.
+# Exit codes:
+#   0  healed, and the L1 sync cursor advanced (positive proof it recovered)
+#   1  error, or the service is not stably running afterwards
+#   3  wipe completed and the service is running, but NO local proof was
+#      available (a quiet stack moves no cursor). The CALLER must prove the
+#      claim pipeline. `set -e` callers must use
+#      `if ...; then rc=0; else rc=$?; fi` — a bare call exits before $? is read.
 set -uo pipefail
 
 PROJECT="${PROJECT:-${COMPOSE_PROJECT_NAME:-miden-agglayer}}"
@@ -192,9 +198,8 @@ log "cleared ${stranded:-0} stranded created tx(s); both monitored-tx tables ver
 #       no fresh nonce-error sends — the healthy-quiet shape.
 deadline=$(( $(date +%s) + ${HEAL_CONFIRM_TIMEOUT:-180} ))
 while :; do
-    # Liveness FIRST, for BOTH success shapes. A cursor that advanced while the
-    # container has since exited is not a healed service, and this branch used
-    # to exit 0 without ever looking.
+    # Liveness first, and continuously: a cursor that advanced while the
+    # container has since exited is not a healed service.
     svc_state=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}}' "$SVC_C" 2>/dev/null || echo "gone")
     if [[ "$svc_state" != "running false" ]]; then
         log "FATAL: $SVC_C is not stably running after the heal (state: $svc_state)"
@@ -202,32 +207,27 @@ while :; do
     fi
     psql_die cur "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0"
     if [[ "${cur:-0}" -gt "${l1_cursor_before:-0}" ]]; then
+        # The ONLY positive proof this healer can produce locally: the L1
+        # synchronizer — the component that was starving — made forward
+        # progress after the restart.
         log "positive outcome: L1 sync cursor advanced ${l1_cursor_before} -> ${cur} (service stably running)"
         exit 0
     fi
-    # Population guard: the query excludes the newest 2 network-1 rows as
-    # "still settling", so with <= 2 rows EVERY row is excluded and the count
-    # is 0 no matter how broken things are. Below that size there is no verdict
-    # to give, so the quiet-state shape must not be claimed.
-    psql_die n_l2_rows "SELECT count(*) FROM sync.exit_root WHERE network_id=1"
-    psql_die orphans "
-        SELECT count(*) FROM sync.exit_root l2
-        LEFT JOIN sync.exit_root l1
-          ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
-        WHERE l2.network_id=1 AND l1.id IS NULL
-          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)"
-    if ! fresh_err=$(nonce_error_lines 60); then
-        log "FATAL: cannot read $SVC_C logs to check for nonce errors — refusing to infer a quiet, healthy state from an unreadable log"
-        exit 1
-    fi
-    if [[ "$n_l2_rows" -le 2 ]]; then
-        log "quiet-state shape unavailable: only $n_l2_rows network-1 exit_root row(s), all inside the settling grace — cannot conclude consistency from this"
-    elif [[ "$orphans" -eq 0 && "$fresh_err" -eq 0 ]]; then
-        log "positive outcome: L1-GER join consistent (0 orphans) and no fresh nonce errors (quiet-stack shape; cursor ${l1_cursor_before} unchanged is event-sparse, not starvation)"
-        exit 0
-    fi
+    # The former "quiet state" success shape is GONE. It claimed health from
+    # (zero join orphans) + (no fresh nonce errors), and neither is evidence:
+    # the orphan query excluded the newest rows by RANK — rank is not age, so a
+    # row stuck indefinitely sits in that window forever — and a container that
+    # has just restarted has produced no errors yet precisely because it has
+    # produced nothing. Sampled right after the restart, a completely dead
+    # bridge-service satisfies both.
     [[ $(date +%s) -ge $deadline ]] && break
     sleep 5
 done
-log "UNCONFIRMED: neither cursor advance nor a consistent quiet state within ${HEAL_CONFIRM_TIMEOUT:-180}s (service left RUNNING; orphans=${orphans:-?} fresh_nonce_errs=${fresh_err:-?})"
-exit 1
+
+# No local proof available. Say so and exit with a DISTINCT code, so a caller
+# cannot read "healed" from `rc == 0`. sync.block records only event-bearing
+# blocks, so on a genuinely quiet stack the cursor legitimately does not move —
+# which is exactly why this is UNPROVEN rather than FAILED, and why the caller
+# (which can drive a claim and watch it land) must be the one to conclude.
+log "UNPROVEN: the monitored-tx wipe completed and $SVC_C is stably running, but no L1 sync progress was observed within ${HEAL_CONFIRM_TIMEOUT:-180}s. On a quiet stack that is expected (sync.block records only event-bearing blocks); the CALLER must prove the claim pipeline."
+exit 3

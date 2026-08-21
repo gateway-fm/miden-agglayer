@@ -556,11 +556,28 @@ step "Phase 4 — no ERR_GER_ALREADY_REGISTERED poison; pipeline processes NEW t
 # set, but `| tee` would otherwise mask the exit status, so capture it directly.
 [[ -x "$SCRIPT_DIR/bridge-claimtxman-heal.sh" ]] \
     || fail "bridge-claimtxman-heal.sh is missing/not executable — the #111 heal is required after a full DB loss"
-if ! PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 L1_RPC="$L1_RPC" \
+# rc 3 = "wipe done, service running, but no local proof was available" — the
+# expected outcome on a quiet post-restore stack, where sync.block records only
+# event-bearing blocks so the cursor legitimately does not move. This drill
+# proves the claim pipeline itself further down (the exact deposit reaching
+# ready_for_claim), which is what makes accepting 3 honest here rather than a
+# shrug. Any OTHER non-zero rc is a real failure.
+#
+# `set -e` is active, so a bare invocation would exit before $? is read.
+if PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 L1_RPC="$L1_RPC" \
         "$SCRIPT_DIR/bridge-claimtxman-heal.sh" >>"$EVIDENCE" 2>&1; then
-    tail -20 "$EVIDENCE" || true
-    fail "claimtxman heal FAILED (#111) — post-restore claims would be R4-rejected and the L1-GER index starved"
+    CTM_RC=0
+else
+    CTM_RC=$?
 fi
+case "$CTM_RC" in
+    0) say "claimtxman heal confirmed L1 sync progress" ;;
+    3) say "claimtxman heal completed the wipe; no local proof available (quiet stack) — this drill proves the claim pipeline below" ;;
+    *)
+        tail -20 "$EVIDENCE" || true
+        fail "claimtxman heal FAILED (#111, rc=$CTM_RC) — post-restore claims would be R4-rejected and the L1-GER index starved"
+        ;;
+esac
 
 # FINDING #113 (drill-caught 2026-08-19, RELEASE-REQUIRED): the restore heals
 # the proxy nonce ledger (#90) and the bridge-service claimtxman (#111) — but

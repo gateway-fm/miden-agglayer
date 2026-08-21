@@ -2,21 +2,21 @@
 # Unit tests for `_pf_l1ger_consistency` (scripts/lib-l2l2.sh).
 #
 # This preflight decides whether bridge-service can serve /merkle-proof for
-# net-1 deposits, and review found it wrong in BOTH directions, repeatedly:
-#   * PASS when its own query failed ("not readable yet — vacuous");
-#   * a "newest N are still settling" grace that swallowed the whole population
-#     when there were <= N rows, so it examined nothing and passed;
-#   * a "population grew, the standard check applies next time" branch that
-#     passed while EVERY row was unmatched — and there is no guaranteed next
-#     preflight;
-#   * `timeout <bash function>`, which exits 127 in production because timeout
-#     needs an EXECUTABLE. An earlier version of THIS TEST hid that by defining
-#     a `timeout` shell function, so the suite was green while every real
-#     preflight failed.
+# net-1 deposits. Review found it wrong in both directions, repeatedly:
+#   * PASS when its own query failed;
+#   * a "newest N still settling" grace that swallowed the whole population;
+#   * a "population grew" branch that passed while EVERY row was unmatched;
+#   * `timeout <bash function>` (exit 127 in production) — hidden because THIS
+#     TEST defined a `timeout` shell function;
+#   * an id-based identity rule defeated by reorg delete-and-replay;
+#   * bare failing assignments that abort under the real entrypoints' `set -e`
+#     before any typed failure line is printed.
 #
-# Because of that last one, the mock is a fake `docker` EXECUTABLE placed on
-# PATH — the real `timeout` runs, the real command composition runs, and only
-# the data is synthetic.
+# Hence two deliberate choices here:
+#   1. the mock is a fake `docker` EXECUTABLE on PATH, so the real `timeout` and
+#      the real command composition run — only the data is synthetic;
+#   2. the suite runs itself a SECOND time under `set -e` (errexit), because the
+#      production entrypoints do, and the earlier bugs were invisible without it.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,24 +27,24 @@ _pf_fail() { echo "  FAIL $*"; _PF_FAILS=$((_PF_FAILS + 1)); }
 COMPOSE_PROJECT_NAME=mock
 PF_GER_SETTLE_SECS=10
 
-# Pull in ONLY the two functions under test, from the real file.
 source <(sed -n '/^_pf_ger_probe_sql() {/,/^}/p;/^_pf_l1ger_consistency() {/,/^}/p' "$HERE/lib-l2l2.sh")
 
 MOCKDIR="$(mktemp -d)"
 trap 'rm -rf "$MOCKDIR"' EXIT
 cat > "$MOCKDIR/docker" <<'MOCK'
 #!/usr/bin/env bash
-# Fake `docker`: serves the scripted probe tuples. The ranked probe carries
-# "newest_rank"; the bootstrap count query does not.
+# Fake `docker`. MOCK_SEQ holds ';'-separated probe results; MOCK_RC forces a
+# non-zero exit (docker/timeout failure); the bootstrap count query is the one
+# without "servable".
 sql="$*"
-idx_file="$MOCK_IDX_FILE"
-if [[ "$sql" == *newest_rank* ]]; then
-    i=$(cat "$idx_file" 2>/dev/null || echo 0)
+if [[ -n "${MOCK_RC:-}" && "${MOCK_RC}" != "0" ]]; then
+    echo "Error: No such container: mockpg" >&2; exit "$MOCK_RC"
+fi
+if [[ "$sql" == *servable* ]]; then
+    i=$(cat "$MOCK_IDX_FILE" 2>/dev/null || echo 0)
     IFS=';' read -r -a seq <<< "$MOCK_SEQ"
-    last=$(( ${#seq[@]} - 1 ))
-    pick=$(( i < last ? i : last ))
-    printf '%s' "${seq[$pick]}"
-    echo $((i + 1)) > "$idx_file"
+    last=$(( ${#seq[@]} - 1 )); pick=$(( i < last ? i : last ))
+    printf '%s' "${seq[$pick]}"; echo $((i + 1)) > "$MOCK_IDX_FILE"
 else
     printf '%s' "${MOCK_L1:-5}"
 fi
@@ -52,48 +52,47 @@ MOCK
 chmod +x "$MOCKDIR/docker"
 PATH="$MOCKDIR:$PATH"
 export MOCK_IDX_FILE="$MOCKDIR/idx"
-
-# Speed: the settle loop sleeps between probes.
 sleep() { :; }
 
 RESULT=0
-# expect_case <pass|fail> <name> <probe tuples: pop|settled|total|maxid|minunmatched ...>
 expect_case() {
     local want="$1" name="$2"; shift 2
     local joined; printf -v joined '%s;' "$@"; export MOCK_SEQ="${joined%;}"
-    echo 0 > "$MOCK_IDX_FILE"
-    _PF_FAILS=0
-    # Run in THIS shell: _PF_FAILS is incremented by _pf_fail, and a command
-    # substitution would discard it in a subshell — the same trap that made
-    # psql_num's `exit 1` unable to stop its caller, and that made an earlier
-    # version of this test report every case as passing.
+    echo 0 > "$MOCK_IDX_FILE"; _PF_FAILS=0
+    # Run in THIS shell: a command substitution would discard _PF_FAILS.
     local out="$MOCKDIR/out"
     _pf_l1ger_consistency mockpg > "$out" 2>&1
     local got=pass; [[ "$_PF_FAILS" -gt 0 ]] && got=fail
-    if [[ "$got" == "$want" ]]; then
-        echo "PASS  $name (expected $want)"
-    else
-        echo "FAIL  $name — expected $want, got $got"
-        sed 's/^/        /' "$out"
-        RESULT=1
-    fi
+    if [[ "$got" == "$want" ]]; then echo "PASS  $name (expected $want)"
+    else echo "FAIL  $name — expected $want, got $got"; sed 's/^/        /' "$out"; RESULT=1; fi
 }
 
-# ── the probe must actually RUN (timeout + docker composition) ──────────────
-expect_case pass "healthy: every GER matched"                     "3|0|0|30|0"
-expect_case fail "settled row unmatched (real inconsistency)"     "9|3|3|90|10"
-expect_case fail "stuck row inside grace, nothing new arriving"   "2|0|1|20|20" "2|0|1|20|20"
-# The round-6 mock: population grows while everything stays unmatched.
-expect_case fail "growth with everything unmatched"               "1|0|1|10|10" "3|1|3|30|10"
-# The round-7 ambiguity: an OLD unmatched row drifting into the grace window
-# behind newer matched rows must NOT pass.
-expect_case fail "old unmatched row hides behind newer matched rows" "3|0|1|30|10" "4|0|1|40|10"
-# Genuinely new-and-pending: the unmatched row arrived AFTER we started.
-expect_case pass "only rows that arrived during settling are pending" "3|0|0|30|0" "4|0|1|40|40"
-MOCK_L1=7 expect_case pass "bootstrap: no net-1 rows, L1 side indexing" "0|0|0|0|0"
-MOCK_L1=0 expect_case fail "dead indexer: both networks empty"          "0|0|0|0|0"
-expect_case fail "malformed probe response"                       "not-a-tuple"
+expect_case pass "all servable GERs matched"                       "3|0"
+expect_case fail "a servable GER has no servable L1 row"           "9|3"
+expect_case fail "still unmatched after the settle window"         "2|1" "2|1"
+expect_case pass "unmatched resolves during settling"              "3|1" "3|0"
+MOCK_L1=7 expect_case pass "bootstrap: nothing servable yet, L1 indexing" "0|0"
+MOCK_L1=0 expect_case fail "dead indexer: nothing servable anywhere"      "0|0"
+expect_case fail "malformed probe response"                        "not-a-tuple"
+MOCK_L1=oops expect_case fail "malformed bootstrap response"       "0|0"
+MOCK_RC=1 expect_case fail "docker/psql failure is fail-closed"    "3|0"
+MOCK_RC=124 expect_case fail "timeout (rc 124) is fail-closed"     "3|0"
+unset MOCK_RC
 
 echo "──────────────────────────────────────────────"
 if [[ "$RESULT" == "0" ]]; then echo "L1-GER PREFLIGHT TESTS: ALL PASS"; else echo "L1-GER PREFLIGHT TESTS: FAILURES"; fi
+
+# ERREXIT PASS. Production runs `set -euo pipefail`; a bare failing assignment
+# inside the predicate would abort there while passing here. Re-exec the whole
+# suite under -e and require the same result.
+if [[ "${_PF_ERREXIT_PASS:-0}" != "1" ]]; then
+    echo ""
+    echo "── re-running the whole suite under errexit (production shell options) ──"
+    if _PF_ERREXIT_PASS=1 bash -e "$0"; then
+        echo "ERREXIT RE-RUN: ALL PASS"
+    else
+        echo "ERREXIT RE-RUN: FAILED — the predicate aborts under production shell options"
+        RESULT=1
+    fi
+fi
 exit "$RESULT"
