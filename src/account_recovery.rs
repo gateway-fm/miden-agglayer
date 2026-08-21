@@ -314,7 +314,9 @@ mod tests {
             endpoint: RpcEndpoint::SubmitProvenTx,
             error_kind: GrpcError::InvalidArgument,
             endpoint_error: Some(EndpointError::AddTransaction(
-                AddTransactionError::StateConflict { message: message.into() },
+                AddTransactionError::StateConflict {
+                    message: message.into(),
+                },
             )),
             source: None,
         }

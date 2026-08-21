@@ -875,8 +875,7 @@ mod tests {
     async fn catch_up_propagates_cursor_read_failure() {
         let store = Arc::new(InMemoryStore::new());
         store.fail_l1_evidence_cursor_reads(true);
-        let indexer =
-            test_indexer(store.clone() as Arc<dyn Store>).with_from_block_override(1_000);
+        let indexer = test_indexer(store.clone() as Arc<dyn Store>).with_from_block_override(1_000);
 
         let err = indexer
             .catch_up_to_head(Duration::from_secs(30))

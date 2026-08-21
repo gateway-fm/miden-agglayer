@@ -301,6 +301,97 @@ fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
 /// left the suite failure undiagnosable — the gRPC status (DeadlineExceeded /
 /// ResourceExhausted / Unavailable, each with retry guidance) lives in the
 /// source chain that only Debug formatting surfaces.
+/// Is this submission failure AMBIGUOUS — i.e. might the node have accepted the
+/// transaction even though we got an error?
+///
+/// This is the guard that decides whether it is safe to build a NEW B2AGG note
+/// and try again. Getting it wrong in the permissive direction double-bridges
+/// real funds, so it matches narrowly and by TYPE only:
+///
+/// * `RpcError::RequestError { endpoint: SubmitProvenTx, endpoint_error: None }`
+///   — the submit call itself failed at the transport layer (connection reset,
+///   deadline, stream closed). The node may have processed it before the
+///   response was lost. INDETERMINATE.
+/// * The same endpoint WITH an `endpoint_error` — the node answered with an
+///   application-level rejection (state conflict, expired, capacity). It
+///   processed and refused the transaction, so nothing landed. Determinate.
+/// * Any other endpoint (`GetBlockHeaderByNumber`, `SyncState`, …) — the
+///   failure happened while gathering inputs, before submission. Determinate.
+/// * Any non-RPC `ClientError` (proving, execution, store) — pre-submission by
+///   construction: `submit_new_transaction` proves before it submits, and a
+///   post-submit local failure has its own typed variant
+///   (`ApplyTransactionAfterSubmitFailed`, handled separately). Determinate.
+fn submit_is_indeterminate(err: &ClientError) -> bool {
+    use miden_client::rpc::{RpcEndpoint, RpcError};
+    matches!(
+        err,
+        ClientError::RpcError(RpcError::RequestError {
+            endpoint: RpcEndpoint::SubmitProvenTx,
+            endpoint_error: None,
+            ..
+        })
+    )
+}
+
+/// Does `note_id` exist on chain? Polls for up to `probe_secs`.
+///
+/// Used only after an INDETERMINATE submit, to tell "the node never got it"
+/// from "the node got it and we lost the answer". The B2AGG note is addressed
+/// to the bridge account, which this tool tracks, so once the transaction is in
+/// a block `sync_state` pulls the note into the local store and the scoped
+/// `List` query finds it.
+///
+/// Returns `Ok(false)` only after the full window elapsed with no sighting —
+/// deliberately longer than mempool-to-block latency, because a premature
+/// `false` is what causes a double bridge-out. A sync/store failure is
+/// propagated rather than reported as "absent": callers must be able to tell
+/// "proven absent" from "could not tell".
+async fn note_landed_on_chain(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    note_id: miden_protocol::note::NoteId,
+    probe_secs: u64,
+) -> anyhow::Result<bool> {
+    use miden_client::store::NoteFilter;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(probe_secs);
+    // Assigned by every arm below before it is read: `None` records a clean look
+    // at the chain (so expiry means "proven absent"), `Some` records that we
+    // never got one (so expiry means "unprovable, do not retry").
+    let mut last_err: Option<anyhow::Error>;
+    loop {
+        // A sync failure here is not evidence of absence; remember it and keep
+        // trying, and surface it if the window expires without a sighting.
+        match client.sync_state().await {
+            Ok(_) => {
+                let inputs = client
+                    .get_input_notes(NoteFilter::List(vec![note_id]))
+                    .await
+                    .context("probing input notes for an indeterminate B2AGG submit")?;
+                if !inputs.is_empty() {
+                    return Ok(true);
+                }
+                let outputs = client
+                    .get_output_notes(NoteFilter::List(vec![note_id]))
+                    .await
+                    .context("probing output notes for an indeterminate B2AGG submit")?;
+                if !outputs.is_empty() {
+                    return Ok(true);
+                }
+                last_err = None;
+            }
+            Err(e) => last_err = Some(anyhow!("sync during indeterminate-submit probe: {e:?}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return match last_err {
+                // The window closed on a failing sync: we never got a clean
+                // look at the chain, so we cannot claim the note is absent.
+                Some(e) => Err(e),
+                None => Ok(false),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 async fn sync_with_retry(
     client: &mut miden_agglayer_service::miden_client::MidenClientLib,
     label: &str,
@@ -1222,6 +1313,15 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(6);
+    // How long to keep probing for the note after an INDETERMINATE submit
+    // before concluding it never landed. Must comfortably exceed
+    // mempool-to-block latency, since the whole point is to avoid mistaking a
+    // not-yet-committed acceptance for a failure and bridging twice.
+    let probe_secs: u64 = std::env::var("B2AGG_INDETERMINATE_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(90);
     let mut tx_id = None;
     let mut submitted_note_id = None;
     for attempt in 1..=submit_attempts {
@@ -1309,25 +1409,87 @@ async fn main() -> anyhow::Result<()> {
                 );
                 std::process::exit(4);
             }
-            Err(e) if attempt < submit_attempts => {
-                let delay = (5u64 << (attempt - 1)).min(60);
-                eprintln!(
-                    "[bridge-out] submit attempt {attempt}/{submit_attempts} failed: {e:?}; \
-                     retrying in {delay}s (prover backpressure is the common cause)"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            }
             Err(e) => {
-                // Nothing was accepted on chain — a whole-op retry is SAFE.
-                // Exit 3 = "failed pre-submission, retryable" (script contract).
-                eprintln!("[bridge-out] submit failed after {submit_attempts} attempts: {e}");
-                std::process::exit(3);
+                // Every retry below BUILDS A NEW NOTE, which is only safe when
+                // the failed attempt provably never reached the node. If the
+                // node accepted the transaction and merely the response was
+                // lost, a retry bridges the amount a SECOND time.
+                //
+                // `submit_is_indeterminate` is the typed test for exactly that
+                // ambiguous case: a transport-level failure on the
+                // SubmitProvenTx endpoint. Everything else — proving
+                // backpressure, executor errors, RPC failures on other
+                // endpoints, and node-level REJECTIONS at submit (the node
+                // answered, so it did not accept) — is provably pre-acceptance
+                // and keeps the cheap immediate retry.
+                if submit_is_indeterminate(&e) {
+                    eprintln!(
+                        "[bridge-out] INDETERMINATE submit on attempt {attempt}/{submit_attempts}: \
+                         {e}. The node may have accepted this transaction — probing for note \
+                         {b2agg_note_id} before deciding (never blind-retry an ambiguous submit)."
+                    );
+                    match note_landed_on_chain(&mut client, b2agg_note_id, probe_secs).await {
+                        Ok(true) => {
+                            // The note IS on chain: the submit succeeded and
+                            // only its response was lost. Adopt it rather than
+                            // bridging a second time.
+                            println!(
+                                "[bridge-out] probe: note {b2agg_note_id} IS on chain — the \
+                                 ambiguous submit landed; adopting it (no second bridge-out)"
+                            );
+                            submitted_note_id = Some(b2agg_note_id);
+                            break;
+                        }
+                        Ok(false) => {
+                            // Absent for the whole probe window, which is far
+                            // longer than mempool-to-block latency: a genuine
+                            // pre-acceptance failure, so a retry is safe.
+                            eprintln!(
+                                "[bridge-out] probe: note {b2agg_note_id} is absent after \
+                                 {probe_secs}s — the submit did not land, retry is safe"
+                            );
+                        }
+                        Err(probe_err) => {
+                            // Unprovable either way. Fail closed with exit 4
+                            // ("may be submitted, DO NOT retry"): a wrong retry
+                            // double-bridges, a wrong stop only costs an
+                            // operator a look.
+                            eprintln!(
+                                "[bridge-out] INDETERMINATE-UNPROVABLE note={b2agg_note_id}: the \
+                                 submit outcome is unknown and the probe itself failed \
+                                 ({probe_err:#}). Refusing to retry — re-running this tool could \
+                                 bridge twice. Check whether note {b2agg_note_id} exists on chain \
+                                 before any manual retry."
+                            );
+                            std::process::exit(4);
+                        }
+                    }
+                }
+
+                if attempt < submit_attempts {
+                    let delay = (5u64 << (attempt - 1)).min(60);
+                    eprintln!(
+                        "[bridge-out] submit attempt {attempt}/{submit_attempts} failed: {e:?}; \
+                         retrying in {delay}s (prover backpressure is the common cause)"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                } else {
+                    // Nothing was accepted on chain — a whole-op retry is SAFE.
+                    // Exit 3 = "failed pre-submission, retryable" (script contract).
+                    eprintln!("[bridge-out] submit failed after {submit_attempts} attempts: {e}");
+                    std::process::exit(3);
+                }
             }
         }
     }
-    let tx_id = tx_id.expect("loop either sets tx_id or returns");
+    // An adopted ambiguous submit has a note but no TransactionId — the id was
+    // in the response we never received.
+    let tx_label = tx_id.map_or_else(
+        || "<adopted after an indeterminate submit; id unknown>".to_string(),
+        |id| id.to_string(),
+    );
 
-    println!("[bridge-out] transaction submitted: {tx_id}");
+    println!("[bridge-out] transaction submitted: {tx_label}");
 
     // Wait for the B2AGG to be CONSUMED on-chain (not merely accepted). Pacing
     // on tx acceptance alone lets a load test flood the bridge with in-flight
@@ -1361,7 +1523,7 @@ async fn main() -> anyhow::Result<()> {
             // parseable marker and exit 4 ("submitted, do not retry"); the
             // caller decides whether to keep waiting on the deposit downstream.
             eprintln!(
-                "[bridge-out] PENDING-CONSUMPTION note={note_id} tx={tx_id}: not consumed within {}s",
+                "[bridge-out] PENDING-CONSUMPTION note={note_id} tx={tx_label}: not consumed within {}s",
                 args.wait_consumed_secs
             );
             std::process::exit(4);
@@ -1389,4 +1551,92 @@ async fn main() -> anyhow::Result<()> {
     println!("[bridge-out] done");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::submit_is_indeterminate;
+    use miden_client::ClientError;
+    use miden_client::rpc::node::AddTransactionError;
+    use miden_client::rpc::{EndpointError, GrpcError, RpcEndpoint, RpcError};
+
+    fn request_error(
+        endpoint: RpcEndpoint,
+        error_kind: GrpcError,
+        endpoint_error: Option<EndpointError>,
+    ) -> ClientError {
+        ClientError::RpcError(RpcError::RequestError {
+            endpoint,
+            error_kind,
+            endpoint_error,
+            source: None,
+        })
+    }
+
+    /// The ONLY ambiguous case: the submit call failed at the transport layer,
+    /// so the node may have accepted the transaction before the response was
+    /// lost. Retrying here builds a second B2AGG note and bridges twice.
+    #[test]
+    fn transport_failure_on_submit_is_indeterminate() {
+        for kind in [
+            GrpcError::Unavailable,
+            GrpcError::DeadlineExceeded,
+            GrpcError::Internal,
+        ] {
+            let label = format!("{kind:?}");
+            assert!(
+                submit_is_indeterminate(&request_error(RpcEndpoint::SubmitProvenTx, kind, None)),
+                "a {label} transport failure on SubmitProvenTx must be treated as indeterminate"
+            );
+        }
+    }
+
+    /// The node ANSWERED with an application-level rejection — it processed the
+    /// transaction and refused it, so nothing landed and a retry is safe.
+    #[test]
+    fn node_rejection_at_submit_is_determinate() {
+        for endpoint_error in [
+            EndpointError::AddTransaction(AddTransactionError::StateConflict {
+                message: "transaction conflicts with current mempool state".into(),
+            }),
+            EndpointError::AddTransaction(AddTransactionError::Expired),
+            EndpointError::AddTransaction(AddTransactionError::CapacityExceeded),
+        ] {
+            assert!(
+                !submit_is_indeterminate(&request_error(
+                    RpcEndpoint::SubmitProvenTx,
+                    GrpcError::InvalidArgument,
+                    Some(endpoint_error),
+                )),
+                "a node-level rejection means the node did not accept the transaction"
+            );
+        }
+    }
+
+    /// Failures on other endpoints happen while gathering inputs, i.e. before
+    /// anything is submitted.
+    #[test]
+    fn failures_on_other_endpoints_are_determinate() {
+        for endpoint in [
+            RpcEndpoint::SyncNotes,
+            RpcEndpoint::GetBlockHeaderByNumber,
+            RpcEndpoint::GetAccount,
+        ] {
+            let label = format!("{endpoint:?}");
+            assert!(
+                !submit_is_indeterminate(&request_error(endpoint, GrpcError::Unavailable, None)),
+                "{label} is not the submission call — the transaction was never sent"
+            );
+        }
+    }
+
+    /// Non-RPC client errors are pre-submission by construction (proving and
+    /// execution both precede the submit call), and the post-submit local
+    /// failure has its own variant handled elsewhere.
+    #[test]
+    fn non_rpc_client_errors_are_determinate() {
+        assert!(!submit_is_indeterminate(&ClientError::RpcError(
+            RpcError::DeserializationError("bad response".into())
+        )));
+    }
 }

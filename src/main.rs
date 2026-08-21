@@ -1145,7 +1145,10 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(from_block) = command.l1_indexer_from_block {
                         indexer = indexer.with_from_block_override(from_block);
                     }
-                    match indexer.catch_up_to_head(l1_evidence_catch_up_budget()).await {
+                    match indexer
+                        .catch_up_to_head(l1_evidence_catch_up_budget())
+                        .await
+                    {
                         Ok(outcome) if outcome.converged => tracing::info!(
                             l1_evidence_block = outcome.last_processed,
                             passes = outcome.passes,

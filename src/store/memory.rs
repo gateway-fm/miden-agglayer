@@ -196,6 +196,7 @@ pub struct InMemoryStore {
     // latter is a fresh database, the former is an unknown state, and treating
     // one as the other restarts the L1 evidence scan at the head and abandons
     // every block of evidence below it.
+    #[cfg(test)]
     fail_l1_evidence_cursor_reads: RwLock<bool>,
 
     // Canonical EvidenceTag that produced the persisted selected-scan state.
@@ -279,6 +280,7 @@ impl InMemoryStore {
             reconcile_cursor: RwLock::new(0),
             nonce_ledger_rebuilt: RwLock::new(false),
             l1_evidence_cursor: RwLock::new(0),
+            #[cfg(test)]
             fail_l1_evidence_cursor_reads: RwLock::new(false),
             l1_evidence_policy: RwLock::new(None),
             tx_note_links: RwLock::new(HashMap::new()),
