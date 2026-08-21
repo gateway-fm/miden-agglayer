@@ -761,7 +761,13 @@ _pf_l1ger_readable() {
     if [[ ! "$n_l1" =~ ^[0-9]+$ || ! "$n_l2" =~ ^[0-9]+$ ]]; then
         _pf_fail "bridge-service exit_root count returned '$out', not a pair of numbers"
     elif [[ "$n_l1" -eq 0 && "$n_l2" -eq 0 ]]; then
-        _pf_fail "bridge-service sync.exit_root is EMPTY for BOTH networks — the synchronizer has indexed nothing"
+        # NOT a failure. sync.exit_root only gains rows when GER events occur,
+        # and the pinned synchronizer walks eventless ranges perfectly happily —
+        # a caught-up quiet stack legitimately has zero rows. The old "dead
+        # indexer" reading was a population veto this check has no basis to
+        # make; whether the synchronizer is alive is asserted separately by the
+        # freshness and sync-lag checks.
+        _pf_pass "bridge-service exit_root readable and empty on both networks (no GER events yet — the synchronizer's liveness is asserted by the freshness/lag checks)"
     else
         _pf_pass "bridge-service exit_root readable (L1 $n_l1 / L2 $n_l2 rows). NOTE: proof-serving consistency is NOT asserted here — see docs/development/followups-h6-evidence-provenance.md"
     fi

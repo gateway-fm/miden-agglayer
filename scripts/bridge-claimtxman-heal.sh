@@ -71,12 +71,16 @@ psql_b() {
 # script has no `set -e` to catch it). Every call site must therefore be
 # written `x=$(psql_num ...) || exit 1`, which `psql_die` enforces below.
 psql_num() {
-    local v
-    v=$(psql_b "$1" | tr -d '[:space:]') || {
+    local v raw
+    # NOT `psql_b ... | tr`: a pipeline runs psql_b in a SUBSHELL, so the
+    # PSQL_ERR it sets is discarded and the operator is told only that
+    # something failed. Capture first, strip second.
+    raw=$(psql_b "$1") || {
         log "FATAL: query failed: $1"
         log "       psql said: ${PSQL_ERR:-<no output>}"
         return 1
     }
+    v=$(printf '%s' "$raw" | tr -d '[:space:]')
     [[ "$v" =~ ^[0-9]+$ ]] || {
         log "FATAL: query did not return a number (got '${v}'): $1"
         return 1
@@ -88,11 +92,19 @@ psql_num() {
 # Runs the query in THIS shell's context for the abort decision, so a failure
 # really does stop the script.
 psql_die() {
-    local __var="$1" __sql="$2" __val
-    __val=$(psql_num "$__sql") || {
+    local __var="$1" __sql="$2" __val __rc=0
+    # psql_num's diagnostics go to STDOUT via log(), and `$( )` would swallow
+    # them along with the value — leaving the operator with a bare "aborting"
+    # and no failing query or PostgreSQL error. Send the value to a temp file so
+    # the diagnostics stay on the terminal.
+    local __tmp; __tmp=$(mktemp)
+    psql_num "$__sql" > "$__tmp" || __rc=$?
+    if [[ $__rc -ne 0 ]]; then
+        rm -f "$__tmp"
         log "       aborting: this script deletes state and must never proceed on unreadable data"
         exit 1
-    }
+    fi
+    __val=$(cat "$__tmp"); rm -f "$__tmp"
     printf -v "$__var" '%s' "$__val"
 }
 

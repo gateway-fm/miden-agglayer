@@ -675,7 +675,7 @@ say "liveness: bridgeAsset tx=$LIVE_TX (expected deposit_cnt≈$CNT on network 0
 # answering for it.
 deadline=$((SECONDS + 300))
 while :; do
-    READY=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+    READY=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
         | LIVE_TX="$LIVE_TX" python3 -c "
 import json, os, sys
 want = os.environ['LIVE_TX'].lower()
@@ -693,7 +693,7 @@ else:
     (( SECONDS >= deadline )) && fail "the post-restore deposit from tx $LIVE_TX (network 0, dest $DEST) never became ready_for_claim in 300s (last state: $READY) — pipeline dead after restore"
     sleep 5
 done
-DEPOSIT_CNT_SEEN=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+DEPOSIT_CNT_SEEN=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
     | LIVE_TX="$LIVE_TX" python3 -c "
 import json, os, sys
 want = os.environ['LIVE_TX'].lower()
@@ -710,8 +710,13 @@ pass "post-restore deposit from OUR tx $LIVE_TX (deposit_cnt=$DEPOSIT_CNT_SEEN, 
 # a real one: the claim transaction for OUR deposit must land.
 deadline=$((SECONDS + 600))
 CLAIM_TX=""
+CLAIM_GI=""
 while :; do
-    CLAIM_TX=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+    # --max-time: without a per-request bound, one accepted-but-stalled request
+    # holds the loop open forever and the deadline below is never evaluated —
+    # the drill would hang instead of naming the #111 shape. The pinned server
+    # sets no response deadline of its own.
+    CLAIM_TX=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
         | LIVE_TX="$LIVE_TX" python3 -c "
 import json, os, sys
 want = os.environ['LIVE_TX'].lower()
@@ -723,7 +728,26 @@ print(next((d.get('claim_tx_hash') or '' for d in ds
     (( SECONDS >= deadline )) && fail "the post-restore deposit from tx $LIVE_TX became ready_for_claim but was NEVER CLAIMED within 600s — the sponsor (claimtxman) is not settling claims, which is exactly the #111 shape both heals above were allowed to leave unproven"
     sleep 10
 done
-pass "post-restore claim SETTLED for our deposit: claim_tx=$CLAIM_TX (money moved, not merely indexed)"
+
+# A claim_tx_hash alone is NOT settlement. The RD-860 short-circuit accepts a
+# claim whose destination cannot be resolved and emits a note-less ClaimEvent —
+# the deposit gets a claim tx hash and no asset ever moves. A transient
+# mapping-store error can put a perfectly good destination on that path, so the
+# marker must be checked rather than assumed absent: the proxy records exactly
+# these in `unclaimable_claims`, keyed by global index.
+CLAIM_GI=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+    | LIVE_TX="$LIVE_TX" python3 -c "
+import json, os, sys
+want = os.environ['LIVE_TX'].lower()
+ds = json.load(sys.stdin).get('deposits', [])
+print(next((str(d.get('global_index','')) for d in ds
+            if str(d.get('tx_hash','')).lower() == want and int(d.get('network_id', -1)) == 0), ''))
+" 2>/dev/null || echo "")
+[[ -n "$CLAIM_GI" ]] || fail "could not read the global index of our deposit (tx $LIVE_TX) to verify the claim was not a note-less short-circuit"
+UNCLAIMABLE=$(pgq "SELECT count(*) FROM unclaimable_claims WHERE global_index = '$(printf '0x%x' "$CLAIM_GI" 2>/dev/null || echo "$CLAIM_GI")' OR global_index = '$CLAIM_GI'")
+[[ "$UNCLAIMABLE" == "0" ]] \
+    || fail "our deposit (gi=$CLAIM_GI) has a claim tx ($CLAIM_TX) but is recorded in unclaimable_claims — that is the RD-860 note-less short-circuit: an event was emitted and NO asset moved (#103)"
+pass "post-restore claim SETTLED for our deposit: claim_tx=$CLAIM_TX, gi=$CLAIM_GI, no unclaimable_claims row (a real claim, not a note-less short-circuit)"
 
 # PR#164 re-review — compare COUNT to COUNT. `INJ1` is the injected-set MD5 from
 # `fingerprint()`, not a number: `[[ "$INJ2" -gt "$INJ1" ]]` compared an integer to

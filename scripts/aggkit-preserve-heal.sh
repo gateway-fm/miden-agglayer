@@ -378,7 +378,8 @@ if true; then
     # aggregate-counter fallback. The wait below is meaningful only when an
     # exact TARGET_TX exists; otherwise it ends immediately as UNPROVEN and the
     # caller (which can drive an injection and watch it land) concludes.
-    [ -n "$TARGET_TX" ] || waited="$CONFIRM_TIMEOUT"
+    NO_TARGET=0
+    [ -n "$TARGET_TX" ] || { NO_TARGET=1; waited="$CONFIRM_TIMEOUT"; }
     while [ "$confirmed" -eq 0 ] && [ "$waited" -lt "$CONFIRM_TIMEOUT" ]; do
         known=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
             "SELECT count(*) FROM transactions WHERE tx_hash='$TARGET_TX'" 2>/dev/null || echo "")
@@ -410,10 +411,21 @@ if true; then
         if [ "${HEAL_ALLOW_DEFERRED_PROOF:-0}" = "1" ]; then
             # Quiet stack with nothing to inject: the caller has said it will
             # prove liveness itself (the drill's own post-heal GER leg).
-            log "no injection observed within ${CONFIRM_TIMEOUT}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
+            if [ "${NO_TARGET:-0}" = "1" ]; then
+                # No wait happened — there was nothing to wait FOR. Reporting
+                # "within ${CONFIRM_TIMEOUT}s" here would describe a
+                # confirmation window that never ran.
+                log "no pending injection existed to confirm against (no wait performed) and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
+            else
+                log "no injection observed within ${waited}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
+            fi
             PROOF_DEFERRED=1
         else
-            fail_soft "the exact target ${TARGET_TX:-<none pending>} was not durably admitted within ${CONFIRM_TIMEOUT}s — no positive proof the injection pipeline recovered"
+            if [ "${NO_TARGET:-0}" = "1" ]; then
+                fail_soft "no pending injection existed to confirm against (no wait performed) — no positive proof the injection pipeline recovered"
+            else
+                fail_soft "the exact target ${TARGET_TX} was not durably admitted within ${waited}s — no positive proof the injection pipeline recovered"
+            fi
         fi
     fi
     # Only claim the EXACT transaction when the exact-transaction check is what
