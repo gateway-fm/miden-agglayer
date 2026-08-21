@@ -1144,16 +1144,30 @@ fn build_bridge_replay(
             // it from each fetched note's OWN id and OWN derived nullifier
             // (`Note::nullifier()`), not from the transaction's refs. Where the
             // two sources overlap they must agree.
-            if let Some(scanned_id) = id_by_nullifier.get(&input.nullifier())
-                && *scanned_id != id
-            {
-                anyhow::bail!(
+            // The scan inserts `by_id[id]` and `id_by_nullifier[nullifier]` in
+            // the SAME step, from the same fetched note — so a body resolved
+            // here implies the scan holds that note's true nullifier binding.
+            // Both a mismatch and an ABSENCE therefore prove the id we resolved
+            // belongs to a different nullifier than this input: the `if let
+            // Some` form let the absence case through, which is exactly how a
+            // B2AGG ref swapped with a CLAIM ref would slip past (its nullifier
+            // is in the CLAIM map, not this one).
+            match id_by_nullifier.get(&input.nullifier()) {
+                Some(scanned_id) if *scanned_id == id => {}
+                Some(scanned_id) => anyhow::bail!(
                     "restore: input nullifier {} resolves to NoteId {id} via the transaction's \
                      consumed-note refs but to NoteId {scanned_id} via the node block scan. \
                      Refusing to replay: a mismatched reference reorders bridge-outs and shifts \
                      deposit counts.",
                     input.nullifier(),
-                );
+                ),
+                None => anyhow::bail!(
+                    "restore: a B2AGG body was resolved for NoteId {id}, but the node block scan \
+                     holds no B2AGG note for input nullifier {} — the scan records id and \
+                     nullifier together, so this proves the resolved reference belongs to a \
+                     different note. Refusing to replay.",
+                    input.nullifier(),
+                ),
             }
             replay.push(ReplayBridgeOut {
                 id,
@@ -1206,15 +1220,23 @@ fn build_claim_replay(
             // scan independently knows which note id owns this nullifier, the
             // transaction's ref must agree, so a mismatched reference cannot
             // attach the wrong CLAIM body to this consumption.
-            if let Some(scanned_id) = claim_id_by_nullifier.get(&input.nullifier())
-                && *scanned_id != id
-            {
-                anyhow::bail!(
+            // Same reasoning as build_bridge_replay: the CLAIM scan inserts
+            // body and nullifier binding together, so absence is as conclusive
+            // as a mismatch.
+            match claim_id_by_nullifier.get(&input.nullifier()) {
+                Some(scanned_id) if *scanned_id == id => {}
+                Some(scanned_id) => anyhow::bail!(
                     "restore: CLAIM input nullifier {} resolves to NoteId {id} via the \
                      transaction's consumed-note refs but to NoteId {scanned_id} via the node \
                      block scan — refusing to replay a mismatched reference",
                     input.nullifier(),
-                );
+                ),
+                None => anyhow::bail!(
+                    "restore: a CLAIM body was resolved for NoteId {id}, but the node block scan \
+                     holds no CLAIM note for input nullifier {} — the resolved reference belongs \
+                     to a different note. Refusing to replay.",
+                    input.nullifier(),
+                ),
             }
             // Only the consumption BLOCK is kept: live claim records carry no
             // tx order (see ReplayClaim's docs / `projection_order`).
@@ -3820,8 +3842,16 @@ mod tests {
         );
         assert!(ensure_complete_note_response(&ids, &ids[..1]).is_err());
 
+        // The scan inserts a body and its (nullifier -> id) binding in the SAME
+        // step, so a fixture that carries a body WITHOUT its binding describes
+        // a state the scan cannot produce — and, worse, it is exactly the state
+        // the ref-binding check must reject. Bind both notes, as a real scan
+        // would.
         let recovered = RecoveredBridgeOuts {
-            id_by_nullifier: std::collections::HashMap::from([(second_nullifier, second.id())]),
+            id_by_nullifier: std::collections::HashMap::from([
+                (nullifier(1), first.id()),
+                (second_nullifier, second.id()),
+            ]),
             by_id: ids
                 .iter()
                 .copied()
@@ -3843,6 +3873,127 @@ mod tests {
             replay
                 .iter()
                 .all(|item| item.block == 7 && item.tx_order == 0)
+        );
+    }
+
+    /// SAME-TYPE swap: two B2AGG refs whose note ids are exchanged. Both
+    /// nullifiers were genuinely consumed by this transaction, so upstream's
+    /// `trusted_consumed_note_refs` filter passes them both — but each id now
+    /// lands at the other's `within_tx_pos`, which silently reverses
+    /// BridgeEvent order and shifts every downstream deposit count. The node
+    /// block scan is the independent witness that catches it.
+    #[test]
+    fn swapped_same_type_bridge_refs_are_refused() {
+        use miden_protocol::note::{NoteHeader, Nullifier};
+        let (faucet_id, bridge_id, sender_id) = ma3_accounts();
+        let details = ma3_b2agg_input_note(faucet_id, None).details().clone();
+        let attachments = NoteAttachments::default();
+        let metadata = |sender| {
+            NoteMetadata::new(
+                PartialNoteMetadata::new(sender, NoteType::Public),
+                &attachments,
+            )
+        };
+        let first = NoteHeader::new(details.commitment(), metadata(bridge_id));
+        let second = NoteHeader::new(details.commitment(), metadata(sender_id));
+        let ids = [first.id(), second.id()];
+        let nullifier = |value| Nullifier::from_raw(Word::new([Felt::new(value).unwrap(); 4]));
+
+        // SWAPPED: nullifier(1) claims second.id(), nullifier(2) claims first.id().
+        let tx = crate::test_helpers::test_tx_record(
+            7,
+            bridge_id,
+            Word::default(),
+            Word::new([Felt::new(1).unwrap(); 4]),
+            vec![nullifier(1), nullifier(2)],
+            vec![(nullifier(1), second.id()), (nullifier(2), first.id())],
+        );
+        let recovered = RecoveredBridgeOuts {
+            id_by_nullifier: std::collections::HashMap::from([
+                (nullifier(1), first.id()),
+                (nullifier(2), second.id()),
+            ]),
+            by_id: ids
+                .iter()
+                .copied()
+                .map(|id| {
+                    (
+                        id,
+                        RecoveredBridgeBody {
+                            details: details.clone(),
+                            attachments: attachments.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let err = match build_bridge_replay(&[tx], bridge_id, recovered) {
+            Err(e) => e,
+            Ok(replay) => panic!(
+                "swapped same-type refs must fail closed, not reorder the replay (got {} entries)",
+                replay.len()
+            ),
+        };
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("block scan"),
+            "the error must name the independent witness that disagreed: {report}"
+        );
+    }
+
+    /// CROSS-TYPE swap: a B2AGG ref pointing at a CLAIM note id. The nullifier
+    /// is absent from the B2AGG scan map (it belongs to the CLAIM map), which
+    /// the earlier `if let Some(..)` form treated as "nothing to check" and let
+    /// through — the fail-open path. Absence is conclusive here, because the
+    /// scan records body and binding together.
+    #[test]
+    fn cross_type_swapped_ref_is_refused() {
+        use miden_protocol::note::{NoteHeader, Nullifier};
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        let details = ma3_b2agg_input_note(faucet_id, None).details().clone();
+        let attachments = NoteAttachments::default();
+        let first = NoteHeader::new(
+            details.commitment(),
+            NoteMetadata::new(
+                PartialNoteMetadata::new(bridge_id, NoteType::Public),
+                &attachments,
+            ),
+        );
+        let nullifier = |value| Nullifier::from_raw(Word::new([Felt::new(value).unwrap(); 4]));
+
+        let tx = crate::test_helpers::test_tx_record(
+            7,
+            bridge_id,
+            Word::default(),
+            Word::new([Felt::new(1).unwrap(); 4]),
+            vec![nullifier(9)],
+            vec![(nullifier(9), first.id())],
+        );
+        let recovered = RecoveredBridgeOuts {
+            // nullifier(9) is NOT a B2AGG nullifier — it belongs to some other
+            // note kind, so the B2AGG scan map has no entry for it.
+            id_by_nullifier: std::collections::HashMap::from([(nullifier(1), first.id())]),
+            by_id: std::collections::HashMap::from([(
+                first.id(),
+                RecoveredBridgeBody {
+                    details: details.clone(),
+                    attachments: attachments.clone(),
+                },
+            )]),
+            ..Default::default()
+        };
+        let err = match build_bridge_replay(&[tx], bridge_id, recovered) {
+            Err(e) => e,
+            Ok(replay) => panic!(
+                "a ref whose nullifier the B2AGG scan never saw must fail closed (got {} entries)",
+                replay.len()
+            ),
+        };
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("no B2AGG note for input nullifier"),
+            "the error must state that the scan holds no such binding: {report}"
         );
     }
 

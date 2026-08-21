@@ -1314,14 +1314,24 @@ async fn main() -> anyhow::Result<()> {
                 // one where serving early would be wrong. The restore one-shot
                 // runs the same catch-up, so a restored database normally
                 // arrives here already converged.
+                let mut barrier_reached: Option<u64> = None;
                 if strict_h6 {
                     let budget = l1_evidence_catch_up_budget();
                     match indexer.catch_up_to_head(budget).await {
-                        Ok(outcome) if outcome.converged => tracing::info!(
-                            l1_evidence_block = outcome.last_processed,
-                            passes = outcome.passes,
-                            "L1 evidence index is current — strict-H6 readiness barrier passed"
-                        ),
+                        Ok(outcome) if outcome.converged => {
+                            // Hand the barrier's position to the ticker below:
+                            // `spawn()` would otherwise re-resolve the start
+                            // block, and --l1-indexer-from-block outranks the
+                            // stored cursor, rewinding the scan we just
+                            // completed and replaying the whole range in front
+                            // of every new GER.
+                            barrier_reached = Some(outcome.last_processed);
+                            tracing::info!(
+                                l1_evidence_block = outcome.last_processed,
+                                passes = outcome.passes,
+                                "L1 evidence index is current — strict-H6 readiness barrier passed"
+                            );
+                        }
                         Ok(outcome) => anyhow::bail!(
                             "strict H6 GER corroboration is enabled, but the L1 evidence index did \
                              not catch up within {}s: indexed to block {}, L1 head {} ({} blocks \
@@ -1349,7 +1359,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                match indexer.spawn() {
+                match indexer.spawn_resuming_at(barrier_reached) {
                     Ok(shutdown_tx) => {
                         // The indexer runs for the lifetime of the tokio
                         // runtime; when `main` returns, the runtime tears

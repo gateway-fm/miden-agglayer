@@ -734,6 +734,9 @@ impl SyntheticProjector {
             // (up to RECONCILE_BACKPRESSURE_BUDGET_SECS, and once per window)
             // would otherwise hold the client for minutes while the nominal
             // tick budget claims to be 2s.
+            // Recomputed again inside the chunk loop below: a single value
+            // computed here is the WHOLE remaining tick, so N sequential chunks
+            // could each spend it and the "2s tick" would run for N x 2s.
             let backoff_budget =
                 patience.window_backoff_secs(deadline.saturating_duration_since(Instant::now()));
             let mut results: Vec<(u64, u64, anyhow::Result<Vec<NoteId>>)> = if let [(from, to)] =
@@ -751,6 +754,19 @@ impl SyntheticProjector {
                 // limiter on grown chains.
                 let mut out = Vec::with_capacity(windows.len());
                 for chunk in windows.chunks(reconcile_window_concurrency()) {
+                    // ONE absolute deadline governs the tick. Each chunk gets
+                    // only what is still left of it, so the inner backoff can
+                    // never turn a 2s tick into (chunks x 2s) of a blocked
+                    // client loop.
+                    let chunk_budget = patience
+                        .window_backoff_secs(deadline.saturating_duration_since(Instant::now()));
+                    if chunk_budget == 0 && patience == ReconcilePatience::LiveTick {
+                        // Tick budget exhausted: the remaining windows are
+                        // re-planned on the next tick behind the same
+                        // low-water-mark cursor, so stopping here loses
+                        // nothing and keeps the client available.
+                        break;
+                    }
                     let mut set = tokio::task::JoinSet::new();
                     for &(from, to) in chunk {
                         let fetcher = Arc::clone(fetcher);
@@ -758,7 +774,7 @@ impl SyntheticProjector {
                             (
                                 from,
                                 to,
-                                fetch_window_with_backoff(&fetcher, from, to, backoff_budget).await,
+                                fetch_window_with_backoff(&fetcher, from, to, chunk_budget).await,
                             )
                         });
                     }

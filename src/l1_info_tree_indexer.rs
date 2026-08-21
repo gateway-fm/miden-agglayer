@@ -62,6 +62,19 @@ const CATCH_UP_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// honest verdict rather than chase the head indefinitely.
 const CATCH_UP_MAX_PASSES: u32 = 64;
 
+/// Time allowance for ONE scan batch: a floor of [`CATCH_UP_RPC_TIMEOUT`] plus
+/// room proportional to the block range (one timestamp RPC per unique block
+/// dominates a dense batch), clamped to whatever is left of the overall budget.
+fn batch_timeout_for(max_range: u64, remaining_budget: Duration) -> Duration {
+    let scaled = Duration::from_secs(CATCH_UP_RPC_TIMEOUT.as_secs() + max_range / 20);
+    if remaining_budget.is_zero() {
+        // Budget already spent: let the caller's own budget check end the loop
+        // rather than blocking here indefinitely.
+        return Duration::from_secs(1);
+    }
+    scaled.min(remaining_budget)
+}
+
 /// Result of a bounded synchronous catch-up.
 ///
 /// `converged` is the readiness signal callers act on: only `true` means the
@@ -266,6 +279,24 @@ impl L1InfoTreeIndexer {
 
         let head0 = self.scan_head_bounded(&provider).await?;
         let mut last_processed = self.initial_cursor(stored, head0);
+
+        // A frontier AHEAD of the source head is not "already caught up": the
+        // loop below would find `last_processed >= head` immediately and report
+        // converged having scanned nothing, so strict serving would start with
+        // zero corroboration. This is a misconfiguration (a from-block for a
+        // different//reset chain, or a cursor from a longer chain) and must be
+        // said out loud rather than silently satisfied.
+        if last_processed > head0 {
+            anyhow::bail!(
+                "L1 evidence frontier is AHEAD of the chain: scanning would start at block {} \
+                 but the `{}` head is only {}. Nothing can be corroborated from here — check \
+                 --l1-indexer-from-block, or whether this database belongs to a different (or \
+                 since-reset) L1 than the configured RPC.",
+                last_processed + 1,
+                self.evidence_tag.describe(),
+                head0,
+            );
+        }
         let mut head = head0;
         tracing::info!(
             start_block = last_processed,
@@ -293,8 +324,17 @@ impl L1InfoTreeIndexer {
                     return Ok(CatchUp::not_converged(last_processed, head, passes));
                 }
                 let before = last_processed;
+                // One batch is a getLogs over up to `max_range` blocks PLUS a
+                // timestamp fetch per unique block PLUS the durable writes, so
+                // a flat per-RPC ceiling applied to the whole batch fails a
+                // dense-but-healthy range every time and blocks strict startup
+                // for a reason that has nothing to do with health. Scale the
+                // allowance with the work, and never exceed what is left of the
+                // overall budget.
+                let batch_timeout =
+                    batch_timeout_for(self.max_range, budget.saturating_sub(started.elapsed()));
                 timeout(
-                    CATCH_UP_RPC_TIMEOUT,
+                    batch_timeout,
                     self.poll_to_head(&provider, &mut last_processed, head),
                 )
                 .await
@@ -302,7 +342,7 @@ impl L1InfoTreeIndexer {
                     anyhow::anyhow!(
                         "L1 evidence scan of blocks {}..={head} timed out after {}s",
                         before + 1,
-                        CATCH_UP_RPC_TIMEOUT.as_secs()
+                        batch_timeout.as_secs()
                     )
                 })??;
                 // `poll_to_head` advances the cursor only after the batch is
@@ -322,6 +362,26 @@ impl L1InfoTreeIndexer {
 
             let new_head = self.scan_head_bounded(&provider).await?;
             if new_head <= last_processed {
+                // The cursor write inside `poll_to_head` is best-effort (a
+                // transient DB blip must not wedge the live ticker), so
+                // in-memory progress can outrun what is durable. For a
+                // READINESS verdict that distinction matters: if the cursor did
+                // not persist, the next process starts over and the barrier we
+                // just passed proved nothing about it. Re-read and require
+                // durability before claiming convergence.
+                let persisted =
+                    self.store.get_l1_evidence_cursor().await.context(
+                        "re-reading the L1 evidence cursor to confirm catch-up durability",
+                    )?;
+                if persisted < last_processed {
+                    tracing::warn!(
+                        persisted,
+                        last_processed,
+                        "L1InfoTreeIndexer: catch-up reached {last_processed} in memory but only \
+                         {persisted} is durable — reporting NOT converged"
+                    );
+                    return Ok(CatchUp::not_converged(persisted, new_head, passes));
+                }
                 tracing::info!(
                     last_processed,
                     l1_head = new_head,
@@ -353,7 +413,25 @@ impl L1InfoTreeIndexer {
             })?
     }
 
+    /// Spawn the background ticker, resuming at `resume_at` when the caller has
+    /// already brought the index up to that block (the strict-H6 readiness
+    /// barrier does exactly that).
+    ///
+    /// Without this, `spawn()` re-resolves the start block from scratch — and
+    /// `from_block_override` outranks both the stored cursor and the barrier's
+    /// result, so a deployment that keeps `--l1-indexer-from-block` set (ours
+    /// does) would rewind to that block and replay the entire range again the
+    /// moment the listener binds: duplicate work in front of every new GER, and
+    /// on a long chain a replay that outlives the process.
+    pub fn spawn_resuming_at(self, resume_at: Option<u64>) -> anyhow::Result<oneshot::Sender<()>> {
+        self.spawn_inner(resume_at)
+    }
+
     pub fn spawn(self) -> anyhow::Result<oneshot::Sender<()>> {
+        self.spawn_inner(None)
+    }
+
+    fn spawn_inner(self, resume_at: Option<u64>) -> anyhow::Result<oneshot::Sender<()>> {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let provider = ProviderBuilder::new().connect_http(
@@ -412,10 +490,18 @@ impl L1InfoTreeIndexer {
                      Remove --l1-indexer-from-block after this boot's backfill completes."
                 );
             }
-            let mut last_processed = self.initial_cursor(stored, head);
+            // A completed readiness barrier is authoritative for where the
+            // ticker resumes: it already scanned (and persisted) up to
+            // `resume_at`, and re-applying the operator override here would
+            // throw that away.
+            let mut last_processed = match resume_at {
+                Some(from_barrier) => self.initial_cursor(stored, head).max(from_barrier),
+                None => self.initial_cursor(stored, head),
+            };
             tracing::info!(
                 start_block = last_processed,
                 stored_cursor = stored,
+                resumed_from_barrier = ?resume_at,
                 selected_head = head,
                 evidence_tag = %self.evidence_tag.describe(),
                 from_block_override = ?self.from_block_override,

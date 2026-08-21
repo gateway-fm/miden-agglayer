@@ -30,6 +30,11 @@ C="$PROJECT-$SVC-1"
 PG="$PROJECT-agglayer-postgres-1"
 REPEATS_MIN="${REPEATS_MIN:-5}"       # same-hash repeats/60s to call it wedged
 FORCE="${FORCE:-0}"                    # 1 = heal without the wedge precheck
+# FORCE=1 callers (the full-DB-loss drill) never supply a wedged tx id, and the
+# proof block below now runs for them too — under `set -u` a bare "$WEDGE_TX"
+# expansion there would abort the healer instead of proving recovery. Normalise
+# once so every later reference is safe and "unset" means "no exact target".
+WEDGE_TX="${WEDGE_TX:-}"
 
 COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
 [[ -f "$PROJECT_DIR/docker-compose.l2l2.yml" ]] && COMPOSE+=(-f "$PROJECT_DIR/docker-compose.l2l2.yml")
@@ -356,9 +361,16 @@ if true; then
     # the injection counter advancing. Waiting for it is still worthwhile (that
     # is the pipeline we healed); only give up on proof if the caller has
     # explicitly accepted a deferred verdict.
-    if [ -z "$TARGET_TX" ] && [ -z "$PRE_INJECTED" ]; then
-        confirmed=1   # cannot query the baseline at all — deferred, and said so
-        log "WARNING: no injection baseline available — positive proof DEFERRED to live traffic"
+    # An UNREADABLE proof source is not a proof. Auto-confirming here would let
+    # a broken postgres certify a dead aggoracle as healed — the exact
+    # false-green shape this block exists to remove. Only an explicit deferred
+    # mode may end without proof, and it ends UNCONFIRMED, never confirmed.
+    if [ -z "$PRE_INJECTED" ]; then
+        if [ "${HEAL_ALLOW_DEFERRED_PROOF:-0}" = "1" ]; then
+            log "WARNING: injection baseline unreadable and HEAL_ALLOW_DEFERRED_PROOF=1 — ending UNPROVEN; the caller must prove the pipeline itself"
+        else
+            fail_soft "could not read the ger_entries injection baseline — refusing to report a heal as confirmed on unreadable state"
+        fi
     fi
     while [ "$confirmed" -eq 0 ] && [ "$waited" -lt "$CONFIRM_TIMEOUT" ]; do
         known=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
@@ -387,15 +399,17 @@ if true; then
                 break
             fi
         fi
-        rewedged=$(docker logs --since 10s "$C" 2>&1 | grep -F "$WEDGE_TX" \
-            | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
-        [ "${rewedged:-0}" -eq 0 ] \
-            || fail_soft "$SVC re-wedged on the exact tx ${WEDGE_TX} while waiting for durable admission"
+        if [ -n "$WEDGE_TX" ]; then
+            rewedged=$(docker logs --since 10s "$C" 2>&1 | grep -F "$WEDGE_TX" \
+                | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
+            [ "${rewedged:-0}" -eq 0 ] \
+                || fail_soft "$SVC re-wedged on the exact tx ${WEDGE_TX} while waiting for durable admission"
+        fi
         sleep 5
         waited=$((waited + 5))
     done
     if [ "$confirmed" -ne 1 ]; then
-        if [ -z "$TARGET_TX" ] && [ "${HEAL_ALLOW_DEFERRED_PROOF:-0}" = "1" ]; then
+        if [ "${HEAL_ALLOW_DEFERRED_PROOF:-0}" = "1" ]; then
             # Quiet stack with nothing to inject: the caller has said it will
             # prove liveness itself (the drill's own post-heal GER leg).
             log "no injection observed within ${CONFIRM_TIMEOUT}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
@@ -408,5 +422,12 @@ if true; then
 fi
 [ "${PROGRESS_MATCHES:-0}" -gt 0 ] \
     || fail_soft "$SVC produced no progress output (PROGRESS_PATTERN) in the settle window"
+# Every success proof has now passed and the restored state lives in the
+# running container, so the staging copy is no longer the only copy — disarm
+# the retention that was armed before the destructive step. Without this, each
+# successful heal leaves a complete aggkit snapshot (cert lineage, sync
+# cursors) in /tmp forever: unbounded disk growth and sensitive state kept
+# around with no owner.
+KEEP_STAGE=0
 log "preserve-healed (manifest=$manifest_count files restored+content-verified, $POISON wiped, health confirmed after $(( $(date +%s) - HEAL_T0 ))s: running, restarts stable at $NOW_RESTARTS, ${RECENT_LINES} fresh log lines, 0 crash markers)"
 exit 0

@@ -568,6 +568,10 @@ nudge_until() {
 CREATE_AGGCHAIN_TOPIC="0x144e3f9b5c63682a3bb7e9ad31e99c043890d3d540cd79dcebc3b5bdfba94c9b"
 _PF_FAILS=0
 _pf_pass() { echo -e "  ${GREEN}PASS${NC} $*"; }
+# NO VERDICT — the check could not reach a conclusion. Deliberately NOT a pass:
+# a preflight that cannot decide must not print PASS, because "it printed PASS"
+# is what every later reader takes as proof.
+_pf_undecided() { echo -e "  ${YELLOW:-}NO-VERDICT${NC} $*"; }
 _pf_fail() { echo -e "  ${RED}FAIL${NC} $*"; _PF_FAILS=$((_PF_FAILS + 1)); }
 
 # _pf_log_has <container> <ere-pattern> <tail-lines> <desc> — assert a pattern
@@ -700,6 +704,12 @@ _pf_sync_lag() {
 _pf_l1ger_consistency() {
     local pg="${1:-${COMPOSE_PROJECT_NAME}-postgres-1}"
     local orphans counts n_l1 n_l2 err
+    # The "newest N are still settling" grace must not swallow the whole
+    # population: with <= N network-1 rows every unmatched row falls inside the
+    # grace set and the check reports "all settled rows have L1 evidence"
+    # having examined nothing. Below that size there is no verdict to give, so
+    # say so instead of passing.
+    local PF_GER_GRACE_ROWS="${PF_GER_GRACE_ROWS:-2}"
 
     # FAIL CLOSED on an unreadable table. The previous form sent stderr to
     # /dev/null and treated the resulting empty string as "fresh stack —
@@ -719,6 +729,10 @@ _pf_l1ger_consistency() {
     fi
     # Genuinely-empty bootstrap vs a dead indexer: with zero net-1 rows there is
     # nothing to join, but that is only benign if the L1 side is being indexed.
+    if [[ "$n_l2" -gt 0 && "$n_l2" -le "$PF_GER_GRACE_ROWS" ]]; then
+        _pf_undecided "bridge-service L1-GER consistency: only $n_l2 network-1 row(s) — all inside the newest-$PF_GER_GRACE_ROWS settling grace, so this check has NO verdict yet (not a pass)"
+        return
+    fi
     if [[ "$n_l2" -eq 0 ]]; then
         if [[ "$n_l1" -gt 0 ]]; then
             _pf_pass "bridge-service L1-GER consistency: no L2-observed GERs yet (L1 side indexing, $n_l1 row(s)) — nothing to join"
@@ -733,7 +747,7 @@ _pf_l1ger_consistency() {
         LEFT JOIN sync.exit_root l1
           ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
         WHERE l2.network_id=1 AND l1.id IS NULL
-          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)" 2>&1); then
+          AND l2.id <= (SELECT coalesce(max(id),0) - $PF_GER_GRACE_ROWS FROM sync.exit_root WHERE network_id=1)" 2>&1); then
         _pf_fail "bridge-service L1-GER consistency: the orphan query FAILED — psql: ${orphans//$'\n'/ }"
         return
     fi

@@ -1441,13 +1441,38 @@ async fn main() -> anyhow::Result<()> {
                             break;
                         }
                         Ok(false) => {
-                            // Absent for the whole probe window, which is far
-                            // longer than mempool-to-block latency: a genuine
-                            // pre-acceptance failure, so a retry is safe.
-                            eprintln!(
-                                "[bridge-out] probe: note {b2agg_note_id} is absent after \
-                                 {probe_secs}s — the submit did not land, retry is safe"
-                            );
+                            // Absence after a finite window is EVIDENCE, not
+                            // PROOF: a transaction still sitting in the mempool
+                            // can commit after the probe gives up, and by then
+                            // a replacement note would already be in flight —
+                            // two bridge-outs for one intent. The default is
+                            // therefore to stop, not to replace.
+                            //
+                            // B2AGG_REPLACE_AFTER_ABSENT_PROBE=1 opts into the
+                            // old behaviour for throughput-oriented harness
+                            // runs where a duplicate bridge-out is an
+                            // accounting nuisance rather than a loss; it must
+                            // never be set where funds matter.
+                            if std::env::var("B2AGG_REPLACE_AFTER_ABSENT_PROBE").as_deref()
+                                == Ok("1")
+                            {
+                                eprintln!(
+                                    "[bridge-out] probe: note {b2agg_note_id} absent after \
+                                     {probe_secs}s and B2AGG_REPLACE_AFTER_ABSENT_PROBE=1 — \
+                                     replacing (accepted risk: a late commit double-bridges)"
+                                );
+                            } else {
+                                eprintln!(
+                                    "[bridge-out] INDETERMINATE-UNRESOLVED note={b2agg_note_id}: \
+                                     the submit may have reached the node and the note has not \
+                                     appeared within {probe_secs}s. Refusing to replace it — a \
+                                     late commit would make this a SECOND bridge-out. Re-check \
+                                     the note before any manual retry; set \
+                                     B2AGG_REPLACE_AFTER_ABSENT_PROBE=1 only where a duplicate \
+                                     bridge-out is acceptable."
+                                );
+                                std::process::exit(4);
+                            }
                         }
                         Err(probe_err) => {
                             // Unprovable either way. Fail closed with exit 4

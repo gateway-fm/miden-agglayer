@@ -56,18 +56,37 @@ psql_b() {
 }
 # Numeric-or-die: every count this script branches on must be a number that
 # actually came back from the database.
+#
+# The exit status is the contract, NOT an `exit` inside the function: callers
+# use `x=$(psql_num ...)`, which runs the function in a SUBSHELL, so an `exit`
+# there kills only the substitution and the script sails on with an empty
+# value — the exact fail-open shape this helper exists to prevent (and the
+# script has no `set -e` to catch it). Every call site must therefore be
+# written `x=$(psql_num ...) || exit 1`, which `psql_die` enforces below.
 psql_num() {
     local v
     v=$(psql_b "$1" | tr -d '[:space:]') || {
         log "FATAL: query failed: $1"
         log "       psql said: ${PSQL_ERR:-<no output>}"
-        exit 1
+        return 1
     }
     [[ "$v" =~ ^[0-9]+$ ]] || {
         log "FATAL: query did not return a number (got '${v}'): $1"
-        exit 1
+        return 1
     }
     printf '%s' "$v"
+}
+
+# Assign-or-abort. Usage: psql_die VAR "SELECT ..."
+# Runs the query in THIS shell's context for the abort decision, so a failure
+# really does stop the script.
+psql_die() {
+    local __var="$1" __sql="$2" __val
+    __val=$(psql_num "$__sql") || {
+        log "       aborting: this script deletes state and must never proceed on unreadable data"
+        exit 1
+    }
+    printf -v "$__var" '%s' "$__val"
 }
 
 # STRING MATCHING — deliberate, and the only option here. The subject is
@@ -108,7 +127,7 @@ LOCK="/tmp/.claimtxman-heal.$PROJECT.lock"
 exec 9>"$LOCK"
 flock -n 9 || { log "another claimtxman heal is already running for project $PROJECT (lock: $LOCK) — refusing to run concurrently"; exit 1; }
 
-stranded=$(psql_num "SELECT count(*) FROM sync.monitored_txs WHERE status='created'")
+psql_die stranded "SELECT count(*) FROM sync.monitored_txs WHERE status='created'"
 if [[ "$FORCE" != "1" ]]; then
     # Wedge signature: stranded created rows AND fresh nonce-mismatch sends.
     mismatches=$(nonce_error_lines 120)
@@ -121,7 +140,7 @@ else
     log "FORCE=1 (post-restore): clearing ${stranded:-0} created monitored tx(s) unconditionally"
 fi
 
-l1_cursor_before=$(psql_num "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0")
+psql_die l1_cursor_before "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0"
 
 docker stop "$SVC_C" >/dev/null 2>&1
 [[ "$(docker inspect -f '{{.State.Status}}' "$SVC_C" 2>/dev/null)" == "exited" ]] \
@@ -144,7 +163,7 @@ DEL_OUT=$(docker exec "$PG_C" psql -U bridge_user -d bridge_db -v ON_ERROR_STOP=
 # Prove the wipe before restarting: restarting on top of surviving rows
 # recreates the exact divergence this heal exists to clear.
 for t in sync.monitored_txs sync.monitored_txs_group; do
-    left=$(psql_num "SELECT count(*) FROM $t")
+    psql_die left "SELECT count(*) FROM $t"
     [[ "$left" -eq 0 ]] || {
         log "FATAL: $t still has $left row(s) after the wipe — refusing to restart into a partially-cleared state"
         exit 1
@@ -164,18 +183,26 @@ log "cleared ${stranded:-0} stranded created tx(s); both monitored-tx tables ver
 #       no fresh nonce-error sends — the healthy-quiet shape.
 deadline=$(( $(date +%s) + ${HEAL_CONFIRM_TIMEOUT:-180} ))
 while :; do
-    cur=$(psql_num "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0")
+    psql_die cur "SELECT coalesce(max(block_num),0) FROM sync.block WHERE network_id=0"
     if [[ "${cur:-0}" -gt "${l1_cursor_before:-0}" ]]; then
         log "positive outcome: L1 sync cursor advanced ${l1_cursor_before} -> ${cur}"
         exit 0
     fi
-    orphans=$(psql_num "
+    psql_die orphans "
         SELECT count(*) FROM sync.exit_root l2
         LEFT JOIN sync.exit_root l1
           ON l1.network_id=0 AND l1.global_exit_root=l2.global_exit_root
         WHERE l2.network_id=1 AND l1.id IS NULL
-          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)")
+          AND l2.id <= (SELECT coalesce(max(id),0)-2 FROM sync.exit_root WHERE network_id=1)"
     fresh_err=$(nonce_error_lines 60)
+    # "No fresh nonce errors" is also what a container that EXITED produces, so
+    # the quiet-state shape must first establish that the service is actually
+    # running — otherwise a heal that killed bridge-service reports success.
+    svc_state=$(docker inspect -f '{{.State.Status}} {{.State.Restarting}}' "$SVC_C" 2>/dev/null || echo "gone")
+    if [[ "$svc_state" != "running false" ]]; then
+        log "FATAL: $SVC_C is not stably running after the heal (state: $svc_state)"
+        exit 1
+    fi
     if [[ "$orphans" -eq 0 && "$fresh_err" -eq 0 ]]; then
         log "positive outcome: L1-GER join consistent (0 orphans) and no fresh nonce errors (quiet-stack shape; cursor ${l1_cursor_before} unchanged is event-sparse, not starvation)"
         exit 0

@@ -315,9 +315,22 @@ getlogs_dump() { # $1 = output file
                 (.topics|join(",")), .data, .transactionIndex, (.removed|tostring),
                 .transactionHash ] | @tsv' >> "$raw" || return 1
     done
-    # NUMERIC sort by (block, log_index) — hex strings of differing width do not sort
-    # lexically, and window boundaries mean the raw append order is only block-major.
-    sort -t"$(printf '\t')" -k1,1n -k2,2n "$raw" > "$1"
+    # DO NOT SORT THE SUBJECT UNDER TEST. The served (block, logIndex) order IS
+    # the contract aggkit consumes; sorting the capture before comparing it
+    # means a projector that returns the right entries in the WRONG order
+    # compares equal on both sides and the drill certifies the one property it
+    # exists to protect. Instead: assert the served stream is ALREADY ordered
+    # (that is the real assertion), then compare it as served.
+    #
+    # Pagination appends windows in ascending block order, so a correctly
+    # ordered feed yields an already-sorted concatenation.
+    if ! sort -c -t"$(printf '\t')" -k1,1n -k2,2n "$raw" 2>/dev/null; then
+        say "getlogs: SERVED ORDER VIOLATION — the feed is not ascending by (block, logIndex)."
+        say "         First out-of-order boundary:"
+        sort -c -t"$(printf '\t')" -k1,1n -k2,2n "$raw" 2>&1 | head -3 | sed 's/^/         /'
+        return 1
+    fi
+    cp "$raw" "$1"
     [[ -s "$1" ]]
 }
 
@@ -603,10 +616,17 @@ PYEOF
 [[ ${#SVC_HEX} -eq 30 ]] || fail "liveness dest: decoded service id is not 15 bytes ('$SVC_HEX')"
 DEST="0x00000000${SVC_HEX:0:16}${SVC_HEX:16:14}00"
 say "liveness: bridgeAsset cnt=$CNT dest=$DEST (embeds service account $SVC_BECH32)"
-cast send --rpc-url "$L1_RPC" --private-key "$SIGNER_KEY" "$L1_BRIDGE_ADDRESS" \
+# Keep the receipt: depositCount() was read BEFORE the send, so on a stack with
+# concurrent traffic (the soak runs loadtests against this same stack) another
+# deposit can take that index and leave ours at count+1 — the drill would then
+# validate somebody else's deposit. The transaction hash is ours alone.
+LIVE_TX=$(cast send --rpc-url "$L1_RPC" --private-key "$SIGNER_KEY" "$L1_BRIDGE_ADDRESS" \
   'bridgeAsset(uint32,address,uint256,address,bool,bytes)' \
   1 "$DEST" "$DEPOSIT_WEI" 0x0000000000000000000000000000000000000000 true 0x \
-  --value "$DEPOSIT_WEI" >/dev/null
+  --value "$DEPOSIT_WEI" --json | jq -r '.transactionHash')
+[[ "$LIVE_TX" =~ ^0x[0-9a-fA-F]{64}$ ]] \
+    || fail "liveness bridgeAsset did not return a transaction hash (got '${LIVE_TX:-<none>}')"
+say "liveness: bridgeAsset tx=$LIVE_TX (expected deposit_cnt≈$CNT on network 0)"
 
 # Assert on THIS deposit, by its exact index. `$DEST` is derived from the
 # service account, so it is the SAME destination in every drill on a
@@ -615,24 +635,38 @@ cast send --rpc-url "$L1_RPC" --private-key "$SIGNER_KEY" "$L1_BRIDGE_ADDRESS" \
 # i.e. it could pass with the post-restore pipeline completely dead. `$CNT` was
 # read from depositCount() immediately BEFORE the bridgeAsset call, so it is
 # this deposit's own deposit_cnt.
+# Match on (tx_hash, network_id=0): the transaction identifies OUR deposit
+# uniquely and cannot be satisfied by a concurrent one, and pinning the
+# origin network stops an equal deposit_cnt on another network from
+# answering for it.
 deadline=$((SECONDS + 300))
 while :; do
     READY=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
-        | CNT="$CNT" python3 -c "
+        | LIVE_TX="$LIVE_TX" python3 -c "
 import json, os, sys
-want = int(os.environ['CNT'])
+want = os.environ['LIVE_TX'].lower()
 ds = json.load(sys.stdin).get('deposits', [])
-mine = [d for d in ds if int(d.get('deposit_cnt', -1)) == want]
+mine = [d for d in ds
+        if str(d.get('tx_hash', '')).lower() == want and int(d.get('network_id', -1)) == 0]
 if not mine:
     print('absent')
+elif len(mine) > 1:
+    print('ambiguous')
 else:
     print('True' if mine[0].get('ready_for_claim') else 'notready')
 " 2>/dev/null || echo err)
     [[ "$READY" == "True" ]] && break
-    (( SECONDS >= deadline )) && fail "post-restore deposit_cnt=$CNT to $DEST never became ready_for_claim in 300s (last state: $READY) — pipeline dead after restore"
+    (( SECONDS >= deadline )) && fail "the post-restore deposit from tx $LIVE_TX (network 0, dest $DEST) never became ready_for_claim in 300s (last state: $READY) — pipeline dead after restore"
     sleep 5
 done
-pass "post-restore deposit_cnt=$CNT ready_for_claim (exact deposit, not any-of-the-page)"
+DEPOSIT_CNT_SEEN=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+    | LIVE_TX="$LIVE_TX" python3 -c "
+import json, os, sys
+want = os.environ['LIVE_TX'].lower()
+ds = json.load(sys.stdin).get('deposits', [])
+print(next((d.get('deposit_cnt') for d in ds if str(d.get('tx_hash','')).lower() == want), '?'))
+" 2>/dev/null || echo '?')
+pass "post-restore deposit from OUR tx $LIVE_TX (deposit_cnt=$DEPOSIT_CNT_SEEN, network 0) is ready_for_claim"
 
 # PR#164 re-review — compare COUNT to COUNT. `INJ1` is the injected-set MD5 from
 # `fingerprint()`, not a number: `[[ "$INJ2" -gt "$INJ1" ]]` compared an integer to
