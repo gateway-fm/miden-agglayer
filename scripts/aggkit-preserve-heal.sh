@@ -182,8 +182,18 @@ if ! OWN_DIFF=$(diff "$B/manifest.stage" "$B/manifest.readback" 2>&1); then
 fi
 
 BASE_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 0)
-COMPOSE_PROJECT_NAME="$PROJECT" docker compose "${COMPOSE[@]}" --env-file "$ENV_FILE" \
-    start "$SVC" >/dev/null 2>&1 \
+# `docker start` (plain), NOT `docker compose start`: compose honours
+# depends_on and BLOCKS until this service's dependencies report healthy
+# ("Container <proxy> Healthy" before "Container <aggkit> Starting"). The
+# chaos watchdog calls this heal precisely WHILE faults are active — the
+# proxy is paused/killed/unhealthy by design — so the compose form fails,
+# the container is left in state "created", and the whole run is crippled
+# (2026-08-21 chaos: services_down='aggkit=created', loadtest and fresh-op
+# both failed downstream; same cause as the 2026-08-20 manual "FATAL: start
+# failed"). The container was already created with the correct config by the
+# recreate above, so a plain start needs no dependency graph — and this heal's
+# job is to restore THIS service, not to require a healthy stack.
+docker start "$C" >/dev/null 2>&1 \
     || {
         KEEP_STAGE=1
         log "FATAL: start failed — stopping any partially-started $SVC; staging dir retained"
