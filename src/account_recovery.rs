@@ -308,16 +308,33 @@ mod tests {
     const RC1_WIRE_OUTPUT_NOTES_EXIST: &str = "transaction conflicts with current mempool state\ncaused by: output notes already exist: [0x5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d]";
     const RC1_WIRE_UNAUTHENTICATED_MISSING: &str = "transaction conflicts with current mempool state\ncaused by: unauthenticated input notes are unknown: [0x6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e]";
 
+    /// The node's gRPC error code for a state conflict (miden-node
+    /// `MempoolSubmissionError` -> `AddTransactionError::from_code`).
+    const NODE_STATE_CONFLICT_CODE: u8 = 2;
+
+    /// Build the endpoint error the way PRODUCTION does: from the wire
+    /// (code, message) pair through upstream's OWN decoder, instead of naming
+    /// the variant ourselves.
+    ///
+    /// The decode step is part of what this module depends on — the node sends
+    /// code 2 with the cause as prose, and `AddTransactionError::from_code` is
+    /// what turns that into the variant the predicate matches. Constructing
+    /// `StateConflict { .. }` by hand would keep passing even if upstream
+    /// re-mapped code 2 elsewhere, which is exactly the silent break these
+    /// tests exist to catch.
     fn state_conflict_rpc_error(message: &str) -> RpcError {
         use miden_client::rpc::{GrpcError, RpcEndpoint};
+        let decoded = AddTransactionError::from_code(NODE_STATE_CONFLICT_CODE, message);
+        assert!(
+            matches!(decoded, AddTransactionError::StateConflict { .. }),
+            "upstream no longer decodes node error code {NODE_STATE_CONFLICT_CODE} to \
+             StateConflict (got {decoded:?}) — the recovery predicate matches a variant the node \
+             no longer produces"
+        );
         RpcError::RequestError {
             endpoint: RpcEndpoint::SubmitProvenTx,
             error_kind: GrpcError::InvalidArgument,
-            endpoint_error: Some(EndpointError::AddTransaction(
-                AddTransactionError::StateConflict {
-                    message: message.into(),
-                },
-            )),
+            endpoint_error: Some(EndpointError::AddTransaction(decoded)),
             source: None,
         }
     }

@@ -876,13 +876,29 @@ step "Leg 1 — deposit L1→L2, then the USER claims it manually"
 LEG1_GI=""; LEG1_TX=""
 for attempt in $(seq 1 "$MAX_LEG1_ATTEMPTS"); do
     log "Leg 1 attempt $attempt/$MAX_LEG1_ATTEMPTS"
-    # RE-BASELINE per attempt. These are process-wide counters and the
+    # QUIESCE, then RE-BASELINE. These are process-wide counters and the
     # assertion below attributes their growth to the attempt that produced
-    # LEG1_GI — but a baseline taken once, before the loop, also captures every
-    # EARLIER attempt's increments. A failed attempt 1 could therefore satisfy
-    # the proof for attempt 2, whose gi is the one isClaimed() then confirms:
-    # two unrelated facts reported as one causal chain. Re-reading here makes
-    # the delta belong to the winning attempt.
+    # LEG1_GI. Two ways that attribution can be wrong:
+    #   * a baseline taken once, before the loop, also captures every EARLIER
+    #     attempt's increments (fixed by re-reading here); and
+    #   * an earlier attempt's sponsor claim can still be IN FLIGHT and
+    #     increment the counter AFTER this baseline — a late increment credited
+    #     to the wrong attempt, which re-reading alone does not fix.
+    # So wait for every previous attempt to reach a terminal state (its global
+    # index claimed on chain) before taking the new baseline. Then any increment
+    # observed after it belongs to THIS attempt.
+    for prior_gi in ${PRIOR_ATTEMPT_GIS:-}; do
+        quiesce_deadline=$((SECONDS + 180))
+        while ! proxy_is_claimed "$prior_gi"; do
+            if (( SECONDS >= quiesce_deadline )); then
+                fail "attempt $attempt cannot establish a clean metric baseline: the previous \
+attempt's global index $prior_gi is still unclaimed after 180s, so its sponsor claim may still be \
+in flight and would be credited to this attempt"
+            fi
+            sleep 3
+        done
+        log "previous attempt gi=$prior_gi is terminal (claimed) — safe to baseline"
+    done
     DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
     ESTIMATE_ALREADY_CLAIMED_BEFORE=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
     INFLIGHT_DEDUP_BEFORE=$(metric_value "$INFLIGHT_DEDUP_METRIC")
@@ -892,6 +908,9 @@ for attempt in $(seq 1 "$MAX_LEG1_ATTEMPTS"); do
     fetch_deposit_json "$L1_DEP_CNT" 300
     GI=$(echo "$DEP_JSON" | dep_field global_index)
     log "deposit_cnt=$L1_DEP_CNT globalIndex=$GI"
+    # Remembered so the NEXT attempt can wait for this one to go terminal
+    # before it baselines the shared counters.
+    PRIOR_ATTEMPT_GIS="${PRIOR_ATTEMPT_GIS:-} $GI"
 
     # Start submitting IMMEDIATELY (before ready_for_claim): the loop retries
     # the C6 "GER not observed yet" rejections sub-second, so the user grabs

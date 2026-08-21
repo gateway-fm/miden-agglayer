@@ -530,6 +530,69 @@ fn l1_evidence_catch_up_budget() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Round-2 review #6 — bind persisted GER corroboration to the L1 it came from.
+///
+/// `ger_entries` rows and the evidence cursor record that a root was OBSERVED,
+/// never on which chain. Repoint the same database at a different L1, a
+/// re-genesised devnet, or a redeployed GER manager and every historic row is
+/// still consulted as corroboration — so under strict H6 a GER could be
+/// admitted on evidence gathered somewhere else entirely, which is precisely
+/// what H6 exists to prevent.
+///
+/// First boot with an L1 configured records the identity; later boots compare.
+/// A mismatch is a refusal: continuing would serve corroboration that means
+/// nothing, and the operator's intent (new chain vs wrong config) cannot be
+/// guessed from here.
+async fn check_l1_evidence_source(
+    store: &std::sync::Arc<dyn miden_agglayer_service::store::Store>,
+    chain_id: u64,
+    ger_address: alloy::primitives::Address,
+    evidence_tag: &str,
+) -> anyhow::Result<()> {
+    // Normalised so a checksum-case difference is not read as a different
+    // contract.
+    let ger = format!("{ger_address:?}").to_lowercase();
+    match store
+        .get_l1_evidence_source()
+        .await
+        .context("reading the recorded L1 evidence source")?
+    {
+        None => {
+            store
+                .set_l1_evidence_source(chain_id, &ger, evidence_tag)
+                .await
+                .context("recording the L1 evidence source")?;
+            tracing::info!(
+                chain_id,
+                ger_address = %ger,
+                evidence_tag,
+                "recorded the L1 evidence source for this store (first boot with an L1 configured)"
+            );
+        }
+        Some((stored_chain, stored_ger, stored_tag)) => {
+            if stored_chain != chain_id || stored_ger != ger || stored_tag != evidence_tag {
+                anyhow::bail!(
+                    "L1 EVIDENCE SOURCE MISMATCH — this store's GER corroboration was gathered \
+                     from chain_id={stored_chain} ger={stored_ger} tag={stored_tag}, but this \
+                     process is configured for chain_id={chain_id} ger={ger} tag={evidence_tag}. \
+                     Every persisted `ger_entries` row and the evidence cursor describe the OLD \
+                     source, so serving now would corroborate roots against evidence from a \
+                     different chain/contract. If this is a deliberate re-point, start from an \
+                     empty store (or drop the evidence state) so the index is rebuilt against \
+                     the new source."
+                );
+            }
+            tracing::info!(
+                chain_id,
+                ger_address = %ger,
+                evidence_tag,
+                "L1 evidence source matches the recorded identity"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn check_h6_backfill_invariant(
     reject_unverified_ger: bool,
     require_hardening: bool,
@@ -1212,6 +1275,28 @@ async fn main() -> anyhow::Result<()> {
             persisted_cursor,
         ) {
             anyhow::bail!("{reason}");
+        }
+
+        // Bind that evidence to the L1 it came from (round-2 review #6). Runs
+        // whenever an L1 + GER contract are configured — the corroboration is
+        // just as source-specific in lenient mode, and recording the identity
+        // early means a later switch to strict mode has something to compare.
+        if let (Some(l1_rpc_url), Some(ger_addr_str)) =
+            (command.l1_rpc_url.clone(), command.ger_l1_address.clone())
+            && let Ok(ger_addr) = ger_addr_str.parse::<alloy::primitives::Address>()
+        {
+            let provider = alloy::providers::ProviderBuilder::new().connect_http(
+                l1_rpc_url
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid L1 RPC URL '{l1_rpc_url}': {e}"))?,
+            );
+            use alloy::providers::Provider as _;
+            let chain_id = provider
+                .get_chain_id()
+                .await
+                .context("reading eth_chainId to identify the L1 evidence source")?;
+            check_l1_evidence_source(&store, chain_id, ger_addr, l1_evidence_tag.describe())
+                .await?;
         }
     }
 

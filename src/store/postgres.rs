@@ -240,6 +240,42 @@ impl Store for PgStore {
 
     // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
 
+    async fn get_l1_evidence_source(&self) -> anyhow::Result<Option<(u64, String, String)>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT chain_id, ger_address, evidence_tag FROM l1_evidence_source WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(row.map(|r| {
+            (
+                r.get::<_, i64>(0) as u64,
+                r.get::<_, String>(1),
+                r.get::<_, String>(2),
+            )
+        }))
+    }
+
+    async fn set_l1_evidence_source(
+        &self,
+        chain_id: u64,
+        ger_address: &str,
+        evidence_tag: &str,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO l1_evidence_source (id, chain_id, ger_address, evidence_tag) \
+                 VALUES (1, $1, $2, $3) \
+                 ON CONFLICT (id) DO UPDATE SET chain_id = EXCLUDED.chain_id, \
+                     ger_address = EXCLUDED.ger_address, evidence_tag = EXCLUDED.evidence_tag",
+                &[&(chain_id as i64), &ger_address, &evidence_tag],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;
         let row = client

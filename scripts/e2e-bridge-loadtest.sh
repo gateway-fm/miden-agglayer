@@ -623,3 +623,28 @@ else
 fi
 r "Results log: $RESULTS_LOG"
 r "Verbose log: $VERBOSE_LOG"
+
+# ── VERDICT ─────────────────────────────────────────────────────────────────
+# This script used to END here, so its exit status was whatever the last `r`
+# returned: ZERO, unconditionally — including a run that submitted bridges and
+# delivered none of them, and including a run that submitted nothing at all
+# (over which every "no undelivered bridges" statement above is vacuously
+# true). Anything consuming its exit code was reading a constant.
+#
+# LOADTEST_ALLOW_UNDELIVERED=1 is for diagnostic runs that expect losses; it
+# must never be set in a release gate.
+VERDICT_RC=0
+if [[ "${G_SUB:-0}" -eq 0 ]]; then
+    r "VERDICT: FAIL — zero bridges were submitted; every completeness statement above is vacuous"
+    VERDICT_RC=1
+elif [[ "${G_CLM:-0}" -lt "${G_SUB:-0}" ]]; then
+    if [[ "${LOADTEST_ALLOW_UNDELIVERED:-0}" == "1" ]]; then
+        r "VERDICT: undelivered bridges present ($G_CLM/$G_SUB claimed) but LOADTEST_ALLOW_UNDELIVERED=1 — reporting success as instructed"
+    else
+        r "VERDICT: FAIL — $(( G_SUB - G_CLM )) of $G_SUB submitted bridge(s) were never claimed"
+        VERDICT_RC=1
+    fi
+else
+    r "VERDICT: PASS — all $G_SUB submitted bridge(s) were claimed"
+fi
+exit "$VERDICT_RC"

@@ -512,6 +512,28 @@ pub trait Store: Send + Sync + 'static {
     async fn set_nonce_ledger_rebuilt(&self, _rebuilt: bool) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// The L1 this store's GER corroboration was gathered from, if recorded.
+    ///
+    /// Audit-H6 evidence is only meaningful relative to a source: `ger_entries`
+    /// rows say "observed on L1" without saying WHICH L1, so the same database
+    /// pointed at a different chain, a re-genesised devnet, or a redeployed GER
+    /// manager would keep accepting historic rows as corroboration for roots
+    /// that never existed there. Returns `(chain_id, ger_address, evidence_tag)`.
+    async fn get_l1_evidence_source(&self) -> anyhow::Result<Option<(u64, String, String)>> {
+        Ok(None)
+    }
+
+    /// Record the evidence source on first use. Idempotent: writing the same
+    /// identity again is a no-op, and callers compare before writing.
+    async fn set_l1_evidence_source(
+        &self,
+        _chain_id: u64,
+        _ger_address: &str,
+        _evidence_tag: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// #90 — seed a signer's nonce baseline iff it has NO row yet. Insert-if-absent,
     /// so it is atomic and idempotent across replicas: exactly one caller seeds and
     /// every later call is a no-op. Returns `true` iff this call created the row.

@@ -700,8 +700,14 @@ fi
 # parent's LT_RC could be a false green with missing L1 workload. The predicate
 # lives in lib-chaos-verdict.sh so the same rule is unit-tested and the parent
 # consumes a real exit code instead of parsing human-readable logs.
+# STRICT BY DEFAULT (was opt-in). A release gate that only enforces the
+# operational result when the caller remembers to ask is not a gate: with
+# STRICT_OPS=0 and VERIFY=0, a run where every operation failed before
+# producing a note exits 0 and the completeness checks over the empty feed are
+# vacuously true. Diagnostic runs can still opt out with STRICT_OPS=0, which is
+# now an explicit statement rather than the default.
 OPS_RC=0
-if [[ "${STRICT_OPS:-0}" == "1" ]]; then
+if [[ "${STRICT_OPS:-1}" == "1" ]]; then
     # shellcheck source=/dev/null
     source "$SCRIPT_DIR/lib-chaos-verdict.sh"
     if l1_ops_ok "$TOT_SUB_L1" "$PLAN_L1" "$TOT_SUB_L2" "$PLAN_L2" \

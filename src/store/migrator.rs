@@ -133,6 +133,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "022_nonce_ledger_rebuilt.sql",
         include_str!("../../migrations/022_nonce_ledger_rebuilt.sql"),
     ),
+    (
+        "023_l1_evidence_source.sql",
+        include_str!("../../migrations/023_l1_evidence_source.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be
