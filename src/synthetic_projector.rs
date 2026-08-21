@@ -225,6 +225,39 @@ fn reconcile_backpressure_budget_secs() -> u64 {
     })
 }
 
+/// How long a reconcile sweep may wait out node backpressure.
+///
+/// The two callers have opposite constraints, and giving them one shared budget
+/// was wrong in the live direction:
+///
+/// * [`ReconcilePatience::Recovery`] — the `--restore` one-shot. It has nobody
+///   to keep responsive and a hard correctness dependency on a COMPLETE feed
+///   (a partial sweep silently truncates the GER hash chain), so it waits out
+///   backpressure for the full `RECONCILE_BACKPRESSURE_BUDGET_SECS` (#112).
+///
+/// * [`ReconcilePatience::LiveTick`] — the sync listener. It runs INLINE on the
+///   serialized Miden client loop, so every second spent backing off is a
+///   second no proxy request can acquire the client. Waiting is also pointless
+///   there: a window that fails is simply retried on the next tick, with the
+///   low-water-mark cursor holding the line. Its backoff is therefore clamped
+///   to whatever remains of the tick budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcilePatience {
+    Recovery,
+    LiveTick,
+}
+
+impl ReconcilePatience {
+    /// Seconds a single window fetch may spend backing off, given the time left
+    /// in the current tick.
+    fn window_backoff_secs(self, remaining_tick: Duration) -> u64 {
+        match self {
+            Self::Recovery => reconcile_backpressure_budget_secs(),
+            Self::LiveTick => reconcile_backpressure_budget_secs().min(remaining_tick.as_secs()),
+        }
+    }
+}
+
 struct RpcReconcileFetcher(Arc<dyn NodeRpcClient>);
 
 #[async_trait::async_trait]
@@ -610,9 +643,10 @@ impl SyntheticProjector {
         client: &mut MidenClientLib,
         rpc: &Arc<dyn NodeRpcClient>,
         tip: u64,
+        patience: ReconcilePatience,
     ) -> anyhow::Result<()> {
         let fetcher: Arc<dyn ReconcileFetcher> = Arc::new(RpcReconcileFetcher(Arc::clone(rpc)));
-        self.reconcile_notes_with(Some(client), Some(rpc.as_ref()), &fetcher, tip)
+        self.reconcile_notes_with(Some(client), Some(rpc.as_ref()), &fetcher, tip, patience)
             .await
     }
 
@@ -644,7 +678,8 @@ impl SyntheticProjector {
             if before >= tip {
                 return Ok(before);
             }
-            self.reconcile_notes(client, &self.node_rpc, tip).await?;
+            self.reconcile_notes(client, &self.node_rpc, tip, ReconcilePatience::Recovery)
+                .await?;
             let after = self.reconcile_cursor.load(Ordering::Acquire);
             if after <= before {
                 anyhow::bail!(
@@ -684,6 +719,7 @@ impl SyntheticProjector {
         rpc: Option<&dyn NodeRpcClient>,
         fetcher: &Arc<dyn ReconcileFetcher>,
         tip: u64,
+        patience: ReconcilePatience,
     ) -> anyhow::Result<()> {
         let deadline = Instant::now() + self.reconcile_budget;
         loop {
@@ -693,7 +729,13 @@ impl SyntheticProjector {
             }
             // Caught-up fast path: a single (near-tip) window is fetched inline
             // — identical behavior and cost to the historical per-tick sweep.
-            let backoff_budget = reconcile_backpressure_budget_secs();
+            // A LiveTick backoff must fit inside what is left of the tick: this
+            // runs inline on the serialized client loop, so the inner backoff
+            // (up to RECONCILE_BACKPRESSURE_BUDGET_SECS, and once per window)
+            // would otherwise hold the client for minutes while the nominal
+            // tick budget claims to be 2s.
+            let backoff_budget =
+                patience.window_backoff_secs(deadline.saturating_duration_since(Instant::now()));
             let mut results: Vec<(u64, u64, anyhow::Result<Vec<NoteId>>)> = if let [(from, to)] =
                 windows[..]
             {
@@ -724,6 +766,14 @@ impl SyntheticProjector {
                         out.push(joined.map_err(|e| {
                             anyhow::anyhow!("reconcile window-fetch task panicked: {e}")
                         })?);
+                    }
+                    // Results are applied in ascending order and the batch
+                    // aborts at the first failed window, so everything fetched
+                    // after a failure is discarded anyway. Stop launching
+                    // chunks once one has failed rather than paying (and
+                    // back-pressuring the node for) fetches we will throw away.
+                    if out.iter().any(|(_, _, r)| r.is_err()) {
+                        break;
                     }
                 }
                 out
@@ -1024,6 +1074,28 @@ impl SyntheticProjector {
         let mut recs = Vec::new();
         for (nullifier, cref, note_id) in &refs {
             if let Some(body) = body_by_id.get(note_id) {
+                // BIND the fetched body to the consumption it was resolved for.
+                // The id can come from the transaction's (nullifier, note_id)
+                // refs, and upstream's `trusted_consumed_note_refs` only checks
+                // that the ref's NULLIFIER was consumed by this transaction —
+                // never that the paired id is the note that nullifier belongs
+                // to. Two refs with swapped ids both pass that filter, and
+                // since the id carries `within_tx_pos`, a swap would reorder
+                // BridgeEvents and shift deposit counts while every count
+                // stayed correct. The body's own nullifier settles it.
+                if body.nullifier != *nullifier {
+                    metrics::counter!("synthetic_projector_b2agg_ref_mismatch_total").increment(1);
+                    anyhow::bail!(
+                        "projector: note {} was resolved for consumed nullifier {} but its own \
+                         nullifier is {} — the node's (nullifier, note_id) reference is \
+                         inconsistent. Refusing to seal block {}: a mismatched reference \
+                         reorders bridge-outs and shifts deposit counts.",
+                        note_id.to_hex(),
+                        nullifier.to_hex(),
+                        body.nullifier.to_hex(),
+                        cref.block,
+                    );
+                }
                 within_tx_pos.insert(*note_id, cref.within_tx_pos);
                 recs.push((
                     *note_id,
@@ -1424,7 +1496,10 @@ impl SyntheticProjector {
         let mut cursor = self.cursor.load(Ordering::Acquire);
         // Reconcile even when projection is already at the tip so note imports do not stall
         // while block production is paused.
-        if let Err(e) = self.reconcile_notes(client, &self.node_rpc, tip).await {
+        if let Err(e) = self
+            .reconcile_notes(client, &self.node_rpc, tip, ReconcilePatience::LiveTick)
+            .await
+        {
             tracing::warn!(
                 error = %format!("{e:#}"),
                 "note reconciler failed (transient — will retry next tick)"
@@ -1730,6 +1805,10 @@ pub(crate) struct FetchedBody {
     pub id: NoteId,
     pub details: NoteDetails,
     pub attachments: NoteAttachments,
+    /// The note's OWN nullifier, taken from the fetched note before the
+    /// details conversion drops its metadata. Kept so a consumption can be
+    /// bound to the body it claims — see the check in the resolve loop.
+    pub nullifier: Nullifier,
 }
 
 /// The result of an authoritative fetch: the decoded PUBLIC bodies AND the full set of ids
@@ -1776,11 +1855,13 @@ impl PublicNoteFetcher for RpcNoteFetcher<'_> {
                 continue;
             };
             let attachments = note.attachments().clone();
+            let nullifier = note.nullifier();
             let details: NoteDetails = note.into();
             bodies.push(FetchedBody {
                 id,
                 details,
                 attachments,
+                nullifier,
             });
         }
         Ok(FetchedBodies {
@@ -2267,7 +2348,7 @@ mod tests {
         let fetcher = FakeFetcher::with_note_ids(None, vec![note_id]);
         let f: StdArc<dyn ReconcileFetcher> = fetcher;
         let err = projector
-            .reconcile_notes_with(None, None, &f, 200)
+            .reconcile_notes_with(None, None, &f, 200, ReconcilePatience::Recovery)
             .await
             .expect_err("candidate import without a client must fail");
         assert!(format!("{err:#}").contains("no client handle"));
@@ -2300,7 +2381,7 @@ mod tests {
         let failed_fetcher = FakeFetcher::with_note_ids(Some(1), vec![note_id]);
         let failed: StdArc<dyn ReconcileFetcher> = failed_fetcher;
         failed_projector
-            .reconcile_notes_with(None, None, &failed, 200)
+            .reconcile_notes_with(None, None, &failed, 200, ReconcilePatience::Recovery)
             .await
             .expect_err("injected fetch failure must fail the window");
         assert_eq!(
@@ -2334,7 +2415,7 @@ mod tests {
         let fetcher = FakeFetcher::new(None);
         let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
         projector
-            .reconcile_notes_with(None, None, &f, 2_000)
+            .reconcile_notes_with(None, None, &f, 2_000, ReconcilePatience::Recovery)
             .await
             .unwrap();
         // Fetch-task completion order is unspecified — compare as a set.
@@ -2354,7 +2435,7 @@ mod tests {
         let fetcher = FakeFetcher::new(None);
         let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
         projector
-            .reconcile_notes_with(None, None, &f, 2_000)
+            .reconcile_notes_with(None, None, &f, 2_000, ReconcilePatience::Recovery)
             .await
             .unwrap();
         let mut calls = fetcher.calls();
@@ -2386,14 +2467,27 @@ mod tests {
         let fetcher = FakeFetcher::new(Some(401));
         let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
         let err = projector
-            .reconcile_notes_with(None, None, &f, 2_000)
+            .reconcile_notes_with(None, None, &f, 2_000, ReconcilePatience::Recovery)
             .await
             .expect_err("a failed window must fail the tick (stays loud/transient)");
         assert!(
             format!("{err:#}").contains("401..600"),
             "error must name the failed window: {err:#}"
         );
-        assert_eq!(fetcher.calls().len(), 8, "the whole batch was fetched");
+        // Fetching stops at the chunk that contained the failure: results are
+        // applied in ascending order and the batch aborts at the first failed
+        // window, so any window fetched after it would be discarded anyway.
+        // What matters is that nothing ABOVE the failure was APPLIED — asserted
+        // by the low-water cursor below.
+        let calls = fetcher.calls();
+        assert!(
+            calls.len() >= 3,
+            "the failing window and everything below it must still be fetched, got {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|(from, _)| *from <= 600),
+            "no window above the failed one (401..600) may be fetched after the failure: {calls:?}"
+        );
         assert_eq!(
             store.get_reconcile_cursor().await.unwrap(),
             400,
@@ -2410,7 +2504,7 @@ mod tests {
         let fetcher = FakeFetcher::new(None);
         let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
         projector
-            .reconcile_notes_with(None, None, &f, 2_000)
+            .reconcile_notes_with(None, None, &f, 2_000, ReconcilePatience::Recovery)
             .await
             .unwrap();
         let mut retry_calls = fetcher.calls();
@@ -2438,7 +2532,7 @@ mod tests {
         let fetcher = FakeFetcher::new(None);
         let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
         projector
-            .reconcile_notes_with(None, None, &f, 10_000)
+            .reconcile_notes_with(None, None, &f, 10_000, ReconcilePatience::Recovery)
             .await
             .unwrap();
         assert_eq!(
@@ -2452,7 +2546,7 @@ mod tests {
         let fetcher = FakeFetcher::new(None);
         let f: StdArc<dyn ReconcileFetcher> = fetcher.clone();
         projector
-            .reconcile_notes_with(None, None, &f, 10_000)
+            .reconcile_notes_with(None, None, &f, 10_000, ReconcilePatience::Recovery)
             .await
             .unwrap();
         assert!(fetcher.calls().is_empty(), "caught up: zero RPC work");
@@ -3260,11 +3354,13 @@ mod tests {
                     id: id_a,
                     details: details.clone(),
                     attachments: attachments.clone(),
+                    nullifier: nf_a,
                 },
                 FetchedBody {
                     id: id_b,
                     details,
                     attachments,
+                    nullifier: nf_b,
                 },
             ],
             ..Default::default()
@@ -3322,6 +3418,67 @@ mod tests {
         super::Nullifier::from_raw(Word::new([Felt::new(byte).unwrap(); 4]))
     }
 
+    /// A node reference that pairs a consumed nullifier with the WRONG note id
+    /// must be refused, not projected.
+    ///
+    /// Upstream's `trusted_consumed_note_refs` filters refs to nullifiers this
+    /// transaction actually consumed — but it never checks that the paired note
+    /// id belongs to that nullifier. Two refs with swapped ids therefore both
+    /// survive it, and because the id carries `within_tx_pos`, projecting them
+    /// would emit the two BridgeEvents in the wrong order: deposit counts and
+    /// global indexes shift, while every count-based check stays green. The
+    /// body's own nullifier is the independent fact that catches it.
+    #[tokio::test]
+    async fn swapped_consumed_note_reference_is_refused() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let body_note = b2agg_note(600, Some(0));
+        let details = body_note.details().clone();
+        let note_id = NoteId::new(
+            body_note.details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let consumed_nf = nullifier(0xbe);
+        let other_nf = nullifier(0xef);
+
+        // The transaction consumed `consumed_nf` and the node says that
+        // nullifier's note is `note_id` — but the fetched body for `note_id`
+        // reports a DIFFERENT nullifier, so the pairing is a lie.
+        let consumed_refs = HashMap::from([(
+            consumed_nf,
+            ConsumedRef {
+                block: 600,
+                order: 0,
+                note_id: Some(note_id),
+                within_tx_pos: 0,
+            },
+        )]);
+        let fetcher = MockFetcher {
+            bodies: vec![FetchedBody {
+                id: note_id,
+                details,
+                attachments: NoteAttachments::default(),
+                nullifier: other_nf,
+            }],
+            ..Default::default()
+        };
+
+        let err = projector
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut HashMap::new())
+            .await
+            .expect_err("a body whose nullifier is not the consumed one must fail closed");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("inconsistent"),
+            "the error must name the inconsistent reference, got: {report}"
+        );
+    }
+
     /// The regression for note `0xacfee0cb…` (N=30 loadtest, exactly 1 missing BridgeEvent): a
     /// bridge consumption created and consumed under load must still be resolved and emitted
     /// at its exact block. When a client retains the protocol header,
@@ -3358,6 +3515,7 @@ mod tests {
                 id: note_id,
                 details: details.clone(),
                 attachments: NoteAttachments::default(),
+                nullifier: nf,
             }],
             ..Default::default()
         };

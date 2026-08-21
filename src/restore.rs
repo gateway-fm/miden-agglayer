@@ -1130,6 +1130,31 @@ fn build_bridge_replay(
             {
                 anyhow::bail!("restore: NoteId {id} body/transaction commitment mismatch");
             }
+            // BIND the resolved id back to the input it was resolved FOR.
+            // Upstream's `trusted_consumed_note_refs` only checks that each
+            // ref's NULLIFIER is one this transaction consumed; it never checks
+            // that the paired note id is the note that nullifier belongs to.
+            // Two refs whose ids are SWAPPED therefore both survive that
+            // filter, and since the id decides which body lands at which
+            // `within_tx_pos`, a swap silently REORDERS bridge-outs — deposit
+            // counts and global indexes shift while every cardinality check
+            // stays green.
+            //
+            // `id_by_nullifier` is an independent pairing: the block walk built
+            // it from each fetched note's OWN id and OWN derived nullifier
+            // (`Note::nullifier()`), not from the transaction's refs. Where the
+            // two sources overlap they must agree.
+            if let Some(scanned_id) = id_by_nullifier.get(&input.nullifier())
+                && *scanned_id != id
+            {
+                anyhow::bail!(
+                    "restore: input nullifier {} resolves to NoteId {id} via the transaction's \
+                     consumed-note refs but to NoteId {scanned_id} via the node block scan. \
+                     Refusing to replay: a mismatched reference reorders bridge-outs and shifts \
+                     deposit counts.",
+                    input.nullifier(),
+                );
+            }
             replay.push(ReplayBridgeOut {
                 id,
                 body,
@@ -1176,6 +1201,20 @@ fn build_claim_replay(
                 && header.details_commitment() != body.details.commitment()
             {
                 anyhow::bail!("restore: CLAIM NoteId {id} body/transaction commitment mismatch");
+            }
+            // Same binding check as `build_bridge_replay`: where the node block
+            // scan independently knows which note id owns this nullifier, the
+            // transaction's ref must agree, so a mismatched reference cannot
+            // attach the wrong CLAIM body to this consumption.
+            if let Some(scanned_id) = claim_id_by_nullifier.get(&input.nullifier())
+                && *scanned_id != id
+            {
+                anyhow::bail!(
+                    "restore: CLAIM input nullifier {} resolves to NoteId {id} via the \
+                     transaction's consumed-note refs but to NoteId {scanned_id} via the node \
+                     block scan — refusing to replay a mismatched reference",
+                    input.nullifier(),
+                );
             }
             // Only the consumption BLOCK is kept: live claim records carry no
             // tx order (see ReplayClaim's docs / `projection_order`).
