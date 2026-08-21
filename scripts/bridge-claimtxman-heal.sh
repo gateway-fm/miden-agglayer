@@ -27,6 +27,7 @@
 # Exit codes:
 #   0  healed, and the L1 sync cursor advanced (positive proof it recovered)
 #   1  error, or the service is not stably running afterwards
+#   2  no action taken (no wedge to heal) — NOT a statement about health
 #   3  wipe completed and the service is running, but NO local proof was
 #      available (a quiet stack moves no cursor). The CALLER must prove the
 #      claim pipeline. `set -e` callers must use
@@ -147,8 +148,12 @@ if [[ "$FORCE" != "1" ]]; then
         exit 1
     fi
     if [[ "${stranded:-0}" -eq 0 || "${mismatches:-0}" -eq 0 ]]; then
-        log "no stranded-nonce wedge (created=${stranded:-0} fresh_mismatches=${mismatches:-0}) — nothing to heal"
-        exit 0
+        # Exit 2 = NO ACTION, not 0. Exit 0 is documented as "healed, with
+        # proven L1 progress"; returning it here let a STOPPED container with
+        # readable old logs and zero matching rows read as a successful heal —
+        # the same dead-container false success the post-wipe rewrite removed.
+        log "no stranded-nonce wedge (created=${stranded:-0} fresh_mismatches=${mismatches:-0}) — nothing to heal (NO ACTION)"
+        exit 2
     fi
     log "wedge: $stranded stranded created tx(s), $mismatches nonce-mismatch send(s)/120s"
 else

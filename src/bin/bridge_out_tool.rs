@@ -322,15 +322,31 @@ fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
 ///   post-submit local failure has its own typed variant
 ///   (`ApplyTransactionAfterSubmitFailed`, handled separately). Determinate.
 fn submit_is_indeterminate(err: &ClientError) -> bool {
-    use miden_client::rpc::{RpcEndpoint, RpcError};
-    matches!(
-        err,
+    use miden_client::rpc::{GrpcError, RpcEndpoint, RpcError};
+    match err {
         ClientError::RpcError(RpcError::RequestError {
             endpoint: RpcEndpoint::SubmitProvenTx,
             endpoint_error: None,
+            error_kind,
             ..
-        })
-    )
+        }) => match error_kind {
+            // PRE-ADMISSION REJECTIONS. The validator answers these BEFORE the
+            // transaction reaches the block producer, so nothing can have
+            // landed — treating them as ambiguous costs a 90s probe and an
+            // exit 4 where the honest answer is "definitely not admitted, retry
+            // freely".
+            //   * FailedPrecondition — stale transaction-encryption key id; the
+            //     client evicts the key and the caller re-submits.
+            //   * ResourceExhausted — validator busy (e.g. backup in progress).
+            // Matched by TYPED gRPC status, never by message text.
+            GrpcError::FailedPrecondition | GrpcError::ResourceExhausted => false,
+            // Everything else on this endpoint is a transport-level failure
+            // with no answer from the node: the transaction may have been
+            // accepted and only the response lost. INDETERMINATE.
+            _ => true,
+        },
+        _ => false,
+    }
 }
 
 /// Does `note_id` exist on chain? Polls for up to `probe_secs`.
@@ -1634,6 +1650,21 @@ mod tests {
                     Some(endpoint_error),
                 )),
                 "a node-level rejection means the node did not accept the transaction"
+            );
+        }
+    }
+
+    /// Pre-admission rejections: the validator answers BEFORE the block
+    /// producer sees the transaction, so nothing landed. Classifying them as
+    /// ambiguous would cost a 90s probe and a refusal to retry, where the truth
+    /// is "definitely not admitted".
+    #[test]
+    fn pre_admission_rejections_are_determinate() {
+        for kind in [GrpcError::FailedPrecondition, GrpcError::ResourceExhausted] {
+            let label = format!("{kind:?}");
+            assert!(
+                !submit_is_indeterminate(&request_error(RpcEndpoint::SubmitProvenTx, kind, None)),
+                "{label} is answered before admission — nothing can have landed"
             );
         }
     }

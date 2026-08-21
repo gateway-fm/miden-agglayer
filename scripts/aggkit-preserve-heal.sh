@@ -268,18 +268,6 @@ BASE_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$C" 2>/dev/null || echo 0
 # failed"). The container was already created with the correct config by the
 # recreate above, so a plain start needs no dependency graph — and this heal's
 # job is to restore THIS service, not to require a healthy stack.
-# Baseline for the POSITIVE proof below, captured BEFORE the service starts.
-# Taking it after the restart (as it was) lets a legitimate injection that
-# lands in the first moments be swallowed INTO the baseline, after which the
-# healer reports "no new injections" on a stack that healed perfectly.
-# `is_injected` rows are written exclusively by the GER injection path, so —
-# unlike a bare transactions count — concurrent bridge/claim load cannot
-# manufacture this signal.
-PRE_INJECTED=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
-    "SELECT count(*) FROM ger_entries WHERE is_injected" 2>/dev/null | tr -d '[:space:]')
-[[ "${PRE_INJECTED:-}" =~ ^[0-9]+$ ]] || PRE_INJECTED=""
-log "pre-start injected-GER baseline: ${PRE_INJECTED:-<unreadable>}"
-
 docker start "$C" >/dev/null 2>&1 \
     || {
         KEEP_STAGE=1
@@ -385,22 +373,12 @@ if true; then
     CONFIRM_TIMEOUT="${HEAL_CONFIRM_TIMEOUT:-120}"
     waited=0
     confirmed=0
-    # With no pending injection to await, the only remaining positive signal is
-    # the injection counter advancing. Waiting for it is still worthwhile (that
-    # is the pipeline we healed); only give up on proof if the caller has
-    # explicitly accepted a deferred verdict.
-    # An UNREADABLE proof source is not a proof. Auto-confirming here would let
-    # a broken postgres certify a dead aggoracle as healed — the exact
-    # false-green shape this block exists to remove. Only an explicit deferred
-    # mode may end without proof, and it ends UNCONFIRMED, never confirmed.
-    if [ -z "$PRE_INJECTED" ]; then
-        if [ "${HEAL_ALLOW_DEFERRED_PROOF:-0}" = "1" ]; then
-            log "WARNING: injection baseline unreadable and HEAL_ALLOW_DEFERRED_PROOF=1 — ending UNPROVEN; the caller must prove the pipeline itself"
-            PROOF_DEFERRED=1
-        else
-            fail_soft "could not read the ger_entries injection baseline — refusing to report a heal as confirmed on unreadable state"
-        fi
-    fi
+    # With no pending injection to await there is nothing here to prove, and
+    # nothing this script can substitute for it — see the removed
+    # aggregate-counter fallback. The wait below is meaningful only when an
+    # exact TARGET_TX exists; otherwise it ends immediately as UNPROVEN and the
+    # caller (which can drive an injection and watch it land) concludes.
+    [ -n "$TARGET_TX" ] || waited="$CONFIRM_TIMEOUT"
     while [ "$confirmed" -eq 0 ] && [ "$waited" -lt "$CONFIRM_TIMEOUT" ]; do
         known=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
             "SELECT count(*) FROM transactions WHERE tx_hash='$TARGET_TX'" 2>/dev/null || echo "")
@@ -408,26 +386,17 @@ if true; then
             confirmed=1; CONFIRMED_BY=exact
             break
         fi
-        # Any NEWLY injected GER proves the wedge cleared — the pending id can
-        # supersede repeatedly while we wait (live 2026-08-19: three distinct
-        # ids in ~2 min), so chasing one exact id reports a false UNCONFIRMED on
-        # a healthy pipeline.
+        # The aggregate injected-GER counter fallback is GONE. It accepted ANY
+        # increase in the global count as proof this aggoracle recovered, but
+        # the count carries no identity: the restore projector can independently
+        # mark an already-consumed, pre-heal GER as injected, advancing the
+        # counter while the restarted aggoracle stays dead and the target stays
+        # unadmitted. The log line that went with it also asserted a
+        # "superseding injection" the counter cannot identify.
         #
-        # This must be scoped to the GER INJECTION pipeline, which is what the
-        # heal repairs. The previous form counted ANY transaction admitted in
-        # the last 5 minutes — under this repo's own soak that is satisfied by
-        # concurrent bridge/claim load, so a permanently dead aggoracle
-        # certified itself as healed. `ger_entries.is_injected` grows only when
-        # an injection is actually admitted.
-        if [ -n "$PRE_INJECTED" ]; then
-            now_injected=$(docker exec "$PG" psql -U agglayer -d agglayer_store -tAc \
-                "SELECT count(*) FROM ger_entries WHERE is_injected" 2>/dev/null | tr -d '[:space:]')
-            if [[ "${now_injected:-}" =~ ^[0-9]+$ ]] && [ "$now_injected" -gt "$PRE_INJECTED" ]; then
-                confirmed=1; CONFIRMED_BY=counter
-                log "positive outcome: GER injections advanced ${PRE_INJECTED} -> ${now_injected} after the heal (pending id superseded ${TARGET_TX:0:18}…)"
-                break
-            fi
-        fi
+        # Proof here is the EXACT target being durably admitted, or nothing —
+        # in which case the caller is told so (exit 3) and proves the pipeline
+        # itself.
         if [ -n "$WEDGE_TX" ]; then
             rewedged=$(docker logs --since 10s "$C" 2>&1 | grep -F "$WEDGE_TX" \
                 | grep -cE "${WEDGE_PATTERN:-already exists in monitoring DB}" || true)
@@ -444,7 +413,7 @@ if true; then
             log "no injection observed within ${CONFIRM_TIMEOUT}s and HEAL_ALLOW_DEFERRED_PROOF=1 — positive proof deferred to the caller"
             PROOF_DEFERRED=1
         else
-            fail_soft "no GER injection was admitted within ${CONFIRM_TIMEOUT}s (target ${TARGET_TX:-<none pending>}, injected count still ${PRE_INJECTED:-?}) — no positive proof the injection pipeline recovered"
+            fail_soft "the exact target ${TARGET_TX:-<none pending>} was not durably admitted within ${CONFIRM_TIMEOUT}s — no positive proof the injection pipeline recovered"
         fi
     fi
     # Only claim the EXACT transaction when the exact-transaction check is what
@@ -454,8 +423,6 @@ if true; then
     # evidence.
     if [ "${CONFIRMED_BY:-}" = "exact" ] && [ -n "$TARGET_TX" ]; then
         log "positive exact outcome: proxy durably admitted ${TARGET_TX:0:18}… after ${waited}s"
-    elif [ "${CONFIRMED_BY:-}" = "counter" ]; then
-        log "positive outcome: GER injections advanced after the heal (a superseding injection, not necessarily ${TARGET_TX:0:18}…)"
     fi
 fi
 [ "${PROGRESS_MATCHES:-0}" -gt 0 ] \

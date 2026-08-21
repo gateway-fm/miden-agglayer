@@ -715,123 +715,55 @@ _pf_sync_lag() {
 # GER (network_id=1 row) older than the 2 newest with NO matching L1 row means
 # /merkle-proof is already 500ing for every net-1 deposit — Miden->L2B claims
 # are impossible regardless of what sync.status claims.
-# SQL for the L1-GER consistency probe.
+# L1-GER consistency: READABILITY ONLY. The consistency VERDICT is retired.
 #
-# Emitted as a string so the caller can run it through `timeout docker exec ...`
-# — `timeout` takes an EXECUTABLE, and handing it a bash function fails with 127
-# ("No such file or directory"), which an earlier version did while its test hid
-# the defect behind a `timeout` shell function.
+# This check tried to answer "can bridge-service serve /merkle-proof for net-1
+# deposits?" (the #111 starvation shape). Three successive attempts modelled the
+# wrong thing:
+#   1. a join over all rows with a newest-N rank grace — rank is not age, small
+#      populations were swallowed whole, and growth short-circuited to PASS;
+#   2. an id-based identity rule across probes — defeated by reorg
+#      delete-and-replay, since the pinned service's Reset cascade-deletes
+#      exit_root rows and ids are sequence-backed;
+#   3. the synchronizer's ROOT-HYDRATION predicate (`allowed AND block_id > 0`,
+#      empty exit_roots) — which is the background work queue, NOT the request
+#      selector. With FinalizedGEREnabled the endpoint serves from the single
+#      LATEST TRUSTED row (GetLatestTrustedExitRoot, ordered by id DESC), so a
+#      historical orphan beneath a newer hydrated row makes this check red a
+#      stack the endpoint serves perfectly well.
 #
-# The predicate MIRRORS what bridge-service actually uses to serve
-# /merkle-proof, rather than approximating it. Quoted from the pinned service
-# (revitteth/zkevm-bridge-service @2e87f97, db/pgstorage/pgstorage.go): the L2
-# GER it will serve must have `allowed AND block_id > 0 AND
-# cardinality(exit_roots) = 0`, and the L1 row it joins to must have
-# `allowed AND block_id > 0`. An earlier version counted every network-1 row
-# and accepted any network-0 row with the same value, so an INELIGIBLE L1 row
-# could manufacture a match that serving rejects, and trusted/removed L2 rows
-# could manufacture failures.
+# Each attempt replaced one false verdict with another, in both directions. The
+# property is real and worth checking, but it can only be checked by evaluating
+# the row `GetClaimProof` would actually SELECT under the deployment's own
+# config — that is a piece of work with its own upstream-pinning, not something
+# to keep guessing at inside an unrelated PR. Filed:
+# docs/development/followups-h6-evidence-provenance.md.
 #
-# Returns: servable-L2-GERs | unmatched
-_pf_ger_probe_sql() {
-    cat <<'SQL'
-WITH servable AS (
-    SELECT global_exit_root
-    FROM sync.exit_root
-    WHERE network_id = 1 AND allowed AND block_id > 0
-      AND cardinality(exit_roots) = 0
-)
-SELECT count(*) || '|' ||
-       count(*) FILTER (
-           WHERE NOT EXISTS (
-               SELECT 1 FROM sync.exit_root l1
-               WHERE l1.network_id = 0 AND l1.allowed AND l1.block_id > 0
-                 AND l1.global_exit_root = servable.global_exit_root))
-FROM servable
-SQL
-}
-
-# Is every GER that bridge-service would SERVE backed by an L1 row it would
-# ACCEPT? If not, /merkle-proof 500s (code=2) for net-1 deposits and
-# claimtxman starves (#111).
-#
-# No rank arithmetic, no "newest N" grace, no cross-probe identity heuristics.
-# Those were invented here and each iteration produced a new hole (a grace that
-# swallowed small populations; a growth shortcut that passed while everything
-# was unmatched; an id-based identity rule defeated by reorg delete-and-replay,
-# since the pinned service's Reset cascade-deletes exit_root rows and ids are
-# sequence-backed). A freshly-observed GER whose L1 row has not landed yet is
-# handled by the only thing that is actually true about it: WAIT. If it
-# resolves within the settle window the stack is consistent; if it does not, it
-# is a finding regardless of how new it is.
-_pf_l1ger_consistency() {
+# What remains is the part that is unambiguously true and strictly better than
+# leaving it out: the tables must be READABLE. An unreadable bridge_db is a
+# broken stack, and reporting that is a fact rather than a model. It does NOT
+# claim proof-serving consistency, and says so.
+_pf_l1ger_readable() {
     local pg="${1:-${COMPOSE_PROJECT_NAME}-postgres-1}"
-    local settle="${PF_GER_SETTLE_SECS:-60}"
-    local probe rc servable unmatched waited=0
-
-    # EVERY call site is written so a failure cannot escape `set -e` before the
-    # typed _pf_fail runs: no bare failing assignment, status captured with
-    # `|| rc=$?`. The real entrypoints run `set -euo pipefail`, so a bare
-    # assignment here aborts the whole preflight with no verdict line at all.
-    _pf_run_probe() {
-        rc=0
-        probe=$(timeout 30 docker exec "$pg" psql -U bridge_user -d bridge_db \
-            -v ON_ERROR_STOP=1 -tAX -c "$(_pf_ger_probe_sql)" 2>&1) || rc=$?
-        [[ $rc -eq 0 ]] || return 0
-        probe=$(printf '%s' "$probe" | tr -d '[:space:]')
-        IFS='|' read -r servable unmatched <<<"$probe"
-        if [[ ! "$servable" =~ ^[0-9]+$ || ! "$unmatched" =~ ^[0-9]+$ ]]; then
-            rc=64
-        fi
-        return 0
-    }
-
-    _pf_run_probe
-    if [[ $rc -eq 64 ]]; then
-        _pf_fail "bridge-service L1-GER consistency: unexpected query response '$probe'"
-        return
-    elif [[ $rc -ne 0 ]]; then
-        _pf_fail "bridge-service L1-GER consistency: query FAILED (rc=$rc) — refusing to report this check as passed. psql: ${probe//$'\n'/ }"
+    local out rc=0
+    # `|| rc=$?` so a failure cannot escape the real entrypoints' `set -e`
+    # before the typed verdict line is printed.
+    out=$(timeout 30 docker exec "$pg" psql -U bridge_user -d bridge_db \
+        -v ON_ERROR_STOP=1 -tAX -c \
+        "SELECT count(*) FILTER (WHERE network_id = 0) || '|' ||
+                count(*) FILTER (WHERE network_id = 1) FROM sync.exit_root" 2>&1) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        _pf_fail "bridge-service exit_root table is NOT READABLE in $pg (rc=$rc) — psql: ${out//$'\n'/ }"
         return
     fi
-
-    # Nothing servable yet: benign bootstrap ONLY if the L1 side is indexing.
-    if [[ "$servable" -eq 0 ]]; then
-        local n_l1 lrc=0
-        n_l1=$(timeout 30 docker exec "$pg" psql -U bridge_user -d bridge_db \
-            -v ON_ERROR_STOP=1 -tAX -c \
-            "SELECT count(*) FROM sync.exit_root WHERE network_id = 0 AND allowed AND block_id > 0" 2>&1) || lrc=$?
-        if [[ $lrc -ne 0 ]]; then
-            _pf_fail "bridge-service L1-GER consistency: L1-side count FAILED (rc=$lrc) — psql: ${n_l1//$'\n'/ }"
-            return
-        fi
-        n_l1=$(printf '%s' "$n_l1" | tr -d '[:space:]')
-        if [[ ! "$n_l1" =~ ^[0-9]+$ ]]; then
-            _pf_fail "bridge-service L1-GER consistency: L1-side count returned '$n_l1', not a number"
-        elif [[ "$n_l1" -gt 0 ]]; then
-            _pf_pass "bridge-service L1-GER consistency: no servable L2 GERs yet (L1 side indexing, $n_l1 row(s)) — nothing to join"
-        else
-            _pf_fail "bridge-service L1-GER consistency: NO servable rows on either network — a dead indexer, not a fresh stack"
-        fi
-        return
-    fi
-
-    while [[ "$unmatched" -gt 0 && $waited -lt $settle ]]; do
-        sleep 5; waited=$((waited + 5))
-        _pf_run_probe
-        if [[ $rc -eq 64 ]]; then
-            _pf_fail "bridge-service L1-GER consistency: unexpected settle-retry response '$probe'"
-            return
-        elif [[ $rc -ne 0 ]]; then
-            _pf_fail "bridge-service L1-GER consistency: settle-retry query FAILED (rc=$rc) — psql: ${probe//$'\n'/ }"
-            return
-        fi
-    done
-
-    if [[ "$unmatched" -gt 0 ]]; then
-        _pf_fail "bridge-service L1-GER INCONSISTENT: $unmatched of $servable servable L2 GER(s) have no servable L1 row after ${waited}s — /merkle-proof will 500 (code=2) for net-1 deposits; claimtxman starvation (#111). Heal: scripts/bridge-claimtxman-heal.sh"
+    out=$(printf '%s' "$out" | tr -d '[:space:]')
+    local n_l1="${out%%|*}" n_l2="${out##*|}"
+    if [[ ! "$n_l1" =~ ^[0-9]+$ || ! "$n_l2" =~ ^[0-9]+$ ]]; then
+        _pf_fail "bridge-service exit_root count returned '$out', not a pair of numbers"
+    elif [[ "$n_l1" -eq 0 && "$n_l2" -eq 0 ]]; then
+        _pf_fail "bridge-service sync.exit_root is EMPTY for BOTH networks — the synchronizer has indexed nothing"
     else
-        _pf_pass "bridge-service L1-GER consistency: all $servable servable L2 GER(s) have their L1 row (proofs servable)$([[ $waited -gt 0 ]] && echo " after ${waited}s of settling")"
+        _pf_pass "bridge-service exit_root readable (L1 $n_l1 / L2 $n_l2 rows). NOTE: proof-serving consistency is NOT asserted here — see docs/development/followups-h6-evidence-provenance.md"
     fi
 }
 
@@ -913,7 +845,7 @@ l2l2_validate_stack() {
     # never reaching ready_for_claim while nets 0 and 2 look perfectly healthy.
     _pf_sync_lag 1 "$L2_RPC"  "Miden (Miden svc)" "${COMPOSE_PROJECT_NAME}-postgres-1"
     _pf_sync_lag 2 "$L2B_RPC" "L2B (L2B svc)"   "${COMPOSE_PROJECT_NAME}-postgres-l2b-1"
-    _pf_l1ger_consistency "${COMPOSE_PROJECT_NAME}-postgres-1"
+    _pf_l1ger_readable "${COMPOSE_PROJECT_NAME}-postgres-1"
 
     # (e) aggkit-l2b aggoracle alive — GER injection into L2B GER. A quiet stack
     # legitimately has no RECENT inject (aggoracle only fires on a new L1 GER), so

@@ -93,3 +93,31 @@ unrelated base GER activity could satisfy an L2B recovery proof. The watchdog
 now covers only the base aggkit — watching through the wrong database is worse
 than not watching. Restoring L2B coverage needs an L2B-side admission probe and
 a healer that reads the L2B database.
+
+## 4. L1-GER proof-serving consistency check (retired, needs deriving)
+
+The L2L2 preflight used to assert that bridge-service could serve /merkle-proof
+for net-1 deposits (the #111 starvation shape). Three successive models were all
+wrong, in both directions:
+
+1. a join over all rows with a newest-N RANK grace — rank is not age, small
+   populations were swallowed whole, and a "population grew" branch passed while
+   every row was unmatched;
+2. an id-based identity rule across probes — defeated by reorg
+   delete-and-replay, since the pinned service's `Reset` cascade-deletes
+   `sync.exit_root` rows and ids are sequence-backed;
+3. the synchronizer's ROOT-HYDRATION predicate (`allowed AND block_id > 0`,
+   empty `exit_roots`) — which is the background work queue, not the request
+   selector. With `FinalizedGEREnabled` the endpoint serves from the single
+   LATEST TRUSTED row (`GetLatestTrustedExitRoot`, id DESC), so a historical
+   orphan beneath a newer hydrated row reds a stack the endpoint serves fine.
+
+The verdict is therefore RETIRED; the preflight now only asserts the tables are
+readable and says explicitly that consistency is not checked.
+
+Requirements for a correct version: evaluate the row `GetClaimProof` would
+actually SELECT under the deployment's own configuration (which differs with
+`FinalizedGEREnabled`), pinned to the bridge-service commit in use, with a test
+that drives the real selection rather than a count. Until then, #111 detection
+rests on the functional gates — the full-DB-loss drill now requires an actual
+claim to SETTLE, not merely reach `ready_for_claim`.

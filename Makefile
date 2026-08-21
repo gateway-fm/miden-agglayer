@@ -81,14 +81,11 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	bash -n scripts/test-verify-completeness-substitution.sh
 	python3 -m py_compile scripts/lib-verify-completeness.py
 	TOOL_BIN=target/release/bridge-out-tool bash scripts/test-verify-completeness-substitution.sh
-	# Verdict predicates that decide whether a gate passes. Both have been
-	# false-green in review (an all-zero operational tuple returning OK; an
-	# L1-GER preflight that passed while its own probe could not execute), so
-	# they run here rather than only inside a docker-bound e2e.
+	# Verdict predicates that decide whether a gate passes. This one returned
+	# OK for an all-zero operational tuple — a run that did no work certifying
+	# itself — so it runs here rather than only inside a docker-bound e2e.
 	bash -n scripts/test-chaos-verdict.sh
 	bash scripts/test-chaos-verdict.sh
-	bash -n scripts/test-l1ger-preflight.sh
-	bash scripts/test-l1ger-preflight.sh
 
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)

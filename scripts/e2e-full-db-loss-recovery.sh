@@ -702,6 +702,29 @@ print(next((d.get('deposit_cnt') for d in ds if str(d.get('tx_hash','')).lower()
 " 2>/dev/null || echo '?')
 pass "post-restore deposit from OUR tx $LIVE_TX (deposit_cnt=$DEPOSIT_CNT_SEEN, network 0) is ready_for_claim"
 
+# READY IS NOT CLAIMED. ready_for_claim proves the INDEXER caught up; it says
+# nothing about ClaimTxManager actually submitting and settling the claim — and
+# claimtxman starvation (#111) is precisely a failure that leaves deposits ready
+# forever while no money moves. Both healers above are allowed to end UNPROVEN
+# on the promise that this drill supplies the functional proof, so it has to be
+# a real one: the claim transaction for OUR deposit must land.
+deadline=$((SECONDS + 600))
+CLAIM_TX=""
+while :; do
+    CLAIM_TX=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+        | LIVE_TX="$LIVE_TX" python3 -c "
+import json, os, sys
+want = os.environ['LIVE_TX'].lower()
+ds = json.load(sys.stdin).get('deposits', [])
+print(next((d.get('claim_tx_hash') or '' for d in ds
+            if str(d.get('tx_hash','')).lower() == want and int(d.get('network_id', -1)) == 0), ''))
+" 2>/dev/null || echo "")
+    [[ "$CLAIM_TX" =~ ^0x[0-9a-fA-F]{64}$ ]] && break
+    (( SECONDS >= deadline )) && fail "the post-restore deposit from tx $LIVE_TX became ready_for_claim but was NEVER CLAIMED within 600s — the sponsor (claimtxman) is not settling claims, which is exactly the #111 shape both heals above were allowed to leave unproven"
+    sleep 10
+done
+pass "post-restore claim SETTLED for our deposit: claim_tx=$CLAIM_TX (money moved, not merely indexed)"
+
 # PR#164 re-review — compare COUNT to COUNT. `INJ1` is the injected-set MD5 from
 # `fingerprint()`, not a number: `[[ "$INJ2" -gt "$INJ1" ]]` compared an integer to
 # a hex digest, so bash arithmetic evaluated the non-numeric side as 0 and the
