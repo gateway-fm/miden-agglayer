@@ -1559,34 +1559,16 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
-    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
-        // #146 (PR#155 blocker 3) — see the postgres impl: TTL may only reap a
-        // row that is still genuinely GAP-BLOCKED. A parked tx at or below the
-        // signer's next expected nonce is executable now and merely awaiting
-        // promotion; dropping it orphans an acknowledged tx (the #119 wedge).
-        // Snapshot nonces FIRST, then take the queue lock (consistent ordering).
-        let frontier: std::collections::HashMap<String, u64> = self
-            .nonces
+    async fn count_stale_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
+        // Deletes NOTHING. See the trait doc: a parked tx is already
+        // acknowledged, so a TTL may report it but must never destroy it.
+        Ok(self
+            .queued_txns
             .read()
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        let mut map = self.queued_txns.write();
-        let mut dropped = 0;
-        for (signer, inner) in map.iter_mut() {
-            let next = frontier.get(signer).copied().unwrap_or(0);
-            let stale: Vec<u64> = inner
-                .iter()
-                .filter(|(nonce, q)| q.expires_at <= now && **nonce > next)
-                .map(|(n, _)| *n)
-                .collect();
-            for n in stale {
-                inner.remove(&n);
-                dropped += 1;
-            }
-        }
-        map.retain(|_, inner| !inner.is_empty());
-        Ok(dropped)
+            .values()
+            .flat_map(|m| m.values())
+            .filter(|q| q.expires_at <= now)
+            .count())
     }
 
     // ── Nonces ───────────────────────────────────────────────────
@@ -4219,18 +4201,19 @@ mod tests {
         assert_eq!(store.list_faucets().await.unwrap().len(), 1);
     }
 
-    /// #146 (PR#155 blocker 3) — TTL is a bounded-memory valve for a gap that
-    /// will NEVER fill, NOT a delivery deadline. A parked tx at or below the
-    /// signer's next expected nonce is EXECUTABLE RIGHT NOW and merely awaiting
-    /// promotion (writer saturation, a failed drain, a crash between admit and
-    /// delete). Reaping it silently orphans an ALREADY ACKNOWLEDGED transaction,
-    /// which is exactly the permanent claim-stream wedge of #119: the sender
-    /// never resubmits and the peer cannot classify the resulting rejection.
+    /// #146/#119 — a parked tx has already been ACKNOWLEDGED to its sender, so a
+    /// TTL may REPORT it but must never destroy it. Deleting one silently orphans
+    /// an accepted transaction: the sender never resubmits (it was told "accepted")
+    /// and the downstream consumer cannot classify the rejection it eventually
+    /// sees. That is exactly the permanent claim-stream wedge of #119.
     ///
-    /// So expiry must skip executable rows and reap only genuinely gap-blocked
-    /// ones. RED before the guard: both rows were dropped.
+    /// Covers the case a "gap-blocked only" predicate gets wrong: with frontier N
+    /// and expired rows at N AND N+1 there is no gap at all — both form an
+    /// executable contiguous prefix — yet such a predicate would delete N+1
+    /// merely because N+1 > frontier. Here NOTHING is deleted, and the count is
+    /// reported for operator visibility.
     #[tokio::test]
-    async fn expiry_never_reaps_an_executable_parked_txn() {
+    async fn stale_parked_txns_are_reported_never_deleted() {
         use alloy::consensus::{Signed, TxLegacy};
         use alloy::primitives::Signature;
         let store = InMemoryStore::new();
@@ -4249,35 +4232,30 @@ mod tests {
             global: 16,
         };
 
-        // Signer's executable frontier is nonce 7.
+        // Executable frontier is nonce 7.
         store.nonce_bootstrap_if_absent(signer, 7).await.unwrap();
 
-        // nonce 7 == frontier: executable, only awaiting promotion.
-        let (h7, e7) = mk(0x77);
-        store
-            .queue_txn(signer, 7, h7, &e7, 10, bounds)
-            .await
-            .unwrap();
-        // nonce 9: genuinely gap-blocked (8 is missing).
-        let (h9, e9) = mk(0x99);
-        store
-            .queue_txn(signer, 9, h9, &e9, 10, bounds)
-            .await
-            .unwrap();
+        // 7 == frontier and 8 == frontier+1: a CONTIGUOUS executable prefix.
+        // 10 is genuinely gap-blocked (9 is missing).
+        for (n, h) in [(7u64, 0x77u8), (8, 0x88), (10, 0xAA)] {
+            let (hash, env) = mk(h);
+            store
+                .queue_txn(signer, n, hash, &env, 10, bounds)
+                .await
+                .unwrap();
+        }
 
-        // Both are long past their TTL block.
-        let dropped = store.expire_queued_txns(100).await.unwrap();
+        // All three are long past their TTL block.
+        let stale = store.count_stale_queued_txns(100).await.unwrap();
+        assert_eq!(stale, 3, "all three must be REPORTED as stale");
 
-        assert_eq!(dropped, 1, "only the gap-blocked row may be reaped");
-        assert!(
-            store.get_queued_txn(signer, 7).await.unwrap().is_some(),
-            "an EXECUTABLE parked tx must never be expired — dropping it orphans an \
-             acknowledged transaction (the #119 wedge)"
-        );
-        assert!(
-            store.get_queued_txn(signer, 9).await.unwrap().is_none(),
-            "a genuinely gap-blocked parked tx past its TTL is still reaped"
-        );
+        for n in [7u64, 8, 10] {
+            assert!(
+                store.get_queued_txn(signer, n).await.unwrap().is_some(),
+                "parked nonce {n} was DELETED — an acknowledged tx must never be dropped, \
+                 whether it is executable, contiguous-executable, or gap-blocked (#119)"
+            );
+        }
     }
 
     /// #146 — the future-nonce queue's park/idempotency/conflict/bounds/expiry
@@ -4425,9 +4403,16 @@ mod tests {
         assert!(store.delete_queued_txn(a, 5, h5).await.unwrap());
         assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), Some(6));
 
-        // Expiry drops every row whose expires_at <= now (nonce 6, expires_at 100).
-        assert_eq!(store.expire_queued_txns(100).await.unwrap(), 1);
-        assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), None);
-        assert!(store.queued_signers().await.unwrap().is_empty());
+        // #146/#119 — expiry REPORTS, it does not delete. This assertion used to
+        // require the stale row to be dropped; an acknowledged parked tx must
+        // survive its TTL, so the row (nonce 6, expires_at 100) is still here and
+        // is merely counted.
+        assert_eq!(store.count_stale_queued_txns(100).await.unwrap(), 1);
+        assert_eq!(
+            store.peek_queued_min_nonce(a).await.unwrap(),
+            Some(6),
+            "a stale parked tx is RETAINED, never dropped"
+        );
+        assert_eq!(store.queued_signers().await.unwrap(), vec![a.to_string()]);
     }
 }

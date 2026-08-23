@@ -2048,27 +2048,17 @@ impl Store for PgStore {
         }))
     }
 
-    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
+    async fn count_stale_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
+        // Deletes NOTHING. See the trait doc: a parked tx is already
+        // acknowledged, so a TTL may report it but must never destroy it.
         let client = self.pool.get().await?;
-        // #146 (PR#155 blocker 3) — TTL is a bounded-memory valve for a gap that
-        // will NEVER fill, not a deadline on delivery. A row at or below the
-        // signer's next expected nonce is EXECUTABLE RIGHT NOW: the drain simply
-        // has not promoted it yet (writer saturation, a failed drain, a restart
-        // between admit and delete). Dropping it silently orphans an ALREADY
-        // ACKNOWLEDGED transaction, which is exactly the permanent claim-stream
-        // wedge #119 documented — the caller never resubmits and the peer cannot
-        // classify the resulting rejection. So expire only rows that are still
-        // genuinely gap-blocked (nonce strictly above the executable frontier).
-        let n = client
-            .execute(
-                "DELETE FROM queued_txns q
-                  WHERE q.expires_at <= $1
-                    AND q.nonce > COALESCE(
-                        (SELECT n.nonce FROM nonces n WHERE n.address = q.signer), 0)",
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM queued_txns WHERE expires_at <= $1",
                 &[&(now as i64)],
             )
             .await?;
-        Ok(n as usize)
+        Ok(row.get::<_, i64>(0).max(0) as usize)
     }
 
     // ── Nonces ───────────────────────────────────────────────────

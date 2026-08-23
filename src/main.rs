@@ -866,6 +866,25 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     } else {
+        // #146 (review) — the future-nonce queue makes durability a CORRECTNESS
+        // property, not just an operational preference: a parked tx has been
+        // ACKNOWLEDGED to its sender, which will never resubmit it. An ephemeral
+        // store loses every parked tx on restart, silently orphaning accepted
+        // work (#119). Refuse to start that way unless an operator opts in
+        // explicitly, which keeps tests and local runs working while making the
+        // unsafe production shape impossible to reach by accident.
+        if std::env::var("ALLOW_EPHEMERAL_STORE").ok().as_deref() != Some("1") {
+            anyhow::bail!(
+                "refusing to start with an in-memory store: transactions accepted into the \
+                 future-nonce queue would be silently lost on restart after being acknowledged \
+                 to their sender. Pass --database-url for a durable store, or set \
+                 ALLOW_EPHEMERAL_STORE=1 to accept that data loss (never in production)."
+            );
+        }
+        tracing::warn!(
+            "starting with an EPHEMERAL in-memory store (ALLOW_EPHEMERAL_STORE=1): every \
+             acknowledged future-nonce transaction is lost on restart"
+        );
         Arc::new(InMemoryStore::new())
     };
 

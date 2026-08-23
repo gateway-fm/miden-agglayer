@@ -11,12 +11,23 @@
 # advances across the whole 0..=K prefix).
 #
 # The e2e proxy runs with `--insecure-allow-any-signer` (see docker-compose.e2e
-# .yml), so this uses a FRESH random key — no allow-list wiring needed. The txs
-# carry the `insertGlobalExitRoot(bytes32)` selector the proxy admits (decoded by
-# selector, targeted at the L2 GER manager). Promotion is observed via the
-# `pending` transaction count advancing across the gap — this is admission-level
-# (queue drain + nonce CAS), independent of whether the GER itself finalises on
-# Miden.
+# .yml), so this uses a FRESH random key — no allow-list wiring needed.
+#
+# VEHICLE: `claimAsset`, deliberately. The obvious choice, `insertGlobalExitRoot`,
+# CANNOT be used on a stack running `--reject-unverified-ger-injection`: the
+# strict-H6 preflight (service_send_raw_txn, scoped to DecodedWriteCall::Ger)
+# refuses a root the configured L1 scan has not observed, and it runs BEFORE the
+# nonce/park decision — so every tx was rejected and the queue was never
+# exercised at all. claimAsset is not preflighted, reaches the park decision, and
+# is also the exact shape of the incident this queue exists to prevent (#119: one
+# out-of-order claimAsset permanently wedged an account's claim stream). The
+# calldata does not need to describe a claimable deposit: this test asserts
+# ADMISSION-level behaviour (park / idempotency / conflict / promotion + order),
+# which is decided before any claim semantics are evaluated.
+#
+# Promotion is observed via the `pending` transaction count advancing across the
+# gap — admission-level (queue drain + nonce CAS), independent of whether the
+# claim itself settles on Miden.
 # ══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -31,12 +42,30 @@ fail() { echo -e "${RED}[$(date +%H:%M:%S)] FAIL:${NC} $*" >&2; exit 1; }
 pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
 
 L2_RPC="${L2_RPC:-http://localhost:8546}"
-# L2 GlobalExitRootManager address the proxy synthesises GER updates at
-# (src/log_synthesis.rs::L2_GLOBAL_EXIT_ROOT_ADDRESS). insertGlobalExitRoot is
-# admitted by SELECTOR, so the destination only needs to be a plausible target.
-GER_ADDR="${GER_ADDR:-0xa40D5f56745a118D0906a34E69aeC8C0Db1cB8fA}"
-CHAIN_ID="${CHAIN_ID:-1}"
-GAS_LIMIT="${GAS_LIMIT:-300000}"
+# The L2 bridge address claimAsset is decoded against (admitted by SELECTOR, so
+# the destination only needs to be a plausible target).
+BRIDGE_ADDR="${BRIDGE_ADDR:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}"
+CLAIM_SIG='claimAsset(bytes32[32],bytes32[32],uint256,bytes32,bytes32,uint32,address,uint32,address,uint256,bytes)'
+# 32-entry proof arrays; the marker byte makes each tx's calldata (and therefore
+# its hash) distinct so the conflict case is a genuinely different transaction.
+proof32() {
+    local m="$1" out="[" i
+    for i in $(seq 0 31); do
+        [[ $i -gt 0 ]] && out+=","
+        out+="$(printf '0x%062x%02x' "$i" "$((16#$m))")"
+    done
+    echo "${out}]"
+}
+# Chain id MUST come from the node, not a constant: the plain e2e stack and the
+# l2l2 stack use DIFFERENT ids (1 vs 2), and R4 rejects a chain-id mismatch
+# before the future-nonce path is ever reached — so a hardcoded id silently
+# turned this whole test into "the proxy rejects everything" on l2l2.
+if [[ -z "${CHAIN_ID:-}" ]]; then
+    CHAIN_ID_HEX="$(cast rpc --rpc-url "$L2_RPC" eth_chainId 2>/dev/null | tr -d '"' || true)"
+    [[ "$CHAIN_ID_HEX" == 0x* ]] || fail "could not read eth_chainId from $L2_RPC (got: '$CHAIN_ID_HEX')"
+    CHAIN_ID="$((CHAIN_ID_HEX))"
+fi
+GAS_LIMIT="${GAS_LIMIT:-900000}"
 GAS_PRICE="${GAS_PRICE:-1000000000}"
 
 command -v cast >/dev/null || fail "cast (foundry) not found"
@@ -47,30 +76,40 @@ KEY="$(cast wallet new 2>/dev/null | awk '/Private key:/{print $NF}')"
 [[ -n "$KEY" ]] || fail "could not mint a throwaway signing key"
 SIGNER="$(cast wallet address --private-key "$KEY")"
 SIGNER_LC="$(echo "$SIGNER" | tr 'A-F' 'a-f')"
-log "signer=$SIGNER  rpc=$L2_RPC  ger=$GER_ADDR"
+log "signer=$SIGNER  rpc=$L2_RPC  bridge=$BRIDGE_ADDR  chain_id=$CHAIN_ID"
 
-# mk_raw <nonce> <root32> → echoes the raw EIP-2718 signed insertGlobalExitRoot tx.
+# mk_raw <nonce> <marker-hex-byte> → raw EIP-2718 signed claimAsset tx.
 mk_raw() {
+    local pr; pr="$(proof32 "$2")"
     cast mktx --private-key "$KEY" --nonce "$1" --chain-id "$CHAIN_ID" \
         --gas-limit "$GAS_LIMIT" --gas-price "$GAS_PRICE" --value 0 \
-        "$GER_ADDR" "insertGlobalExitRoot(bytes32)" "$2" 2>/dev/null
+        "$BRIDGE_ADDR" "$CLAIM_SIG" \
+        "$pr" "$pr" 1 \
+        0x0000000000000000000000000000000000000000000000000000000000000001 \
+        0x0000000000000000000000000000000000000000000000000000000000000002 \
+        0 0x0000000000000000000000000000000000000000 1 "$SIGNER" 1 0x 2>/dev/null
 }
 # JSON-RPC helpers (cast rpc prints the raw result; strip surrounding quotes).
-send_raw()   { cast rpc --rpc-url "$L2_RPC" eth_sendRawTransaction "$1" 2>&1; }
+# NOTE: returns the node's reply on stdout and NEVER fails the script — the
+# caller must inspect the reply. `cast rpc` exits non-zero on an RPC error, and
+# under `set -e` a bare `X="$(send_raw ...)"` would abort before the caller's
+# `|| fail` could report WHY, which hid a real rejection as a silent exit.
+send_raw()   { cast rpc --rpc-url "$L2_RPC" eth_sendRawTransaction "$1" 2>&1 || true; }
 get_receipt(){ cast rpc --rpc-url "$L2_RPC" eth_getTransactionReceipt "$1" 2>/dev/null | tr -d '"'; }
 get_tx()     { cast rpc --rpc-url "$L2_RPC" eth_getTransactionByHash "$1" 2>/dev/null; }
 pending_cnt(){ cast rpc --rpc-url "$L2_RPC" eth_getTransactionCount "$SIGNER" "pending" 2>/dev/null | tr -d '"' | xargs -I{} printf '%d\n' {} 2>/dev/null || echo 0; }
 
-ROOT1="0x1111111111111111111111111111111111111111111111111111111111111111"
-ROOT1B="0x2222222222222222222222222222222222222222222222222222222222222222"
-ROOT0="0x0000000000000000000000000000000000000000000000000000000000000011"
+# Distinct calldata markers -> distinct tx hashes.
+ROOT1="a1"
+ROOT1B="b2"
+ROOT0="c3"
 
 # ── 1. Future nonce (N+1 before N) is PARKED, not rejected ────────────────────
 step "1. submit nonce 1 (future) before nonce 0 — must be PARKED (accepted), not rejected"
 RAW1="$(mk_raw 1 "$ROOT1")"; [[ "$RAW1" == 0x* ]] || fail "could not build the nonce-1 tx (cast mktx): $RAW1"
 HASH1="$(cast tx-hash "$RAW1" 2>/dev/null || true)"
 SEND1="$(send_raw "$RAW1")"
-echo "$SEND1" | grep -qi 'nonce mismatch' && fail "future-nonce tx was REJECTED (nonce mismatch) — #146 not in effect: $SEND1"
+echo "$SEND1" | grep -qiE 'nonce mismatch|nonce too high' && fail "future-nonce tx was REJECTED instead of parked — #146 not in effect: $SEND1"
 RET1="$(echo "$SEND1" | tr -d '"')"
 [[ "$RET1" == 0x* && ${#RET1} -ge 66 ]] || fail "eth_sendRawTransaction did not return a tx hash for the parked tx: $SEND1"
 [[ -z "$HASH1" || "$HASH1" == "$RET1" ]] || fail "returned hash $RET1 != computed $HASH1"
@@ -111,7 +150,7 @@ pass "3. conflicting same-(signer,nonce) tx is refused"
 step "4. submit nonce 0 (fills the gap) — must promote the parked nonce-1 successor"
 RAW0="$(mk_raw 0 "$ROOT0")"; [[ "$RAW0" == 0x* ]] || fail "could not build the nonce-0 tx"
 SEND0="$(send_raw "$RAW0")"
-echo "$SEND0" | grep -qi 'nonce mismatch' && fail "the in-order nonce-0 tx was rejected: $SEND0"
+echo "$SEND0" | grep -qiE 'nonce mismatch|nonce too (low|high)' && fail "the in-order nonce-0 tx was rejected: $SEND0"
 RET0="$(echo "$SEND0" | tr -d '"')"
 [[ "$RET0" == 0x* ]] || fail "nonce-0 submission did not return a hash: $SEND0"
 pass "4. in-order nonce-0 tx accepted (hash=$RET0)"

@@ -855,9 +855,19 @@ pub trait Store: Send + Sync + 'static {
     /// Look up a parked tx by its hash (for `eth_getTransactionByHash`).
     async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>>;
 
-    /// Drop every parked tx whose `expires_at` block is `<= now`. Returns how
-    /// many rows were dropped.
-    async fn expire_queued_txns(&self, now: u64) -> anyhow::Result<usize>;
+    /// Count parked txs whose `expires_at` block is `<= now`. OBSERVABILITY
+    /// ONLY — it deletes nothing.
+    ///
+    /// #146/#119: a parked tx has already been ACKNOWLEDGED to its sender, which
+    /// will therefore never resubmit it, and the downstream consumer cannot
+    /// classify the rejection it would eventually see. Deleting one silently
+    /// orphans it — precisely the permanent claim-stream wedge this queue exists
+    /// to prevent. A TTL cannot distinguish "the gap will never fill" from "the
+    /// gap is slow", so it must not be allowed to destroy durable, acknowledged
+    /// work. Memory is bounded instead by the per-signer and global queue caps,
+    /// which reject at SUBMISSION time (an immediate, visible error to a caller
+    /// that still holds the tx) rather than dropping an accepted one later.
+    async fn count_stale_queued_txns(&self, now: u64) -> anyhow::Result<usize>;
 
     // === Nonces ===
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
@@ -1384,16 +1394,20 @@ impl SyncListener for StoreSyncListener {
             self.store
                 .txn_expire_pending(data.block_num, block_hash)
                 .await?;
-            // #146 — reap parked future-nonce txns whose gap never filled, on the
-            // same block-denominated sweep that expires pending receipts.
-            let dropped = self.store.expire_queued_txns(data.block_num).await?;
-            if dropped > 0 {
-                ::metrics::counter!("rpc_future_nonce_expired_total").increment(dropped as u64);
-                tracing::info!(
+            // #146 — SURFACE (never reap) parked future-nonce txns whose gap has
+            // outlived its TTL. These are acknowledged transactions: dropping one
+            // orphans it permanently (#119). Report them so an operator can act;
+            // the queue's per-signer/global bounds cap memory.
+            let stale = self.store.count_stale_queued_txns(data.block_num).await?;
+            ::metrics::gauge!("rpc_future_nonce_stale_parked").set(stale as f64);
+            if stale > 0 {
+                tracing::warn!(
                     target: "rpc::mempool",
-                    dropped,
+                    stale,
                     block = data.block_num,
-                    "expired stale parked future-nonce txns (gap never filled)"
+                    "parked future-nonce txns have outlived their TTL and are STILL RETAINED \
+                     (an acknowledged tx is never dropped); their predecessor nonce has not \
+                     arrived — investigate the sender or fill the gap"
                 );
             }
         }
