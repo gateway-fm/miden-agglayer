@@ -870,6 +870,14 @@ pub trait Store: Send + Sync + 'static {
     async fn count_stale_queued_txns(&self, now: u64) -> anyhow::Result<usize>;
 
     // === Nonces ===
+    /// Does ANY signer hold a nonce ledger row?
+    ///
+    /// #90 — durable evidence that traffic has resumed after a store rebuild.
+    /// The restore leaves this empty; the first admitted transaction repopulates
+    /// it. Used to decide when the post-rebuild bootstrap may retire, so the
+    /// decision survives a restart (a process-local timer did not).
+    async fn nonce_ledger_is_populated(&self) -> anyhow::Result<bool>;
+
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;

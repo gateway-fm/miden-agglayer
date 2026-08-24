@@ -2063,6 +2063,14 @@ impl Store for PgStore {
 
     // ── Nonces ───────────────────────────────────────────────────
 
+    async fn nonce_ledger_is_populated(&self) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one("SELECT EXISTS (SELECT 1 FROM nonces)", &[])
+            .await?;
+        Ok(row.get::<_, bool>(0))
+    }
+
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let key = addr.to_lowercase();

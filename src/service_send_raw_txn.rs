@@ -301,34 +301,41 @@ async fn accept_and_revert_landed_claim(
 
 /// Is the post-rebuild nonce bootstrap currently permitted?
 ///
-/// #90 (re-review) — this used to be a WALL-CLOCK window measured from first
-/// observation in a `OnceLock`. That was unsound in both directions: the marker
-/// is durable but the clock was process-local, so every restart reset it and
-/// repeated restarts could extend "recovery mode" indefinitely; and a continuing
-/// wallet that first reconnected after the window expired got no bootstrap at
-/// all, leaving its tx parked behind nonce 0 forever.
+/// #90 — history of this bound, because both earlier shapes were wrong:
 ///
-/// The bound is now PROGRESS-based and therefore restart-safe: recovery mode
-/// stays available exactly while some signer still has parked work that may need
-/// a baseline, and retires durably the moment the queue is empty — at which point
-/// nothing is waiting on a baseline and any later first-contact signer is a
-/// genuinely new one that must NOT be bootstrapped.
+///  * A wall-clock window in a `OnceLock` was unsound in both directions: the
+///    marker is durable but the clock was process-local, so restarts reset it
+///    (recovery could be extended indefinitely), and a wallet whose first
+///    reconnect fell outside the window got no bootstrap at all.
+///  * "Retire once the queue is empty" was WORSE: a full-DB-loss restore exits
+///    with an EMPTY `queued_txns`, so the first sweep — which runs at boot,
+///    before any wallet has reconnected — retired the marker immediately. The
+///    continuing wallet then parked at nonce 35 behind expected 0 with bootstrap
+///    already disabled: stranded forever. That is the exact wedge #90 exists to
+///    prevent, reintroduced by its own guard.
 ///
-/// Trade-off, stated explicitly: a signer whose parked row can never execute
-/// keeps recovery mode alive. That row is already surfaced loudly by
-/// `reconcile_stale_queued_prefix` and the `rpc_future_nonce_stale_parked` gauge
-/// and needs operator action regardless, so it does not hide.
+/// The bound is therefore EVIDENCE-based and made of durable store facts only,
+/// so it survives a restart: recovery retires once traffic has demonstrably
+/// resumed (at least one signer holds a nonce ledger row again) AND nothing is
+/// left parked. Until the first wallet comes back, the marker stays regardless
+/// of how many times the process restarts or how long it takes.
+///
+/// Trade-off, stated: a parked row that can never execute keeps recovery alive.
+/// That row is already surfaced by `reconcile_stale_queued_prefix` and the
+/// `rpc_future_nonce_stale_parked` gauge and needs operator action anyway.
 async fn recovery_bootstrap_active(service: &ServiceState) -> anyhow::Result<bool> {
     if !service.store.is_nonce_ledger_rebuilt().await? {
         return Ok(false);
     }
-    if service.store.queued_signers().await?.is_empty() {
+    let traffic_resumed = service.store.nonce_ledger_is_populated().await?;
+    let nothing_parked = service.store.queued_signers().await?.is_empty();
+    if traffic_resumed && nothing_parked {
         service.store.set_nonce_ledger_rebuilt(false).await?;
         ::metrics::counter!("rpc_nonce_recovery_mode_expired_total").increment(1);
         tracing::info!(
             target: "rpc::nonce_repair",
-            "#90: no parked work remains — post-rebuild nonce bootstrap retired durably; \
-             ordinary R4 admission applies to every signer from here on"
+            "#90: traffic has resumed and no parked work remains — post-rebuild nonce \
+             bootstrap retired durably; ordinary R4 admission applies from here on"
         );
         return Ok(false);
     }
@@ -1359,12 +1366,23 @@ async fn service_send_raw_txn_inner(
         // per-signer lock below); if it races and we let a now-executable tx
         // through, the writer enqueue simply reports saturation later, which is
         // no worse than rejecting here.
-        let expected_hint = service
-            .store
-            .nonce_get(&signer_str)
-            .await
-            .unwrap_or(u64::MAX);
-        if tx_nonce <= expected_hint {
+        // On a read error, DO NOT apply the gate: `u64::MAX` would make every tx
+        // look executable and reject parkable traffic as saturated. Letting it
+        // through is safe — the authoritative classification happens under the
+        // per-signer lock, and a genuinely executable tx simply meets writer
+        // saturation at enqueue instead.
+        let executable_now = match service.store.nonce_get(&signer_str).await {
+            Ok(expected_hint) => tx_nonce <= expected_hint,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rpc::mempool", signer = %signer_str, error = %e,
+                    "capacity gate: nonce hint read failed — not rejecting; the parked/executable \
+                     decision is made authoritatively under the signer lock"
+                );
+                false
+            }
+        };
+        if executable_now {
             return Err(crate::writer_worker::WriterQueueSaturatedError.into());
         }
     }
@@ -1743,6 +1761,13 @@ async fn service_send_raw_txn_inner(
 /// fills within a few blocks; this only reaps a gap that never fills, via the
 /// same sweep that expires pending receipts. ~1h at ~1 block/s.
 const QUEUE_TTL_BLOCKS: u64 = 3_600;
+
+/// Blocks the lowest parked nonce must have been queued for before it may seed a
+/// post-rebuild baseline, so a LOWER nonce still in validation can arrive first.
+const BOOTSTRAP_SETTLE_BLOCKS: u64 = 3;
+
+/// Wall-clock budget for one signer's slice of the periodic drain sweep.
+const SWEEP_PER_SIGNER_BUDGET_SECS: u64 = 20;
 /// Bound on parked future-nonce txs per signer (a bursty sender's reorder depth
 /// is small; this caps a misbehaving/adversarial signer).
 const QUEUE_MAX_PER_SIGNER: usize = 256;
@@ -1874,7 +1899,30 @@ pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
                 }
             };
             let guard = service.per_signer_locks.lock(addr).await;
-            if let Some(min_parked) = service.store.peek_queued_min_nonce(&signer).await?
+            // (review) A LOWER nonce may still be in decode / stateful validation
+            // and therefore not yet visible in the queue — seeding on the current
+            // minimum would adopt too high a baseline and reject that request as
+            // stale when it finally arrives. Require the minimum to have been
+            // parked for a settle margin first. `expires_at` is stamped
+            // `latest_block + QUEUE_TTL_BLOCKS` at park time, so the park block is
+            // recoverable from it without a schema change.
+            let settled = match (
+                service.store.peek_queued_min_nonce(&signer).await?,
+                service.store.get_latest_block_number().await,
+            ) {
+                (Some(min), Ok(now_block)) => {
+                    match service.store.get_queued_txn(&signer, min).await {
+                        Ok(Some(q)) => {
+                            let parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
+                            now_block >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if settled
+                && let Some(min_parked) = service.store.peek_queued_min_nonce(&signer).await?
                 && min_parked > 0
                 && service
                     .store
@@ -1910,7 +1958,27 @@ pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
             .is_some()
         {
             tracing::info!(target: "rpc::mempool", signer = %signer, expected, "resuming drain of persisted future-nonce txns");
-            drain_queued(service, &signer).await;
+            // (review) FAIRNESS: the sweep walks every signer serially and a
+            // single row can sit in stateful validation for minutes (strict-H6
+            // GER observation waits, and Miden-client calls have no outer
+            // deadline). Without a per-signer bound one poison row starves every
+            // later signer of the recovery guarantee indefinitely. Cap each
+            // signer's slice; the next tick resumes wherever this one stopped.
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(SWEEP_PER_SIGNER_BUDGET_SECS),
+                drain_queued(service, &signer),
+            )
+            .await
+            .is_err()
+            {
+                ::metrics::counter!("rpc_future_nonce_drain_budget_exceeded_total").increment(1);
+                tracing::warn!(
+                    target: "rpc::mempool", signer = %signer,
+                    budget_secs = SWEEP_PER_SIGNER_BUDGET_SECS,
+                    "drain: per-signer sweep budget exhausted — moving on so later signers are \
+                     not starved; this signer resumes on the next tick"
+                );
+            }
         }
     }
     Ok(())
@@ -3157,7 +3225,26 @@ mod tests {
             "the tx must be durably parked, not dropped"
         );
 
-        // The drain adopts the LOWEST PARKED nonce as the baseline and promotes.
+        // The settle margin must elapse first: a LOWER nonce could still be in
+        // validation, and seeding on the current minimum would strand it.
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "no baseline may be adopted before the settle margin elapses"
+        );
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "still no baseline — the settle margin has not elapsed"
+        );
+
+        // Advance past the margin; the drain adopts the LOWEST PARKED nonce.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
         resume_queued_drain(&service).await.unwrap();
 
         assert_eq!(
@@ -3198,11 +3285,6 @@ mod tests {
         );
     }
 
-    /// `RECOVERY_MODE_SINCE` is a process-wide static and the window-expiry path
-    /// retires recovery mode durably. Tests that touch it must not run
-    /// concurrently or one will retire the mode mid-assertion for the other.
-    static NONCE_RECOVERY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// #90 x #146 (re-review) — ORDERING: `N+1` may reach the proxy before a
     /// still-pending `N` (HTTP reordering, a retry, concurrent submitters).
     /// Seeding from whichever request arrived FIRST would adopt `N+1` and strand
@@ -3239,6 +3321,12 @@ mod tests {
             "both are parked and the queue's minimum is the LOWER nonce"
         );
 
+        // Let the settle margin elapse so the baseline may be adopted.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
         resume_queued_drain(&service).await.unwrap();
 
         // Seeded at 21 (not 22), then BOTH promoted in order -> next expected 23.
@@ -3255,33 +3343,54 @@ mod tests {
         );
     }
 
-    /// #90 (re-review) — recovery mode must not be a permanent global amnesty. It is
-    /// time-scoped from first observation and CLEARS the durable marker when the
-    /// window lapses, so it cannot keep applying to every previously-unseen signer
-    /// for the life of the deployment.
+    /// #90 (re-review) — recovery mode must not be a permanent global amnesty,
+    /// and must NOT retire before the wallets it exists for have reconnected.
+    ///
+    /// Both earlier bounds failed one side or the other: a process-local timer
+    /// could be extended forever by restarts, and "retire when the queue is
+    /// empty" retired at boot — restore leaves an EMPTY queue, so the marker was
+    /// cleared before first contact and the continuing wallet stranded. The rule
+    /// is now evidence-based on durable facts: retire only once traffic has
+    /// demonstrably resumed (some signer holds a nonce row) AND nothing is parked.
     #[tokio::test]
-    async fn finding90_recovery_mode_is_scoped_and_self_clearing() {
-        let service = create_test_service();
+    async fn finding90_recovery_mode_retires_only_after_traffic_resumes() {
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
         store.set_nonce_ledger_rebuilt(true).await.unwrap();
 
-        // A zero-length window means the very first check retires recovery mode.
-        // The guard covers only the shared-static mutation (see the sibling test):
-        // a std Mutex must not be held across an await.
-        {
-            let _guard = NONCE_RECOVERY_TEST_GUARD
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
-        }
-        let active = recovery_bootstrap_active(&service).await.unwrap();
-        unsafe { std::env::remove_var("NONCE_RECOVERY_WINDOW_SECS") };
+        // Immediately post-restore: empty ledger, empty queue. Recovery must STAY
+        // armed — this is precisely the boot-time moment the previous rule got
+        // wrong, disabling the bootstrap before any wallet reconnected.
+        assert!(
+            recovery_bootstrap_active(&service).await.unwrap(),
+            "recovery must remain armed after restore until traffic actually resumes"
+        );
+        assert!(
+            store.is_nonce_ledger_rebuilt().await.unwrap(),
+            "the durable marker must not be cleared at boot"
+        );
 
-        assert!(!active, "an elapsed window must not permit bootstrap");
+        // A continuing wallet reconnects and is bootstrapped + promoted.
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+        let (raw, _) = ger_tx_at(&key, 21, 0xE1);
+        service_send_raw_txn(service.clone(), raw).await.unwrap();
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 22);
+
+        // Traffic has resumed and nothing is parked -> retire, durably.
+        assert!(
+            !recovery_bootstrap_active(&service).await.unwrap(),
+            "recovery must retire once traffic resumed and no parked work remains"
+        );
         assert!(
             !store.is_nonce_ledger_rebuilt().await.unwrap(),
-            "the durable marker must be CLEARED once the window lapses — recovery mode \
-             must not apply indefinitely to every future unseen signer"
+            "retirement must be DURABLE so a restart cannot re-arm the amnesty"
         );
     }
 

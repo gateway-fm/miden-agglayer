@@ -1573,6 +1573,10 @@ impl Store for InMemoryStore {
 
     // ── Nonces ───────────────────────────────────────────────────
 
+    async fn nonce_ledger_is_populated(&self) -> anyhow::Result<bool> {
+        Ok(!self.nonces.read().is_empty())
+    }
+
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
         Ok(*self.nonces.read().get(&addr.to_lowercase()).unwrap_or(&0))
     }
