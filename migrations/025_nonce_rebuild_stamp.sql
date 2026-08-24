@@ -1,0 +1,26 @@
+-- #90 x #146 — WHEN the nonce ledger was rebuilt, so the post-restore bootstrap
+-- window is DURABLE and bounded.
+--
+-- The window has been wrong three ways already, and each shape stranded an
+-- acknowledged claim or left a permanent amnesty:
+--
+--   * a process-local `OnceLock` timer: the marker is durable but the clock was
+--     not, so every restart reset it and repeated restarts extended recovery
+--     indefinitely; a wallet whose first reconnect fell outside the window got
+--     no bootstrap at all.
+--   * "retire when the queue is empty": restore EXITS with an empty queue and
+--     the sweep runs at boot, so the marker cleared before any wallet
+--     reconnected — the continuing wallet then parked behind nonce 0 forever.
+--   * "retire once any signer has a nonce row": one wallet resuming retired the
+--     amnesty for ALL of them, so a second continuing wallet reconnecting later
+--     was stranded exactly like the first case.
+--
+-- The bound must therefore be measured from the REBUILD ITSELF and survive
+-- restarts, which needs a durable stamp. Unlike a proxy, geth can re-derive any
+-- account's nonce from chain state; this store cannot (restore only recreates
+-- bridge-authored synthetic claim rows, never an external wallet's history), so
+-- a bounded first-contact window is the available mechanism.
+--
+-- Unix seconds, NULL when no rebuild has happened.
+ALTER TABLE service_state
+    ADD COLUMN IF NOT EXISTS nonce_ledger_rebuilt_at BIGINT;

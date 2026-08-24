@@ -188,6 +188,7 @@ pub struct InMemoryStore {
     reconcile_cursor: RwLock<u64>,
     /// #90 — set by restore when it rebuilt the store and left `nonces` empty.
     nonce_ledger_rebuilt: RwLock<bool>,
+    nonce_ledger_rebuilt_at: RwLock<Option<u64>>,
 
     // Cursor of the one configured L1 evidence scan. PostgreSQL stores this in
     // the legacy `finalized_scan_cursor` column for upgrade-safe provenance.
@@ -287,6 +288,7 @@ impl InMemoryStore {
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
             nonce_ledger_rebuilt: RwLock::new(false),
+            nonce_ledger_rebuilt_at: RwLock::new(None),
             l1_evidence_cursor: RwLock::new(0),
             #[cfg(test)]
             fail_l1_evidence_cursor_reads: RwLock::new(false),
@@ -495,7 +497,17 @@ impl Store for InMemoryStore {
 
     async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
         *self.nonce_ledger_rebuilt.write() = rebuilt;
+        *self.nonce_ledger_rebuilt_at.write() = rebuilt.then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
         Ok(())
+    }
+
+    async fn nonce_ledger_rebuilt_at(&self) -> anyhow::Result<Option<u64>> {
+        Ok(*self.nonce_ledger_rebuilt_at.read())
     }
 
     async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {

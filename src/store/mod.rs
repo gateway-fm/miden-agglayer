@@ -878,6 +878,16 @@ pub trait Store: Send + Sync + 'static {
     /// decision survives a restart (a process-local timer did not).
     async fn nonce_ledger_is_populated(&self) -> anyhow::Result<bool>;
 
+    /// Unix seconds when the nonce ledger was last rebuilt, or `None`.
+    ///
+    /// #90 — the post-restore bootstrap window is measured from THIS, durably, so
+    /// it neither resets on restart nor retires early. See
+    /// `migrations/025_nonce_rebuild_stamp.sql` for why the three earlier bounds
+    /// were unsound.
+    async fn nonce_ledger_rebuilt_at(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;

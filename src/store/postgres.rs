@@ -264,13 +264,36 @@ impl Store for PgStore {
 
     async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
+        // Stamp WHEN the rebuild happened so the bootstrap window is durable and
+        // bounded; clear the stamp on retirement so a later rebuild starts fresh.
+        let stamp: Option<i64> = rebuilt.then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
         client
             .execute(
-                "UPDATE service_state SET nonce_ledger_rebuilt = $1, updated_at = now() WHERE id = 1",
-                &[&rebuilt],
+                "UPDATE service_state SET nonce_ledger_rebuilt = $1, \
+                 nonce_ledger_rebuilt_at = $2, updated_at = now() WHERE id = 1",
+                &[&rebuilt, &stamp],
             )
             .await?;
         Ok(())
+    }
+
+    async fn nonce_ledger_rebuilt_at(&self) -> anyhow::Result<Option<u64>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT nonce_ledger_rebuilt_at FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get::<_, Option<i64>>(0))
+            .map(|v| v.max(0) as u64))
     }
 
     async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {

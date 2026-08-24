@@ -136,6 +136,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "022_nonce_ledger_rebuilt.sql",
         include_str!("../../migrations/022_nonce_ledger_rebuilt.sql"),
     ),
+    // 023 and 024 are BURNED: intermediate commits of the rc.1 branch applied
+    // files under both names and those databases still carry the rows.
+    (
+        "025_nonce_rebuild_stamp.sql",
+        include_str!("../../migrations/025_nonce_rebuild_stamp.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be
