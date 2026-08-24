@@ -23,6 +23,16 @@ jobs:
       - run: make test-unit
       - run: make test-scripts
 
+      # SCA scanners report the LGPL arm of SPDX "A OR B" expressions as if it
+      # were the only option, and do not exclude target-gated crates that never
+      # compile. deny.toml records the actual elections (and why each reported
+      # crate is not a problem) so the policy is machine-checked here instead of
+      # re-derived by hand every time a scan runs.
+      - name: license policy (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
   # Blocks on an UNRESOLVED upstream API gap. It does NOT block on every vendor
   # patch: the miden-agglayer one it was written for is RESOLVED (rc.6 restored
   # read_let_num_leaves/is_ger_registered as public API and vendor/ is gone), so
