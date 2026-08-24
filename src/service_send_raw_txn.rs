@@ -351,26 +351,24 @@ async fn recovery_bootstrap_active(service: &ServiceState) -> anyhow::Result<boo
 
 /// May THIS signer still adopt a post-rebuild baseline?
 ///
-/// #90 (round-4) — the global window closing must not orphan work that was
-/// ACKNOWLEDGED while it was open. A tx parked just before expiry cannot be
-/// bootstrapped immediately (the settle margin has not elapsed), and the next
-/// sweep would have found the window shut and left it parked behind nonce 0
-/// forever; a re-broadcast only returns `AlreadyParked`, so the sender cannot
-/// heal it either.
+/// #90 (round-5) — this used to GRANDFATHER any signer with parked rows and
+/// `nonce_get() == 0`, so that the global window closing could not orphan work
+/// acknowledged while it was open. That was WRONG and is reverted: an ABSENT
+/// ledger row also reads 0, and the predicate proved neither that a rebuild had
+/// happened nor that the row was parked while the window was open. On a fresh
+/// deployment a genuinely new wallet could submit nonce 42, be parked, and then
+/// be seeded to 42 — skipping 0..41 entirely. That is a direct nonce-ordering
+/// violation, and a permanent amnesty rather than a bounded one.
 ///
-/// So a signer that HAS parked rows and NO ledger row stays eligible regardless
-/// of the global window. That is not an open-ended amnesty: it is scoped to
-/// transactions this proxy already accepted, it cannot rewind a nonce
-/// (`_if_absent` is a no-op once a row exists), and it also repairs a store whose
-/// marker was retired by an earlier revision before every wallet had returned.
-async fn signer_may_bootstrap(service: &ServiceState, signer: &str, global: bool) -> bool {
-    if global {
-        return true;
-    }
-    matches!(
-        service.store.peek_queued_min_nonce(signer).await,
-        Ok(Some(_))
-    ) && matches!(service.store.nonce_get(signer).await, Ok(0))
+/// Eligibility is therefore the durable global window only. The residual it
+/// leaves is real and is recorded in the branch notes rather than papered over:
+/// a transaction parked in the last few blocks before the window closes cannot
+/// be seeded on that sweep (the settle margin has not elapsed) and will not be
+/// seeded afterwards. Closing that hole needs proof that a row was parked while
+/// the window was open — a durable per-row "parked during recovery" marker — not
+/// a predicate that cannot tell a continuing wallet from a new one.
+async fn signer_may_bootstrap(_service: &ServiceState, _signer: &str, global: bool) -> bool {
+    global
 }
 
 /// #55 BLOCKER C/D — idempotent crash-gap nonce repair via store-level CAS.
@@ -3446,57 +3444,50 @@ mod tests {
         );
     }
 
-    /// #90 (round-4) — the global bootstrap window closing must NOT orphan work
-    /// that was acknowledged while it was open.
+    /// #90 (round-5) — a genuinely NEW wallet must never be bootstrapped.
     ///
-    /// A tx parked just before expiry cannot be bootstrapped on that same sweep
-    /// (the settle margin has not elapsed). If eligibility were purely global,
-    /// the next sweep would find the window shut and leave it parked behind nonce
-    /// 0 forever — and a re-broadcast only returns AlreadyParked, so the sender
-    /// cannot heal it. Already-parked work is therefore grandfathered.
+    /// An earlier revision grandfathered any signer with parked rows and
+    /// `nonce_get() == 0` so a late-parked tx could not be orphaned by the window
+    /// closing. But an ABSENT ledger row also reads 0, so that predicate could not
+    /// tell a continuing wallet from a new one: on a fresh deployment a new wallet
+    /// submitting nonce 42 was parked and then SEEDED to 42, skipping 0..41. This
+    /// pins that it cannot happen once the window is shut.
     #[tokio::test]
-    async fn finding90_expired_window_still_bootstraps_already_parked_work() {
+    async fn finding90_new_wallet_is_never_bootstrapped_after_the_window() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
-        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        // No rebuild ever happened: an ordinary running deployment.
+        assert!(!store.is_nonce_ledger_rebuilt().await.unwrap());
 
-        // Acknowledged while the window was open.
         let key = alloy::signers::local::PrivateKeySigner::random();
         let signer_str = format!("{:#x}", key.address());
-        let (raw, _) = ger_tx_at(&key, 42, 0xE7);
+        let (raw, _) = ger_tx_at(&key, 42, 0xE8);
+        // Accepted and parked — that part is correct and is the #146 contract.
         service_send_raw_txn(service.clone(), raw).await.unwrap();
         assert_eq!(
             store.peek_queued_min_nonce(&signer_str).await.unwrap(),
             Some(42)
         );
 
-        // The window now expires BEFORE the settle margin lets it be seeded.
-        unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
-        let global = recovery_bootstrap_active(&service).await.unwrap();
-        unsafe { std::env::remove_var("NONCE_RECOVERY_WINDOW_SECS") };
-        assert!(!global, "precondition: the global window is shut");
-        assert!(
-            !store.is_nonce_ledger_rebuilt().await.unwrap(),
-            "precondition: retirement was written back durably"
-        );
-
-        // Grandfathered: this signer is still eligible, so the parked tx promotes.
+        // Let the settle margin elapse and sweep repeatedly.
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
             .await
             .unwrap();
         resume_queued_drain(&service).await.unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
         assert_eq!(
             store.nonce_get(&signer_str).await.unwrap(),
-            43,
-            "work acknowledged while the window was open must still be bootstrapped and \
-             promoted after it closes — otherwise the cutoff orphans an accepted claim"
+            0,
+            "a new wallet must NOT have its ledger seeded to 42 — that would skip nonces \
+             0..41 and execute out of order"
         );
         assert_eq!(
             store.peek_queued_min_nonce(&signer_str).await.unwrap(),
-            None,
-            "and it must leave the queue, not sit there forever"
+            Some(42),
+            "its tx stays parked (accepted, not dropped) until nonce 0.. actually arrive"
         );
     }
 
