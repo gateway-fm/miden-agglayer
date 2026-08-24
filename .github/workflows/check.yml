@@ -8,6 +8,14 @@ on:
       - opened
       - synchronize
 
+# CodeQL (actions/missing-workflow-permissions): without this, jobs inherit the
+# repository default GITHUB_TOKEN scope, which is far wider than anything here
+# needs. Every job in this workflow only reads the checked-out source — it builds,
+# lints, tests and inspects Cargo.toml — so read-only contents is sufficient.
+# Matches release.yml and e2e-l2l2.yml, which already declare exactly this.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
