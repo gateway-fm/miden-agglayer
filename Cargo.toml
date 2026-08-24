@@ -33,7 +33,7 @@ path = "src/bin/bridge_autoclaim.rs"
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
 # upstream in rc.1).
-miden-client = { version = "=0.16.0-rc.1", features = ["testing", "tonic"] }
+miden-client = { version = "=0.16.0-rc.2", features = ["testing", "tonic"] }
 tempfile = "3.10"
 # test-util enables tokio's paused virtual clock (start_paused) — used by the
 # ger::poll_until_ready timing regression test to pin the exact sleep count
@@ -191,8 +191,8 @@ miden-processor = { default-features = false, features = [
 # the pins above.
 miden-client = { default-features = false, features = [
   "tonic",
-], version = "=0.16.0-rc.1" }
-miden-client-sqlite-store = { version = "=0.16.0-rc.1" }
+], version = "=0.16.0-rc.2" }
+miden-client-sqlite-store = { version = "=0.16.0-rc.2" }
 
 [features]
 default = []
@@ -208,19 +208,36 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 # RESOLVED (rc.6, verified 2026-08-18): upstream restored
 # `AggLayerBridge::read_let_num_leaves` + `is_ger_registered` as public API in
 # the ungated impl — the vendored miden-agglayer patch is gone. The
-# `upstream-api-gate` CI job stays RED while the miden-client vendor below
-# remains.
+# `upstream-api-gate` CI job now PASSES, with the miden-client vendor below as a
+# reviewed, allow-listed exception (see .github/workflows/check.yml).
 [patch.crates-io]
-# TEMPORARY vendor patch — miden-client rc.1's foreign-account fetch uses a
-# `VaultFetch::IfChangedFrom(local_root)` delta optimization, but the
-# reconstruction path (`account_proof_into_inputs`) rebuilds the vault from
-# the returned asset list unconditionally, so an "unchanged" (omitted) vault
-# reconstructs as EMPTY and the kernel rejects the foreign account with a
-# commitment mismatch — permanently wedging every bridge-targeted transaction
-# (GER injection, claim publish, faucet config) once the bridge vault holds
-# its first locked native asset. The vendored copy is byte-identical to the
-# crates.io release except that fetch forces `VaultFetch::Always` (see the
-# VENDOR PATCH comment in vendor/miden-client-0.16.0-rc.1/src/transaction/
-# mod.rs). Remove this patch AND the vendor copy when upstream fixes the
-# unchanged-vault reconstruction.
-miden-client = { path = "vendor/miden-client-0.16.0-rc.1" }
+# TEMPORARY vendor patch — miden-client rc.2 routes `submit_proven_transaction`
+# through `call_with_retry`, which re-sends on `ResourceExhausted | Unavailable`.
+# Submitting a proven transaction is NOT idempotent (it consumes notes), so if the
+# node ACCEPTS it and the response is then lost, the SAME transaction is silently
+# re-sent. The retry reaches a node that has already spent the nullifier and
+# answers with an APPLICATION-level rejection — and only that second error ever
+# reaches the caller.
+#
+# That destroys the distinction every safe caller depends on:
+#   transport failure, no endpoint_error -> the node MAY have processed it
+#   node answered with a rejection       -> it processed and refused; nothing landed
+# The retry silently falsifies the second premise. Our bridge-out tool, reasoning
+# correctly from it, concluded "nothing landed", minted a NEW B2AGG note, and
+# bridged the same assets twice. See `submit_is_indeterminate` in
+# src/bin/bridge_out_tool.rs — the caller-side backstop for exactly this.
+#
+# The vendored copy is byte-identical to the crates.io release except that submit
+# does not retry; every OTHER endpoint keeps its retries (they are reads, where a
+# re-send is free).
+#
+# rc.1 additionally needed a `VaultFetch::Always` patch (an omitted "unchanged"
+# vault reconstructed as EMPTY and wedged every bridge-targeted transaction once
+# the bridge vault held a locked native asset). rc.2 fixes that upstream, and
+# better — it keeps the bandwidth optimisation and validates the rebuilt vault
+# against the header root, falling back to a root-only partial vault. That second
+# patch is therefore GONE.
+#
+# Remove this patch AND the vendor copy when upstream stops retrying submit, makes
+# retryability per-endpoint, or makes submit idempotent server-side.
+miden-client = { path = "vendor/miden-client-0.16.0-rc.2" }
