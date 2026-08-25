@@ -1622,25 +1622,31 @@ async fn main() -> anyhow::Result<()> {
     // stall the bind and health/readiness could never answer. Mirror the #156
     // startup-recovery shape instead: bounded, backgrounded, best-effort — the
     // periodic drain sweep continues the promotion regardless.
+    // PR#155 review (codex, blocking #2): this used to wrap the whole call in
+    // `tokio::time::timeout`, which DEFEATED the resume's own cancellation
+    // contract. `resume_queued_drain` deliberately runs `bootstrap_one_signer`
+    // OUTSIDE its per-signer timeout because cancelling a PostgreSQL insert
+    // mid-flight is unsafe here: the client goes away, the server keeps the
+    // statement, and the abandoned insert can still commit a baseline AFTER a
+    // lower nonce has parked and been acknowledged — stranding that nonce below
+    // the frontier permanently. An outer blanket timeout reintroduced exactly
+    // the cancellation the inner design forbids.
+    //
+    // The inner function already bounds every cancel-SAFE region per signer, so
+    // the outer bound is removed rather than replaced. Being backgrounded is
+    // what keeps a slow Miden node from stalling the HTTP bind (the original
+    // reason a bound was reached for); it does not require cancellation.
     {
         let queued_state = state.clone();
         tokio::spawn(async move {
-            let bound = std::time::Duration::from_secs(
-                miden_agglayer_service::orphan_recovery::RECOVERY_SWEEP_INTERVAL_SECS,
-            );
-            match tokio::time::timeout(
-                bound,
-                miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&queued_state),
-            )
-            .await
+            if let Err(e) =
+                miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&queued_state)
+                    .await
             {
-                Err(_) => tracing::warn!(
-                    "startup mempool resume timed out (Miden slow/unavailable?); the periodic drain sweep will continue"
-                ),
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "startup mempool resume_queued_drain failed (periodic sweep will retry)")
-                }
-                Ok(Ok(())) => {}
+                tracing::error!(
+                    error = %e,
+                    "startup mempool resume_queued_drain failed (periodic sweep will retry)"
+                );
             }
         });
     }
