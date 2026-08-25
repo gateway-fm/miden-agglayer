@@ -17,8 +17,18 @@
 -- mined" pending shape so aggkit treats it as accepted rather than dropped.
 -- `envelope` is the raw EIP-2718-encoded signed transaction, replayed verbatim
 -- when the gap fills. `expires_at` is a BLOCK NUMBER (same denomination as
--- `transactions.expires_at`); a never-filled gap is dropped by the same expiry
--- sweep that expires pending receipts.
+-- `transactions.expires_at`), but note what it does and does NOT do: it marks a
+-- parked tx as STALE for reporting. NOTHING ever deletes that row.
+--
+-- A parked tx has already been ACKNOWLEDGED to its sender, which will therefore
+-- never resubmit it. Dropping one silently orphans it — exactly the permanent
+-- claim-stream wedge (#119) this queue exists to prevent — and a TTL cannot
+-- distinguish "the gap will never fill" from "the gap is slow". So the sweep
+-- SURFACES these rows (gauge `rpc_future_nonce_stale_parked` plus a warning) and
+-- leaves them in place for an operator to act on. Memory is bounded by the
+-- per-signer and global caps, which reject at SUBMISSION time — an immediate,
+-- visible error to a caller that still holds the transaction — rather than by
+-- discarding work already accepted.
 CREATE TABLE IF NOT EXISTS queued_txns (
     signer      TEXT NOT NULL,
     nonce       BIGINT NOT NULL,
